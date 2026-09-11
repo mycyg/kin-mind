@@ -1,12 +1,14 @@
 from pathlib import Path
 from zipfile import ZipFile
 
-wheel = next(Path("dist").glob("eventmem-1.0.0-*.whl"))
+wheel = next(Path("dist").glob("kin_mind-0.1.0-*.whl"))
 with ZipFile(wheel) as archive:
     names = archive.namelist()
     for required in [
         "eventmem/web/index.html",
         "eventmem/core/engine.py",
+        "kin_mind/state.py",
+        "kin_mind/profile.py",
         "eventmem/sdk/__init__.pyi",
         "eventmem/sdk/py.typed",
     ]:

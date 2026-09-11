@@ -1,4 +1,4 @@
-name: MemoryPalace checks
+name: Kin Mind checks
 on:
   push:
     branches: [main]
@@ -25,6 +25,7 @@ jobs:
           node-version: 22
       - run: npm ci --prefix sdk/typescript && npm run build --prefix sdk/typescript
       - run: uv run pytest -q
+      - run: node --test adapters/owner-host.test.mjs
       - run: uv run python scripts/generate_contract.py && npm run generate --prefix sdk/typescript
       - run: git diff --exit-code -- contracts src/eventmem/sdk sdk/typescript/src
       - run: uv run eventmem evaluate --output replay.json

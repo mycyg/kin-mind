@@ -3,9 +3,9 @@ requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [project]
-name = "eventmem"
-version = "1.0.0"
-description = "MemoryPalace: provenance-aware memory for tools, companionship and knowledge"
+name = "kin-mind"
+version = "0.1.0"
+description = "Kin Mind: source-backed memory, affect, desires and personality"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",
@@ -25,13 +25,14 @@ local-embedding = ["sentence-transformers>=3,<6", "transformers>=4.51,<6"]
 vector = ["lancedb>=0.25,<1", "numpy>=2", "pyarrow>=18"]
 graph = ["igraph>=0.11,<2"]
 media = ["docling>=2.50,<3", "imageio-ffmpeg>=0.6", "pillow>=11"]
-all = ["eventmem[vector,graph,media]"]
+all = ["kin-mind[vector,graph,media]"]
 
 [project.scripts]
 eventmem = "eventmem.cli:main"
+kin-mind = "kin_mind.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/eventmem"]
+packages = ["src/eventmem", "src/kin_mind"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
