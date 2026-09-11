@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import selectors
 import signal
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from pydantic import Field, field_validator
 
@@ -27,6 +29,13 @@ class Citation(Model):
     @field_validator("url")
     @classmethod
     def source_url(cls, value):
+        if value.startswith("file://"):
+            parsed = urlparse(value)
+            if parsed.netloc not in {"", "localhost"}:
+                raise ValueError(
+                    "A local citation must not point to a remote file host"
+                )
+            value = unquote(parsed.path)
         if not value.startswith(("https://", "http://", "/")):
             raise ValueError("Use an actual URL or an authorized local document path")
         return value
@@ -53,9 +62,16 @@ def final_result(line):
             )
         if not isinstance(content, str):
             return None
-        if content.strip().startswith("```"):
-            content = "\n".join(content.strip().splitlines()[1:-1])
-        return Findings.model_validate(json.loads(content))
+        fenced = re.findall(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
+        candidates = fenced or [content[content.find("{") :]]
+        valid = []
+        for candidate in candidates:
+            try:
+                value, _ = json.JSONDecoder().raw_decode(candidate.strip())
+                valid.append(Findings.model_validate(value))
+            except (ValueError, TypeError):
+                continue
+        return valid[0] if len(valid) == 1 else None
     except (ValueError, TypeError, AttributeError):
         return None
 

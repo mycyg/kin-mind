@@ -143,3 +143,30 @@ def test_exploration_result_is_persisted_once_and_readable(tmp_path):
         runner=lambda *a, **k: pytest.fail("Duplicate exploration"),
     )
     assert again["state"] == "waiting"
+
+
+def test_native_kimi_file_uri_citation():
+    from kin_mind.exploration import Citation
+
+    assert (
+        Citation(url="file:///tmp/a%20b.py", title="Synthetic code").url
+        == "/tmp/a b.py"
+    )
+    with pytest.raises(ValueError):
+        Citation(url="file://remote-host/private", title="Not local")
+
+
+def test_final_json_may_follow_brief_delivery_prose():
+    payload = {
+        "summary": "Synthetic final finding",
+        "findings": [],
+        "sources": [{"url": "file:///tmp/source.py", "title": "Synthetic source"}],
+        "open_questions": [],
+        "suggested_share": None,
+    }
+    text = "Research is complete.\n\n```json\n" + json.dumps(payload) + "\n```"
+    result = final_result(json.dumps({"role": "assistant", "content": text}))
+    assert (
+        result.summary == "Synthetic final finding"
+        and result.sources[0].url == "/tmp/source.py"
+    )
