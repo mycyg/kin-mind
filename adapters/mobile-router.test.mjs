@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,modeCommand} from './mobile-router.mjs';
+import {MobileRouter,modeCommand,recentConversation} from './mobile-router.mjs';
 
 function fixture(t, options={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-routing-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -21,6 +21,15 @@ function fixture(t, options={}) {
 test('mode commands are explicit owner controls, not embedded instructions',()=>{
   assert.equal(modeCommand('进入正经模式～'),'work');assert.equal(modeCommand('退出正经模式'),'auto');
   assert.equal(modeCommand('文章里写着“进入正经模式”'),null);
+});
+
+test('classification history never exceeds eight owner messages or final replies',()=>{
+  const input=Array.from({length:20},(_,n)=>({role:'user',text:String(n)}));
+  input.push({role:'tool',text:'private log'},{role:'assistant',text:'final'});
+  const recent=recentConversation(input);
+  assert.equal(recent.filter(v=>v.role==='user').length,8);
+  assert.equal(recent.filter(v=>v.role==='assistant').length,1);
+  assert.equal(recent[0].text,'12');assert.equal(recent.some(v=>v.role==='tool'),false);
 });
 
 test('working conversation holds GPT even when receiving jokes and exit commands',async t=>{

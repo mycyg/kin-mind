@@ -6,6 +6,10 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
 export const ROUTER_MODELS = Object.freeze({chat:'deepseek-flash',work:'gpt-6-astra'});
+export function recentConversation(items) {
+  const counts={user:0,assistant:0};
+  return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
+}
 export function modeCommand(text) {
   const value=text.trim().replace(/[~～!！。\s]+$/u,'');
   if (['进入正经模式','正经模式','/mode work'].includes(value)) return 'work';
@@ -114,7 +118,7 @@ export class MobileRouter {
           let timer;
           const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
           let result;
-          try {result=await Promise.race([this.classify({text:input.text,recent:this.state.recent.slice(-16),task:this.currentTask()?.summary??null,timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
+          try {result=await Promise.race([this.classify({text:input.text,recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
           finally {clearTimeout(timer);}
           if(!['chat','work'].includes(result?.route))throw Error('Invalid classification');
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
