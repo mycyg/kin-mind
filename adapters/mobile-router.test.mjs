@@ -69,6 +69,19 @@ test('unconfirmed delivery and unknown runtime hold the provider after restart',
   f.runtime.known=false;await restored.reconcile();assert.equal(restored.tasks().length,1);
 });
 
+test('desktop handoff and its pending result keep work locked after the native turn ends',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'finish',mode:'auto',reason:'desktop result pending',completedTaskId:f.router.currentTask().id});
+  await f.router.observe('prompt-end',{stopReason:'end_turn'});
+  await f.router.observe('delivery',{id:'ack',state:'accepted',messageId:'ack-id'});
+  f.runtime.handoffTasks=1;
+  const restored=new MobileRouter(f.args);await restored.reconcile();
+  assert.equal(restored.tasks().length,1);await restored.applyPendingMode();
+  assert.equal(f.switched.length,0);
+  f.runtime.handoffTasks=0;await restored.reconcile();
+  assert.equal(restored.tasks().length,0);
+});
+
 test('duplicate input never resubmits or reclassifies; uncertain submission is held',async t=>{
   const f=fixture(t);let count=0;const input={id:'one',text:'hello'};
   await f.router.dispatch(input,async()=>{count++;return'new-turn';});

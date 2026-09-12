@@ -55,7 +55,7 @@ export class MobileRouter {
   busy(runtime) {
     return !runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
       runtime.nativeSessionId!==this.sessionId || runtime.nativeStatus!=='idle' || runtime.active ||
-      runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0;
+      runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0 || runtime.handoffTasks>0;
   }
   verified(runtime,model) {
     return runtime.known&&runtime.profileReady!==false&&runtime.model===model&&
