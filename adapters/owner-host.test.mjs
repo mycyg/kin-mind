@@ -12,3 +12,5 @@ test('new message invalidates a draft',async()=>{let f;f=fixture({draft:async()=
 test('missing message ID is unconfirmed',async()=>{const{loop,events}=fixture({send:async()=>({state:'accepted'})});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');});
 test('timeout never invents another send ID',async()=>{const{loop,events}=fixture({send:async()=>{throw Error('timeout');}});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');assert.equal(events.filter(x=>x[0]==='claim').length,1);});
 test('concurrent ticks share one draft',async()=>{let release;const gate=new Promise(r=>release=r);const{loop,events}=fixture({draft:async()=>{await gate;return'hello';}});const one=loop.tick();await new Promise(r=>setImmediate(r));await loop.tick();release();await one;assert.equal(events.filter(x=>x[0]==='claim').length,1);});
+
+test('empty draft defers without sending',async()=>{const{loop,events}=fixture({draft:async()=>null,send:async()=>assert.fail('must not send')});await loop.tick();assert.equal(events.at(-1)[1].reason,'draft-empty');});

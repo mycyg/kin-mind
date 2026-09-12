@@ -386,3 +386,92 @@ def test_personality_prospective_limits_history_and_reversion(setup):
     assert mind.read()["dimensions"]["curiosity"]["baseline"] == 75
     assert not mind.read()["traits"]
     assert len(mind.read(history=10)["history"]) == 3
+
+
+def test_authorized_time_growth_and_open_discovery(setup, tmp_path):
+    from kin_mind.exploration import Explorations
+    mind, source, clock = setup
+    mind.configure_autonomy({
+        "command_id": "autonomy", "agent_version": "synthetic-v2",
+        "expected_revision": mind.read()["revision"],
+        "evidence_ids": [source("allow-new-topics")], "reason": "User requested discovery and time growth",
+    })
+    wish(mind, source, strength=58)
+    mind.record(event(mind, source, "reset-like", {"initiative": 20}))
+    initial = mind.read()
+    clock[0] += timedelta(hours=6)
+    projected = mind.read()
+    assert projected["dimensions"]["initiative"]["value"] >= 75
+    assert projected["dimensions"]["grievance"]["value"] == initial["dimensions"]["grievance"]["value"]
+    assert projected["contact"] == initial["contact"]
+    assert Mind(mind.engine, mind.scope, clock=mind.clock).read()["dimensions"]["initiative"] == projected["dimensions"]["initiative"]
+
+    def runner(executable, brief, directory, **kwargs):
+        assert brief["topic"] == "Kin 选定的探索题目" and brief["source_ids"]
+        assert kwargs["budget_seconds"] == 1200
+        return {"state": "complete", "partial": False, "result": {
+            "summary": "A synthetic discovery", "findings": ["Synthetic"],
+            "sources": [{"url": "https://example.com", "title": "Fixture"}],
+            "open_questions": [], "suggested_share": "A discovery",
+        }}
+    explorer = Explorations(mind)
+    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["reason"] == "kin-topic-selection-required"
+    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner, brief="Kin chooses a synthetic question")["state"] == "complete"
+    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["state"] == "waiting"
+
+
+def test_autonomy_requires_explicit_evidence(setup):
+    mind, source, _ = setup
+    with pytest.raises(Conflict):
+        mind.configure_autonomy({
+            "command_id": "bad-policy", "agent_version": "synthetic-v2",
+            "expected_revision": mind.read()["revision"],
+            "evidence_ids": [source("inferred", authority="model")], "reason": "Not user permission",
+        })
+
+
+def test_minute_review_queues_authorized_exploration_once(setup, tmp_path, monkeypatch):
+    from kin_mind import host
+    mind, source, _ = setup
+    mind.configure_autonomy({
+        "command_id": "autonomy", "agent_version": "synthetic-v2",
+        "expected_revision": mind.read()["revision"],
+        "evidence_ids": [source("open")], "reason": "User authorization",
+    })
+    monkeypatch.setattr(host, "Engine", lambda root: mind.engine)
+    monkeypatch.setattr(host, "Mind", lambda engine, scope: mind)
+    monkeypatch.setattr(host.DeepSeek, "from_engine", lambda engine: None)
+    monkeypatch.setattr(host.Appraisals, "run_one", lambda self, provider: {"state": "idle"})
+    config = {"root": str(tmp_path), "scope": mind.scope.model_dump(),
+              "exploration_stop_file": str(tmp_path / "stop")}
+    assert host.dispatch(config, "review", {})["state"] == "idle"
+    wake = tmp_path / "mind-exploration-request.json"
+    before = wake.stat().st_mtime_ns
+    host.dispatch(config, "review", {})
+    assert wake.stat().st_mtime_ns == before
+    assert json.loads(wake.read_text())["kind"] == "internal-exploration-wakeup"
+
+
+def test_empty_draft_waits_and_survives_restart(setup):
+    mind, source, clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-empty", {"initiative": 90}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    before = mind.read()["dimensions"]["mood"]["value"]
+    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-empty")
+    restarted = Mind(mind.engine, mind.scope, clock=mind.clock)
+    assert not restarted.contact_candidate()["eligible"]
+    assert restarted.read()["desires"][0]["status"] == "waiting"
+    assert restarted.read()["dimensions"]["mood"]["value"] == before
+
+
+def test_empty_draft_does_not_override_changed_wish(setup):
+    mind, source, clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-changed", {"initiative": 90}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.manage_desire(DesireChange(command_id="change-wish", agent_version="synthetic-v1",
+        expected_revision=mind.read()["revision"], evidence_ids=[source("change-wish")],
+        action="update", desire_id=attempt["desire_id"], content="A different finding", reason="New source"))
+    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-empty")
+    assert mind.read()["desires"][0]["status"] == "wanted"

@@ -338,6 +338,31 @@ class Mind:
                 conn, self._key(payload["command_id"]), payload, run
             )
 
+    def configure_autonomy(self, request):
+        """Explicit user policy; never an inferred emotion or personality update."""
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Autonomy policy requires explicit user evidence")
+            self._retarget(conn, state, self.clock())
+            state["autonomy"] = {
+                "initiative_target": 85,
+                "open_exploration": True,
+                "topic_selected_by": "Kin",
+                "evidence": refs,
+                "configured_at": self.clock(),
+                "event_id": event_id,
+                "reason": request["reason"],
+            }
+            state["profile_version"] = digest([state["profile"], state["autonomy"]])[:16]
+            self._retarget(conn, state, self.clock())
+            return {"autonomy": state["autonomy"]}
+        return self._mutate(request, "autonomy-policy", apply)
+
+    def _autonomy(self, conn, state):
+        policy = state.get("autonomy", {})
+        return policy if policy and self._fresh(conn, policy["evidence"]) else {}
+
     def _desire_ready(self, conn, desire, at):
         return (
             desire["kind"] == "contact"
@@ -371,7 +396,7 @@ class Mind:
                 [
                     entry["baseline"],
                     *[
-                        d["strength"]
+                        max(d["strength"], self._autonomy(conn, state).get("initiative_target", 0))
                         for d in wishes
                         if timestamp(d["expires_at"]) > timestamp(cursor)
                     ],
@@ -390,7 +415,7 @@ class Mind:
             [
                 state["profile"]["dimensions"]["initiative"]["baseline"],
                 *[
-                    d["strength"]
+                    max(d["strength"], self._autonomy(conn, state).get("initiative_target", 0))
                     for d in state["desires"].values()
                     if self._desire_ready(conn, d, at)
                 ],
@@ -726,6 +751,7 @@ class Mind:
             "traits": traits,
             "contact": state["profile"]["contact"],
             "exploration": state["profile"]["exploration"],
+            "autonomy": self._autonomy(conn, state),
             "last_evolution_day": state["last_evolution_day"],
         }
 
@@ -900,6 +926,22 @@ class Mind:
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
+            if state == "canceled" and reason == "draft-empty":
+                current = self._load(conn)
+                desire = current["desires"].get(attempt["desire_id"])
+                # An empty draft is a decision to wait, not a failed send. Do not
+                # overwrite a wish that changed while the model was drafting.
+                if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
+                    self._retarget(conn, current, self.clock())
+                    eid = "mind_" + digest([attempt_id, "draft-empty"])[:32]
+                    desire.update(status="waiting", revision=desire["revision"] + 1,
+                                  updated_at=self.clock(), event_id=eid,
+                                  reason="Kin returned an empty draft; wait for a sourced reconsideration")
+                    self._retarget(conn, current, self.clock())
+                    current["revision"] += 1
+                    current["updated_at"] = self.clock()
+                    self._save(conn, current)
+                    self._history(conn, eid, current, "contact-deferred", attempt)
             if state == "accepted":
                 current = self._load(conn)
                 desire = current["desires"][attempt["desire_id"]]

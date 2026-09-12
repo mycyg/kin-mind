@@ -40,6 +40,9 @@ export class MindLoop {
       attempt=await this.call('claim',{owner_epoch:epoch});
       if(attempt.state!=='drafting')return attempt;
       const content=await this.draft(attempt);
+      if(!this.closed&&!content?.trim()&&epoch===this.ownerEpoch()) {
+        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-empty'});
+      }
       const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch()});
       if(this.closed||!content?.trim()||!valid.eligible||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});

@@ -247,6 +247,8 @@ class Explorations:
         canceled=lambda: False,
         model=None,
         runner=run_kimi,
+        brief=None,
+        budget_seconds=1200,
     ):
         view = self.mind.read()
         latest = self.recent(1)
@@ -268,13 +270,28 @@ class Explorations:
             and not d["expired"]
             and not d["needs_review"]
         ]
-        if not choices:
+        policy = view.get("autonomy", {})
+        if policy.get("open_exploration"):
+            if not isinstance(brief, str) or not brief.strip() or len(brief) > 3000:
+                return {"state": "waiting", "reason": "kin-topic-selection-required"}
+            desire = {
+                "id": "kin-selected",
+                "topic": "Kin 选定的探索题目",
+                "content": brief,
+                "evidence": policy.get("evidence", []),
+            }
+        elif choices:
+            desire = max(choices, key=lambda d: d["strength"])
+        else:
             return {"state": "quiet", "reason": "no-sourced-interest"}
-        desire = max(choices, key=lambda d: d["strength"])
+        budget_seconds = min(view["exploration"]["budget_seconds"], max(1, int(budget_seconds)))
         at = self.mind.clock()
         eid = "explore_" + digest([self.mind.scope.key(), at, desire["id"]])[:32]
         data = {
             "desire_id": desire["id"],
+            "selected_brief": brief if desire["id"] == "kin-selected" else None,
+            "topic_selected_by": "Kin" if desire["id"] == "kin-selected" else "existing-desire",
+
             "agent_version": agent_version,
             "evidence_ids": [r["record_id"] for r in desire["evidence"]],
         }
@@ -295,7 +312,7 @@ class Explorations:
                     "source_ids": data["evidence_ids"],
                 },
                 Path(directory) / eid,
-                budget_seconds=view["exploration"]["budget_seconds"],
+                budget_seconds=budget_seconds,
                 canceled=canceled,
                 model=model,
             )
@@ -324,17 +341,18 @@ class Explorations:
                 data["source_id"] = source["id"]
                 if output["state"] == "complete" and output["result"]["sources"]:
                     current = self.mind.read()
-                    self.mind.manage_desire(
-                        DesireChange(
-                            command_id=eid + ":complete",
-                            agent_version=agent_version,
-                            expected_revision=current["revision"],
-                            evidence_ids=[source["id"]],
-                            action="complete",
-                            desire_id=desire["id"],
-                            reason="Kimi returned a report with sources; conclusions remain reviewable",
+                    if desire["id"] != "kin-selected":
+                        self.mind.manage_desire(
+                            DesireChange(
+                                command_id=eid + ":complete",
+                                agent_version=agent_version,
+                                expected_revision=current["revision"],
+                                evidence_ids=[source["id"]],
+                                action="complete",
+                                desire_id=desire["id"],
+                                reason="Kimi returned a report with sources; conclusions remain reviewable",
+                            )
                         )
-                    )
                     Appraisals(self.mind).enqueue(
                         [source["id"]], agent_version, "exploration"
                     )
