@@ -30,7 +30,7 @@ export class MobileRouter {
   constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now()}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now});
     this.tail=Promise.resolve();this.inflight=new Map();
-    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:5000,auditIntervalHours:4}};
+    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
     if(this.state.schema!==1||this.state.sessionId!==sessionId)throw Error('Router session mismatch');
     this.state.configRevision??=0;
     // An interrupted acceptance/switch cannot safely be replayed after restart.

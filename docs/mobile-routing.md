@@ -41,18 +41,23 @@ background terminals remain active. An unsupported adapter version fails closed.
 
 The mobile process uses its own combined model catalogue. Global desktop model
 configuration and account credentials are not rewritten. GPT-6 retains the host's
-configured Fast setting. DeepSeek requests explicitly disable thinking.
+configured Fast setting. DeepSeek conversation, classification and health review
+use `max` thinking; private reasoning never enters the channel output.
 
 `deepseek-gateway.mjs` binds an authenticated loopback endpoint and forwards only
 DeepSeek Flash Responses requests to the official HTTPS endpoint. It excludes
 provider-specific reasoning payloads from cross-provider input and output while
 preserving user messages, assistant answers, function calls and tool results.
+Trusted developer instructions map to the provider's supported system role.
+The gateway adds a stable instruction to address the user without narrating
+response planning. This is a generation constraint: prose mislabeled by the
+provider as a final answer cannot be identified by a channel filter alone.
 This addresses reasoning content accepted by one provider but rejected by another;
 it does not rewrite an existing native transcript. Provider keys never appear in
 the loopback client token or diagnostic errors.
 
 Classification uses the current message, a bounded recent conversation and task
-summary. A five-second timeout or invalid result selects the work model before
+summary. A bounded timeout (15 seconds by default) or invalid result selects the work model before
 submission. Once native acceptance is uncertain, no model fallback may replay the
 message. Interrupted provider replacement requires reconciliation rather than a
 new conversation.

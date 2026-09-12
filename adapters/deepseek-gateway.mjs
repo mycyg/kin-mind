@@ -1,12 +1,20 @@
 import http from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 
-// Reasoning payloads belong to their provider. Keep user/assistant messages,
-// function calls and receipts unchanged in the native conversation history.
-export function deepseekRequest(body) {
+export const replyContract = 'Write only messages addressed to the user: the answer or a useful progress update. Do not narrate your interpretation of the user, response planning, private analysis, or internal tool-result commentary. Earlier assistant messages may contain that narration; do not imitate it. Keep tool calls separate from user-facing text. Runtime metadata is evidence to check, not a preface to repeat. Follow the conversation language and persona.';
+const privateChannels = new Set(['analysis', 'reasoning', 'summary']);
+export const isPrivateOutput = item => item?.type === 'reasoning' ||
+  privateChannels.has(item?.channel) || privateChannels.has(item?.phase);
+
+// DeepSeek treats developer messages as user input. Map trusted developer
+// instructions to its supported system role; leave user data and receipts alone.
+export function deepseekRequest(body, reasoningEffort = 'max') {
   if (body.model !== 'deepseek-flash' || !Array.isArray(body.input)) throw Error('unsupported-request');
-  const result = {...body, reasoning: {effort: 'none'}, store: false};
-  result.input = body.input.filter(item => item.type !== 'reasoning');
+  if (!['none','low','high','max'].includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
+  const result = {...body, reasoning: {effort: reasoningEffort}, store: false};
+  result.input = body.input.filter(item => !isPrivateOutput(item)).map(item =>
+    item.role === 'developer' ? {...item, role: 'system'} : item);
+  result.instructions = [body.instructions, replyContract].filter(Boolean).join('\n\n');
   delete result.service_tier;
   delete result.previous_response_id;
   delete result.conversation;
@@ -15,21 +23,27 @@ export function deepseekRequest(body) {
 
 export function responseNormalizer() {
   const indexes = new Map();
+  const suppressed = new Set(), suppressedIds = new Set();
   let next = 0;
   return event => {
     if (event.type?.startsWith('response.reasoning')) return null;
-    if (event.item?.type === 'reasoning') return null;
+    if (isPrivateOutput(event.item) || isPrivateOutput(event)) {
+      if (Number.isInteger(event.output_index)) suppressed.add(event.output_index);
+      if (event.item?.id) suppressedIds.add(event.item.id);
+      return null;
+    }
+    if (suppressed.has(event.output_index) || suppressedIds.has(event.item_id)) return null;
     const value = structuredClone(event);
     if (Number.isInteger(value.output_index)) {
       if (!indexes.has(value.output_index)) indexes.set(value.output_index, next++);
       value.output_index = indexes.get(value.output_index);
     }
-    if (value.response?.output) value.response.output = value.response.output.filter(item => item.type !== 'reasoning');
+    if (value.response?.output) value.response.output = value.response.output.filter(item => !isPrivateOutput(item));
     return value;
   };
 }
 
-export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 120000}) {
+export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 120000, reasoningEffort = 'max'}) {
   if (!key) throw Error('deepseek-key-unavailable');
   const token = randomBytes(32).toString('hex');
   const controllers = new Set();
@@ -51,7 +65,7 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         raw += chunk;
         if (Buffer.byteLength(raw) > 64 * 1024 * 1024) throw Error('request-too-large');
       }
-      const body = deepseekRequest(JSON.parse(raw));
+      const body = deepseekRequest(JSON.parse(raw), reasoningEffort);
       const upstream = await fetchImpl('https://api.deepseek.com/responses', {
         method: 'POST', redirect: 'error', signal: abort.signal,
         headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + key},
@@ -64,7 +78,7 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       const normalize = responseNormalizer();
       if (!(upstream.headers.get('content-type') ?? '').includes('text/event-stream')) {
         const value = await upstream.json();
-        value.output = (value.output ?? []).filter(item => item.type !== 'reasoning');
+        value.output = (value.output ?? []).filter(item => !isPrivateOutput(item));
         onUsage({model: value.model, usage: value.usage, requestId: value.id});
         res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(value)); return;
       }
@@ -99,7 +113,7 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
   });
   await new Promise((resolve, reject) => {server.once('error', reject);server.listen(0, '127.0.0.1', resolve);});
   return {
-    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, token,
+    baseUrl: `http://127.0.0.1:${server.address().port}/v1`, token, reasoningEffort,
     active: () => controllers.size,
     close: () => {for (const controller of controllers) controller.abort(); server.closeAllConnections(); return new Promise(resolve => server.close(resolve));},
   };
