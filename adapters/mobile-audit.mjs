@@ -37,6 +37,11 @@ export class MobileAudit {
   settle(id,state,receipt) {
     if(!this.state.repairs[id])throw Error('Unknown audit repair');
     if(!['accepted','unconfirmed','resolved','needs-attention'].includes(state))throw Error('Invalid repair state');
-    Object.assign(this.state.repairs[id],{state,receipt,updatedAt:this.now()});atomicJson(this.file,this.state);
+    Object.assign(this.state.repairs[id],{state,receipt,updatedAt:this.now()});
+    if(this.state.lastReview?.id===id&&['resolved','needs-attention'].includes(state)) {
+      this.state.status=state==='resolved'?'healthy':'needs_attention';
+      this.state.lastFollowup={id,state,at:this.now(),receipt};
+    }
+    atomicJson(this.file,this.state);
   }
 }
