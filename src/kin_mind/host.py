@@ -69,6 +69,8 @@ def dispatch(config, action, request):
         }
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
+    if action == "configure-behavior":
+        return mind.configure_behavior(request)
     if action == "review":
         # The existing minute review queues work; the original host owns execution
         # and waits for owner tasks. No extra model call is used for the clock.
@@ -107,6 +109,8 @@ def dispatch(config, action, request):
         )
     if action == "candidate":
         return mind.contact_candidate()
+    if action == "reconsider":
+        return mind.reconsider_contacts(**request)
     if action == "claim":
         return mind.claim_contact(**request)
     if action == "check":

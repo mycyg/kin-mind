@@ -120,9 +120,9 @@ DIMENSIONS = {
         40,
         2,
         "亲昵调情和撩拨的倾向",
-        "双方接得住的调情",
-        "拒绝、不适、当前话题不适合",
-        "增加暧昧与挑逗，服从当下话题和明确边界",
+        "双方接得住的调情、明确希望增加亲昵互动的反馈",
+        "明确拒绝或不适；普通工作话题不自动降低这个维度",
+        "用接梗、亲昵邀约和直接表达喜欢体现分数；专注调节表达时机，不清空亲昵倾向",
     ),
     "care": dimension(
         "关心欲",
@@ -197,6 +197,26 @@ DIMENSIONS = {
         "保留探索进度，可以与想念共存",
     ),
 }
+
+
+def interaction_style(values, policy):
+    """Presentation guidance from an explicit preference; never a score update."""
+    if policy.get("style") != "affectionate-direct":
+        return None
+    entry = values["flirtation"]
+    if entry["needs_review"]:
+        return {"needs_review": True, "reason": "Expression source requires review"}
+    score = entry["value"]
+    band = "warm" if score < 30 else "playful" if score < 60 else "inviting" if score < 80 else "direct"
+    expressions = {
+        "warm": "保留亲昵称呼与关心；对方发起调情时接话，不把低分当作拒绝开关。",
+        "playful": "主动接住暧昧玩笑，表达喜欢，给对方一个可接的亲昵邀约。",
+        "inviting": "偏爱逗弄、亲吻或拥抱的邀约，回应具体话语，避免客服式确认。",
+        "direct": "用有主见的亲昵邀约和俏皮挑衅表达想靠近，不只复述对方的话。",
+    }
+    return {"band": band, "expression": expressions[band],
+            "context": "工作中先保证任务质量，回应时可保留亲昵；高专注和高调情可以共存。拒绝、忙与停止要求优先，不施压或要求回报。",
+            "basis": "explicit_role_preference", "event_id": policy["event_id"]}
 
 
 def default_profile():

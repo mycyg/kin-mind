@@ -475,3 +475,126 @@ def test_empty_draft_does_not_override_changed_wish(setup):
         action="update", desire_id=attempt["desire_id"], content="A different finding", reason="New source"))
     mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-empty")
     assert mind.read()["desires"][0]["status"] == "wanted"
+
+
+def defer(mind, condition="time", **extra):
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    return mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-decision",
+        decision={"action": "wait", "condition": condition, "reason": "A temporary condition", **extra})
+
+
+def test_declared_time_wait_resumes_after_restart_without_scoring(setup):
+    mind, source, clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready", {"initiative": 90, "flirtation": 80, "focus": 85}))
+    defer(mind, retry_after_seconds=1800)
+    assert not mind.contact_candidate()["eligible"]
+    clock[0] += timedelta(minutes=29)
+    assert mind.reconsider_contacts(owner_epoch="owner-1")["state"] == "unchanged"
+    clock[0] += timedelta(minutes=1)
+    restarted = Mind(mind.engine, mind.scope, clock=mind.clock)
+    before = restarted.read()["dimensions"]
+    assert restarted.reconsider_contacts(owner_epoch="owner-1")["state"] == "resumed"
+    assert restarted.read()["dimensions"]["flirtation"] == before["flirtation"]
+    assert restarted.read()["dimensions"]["focus"] == before["focus"]
+    assert restarted.contact_candidate()["eligible"]
+    assert restarted.reconsider_contacts(owner_epoch="owner-1")["state"] == "unchanged"
+
+
+@pytest.mark.parametrize("block", ["expired", "corrected", "needs-evidence", "owner-reply"])
+def test_time_alone_does_not_release_other_waits(setup, block):
+    mind, source, clock = setup
+    sid = source("finding")
+    wish(mind, source, evidence_ids=[sid], expires_at=(clock[0]+timedelta(hours=1)).isoformat())
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    defer(mind, condition={"needs-evidence":"new_evidence", "owner-reply":"owner_reply"}.get(block,"time"))
+    clock[0] += timedelta(minutes=30)
+    if block == "expired": clock[0] += timedelta(hours=1)
+    if block == "corrected": source("finding", text="A correction", version="2")
+    assert mind.reconsider_contacts(owner_epoch="owner-1")["resumed"] == []
+    assert not mind.contact_candidate()["eligible"]
+
+
+def test_owner_reply_condition_requires_real_epoch_change(setup):
+    mind, source, _ = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    defer(mind, condition="owner_reply")
+    assert not mind.reconsider_contacts(owner_epoch="owner-1")["resumed"]
+    assert mind.reconsider_contacts(owner_epoch="owner-2")["resumed"]
+
+
+def test_bad_drafts_back_off_and_stop_after_three_attempts(setup):
+    mind, source, clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready", {"initiative": 95}))
+    for index in range(1, 4):
+        attempt = mind.claim_contact(owner_epoch="owner-1")
+        receipt = mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-failed")
+        assert receipt["decision"]["condition"] == ("time" if index < 3 else "new_evidence")
+        assert not mind.contact_candidate()["eligible"]
+        clock[0] += timedelta(seconds=300*index)
+        resumed = mind.reconsider_contacts(owner_epoch="owner-1")["resumed"]
+        assert bool(resumed) == (index < 3)
+    assert mind.read()["desires"][0]["contact_failures"] == 3
+
+
+def test_redundant_share_is_retired_without_claiming_delivery(setup):
+    mind, source, _ = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-decision",
+                        decision={"action":"abandon", "reason":"Already addressed in ordinary conversation"})
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "abandoned"
+    assert "delivery" not in desire
+    assert mind.read()["dimensions"]["initiative"]["value"] == 90
+
+
+def test_expression_policy_has_evidence_without_inflating_scores(setup):
+    mind, source, clock = setup
+    mind.record(event(mind, source, "mixed", {"flirtation": 85, "focus": 90}))
+    sid = source("style", "Prefer playful affectionate responses")
+    before = mind.read()["dimensions"]
+    result = mind.configure_behavior({"command_id":"style", "expected_revision":mind.read()["revision"],
+        "agent_version":"synthetic-v2", "evidence_ids":[sid], "reason":"Explicit preference",
+        "style":"affectionate-direct", "quiet_start_hour":0})
+    view = mind.read()
+    assert view["dimensions"] == before
+    assert view["interaction_style"]["band"] == "direct"
+    assert view["interaction_style"]["event_id"] == result["event_id"]
+    assert view["contact"]["quiet_start"] == 0
+    clock[0] += timedelta(seconds=1)
+    source("style", "Withdraw that preference", version="2")
+    assert mind.read()["interaction_style"]["needs_review"]
+
+
+def test_appraiser_retires_conversationally_addressed_contact(setup):
+    from kin_mind.appraisal import WishUpdate
+    mind, source, _ = setup
+    wish(mind, source)
+    did = mind.read()["desires"][0]["id"]
+    jobs = Appraisals(mind)
+    jobs.enqueue([source("already-discussed")], "synthetic-v1")
+    reviewer = FakeReviewer(Appraisal(reason="The question was addressed in dialogue",
+        wish_updates=[WishUpdate(desire_id=did, action="complete", reason="Already discussed")]))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "abandoned" and "delivery" not in desire
+
+
+def test_model_wait_ignores_maintenance_but_accepts_a_real_phone_source(setup):
+    mind, source, clock = setup
+    wish(mind, source)
+    did = mind.read()["desires"][0]["id"]
+    mind.manage_desire(DesireChange(command_id="wait-for-reply", expected_revision=mind.read()["revision"],
+        agent_version="synthetic-v1", evidence_ids=[source("user-is-busy")],
+        action="wait", desire_id=did, wait_condition="owner_reply", reason="Waiting for the owner's response"))
+    clock[0] += timedelta(minutes=5)
+    for channel in ["internal", "desktop", "feishu"]:
+        mind.engine.receive(SourceInput(namespace="test", key=channel, scope=mind.scope,
+            text="A synthetic event", authority="explicit", occurred_at=clock[0].isoformat(),
+            metadata={"host_event":"message", "role":"user", "channel":channel}))
+        result = mind.reconsider_contacts(owner_epoch="unchanged")
+        assert bool(result["resumed"]) == (channel == "feishu")

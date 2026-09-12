@@ -97,6 +97,28 @@ It performs these operations:
 6. On accepted delivery, complete that wish and reset initiative to 20. Track phone
    visibility separately. An internal wake does not count as a user reply.
 
+Drafts use the public `contact-draft.mjs` contract: send text, abandon an obsolete
+wish, or wait for a declared condition. Time waits include a bounded `retry_at`;
+owner-reply waits require authenticated owner activity; evidence waits require a
+new related source. The host calls `reconsider` before candidate selection. This
+deterministic operation survives restart and never creates evidence or scores.
+Expired or corrected sources cannot resume. Every attempted draft still passes
+the existing send-boundary checks after a condition becomes ready.
+
+Invalid JSON and generation errors are technical failures, distinct from a valid
+decision to wait. Failed drafts retry after five and ten minutes; the third failure
+waits for new evidence. An uncertain send remains held and is never converted into
+a retryable draft error. Contact status exposes the last check and blocking reason.
+Wishes already addressed in ordinary dialogue are retired without inventing a
+proactive delivery receipt.
+
+`configure-behavior` records an explicit expression preference and optional quiet
+start hour under a new configuration version. It does not change scores, baselines,
+or decay parameters. `interaction_style` turns a sourced affectionate preference
+and the current flirtation band into short response guidance. Focus controls timing
+and task quality without suppressing the independent flirtation state. Corrected
+preference sources mark that guidance for review.
+
 Owner activity, the contact state machine and the authenticated transport must be
 checked together. The library alone does not know recipient identity, quiet-hour
 preferences, phone read status, or whether a native session is still working. Do not

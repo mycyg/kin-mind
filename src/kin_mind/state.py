@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -18,7 +18,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
 
-from .profile import default_profile
+from .profile import DIMENSIONS, default_profile, interaction_style
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_state(
@@ -97,11 +97,15 @@ class DesireChange(Model):
     expires_at: str | None = None
     completion: str | None = Field(default=None, min_length=1, max_length=1000)
     reason: str = Field(min_length=1, max_length=1200)
+    wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
+    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
 
     _time = field_validator("expires_at")(lambda v: utc(v) if v else v)
 
     @model_validator(mode="after")
     def shape(self):
+        if self.wait_condition is not None and self.action != "wait":
+            raise ValueError("Only waiting desires have a resume condition")
         if self.action == "create":
             if self.desire_id or any(
                 getattr(self, k) is None
@@ -120,6 +124,13 @@ class DesireChange(Model):
         elif not self.desire_id:
             raise ValueError("A desire ID is required")
         return self
+
+
+class ContactDecision(Model):
+    action: Literal["wait", "abandon"]
+    reason: str = Field(min_length=1, max_length=1200)
+    condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
+    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
 
 
 def timestamp(value):
@@ -363,6 +374,29 @@ class Mind:
         policy = state.get("autonomy", {})
         return policy if policy and self._fresh(conn, policy["evidence"]) else {}
 
+    def configure_behavior(self, request):
+        """Install sourced expression/contact policy without changing any score."""
+        if request.get("style") not in {"affectionate-direct", "contextual"}:
+            raise ValueError("Unknown interaction style")
+        start = request.get("quiet_start_hour")
+        if start is not None and (type(start) is not int or not 0 <= start <= 23):
+            raise ValueError("Invalid quiet-hour start")
+
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Behavior policy requires explicit user evidence")
+            state["behavior"] = {"style": request["style"], "evidence": refs,
+                                 "event_id": event_id, "reason": request["reason"]}
+            for key in ("definition", "increase", "decrease", "expression"):
+                state["profile"]["dimensions"]["flirtation"][key] = DIMENSIONS["flirtation"][key]
+            if start is not None:
+                state["profile"]["contact"]["quiet_start"] = start
+            state["profile_version"] = digest([state["profile"], state.get("autonomy"), state["behavior"]])[:16]
+            return {"behavior": state["behavior"]}
+
+        return self._mutate(request, "behavior-policy", apply)
+
     def _desire_ready(self, conn, desire, at):
         return (
             desire["kind"] == "contact"
@@ -521,6 +555,13 @@ class Mind:
             }
             if request.action in transitions:
                 desire["status"] = transitions[request.action]
+            desire.pop("contact_wait", None)
+            desire.pop("contact_failures", None)
+            if request.action == "wait":
+                desire["contact_wait"] = self._wait_details(
+                    ContactDecision(action="wait", reason=request.reason,
+                                    condition=request.wait_condition or "new_evidence",
+                                    retry_after_seconds=request.retry_after_seconds), at)
             if request.action == "update":
                 for k in ("content", "topic", "strength", "expires_at", "completion"):
                     if getattr(request, k) is not None:
@@ -762,6 +803,12 @@ class Mind:
             result = self._view(
                 conn, self._load(conn), utc(as_of) if as_of else self.clock()
             )
+            state = self._load(conn)
+            behavior = state.get("behavior", {})
+            if behavior and self._fresh(conn, behavior["evidence"]):
+                result["interaction_style"] = interaction_style(result["dimensions"], behavior)
+            elif behavior:
+                result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
             if history:
                 result["history"] = [
                     dict(
@@ -778,10 +825,62 @@ class Mind:
                 ]
             return result
 
+    @staticmethod
+    def _wait_details(decision, at, owner_epoch=None):
+        return {"condition": decision.condition, "reason": decision.reason,
+                "retry_at": (timestamp(at) + timedelta(seconds=decision.retry_after_seconds)).isoformat()
+                    if decision.condition == "time" else None,
+                "owner_epoch": owner_epoch, "since": at}
+
+    def reconsider_contacts(self, *, owner_epoch):
+        """Resume only declared conditions. No model, new evidence, or owner activity is invented."""
+        with self.engine.db.connect(write=True) as conn:
+            state, at = self._load(conn), self.clock()
+            due = []
+            for desire in state["desires"].values():
+                wait = desire.get("contact_wait", {})
+                if (desire["kind"] != "contact" or desire["status"] != "waiting"
+                        or timestamp(desire["expires_at"]) <= timestamp(at)
+                        or not self._fresh(conn, desire["evidence"])):
+                    continue
+                replied = False
+                if wait.get("condition") == "owner_reply":
+                    if wait.get("owner_epoch"):
+                        replied = bool(owner_epoch and owner_epoch != wait["owner_epoch"])
+                    else:
+                        replied = bool(conn.execute(
+                            "SELECT 1 FROM sources WHERE scope=? AND deleted=0 AND occurred_at>? "
+                            "AND json_extract(data,'$.authority')='explicit' "
+                            "AND json_extract(data,'$.metadata.role')='user' "
+                            "AND json_extract(data,'$.metadata.host_event')='message' "
+                            "AND json_extract(data,'$.metadata.channel') IN ('wechat','feishu') LIMIT 1",
+                            (self.scope.key(), wait.get("since", at)),
+                        ).fetchone())
+                if (wait.get("condition") == "time" and wait.get("retry_at") and timestamp(wait["retry_at"]) <= timestamp(at)) or replied:
+                    due.append(desire)
+            if not due:
+                return {"state": "unchanged", "resumed": []}
+            self._retarget(conn, state, at)
+            eid = "mind_" + digest([self.scope.key(), "contact-resumed", [(d["id"], d["revision"]) for d in due]])[:32]
+            for desire in due:
+                wait = desire.pop("contact_wait")
+                desire.update(status="wanted", revision=desire["revision"] + 1,
+                              updated_at=at, event_id=eid,
+                              reason="Declared contact condition became ready: " + wait["condition"])
+            self._retarget(conn, state, at)
+            state.update(revision=state["revision"] + 1, updated_at=at)
+            self._save(conn, state)
+            result = {"state": "resumed", "resumed": [d["id"] for d in due]}
+            self._history(conn, eid, state, "contact-resumed", result)
+            return result
+
     def contact_candidate(self):
         with self.engine.db.connect() as conn:
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
+            waiting = [{"id": d["id"], "expired": d["expired"], "needs_review": d["needs_review"],
+                        **d.get("contact_wait", {"condition": "new_evidence", "reason": d.get("reason", "")})}
+                       for d in view["desires"] if d["kind"] == "contact" and d["status"] == "waiting"]
             active = conn.execute(
                 "SELECT id,state FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending','unconfirmed')",
                 (self.scope.key(),),
@@ -796,12 +895,12 @@ class Mind:
             if view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
             if view["dimensions"]["initiative"]["value"] < view["contact"]["threshold"]:
-                return {"eligible": False, "reason": "below-threshold"}
+                return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock())
             ]
             if not ready:
-                return {"eligible": False, "reason": "no-actionable-desire"}
+                return {"eligible": False, "reason": "no-actionable-desire", "waiting_desires": waiting}
             desire = min(
                 ready, key=lambda d: (-d["strength"], d["created_at"], d["id"])
             )
@@ -900,7 +999,10 @@ class Mind:
             raise Missing("Contact attempt is outside this scope or missing")
         return json.loads(row[0])
 
-    def settle_contact(self, *, attempt_id, state, message_id=None, reason=""):
+    def settle_contact(self, *, attempt_id, state, message_id=None, reason="", decision=None):
+        decision = ContactDecision.model_validate(decision) if decision is not None else None
+        if decision and state != "canceled":
+            raise ValueError("Wish decisions apply only before sending")
         if state not in {"pending", "accepted", "unconfirmed", "canceled"}:
             raise ValueError("Unknown contact delivery state")
         if state == "accepted" and not (
@@ -926,17 +1028,30 @@ class Mind:
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and reason == "draft-empty":
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed"}):
                 current = self._load(conn)
                 desire = current["desires"].get(attempt["desire_id"])
                 # An empty draft is a decision to wait, not a failed send. Do not
                 # overwrite a wish that changed while the model was drafting.
                 if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
                     self._retarget(conn, current, self.clock())
-                    eid = "mind_" + digest([attempt_id, "draft-empty"])[:32]
-                    desire.update(status="waiting", revision=desire["revision"] + 1,
+                    eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
+                    if reason == "draft-failed":
+                        failures = desire.get("contact_failures", 0) + 1
+                        desire["contact_failures"] = failures
+                        decision = ContactDecision(action="wait", reason="Draft generation or parsing failed",
+                            condition="time" if failures < 3 else "new_evidence",
+                            retry_after_seconds=300 * failures)
+                    decision = decision or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
+                    desire.update(status="abandoned" if decision.action == "abandon" else "waiting", revision=desire["revision"] + 1,
                                   updated_at=self.clock(), event_id=eid,
-                                  reason="Kin returned an empty draft; wait for a sourced reconsideration")
+                                  reason=decision.reason)
+                    if decision.action == "wait":
+                        desire["contact_wait"] = self._wait_details(decision, self.clock(), attempt["owner_epoch"])
+                    else:
+                        desire.pop("contact_wait", None)
+                    attempt["decision"] = decision.model_dump()
+                    conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(attempt), attempt_id))
                     self._retarget(conn, current, self.clock())
                     current["revision"] += 1
                     current["updated_at"] = self.clock()

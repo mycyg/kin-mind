@@ -25,6 +25,8 @@ def main():
             "claim",
             "check",
             "settle",
+            "reconsider",
+            "configure-behavior",
         ],
     )
     args = parser.parse_args()
@@ -44,6 +46,10 @@ def main():
         result = mind.claim_contact(**request)
     elif args.action == "check":
         result = mind.check_contact(**request)
+    elif args.action == "reconsider":
+        result = mind.reconsider_contacts(**request)
+    elif args.action == "configure-behavior":
+        result = mind.configure_behavior(request)
     else:
         result = mind.settle_contact(**request)
     print(json.dumps(result, ensure_ascii=False))
