@@ -20,6 +20,13 @@ const SESSION = 'sess-abc'
 
 let project: string
 let injected: string[]
+const runtimes: EventmemRuntime[] = []
+
+function makeRuntime(...args: ConstructorParameters<typeof EventmemRuntime>): EventmemRuntime {
+  const runtime = new EventmemRuntime(...args)
+  runtimes.push(runtime)
+  return runtime
+}
 
 function config(overrides: Partial<Config> = {}): Config {
   return Config({ ...overrides })
@@ -72,13 +79,15 @@ beforeEach(() => {
   clearEventCache()
 })
 
-afterEach(() => {
-  rmSync(project, { recursive: true, force: true, maxRetries: 3 })
+afterEach(async () => {
+  // 断言只读注入内容时仍有日志排队；落盘完成后才删除测试目录。
+  await Promise.all(runtimes.splice(0).map(runtime => runtime.flushAll()))
+  rmSync(project, { recursive: true, force: true })
 })
 
 describe('工具名映射', () => {
   it('默认表把 read/edit/write 归为 file，bash 归为 error，todo_write 交给 session/event', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改了 foo' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
 
@@ -95,7 +104,7 @@ describe('工具名映射', () => {
   })
 
   it('未在映射表里的工具名不参与浮现也不进 feed', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
     runtime.toolResult(observation({ toolName: 'grep' }), inject)
     await runtime.flush(SESSION)
@@ -104,7 +113,7 @@ describe('工具名映射', () => {
   })
 
   it('映射表可配置：把 str_replace_editor 的路径字段换成 path', async () => {
-    const runtime = new EventmemRuntime(config({
+    const runtime = makeRuntime(config({
       toolRoles: { my_editor: 'file' },
       toolNameMap: { my_editor: 'Edit' },
       filePathKeys: ['target'],
@@ -122,7 +131,7 @@ describe('工具名映射', () => {
 
 describe('浮现预算与去重', () => {
   it('单次注入不超过 K 行', () => {
-    const runtime = new EventmemRuntime(config({ surfaceK: 2 }))
+    const runtime = makeRuntime(config({ surfaceK: 2 }))
     const ids = ['2026-08-01_090000', '2026-08-02_090000', '2026-08-03_090000']
     for (const id of ids) writeEvent(project, { id, status: 'done', intent: id, outcome: id })
     writeAnchors(project, { 'file:src/foo.py': ids })
@@ -132,7 +141,7 @@ describe('浮现预算与去重', () => {
   })
 
   it('同会话同事件不重复浮现，seen 落盘且格式与 Python 一致', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: 'a' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
 
@@ -145,7 +154,7 @@ describe('浮现预算与去重', () => {
 
   it('已存在的 seen 文件在建状态时被读入', () => {
     writeFileSync(join(project, '.memory', 'log', `seen-${SESSION}.txt`), '2026-08-01_090000\n', 'utf8')
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: 'a' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
     runtime.toolResult(observation(), inject)
@@ -153,7 +162,7 @@ describe('浮现预算与去重', () => {
   })
 
   it('多条 in_progress todo 各自命中时总注入量仍不越预算', () => {
-    const runtime = new EventmemRuntime(config({ surfaceK: 2 }))
+    const runtime = makeRuntime(config({ surfaceK: 2 }))
     const anchors: Record<string, string[]> = {}
     const ids = ['2026-08-01_090000', '2026-08-02_090000', '2026-08-03_090000', '2026-08-04_090000']
     for (const id of ids) writeEvent(project, { id, status: 'done', intent: id, outcome: id })
@@ -170,7 +179,7 @@ describe('浮现预算与去重', () => {
   })
 
   it('只有 in_progress 的 todo 触发浮现', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: 'a' })
     const anchors: Record<string, string[]> = {}
     for (const token of intentTokens('修复端口冲突')) anchors[anchorKey('intent', token)] = ['2026-08-01_090000']
@@ -185,7 +194,7 @@ describe('浮现预算与去重', () => {
 
 describe('bash 错误浮现', () => {
   it('exitCode 非零时用 stderr 做 error 线索', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改端口区间' })
     writeAnchors(project, { [anchorKey('error', 'ValueError: port busy')]: ['2026-08-01_090000'] })
 
@@ -202,7 +211,7 @@ describe('bash 错误浮现', () => {
   })
 
   it('exitCode 为 0 时不浮现', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改端口区间' })
     writeAnchors(project, { [anchorKey('error', 'ValueError: port busy')]: ['2026-08-01_090000'] })
 
@@ -219,7 +228,7 @@ describe('bash 错误浮现', () => {
   })
 
   it('isError 为真但结构化取值缺失时退回错误消息', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改端口区间' })
     writeAnchors(project, { [anchorKey('error', 'ValueError: port busy')]: ['2026-08-01_090000'] })
 
@@ -236,7 +245,7 @@ describe('bash 错误浮现', () => {
 
 describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
   it('文件类工具命中记 cue/cue_kind=file，chars 等于注入行长度，格式与 Python _log_surfaced 一致', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改了 foo' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
 
@@ -255,7 +264,7 @@ describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
   })
 
   it('bash 错误浮现记 cue_kind=error，cue 为规范化后的签名而非原始多行文本', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改端口区间' })
     writeAnchors(project, { [anchorKey('error', 'ValueError: port busy')]: ['2026-08-01_090000'] })
 
@@ -277,7 +286,7 @@ describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
   })
 
   it('多条 in_progress todo 各自命中时，每条命中记它自己那条 todo 的文本为 cue', async () => {
-    const runtime = new EventmemRuntime(config({ surfaceK: 2 }))
+    const runtime = makeRuntime(config({ surfaceK: 2 }))
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: 'a' })
     writeEvent(project, { id: '2026-08-02_090000', status: 'done', intent: 'B', outcome: 'b' })
     const anchors: Record<string, string[]> = {}
@@ -298,7 +307,7 @@ describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
   })
 
   it('只记被 K 截断后真正注入的命中，不记被砍掉的多余命中', async () => {
-    const runtime = new EventmemRuntime(config({ surfaceK: 1 }))
+    const runtime = makeRuntime(config({ surfaceK: 1 }))
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: 'a' })
     writeEvent(project, { id: '2026-08-02_090000', status: 'done', intent: 'B', outcome: 'b' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000', '2026-08-02_090000'] })
@@ -312,7 +321,7 @@ describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
     rmSync(join(project, '.memory', 'log'), { recursive: true, force: true })
     writeFileSync(join(project, '.memory', 'log'), '占位文件，不是目录', 'utf8')
 
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeEvent(project, { id: '2026-08-01_090000', status: 'done', intent: 'A', outcome: '改了 foo' })
     writeAnchors(project, { 'file:src/foo.py': ['2026-08-01_090000'] })
 
@@ -323,7 +332,7 @@ describe('浮现埋点 surfaced-<session>.jsonl（SPEC §3.13）', () => {
 
 describe('注入埋点 injected-<session>.jsonl（SPEC §3.13）', () => {
   it('非空工作集注入后记一行，source/chars 与 Python _log_injected 同格式', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     const text = '# Memory working set\n\n- 一条\n'
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), text, 'utf8')
     runtime.sessionStart(SESSION, project, inject)
@@ -336,7 +345,7 @@ describe('注入埋点 injected-<session>.jsonl（SPEC §3.13）', () => {
   })
 
   it('工作集缺失或全空白时不注入也不记埋点', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.sessionStart(SESSION, project, inject)
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), '   \n\n', 'utf8')
     runtime.sessionStart(SESSION, project, inject)
@@ -348,7 +357,7 @@ describe('注入埋点 injected-<session>.jsonl（SPEC §3.13）', () => {
     rmSync(join(project, '.memory', 'log'), { recursive: true, force: true })
     writeFileSync(join(project, '.memory', 'log'), '占位文件，不是目录', 'utf8')
 
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), '内容\n', 'utf8')
     expect(() => { runtime.sessionStart(SESSION, project, inject) }).not.toThrow()
     expect(injected).toEqual(['内容\n'])
@@ -357,7 +366,7 @@ describe('注入埋点 injected-<session>.jsonl（SPEC §3.13）', () => {
 
 describe('委托工具写入 feed（SPEC §3.17）', () => {
   it('默认名单命中 task 时以 Task 写入 tool_use/tool_result，不触发浮现注入', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.toolResult(observation({
       toolName: 'task',
       callId: 'task-1',
@@ -382,7 +391,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
   })
 
   it('大小写不敏感命中，且首字母大写化对齐 Python 侧的 Task/Agent 识别：Agent → Agent', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.toolResult(observation({ toolName: 'Agent', callId: 'a-1', args: {}, contentText: 'done' }), inject)
     await runtime.flush(SESSION)
     const lines = feedLines() as { message: { content: { name?: string }[] } }[]
@@ -390,7 +399,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
   })
 
   it('失败调用记 errorMessage 而不是折叠成 ok', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.toolResult(observation({
       toolName: 'task',
       callId: 'task-err',
@@ -405,7 +414,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
   })
 
   it('arguments 的字符串字段与 result 文本超限时各自截断到 2000 字符', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     const long = 'x'.repeat(3000)
     runtime.toolResult(observation({
       toolName: 'task',
@@ -428,7 +437,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
   })
 
   it('可配置名单：只有命中自定义 delegationTools 的工具名才写入委托形态', async () => {
-    const runtime = new EventmemRuntime(config({ delegationTools: ['dispatch'] }))
+    const runtime = makeRuntime(config({ delegationTools: ['dispatch'] }))
     runtime.toolResult(observation({ toolName: 'task', callId: 't-1', args: {}, contentText: 'x' }), inject)
     runtime.toolResult(observation({ toolName: 'dispatch', callId: 'd-1', args: {}, contentText: 'y' }), inject)
     await runtime.flush(SESSION)
@@ -439,7 +448,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
   })
 
   it('writeFeed 关闭时委托调用也不写入', async () => {
-    const runtime = new EventmemRuntime(config({ writeFeed: false }))
+    const runtime = makeRuntime(config({ writeFeed: false }))
     runtime.toolResult(observation({ toolName: 'task', callId: 't-1', args: {}, contentText: 'x' }), inject)
     await runtime.flush(SESSION)
     expect(feedLines()).toEqual([])
@@ -448,7 +457,7 @@ describe('委托工具写入 feed（SPEC §3.17）', () => {
 
 describe('feed 落盘', () => {
   it('bash 结果带 toolUseResult 的结构化 stdout/stderr', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.toolResult(observation({
       toolName: 'bash',
       args: { command: "git commit -am 'fix: port conflict'" },
@@ -472,14 +481,14 @@ describe('feed 落盘', () => {
   })
 
   it('turn/step 边界写成自描述标记行', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.boundary(SESSION, project, 'turn/start', { turn: 1, seq: 7 })
     await runtime.flush(SESSION)
     expect(feedLines()).toEqual([{ type: 'dsh/turn/start', turn: 1, seq: 7 }])
   })
 
   it('writeFeed 关闭时不产生 feed 文件', async () => {
-    const runtime = new EventmemRuntime(config({ writeFeed: false }))
+    const runtime = makeRuntime(config({ writeFeed: false }))
     runtime.boundary(SESSION, project, 'turn/start', { turn: 1 })
     runtime.toolResult(observation(), inject)
     await runtime.flush(SESSION)
@@ -487,7 +496,7 @@ describe('feed 落盘', () => {
   })
 
   it('同一 feed 的并发写入串行且不交错', async () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     for (let i = 0; i < 50; i += 1) runtime.boundary(SESSION, project, 'step/end', { turn: 1, step: i })
     await runtime.flush(SESSION)
     const lines = feedLines() as { step: number }[]
@@ -498,14 +507,14 @@ describe('feed 落盘', () => {
 
 describe('工作集注入与自举', () => {
   it('非空工作集被原样注入', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), '# Memory working set\n\n- 一条\n', 'utf8')
     runtime.sessionStart(SESSION, project, inject)
     expect(injected).toEqual(['# Memory working set\n\n- 一条\n'])
   })
 
   it('工作集缺失或全空白时不注入', () => {
-    const runtime = new EventmemRuntime(config())
+    const runtime = makeRuntime(config())
     runtime.sessionStart(SESSION, project, inject)
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), '   \n\n', 'utf8')
     runtime.sessionStart(SESSION, project, inject)
@@ -515,14 +524,14 @@ describe('工作集注入与自举', () => {
   it('.memory/ 不存在时不注入，且自举命令用配置的解释器', () => {
     const bare = makeProject('eventmem-bare-')
     rmSync(join(bare, '.memory'), { recursive: true, force: true })
-    const runtime = new EventmemRuntime(config({ pythonExecutable: '/nonexistent/python' }))
+    const runtime = makeRuntime(config({ pythonExecutable: '/nonexistent/python' }))
     expect(() => { runtime.sessionStart(SESSION, bare, inject) }).not.toThrow()
     expect(injected).toEqual([])
     rmSync(bare, { recursive: true, force: true })
   })
 
   it('injectWorkingSet 关闭时不注入', () => {
-    const runtime = new EventmemRuntime(config({ injectWorkingSet: false }))
+    const runtime = makeRuntime(config({ injectWorkingSet: false }))
     writeFileSync(join(project, '.memory', 'index', 'working-set.md'), '内容\n', 'utf8')
     runtime.sessionStart(SESSION, project, inject)
     expect(injected).toEqual([])

@@ -17,6 +17,7 @@ import { clearAnchorCache } from '../src/recall.js'
 import { makeProject, readIfExists, writeAnchors, writeEvent } from './helpers.js'
 
 type Listener = (...args: never[]) => unknown
+const pendingDisposers: (() => Promise<void> | void)[] = []
 
 interface Harness {
   ctx: Context
@@ -37,7 +38,11 @@ function harness(): Harness {
     },
     effect(execute: () => unknown) {
       const produced = execute()
-      if (typeof produced === 'function') disposers.push(produced as () => Promise<void> | void)
+      if (typeof produced === 'function') {
+        const dispose = produced as () => Promise<void> | void
+        disposers.push(dispose)
+        pendingDisposers.push(dispose)
+      }
       return { [Symbol.asyncDispose]: async () => { /* noop */ } }
     },
     get() {
@@ -95,7 +100,9 @@ beforeEach(() => {
   clearEventCache()
 })
 
-afterEach(() => {
+afterEach(async () => {
+  // 插件卸载先排空异步日志，目录清理不能与 mkdir/appendFile 争抢。
+  await Promise.all(pendingDisposers.splice(0).map(dispose => dispose()))
   vi.useRealTimers()
   rmSync(project, { recursive: true, force: true })
   // 会话不可用时护栏日志退回当前目录（与 Python 侧 _guard_log 同口径），清掉这个副产物
