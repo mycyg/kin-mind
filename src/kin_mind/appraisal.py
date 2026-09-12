@@ -18,6 +18,7 @@ from pydantic import Field, StrictInt, ValidationError, field_validator
 
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model
+from eventmem.core.persona import load_persona, persona_prompt, persona_metadata
 
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, timestamp
@@ -101,14 +102,17 @@ class DeepSeek:
                 "SELECT data FROM settings WHERE key='models'"
             ).fetchone()
         cfg = json.loads(row[0])["summary"]
-        return cls(
+        provider = cls(
             cfg["endpoint"],
             cfg["model"],
             cfg.get("api_key_env", "EVENTMEM_API_KEY"),
             cfg.get("timeout_seconds", 60),
         )
+        provider.engine = engine
+        return provider
 
     def appraise(self, context):
+        policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
@@ -120,7 +124,7 @@ class DeepSeek:
                     json={
                         "model": self.model,
                         "max_tokens": 2800,
-                        "system": SYSTEM,
+                        "system": SYSTEM + persona_prompt(policy),
                         "messages": [{"role": "user", "content": dumps(context)}],
                         "tools": [
                             {
@@ -149,6 +153,7 @@ class DeepSeek:
                 "model": body.get("model", self.model),
                 "usage": body.get("usage", {}),
                 "request_id": body.get("id"),
+                "persona_contract": persona_metadata(policy),
             }
         except httpx.TimeoutException:
             raise RuntimeError("deepseek-timeout") from None

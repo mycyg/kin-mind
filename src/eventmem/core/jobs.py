@@ -311,7 +311,7 @@ class Worker:
             result = Providers(engine).json(
                 "extraction",
                 'Extract facts, preferences, relationships, commitments, procedures and episodes. Return {"candidates":[{"kind":"fact","content":"...","quote":"exact source excerpt","title":"...","attributes":{}}]}. Only include conclusions supported by an exact quote. Inferences remain unverified.',
-                {"source_id": sid, "text": text},
+                {"source_id": sid, "text": text, "scope": source["scope"]},
             )
             proposals = []
             for i, candidate in enumerate(result.get("candidates", [])[:100]):
@@ -371,7 +371,7 @@ class Worker:
             result = Providers(engine).json(
                 "conflict",
                 'Return {"relations":[{"id":"existing id","relation":"coexists|refutes|supports","reason":"..."}]}. Consider time, scope, version and independent evidence.',
-                {"candidate": data, "existing": hits["items"]},
+                {"candidate": data, "existing": hits["items"], "scope": data["scope"]},
             )
 
             def apply(conn):
@@ -442,7 +442,7 @@ class Worker:
             result = Providers(engine).json(
                 "summary" if kind != "prediction" else "prediction",
                 'Return {"content":"...","evidence_ids":[id,...]}. Write only supported observations, preserving uncertainty. Predictions must be explicitly tentative. Do not invent feelings or user commitments.',
-                {"kind": kind, "records": records},
+                {"kind": kind, "records": records, "scope": scope.model_dump()},
             )
             evidence = list(
                 dict.fromkeys(

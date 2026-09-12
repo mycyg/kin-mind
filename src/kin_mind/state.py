@@ -17,6 +17,7 @@ from pydantic import Field, FiniteFloat, StrictInt, field_validator, model_valid
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
+from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
 
 from .profile import DIMENSIONS, default_profile, interaction_style
 
@@ -605,6 +606,7 @@ class Mind:
         return {"desire_id": did, "desire_revision": desire["revision"]}
 
     def _evolve(self, conn, state, request, refs, event_id):
+        validate_trait_changes(load_persona(self.engine, self.scope), request.evolution.traits)
         if request.evolution.revert_event_id:
             return self._revert(conn, state, request, refs, event_id)
         spec = state["profile"]["evolution"]
@@ -762,6 +764,7 @@ class Mind:
                     reason=request.reason,
                     agent_version=request.agent_version,
                 )
+        validate_trait_changes(load_persona(self.engine, self.scope), previous["traits"])
         state["profile"], state["traits"] = previous["profile"], previous["traits"]
         state["profile_reviews"] = previous.get("profile_reviews", {})
         state["profile_version"] = digest(
@@ -839,6 +842,7 @@ class Mind:
             result = self._view(
                 conn, self._load(conn), utc(as_of) if as_of else self.clock()
             )
+            result["persona_contract"] = persona_metadata(load_persona(self.engine, self.scope))
             state = self._load(conn)
             behavior = state.get("behavior", {})
             if behavior and self._fresh(conn, behavior["evidence"]):

@@ -145,6 +145,10 @@ class Providers:
                 time.sleep(0.2 * (attempt + 1))
 
     def _json_once(self, role, instruction, payload, image=None):
+        from .persona import load_persona, persona_prompt
+
+        if role in {"extraction", "conflict", "summary", "prediction"}:
+            instruction += persona_prompt(load_persona(self.engine, payload.get("scope")))
         config = self.role(role)
         content = json.dumps(payload, ensure_ascii=False)
         if config.protocol == "anthropic":
