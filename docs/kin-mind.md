@@ -49,6 +49,11 @@ queue readiness; no ready evidence means no model request. Source bodies and pro
 reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending.
 
+The one-minute host timer is a local queue/threshold check, not a periodic model
+request. Lengthening it to twenty minutes delays threshold detection without
+reducing idle provider requests, which are already zero. Exploration retains its
+independent four-hour cadence.
+
 A daily personality review is separate from short-term scoring. It requires three
 independent original interactions and an existing prospective behavioral assessment
 in the same agent version. `Mind` enforces parameter limits and preserves the claim's
@@ -76,6 +81,22 @@ The stock runner is Kimi CLI; `Explorations.run(..., runner=...)` is the extensi
 point for a host-provided Luna runner with the same result and cancellation contract.
 
 ## Shared-session contact host
+
+Contact preferences are owner-editable configuration. `Mind.configure_contact`
+(host action `configure-contact`) records an explicit source, expected revision,
+configuration version and idempotent command. It can change `wait_for_reply`
+without changing scores, quiet hours, exploration cadence or delivery records.
+Corrected preference evidence pauses contact for review, including a draft already
+in progress. A host projects the accepted preference into its live transport gate
+and verifies both writes before reporting completion. Replaying an older command
+must not restore an obsolete preference.
+
+Hosts that provide model-side configuration tools should state that prior owner
+preferences can be changed by a new explicit owner request; they are not immutable
+tool permissions. The current preference must accompany the response/draft context.
+When reply waiting is disabled, new thoughts, playful ideas and imagined scenarios
+may be shared as such; repeating a previous share or inventing an experience is
+not new content. A particular question can still wait for an answer.
 
 `adapters/owner-host.mjs` supplies a dependency-injected `MindLoop`. The private host
 must authenticate the sender, bind a single recipient and preserve its native session.

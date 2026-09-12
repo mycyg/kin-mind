@@ -570,6 +570,48 @@ def test_expression_policy_has_evidence_without_inflating_scores(setup):
     assert mind.read()["interaction_style"]["needs_review"]
 
 
+def test_owner_contact_preference_is_reversible_and_does_not_change_scores(setup):
+    mind, source, _ = setup
+    before = mind.read()
+    request = {"command_id": "allow-new-content", "agent_version": "synthetic-v2",
+        "expected_revision": before["revision"], "evidence_ids": [source("allow")],
+        "reason": "New content may be shared without waiting", "wait_for_reply": False}
+    result = mind.configure_contact(request)
+    assert mind.configure_contact(request) == result
+    view = mind.read()
+    assert view["contact"]["wait_for_reply"] is False
+    assert view["contact"]["preference"]["event_id"] == result["event_id"]
+    assert view["contact"]["quiet_start"] == before["contact"]["quiet_start"]
+    assert view["dimensions"] == before["dimensions"]
+    assert view["exploration"] == before["exploration"]
+    mind.configure_contact({**request, "command_id": "restore-wait",
+        "expected_revision": view["revision"], "evidence_ids": [source("restore")],
+        "reason": "The owner restored waiting", "wait_for_reply": True})
+    assert mind.read()["contact"]["wait_for_reply"] is True
+    assert mind.read()["dimensions"] == before["dimensions"]
+
+
+def test_contact_preference_requires_explicit_current_evidence(setup):
+    mind, source, clock = setup
+    request = {"command_id": "preference", "agent_version": "synthetic-v2",
+        "expected_revision": mind.read()["revision"], "evidence_ids": [source("guess", authority="model")],
+        "reason": "An inferred preference is insufficient", "wait_for_reply": False}
+    with pytest.raises(Conflict):
+        mind.configure_contact(request)
+    with pytest.raises(ValueError):
+        mind.configure_contact({**request, "wait_for_reply": "false"})
+    wish(mind, source)
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    mind.configure_contact({**request, "expected_revision": mind.read()["revision"],
+        "evidence_ids": [source("explicit-preference")]})
+    attempt = mind.claim_contact(owner_epoch="owner")
+    clock[0] += timedelta(seconds=1)
+    source("explicit-preference", "Correction to that preference", version="2")
+    assert mind.read()["contact"]["preference"]["needs_review"]
+    assert mind.contact_candidate()["reason"] == "contact-preference-needs-review"
+    assert not mind.check_contact(attempt["id"], "owner")["eligible"]
+
+
 def test_appraiser_retires_conversationally_addressed_contact(setup):
     from kin_mind.appraisal import WishUpdate
     mind, source, _ = setup

@@ -89,7 +89,7 @@ export function stateContext(result) {
     revision:state.revision,agent_version:state.agent_version,profile_version:state.profile_version,
     dimensions:Object.fromEntries(Object.entries(state.dimensions).map(([k,v])=>[k,{value:v.value,basis:v.basis,needs_review:v.needs_review,reason:v.reason}])),
     desires:state.desires.filter(d=>!d.expired&&!d.needs_review&&['wanted','waiting','in_progress'].includes(d.status)).slice(-8),
-    traits:state.traits,interaction_style:state.interaction_style,appraisal:result.appraisal??result.appraisals,
+    traits:state.traits,interaction_style:state.interaction_style,contact:state.contact,appraisal:result.appraisal??result.appraisals,
     exploration_results:(result.findings??[]).filter(x=>x.result).map(x=>({id:x.id,state:x.state,result:x.result,source_id:x.source_id})).slice(0,2)
   });
 }

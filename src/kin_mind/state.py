@@ -374,6 +374,32 @@ class Mind:
         policy = state.get("autonomy", {})
         return policy if policy and self._fresh(conn, policy["evidence"]) else {}
 
+    def configure_contact(self, request):
+        """Change an explicit owner preference; keep scores and delivery history intact."""
+        if type(request.get("wait_for_reply")) is not bool:
+            raise ValueError("wait_for_reply must be a boolean")
+        for key in ("command_id", "agent_version", "reason"):
+            if not isinstance(request.get(key), str) or not request[key].strip():
+                raise ValueError(f"{key} is required")
+
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Contact preferences require explicit user evidence")
+            state["profile"]["contact"]["wait_for_reply"] = request["wait_for_reply"]
+            state["contact_preference"] = {
+                "wait_for_reply": request["wait_for_reply"], "evidence": refs,
+                "event_id": event_id, "reason": request["reason"],
+                "configured_at": self.clock(),
+            }
+            state["profile_version"] = digest([
+                state["profile"], state.get("autonomy"), state.get("behavior"),
+                state["contact_preference"],
+            ])[:16]
+            return {"contact_preference": state["contact_preference"]}
+
+        return self._mutate(request, "contact-preference", apply)
+
     def configure_behavior(self, request):
         """Install sourced expression/contact policy without changing any score."""
         if request.get("style") not in {"affectionate-direct", "contextual"}:
@@ -781,6 +807,16 @@ class Mind:
             k: dict(v, needs_review=not self._entry_fresh(conn, v))
             for k, v in state["traits"].items()
         }
+        contact = deepcopy(state["profile"]["contact"])
+        preference = state.get("contact_preference")
+        if preference:
+            contact["preference"] = {
+                "event_id": preference["event_id"],
+                "configured_at": preference["configured_at"],
+                "reason": preference["reason"],
+                "needs_review": not self._fresh(conn, preference["evidence"]),
+                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
+            }
         return {
             "revision": state["revision"],
             "scope": self.scope.model_dump(),
@@ -790,7 +826,7 @@ class Mind:
             "dimensions": values,
             "desires": desires,
             "traits": traits,
-            "contact": state["profile"]["contact"],
+            "contact": contact,
             "exploration": state["profile"]["exploration"],
             "autonomy": self._autonomy(conn, state),
             "last_evolution_day": state["last_evolution_day"],
@@ -878,6 +914,8 @@ class Mind:
         with self.engine.db.connect() as conn:
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
+            if view["contact"].get("preference", {}).get("needs_review"):
+                return {"eligible": False, "reason": "contact-preference-needs-review"}
             waiting = [{"id": d["id"], "expired": d["expired"], "needs_review": d["needs_review"],
                         **d.get("contact_wait", {"condition": "new_evidence", "reason": d.get("reason", "")})}
                        for d in view["desires"] if d["kind"] == "contact" and d["status"] == "waiting"]
@@ -929,6 +967,7 @@ class Mind:
             ]
             if (
                 not ready
+                or view["contact"].get("preference", {}).get("needs_review")
                 or view["dimensions"]["initiative"]["needs_review"]
                 or view["dimensions"]["initiative"]["value"]
                 < view["contact"]["threshold"]
@@ -974,9 +1013,11 @@ class Mind:
             attempt = self._attempt(conn, attempt_id)
             state = self._load(conn)
             desire = state["desires"].get(attempt["desire_id"])
-            value = self._view(conn, state, self.clock())["dimensions"]["initiative"]
+            view = self._view(conn, state, self.clock())
+            value = view["dimensions"]["initiative"]
             valid = (
                 attempt["state"] == "drafting"
+                and not view["contact"].get("preference", {}).get("needs_review")
                 and attempt["owner_epoch"] == owner_epoch
                 and desire
                 and desire["revision"] == attempt["desire_revision"]
