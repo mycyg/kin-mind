@@ -54,6 +54,10 @@ request. Lengthening it to twenty minutes delays threshold detection without
 reducing idle provider requests, which are already zero. Exploration retains its
 independent four-hour cadence.
 
+The optional [mobile routing host](mobile-routing.md) keeps conversation and work
+models in one native thread, protects ongoing tasks during model changes, and
+separates four-hour mobile health reviews from the daily desktop check.
+
 A daily personality review is separate from short-term scoring. It requires three
 independent original interactions and an existing prospective behavioral assessment
 in the same agent version. `Mind` enforces parameter limits and preserves the claim's
