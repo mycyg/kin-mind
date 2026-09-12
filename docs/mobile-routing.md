@@ -11,12 +11,16 @@ state files and personas remain private.
 `MobileRouter` persists input receipts, work tasks, mode requests, configuration
 revisions and transition history. Input acceptance and provider replacement share
 one mutex. New work received during a DeepSeek turn waits for that turn to finish.
-During GPT-6 work, incoming chat is steered to the existing task without another
-classification request.
+DeepSeek classifies natural language using the current message, recent conversation,
+mode and task summary, including during work. Its result describes intent; the
+host independently keeps active work on GPT-6. Runtime enquiries and notification
+requests do not create work or invalidate a completion proposal. Literal native
+commands have their own protocol path; natural phrasing is not matched by a
+collection of regular expressions.
 
 Entering work mode takes effect at an idle boundary. An exit request remains
 pending until the task is delivered. A completion proposal alone does not release
-work: the host checks the task input version, native turn completion, tool states,
+work: the host requires `completedTaskId` and `completedInputVersion`, then checks native turn completion, tool states,
 background terminals and confirmed delivery receipts. New input invalidates an
 earlier completion proposal. Unknown runtime, failed work and uncertain delivery
 retain the task. An explicit owner cancellation releases it only after execution
@@ -31,6 +35,37 @@ the provider restart inside the requesting tool call.
 from internal continuations and reviews. It saves the original owner text instead
 of transport metadata. Internal prompts, answers and tool events stay in the
 native transcript and host journal without becoming new interpersonal evidence.
+
+## Runtime controls and native maintenance
+
+The classifier returns `chat`, `work`, or `control`. Control intentions are
+`status`, `watch`, `work` (enter work mode) and `auto` (request automatic routing).
+The host answers status requests from verified runtime metadata. Asking for a
+switch notification attaches to the pending request; it does not start a GPT-6
+task. A mixed message that also requests code, a document or a repair remains work.
+
+A mode request can set `notify: true`. After native model verification, the host
+creates a durable notification with a stable output ID. The owner-bound sender
+and its durable outbox are injected through `flushNotices({send, lookup})`.
+Successful delivery requires a platform message ID. A missing ID or timeout is
+reconciled against that same outbox record; it does not trigger another model
+turn or a fresh send. Only a confirmed pre-send failure (`not-started`) retries,
+with the same ID. Notification receipts are separate from task delivery receipts.
+Host integrations must guard provider changes for the duration of the send and
+must bypass task-delivery accounting for these non-task messages.
+
+`actual` is the fresh native model result. `lastTransition` is a historical record
+with `matchesCurrentModel`; `transition` remains a compatibility alias. Every
+host switch, including verification probes, records its origin and verified
+result. An independently observed model change gets its own transition record.
+
+`/compact` is native maintenance, with an independent operation receipt. The host
+uses `compactPrompt` to put the command in the first prompt block before attaching
+host metadata: ACP only recognizes commands in that position. It reports operation
+start and completion through `observeOperation`; these events do not complete an
+unrelated user task. An interrupted operation remains unconfirmed rather than
+being replayed. Native compaction completion follows the app server's
+[`contextCompaction` lifecycle](https://learn.chatgpt.com/docs/app-server).
 
 ## Provider compatibility
 
@@ -76,7 +111,7 @@ schedule remain independent. Exploration retains its twenty-minute budget.
 Routine healthy reviews do not send a message.
 
 The independent reviewer uses DeepSeek's [Anthropic-compatible endpoint](https://api-docs.deepseek.com/guides/anthropic_api/)
-with thinking disabled and a forced structured result. The conversation gateway
+with `max` thinking and a structured tool result. The conversation gateway
 uses the [Responses endpoint](https://api-docs.deepseek.com/guides/responses_api/).
 
 ## Validation

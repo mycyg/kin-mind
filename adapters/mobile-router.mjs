@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
+import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
@@ -12,8 +13,8 @@ export function recentConversation(items) {
 }
 export function modeCommand(text) {
   const value=text.trim().replace(/[~～!！。\s]+$/u,'');
-  if (['进入正经模式','正经模式','/mode work'].includes(value)) return 'work';
-  if (['退出正经模式','恢复自动分流','恢复自动','/mode auto'].includes(value)) return 'auto';
+  if (value==='/mode work') return 'work';
+  if (value==='/mode auto') return 'auto';
   return null;
 }
 export function atomicJson(file, value) {
@@ -32,7 +33,9 @@ export class MobileRouter {
     this.tail=Promise.resolve();this.inflight=new Map();
     this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
     if(this.state.schema!==1||this.state.sessionId!==sessionId)throw Error('Router session mismatch');
-    this.state.configRevision??=0;
+    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};
+    for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
+    for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
     for(const record of Object.values(this.state.inputs))if(record.state==='submitting')record.state='unconfirmed';
     if(this.state.transition?.state==='switching')this.state.transition.state='unconfirmed';
@@ -53,6 +56,8 @@ export class MobileRouter {
   snapshot() {return clone(this.state);}
   currentTask() {return this.tasks().at(-1);}
   busy(runtime) {
+    if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
+    if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
     return !runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
       runtime.nativeSessionId!==this.sessionId || runtime.nativeStatus!=='idle' || runtime.active ||
       runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0 || runtime.handoffTasks>0;
@@ -100,16 +105,13 @@ export class MobileRouter {
         return clone(previous);
       }
       const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
-      const command=stop?'stop':modeCommand(input.text), runtime=await this.inspect();
+      const owner=!input.kind||input.kind==='owner';
+      let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      const runtime=await this.inspect();
       let decision,reason;
       if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
-      else if(command==='work') {this.state.mode='work';this.state.exitRequested=false;decision='work';reason='owner-mode-command';}
-      else if(command==='auto') {
-        this.state.exitRequested=true;
-        if(!this.tasks().length && !this.busy(runtime))this.state.mode='auto';
-        decision=this.tasks().length||this.busy(runtime)?'work':'chat';reason='owner-exit-command';
-      } else if(this.tasks().length||this.state.mode==='work'||(runtime.active&&runtime.model===ROUTER_MODELS.work)) {
-        decision='work';reason='work-lock';
+      else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
+      } else if(command==='compact') {decision='maintenance';reason='native-compact';
       } else if(input.attachments?.length||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
         decision='work';reason='work-input';
       } else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
@@ -118,14 +120,18 @@ export class MobileRouter {
           let timer;
           const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
           let result;
-          try {result=await Promise.race([this.classify({text:input.text,recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
+          try {result=await Promise.race([this.classify({text:input.text,recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
           finally {clearTimeout(timer);}
-          if(!['chat','work'].includes(result?.route))throw Error('Invalid classification');
+          if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
+          if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
         } catch {decision='work';reason='classifier-unconfirmed';}
       }
-      const task=decision==='work'&&!command?this.addTask(input):this.currentTask();
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,reason,command,taskId:task?.id,at:this.now()};
+      const intent=decision;
+      // DeepSeek judges meaning; its answer never owns the execution lock.
+      if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
+      const task=decision==='work'&&!command&&(intent==='work'||this.currentTask())?this.addTask(input):command?null:this.currentTask();
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now()};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000)});
@@ -147,18 +153,23 @@ export class MobileRouter {
         const record=this.state.inputs[input.id];
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         const runtime=await this.reconcileTransition(await this.inspect());
-        let target=ROUTER_MODELS[record.route];
-        if(this.tasks().length||this.state.mode==='work')target=ROUTER_MODELS.work;
+        if(record.route==='control') {
+          this.acceptControl(record,runtime);record.state='accepted';record.acceptedAt=this.now();
+          this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:runtime.model};
+        }
+        if(record.route==='maintenance'&&this.busy(runtime))return null;
+        let target=record.route==='maintenance'?runtime.model:ROUTER_MODELS[record.route];
+        if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work'))target=ROUTER_MODELS.work;
         // A queued work request must not change the provider mid-DeepSeek turn.
         if((target!==runtime.model||runtime.profileReady===false)&&this.busy(runtime))return null;
         if(!runtime.known)throw Error('Native runtime requires reconciliation');
         if(this.state.transition?.state==='unconfirmed')throw Error('Provider switch requires reconciliation');
         if(target!==runtime.model||runtime.profileReady===false) {
-          this.state.transition={state:'switching',from:runtime.model,to:target,reason:record.reason,at:this.now()};this.save('switch-requested');
+          this.startTransition(runtime,target,record.reason,'input',input.id);this.save('switch-requested');
           try {
             const actual=await this.switchModel(target);
             if(!this.verified(actual,target))throw Error('Provider verification failed');
-            this.state.actual=actual;this.state.transition.state='applied';this.save('switch-applied',{model:target});
+            this.finishTransition(actual);this.save('switch-applied',{model:target});
           } catch {
             // No owner input has been submitted. Restore the work provider only
             // after a fresh idle check; ambiguous restoration remains held.
@@ -166,17 +177,18 @@ export class MobileRouter {
               const current=await this.inspect();if(this.busy(current))throw Error('busy');
               const restored=await this.switchModel(ROUTER_MODELS.work);
               if(!this.verified(restored,ROUTER_MODELS.work))throw Error('restore-unconfirmed');
-              this.state.actual=restored;this.state.transition.state='failed-restored';target=ROUTER_MODELS.work;
+              this.state.actual=restored;this.state.transition.state='failed-restored';this.state.transition.actualModel=restored.model;this.state.transition.verifiedAt=restored.checkedAt;target=ROUTER_MODELS.work;
               if(!record.taskId&&!record.command)record.taskId=this.addTask(input).id;
               this.save('switch-failed-restored');
             } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
           }
         } else this.state.actual=runtime;
         if(target===ROUTER_MODELS.work&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.addTask(input).id;
+        if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
         record.state='submitting';record.model=target;this.save('input-submitting',{id:input.id});
         try {
-          const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command});
-          if(route==='superseded') {record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
+          const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null});
+          if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
           record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
           return{route,model:target};
         } catch {record.state='unconfirmed';this.save('input-unconfirmed',{id:input.id});throw Error('Input acceptance requires reconciliation');}
@@ -187,11 +199,16 @@ export class MobileRouter {
   }
   async requestMode(request) {
     return this.locked(async()=>{
+      return this.recordModeRequest(request);
+    });
+  }
+  recordModeRequest(request) {
       if(!request.commandId||!['work','auto'].includes(request.mode)||!request.reason?.trim())throw Error('Invalid mode request');
       const hash=digest(request), previous=this.state.requests[request.commandId];
       if(previous) {if(previous.hash!==hash)throw Error('Command id conflict');return clone(previous);}
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
       if(request.completedTaskId&&(!this.state.tasks[request.completedTaskId]||!open(this.state.tasks[request.completedTaskId])))throw Error('Task is not open');
+      if(request.completedTaskId&&request.completedInputVersion!==this.state.tasks[request.completedTaskId].inputVersion)throw Error('Task input version changed; read current runtime');
       if(request.mode==='work') {
         this.state.mode='work';this.state.exitRequested=false;
         if(request.handoff) {
@@ -208,29 +225,29 @@ export class MobileRouter {
       }
       this.state.configRevision++;
       const result={state:'pending',mode:request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
-        sourceInputId:Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id,at:this.now()};
+        sourceInputId:request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id,notify:request.notify===true,at:this.now()};
+      for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto'].includes(prior.mode)){prior.state='superseded';prior.supersededBy=request.commandId;}
       this.state.requests[request.commandId]=result;this.save('mode-request',{commandId:request.commandId,mode:request.mode});
       return clone(result);
-    });
   }
   async applyPendingMode() {
     return this.locked(async()=>{
       const runtime=await this.reconcileTransition(await this.inspect());
-      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending');
+      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto'].includes(r.mode));
       if(!request||this.busy(runtime)||this.state.transition?.state==='unconfirmed')return{state:'pending'};
       if(request.mode==='auto'&&this.tasks().length)return{state:'work-held'};
       const target=ROUTER_MODELS[request.mode==='work'?'work':'chat'];
       try {
         if(!this.verified(runtime,target)) {
-          this.state.transition={state:'switching',from:runtime.model,to:target,reason:request.reason,at:this.now()};this.save('switch-requested');
+          this.startTransition(runtime,target,request.reason,'mode-request',request.commandId);this.save('switch-requested');
           const actual=await this.switchModel(target);
           if(!this.verified(actual,target))throw Error('Unverified mode change');
-          this.state.actual=actual;this.state.transition.state='applied';
+          this.finishTransition(actual);
         } else this.state.actual=runtime;
         // A later request replaces earlier pending mode intents, but preserves
         // their receipts and the task completion proposal they may have carried.
         for(const prior of Object.values(this.state.requests))if(prior!==request&&prior.state==='pending'){prior.state='superseded';prior.supersededBy=request.commandId;}
-        request.state='applied';request.appliedAt=this.now();this.save('mode-applied',{commandId:request.commandId,model:target});
+        this.modeApplied(request,this.state.actual);this.save('mode-applied',{commandId:request.commandId,model:target});
       } catch {
         request.state='failed';request.failedAt=this.now();
         this.state.transition.state='unconfirmed';this.save('mode-failed',{commandId:request.commandId});
@@ -238,6 +255,91 @@ export class MobileRouter {
       }
       return clone(request);
     });
+  }
+  startTransition(before,model,reason,source,sourceId) {
+    this.state.transition={id:'switch-'+digest([this.sessionId,this.state.revision,sourceId,model]).slice(0,24),state:'switching',
+      from:before.model,to:model,reason,source,sourceId,at:this.now()};
+  }
+  finishTransition(actual) {
+    this.state.actual=actual;Object.assign(this.state.transition,{state:'applied',actualModel:actual.model,verifiedAt:actual.checkedAt,appliedAt:this.now()});
+  }
+  observeRuntime(runtime) {
+    if(runtime.known&&this.state.actual?.known&&this.state.actual.model!==runtime.model&&this.state.transition?.state!=='switching'&&this.state.transition?.state!=='unconfirmed'&&this.state.transition?.to!==runtime.model) {
+      this.startTransition(this.state.actual,runtime.model,'Observed native model change','runtime-observation');
+      this.finishTransition(runtime);this.state.transition.state='observed';this.save('runtime-model-observed');
+    }
+    this.state.actual=runtime;
+  }
+  async readRuntime(loaded=true) {
+    return this.locked(async()=>{const runtime=await this.inspect();this.observeRuntime(runtime);return publicMobileRuntime(this.state,runtime,this.sessionId,loaded);});
+  }
+  async prepareModel(model) {
+    return this.locked(async()=>{
+      const runtime=await this.inspect();
+      if(this.tasks().length||this.busy(runtime))throw Error('Work prevents model verification');
+      if(this.verified(runtime,model)){this.observeRuntime(runtime);return runtime;}
+      this.startTransition(runtime,model,'Host model verification','probe');this.save('switch-requested');
+      try {const actual=await this.switchModel(model);if(!this.verified(actual,model))throw Error('Unverified model');this.finishTransition(actual);this.save('switch-applied');return actual;}
+      catch(error){this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw error;}
+    });
+  }
+  queueNotice(key,kind,extra={}) {
+    const id='kin-mode-'+digest([this.sessionId,key,kind]).slice(0,40);
+    this.state.notices[id]??={id,kind,state:'pending',createdAt:this.now(),...extra};return this.state.notices[id];
+  }
+  modeApplied(request,runtime) {
+    request.state='applied';request.appliedAt=this.now();
+    request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
+      sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id};
+    if(request.notify)this.queueNotice(request.commandId,'mode-applied',{requestId:request.commandId,target:runtime.model});
+  }
+  acceptControl(record,runtime) {
+    if(['work','auto'].includes(record.command)) {
+      this.recordModeRequest({commandId:'owner-mode:'+record.id,mode:record.command,reason:'Explicit owner mode command',sourceInputId:record.id,notify:true});
+      if(this.busy(runtime)||this.tasks().length)this.queueNotice(record.id,'mode-pending');
+    } else if(record.command==='watch') {
+      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto'].includes(r.mode));
+      if(request){request.notify=true;this.queueNotice(record.id,'mode-pending',{requestId:request.commandId});}
+      else this.queueNotice(record.id,'status');
+    } else this.queueNotice(record.id,'status');
+  }
+  observeOperation(inputId,phase,result={}) {
+    return this.locked(async()=>{
+      const operation=this.state.operations[inputId];if(!operation)throw Error('Unknown native operation');
+      operation.state=phase==='start'?'running':result.stopReason==='end_turn'?'completed':'unconfirmed';
+      operation.updatedAt=this.now();operation.stopReason=result.stopReason;
+      this.save('native-operation-'+phase,{inputId,state:operation.state});
+    });
+  }
+  async flushNotices({send,lookup}) {
+    // The owner-bound sender has its own durable outbox. Never replay an
+    // ambiguous send; reconcile the original ID, including after host restart.
+    for(const id of Object.keys(this.state.notices)) {
+      const notice=await this.locked(async()=>{
+        const n=this.state.notices[id];
+        if(!['pending','retry','unconfirmed'].includes(n.state)||n.nextAttemptAt>this.now())return null;
+        if(n.state==='unconfirmed')return clone(n);
+        const runtime=await this.inspect();const view=publicMobileRuntime(this.state,runtime,this.sessionId);
+        if(!view.actual.verified)return null;
+        if(n.kind==='mode-applied'&&runtime.model!==n.target){n.state='superseded';this.save('notice-superseded',{id});return null;}
+        if(n.state==='retry'){delete n.text;delete n.runtime;}
+        n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
+        n.runtime??=view.actual;n.state='sending';n.attempts=(n.attempts??0)+1;
+        this.save('notice-sending',{id});return {...clone(n),sendNow:true};
+      });
+      if(!notice)continue;
+      let receipt;
+      try {receipt=notice.sendNow?await send({id,text:notice.text,kind:'runtime-status'}):await lookup(id);}
+      catch {receipt=await lookup(id).catch(()=>null);}
+      await this.locked(async()=>{
+        const n=this.state.notices[id];
+        if(receipt?.state==='accepted'&&receipt.messageId){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();
+          if(!n.replyRecorded){this.state.recent.push({role:'assistant',text:n.text.slice(0,4000)});this.state.recent=this.state.recent.slice(-16);n.replyRecorded=true;}}
+        else if(receipt?.state==='not-started'&&n.attempts<3){n.state='retry';n.nextAttemptAt=this.now()+2000*n.attempts;}
+        else {n.state='unconfirmed';n.nextAttemptAt=this.now()+30000;}
+        this.save('notice-settled',{id,state:n.state});
+      });
+    }
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
@@ -262,7 +364,7 @@ export class MobileRouter {
   }
   async reconcile() {
     return this.locked(async()=>{
-      const runtime=await this.reconcileTransition(await this.inspect());this.state.actual=runtime;
+      const runtime=await this.reconcileTransition(await this.inspect());this.observeRuntime(runtime);
       if(this.busy(runtime))return {state:'busy'};
       let changed=false;
       for(const task of this.tasks()) {
@@ -277,7 +379,7 @@ export class MobileRouter {
       }
       if(changed&&!this.tasks().length) {this.state.mode='auto';this.state.exitRequested=false;}
       for(const request of Object.values(this.state.requests))if(request.state==='pending') {
-        if(request.mode==='work'&&this.verified(runtime,ROUTER_MODELS.work) || request.mode==='auto'&&!this.tasks().length&&this.verified(runtime,ROUTER_MODELS.chat)) {request.state='applied';request.appliedAt=this.now();changed=true;}
+        if(request.mode==='work'&&this.verified(runtime,ROUTER_MODELS.work) || request.mode==='auto'&&!this.tasks().length&&this.verified(runtime,ROUTER_MODELS.chat)) {this.modeApplied(request,runtime);changed=true;}
       }
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });
