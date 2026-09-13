@@ -49,9 +49,13 @@ queue readiness; no ready evidence means no model request. Source bodies and pro
 reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending. The request includes projected scores,
 active wishes with source IDs and compact completed-wish summaries. Full receipts
-and evidence history remain in the database. Max reasoning has a 16,384-token output
-budget and a 120–150 second request timeout within the 180-second worker lease;
-exhaustion remains a pending appraisal, never an empty successful decision.
+and evidence history remain in the database. Max reasoning uses a 131,072-token
+output ceiling, matching the [official max-effort default](https://api-docs.deepseek.com/api/create-chat-completion/).
+The background request timeout is 600 seconds; the durable lease includes a
+30-second margin. A private host must allow 660 seconds for the review subprocess.
+This does not block the chat session. Exhaustion remains a pending appraisal,
+never an empty successful decision. Output ceilings do not require that many tokens
+to be generated.
 
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without

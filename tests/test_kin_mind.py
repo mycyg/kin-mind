@@ -249,6 +249,29 @@ def test_failed_appraisal_keeps_state(setup):
     assert mind.read()["revision"] == 1
 
 
+def test_long_max_review_does_not_lose_lease_to_another_worker(setup, monkeypatch):
+    import time
+
+    from kin_mind import appraisal
+
+    mind, source, _clock = setup
+    jobs = Appraisals(mind)
+    jobs.enqueue([source("long-max-review")], "synthetic-v1")
+    started = time.time()
+    duplicate = FakeReviewer(error=AssertionError("Active max request must not replay"))
+
+    class LongReviewer(FakeReviewer):
+        timeout = 600
+
+        def appraise(self, context):
+            monkeypatch.setattr(appraisal.time, "time", lambda: started + 240)
+            assert jobs.run_one(duplicate)["state"] in {"idle", "busy"}
+            return super().appraise(context)
+
+    assert jobs.run_one(LongReviewer(Appraisal(values={}, reason="Reviewed")))["state"] == "complete"
+    assert duplicate.calls == 0
+
+
 def test_appraisal_projection_keeps_decisions_and_source_ids_without_receipt_history():
     context = {"stimulus": "bootstrap", "new_evidence": [{"id": "current", "text": "Owner preference"}], "state": {
         "revision": 4, "scope": {"persona": "synthetic"},
@@ -288,7 +311,7 @@ def test_deepseek_contract_and_redaction(monkeypatch):
         assert body["tool_choice"]["type"] == "auto"
         assert body["thinking"]["type"] == "enabled"
         assert body["output_config"]["effort"] == "max"
-        assert body["max_tokens"] == 16384
+        assert body["max_tokens"] == 131072
         return httpx.Response(
             200,
             json={

@@ -166,7 +166,7 @@ class DeepSeek:
             cfg["endpoint"],
             "deepseek-flash",
             cfg.get("api_key_env", "EVENTMEM_API_KEY"),
-            min(150, max(120, cfg.get("timeout_seconds", 60))),
+            600,
         )
         provider.engine = engine
         return provider
@@ -184,7 +184,7 @@ class DeepSeek:
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                     json={
                         "model": self.model,
-                        "max_tokens": 16384,
+                        "max_tokens": 131072,
                         "system": SYSTEM + persona_prompt(policy),
                         "messages": [{"role": "user", "content": dumps(request_context)}],
                         "tools": [
@@ -224,7 +224,7 @@ class DeepSeek:
                 "persona_contract": persona_metadata(policy),
                 "context_projection": "affect-decision-v2",
                 "context_characters": len(dumps(request_context)),
-                "max_output_tokens": 16384,
+                "max_output_tokens": 131072,
             }
         except httpx.TimeoutException:
             raise RuntimeError("deepseek-timeout") from None
@@ -317,7 +317,7 @@ class Appraisals:
                 return {"state": "busy"}
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
-                (time.time() + 180, row["id"]),
+                (time.time() + max(180, float(getattr(provider, "timeout", 150)) + 30), row["id"]),
             )
         data = json.loads(row["data"])
         try:
