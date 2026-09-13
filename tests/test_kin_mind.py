@@ -302,6 +302,15 @@ def test_exhausted_thinking_budget_is_not_an_appraisal(monkeypatch):
         provider.appraise({})
 
 
+def test_missing_reported_model_cannot_be_labeled_verified(monkeypatch):
+    monkeypatch.setenv("SYNTHETIC_KEY", "test-only-key")
+    provider = DeepSeek("https://api.deepseek.com/anthropic", "deepseek-flash", "SYNTHETIC_KEY", transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "content": [{"type": "tool_use", "name": "submit_appraisal", "input": {"reason": "No change"}}],
+    })))
+    with pytest.raises(RuntimeError, match="^deepseek-model-unverified$"):
+        provider.appraise({})
+
+
 def test_deepseek_contract_and_redaction(monkeypatch):
     monkeypatch.setenv("SYNTHETIC_KEY", "test-only-key")
 

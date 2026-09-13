@@ -204,7 +204,7 @@ class DeepSeek:
             body = response.json()
             if body.get("stop_reason") == "max_tokens":
                 raise RuntimeError("deepseek-output-budget-exhausted")
-            if body.get("model", self.model) != "deepseek-flash":
+            if body.get("model") != "deepseek-flash":
                 raise RuntimeError("deepseek-model-unverified")
             calls = [
                 v
@@ -216,7 +216,7 @@ class DeepSeek:
             proposal = Appraisal.model_validate(calls[0]["input"])
             return proposal, {
                 "provider": "deepseek",
-                "model": body.get("model", self.model),
+                "model": body["model"],
                 "usage": body.get("usage", {}),
                 "request_id": body.get("id"),
                 "reasoning": "max",
