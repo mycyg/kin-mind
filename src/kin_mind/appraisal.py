@@ -317,7 +317,9 @@ class Appraisals:
                 return {"state": "busy"}
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
-                (time.time() + max(180, float(getattr(provider, "timeout", 150)) + 30), row["id"]),
+                # The host's absolute worker deadline is request timeout + 60s;
+                # keep the lease beyond that deadline, including HTTP keepalives.
+                (time.time() + max(180, float(getattr(provider, "timeout", 90)) + 90), row["id"]),
             )
         data = json.loads(row["data"])
         try:

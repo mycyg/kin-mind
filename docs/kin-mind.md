@@ -51,8 +51,9 @@ valid revision while appraisal is pending. The request includes projected scores
 active wishes with source IDs and compact completed-wish summaries. Full receipts
 and evidence history remain in the database. Max reasoning uses a 131,072-token
 output ceiling, matching the [official max-effort default](https://api-docs.deepseek.com/api/create-chat-completion/).
-The background request timeout is 600 seconds; the durable lease includes a
-30-second margin. A private host must allow 660 seconds for the review subprocess.
+The background request timeout is 600 seconds. A private host must enforce a
+660-second absolute review-subprocess deadline; the durable lease lasts 690 seconds,
+so another worker cannot reclaim it before the original subprocess exits.
 This does not block the chat session. Exhaustion remains a pending appraisal,
 never an empty successful decision. Output ceilings do not require that many tokens
 to be generated.
