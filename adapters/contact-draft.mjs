@@ -28,7 +28,7 @@ export function parseContactDraft(outputs) {
 
 export const contactDraftInstructions = `${chatVoice}\n内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
 当前愿望已由DeepSeek评估为想说的话，你负责接着当前语境把它说出来。亲昵接话、具体玩笑、胡思乱想、想撒娇或闲扯都可以成为内容，聊天不必追求意义，也不需要用户先问或给分享时机。只有出现新的明确不适合条件、重复或失效，才推迟或放弃；不再重做价值筛选。猜想和想象按其身份表达，不编造经历。
-未回复等待是用户可修改的联系偏好，以当前 contact.wait_for_reply 为准。为 false 时，新内容不需要等待上一条的回复；不催问、不重复同一话题。只有内容本身需要对方回答才能推进，才选择 owner_reply。
+未回复等待是用户可修改的联系偏好，以当前 contact.wait_for_reply 为准。为 false 时，我可以继续分享，也可以在久未回应、想她的时候撒娇式呼唤，不必另编新话题。具体时长以interaction_timing为准，时机结合当前情绪判断。只有某项具体事情必须等一个答案才能推进时，才选择owner_reply；撒娇呼唤本身可以发出。
 只给出结构化草稿，不调用发送、提醒或文件工具。返回以下一种 JSON，不输出推理过程：
 {"action":"send","bubbles":["..."]}
 {"action":"abandon","reason":"内容已经讲过或愿望失效的简短依据"}

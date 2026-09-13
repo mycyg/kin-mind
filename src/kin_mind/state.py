@@ -869,10 +869,28 @@ class Mind:
         if not 0 <= history <= 100:
             raise ValueError("History must be between 0 and 100")
         with self.engine.db.connect() as conn:
-            result = self._view(
-                conn, self._load(conn), utc(as_of) if as_of else self.clock()
-            )
+            at = utc(as_of) if as_of else self.clock()
+            result = self._view(conn, self._load(conn), at)
             result["persona_contract"] = persona_metadata(load_persona(self.engine, self.scope))
+            owner = conn.execute(
+                "SELECT occurred_at FROM sources WHERE scope=? AND namespace='kin-owner-input' "
+                "AND deleted=0 AND occurred_at<=? ORDER BY occurred_at DESC LIMIT 1",
+                (self.scope.key(), at),
+            ).fetchone()
+            accepted = conn.execute(
+                "SELECT data FROM mind_contacts WHERE scope=? AND state='accepted' "
+                "AND json_extract(data,'$.updated_at')<=? ORDER BY json_extract(data,'$.updated_at') DESC LIMIT 1",
+                (self.scope.key(), at),
+            ).fetchone()
+            last_owner = owner[0] if owner else None
+            last_contact = json.loads(accepted[0]).get("updated_at") if accepted else None
+            awaiting = bool(last_contact and (not last_owner or timestamp(last_contact) > timestamp(last_owner)))
+            result["interaction_timing"] = {
+                "last_owner_message_at": last_owner, "last_proactive_accepted_at": last_contact,
+                "awaiting_reply": awaiting,
+                "owner_silence_seconds": max(0, (timestamp(at)-timestamp(last_owner)).total_seconds()) if last_owner else None,
+                "unanswered_contact_seconds": max(0, (timestamp(at)-timestamp(last_contact)).total_seconds()) if awaiting else 0,
+            }
             result["decision_runtime"] = None
             if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
                 receipt = conn.execute("SELECT json_extract(data,'$.receipt') FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.receipt') IS NOT NULL ORDER BY json_extract(data,'$.receipt.verified_at') DESC LIMIT 1", (self.scope.key(),)).fetchone()

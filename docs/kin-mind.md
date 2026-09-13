@@ -160,6 +160,13 @@ verification; CI uses synthetic sources and controlled provider/CLI stubs.
 
 ## Affect-driven action episodes
 
+An owner can permit affectionate calls for attention after a long silence. The
+reviewer receives `interaction_timing` from authenticated owner inputs and accepted
+proactive receipts, and combines it with current affect. It need not invent a new
+topic. Internal reviews and configuration changes do not count as an owner reply;
+silence does not itself increase grievance or possessiveness. A new episode uses a
+new wish identity while delivery retries keep the existing message identities.
+
 `AffectiveEvent.motivations` and `Appraisal.motivations` accept `initiative` and
 `curiosity`, each with a target (0–100), a half-life in minutes (20, 60 or 180),
 and a sourced reason. These are short-term episode parameters; long-term trait

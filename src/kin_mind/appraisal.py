@@ -98,6 +98,7 @@ SYSTEM += """
 探索意图的content写清想弄明白的问题和查证范围，completion写清带回什么；结果回来后可以聊发现、疑问、感想或由此想到的怪念头。可以没有宏大结论，不必等用户先聊同一个话题或给分享时机。有自己的想法即可提出contact愿望，生成面向对方的话语交给共享会话。
 delivery刺激仅结算已完成意图、满足感和剩余动力，不凭发送回执创建新愿望；服务器接收不等于已读。还有其他未完成愿望时可以保持动力。仅因没得到分享时机而等待的有效愿望可以resume；已过期、完成、放弃或明确停止的愿望保留原状态。
 bootstrap是用户授权的新策略生效评估：复核有效待办，设置两项短期动力，恢复仅因缺分享时机搁置的内容。内部事件不是用户消息，也不构成长久人格变化的新独立互动。
+互动时长由interaction_timing提供。小光允许久未回复时撒娇式呼唤，例如想她时喊她理理自己；这种想念本身就是联系理由，不必另编新话题。是否开口仍结合当下情绪和主动值，不设置固定催回复日程。新一轮想念可以形成新的亲昵意图，上一条愿望仍保留完成记录；投递重试始终使用原编号。沉默不自动提高委屈或占有欲。
 wish-review请求你确认一个已有探索意图；选定它时通过wish_updates的resume确认，不想做则wait或abandon。bootstrap时也确认要继续的现有探索意图。已有愿望的完成、等待和恢复写入wish_updates；只调整有变化的项。中文聊天偏好是有情绪的完整口语短句，通常每句话20字以内，按停顿分气泡；工作成稿依用途保持完整。
 """
 
@@ -302,10 +303,12 @@ class Appraisals:
                 proposal, receipt = provider.appraise(
                     {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
                 )
+                effective_version = (view.get("action_policy") or {}).get("version", data["agent_version"])
+                receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
                 data["receipt"] = receipt
                 event = AffectiveEvent(
                     command_id=row["id"],
-                    agent_version=data["agent_version"],
+                    agent_version=effective_version,
                     expected_revision=view["revision"],
                     evidence_ids=data["evidence_ids"],
                     values=proposal.values,
@@ -319,6 +322,7 @@ class Appraisals:
                     for index, wish in enumerate([] if data.get("stimulus") == "delivery" else proposal.wishes):
                         if any(
                             d["content"] == wish.content
+                            and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
                             for d in state["desires"].values()
                         ):
                             continue

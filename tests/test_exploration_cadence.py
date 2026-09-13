@@ -7,6 +7,7 @@ from threading import Barrier
 from test_kin_mind import FakeReviewer, event, wish
 from test_kin_mind import setup as _setup
 
+from eventmem.core.models import SourceInput
 from kin_mind.actions import ActionEvents
 from kin_mind.appraisal import Appraisal, Appraisals, Wish, WishUpdate
 from kin_mind.exploration import Explorations
@@ -155,6 +156,88 @@ def test_delivery_reappraises_instead_of_reset_and_cannot_invent_next_thought(se
     assert actions.crossings() == []
 
 
+def test_unanswered_timing_ignores_internal_configuration_and_uses_view_clock(setup):
+    mind, source, clock = setup
+
+    def receive(namespace, key):
+        return mind.engine.receive(
+            SourceInput(
+                namespace=namespace,
+                key=key,
+                scope=mind.scope,
+                text="Synthetic interaction",
+                occurred_at=mind.clock(),
+                extract=False,
+            )
+        )
+
+    receive("kin-owner-input", "owner-one")
+    clock[0] += timedelta(minutes=1)
+    wish(mind, source, "affection", content="I feel like calling for attention")
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    attempt = mind.claim_contact(owner_epoch="owner-one")
+    mind.settle_contact(
+        attempt_id=attempt["id"], state="accepted", message_id="synthetic-message"
+    )
+    clock[0] += timedelta(minutes=30)
+    receive("mind-internal-event", "review")
+    receive("kin-owner-configuration", "policy")
+    timing = mind.read()["interaction_timing"]
+    assert timing["awaiting_reply"]
+    assert timing["owner_silence_seconds"] == 31 * 60
+    assert timing["unanswered_contact_seconds"] == 30 * 60
+    assert (
+        mind.read(as_of=(clock[0] + timedelta(hours=1)).isoformat())[
+            "interaction_timing"
+        ]["unanswered_contact_seconds"]
+        == 90 * 60
+    )
+    receive("kin-owner-input", "owner-two")
+    assert not mind.read()["interaction_timing"]["awaiting_reply"]
+
+
+def test_new_affection_episode_keeps_prior_completion_and_current_config_version(setup):
+    mind, source, clock = setup
+    actions, jobs = activate(mind, source)
+    content = "I miss you and want a little attention"
+    wish(mind, source, "first-affection", content=content)
+    mind.record(event(mind, source, "ready", {"initiative": 90}))
+    attempt = mind.claim_contact(owner_epoch="same")
+    mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="m1")
+    review(
+        actions, jobs, Appraisal(values={"initiative": 50}, reason="Contented for now")
+    )
+    clock[0] += timedelta(hours=2)
+    job = jobs.enqueue(
+        [source("new-episode")], "older-enqueued-version", stimulus="drive-crossing"
+    )
+    result = jobs.run_one(
+        FakeReviewer(
+            Appraisal(
+                values={"initiative": 85},
+                reason="A new affectionate impulse",
+                wishes=[
+                    Wish(
+                        content=content,
+                        topic="affection",
+                        kind="contact",
+                        strength=85,
+                        ttl_hours=6,
+                        completion="Express the new feeling",
+                    )
+                ],
+            )
+        )
+    )
+    assert result["id"] == job["id"] and result["state"] == "complete"
+    assert result["receipt"]["agent_version"] == "synthetic-actions-v2"
+    assert result["receipt"]["enqueued_agent_version"] == "older-enqueued-version"
+    desires = [d for d in mind.read()["desires"] if d["content"] == content]
+    assert len(desires) == 2
+    assert {d["status"] for d in desires} == {"completed", "wanted"}
+    assert len({d["id"] for d in desires}) == 2
+
+
 def result(*args, **kwargs):
     assert kwargs["budget_seconds"] == 1200
     return {
@@ -285,22 +368,33 @@ def test_corrected_evidence_stops_a_pending_crossing(setup):
     assert mind.read()["dimensions"]["initiative"]["needs_review"]
 
 
-def test_concurrent_admission_cannot_replay_a_successful_worker_claim(setup, tmp_path, monkeypatch):
+def test_concurrent_admission_cannot_replay_a_successful_worker_claim(
+    setup, tmp_path, monkeypatch
+):
     mind, source, _ = setup
     wish(mind, source, "concurrent-question", kind="explore")
     barrier = Barrier(2)
     original = ActionEvents.exploration_candidate
+
     def simultaneous(self):
         snapshot = original(self)
         barrier.wait(timeout=5)
         return snapshot
+
     monkeypatch.setattr(ActionEvents, "exploration_candidate", simultaneous)
     first, second = Explorations(mind), Explorations(mind)
     calls = []
+
     def run_once(*args, **kwargs):
         calls.append(1)
         return result(*args, **kwargs)
+
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda e: e.run("fake", tmp_path/"work", "v1", runner=run_once), [first, second]))
+        results = list(
+            pool.map(
+                lambda e: e.run("fake", tmp_path / "work", "v1", runner=run_once),
+                [first, second],
+            )
+        )
     assert len(calls) == 1
     assert sorted(r["state"] for r in results) == ["complete", "waiting"]
