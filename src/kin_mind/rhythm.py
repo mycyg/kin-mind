@@ -1,10 +1,19 @@
 """Interaction-led rhythm projections. There is no scheduled sleep or wake time."""
 
-import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import digest
+
+INTERACTION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS mind_source_versions ON sources(namespace,source_key,scope,received_at)
+ WHERE deleted=0;
+CREATE INDEX IF NOT EXISTS mind_owner_interactions ON sources(scope,occurred_at,id)
+ WHERE deleted=0 AND (namespace='kin-owner-input' OR substr(namespace,1,5)='host:')
+ AND json_extract(data,'$.authority')='explicit'
+ AND json_extract(data,'$.metadata.role')='user'
+ AND json_extract(data,'$.metadata.host_event')='message';
+"""
 
 
 def stamp(text):
@@ -14,21 +23,19 @@ def stamp(text):
 def interaction_windows(conn, scope, at, timezone="Asia/Singapore"):
     cutoff = (stamp(at) - timedelta(days=14)).isoformat()
     rows = conn.execute(
-        "SELECT id,occurred_at,data,namespace FROM sources WHERE scope=? AND deleted=0 "
-        "AND occurred_at>=? AND occurred_at<=? AND "
-        "(namespace='kin-owner-input' OR namespace LIKE 'host:%') ORDER BY occurred_at,id",
+        "SELECT s.id,s.occurred_at FROM sources s WHERE s.scope=? AND s.deleted=0 "
+        "AND s.occurred_at>=? AND s.occurred_at<=? "
+        "AND (s.namespace='kin-owner-input' OR substr(s.namespace,1,5)='host:') "
+        "AND json_extract(s.data,'$.authority')='explicit' "
+        "AND json_extract(s.data,'$.metadata.role')='user' "
+        "AND json_extract(s.data,'$.metadata.host_event')='message' "
+        "AND NOT EXISTS(SELECT 1 FROM sources newer WHERE newer.namespace=s.namespace "
+        "AND newer.source_key=s.source_key AND newer.scope=s.scope AND newer.deleted=0 "
+        "AND newer.received_at>s.received_at) ORDER BY s.occurred_at,s.id",
         (scope, cutoff, at),
     ).fetchall()
     windows, seen = [], set()
     for row in rows:
-        data = json.loads(row["data"])
-        meta = data.get("metadata", {})
-        if (
-            data.get("authority") != "explicit"
-            or meta.get("role") != "user"
-            or meta.get("host_event") != "message"
-        ):
-            continue
         # Namespace plus original channel ID are already durable ingestion keys.
         if row["id"] in seen:
             continue

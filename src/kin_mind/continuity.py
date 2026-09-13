@@ -10,17 +10,20 @@ from eventmem.core.db import Conflict, Missing, digest
 from eventmem.core.models import Model
 
 from .expression import compile_expression
-from .rhythm import interaction_windows, rhythm_view, stamp
+from .rhythm import INTERACTION_SCHEMA, interaction_windows, rhythm_view, stamp
 
 FEATURES = ("interpretation", "concerns", "expression", "rhythm")
 CONFIDENCE_THRESHOLD = 0.65
 
-SCHEMA = """
+SCHEMA = (
+    INTERACTION_SCHEMA
+    + """
 CREATE TABLE IF NOT EXISTS mind_concern_evidence(
  scope TEXT NOT NULL,concern_id TEXT NOT NULL,evidence_key TEXT NOT NULL,
  event_id TEXT NOT NULL,source_id TEXT NOT NULL,
  PRIMARY KEY(scope,concern_id,evidence_key));
 """
+)
 
 
 class Understanding(Model):

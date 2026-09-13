@@ -292,6 +292,33 @@ def test_rhythm_groups_real_interactions_and_ignores_maintenance(enabled):
     assert view["sample_status"] == "forming"
 
 
+def test_interaction_index_tracks_source_correction_and_deletion(enabled):
+    mind, _, clock = enabled
+    first = owner(mind, clock, "corrected-message")
+    old_fingerprint = mind.read()["rhythm"]["interactions"]["fingerprint"]
+    clock[0] += timedelta(hours=2)
+    corrected = mind.engine.receive(
+        SourceInput(
+            namespace="kin-owner-input",
+            key="corrected-message",
+            version="2",
+            scope=mind.scope,
+            text="Corrected source time",
+            occurred_at=clock[0].isoformat(),
+            authority="explicit",
+            metadata={"role": "user", "host_event": "message"},
+        )
+    )["id"]
+    stats = mind.read()["rhythm"]["interactions"]
+    assert stats["window_count"] == 1 and stats["last_owner_source_id"] == corrected
+    assert stats["fingerprint"] != old_fingerprint
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE sources SET deleted=1 WHERE id IN (?,?)", (first, corrected)
+        )
+    assert mind.read()["rhythm"]["interactions"]["window_count"] == 0
+
+
 def test_rhythm_has_no_fixed_clock_and_true_owner_input_rouses(enabled):
     mind, source, clock = enabled
     original = event(mind, source, "rest", {})

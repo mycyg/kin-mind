@@ -69,6 +69,10 @@ statistics. Consecutive messages no more than 30 minutes apart form one window;
 each window contributes one start to the hourly distribution. Background events,
 assistant messages and maintenance do not contribute. Fewer than three active
 days or five windows is labeled `forming`, otherwise `observing`.
+The interaction query uses a partial time index and a source-version index. It
+reads timestamps and IDs rather than loading historical message metadata, and
+uses the latest live source revision. Corrections and deletion update this view
+through the database; there is no stale process-local activity cache.
 
 DeepSeek can propose `awake`, `settling`, `drowsy`, `resting`, `roused`, or
 `recovering`, with current alertness, a target and a 20/60/180-minute half-life.
