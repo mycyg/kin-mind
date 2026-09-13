@@ -103,6 +103,47 @@ wish-review请求你确认一个已有探索意图；选定它时通过wish_upda
 """
 
 
+def appraisal_context(context):
+    """Project decision inputs; immutable evidence and full history stay in storage."""
+    result = dict(context)
+    if not isinstance(context.get("state"), dict):
+        return result
+    original = context["state"]
+    state = {k: v for k, v in original.items() if k in {
+        "scope", "agent_version", "revision", "as_of", "contact", "exploration",
+        "interaction_style", "interaction_timing", "autonomy", "persona_contract",
+    }}
+    state["dimensions"] = {}
+    for key, value in original.get("dimensions", {}).items():
+        projected = {k: v for k, v in value.items() if k in {
+            "label", "value", "projected_value", "baseline", "half_life_hours", "target",
+            "basis", "observed_at", "needs_review", "agent_version", "evidence_ids",
+        }}
+        projected["reason"] = value.get("reason", "")[:300]
+        if value.get("motivation"):
+            projected["motivation"] = {**value["motivation"], "reason": value["motivation"].get("reason", "")[:180]}
+        state["dimensions"][key] = projected
+    state["desires"] = []
+    for desire in original.get("desires", []):
+        active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
+        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired"}
+        if active:
+            keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
+        projected = {k: v for k, v in desire.items() if k in keys}
+        projected["content"] = desire.get("content", "")[:2000 if active else 180]
+        if active:
+            projected["reason"] = desire.get("reason", "")[:300]
+            projected["evidence_ids"] = [r["record_id"] for r in desire.get("evidence", [])]
+        state["desires"].append(projected)
+    if original.get("action_policy"):
+        state["action_policy"] = {k: v for k, v in original["action_policy"].items() if k in {
+            "version", "trigger", "provider", "reasoning", "configured_at", "needs_review",
+        }}
+    result["state"] = state
+    result["context_projection"] = "affect-decision-v2"
+    return result
+
+
 class DeepSeek:
     def __init__(
         self, endpoint, model, key_env="EVENTMEM_API_KEY", timeout=60, transport=None
@@ -132,6 +173,7 @@ class DeepSeek:
 
     def appraise(self, context):
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
+        request_context = appraisal_context(context)
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
@@ -142,9 +184,9 @@ class DeepSeek:
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                     json={
                         "model": self.model,
-                        "max_tokens": 8192,
+                        "max_tokens": 16384,
                         "system": SYSTEM + persona_prompt(policy),
-                        "messages": [{"role": "user", "content": dumps(context)}],
+                        "messages": [{"role": "user", "content": dumps(request_context)}],
                         "tools": [
                             {
                                 "name": "submit_appraisal",
@@ -160,6 +202,8 @@ class DeepSeek:
                 if response.status_code != 200:
                     raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
+            if body.get("stop_reason") == "max_tokens":
+                raise RuntimeError("deepseek-output-budget-exhausted")
             if body.get("model", self.model) != "deepseek-flash":
                 raise RuntimeError("deepseek-model-unverified")
             calls = [
@@ -178,6 +222,9 @@ class DeepSeek:
                 "reasoning": "max",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
+                "context_projection": "affect-decision-v2",
+                "context_characters": len(dumps(request_context)),
+                "max_output_tokens": 16384,
             }
         except httpx.TimeoutException:
             raise RuntimeError("deepseek-timeout") from None

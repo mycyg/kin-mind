@@ -7,7 +7,7 @@ import pytest
 from eventmem.core import Engine
 from eventmem.core.db import Conflict
 from eventmem.core.models import Scope, SourceInput
-from kin_mind.appraisal import Appraisal, Appraisals, DeepSeek, Wish
+from kin_mind.appraisal import Appraisal, Appraisals, DeepSeek, Wish, appraisal_context
 from kin_mind.state import AffectiveEvent, DesireChange, Mind
 
 
@@ -249,6 +249,36 @@ def test_failed_appraisal_keeps_state(setup):
     assert mind.read()["revision"] == 1
 
 
+def test_appraisal_projection_keeps_decisions_and_source_ids_without_receipt_history():
+    context = {"stimulus": "bootstrap", "new_evidence": [{"id": "current", "text": "Owner preference"}], "state": {
+        "revision": 4, "scope": {"persona": "synthetic"},
+        "interaction_timing": {"unanswered_contact_seconds": 7200},
+        "dimensions": {"initiative": {"value": 78, "reason": "Current reason", "evidence_ids": ["source-one"], "history": "old bulk" * 1000}},
+        "desires": [{"id": "open", "status": "waiting", "content": "A current affectionate wish", "completion": "Express it", "evidence": [{"record_id": "source-one", "metadata": {"bulk": "receipt" * 1000}}], "decision_receipt": {"bulk": "receipt" * 1000}},
+                    {"id": "old", "status": "completed", "content": "Already shared", "history": "old bulk" * 1000}],
+        "history": "old bulk" * 1000,
+    }}
+    original = json.dumps(context)
+    result = appraisal_context(context)
+    assert result["state"]["desires"][0]["evidence_ids"] == ["source-one"]
+    assert result["state"]["desires"][1]["status"] == "completed"
+    assert result["state"]["interaction_timing"]["unanswered_contact_seconds"] == 7200
+    assert result["new_evidence"] == context["new_evidence"]
+    assert "old bulk" not in json.dumps(result) and "receipt" not in json.dumps(result)
+    assert len(json.dumps(result)) < len(original) / 10
+    assert json.dumps(context) == original
+
+
+def test_exhausted_thinking_budget_is_not_an_appraisal(monkeypatch):
+    monkeypatch.setenv("SYNTHETIC_KEY", "test-only-key")
+    provider = DeepSeek("https://api.deepseek.com/anthropic", "deepseek-flash", "SYNTHETIC_KEY", transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "model": "deepseek-flash", "stop_reason": "max_tokens",
+        "content": [{"type": "thinking", "thinking": "private intermediate content"}],
+    })))
+    with pytest.raises(RuntimeError, match="^deepseek-output-budget-exhausted$"):
+        provider.appraise({})
+
+
 def test_deepseek_contract_and_redaction(monkeypatch):
     monkeypatch.setenv("SYNTHETIC_KEY", "test-only-key")
 
@@ -258,6 +288,7 @@ def test_deepseek_contract_and_redaction(monkeypatch):
         assert body["tool_choice"]["type"] == "auto"
         assert body["thinking"]["type"] == "enabled"
         assert body["output_config"]["effort"] == "max"
+        assert body["max_tokens"] == 16384
         return httpx.Response(
             200,
             json={
@@ -457,7 +488,7 @@ def test_minute_review_queues_authorized_exploration_once(setup, tmp_path, monke
 
 
 def test_empty_draft_waits_and_survives_restart(setup):
-    mind, source, clock = setup
+    mind, source, _clock = setup
     wish(mind, source)
     mind.record(event(mind, source, "ready-empty", {"initiative": 90}))
     attempt = mind.claim_contact(owner_epoch="owner-1")
@@ -470,7 +501,7 @@ def test_empty_draft_waits_and_survives_restart(setup):
 
 
 def test_empty_draft_does_not_override_changed_wish(setup):
-    mind, source, clock = setup
+    mind, source, _clock = setup
     wish(mind, source)
     mind.record(event(mind, source, "ready-changed", {"initiative": 90}))
     attempt = mind.claim_contact(owner_epoch="owner-1")

@@ -35,7 +35,7 @@ existing private environment file and emits sanitized operation receipts.
 
 The existing `settings.models` extraction, conflict and summary endpoints remain
 responsible for memory processing. `DeepSeek.from_engine` reuses the configured
-summary endpoint, model and environment key name for affect appraisal. The adapter
+summary endpoint and environment key name, with `deepseek-flash` for affect appraisal. The adapter
 supports the official [Anthropic-compatible API](https://api-docs.deepseek.com/guides/anthropic_api/),
 with a typed `submit_appraisal` tool call. Credentials are sent only to the official
 HTTPS hostname. Embedding configuration remains independent.
@@ -47,7 +47,10 @@ queue acknowledgement after a committed mutation reuses the command receipt.
 Failures retain previous scores and use bounded retries with backoff. A timer checks
 queue readiness; no ready evidence means no model request. Source bodies and provider
 reasoning are absent from diagnostic errors. User-facing state may show the last
-valid revision while appraisal is pending.
+valid revision while appraisal is pending. The request includes projected scores,
+active wishes with source IDs and compact completed-wish summaries. Full receipts
+and evidence history remain in the database. Max reasoning has a 16,384-token output
+budget; exhaustion remains a pending appraisal, never an empty successful decision.
 
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without
