@@ -50,7 +50,8 @@ reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending. The request includes projected scores,
 active wishes with source IDs and compact completed-wish summaries. Full receipts
 and evidence history remain in the database. Max reasoning has a 16,384-token output
-budget; exhaustion remains a pending appraisal, never an empty successful decision.
+budget and a 120–150 second request timeout within the 180-second worker lease;
+exhaustion remains a pending appraisal, never an empty successful decision.
 
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without

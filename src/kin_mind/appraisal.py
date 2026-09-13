@@ -166,7 +166,7 @@ class DeepSeek:
             cfg["endpoint"],
             "deepseek-flash",
             cfg.get("api_key_env", "EVENTMEM_API_KEY"),
-            cfg.get("timeout_seconds", 60),
+            min(150, max(120, cfg.get("timeout_seconds", 60))),
         )
         provider.engine = engine
         return provider
