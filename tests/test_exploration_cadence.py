@@ -131,7 +131,7 @@ def test_delivery_reappraises_instead_of_reset_and_cannot_invent_next_thought(se
         message_ids=["m1", "m2"],
     )
     assert mind.read()["dimensions"]["initiative"]["value"] == 90
-    assert mind.contact_candidate()["reason"] == "delivery-appraisal-pending"
+    assert mind.contact_candidate()["reason"] == "action-appraisal-pending"
     review(
         actions,
         jobs,

@@ -991,8 +991,8 @@ class Mind:
                     "state": active["state"],
                     "owner_epoch": json.loads(active["data"])["owner_epoch"],
                 }
-            if self._delivery_review_pending(conn):
-                return {"eligible": False, "reason": "delivery-appraisal-pending"}
+            if self._action_review_pending(conn):
+                return {"eligible": False, "reason": "action-appraisal-pending"}
             if view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
             if view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
@@ -1023,8 +1023,8 @@ class Mind:
             ).fetchone()
             if existing:
                 raise Conflict("An unresolved contact attempt already exists")
-            if self._delivery_review_pending(conn):
-                raise Conflict("Delivery appraisal is pending")
+            if self._action_review_pending(conn):
+                raise Conflict("Action appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
             ready = [
@@ -1107,7 +1107,7 @@ class Mind:
             raise Missing("Contact attempt is outside this scope or missing")
         return json.loads(row[0])
 
-    def _delivery_review_pending(self, conn):
+    def _action_review_pending(self, conn):
         return bool(conn.execute("SELECT 1 FROM mind_action_events WHERE scope=? AND state IN ('pending','queued') LIMIT 1", (self.scope.key(),)).fetchone())
 
     def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, partial=False, canceled_bubbles=0, aborted_before_send=False):

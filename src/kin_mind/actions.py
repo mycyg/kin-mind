@@ -216,7 +216,7 @@ class ActionEvents:
                 "curiosity": score["value"],
             }
         with self.mind.engine.db.connect() as conn:
-            if self.mind._delivery_review_pending(conn):
+            if self.mind._action_review_pending(conn):
                 return {"state": "waiting", "reason": "action-appraisal-pending"}
         choices = [
             d

@@ -133,7 +133,7 @@ def test_threshold_before_four_hours_delivery_idempotency(setup):
         == receipt
     )
     assert mind.read()["dimensions"]["initiative"]["value"] == 80
-    assert mind.contact_candidate()["reason"] == "delivery-appraisal-pending"
+    assert mind.contact_candidate()["reason"] == "action-appraisal-pending"
     assert mind.read()["desires"][0]["delivery"]["visibility"] == "unverified"
     assert mind.read()["desires"][0]["status"] == "completed"
     assert not mind.contact_candidate()["eligible"]
