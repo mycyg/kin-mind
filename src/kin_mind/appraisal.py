@@ -407,6 +407,14 @@ class Appraisals:
                 migration = data.get("stimulus") == "continuity-bootstrap"
                 if migration:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [u for u in proposal.wish_updates if u.action == "link"], "evolution": None})
+                if not view.get("continuity", {}).get("features", {}).get("concerns"):
+                    # A rollback flag is enforced by the host even if a model
+                    # returns optional fields for a disabled feature.
+                    proposal = proposal.model_copy(update={
+                        "concerns": [],
+                        "wishes": [w.model_copy(update={"concern_ids": []}) for w in proposal.wishes],
+                        "wish_updates": [u.model_copy(update={"concern_ids": None}) for u in proposal.wish_updates if u.action != "link"],
+                    })
                 effective_version = (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
                 receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
                 data["receipt"] = receipt

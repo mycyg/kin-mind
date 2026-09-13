@@ -718,6 +718,48 @@ def test_mcp_exposes_concerns_and_topic_read_without_replacing_existing_tools(en
     assert "query" in tools["read_affective_state"].parameters["properties"]
 
 
+def test_disabled_concerns_do_not_block_ordinary_assessment_when_model_emits_links(
+    setup,
+):
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    jobs.enqueue([source("hello")], "synthetic-v1")
+    proposal = Appraisal(
+        reason="An ordinary new greeting",
+        values={"mood": 72},
+        wishes=[
+            Wish(
+                content="Share a small idea",
+                topic="chat",
+                kind="contact",
+                strength=80,
+                ttl_hours=2,
+                completion="Platform accepts it",
+                concern_ids=["disabled-topic"],
+            )
+        ],
+        concerns=[
+            ConcernProposal(
+                action="create",
+                key="disabled-topic",
+                kind="curiosity",
+                content="A topic for later",
+                topic="chat",
+                intensity=60,
+                basis="internal_thought",
+                confidence=0.8,
+                reason="A model supplied an optional disabled field",
+            )
+        ],
+    )
+    result = jobs.run_one(FakeReviewer(proposal))
+    assert result["state"] == "complete"
+    view = mind.read()
+    assert view["dimensions"]["mood"]["value"] == 72
+    assert view["desires"][0].get("concern_ids", []) == []
+    assert view["concerns"] == []
+
+
 def test_selected_concerns_follow_query_and_never_exceed_three(enabled):
     mind, source, _ = enabled
     concern(mind, source, "exam", topic="考试", content="惦记考试结果")
