@@ -63,9 +63,9 @@ def test_affective_evaluator_reports_contract_version(configured, monkeypatch, m
     requests = []
     def respond(request):
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"model": "synthetic", "id": "test-receipt",
+        return httpx.Response(200, json={"model": "deepseek-flash", "id": "test-receipt",
           "content": [{"type": "tool_use", "name": "submit_appraisal", "input": {"values": {}, "reason": "No new observation."}}]})
-    provider = DeepSeek("https://api.deepseek.com", "synthetic", "SYNTHETIC_PERSONA_TEST_KEY", transport=httpx.MockTransport(respond))
+    provider = DeepSeek("https://api.deepseek.com", "deepseek-flash", "SYNTHETIC_PERSONA_TEST_KEY", transport=httpx.MockTransport(respond))
     provider.engine = engine
     _, receipt = provider.appraise({"mode": mode, "state": {"scope": scope.model_dump()}})
     assert policy["core"] in requests[0]["system"]

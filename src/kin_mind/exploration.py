@@ -18,8 +18,7 @@ from pydantic import Field, field_validator
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model, SourceInput
 
-from .appraisal import Appraisals
-from .state import DesireChange, timestamp
+from .state import DesireChange
 
 
 class Citation(Model):
@@ -239,130 +238,85 @@ class Explorations:
             ]
 
     def run(
-        self,
-        executable,
-        directory,
-        agent_version,
-        *,
-        canceled=lambda: False,
-        model=None,
-        runner=run_kimi,
-        brief=None,
-        budget_seconds=1200,
+        self, executable, directory, agent_version, *, canceled=lambda: False,
+        model=None, runner=run_kimi, brief=None, budget_seconds=1200, desire_id=None,
     ):
-        view = self.mind.read()
-        latest = self.recent(1)
-        if (
-            latest
-            and (
-                timestamp(self.mind.clock()) - timestamp(latest[0]["created_at"])
-            ).total_seconds()
-            < view["exploration"]["interval_seconds"]
-        ):
-            return {"state": "waiting", "reason": "four-hour-exploration-cadence"}
+        from .actions import ActionEvents
+        actions = ActionEvents(self.mind)
+        candidate = actions.exploration_candidate()
+        if candidate["state"] != "ready":
+            return candidate
         if canceled():
             return {"state": "waiting", "reason": "owner-task"}
-        choices = [
-            d
-            for d in view["desires"]
-            if d["kind"] == "explore"
-            and d["status"] == "wanted"
-            and not d["expired"]
-            and not d["needs_review"]
-        ]
-        policy = view.get("autonomy", {})
-        if policy.get("open_exploration"):
-            if not isinstance(brief, str) or not brief.strip() or len(brief) > 3000:
-                return {"state": "waiting", "reason": "kin-topic-selection-required"}
-            desire = {
-                "id": "kin-selected",
-                "topic": "Kin 选定的探索题目",
-                "content": brief,
-                "evidence": policy.get("evidence", []),
-            }
-        elif choices:
-            desire = max(choices, key=lambda d: d["strength"])
-        else:
-            return {"state": "quiet", "reason": "no-sourced-interest"}
-        budget_seconds = min(view["exploration"]["budget_seconds"], max(1, int(budget_seconds)))
+        desire = candidate["desire"]
+        if desire_id and desire_id != desire["id"]:
+            return {"state": "waiting", "reason": "exploration-intent-changed"}
+        # The selected wish is the reviewed brief; an external wake cannot replace it.
+        budget_seconds = min(1200, max(1, int(budget_seconds)))
         at = self.mind.clock()
-        eid = "explore_" + digest([self.mind.scope.key(), at, desire["id"]])[:32]
-        data = {
-            "desire_id": desire["id"],
-            "selected_brief": brief if desire["id"] == "kin-selected" else None,
-            "topic_selected_by": "Kin" if desire["id"] == "kin-selected" else "existing-desire",
+        eid = "explore_" + digest([self.mind.scope.key(), desire["id"], desire["revision"]])[:32]
+        data = {"desire_id": desire["id"], "selected_brief": desire["content"],
+                "topic_selected_by": "deepseek-appraisal", "agent_version": agent_version,
+                "evidence_ids": [r["record_id"] for r in desire["evidence"]]}
+        request = DesireChange(command_id=eid+":start", agent_version=agent_version,
+            expected_revision=candidate["revision"], evidence_ids=data["evidence_ids"],
+            action="start", desire_id=desire["id"], reason="Host claimed the reviewed exploration intent")
 
-            "agent_version": agent_version,
-            "evidence_ids": [r["record_id"] for r in desire["evidence"]],
-        }
-        with self.engine.db.connect(write=True) as conn:
-            # Compare revision while acquiring the one-worker slot.
-            if self.mind._load(conn)["revision"] != view["revision"]:
-                raise Conflict("Mind changed before exploration started")
-            conn.execute(
-                "INSERT INTO mind_explorations VALUES(?,?,?,?,?)",
-                (eid, self.mind.scope.key(), "running", at, dumps(data)),
-            )
+        def claim(conn, current, event_id):
+            if conn.execute("SELECT 1 FROM mind_explorations WHERE scope=? AND state='running'", (self.mind.scope.key(),)).fetchone():
+                raise Conflict("Exploration worker already active")
+            result = self.mind._apply_desire(conn, current, request, event_id)
+            data["desire_revision"] = result["desire_revision"]
+            conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", (eid, self.mind.scope.key(), "running", at, dumps(data)))
+            return result
         try:
-            output = runner(
-                executable,
-                {
-                    "question": desire["content"],
-                    "topic": desire["topic"],
-                    "source_ids": data["evidence_ids"],
-                },
-                Path(directory) / eid,
-                budget_seconds=budget_seconds,
-                canceled=canceled,
-                model=model,
-            )
+            # Unlike a replayable command, a worker lease must never return a
+            # previous success to a second executor that would run Kimi again.
+            with self.engine.db.connect(write=True) as conn:
+                current = self.mind._load(conn)
+                if current["revision"] != candidate["revision"] or current["desires"][desire["id"]]["status"] != "wanted":
+                    raise Conflict("Exploration intent changed")
+                event_id = "mind_" + digest([eid, "start"])[:32]
+                claim(conn, current, event_id)
+                current["revision"] += 1
+                current["updated_at"] = self.mind.clock()
+                self.mind._save(conn, current)
+                self.mind._history(conn, event_id, current, "exploration-start", request.model_dump())
+        except Conflict:
+            return {"state": "waiting", "reason": "exploration-claim-changed"}
+        try:
+            output = runner(executable, {"question": desire["content"], "topic": desire["topic"],
+                "source_ids": data["evidence_ids"]}, Path(directory)/eid,
+                budget_seconds=budget_seconds, canceled=canceled, model=model)
             data.update(output)
-            if output["result"]:
-                # Model report remains inferred. Source list is inspectable, not automatically trusted.
-                source = self.engine.receive(
-                    SourceInput(
-                        namespace="kin-exploration",
-                        key=eid,
-                        scope=self.mind.scope,
-                        authority="model",
-                        kind="observation",
-                        text=dumps(output["result"]),
-                        occurred_at=self.mind.clock(),
-                        session=eid,
-                        extract=True,
-                        metadata={
-                            "host_event": "exploration-result",
-                            "provider": "kimi-cli",
-                            "partial": output["partial"],
-                            "sources": output["result"]["sources"],
-                        },
-                    )
-                )
-                data["source_id"] = source["id"]
-                if output["state"] == "complete" and output["result"]["sources"]:
-                    current = self.mind.read()
-                    if desire["id"] != "kin-selected":
-                        self.mind.manage_desire(
-                            DesireChange(
-                                command_id=eid + ":complete",
-                                agent_version=agent_version,
-                                expected_revision=current["revision"],
-                                evidence_ids=[source["id"]],
-                                action="complete",
-                                desire_id=desire["id"],
-                                reason="Kimi returned a report with sources; conclusions remain reviewable",
-                            )
-                        )
-                    Appraisals(self.mind).enqueue(
-                        [source["id"]], agent_version, "exploration"
-                    )
             state = output["state"]
-        except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
+        except Exception as error:  # noqa: BLE001 - owned helper boundary; retain a redacted failure receipt
             state = "failed"
-            data["error"] = type(error).__name__
+            data.update(error=type(error).__name__, partial=True, result=None)
+        # A result without a definitive answer still supports reflection and sharing.
+        # Only final reports and execution receipts enter memory, never tool traces.
+        source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
+            scope=self.mind.scope, authority="model", kind="observation", session=eid,
+            text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
+            occurred_at=self.mind.clock(), extract=True,
+            metadata={"host_event": "exploration-result", "provider": "kimi-cli",
+                      "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])}))
+        data["source_id"] = source["id"]
         with self.engine.db.connect(write=True) as conn:
-            conn.execute(
-                "UPDATE mind_explorations SET state=?,data=? WHERE id=?",
-                (state, dumps(data), eid),
-            )
+            current = self.mind._load(conn)
+            active = current["desires"].get(desire["id"])
+            if active and active["revision"] == data["desire_revision"] and active["status"] == "in_progress":
+                event_id = "mind_" + digest([eid, "settled"])[:32]
+                action = "complete" if state == "complete" and data.get("result") else "resume" if state == "preempted" else "wait"
+                update = DesireChange(command_id=eid+":settled", agent_version=agent_version,
+                    expected_revision=current["revision"], evidence_ids=[source["id"], *data["evidence_ids"]],
+                    action=action, desire_id=desire["id"], reason="Exploration execution: "+state)
+                self.mind._apply_desire(conn, current, update, event_id)
+                current["revision"] += 1
+                current["updated_at"] = self.mind.clock()
+                self.mind._save(conn, current)
+                self.mind._history(conn, event_id, current, "exploration-result", data)
+            conn.execute("UPDATE mind_explorations SET state=?,data=? WHERE id=?", (state, dumps(data), eid))
+            actions.emit(conn, "exploration-result", eid, {"exploration_id": eid, "state": state,
+                "evidence_ids": [source["id"], *data["evidence_ids"]], "agent_version": agent_version})
         return dict(data, id=eid, state=state)

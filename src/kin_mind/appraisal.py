@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -18,10 +18,10 @@ from pydantic import Field, StrictInt, ValidationError, field_validator
 
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model
-from eventmem.core.persona import load_persona, persona_prompt, persona_metadata
+from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .profile import DIMENSIONS
-from .state import AffectiveEvent, DesireChange, Evolution, timestamp
+from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 
 
 class Wish(Model):
@@ -57,10 +57,18 @@ class WishUpdate(Model):
 
 class Appraisal(Model):
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
+    motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
     reason: str = Field(min_length=1, max_length=1200)
     wishes: list[Wish] = Field(default_factory=list, max_length=2)
     wish_updates: list[WishUpdate] = Field(default_factory=list, max_length=6)
     evolution: Evolution | None = None
+
+    @field_validator("motivations")
+    @classmethod
+    def valid_motivations(cls, v):
+        if set(v) - {"initiative", "curiosity"}:
+            raise ValueError("Unknown motivation dimension")
+        return v
 
     @field_validator("values")
     @classmethod
@@ -83,6 +91,16 @@ SYSTEM = """你是 Kin 的记忆与情绪评估器。根据提供的新经历提
 人格变化只有在给定的行为检验与三个独立原始互动支持时才提出；否则 evolution 为 null。
 只调用 submit_appraisal 提交结果。reason 简短说明依据，不输出推理链。"""
 
+SYSTEM += """
+当前行动规则：联系由主动值、探索由好奇心驱动，二者阈值均为75。不存在四小时探索或聊天门槛。
+你负责起念、评估、选题与分享意图；Kimi只执行你确定的问题。一个怪念头、想撒娇、想逗伴侣或闲扯都能成为contact愿望，聊天不必追求意义。没有新聊天时，drive-crossing也允许你从已有兴趣和情绪生出自己的新念头，标明这是自己的想法，不能写成用户的新经历。
+为initiative和curiosity提供本轮motivations：target是想达到的动力，half_life_minutes从20、60、180选择，reason写明依据。它们只改变本轮短期动力，不调整长期性格底色。准备开口或探索时可直接更新values到相应强度，不必等待计时；想休息时可以下降。时间本身由宿主计算。
+探索意图的content写清想弄明白的问题和查证范围，completion写清带回什么；结果回来后可以聊发现、疑问、感想或由此想到的怪念头。可以没有宏大结论，不必等用户先聊同一个话题或给分享时机。有自己的想法即可提出contact愿望，生成面向对方的话语交给共享会话。
+delivery刺激仅结算已完成意图、满足感和剩余动力，不凭发送回执创建新愿望；服务器接收不等于已读。还有其他未完成愿望时可以保持动力。仅因没得到分享时机而等待的有效愿望可以resume；已过期、完成、放弃或明确停止的愿望保留原状态。
+bootstrap是用户授权的新策略生效评估：复核有效待办，设置两项短期动力，恢复仅因缺分享时机搁置的内容。内部事件不是用户消息，也不构成长久人格变化的新独立互动。
+wish-review请求你确认一个已有探索意图；选定它时通过wish_updates的resume确认，不想做则wait或abandon。bootstrap时也确认要继续的现有探索意图。已有愿望的完成、等待和恢复写入wish_updates；只调整有变化的项。中文聊天偏好是有情绪的完整口语短句，通常每句话20字以内，按停顿分气泡；工作成稿依用途保持完整。
+"""
+
 
 class DeepSeek:
     def __init__(
@@ -104,7 +122,7 @@ class DeepSeek:
         cfg = json.loads(row[0])["summary"]
         provider = cls(
             cfg["endpoint"],
-            cfg["model"],
+            "deepseek-flash",
             cfg.get("api_key_env", "EVENTMEM_API_KEY"),
             cfg.get("timeout_seconds", 60),
         )
@@ -123,7 +141,7 @@ class DeepSeek:
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                     json={
                         "model": self.model,
-                        "max_tokens": 2800,
+                        "max_tokens": 8192,
                         "system": SYSTEM + persona_prompt(policy),
                         "messages": [{"role": "user", "content": dumps(context)}],
                         "tools": [
@@ -133,13 +151,16 @@ class DeepSeek:
                                 "input_schema": Appraisal.model_json_schema(),
                             }
                         ],
-                        "tool_choice": {"type": "tool", "name": "submit_appraisal"},
-                        "thinking": {"type": "disabled"},
+                        "tool_choice": {"type": "auto"},
+                        "thinking": {"type": "enabled"},
+                        "output_config": {"effort": "max"},
                     },
                 )
                 if response.status_code != 200:
                     raise RuntimeError("deepseek-http-" + str(response.status_code))
-                body = response.json()
+            body = response.json()
+            if body.get("model", self.model) != "deepseek-flash":
+                raise RuntimeError("deepseek-model-unverified")
             calls = [
                 v
                 for v in body.get("content", [])
@@ -153,6 +174,8 @@ class DeepSeek:
                 "model": body.get("model", self.model),
                 "usage": body.get("usage", {}),
                 "request_id": body.get("id"),
+                "reasoning": "max",
+                "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
             }
         except httpx.TimeoutException:
@@ -183,7 +206,7 @@ class Appraisals:
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA)
 
-    def enqueue(self, evidence_ids, agent_version, origin="interaction"):
+    def enqueue(self, evidence_ids, agent_version, origin="interaction", stimulus=None):
         with self.engine.db.connect() as conn:
             refs = self.mind._evidence(conn, evidence_ids)
         job_id = (
@@ -199,6 +222,7 @@ class Appraisals:
             "evidence_ids": evidence_ids,
             "agent_version": agent_version,
             "origin": origin,
+            "stimulus": stimulus,
         }
         with self.engine.db.connect(write=True) as conn:
             conn.execute(
@@ -276,7 +300,7 @@ class Appraisals:
                         }
                     )
                 proposal, receipt = provider.appraise(
-                    {"state": view, "definitions": DIMENSIONS, "new_evidence": sources}
+                    {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
                 )
                 data["receipt"] = receipt
                 event = AffectiveEvent(
@@ -285,26 +309,27 @@ class Appraisals:
                     expected_revision=view["revision"],
                     evidence_ids=data["evidence_ids"],
                     values=proposal.values,
+                    motivations=proposal.motivations,
                     reason=proposal.reason,
                     origin=data["origin"],
                 )
 
                 def apply(conn, state, eid):
                     self.mind._apply_event(conn, state, event, eid)
-                    for index, wish in enumerate(proposal.wishes):
+                    for index, wish in enumerate([] if data.get("stimulus") == "delivery" else proposal.wishes):
                         if any(
                             d["content"] == wish.content
-                            and d["status"] in {"wanted", "waiting", "in_progress"}
                             for d in state["desires"].values()
                         ):
                             continue
-                        self.mind._apply_desire(
+                        changed = self.mind._apply_desire(
                             conn,
                             state,
                             DesireChange(
                                 **event.model_dump(
                                     exclude={
                                         "values",
+                                        "motivations",
                                         "origin",
                                         "evolution",
                                         "command_id",
@@ -320,25 +345,27 @@ class Appraisals:
                             ),
                             eid,
                         )
+                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
                     for update in proposal.wish_updates:
                         desire = state["desires"].get(update.desire_id)
-                        if not desire or desire["status"] in {"completed", "abandoned"}:
+                        if not desire or desire["status"] in {"completed", "abandoned"} or timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()):
                             continue
                         # Ordinary conversation can supersede a wish without inventing
                         # a proactive transport receipt. Retire it as abandoned.
                         action = "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
-                        self.mind._apply_desire(
+                        changed = self.mind._apply_desire(
                             conn,
                             state,
                             DesireChange(
                                 **event.model_dump(
-                                    exclude={"values", "origin", "evolution", "reason"}
+                                    exclude={"values", "motivations", "origin", "evolution", "reason"}
                                 ),
                                 **{**update.model_dump(), "action": action,
                                    "wait_condition": update.wait_condition if action == "wait" else None},
                             ),
                             eid,
                         )
+                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
                     return {"provider": receipt, "proposal": proposal.model_dump()}
 
                 data["result"] = self.mind._mutate(event, "affect", apply)
@@ -351,13 +378,13 @@ class Appraisals:
                 if type(error) is RuntimeError and str(error).startswith("deepseek-")
                 else type(error).__name__
             )
-            state = "pending" if row["attempts"] < 2 else "failed"
+            state = "pending"
         with self.engine.db.connect(write=True) as conn:
             conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,data=? WHERE id=?",
                 (
                     state,
-                    time.time() + 60 * (row["attempts"] + 1),
+                    time.time() + min(1800, 60 * 2 ** min(row["attempts"], 5)),
                     dumps(data),
                     row["id"],
                 ),

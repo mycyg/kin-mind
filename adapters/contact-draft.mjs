@@ -1,3 +1,4 @@
+import {chatVoice} from './chat-bubbles.mjs';
 /** Public output only. A parse failure is an execution error, not a wish decision. */
 export function parseContactDraft(outputs) {
   const last=outputs.filter(raw=>typeof raw==='string'&&raw.trim()).at(-1);
@@ -6,6 +7,11 @@ export function parseContactDraft(outputs) {
     try { result=JSON.parse(raw.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'')); }
     catch { continue; }
     if(!result||typeof result!=='object'||Array.isArray(result))continue;
+    if(result.action==='send'&&Array.isArray(result.bubbles)) {
+      if(result.bubbles.length&&result.bubbles.every(x=>typeof x==='string'&&x.trim())&&result.bubbles.join('\n\n').length<=3000)
+        return {action:'send',text:result.bubbles.map(x=>x.trim()).join('\n\n'),bubbles:result.bubbles.map(x=>x.trim())};
+      continue;
+    }
     // Older hosts can finish an already-started draft during a rolling upgrade.
     if(result.text===null&&!result.action)return {action:'wait',condition:'new_evidence',reason:'Legacy empty draft; a new related source is required'};
     if((result.action==='send'||!result.action)&&typeof result.text==='string'&&result.text.trim()&&result.text.length<=3000)
@@ -20,11 +26,11 @@ export function parseContactDraft(outputs) {
   throw new Error('contact-draft-invalid-result');
 }
 
-export const contactDraftInstructions = `内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
-根据当前共享状态、愿望和已说过的话决定这次联系。亲昵接话、一个具体玩笑、胡思乱想或想分享的念头也可以成为内容，不要求先有研究成果；猜想和想象按其身份表达，不编造经历或重复已经讲过的结论。
+export const contactDraftInstructions = `${chatVoice}\n内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
+当前愿望已由DeepSeek评估为想说的话，你负责接着当前语境把它说出来。亲昵接话、具体玩笑、胡思乱想、想撒娇或闲扯都可以成为内容，聊天不必追求意义，也不需要用户先问或给分享时机。只有出现新的明确不适合条件、重复或失效，才推迟或放弃；不再重做价值筛选。猜想和想象按其身份表达，不编造经历。
 未回复等待是用户可修改的联系偏好，以当前 contact.wait_for_reply 为准。为 false 时，新内容不需要等待上一条的回复；不催问、不重复同一话题。只有内容本身需要对方回答才能推进，才选择 owner_reply。
 只给出结构化草稿，不调用发送、提醒或文件工具。返回以下一种 JSON，不输出推理过程：
-{"action":"send","text":"合适的消息"}
+{"action":"send","bubbles":["..."]}
 {"action":"abandon","reason":"内容已经讲过或愿望失效的简短依据"}
 {"action":"wait","condition":"time","retry_after_seconds":1800,"reason":"暂不适合、稍后复核的具体原因"}
 {"action":"wait","condition":"owner_reply","reason":"需要等待用户的回应"}

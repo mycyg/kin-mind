@@ -4,6 +4,8 @@ import {MindLoop} from './owner-host.mjs';
 function fixture(overrides={}) {
  const events=[];let epoch='owner-1';let eligible=true;let busy=false;
  const loop=new MindLoop({call:async(action,req)=>{events.push([action,req]);if(action==='candidate')return{eligible:true};if(action==='claim')return{id:'stable-id',state:'drafting'};if(action==='check')return{eligible:true};return req;},eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,draft:async()=> 'A sourced hello',send:async()=>({state:'accepted',messageId:'server-id'}),...overrides});
+ // These tests exercise one contact tick; durable queue behavior is tested with SQLite.
+ loop.review=async()=>{};
  return{loop,events,change:()=>{epoch='owner-2';},quiet:()=>{eligible=false;},busy:()=>{busy=true;}};
 }
 test('under four hours is allowed by threshold; accepted receipt settles',async()=>{const{loop,events}=fixture();await loop.tick();assert.equal(events.at(-1)[1].state,'accepted');assert.equal(events.filter(x=>x[0]==='claim').length,1);});

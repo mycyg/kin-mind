@@ -1,7 +1,7 @@
 /** Single-session host orchestration. Each dependency is owner-bound by the adapter. */
 export class MindLoop {
-  constructor({call, eligibility, ownerEpoch, isBusy, draft, send, recordStatus, stopExploration}) {
-    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,recordStatus,stopExploration});
+  constructor({call, eligibility, ownerEpoch, isBusy, draft, send, resume, recordStatus, stopExploration}) {
+    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,resume,recordStatus,stopExploration});
     this.closed=false; this.contactRunning=false; this.reviewRunning=false;
   }
   start() {
@@ -12,6 +12,11 @@ export class MindLoop {
   async ingest(input) {
     this.stopExploration?.();
     const result=await this.call('ingest',input);
+    void this.review();
+    return result;
+  }
+  async observe(input) {
+    const result=await this.call('observe',input);
     void this.review();
     return result;
   }
@@ -42,6 +47,15 @@ export class MindLoop {
     try {
       await this.call('reconsider',{owner_epoch:this.ownerEpoch()});
       const candidate=await this.call('candidate',{});
+      if(candidate.reason==='attempt-in-progress'&&['pending','unconfirmed'].includes(candidate.state)&&this.resume) {
+        const receipt=await this.resume(candidate);
+        if(receipt?.state==='accepted'&&receipt.messageId) {
+          const settled=await this.call('settle',{attempt_id:candidate.attempt_id,state:'accepted',message_id:receipt.messageId,message_ids:receipt.messageIds,partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles});
+          void this.review();return settled;
+        }
+        if(receipt?.state==='canceled')return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:{action:'abandon',reason:'A new owner turn superseded the unsent draft'}});
+        return {...candidate,delivery:receipt};
+      }
       if(!candidate.eligible)return candidate;
       const epoch=this.ownerEpoch();
       if(this.closed||this.isBusy()||!this.eligibility().eligible)return {state:'waiting'};
@@ -68,10 +82,13 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'unconfirmed',reason:'Context changed at send boundary; no automatic replay'});
       }
       possibleSend=true;
-      const receipt=await this.send({id:attempt.id,text:content});
+      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,
+        guard:()=>!this.closed&&!this.isBusy()&&this.eligibility().eligible&&epoch===this.ownerEpoch()});
       const state=receipt.state==='accepted'&&receipt.messageId?'accepted':'unconfirmed';
-      return await this.call('settle',{attempt_id:attempt.id,state,message_id:receipt.messageId,
+      const settled=await this.call('settle',{attempt_id:attempt.id,state,message_id:receipt.messageId,message_ids:receipt.messageIds,
                                       reason:state==='accepted'?'Platform accepted; phone read unverified':'Receipt requires reconciliation'});
+      if(state==='accepted')void this.review();
+      return settled;
     } catch {
       if(attempt) {
         try {return await this.call('settle',{attempt_id:attempt.id,state:possibleSend?'unconfirmed':'canceled',reason:'Host action failed'});}
@@ -89,7 +106,7 @@ export function stateContext(result) {
     revision:state.revision,agent_version:state.agent_version,profile_version:state.profile_version,persona_contract:state.persona_contract,
     dimensions:Object.fromEntries(Object.entries(state.dimensions).map(([k,v])=>[k,{value:v.value,basis:v.basis,needs_review:v.needs_review,reason:v.reason}])),
     desires:state.desires.filter(d=>!d.expired&&!d.needs_review&&['wanted','waiting','in_progress'].includes(d.status)).slice(-8),
-    traits:state.traits,interaction_style:state.interaction_style,contact:state.contact,appraisal:result.appraisal??result.appraisals,
+    traits:state.traits,interaction_style:state.interaction_style,contact:state.contact,action_policy:state.action_policy,action_events:state.action_events,appraisal:result.appraisal??result.appraisals,
     exploration_results:(result.findings??[]).filter(x=>x.result).map(x=>({id:x.id,state:x.state,result:x.result,source_id:x.source_id})).slice(0,2)
   });
 }

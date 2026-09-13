@@ -16,8 +16,8 @@ from pydantic import Field, FiniteFloat, StrictInt, field_validator, model_valid
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, Scope, now, utc
-from eventmem.core.self_knowledge import SelfKnowledge, metadata
 from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
+from eventmem.core.self_knowledge import SelfKnowledge, metadata
 
 from .profile import DIMENSIONS, default_profile, interaction_style
 
@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS mind_contacts(
  id TEXT PRIMARY KEY, scope TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS mind_contact_active ON mind_contacts(scope)
  WHERE state IN ('drafting','pending','unconfirmed');
+CREATE TABLE IF NOT EXISTS mind_action_events(
+ id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,
+ state TEXT NOT NULL,data TEXT NOT NULL);
 """
 
 
@@ -58,12 +61,19 @@ class Evolution(Model):
         return self
 
 
+class Motivation(Model):
+    target: StrictInt = Field(ge=0, le=100)
+    half_life_minutes: Literal[20, 60, 180]
+    reason: str = Field(min_length=1, max_length=1200)
+
+
 class AffectiveEvent(Model):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
     evidence_ids: list[str] = Field(min_length=1, max_length=50)
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
+    motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
     reason: str = Field(min_length=1, max_length=1200)
     origin: Literal["interaction", "exploration", "reflection"] = "interaction"
     evolution: Evolution | None = None
@@ -77,7 +87,9 @@ class AffectiveEvent(Model):
 
     @model_validator(mode="after")
     def separate_evolution(self):
-        if self.evolution and self.values:
+        if set(self.motivations) - {"initiative", "curiosity"}:
+            raise ValueError("Motivation applies to initiative and curiosity")
+        if self.evolution and (self.values or self.motivations):
             raise ValueError("Separate state observations from personality evolution")
         return self
 
@@ -434,6 +446,8 @@ class Mind:
 
     def _initiative_value(self, conn, state, at):
         entry = state["dimensions"]["initiative"]
+        if entry.get("motivation") or state.get("action_policy"):
+            return project(entry, at)
         cursor, end = entry["at"], at
         value = entry["score"]
         wishes = [
@@ -471,6 +485,8 @@ class Mind:
 
     def _retarget(self, conn, state, at):
         current = state["dimensions"]["initiative"]
+        if current.get("motivation") or state.get("action_policy"):
+            return
         value = self._initiative_value(conn, state, at)
         target = max(
             [
@@ -515,8 +531,11 @@ class Mind:
             raise Conflict(
                 "This evidence was already appraised; use a source correction or new evidence"
             )
-        for key, score in request.values.items():
+        for key in request.values.keys() | request.motivations.keys():
             spec = state["profile"]["dimensions"][key]
+            previous = state["dimensions"][key]
+            score = request.values.get(key, project(previous, self.clock()))
+            motivation = request.motivations.get(key)
             state["dimensions"][key] = {
                 "score": score,
                 "baseline": spec["baseline"],
@@ -529,6 +548,12 @@ class Mind:
                 "event_id": event_id,
                 "agent_version": request.agent_version,
             }
+            if motivation or previous.get("motivation"):
+                setting = motivation.model_dump() if motivation else previous["motivation"]
+                state["dimensions"][key].update(
+                    target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
+                    motivation={**setting, "episode_id": event_id},
+                )
         state["last_evidence_key"] = evidence_key
         self._retarget(conn, state, self.clock())
 
@@ -794,6 +819,7 @@ class Mind:
             values[key] = {
                 "label": state["profile"]["dimensions"][key]["label"],
                 "value": round(projected),
+                "projected_value": projected,
                 "raw_value": entry["score"],
                 "baseline": entry["baseline"],
                 "half_life_hours": entry["half_life_hours"],
@@ -805,6 +831,7 @@ class Mind:
                 "agent_version": entry["agent_version"],
                 "evidence_ids": [r["record_id"] for r in entry["evidence"]],
                 "reason": entry.get("reason", "初始化角色底色，尚无状态观测"),
+                "motivation": entry.get("motivation"),
             }
         traits = {
             k: dict(v, needs_review=not self._entry_fresh(conn, v))
@@ -833,6 +860,9 @@ class Mind:
             "exploration": state["profile"]["exploration"],
             "autonomy": self._autonomy(conn, state),
             "last_evolution_day": state["last_evolution_day"],
+            "action_policy": ({**state["action_policy"], "needs_review": not self._fresh(conn, state["action_policy"]["evidence"])} if state.get("action_policy") else None),
+            "action_events": [{**json.loads(r["data"]), "id": r["id"], "kind": r["kind"], "state": r["state"]}
+                              for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
         }
 
     def read(self, *, as_of=None, history=0):
@@ -843,6 +873,12 @@ class Mind:
                 conn, self._load(conn), utc(as_of) if as_of else self.clock()
             )
             result["persona_contract"] = persona_metadata(load_persona(self.engine, self.scope))
+            result["decision_runtime"] = None
+            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
+                receipt = conn.execute("SELECT json_extract(data,'$.receipt') FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.receipt') IS NOT NULL ORDER BY json_extract(data,'$.receipt.verified_at') DESC LIMIT 1", (self.scope.key(),)).fetchone()
+                if receipt:
+                    details = json.loads(receipt[0])
+                    result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
             state = self._load(conn)
             behavior = state.get("behavior", {})
             if behavior and self._fresh(conn, behavior["evidence"]):
@@ -920,11 +956,13 @@ class Mind:
             view = self._view(conn, state, self.clock())
             if view["contact"].get("preference", {}).get("needs_review"):
                 return {"eligible": False, "reason": "contact-preference-needs-review"}
+            if (view.get("action_policy") or {}).get("needs_review"):
+                return {"eligible": False, "reason": "action-policy-needs-review"}
             waiting = [{"id": d["id"], "expired": d["expired"], "needs_review": d["needs_review"],
                         **d.get("contact_wait", {"condition": "new_evidence", "reason": d.get("reason", "")})}
                        for d in view["desires"] if d["kind"] == "contact" and d["status"] == "waiting"]
             active = conn.execute(
-                "SELECT id,state FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending','unconfirmed')",
+                "SELECT id,state,data FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending','unconfirmed')",
                 (self.scope.key(),),
             ).fetchone()
             if active:
@@ -933,10 +971,13 @@ class Mind:
                     "reason": "attempt-in-progress",
                     "attempt_id": active["id"],
                     "state": active["state"],
+                    "owner_epoch": json.loads(active["data"])["owner_epoch"],
                 }
+            if self._delivery_review_pending(conn):
+                return {"eligible": False, "reason": "delivery-appraisal-pending"}
             if view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
-            if view["dimensions"]["initiative"]["value"] < view["contact"]["threshold"]:
+            if view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
                 return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock())
@@ -964,6 +1005,8 @@ class Mind:
             ).fetchone()
             if existing:
                 raise Conflict("An unresolved contact attempt already exists")
+            if self._delivery_review_pending(conn):
+                raise Conflict("Delivery appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
             ready = [
@@ -971,9 +1014,10 @@ class Mind:
             ]
             if (
                 not ready
+                or (view.get("action_policy") or {}).get("needs_review")
                 or view["contact"].get("preference", {}).get("needs_review")
                 or view["dimensions"]["initiative"]["needs_review"]
-                or view["dimensions"]["initiative"]["value"]
+                or view["dimensions"]["initiative"]["projected_value"]
                 < view["contact"]["threshold"]
             ):
                 raise Conflict("The contact threshold or desire is no longer current")
@@ -1021,13 +1065,14 @@ class Mind:
             value = view["dimensions"]["initiative"]
             valid = (
                 attempt["state"] == "drafting"
+                and not (view.get("action_policy") or {}).get("needs_review")
                 and not view["contact"].get("preference", {}).get("needs_review")
                 and attempt["owner_epoch"] == owner_epoch
                 and desire
                 and desire["revision"] == attempt["desire_revision"]
                 and self._desire_ready(conn, desire, self.clock())
                 and not value["needs_review"]
-                and value["value"] >= state["profile"]["contact"]["threshold"]
+                and value["projected_value"] >= state["profile"]["contact"]["threshold"]
             )
             return {
                 "eligible": bool(valid),
@@ -1044,7 +1089,10 @@ class Mind:
             raise Missing("Contact attempt is outside this scope or missing")
         return json.loads(row[0])
 
-    def settle_contact(self, *, attempt_id, state, message_id=None, reason="", decision=None):
+    def _delivery_review_pending(self, conn):
+        return bool(conn.execute("SELECT 1 FROM mind_action_events WHERE scope=? AND state IN ('pending','queued') LIMIT 1", (self.scope.key(),)).fetchone())
+
+    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, partial=False, canceled_bubbles=0, aborted_before_send=False):
         decision = ContactDecision.model_validate(decision) if decision is not None else None
         if decision and state != "canceled":
             raise ValueError("Wish decisions apply only before sending")
@@ -1056,12 +1104,16 @@ class Mind:
             raise ValueError("A platform message ID is required")
         with self.engine.db.connect(write=True) as conn:
             attempt = self._attempt(conn, attempt_id)
+            if aborted_before_send and (state != "canceled" or message_id or attempt.get("message_id") or attempt.get("message_ids")):
+                raise ValueError("Only a host-verified wholly unsent batch can be canceled")
+            if type(partial) is not bool or type(canceled_bubbles) is not int or canceled_bubbles < 0:
+                raise ValueError("Invalid partial delivery receipt")
             if attempt["state"] == "accepted":
                 if state != "accepted" or attempt["message_id"] != message_id:
                     raise Conflict("Accepted delivery cannot be rewritten")
                 return attempt
             if attempt["state"] == "canceled" or (
-                state == "canceled" and attempt["state"] != "drafting"
+                state == "canceled" and attempt["state"] != "drafting" and not aborted_before_send
             ):
                 raise Conflict(
                     "A possible send requires reconciliation, not cancellation"
@@ -1069,6 +1121,12 @@ class Mind:
             attempt.update(state=state, updated_at=self.clock(), reason=reason)
             if message_id:
                 attempt.update(message_id=message_id, visibility="unverified")
+            if message_ids:
+                if not all(isinstance(x, str) and x.strip() for x in message_ids):
+                    raise ValueError("Message identifiers must be nonempty strings")
+                attempt["message_ids"] = message_ids
+            if partial:
+                attempt.update(partial=True, canceled_bubbles=canceled_bubbles)
             conn.execute(
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
@@ -1108,22 +1166,27 @@ class Mind:
                 desire.update(
                     status="completed",
                     delivery={
-                        "state": "accepted",
+                        "state": "partial" if partial else "accepted",
                         "message_id": message_id,
+                        "message_ids": message_ids or [message_id],
+                        "canceled_bubbles": canceled_bubbles,
                         "visibility": "unverified",
                     },
                     revision=desire["revision"] + 1,
                     updated_at=self.clock(),
                 )
-                entry = current["dimensions"]["initiative"]
-                entry.update(
-                    score=current["profile"]["contact"]["reset"],
-                    at=self.clock(),
-                    event_id="mind_" + digest([attempt_id, "accepted"])[:32],
-                    basis="delivery_observed",
-                    reason="平台接收主动消息；手机已读未验证",
-                )
-                self._retarget(conn, current, self.clock())
+                # Acceptance is an execution fact. DeepSeek evaluates satisfaction;
+                # the transport never assigns an emotion score or invents a thought.
+                event_key = "delivery_" + digest([attempt_id, "accepted"])[:32]
+                conn.execute("INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)", (
+                    event_key, self.scope.key(), "delivery", self.clock(), "pending",
+                    dumps({"attempt_id": attempt_id, "desire_id": desire["id"],
+                           "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                           "message_ids": message_ids or [message_id],
+                           "partial": partial, "canceled_bubbles": canceled_bubbles,
+                           "agent_version": current["agent_version"],
+                           "visibility": "unverified"}),
+                ))
                 current["revision"] += 1
                 current["updated_at"] = self.clock()
                 self._save(conn, current)

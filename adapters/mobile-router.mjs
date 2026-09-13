@@ -108,6 +108,7 @@ export class MobileRouter {
       const owner=!input.kind||input.kind==='owner';
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
+      if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
       let decision,reason;
       if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
@@ -147,12 +148,14 @@ export class MobileRouter {
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
+    if(selected.state==='deferred')return {route:'deferred',reason:selected.reason};
     if(selected.state==='accepted')return {route:'deduplicated',model:selected.model};
     for(;;) {
       const outcome=await this.locked(async()=>{
         const record=this.state.inputs[input.id];
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         const runtime=await this.reconcileTransition(await this.inspect());
+        if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
         if(record.route==='control') {
           this.acceptControl(record,runtime);record.state='accepted';record.acceptedAt=this.now();
           this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:runtime.model};
@@ -185,6 +188,7 @@ export class MobileRouter {
         } else this.state.actual=runtime;
         if(target===ROUTER_MODELS.work&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.addTask(input).id;
         if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
+        if(input.kind==='proactive'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
         record.state='submitting';record.model=target;this.save('input-submitting',{id:input.id});
         try {
           const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null});

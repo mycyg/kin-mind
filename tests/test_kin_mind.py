@@ -132,7 +132,8 @@ def test_threshold_before_four_hours_delivery_idempotency(setup):
         )
         == receipt
     )
-    assert mind.read()["dimensions"]["initiative"]["value"] == 20
+    assert mind.read()["dimensions"]["initiative"]["value"] == 80
+    assert mind.contact_candidate()["reason"] == "delivery-appraisal-pending"
     assert mind.read()["desires"][0]["delivery"]["visibility"] == "unverified"
     assert mind.read()["desires"][0]["status"] == "completed"
     assert not mind.contact_candidate()["eligible"]
@@ -254,8 +255,9 @@ def test_deepseek_contract_and_redaction(monkeypatch):
     def handler(request):
         assert request.headers["x-api-key"] == "test-only-key"
         body = json.loads(request.content)
-        assert body["tool_choice"]["name"] == "submit_appraisal"
-        assert body["thinking"]["type"] == "disabled"
+        assert body["tool_choice"]["type"] == "auto"
+        assert body["thinking"]["type"] == "enabled"
+        assert body["output_config"]["effort"] == "max"
         return httpx.Response(
             200,
             json={
@@ -407,7 +409,7 @@ def test_authorized_time_growth_and_open_discovery(setup, tmp_path):
     assert Mind(mind.engine, mind.scope, clock=mind.clock).read()["dimensions"]["initiative"] == projected["dimensions"]["initiative"]
 
     def runner(executable, brief, directory, **kwargs):
-        assert brief["topic"] == "Kin 选定的探索题目" and brief["source_ids"]
+        assert brief["topic"] == "synthetic" and brief["source_ids"]
         assert kwargs["budget_seconds"] == 1200
         return {"state": "complete", "partial": False, "result": {
             "summary": "A synthetic discovery", "findings": ["Synthetic"],
@@ -415,8 +417,9 @@ def test_authorized_time_growth_and_open_discovery(setup, tmp_path):
             "open_questions": [], "suggested_share": "A discovery",
         }}
     explorer = Explorations(mind)
-    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["reason"] == "kin-topic-selection-required"
-    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner, brief="Kin chooses a synthetic question")["state"] == "complete"
+    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["reason"] == "no-exploration-intent"
+    wish(mind, source, "reviewed-exploration", kind="explore")
+    assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["state"] == "complete"
     assert explorer.run("fake", tmp_path / "jobs", "synthetic-v2", runner=runner)["state"] == "waiting"
 
 
@@ -444,6 +447,7 @@ def test_minute_review_queues_authorized_exploration_once(setup, tmp_path, monke
     monkeypatch.setattr(host.Appraisals, "run_one", lambda self, provider: {"state": "idle"})
     config = {"root": str(tmp_path), "scope": mind.scope.model_dump(),
               "exploration_stop_file": str(tmp_path / "stop")}
+    wish(mind, source, "reviewed-question", kind="explore")
     assert host.dispatch(config, "review", {})["state"] == "idle"
     wake = tmp_path / "mind-exploration-request.json"
     before = wake.stat().st_mtime_ns

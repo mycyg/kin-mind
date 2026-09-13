@@ -52,7 +52,7 @@ valid revision while appraisal is pending.
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without
 reducing idle provider requests, which are already zero. Exploration retains its
-independent four-hour cadence.
+independent curiosity threshold and consumed wish identities.
 
 The optional [mobile routing host](mobile-routing.md) keeps conversation and work
 models in one native thread, protects ongoing tasks during model changes, and
@@ -66,8 +66,7 @@ revision while retaining history; intervening personality revisions require revi
 
 ## Exploration
 
-`Explorations` selects an unexpired, source-backed exploration wish. The four-hour
-cadence and 1,200-second maximum are stored in the profile. `run_kimi` starts the
+`Explorations` claims an unexpired question selected by DeepSeek when curiosity is at least 75. The worker claim and desire transition are atomic. There is no elapsed-time admission gate; the 1,200-second maximum remains in the profile. `run_kimi` starts the
 installed CLI with a dedicated [agent profile](https://moonshotai.github.io/kimi-code/en/customization/agents.html)
 that allows Read, Grep, Glob, WebSearch and FetchURL. It excludes write, shell,
 subagent and messaging tools and overrides automatic skill discovery. These are
@@ -119,10 +118,9 @@ It performs these operations:
    transport outbox. Accepted requires the platform's message ID. A timeout, missing
    ID, context race at the send boundary, or uncertain failure stays unconfirmed.
    Never replay it under a fresh ID. Reconcile with actual platform evidence.
-6. On accepted delivery, complete that wish and reset initiative to 20. Track phone
-   visibility separately. An internal wake does not count as a user reply.
+6. On accepted delivery, complete that wish and atomically queue a DeepSeek reassessment. Hold further contact until that review finishes; transport does not assign a score. Track phone visibility separately. An internal wake does not count as a user reply.
 
-Drafts use the public `contact-draft.mjs` contract: send text, abandon an obsolete
+Drafts use the public `contact-draft.mjs` contract: send `bubbles` (legacy `text` remains valid), abandon an obsolete
 wish, or wait for a declared condition. Time waits include a bounded `retry_at`;
 owner-reply waits require authenticated owner activity; evidence waits require a
 new related source. The host calls `reconsider` before candidate selection. This
@@ -158,3 +156,39 @@ delivery, personality evidence and reversion, provider validation, and Kimi proc
 cancellation. Node tests cover quiet/wait gates, owner input races, concurrent ticks,
 platform receipt requirements and uncertain sends. Real providers use private runtime
 verification; CI uses synthetic sources and controlled provider/CLI stubs.
+
+
+## Affect-driven action episodes
+
+`AffectiveEvent.motivations` and `Appraisal.motivations` accept `initiative` and
+`curiosity`, each with a target (0–100), a half-life in minutes (20, 60 or 180),
+and a sourced reason. These are short-term episode parameters; long-term trait
+calibration remains separate. A persisted crossing key prevents a high plateau
+or restart from calling the model repeatedly. Internal thoughts are model-origin
+sources and do not count as new owner interactions or personality evidence.
+
+`ActionEvents` is the transactional outbox for bootstrap, threshold crossings,
+exploration findings and accepted contact. It materializes idempotent sources and
+appraisal jobs. The owner host also ingests public assistant results. Failed model
+requests remain pending with bounded backoff; corrected evidence requires review.
+A delivery receipt can update satisfaction and remaining motivation but cannot
+create a new wish on its own. Existing useful, playful or affectionate intentions
+can continue without imposing a fixed reset or a fixed sending interval.
+
+`configure-actions` requires explicit source evidence, configuration version and
+revision. It installs the policy and queues a one-time migration review without
+resetting scores or reopening completed, expired or abandoned wishes. `read`
+returns episode metadata, action-event state and a verified `decision_runtime`.
+Exploration wishes supplied through another tool are reviewed by DeepSeek before
+execution. The original shared conversation generates outreach only after its
+actual DeepSeek model is verified; active work defers it without changing GPT.
+
+`createContactBatch` freezes text and per-bubble IDs before sending. A restart
+reuses accepted receipts, reconciles uncertain bubbles, and only then sends the
+unsent remainder. The same paragraph splitter serves ordinary and proactive chat;
+it preserves fenced code, words and links rather than truncating them to fit.
+
+DeepSeek requests enable thinking with `output_config.effort=max`, using the
+[official effort controls](https://api-docs.deepseek.com/guides/thinking_mode/).
+Only the validated structured tool result enters the state store. Public copies
+contain synthetic examples; persona contracts and actual state remain private.

@@ -106,7 +106,7 @@ user work permits. Repeated findings do not create duplicate repair jobs. A fail
 review waits for the next review period rather than retrying every minute.
 
 The desktop monitor runs every twenty-four hours as an external check. Local
-transport recovery, contact eligibility checks and the four-hour exploration
+transport recovery, affect-driven contact checks and curiosity-led exploration
 schedule remain independent. Exploration retains its twenty-minute budget.
 Routine healthy reviews do not send a message.
 
