@@ -82,12 +82,12 @@ uv run python examples/mind_demo.py
 
 示例在临时库中运行，不访问个人记忆。生产宿主需配置已有数据库、独立范围、配置版本、DeepSeek 凭据环境变量，以及 Kimi CLI 的登录配置。
 
-MCP 增加三个接口：
+MCP 增加四个接口：
 
 | 接口 | 内容 |
 |---|---|
-| `read_affective_state` | 当前状态、愿望、来源和可选历史 |
-| `manage_concern` | 有来源与修订历史的心事、缓解、解决与重新开启 |
+| `read_affective_state` | 状态、愿望、心事、节律、表达与来源；可选历史 |
+| `manage_concern` | 建立、更新、缓解、解决、重新开启与归档心事；保留来源和修订 |
 | `record_affective_event` | 有版本与去重校验的状态事件；私有宿主可委托 DeepSeek |
 | `manage_desire` | 愿望创建、修订与状态转换 |
 
