@@ -5,6 +5,11 @@ memories or create native agent conversations. A host chooses one database path,
 `Scope`, and configuration version across channels. Persona-specific initialization
 requires a retained explicit configuration source. All following examples are synthetic.
 
+The optional [continuity layer](continuity.md) adds event understanding, grounded
+concerns, local expression compilation and interaction-led rhythm to the same
+transaction and asynchronous assessment. It introduces no separate expression
+model request or native conversation.
+
 ## Storage and tools
 
 `Mind` persists the aggregate state, an append-only event snapshot history, and a

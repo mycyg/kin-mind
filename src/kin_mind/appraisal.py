@@ -14,12 +14,13 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import Field, StrictInt, ValidationError, field_validator
+from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
 
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
+from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 
@@ -31,6 +32,7 @@ class Wish(Model):
     strength: StrictInt = Field(ge=0, le=100)
     ttl_hours: StrictInt = Field(ge=1, le=168)
     completion: str = Field(min_length=1, max_length=1000)
+    concern_ids: list[str] = Field(default_factory=list, max_length=10)
 
     @field_validator("kind")
     @classmethod
@@ -42,7 +44,8 @@ class Wish(Model):
 
 class WishUpdate(Model):
     desire_id: str
-    action: Literal["wait", "resume", "complete", "abandon"]
+    action: Literal["wait", "resume", "complete", "abandon", "link"]
+    concern_ids: list[str] | None = Field(default=None, max_length=10)
     reason: str = Field(min_length=1, max_length=1200)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
@@ -50,9 +53,15 @@ class WishUpdate(Model):
     @field_validator("action")
     @classmethod
     def action_valid(cls, v):
-        if v not in {"wait", "resume", "complete", "abandon"}:
+        if v not in {"wait", "resume", "complete", "abandon", "link"}:
             raise ValueError("Unsupported wish transition")
         return v
+
+    @model_validator(mode="after")
+    def link_shape(self):
+        if self.action == "link" and self.concern_ids is None:
+            raise ValueError("Link updates require concern_ids")
+        return self
 
 
 class Appraisal(Model):
@@ -62,6 +71,9 @@ class Appraisal(Model):
     wishes: list[Wish] = Field(default_factory=list, max_length=2)
     wish_updates: list[WishUpdate] = Field(default_factory=list, max_length=6)
     evolution: Evolution | None = None
+    understanding: Understanding | None = None
+    concerns: list[ConcernProposal] = Field(default_factory=list, max_length=6)
+    rhythm: RhythmProposal | None = None
 
     @field_validator("motivations")
     @classmethod
@@ -102,6 +114,15 @@ bootstrap是用户授权的新策略生效评估：复核有效待办，设置�
 wish-review请求你确认一个已有探索意图；选定它时通过wish_updates的resume确认，不想做则wait或abandon。bootstrap时也确认要继续的现有探索意图。已有愿望的完成、等待和恢复写入wish_updates；只调整有变化的项。中文聊天偏好是有情绪的完整口语短句，通常每句话20字以内，按停顿分气泡；工作成稿依用途保持完整。
 """
 
+SYSTEM += """
+连续性字段只在 state.continuity.features 的对应项启用时填写：
+understanding 保存事件含义、话题、重要程度、置信度与来源。basis=explicit 表示用户明确陈述，inferred 表示你的解读，internal_thought 表示自己的念头；解释写简短结论。低把握的关系解读标为 inferred 并保留低置信度。
+concerns 是心事变更，涵盖 care、anticipation、curiosity、distress、shared_plan。每件心事有稳定 key，先更新已有编号。create 要填 key、kind、content、topic、intensity、basis、confidence、reason；update/ease/resolve/reopen/archive 使用 concern_id。来源引用使用本次 new_evidence 中的 id，也可使用 state 中既有且有效的 evidence_ids。心事与愿望分别保存；发过询问不表示事情已经解决。resolve 需要新的结果或更正来源；已结束心事保持原状态，新发生的同类事情可以明确 reopen。相同经历的摘要只补充关联，不重复提高强度。
+wishes.concern_ids 和 wish_updates.concern_ids 关联已有心事编号，或同一结果中新建心事的 key。给已有愿望建立关联使用 action=link；心事变更后，需要继续的愿望通过 resume/link 确认当前依据。待核验心事先保留，不建立依赖它的可执行愿望。
+rhythm 采用 interaction-led 模式，依据 state.rhythm.interactions 的14天真实互动窗口、表达活力和当前话题，提出 phase、alertness、target、half_life_minutes 和 reason。phase 为 awake、settling、drowsy、resting、roused、recovering；速度为20、60、180分钟。没有固定入睡或起床时刻。forming 是样本形成期，phase 属于角色运行状态，不是观察到的生理睡眠。后台事件不算用户活跃；维护结果和发送回执本身不改变作息判断。有新互动或对当下节奏的新认识时再更新。
+continuity-bootstrap 只建立仍有效愿望与原始来源支持的心事关联，并给出事件理解和节律建议。已有分数、短期动力、愿望内容及状态保持；wishes 留空，wish_updates 只使用 link。已完成、过期和放弃的愿望保持历史身份。没有足够依据的部分留空，不为迁移编造经历。
+"""
+
 
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
@@ -112,6 +133,7 @@ def appraisal_context(context):
     state = {k: v for k, v in original.items() if k in {
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
+        "continuity", "rhythm", "appraisal_summary",
     }}
     state["dimensions"] = {}
     for key, value in original.get("dimensions", {}).items():
@@ -126,7 +148,7 @@ def appraisal_context(context):
     state["desires"] = []
     for desire in original.get("desires", []):
         active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
-        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired"}
+        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review"}
         if active:
             keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
         projected = {k: v for k, v in desire.items() if k in keys}
@@ -135,12 +157,24 @@ def appraisal_context(context):
             projected["reason"] = desire.get("reason", "")[:300]
             projected["evidence_ids"] = [r["record_id"] for r in desire.get("evidence", [])]
         state["desires"].append(projected)
+    # Keep the decision window bounded; evidence dedup and revision history do
+    # not depend on which concerns happen to fit this request.
+    concerns = original.get("concerns", [])
+    query = " ".join(s.get("text", "")[:2000] for s in context.get("new_evidence", []))
+    relevant = {c["id"] for c in select_concerns(concerns, query, limit=8)}
+    linked = {cid for d in state["desires"] if d["status"] in {"wanted", "waiting", "in_progress"} for cid in d.get("concern_ids", [])}
+    chosen = sorted(concerns, key=lambda c: (
+        c["id"] in relevant, c["id"] in linked,
+        c["status"] in {"active", "easing"}, c.get("updated_at", ""), c["id"],
+    ), reverse=True)[:32]
+    state["concerns"] = [{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review")} for c in chosen]
+    state["concern_window"] = {"included": len(chosen), "total": len(concerns)}
     if original.get("action_policy"):
         state["action_policy"] = {k: v for k, v in original["action_policy"].items() if k in {
             "version", "trigger", "provider", "reasoning", "configured_at", "needs_review",
         }}
     result["state"] = state
-    result["context_projection"] = "affect-decision-v2"
+    result["context_projection"] = "affect-decision-v3"
     return result
 
 
@@ -172,6 +206,7 @@ class DeepSeek:
         return provider
 
     def appraise(self, context):
+        started = time.monotonic()
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         request_context = appraisal_context(context)
         key = os.environ.get(self.key_env)
@@ -222,9 +257,10 @@ class DeepSeek:
                 "reasoning": "max",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
-                "context_projection": "affect-decision-v2",
+                "context_projection": "affect-decision-v3",
                 "context_characters": len(dumps(request_context)),
                 "max_output_tokens": 131072,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
             }
         except httpx.TimeoutException:
             raise RuntimeError("deepseek-timeout") from None
@@ -278,6 +314,22 @@ class Appraisals:
                 (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data)),
             )
         return {"id": job_id, "state": self.status(job_id)["state"]}
+
+    def migrate_continuity(self, evidence_ids, agent_version):
+        """One durable migration; include original evidence of live wishes only."""
+        with self.engine.db.connect() as conn:
+            refs = self.mind._evidence(conn, evidence_ids)
+            if any(r["authority"] != "explicit" for r in refs) or not self.mind._fresh(conn, refs):
+                raise Conflict("Migration requires current owner evidence")
+            state = self.mind._load(conn)
+            ids = list(evidence_ids)
+            for wish in state["desires"].values():
+                if wish["status"] in {"wanted", "waiting", "in_progress"} and timestamp(wish["expires_at"]) > timestamp(self.mind.clock()) and self.mind._fresh(conn, wish["evidence"]):
+                    ids.extend(ref["source_id"] for ref in wish["evidence"])
+            ids = list(dict.fromkeys(ids))
+            if len(ids) > 50:
+                raise Conflict("Migration source set needs a bounded batch")
+        return self.enqueue(ids, agent_version, origin="reflection", stimulus="continuity-bootstrap")
 
     def status(self, job_id=None):
         with self.engine.db.connect() as conn:
@@ -352,7 +404,10 @@ class Appraisals:
                 proposal, receipt = provider.appraise(
                     {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
                 )
-                effective_version = (view.get("action_policy") or {}).get("version", data["agent_version"])
+                migration = data.get("stimulus") == "continuity-bootstrap"
+                if migration:
+                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [u for u in proposal.wish_updates if u.action == "link"], "evolution": None})
+                effective_version = (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
                 receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
                 data["receipt"] = receipt
                 event = AffectiveEvent(
@@ -364,10 +419,17 @@ class Appraisals:
                     motivations=proposal.motivations,
                     reason=proposal.reason,
                     origin=data["origin"],
+                    understanding=proposal.understanding,
+                    rhythm=proposal.rhythm if data.get("stimulus") != "delivery" else None,
                 )
 
                 def apply(conn, state, eid):
-                    self.mind._apply_event(conn, state, event, eid)
+                    roots = self.mind._evidence(conn, data["evidence_ids"])
+                    allowed = self.mind._continuity_sources(conn, state, roots) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
+                    self.mind._apply_event(conn, state, event, eid, allowed)
+                    if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery":
+                        for concern in proposal.concerns:
+                            self.mind._apply_concern(conn, state, concern, eid, effective_version, fallback=roots, allowed=allowed)
                     for index, wish in enumerate([] if data.get("stimulus") == "delivery" else proposal.wishes):
                         if any(
                             d["content"] == wish.content
@@ -386,6 +448,7 @@ class Appraisals:
                                         "origin",
                                         "evolution",
                                         "command_id",
+                                        "understanding", "rhythm",
                                     }
                                 ),
                                 command_id=row["id"] + ":wish:" + str(index),
@@ -405,13 +468,13 @@ class Appraisals:
                             continue
                         # Ordinary conversation can supersede a wish without inventing
                         # a proactive transport receipt. Retire it as abandoned.
-                        action = "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
+                        action = "update" if update.action == "link" else "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
                         changed = self.mind._apply_desire(
                             conn,
                             state,
                             DesireChange(
                                 **event.model_dump(
-                                    exclude={"values", "motivations", "origin", "evolution", "reason"}
+                                    exclude={"values", "motivations", "origin", "evolution", "reason", "understanding", "rhythm"}
                                 ),
                                 **{**update.model_dump(), "action": action,
                                    "wait_condition": update.wait_condition if action == "wait" else None},

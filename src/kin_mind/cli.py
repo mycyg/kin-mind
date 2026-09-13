@@ -8,6 +8,7 @@ from pathlib import Path
 from eventmem.core import Engine
 from eventmem.core.models import Scope
 
+from .continuity import ConcernChange, ContinuityConfig
 from .state import AffectiveEvent, DesireChange, Mind
 
 
@@ -27,6 +28,8 @@ def main():
             "settle",
             "reconsider",
             "configure-behavior",
+            "configure-continuity",
+            "concern",
         ],
     )
     args = parser.parse_args()
@@ -40,6 +43,10 @@ def main():
         result = mind.record(AffectiveEvent.model_validate(request))
     elif args.action == "desire":
         result = mind.manage_desire(DesireChange.model_validate(request))
+    elif args.action == "concern":
+        result = mind.manage_concern(ConcernChange.model_validate(request))
+    elif args.action == "configure-continuity":
+        result = mind.configure_continuity(ContinuityConfig.model_validate(request))
     elif args.action == "candidate":
         result = mind.contact_candidate()
     elif args.action == "claim":

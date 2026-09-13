@@ -19,6 +19,8 @@ from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
 
+from .continuity import SCHEMA as CONTINUITY_SCHEMA
+from .continuity import Continuity, RhythmProposal, Understanding
 from .profile import DIMENSIONS, default_profile, interaction_style
 
 SCHEMA = """
@@ -77,6 +79,8 @@ class AffectiveEvent(Model):
     reason: str = Field(min_length=1, max_length=1200)
     origin: Literal["interaction", "exploration", "reflection"] = "interaction"
     evolution: Evolution | None = None
+    understanding: Understanding | None = None
+    rhythm: RhythmProposal | None = None
 
     @field_validator("values")
     @classmethod
@@ -89,7 +93,7 @@ class AffectiveEvent(Model):
     def separate_evolution(self):
         if set(self.motivations) - {"initiative", "curiosity"}:
             raise ValueError("Motivation applies to initiative and curiosity")
-        if self.evolution and (self.values or self.motivations):
+        if self.evolution and (self.values or self.motivations or self.understanding or self.rhythm):
             raise ValueError("Separate state observations from personality evolution")
         return self
 
@@ -109,6 +113,7 @@ class DesireChange(Model):
     strength: StrictInt | None = Field(default=None, ge=0, le=100)
     expires_at: str | None = None
     completion: str | None = Field(default=None, min_length=1, max_length=1000)
+    concern_ids: list[str] | None = Field(default=None, max_length=10)
     reason: str = Field(min_length=1, max_length=1200)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
@@ -158,11 +163,11 @@ def project(entry, at):
     return min(100.0, max(0.0, value))
 
 
-class Mind:
+class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(SCHEMA + CONTINUITY_SCHEMA)
 
     def _load(self, conn):
         row = conn.execute(
@@ -253,6 +258,8 @@ class Mind:
         return True
 
     def _entry_fresh(self, conn, entry):
+        if entry.get("interpretation_unverified"):
+            return False
         if not self._fresh(conn, entry["evidence"]):
             return False
         if entry.get("claim_id"):
@@ -442,6 +449,7 @@ class Mind:
             and desire["status"] == "wanted"
             and timestamp(desire["expires_at"]) > timestamp(at)
             and self._fresh(conn, desire["evidence"])
+            and (not desire.get("concern_revisions") or self._concern_links_fresh(conn, self._load(conn), desire))
         )
 
     def _initiative_value(self, conn, state, at):
@@ -514,7 +522,7 @@ class Mind:
             lambda conn, state, eid: self._apply_event(conn, state, request, eid),
         )
 
-    def _apply_event(self, conn, state, request, event_id):
+    def _apply_event(self, conn, state, request, event_id, continuity_sources=None):
         refs = self._evidence(conn, request.evidence_ids)
         if request.evolution:
             return self._evolve(conn, state, request, refs, event_id)
@@ -531,6 +539,9 @@ class Mind:
             raise Conflict(
                 "This evidence was already appraised; use a source correction or new evidence"
             )
+        previous_values = {key: project(entry, self.clock()) for key, entry in state["dimensions"].items()}
+        if continuity_sources is None and (request.understanding or request.rhythm):
+            continuity_sources = self._continuity_sources(conn, state, refs)
         for key in request.values.keys() | request.motivations.keys():
             spec = state["profile"]["dimensions"][key]
             previous = state["dimensions"][key]
@@ -555,6 +566,7 @@ class Mind:
                     motivation={**setting, "episode_id": event_id},
                 )
         state["last_evidence_key"] = evidence_key
+        self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
 
     def manage_desire(self, request: DesireChange):
@@ -566,6 +578,7 @@ class Mind:
 
     def _apply_desire(self, conn, state, request, event_id):
         refs = self._evidence(conn, request.evidence_ids)
+        link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
         at = self.clock()
         self._retarget(conn, state, at)
         if request.action == "create":
@@ -607,8 +620,9 @@ class Mind:
             }
             if request.action in transitions:
                 desire["status"] = transitions[request.action]
-            desire.pop("contact_wait", None)
-            desire.pop("contact_failures", None)
+            if not link_only:
+                desire.pop("contact_wait", None)
+                desire.pop("contact_failures", None)
             if request.action == "wait":
                 desire["contact_wait"] = self._wait_details(
                     ContactDecision(action="wait", reason=request.reason,
@@ -620,9 +634,16 @@ class Mind:
                         desire[k] = getattr(request, k)
             desire["revision"] += 1
         desire = state["desires"][did]
+        if request.concern_ids is not None:
+            links = self._resolve_concern_links(conn, state, request.concern_ids)
+            desire.update(concern_ids=list(links), concern_revisions=links)
+        elif desire.get("concern_ids") and request.action in {"start", "resume", "update"}:
+            # An explicit wish reassessment also acknowledges current concern revisions.
+            links = self._resolve_concern_links(conn, state, desire["concern_ids"])
+            desire["concern_revisions"] = links
         desire.update(
-            evidence=refs,
-            reason=request.reason,
+            evidence=desire["evidence"] if link_only else refs,
+            reason=desire["reason"] if link_only else request.reason,
             updated_at=at,
             event_id=event_id,
             agent_version=request.agent_version,
@@ -865,7 +886,7 @@ class Mind:
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
         }
 
-    def read(self, *, as_of=None, history=0):
+    def read(self, *, as_of=None, history=0, query=""):
         if not 0 <= history <= 100:
             raise ValueError("History must be between 0 and 100")
         with self.engine.db.connect() as conn:
@@ -903,6 +924,7 @@ class Mind:
                 result["interaction_style"] = interaction_style(result["dimensions"], behavior)
             elif behavior:
                 result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
+            self._continuity_view(conn, state, result, at, query)
             if history:
                 result["history"] = [
                     dict(

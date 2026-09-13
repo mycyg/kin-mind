@@ -13,6 +13,7 @@ from eventmem.core.models import Scope, SourceInput
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
+from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
 from .exploration_cadence import ExplorationCadence
 from .state import Mind
@@ -37,6 +38,12 @@ def dispatch(config, action, request):
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
+    if action == "configure-continuity":
+        return mind.configure_continuity(ContinuityConfig.model_validate(request))
+    if action == "concern":
+        return mind.manage_concern(ConcernChange.model_validate(request))
+    if action == "migrate-continuity":
+        return jobs.migrate_continuity(request["evidence_ids"], request["agent_version"])
     if action == "configure-actions":
         return actions.configure(request)
     if action == "observe":
@@ -68,12 +75,12 @@ def dispatch(config, action, request):
         return {
             "source_id": source["id"],
             "appraisal": job,
-            "state": mind.read(),
+            "state": mind.read(query=request["text"]),
             "findings": explorer.recent(),
         }
     if action == "read":
         return {
-            "state": mind.read(history=request.get("history", 0)),
+            "state": mind.read(history=request.get("history", 0), query=request.get("query", "")),
             "appraisals": jobs.status(),
             "findings": explorer.recent(),
             "exploration_cadence": cadence.status(),
