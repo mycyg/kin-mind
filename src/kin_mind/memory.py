@@ -403,12 +403,13 @@ class MemoryContinuity:
                 "evidence_ids": [r["record_id"] for r in refs], "agent_version": state["agent_version"],
                 "reason": "Reconsider current interests and motives without inventing an owner message", "due_at": due["next_review"]})
 
-    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True):
+    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None):
         """Called inside the same transaction as affect/concerns/wishes."""
         allowed_sources = {r["source_id"] for r in refs}
         allowed_records = {r["record_id"] for r in refs}
         def evidence(ids):
-            selected = self.mind._evidence(conn, ids)
+            records = [record for identifier in ids for record in self._record_ids(conn, identifier)]
+            selected = self.mind._evidence(conn, list(dict.fromkeys(records)))
             if any(r["source_id"] not in allowed_sources and r["record_id"] not in allowed_records for r in selected) or not self.mind._fresh(conn, selected):
                 raise Conflict("Semantic evidence is outside the evaluated source set")
             return selected
@@ -455,7 +456,7 @@ class MemoryContinuity:
                          about_ids=list(dict.fromkeys([*share.get("about_ids", []), *proposal.about_ids])),
                          assessment_event=event_id, assessment_receipt=receipt)
             self._put(conn, share)
-        for ref in refs:
+        for ref in refs if processed_refs is None else processed_refs:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
         if not schedule:
             return

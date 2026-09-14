@@ -302,3 +302,19 @@ def test_explicit_history_budget_counts_the_mcp_json_envelope(system):
     result=Contexts(mind).read_history("share", budget=2000)
     assert tokens(json.dumps(result,ensure_ascii=False,indent=2)) <= 2000
     assert result["cursor"] is not None
+
+
+def test_appraisal_can_link_recalled_delivery_evidence_without_marking_it_fully_processed(system):
+    from kin_mind.memory import MemoryNote
+    mind, memory, source, _ = system
+    old = memory.ingest({"id":"earlier-share", "kind":"delivery", "at":mind.clock(), "text":"An earlier shared idea", "state":"accepted", "message_id":"original-receipt", "historical":True})
+    sid = source("recall-old", "An earlier shared idea")
+    memory.ingest({"id":"recall-old", "kind":"owner-message", "at":mind.clock(), "source_id":sid})
+    jobs = Appraisals(mind);jobs.enqueue([sid], "fixture-v1")
+    class Provider:
+        def appraise(self, context):
+            assert old["share_id"] in [s["id"] for s in context["memory_context"]["shares"]]
+            return Appraisal(reason="Link the earlier disclosure.", memory=MemoryAssessment(notes=[MemoryNote(key="recalled", title="Earlier disclosure", content="This idea was shared before.", evidence_ids=[old["share_id"]])])), {"model":"deepseek-flash"}
+    assert jobs.run_one(Provider())["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE source_id=?", (old["source_id"],)).fetchone()

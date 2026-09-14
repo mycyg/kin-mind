@@ -589,6 +589,13 @@ class Appraisals:
                 if memory_context:
                     model_context["memory_context"] = memory_context
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
+                with self.engine.db.connect() as conn:
+                    semantic_refs = {ref["record_id"]: ref for ref in refs}
+                    for kind in ("works", "shares"):
+                        for node in (memory_context or {}).get(kind, []):
+                            if self.memory._fresh(conn, node):
+                                for ref in self.mind._evidence(conn, self.memory._record_ids(conn, node["id"])):
+                                    semantic_refs[ref["record_id"]] = ref
                 proposal, receipt = provider.appraise(model_context)
                 if historical:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": []})
@@ -703,8 +710,8 @@ class Appraisals:
                         # Keep that share pending for the next batch; independent
                         # records and affect can commit without redoing the call.
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
-                        self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), roots, eid,
-                            memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical)
+                        self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
+                            memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots)
                     return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction)}
 
                 def rebase(conn, state):
