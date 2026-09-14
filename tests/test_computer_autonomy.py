@@ -246,3 +246,17 @@ def test_missing_condition_keeps_the_same_exploration_wish_for_owner_followup(se
     second = Explorations(mind).run("fake", tmp_path / "jobs", "test", runner=result, computer={"enabled": True})
     assert second["state"] == "complete" and second["desire_id"] == first["desire_id"]
     assert second["id"] != first["id"]
+
+
+def test_old_intent_cannot_join_an_already_reserved_sharing_revision(setup, tmp_path):
+    from kin_mind.state import DesireChange
+    mind, source, _, value, jobs = explored(setup, tmp_path)
+    share = SharingDecision(exploration_id=value["id"], decision="share", reason="Relevant")
+    contact = Wish(content="First topic", topic="draft", kind="contact", strength=90, ttl_hours=24, completion="send", exploration_id=value["id"])
+    assert jobs.run_one(FakeReviewer(Appraisal(reason="First", sharing=[share], wishes=[contact])))["state"] == "complete"
+    old = next(d for d in mind.read()["desires"] if d["kind"] == "contact")
+    jobs.enqueue([source("new related owner feedback")], "test")
+    assert jobs.run_one(FakeReviewer(Appraisal(reason="A new related angle", sharing=[share], wishes=[contact.model_copy(update={"content":"Second topic"})])))["state"] == "complete"
+    with pytest.raises(Conflict, match="another contact intent"):
+        mind.manage_desire(DesireChange(command_id="rejoin", agent_version="test", expected_revision=mind.read()["revision"],
+            evidence_ids=[source("resume older topic")], action="resume", desire_id=old["id"], reason="Would duplicate the reserved revision"))

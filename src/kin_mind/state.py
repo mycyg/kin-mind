@@ -450,7 +450,8 @@ class Mind(Continuity):
         return self._mutate(request, "behavior-policy", apply)
 
     def _desire_ready(self, conn, desire, at, *, state=None):
-        state = state or self._load(conn)
+        if state is None and (desire.get("exploration_id") or desire.get("concern_revisions")):
+            state = self._load(conn)
         if desire.get("exploration_id"):
             from .exploration_decisions import require_share
             try:
@@ -637,7 +638,11 @@ class Mind(Continuity):
                 raise Conflict("Only contact wishes link a communication decision")
             if desire.get("exploration_id") and request.action in {"start", "resume", "update"}:
                 from .exploration_decisions import require_share
-                require_share(self, conn, state, request.exploration_id or desire["exploration_id"])
+                linked_result = request.exploration_id or desire["exploration_id"]
+                decision = require_share(self, conn, state, linked_result)
+                if any(d["id"] != did and d.get("exploration_id") == linked_result
+                       and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values()):
+                    raise Conflict("This sharing decision already has another contact intent")
             if desire["status"] in {"completed", "abandoned"}:
                 raise Conflict(
                     "A finished desire stays in history; create a new desire"
