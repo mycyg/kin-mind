@@ -731,6 +731,12 @@ class Appraisals:
                             if current["revision"] != node["revision"] or not self.memory.graph.fresh(conn,current):
                                 raise Conflict("Referenced graph identity changed during evaluation")
                     roots = self.mind._evidence(conn, data["evidence_ids"])
+                    referenced_continuity = set(proposal.understanding.evidence_ids if proposal.understanding else [])
+                    referenced_continuity.update(proposal.rhythm.evidence_ids if proposal.rhythm else [])
+                    referenced_continuity.update(identifier for concern in proposal.concerns for identifier in concern.evidence_ids)
+                    for ref in continuity_refs.values():
+                        if {ref["source_id"], ref["record_id"]} & referenced_continuity and not self.mind._fresh(conn, [ref]):
+                            raise Conflict("Referenced interaction changed during evaluation")
                     allowed = self.mind._continuity_sources(conn, state, roots) + list(continuity_refs.values()) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
                     new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
