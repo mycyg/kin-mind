@@ -5,7 +5,7 @@ Measured locally on 2026-09-14 with Python 3.13 and Node 22. The scale dataset i
 | Check | Result |
 |---|---|
 | Python regression suite | 601 passed; 3 opt-in tests deselected |
-| Host/transport tests | 80 passed |
+| Host/transport tests | 82 passed |
 | Browser workflows | 7 passed, including sent-body and receipt lookup |
 | DSH compatibility | 136 tests passed |
 | TypeScript SDK | Build and 3 tests passed; generated from 50 API operations |
