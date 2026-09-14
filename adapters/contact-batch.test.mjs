@@ -45,3 +45,9 @@ test('owner reply retires unsent remainder without blocking the next conversatio
   const settled=await batch({id:'superseded',superseded:true});
   assert.equal(settled.state,'accepted');assert.equal(settled.partial,true);assert.equal(settled.canceledBubbles,1);assert.equal(calls,1);
 });
+test('each bubble carries the durable memory batch and expected count',async()=>{
+  let state;const sent=[];
+  const run=createContactBatch({read:()=>state,write:(_,v)=>{state=v;},send:async request=>{sent.push(request);return{state:'accepted',messageId:request.id};}});
+  await run({id:'synthetic-batch',channel:'synthetic',bubbles:['First thought.','Its continuation.']});
+  assert.deepEqual(sent.map(r=>[r.memoryBatchId,r.expectedBubbles]),[['synthetic-batch',2],['synthetic-batch',2]]);
+});

@@ -27,7 +27,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
         item.state='pending';await write(id,batch);
         try {
-          const sent=await send({id:item.id,text:item.text,channel:batch.channel});
+          const sent=await send({id:item.id,text:item.text,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length});
           if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
           Object.assign(item,{state:'accepted',messageId:sent.messageId});
         } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}
