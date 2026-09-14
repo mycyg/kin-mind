@@ -110,6 +110,23 @@ def test_idle_reassessment_without_a_drive_crossing(system):
     assert mind.read()["dimensions"]["initiative"]["value"] < 75
 
 
+def test_delivery_projection_retains_receipts_and_drives_without_reopening_concerns(system):
+    from kin_mind.appraisal import appraisal_context
+    mind, _, _, _ = system
+    state = mind.read()
+    state["concerns"] = [{"id": "old-concern", "kind": "care", "status": "active", "topic": "old topic",
+                          "content": "An unrelated unresolved matter", "intensity": 60, "needs_review": False,
+                          "updated_at": mind.clock()}]
+    source = {"id": "delivery-source", "text": "The server accepted the current message."}
+    context = {"stimulus": "delivery", "state": state, "new_evidence": [source]}
+    result = appraisal_context(context)
+    assert result["new_evidence"] == [source]
+    assert result["state"]["dimensions"]["initiative"]["value"] == state["dimensions"]["initiative"]["value"]
+    assert result["state"]["concerns"] == [] and "rhythm" not in result["state"]
+    assert state["concerns"][0]["status"] == "active" and "rhythm" in state
+    assert appraisal_context({**context, "stimulus": "idle-review"})["state"]["concerns"]
+
+
 class Compressor:
     def __init__(self):
         self.calls = 0

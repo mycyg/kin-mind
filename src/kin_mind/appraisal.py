@@ -244,6 +244,14 @@ def appraisal_context(context):
     if shared:
         state["shared_reasons"] = shared
     result["context_projection"] = "affect-decision-v3"
+    if context.get("stimulus") == "delivery":
+        # Receipt settlement cannot modify concerns or rhythm. Keep the actual
+        # sent content, current drives and wishes; unrelated concern history is
+        # available to the next interactive/idle assessment.
+        state["concerns"] = []
+        state["concern_window"]["included"] = 0
+        state.pop("rhythm", None)
+        result["context_projection"] = "receipt-settlement-v1"
     return result
 
 
