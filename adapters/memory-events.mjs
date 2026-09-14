@@ -59,7 +59,8 @@ export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,a
     ...(expectedBubbles??record.expectedBubbles?{expected_bubbles:expectedBubbles??record.expectedBubbles}:{}),
     text:record.text??'',state,...(record.messageId?{message_id:record.messageId}:{}),
     ...(artifact??record.artifact?{artifact:artifact??record.artifact}:{}),
-    ...(record.taskId?{task_id:record.taskId}:{}),...(record.memoryHistorical?{historical:true}:{}),origin:record.kind??'direct'};
+    ...(record.taskId?{task_id:record.taskId}:{}),...(record.memoryHistorical?{historical:true}:{}),
+    ...(record.references?.length?{references:record.references}:{}),...(record.draftId?{draft_id:record.draftId}:{}),origin:record.kind??'direct'};
 }
 export function artifactFromBytes(media) {
   return {sha256:hash(media.data),name:media.name??'attachment',bytes:media.data.length};

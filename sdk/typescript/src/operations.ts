@@ -981,9 +981,378 @@ export const operations = {
           "default": 150,
           "title": "Limit"
         }
+      },
+      {
+        "name": "focus",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Focus"
+        }
+      },
+      {
+        "name": "query",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "",
+          "title": "Query"
+        }
+      },
+      {
+        "name": "since",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Since"
+        }
+      },
+      {
+        "name": "until",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Until"
+        }
+      },
+      {
+        "name": "layer",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "enum": [
+                "evidence",
+                "association"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Layer"
+        }
+      },
+      {
+        "name": "kind",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Kind"
+        }
+      },
+      {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "title": "Cursor"
+        }
+      },
+      {
+        "name": "hops",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 3,
+          "minimum": 0,
+          "default": 1,
+          "title": "Hops"
+        }
       }
     ],
     "body": {}
+  },
+  "read_graph_object": {
+    "method": "GET",
+    "path": "/v1/graph/object/{identifier}",
+    "parameters": [
+      {
+        "name": "identifier",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "title": "Identifier"
+        }
+      },
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "personal",
+          "title": "Project"
+        }
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Persona"
+        }
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Collection"
+        }
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "real",
+          "title": "World"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "read_event_thread": {
+    "method": "GET",
+    "path": "/v1/graph/thread/{identifier}",
+    "parameters": [
+      {
+        "name": "identifier",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "title": "Identifier"
+        }
+      },
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "personal",
+          "title": "Project"
+        }
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Persona"
+        }
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Collection"
+        }
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "real",
+          "title": "World"
+        }
+      },
+      {
+        "name": "query",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "",
+          "title": "Query"
+        }
+      },
+      {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "title": "Cursor"
+        }
+      },
+      {
+        "name": "budget",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 32000,
+          "minimum": 128,
+          "default": 2000,
+          "title": "Budget"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "revise_graph": {
+    "method": "POST",
+    "path": "/v1/graph/revisions",
+    "parameters": [],
+    "body": {
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      },
+      "required": true
+    }
+  },
+  "register_reply_references": {
+    "method": "POST",
+    "path": "/v1/graph/reply-references",
+    "parameters": [],
+    "body": {
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      },
+      "required": true
+    }
+  },
+  "read_conversation_habits": {
+    "method": "GET",
+    "path": "/v1/conversation/habits",
+    "parameters": [
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "personal",
+          "title": "Project"
+        }
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Persona"
+        }
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Collection"
+        }
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "real",
+          "title": "World"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "update_conversation_habits": {
+    "method": "POST",
+    "path": "/v1/conversation/habits",
+    "parameters": [],
+    "body": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      }
+    }
+  },
+  "choose_reply": {
+    "method": "POST",
+    "path": "/v1/conversation/reply-choice",
+    "parameters": [],
+    "body": {
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      },
+      "required": true
+    }
   },
   "configure_contact": {
     "method": "PUT",

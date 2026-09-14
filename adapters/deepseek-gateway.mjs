@@ -1,7 +1,7 @@
 import http from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 
-export const replyContract = 'Write only messages addressed to the user: the answer or a useful progress update. Do not narrate your interpretation of the user, response planning, private analysis, or internal tool-result commentary. Earlier assistant messages may contain that narration; do not imitate it. Keep tool calls separate from user-facing text. Runtime metadata is evidence to check, not a preface to repeat. Follow the conversation language and persona.';
+export const replyContract = 'Write only messages addressed to the user: the answer or a useful progress update. Do not narrate your interpretation of the user, response planning, private analysis, or internal tool-result commentary. Earlier assistant messages may contain that narration; do not imitate it. Keep tool calls separate from user-facing text. Runtime metadata is evidence to check, not a preface to repeat. Follow the conversation language and persona. When the owner has enabled autonomous casual replies, choose_reply can record silent or merged for the current input; the host applies that decision. Each new input is considered independently, and work deliveries follow the task workflow.';
 const privateChannels = new Set(['analysis', 'reasoning', 'summary']);
 export const isPrivateOutput = item => item?.type === 'reasoning' ||
   privateChannels.has(item?.channel) || privateChannels.has(item?.phase);

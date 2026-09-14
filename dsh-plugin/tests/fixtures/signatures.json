@@ -12,7 +12,7 @@
     "output": "ValueError: port busy"
   },
   {
-    "input": "Traceback (most recent call last):\n  File \"/Users/apple/proj/train/launcher.py\", line 10, in <module>\n    raise ValueError('port busy')\nValueError: port busy",
+    "input": "Traceback (most recent call last):\n  File \"/Users/synthetic/proj/train/launcher.py\", line 10, in <module>\n    raise ValueError('port busy')\nValueError: port busy",
     "output": "ValueError: port busy"
   },
   {

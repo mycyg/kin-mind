@@ -182,7 +182,7 @@ def test_search_falls_back_to_raw_store_when_project_index_missing(store: Store,
 def test_error_signature_python_traceback_uses_last_line() -> None:
     tb = (
         "Traceback (most recent call last):\n"
-        '  File "/Users/apple/project/foo.py", line 42, in bar\n'
+        '  File "/Users/synthetic/project/foo.py", line 42, in bar\n'
         '    raise ValueError("bad value")\n'
         "ValueError: bad value"
     )
@@ -195,8 +195,8 @@ def test_error_signature_non_traceback_uses_first_nonblank_line() -> None:
 
 
 def test_error_signature_strips_posix_path_to_basename() -> None:
-    sig = error_signature("error at /Users/apple/project/src/foo.py during load")
-    assert "/Users/apple/project" not in sig
+    sig = error_signature("error at /Users/synthetic/project/src/foo.py during load")
+    assert "/Users/synthetic/project" not in sig
     assert "foo.py" in sig
 
 
@@ -236,7 +236,7 @@ def test_error_signature_combined_normalization_matches_expected_line() -> None:
 def test_error_signature_is_idempotent_on_renormalization() -> None:
     tb = (
         "Traceback (most recent call last):\n"
-        '  File "/Users/apple/project/foo.py", line 42, in bar\n'
+        '  File "/Users/synthetic/project/foo.py", line 42, in bar\n'
         "ValueError: bad value at 0x7fabc1234 on 2026-08-25T14:32:01"
     )
     once = error_signature(tb)

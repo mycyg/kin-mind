@@ -36,7 +36,7 @@ SIGNATURE_INPUTS: list[str] = [
     "ValueError: port busy",
     (
         "Traceback (most recent call last):\n"
-        '  File "/Users/apple/proj/train/launcher.py", line 10, in <module>\n'
+        '  File "/Users/synthetic/proj/train/launcher.py", line 10, in <module>\n'
         "    raise ValueError('port busy')\n"
         "ValueError: port busy"
     ),

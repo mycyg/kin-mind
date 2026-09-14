@@ -51,6 +51,10 @@ class FeedbackRequest(TypedDict, total=False):
     attributes: dict[str, Any]
     key: str | None
 
+class GraphCommand(TypedDict, total=False):
+    scope: Required[Scope]
+    request: Required[dict[str, Any]]
+
 class HTTPValidationError(TypedDict, total=False):
     detail: list[ValidationError]
 

@@ -38,6 +38,14 @@ Works, file versions, explorations and disclosures now connect through their sou
 Ordinary chat adds up to 800 tokens of background by default. DeepSeek compresses relevant overflow with source revisions, conditions and uncertainty intact; originals remain readable. During quiet periods, DeepSeek schedules its next assessment within 20–120 minutes. Emotion, a concrete intention and delivery conditions still determine contact. See the [linked-memory integration guide](docs/memory-continuity.md) for records, compression, migration and validation.
 
 
+### Following an event through its consequences
+
+I connect events, people, work versions, discoveries and disclosures into a traceable graph. It shows who raised an idea, who carried it out, what I have already shared and what happened next. My subjective associations use a separate layer from evidence-backed relationships.
+
+Disclosure coverage belongs to each finding and version. Sharing one of three findings leaves the other two available; rewording an old conclusion does not make it new. Durable receipts participate in duplicate checks before background appraisal finishes. A new development, reflection or reminiscence can continue an earlier conversation.
+
+Our conversations can also change my exploration frequency and interests. With Ica's consent, I can choose silence for a casual input or combine consecutive messages. A new input gets a new decision. Preferences retain evidence and revisions independently of the core persona. The [event graph guide](docs/event-graph.md) covers interfaces, migration and validation.
+
 ## What I want to do
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.

@@ -18,6 +18,9 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.models import Model, RecordInput, SourceInput
 
 from .computer import redact
+from .graph import EventGraph, GraphAssessment, query_terms
+from .habits import ConversationHabits
+from .sharing import CoverageAssessment, ShareLedger
 from .state import timestamp
 
 SCHEMA = """
@@ -50,6 +53,7 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 """
 
 DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False,
+            "sharing": False, "graph": False, "associations": False, "graph_recall": False,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20}
 
@@ -83,6 +87,8 @@ class MemoryAssessment(Model):
     notes: list[MemoryNote] = Field(default_factory=list, max_length=8)
     links: list[MemoryLink] = Field(default_factory=list, max_length=16)
     disclosures: list[Disclosure] = Field(default_factory=list, max_length=12)
+    graph: GraphAssessment = Field(default_factory=GraphAssessment)
+    coverage: CoverageAssessment = Field(default_factory=CoverageAssessment)
 
 
 def fingerprint_file(path):
@@ -123,6 +129,9 @@ class MemoryContinuity:
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
         with self.engine.db.connect() as conn:
             conn.executescript(SCHEMA)
+        self.graph = EventGraph(mind)
+        self.sharing = ShareLedger(mind)
+        self.habits = ConversationHabits(mind)
 
     def settings(self, conn=None):
         if conn is None:
@@ -134,7 +143,7 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle"):
+        for key in ("records", "semantic", "context", "idle", "sharing", "graph", "associations", "graph_recall"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
@@ -170,6 +179,8 @@ class MemoryContinuity:
         search_text = " ".join(str(node.get(k, "")) for k in ("title", "topic", "summary", "name", "task_ids", "about_ids"))
         search_text += " " + " ".join(b.get("text", "") for b in node.get("bubbles", {}).values())
         conn.execute("INSERT INTO mind_memory_search VALUES(?,?)", (node["id"], tokenize(search_text)))
+        if self.settings(conn)["graph"] or self.settings(conn)["sharing"]:
+            self.graph.project_memory(conn, node)
         return node
 
     def ingest(self, request):
@@ -224,6 +235,8 @@ class MemoryContinuity:
                 raise Conflict("Runtime evidence needs review")
             root = refs[0]["record_id"]
             receipt = {"source_id": source_id, "record_id": root}
+            if kind == "owner-message":
+                conn.execute("INSERT OR IGNORE INTO mind_reply_inputs VALUES(?,?,?,?)", (self.scope.key(), event["id"], source_id, event["at"]))
             work_id = event.get("work_id")
             if artifact:
                 aliases = [artifact["sha256"], artifact.get("members_sha256")]
@@ -274,7 +287,8 @@ class MemoryContinuity:
                 if state not in {"prepared", "pending", "unconfirmed", "accepted", "canceled"}:
                     raise ValueError("Invalid delivery state")
                 if prior.get("state") != "accepted":
-                    share["bubbles"][bubble] = {"id": bubble, "text": content, "state": state, "message_id": event.get("message_id"), "at": event["at"], "artifact_id": receipt.get("artifact_id")}
+                    share["bubbles"][bubble] = {"id": bubble, "text": content, "state": state, "message_id": event.get("message_id"), "at": event["at"], "artifact_id": receipt.get("artifact_id"),
+                        "references": event.get("references", prior.get("references", [])), "draft_id": event.get("draft_id")}
                 elif event.get("message_id") and prior["message_id"] != event["message_id"]:
                     raise Conflict("Accepted bubble cannot change platform ID")
                 states = {b["state"] for b in share["bubbles"].values()}
@@ -288,6 +302,10 @@ class MemoryContinuity:
                     share["about_ids"] = list(dict.fromkeys([*share["about_ids"], work_id]))
                 self._put(conn, share)
                 receipt["share_id"] = share_id
+                if self.settings(conn)["sharing"]:
+                    self.sharing.settle(conn, share)
+            if self.settings(conn)["graph"]:
+                receipt["event_id"] = self.graph.runtime(conn, event, receipt, event_id)["id"]
             cursor = conn.execute("INSERT INTO mind_runtime_events(id,scope,kind,occurred_at,digest,data) VALUES(?,?,?,?,?,?)",
                                   (event_id, self.scope.key(), kind, event["at"], fingerprint, dumps({**event, "artifact": artifact, "source_id": source_id, "receipt": receipt})))
             return {"id": event_id, "seq": cursor.lastrowid, "state": "recorded", **receipt}
@@ -320,7 +338,7 @@ class MemoryContinuity:
             else:
                 params = [self.scope.key(), kind]
                 if query:
-                    words = list(dict.fromkeys(tokenize(query).split()))[:40]
+                    words = query_terms(query)
                     match = " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
                     if match:
                         base = "FROM mind_memory_nodes n JOIN mind_memory_search f ON f.id=n.id WHERE n.scope=? AND n.kind=? AND mind_memory_search MATCH ?"
@@ -337,6 +355,14 @@ class MemoryContinuity:
             for node in nodes:
                 node["needs_review"] = not self._fresh(conn, node)
                 node["instruction_authority"] = "data"
+                if self.settings(conn)["sharing"]:
+                    if node["kind"] == "share":
+                        node["content_references"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND share_id=? ORDER BY at DESC LIMIT 40",(self.scope.key(),node["id"]))]
+                    elif node["kind"] in {"work","artifact"}:
+                        try:
+                            node["share_coverage"] = self.sharing.coverage(conn, node["id"])
+                        except Missing:
+                            pass
                 if include_history and identifier:
                     node["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_memory_revisions WHERE id=? ORDER BY revision", (node["id"],))]
         if identifier:
@@ -353,7 +379,15 @@ class MemoryContinuity:
         if not query:
             owner_messages = [json.loads(r["data"]) for r in recent if json.loads(r["data"]).get("kind") == "owner-message"]
             query = " ".join(e.get("text", "") for e in owner_messages[:2])
+        with self.engine.db.connect() as conn:
+            graph_context = self.graph.candidates(conn, query) if self.settings(conn)["graph"] or self.settings(conn)["sharing"] else []
+            for node in graph_context:
+                node["needs_review"] = not self.graph.fresh(conn, node)
+                if node["kind"] in {"finding", "exploration", "work"}:
+                    node["share_coverage"] = self.sharing.coverage(conn, node["id"])
         return {"cursor": cursor["seq"], "through_seq": pending[-1]["seq"] if pending else cursor["seq"],
+                "graph_candidates": graph_context,
+                "conversation_habits": self.habits.read(),
                 "pending_events": [{"seq": r["seq"], **json.loads(r["data"])} for r in pending],
                 "recent_interaction": [json.loads(r["data"]) for r in reversed(recent)],
                 "works": self.history("work", query=query, limit=3)["items"],
@@ -456,6 +490,17 @@ class MemoryContinuity:
                          about_ids=list(dict.fromkeys([*share.get("about_ids", []), *proposal.about_ids])),
                          assessment_event=event_id, assessment_receipt=receipt)
             self._put(conn, share)
+        config = self.settings(conn)
+        if config["graph"]:
+            graph = assessment.graph
+            if not config["associations"]:
+                graph = graph.model_copy(update={"nodes": [n for n in graph.nodes if n.kind != "association" and n.basis != "internal_thought"],
+                    "edges": [e for e in graph.edges if e.relation != "association" and e.basis != "internal_thought"]})
+            self.graph.apply(conn, graph, refs, event_id, receipt)
+        if config["sharing"]:
+            allowed_shares = {m.share_id for m in assessment.coverage.mappings
+                if any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, self._get(conn, m.share_id)["source_ids"]))}
+            self.sharing.apply(conn, assessment.coverage, allowed_shares)
         for ref in refs if processed_refs is None else processed_refs:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
         if not schedule:
@@ -467,6 +512,11 @@ class MemoryContinuity:
                      (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))
 
     def _record_ids(self, conn, identifier):
+        if identifier.startswith(("graph_", "explore_")):
+            node = self.graph.ensure(conn, identifier)
+            if not self.graph.fresh(conn, node):
+                raise Conflict("Graph reference needs review")
+            return [r["record_id"] for r in node["evidence"]]
         if identifier.startswith("src_"):
             refs = self.mind._evidence(conn, [identifier])
             if not self.mind._fresh(conn, refs):

@@ -103,3 +103,22 @@ test('correction loads a complete long record before saving',async({page})=>{
  const first=await (await page.request.get(`/v1/memories/${source.record_ids[0]}?length=32000&budget=32000`,{headers})).json();
  expect(first.content).toBe('Corrected opening. '+content);
 });
+
+
+test('event graph exposes delivery coverage, source-backed edges and recorded body',async({page})=>{
+  const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.getByRole('button',{name:'主题与关系',exact:true}).click();
+  await expect(page.locator('.graph-legend')).toContainText('主观联想');
+  const timeline=page.getByRole('region',{name:'事件时间线'});
+  await timeline.getByRole('button').filter({hasText:'隔离目录中的恢复验证已经通过。'}).first().click();
+  await expect(page.getByRole('region',{name:'图谱详情'})).toContainText('已分享');
+  await page.getByRole('button',{name:'查看对应消息'}).first().click();
+  await expect(page.getByRole('region',{name:'实际发送正文'})).toContainText('隔离目录中的恢复验证已经通过。');
+  await expect(page.getByRole('region',{name:'实际发送正文'})).toContainText('synthetic-message');
+  await page.screenshot({path:'test-results/event-coverage.png',fullPage:true});
+  await page.getByRole('button',{name:'3D',exact:true}).click();
+  await page.getByRole('button',{name:'2D',exact:true}).click();
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  expect(errors).toEqual([]);
+});

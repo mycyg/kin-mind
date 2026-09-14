@@ -35,7 +35,7 @@ import {
   stamp,
   type Scope,
 } from "./api";
-import { Graph } from "./Graph";
+import { EventGraphPanel } from "./EventGraphPanel";
 import {
   FamilyEditor,
   AttachmentPreview,
@@ -746,7 +746,7 @@ function App() {
                   运行增量整理
                 </button>
               </div>
-              <Graph data={graph} onSelect={read} />
+              <EventGraphPanel data={graph} scope={scope} onSource={read} />
               <FamilyEditor
                 families={families}
                 scope={scope}

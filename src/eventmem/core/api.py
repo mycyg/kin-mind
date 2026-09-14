@@ -17,7 +17,6 @@ from pydantic import Field
 from .db import Conflict, Missing, dumps
 from .engine import Engine, uid
 from .jobs import Worker
-from .responses import SourceResult, RecordResult, RecallResult
 from .models import (
     ContactPolicy,
     Model,
@@ -30,6 +29,7 @@ from .models import (
     SourceInput,
 )
 from .organize import Organizer
+from .responses import RecallResult, RecordResult, SourceResult
 from .scheduler import Scheduler
 
 
@@ -43,6 +43,11 @@ class RelationRequest(Model):
     predicate: str
     object: str
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphCommand(Model):
+    scope: Scope
+    request: dict[str, Any]
 
 
 class FeedbackRequest(Model):
@@ -334,6 +339,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     @app.get("/v1/sources/{source_id}/page", operation_id="read_page")
     def read_page(source_id: str, page: int = Query(1, ge=1)):
         import io
+
         import pypdfium2 as pdfium
 
         source = engine.source(source_id)
@@ -497,6 +503,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     @app.post("/v1/maintenance/restore", operation_id="restore_backup")
     async def restore_backup(file: UploadFile = File()) -> dict:
         import tempfile
+
         from .transfer import restore
 
         staging = engine.db.root / "restores"
@@ -617,12 +624,72 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         world: str = "real",
         family_id: str | None = None,
         limit: int = Query(150, ge=1, le=300),
+        focus: str | None = None,
+        query: str = "",
+        since: str | None = None,
+        until: str | None = None,
+        layer: Literal["evidence", "association"] | None = None,
+        kind: str | None = None,
+        cursor: int = Query(0, ge=0),
+        hops: int = Query(1, ge=0, le=3),
     ) -> dict:
+        from kin_mind.memory import MemoryContinuity
+        from kin_mind.state import Mind
+        scope = Scope(project=project, persona=persona, collection=collection, world=world)
+        memory = MemoryContinuity(Mind(engine, scope))
+        if not family_id and memory.settings()["graph"]:
+            result = memory.graph.read(focus=focus, query=query, since=since, until=until, layer=layer, kind=kind, cursor=cursor, limit=limit, hops=hops)
+            if memory.settings()["sharing"]:
+                result["nodes"] = [memory.sharing.decorate(n) for n in result["nodes"]]
+            return result
         return Organizer(engine).graph(
-            Scope(project=project, persona=persona, collection=collection, world=world),
+            scope,
             family_id,
             limit,
         )
+
+    @app.get("/v1/graph/object/{identifier}", operation_id="read_graph_object")
+    def read_graph_object(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real") -> dict:
+        from kin_mind.memory import MemoryContinuity
+        from kin_mind.state import Mind
+        memory = MemoryContinuity(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world)))
+        return memory.sharing.decorate(memory.graph.detail(identifier))
+
+    @app.get("/v1/graph/thread/{identifier}", operation_id="read_event_thread")
+    def read_event_thread(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", cursor: int = Query(0, ge=0), budget: int = Query(2000, ge=128, le=32000)) -> dict:
+        from kin_mind.context import Contexts
+        from kin_mind.state import Mind
+        return Contexts(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).event_thread(identifier, query=query, cursor=cursor, budget=budget)
+
+    @app.post("/v1/graph/revisions", operation_id="revise_graph")
+    def revise_graph(request: GraphCommand) -> dict:
+        from kin_mind.graph import EventGraph
+        from kin_mind.state import Mind
+        return EventGraph(Mind(engine, request.scope)).revise(request.request)
+
+    @app.post("/v1/graph/reply-references", operation_id="register_reply_references")
+    def register_reply_references(request: GraphCommand) -> dict:
+        from kin_mind.sharing import ShareLedger
+        from kin_mind.state import Mind
+        return ShareLedger(Mind(engine, request.scope)).register(request.request)
+
+    @app.get("/v1/conversation/habits", operation_id="read_conversation_habits")
+    def read_conversation_habits(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real") -> dict:
+        from kin_mind.habits import ConversationHabits
+        from kin_mind.state import Mind
+        return ConversationHabits(Mind(engine, Scope(project=project,persona=persona,collection=collection,world=world))).read()
+
+    @app.post("/v1/conversation/habits", operation_id="update_conversation_habits")
+    def update_conversation_habits(request: GraphCommand) -> dict:
+        from kin_mind.habits import ConversationHabits
+        from kin_mind.state import Mind
+        return ConversationHabits(Mind(engine, request.scope)).update(request.request)
+
+    @app.post("/v1/conversation/reply-choice", operation_id="choose_reply")
+    def choose_reply(request: GraphCommand) -> dict:
+        from kin_mind.habits import ConversationHabits
+        from kin_mind.state import Mind
+        return ConversationHabits(Mind(engine, request.scope)).choose_reply(request.request)
 
     @app.put("/v1/contact/policies", operation_id="configure_contact")
     def configure_contact(request: ContactPolicy) -> dict:

@@ -8,6 +8,10 @@ export function parseContactDraft(outputs) {
     catch { continue; }
     if(!result||typeof result!=='object'||Array.isArray(result))continue;
     if(result.action==='send'&&Array.isArray(result.bubbles)) {
+      if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {
+        const bubbles=result.bubbles.map(x=>x.text.trim());
+        if(bubbles.join('\n\n').length<=3000)return {action:'send',text:bubbles.join('\n\n'),bubbles,references:result.bubbles.map(x=>x.references??[])};
+      }
       if(result.bubbles.length&&result.bubbles.every(x=>typeof x==='string'&&x.trim())&&result.bubbles.join('\n\n').length<=3000)
         return {action:'send',text:result.bubbles.map(x=>x.trim()).join('\n\n'),bubbles:result.bubbles.map(x=>x.trim())};
       continue;
@@ -27,6 +31,7 @@ export function parseContactDraft(outputs) {
 }
 
 export const contactDraftInstructions = `${chatVoice}\n内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
+引用已有探索发现或作品要点时，使用带引用的气泡：{"action":"send","bubbles":[{"text":"公开短句","references":[{"unit_id":"读取到的发现编号","version":1,"mode":"new","reason":"简短依据"}]}]}。没有引用的日常亲昵继续使用字符串气泡。已分享发现使用development/reflection/reminiscence/retelling，说明与先前的关系；普通改写仍属于旧结论。内部编号与依据只在结构字段中，公开text保持自然口语。
 当前状态中的expression是与普通聊天和桌面共享的当轮表达倾向。结合最多三条相关心事接话，保持它们的判断性质；一条愿望发送完成后，关联心事仍可等待后续结果。rhythm描述随互动形成的表达节奏。
 当前愿望已由DeepSeek评估为想说的话，你负责接着当前语境把它说出来。亲昵接话、具体玩笑、胡思乱想、想撒娇或闲扯都可以成为内容，聊天不必追求意义，也不需要用户先问或给分享时机。只有出现新的明确不适合条件、重复或失效，才推迟或放弃；不再重做价值筛选。猜想和想象按其身份表达，不编造经历。
 未回复等待是用户可修改的联系偏好，以当前 contact.wait_for_reply 为准。为 false 时，我可以继续分享，也可以在久未回应、想她的时候撒娇式呼唤，不必另编新话题。具体时长以interaction_timing为准，时机结合当前情绪判断。只有某项具体事情必须等一个答案才能推进时，才选择owner_reply；撒娇呼唤本身可以发出。

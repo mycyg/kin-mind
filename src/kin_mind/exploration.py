@@ -387,6 +387,19 @@ class Explorations:
                 self.mind._save(conn, current)
                 self.mind._history(conn, event_id, current, "exploration-result", data)
             conn.execute("UPDATE mind_explorations SET state=?,data=? WHERE id=?", (state, dumps(data), eid))
+            memory = MemoryContinuity.__new__(MemoryContinuity)
+            memory.mind, memory.engine, memory.scope = self.mind, self.engine, self.mind.scope
+            if memory.settings(conn).get("sharing") or memory.settings(conn).get("graph"):
+                from .sharing import ShareLedger
+                # Schemas are initialized before the write transaction by the
+                # earlier MemoryContinuity lookup in the source-receive path.
+                ledger = ShareLedger.__new__(ShareLedger)
+                from .graph import EventGraph
+                graph = EventGraph.__new__(EventGraph)
+                graph.mind, graph.engine, graph.scope = self.mind, self.engine, self.mind.scope
+                ledger.mind, ledger.engine, ledger.scope, ledger.graph = self.mind, self.engine, self.mind.scope, graph
+                data["content_units"] = [{"id": n["id"], "version": n["content_version"]} for n in ledger.exploration(conn, eid, data)]
+                conn.execute("UPDATE mind_explorations SET data=? WHERE id=?", (dumps(data), eid))
             actions.emit(conn, "exploration-result", eid, {"exploration_id": eid, "state": state,
                 # The action dispatcher adds one internal event source.
                 "evidence_ids": list(dict.fromkeys([source["id"], *observation_ids, *data["evidence_ids"]]))[:49], "agent_version": agent_version})

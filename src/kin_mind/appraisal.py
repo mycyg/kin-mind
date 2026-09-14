@@ -23,6 +23,7 @@ from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .exploration_decisions import SharingDecision, apply_decisions
+from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
@@ -82,6 +83,7 @@ class Appraisal(Model):
     sharing: list[SharingDecision] = Field(default_factory=list, max_length=4)
     memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
     next_review_minutes: StrictInt = Field(default=20, ge=20, le=120)
+    habits: HabitProposal | None = None
 
     @field_validator("motivations")
     @classmethod
@@ -154,6 +156,15 @@ delivery仅结算回执；发送状态由宿主保存，memory.disclosures可以
 memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新情绪、不新建或恢复愿望；它不是新经历。
 """
 
+SYSTEM += """
+事件图谱的候选在memory_context.graph_candidates。memory.graph.nodes保存event/thread/entity/finding/association；相同事情优先引用已有id与expected_revision，新记录用本批key。短时间相邻只是候选，按明确内容和来源关联，不强行串联。参与角色在memory.graph.edges.role中描述，人物身份与事件角色分别保存。
+关系使用participates/part_of/continues/responds_to/produces/delivers/shares/corrects/resolves/supports/refutes/causes/association/follows/about/related。发生先后用follows；因果需单独依据。主观联想为internal_thought和association，不当作已发生事实。每条关系给出evidence_ids与简短reason，公开判断不含推理轨迹。
+探索结果已拆为稳定finding编号与content_version。memory.coverage.mappings将share_id中的实际bubble_id关联到具体unit_id/version；仅覆盖正文确实讲到的内容，文件交付不能覆盖报告所有发现。confidence不足时保留待核对。改写同一发现仍属于旧内容；development/reflection/reminiscence/retelling写明与上次分享的关系。普通回复也计入分享，分享决定不是发送回执。
+历史回填只补关联和覆盖；助手自己的安排不会变成用户偏好，旧经历不重复增加状态和愿望。
+聊天中的明确偏好可以更新habits，expected_revision使用memory_context.conversation_habits.revision。preferences支持exploration_frequency（完整短句）、exploration_directions（方向列表）、exploration_min_interval_minutes（用户明确指定的最小间隔，默认0）、exploration_paused、reply_choice（always/autonomous）。evidence_ids只引用用户明确发言；自己的安排不成为用户要求。频率和方向影响后续选题及curiosity动力，按当前偏好调整本轮target和half_life。泛泛说少探索些可记录自然语言偏好，无需编造固定间隔。
+reply_choice=autonomous时，聊天模型可以自行决定回应、合并或安静；每次选择绑定当前真实输入编号。新的输入重新决定，不把一次安静变成永久不理会。
+"""
+
 
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
@@ -171,6 +182,17 @@ def appraisal_context(context):
                     ("provider", "model", "verified_at", "agent_version") if k in receipt}
             shares.append(share)
         memory_context["shares"] = shares
+        memory_context["graph_candidates"] = [{k:n[k] for k in ("id", "kind", "title", "text", "revision", "content_version", "owner_id", "source_ids", "basis", "occurred_at", "created_by", "needs_review", "share_coverage") if k in n} for n in memory_context.get("graph_candidates", [])]
+        for node in memory_context["graph_candidates"]:
+            if node.get("title") == node.get("text"):
+                node.pop("title", None)
+            if node.get("share_coverage"):
+                coverage=node["share_coverage"]
+                node["share_coverage"]={k:coverage[k] for k in ("state","version","last_shared_at","shared","total","visibility") if k in coverage}
+                node["share_coverage"]["messages"]=[{k:d.get(k) for k in ("share_id","bubble_id","message_id","mode")} for d in coverage.get("deliveries",[])[:2]]
+        if memory_context.get("conversation_habits"):
+            habits = memory_context["conversation_habits"]
+            memory_context["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"]}
         result["memory_context"] = memory_context
     if not isinstance(context.get("state"), dict):
         return result
@@ -300,6 +322,8 @@ class DeepSeek:
                 raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
             if body.get("model") != "deepseek-flash" or body.get("stop_reason") == "max_tokens":
+                if hasattr(self,"engine"):
+                    self.engine.db.metric("structured_rejected", 1, {"tool":name,"reported_model":body.get("model"),"stop_reason":body.get("stop_reason"),"usage":body.get("usage",{}),"max_tokens":max_tokens})
                 raise RuntimeError("deepseek-incomplete-or-unverified")
             calls = [b for b in body.get("content", []) if b.get("type") == "tool_use" and b.get("name") == name]
             if len(calls) != 1:
@@ -335,7 +359,7 @@ class DeepSeek:
                 memory_data = request_context["memory_context"]
                 # These are complete decision records, not the entire work/share
                 # ledger. Summarize long latest interactions in the same request.
-                for kind in ("recent_interaction", "works", "shares"):
+                for kind in ("recent_interaction", "works", "shares", "graph_candidates"):
                     for index, value in enumerate(memory_data[kind]):
                         identifier = value.get("id") or kind + ":" + str(index)
                         items.append({"id": identifier, "revision": value.get("revision", 1), "basis": "observed" if kind != "recent_interaction" else "reported", "text": dumps(value)})
@@ -358,6 +382,7 @@ class DeepSeek:
                 request_context["memory_context"]["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in request_context["memory_context"]["pending_events"]]
                 for kind in ("recent_interaction", "works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
+                memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
                 request_context["compression_receipt"] = result.get("receipt")
                 if tokens(dumps(request_context)) > 32000:
                     raise RuntimeError("deepseek-appraisal-budget-pending")
@@ -530,9 +555,19 @@ class Appraisals:
                 ids = list(data["evidence_ids"])
                 stimuli = {data.get("stimulus")}
                 batch_ids = []
+                def evidence_cost(identifiers):
+                    from eventmem.core.retrieval import tokens
+                    total = 0
+                    for identifier in identifiers:
+                        if identifier.startswith("src_"):
+                            record = self.engine._get(conn, "mem_"+digest([identifier,"root"])[:32])
+                            total += tokens(record["content"])
+                        else:
+                            total += tokens(self.engine._get(conn, identifier)["content"])
+                    return total
                 for child in batch:
                     combined = list(dict.fromkeys(ids + json.loads(child["data"])["evidence_ids"]))
-                    if len(combined) > 40:
+                    if len(combined) > 40 or evidence_cost(combined) > 24000:
                         break
                     ids = combined; batch_ids.append(child["id"])
                     stimuli.add(json.loads(child["data"]).get("stimulus"))
@@ -579,6 +614,13 @@ class Appraisals:
                         old = conn.execute(f"SELECT data FROM mind_runtime_events WHERE scope=? AND json_extract(data,'$.source_id') IN ({placeholders})", [self.mind.scope.key(), *data["evidence_ids"]]).fetchall()
                         shares = {json.loads(r[0]).get("receipt", {}).get("share_id") for r in old} - {None}
                         memory_context["shares"] = [self.memory._get(conn, identifier) for identifier in shares]
+                        historical_query = "\n".join(json.loads(r[0]).get("text", "") for r in old)
+                        graph = self.memory.graph.candidates(conn, historical_query)
+                        for node in graph:
+                            node["needs_review"] = not self.memory.graph.fresh(conn, node)
+                            if node["kind"] in {"finding", "exploration", "work"}:
+                                node["share_coverage"] = self.memory.sharing.coverage(conn, node["id"])
+                        memory_context["graph_candidates"] = graph
                 if memory_context:
                     # The source cursor advances only across events actually given
                     # to this evaluation; out-of-window history remains pending.
@@ -623,14 +665,14 @@ class Appraisals:
                             continue
                         for ref in recent_refs:
                             semantic_refs[ref["record_id"]] = ref
-                    for kind in ("works", "shares"):
+                    for kind in ("works", "shares", "graph_candidates"):
                         for node in (memory_context or {}).get(kind, []):
-                            if self.memory._fresh(conn, node):
+                            if not node.get("needs_review") and self.memory._fresh(conn, node):
                                 for ref in self.mind._evidence(conn, self.memory._record_ids(conn, node["id"])):
                                     semantic_refs[ref["record_id"]] = ref
                 proposal, receipt = provider.appraise(model_context)
                 if historical:
-                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": []})
+                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None})
                 exploration_ids = [s["metadata"]["exploration_id"] for s in sources
                                    if s["metadata"].get("exploration_id")]
                 primary_result = exploration_ids[0] if data.get("stimulus") == "exploration-result" and exploration_ids else None
@@ -667,6 +709,14 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
+                    referenced_graph = {v for n in proposal.memory.graph.nodes for v in (n.id,n.owner_id) if v}
+                    referenced_graph.update(v for e in proposal.memory.graph.edges for v in (e.subject,e.object))
+                    referenced_graph.update(r.unit_id for m in proposal.memory.coverage.mappings for r in m.references)
+                    for node in (memory_context or {}).get("graph_candidates", []):
+                        if node["id"] in referenced_graph:
+                            current = self.memory.graph.get(conn,node["id"])
+                            if current["revision"] != node["revision"] or not self.memory.graph.fresh(conn,current):
+                                raise Conflict("Referenced graph identity changed during evaluation")
                     roots = self.mind._evidence(conn, data["evidence_ids"])
                     allowed = self.mind._continuity_sources(conn, state, roots) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
@@ -744,6 +794,8 @@ class Appraisals:
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
                         self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
                             memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots)
+                    if proposal.habits:
+                        self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
                     return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction)}
 
                 def rebase(conn, state):

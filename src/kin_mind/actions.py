@@ -203,6 +203,20 @@ class ActionEvents:
                     )
 
     def exploration_candidate(self):
+        from datetime import timedelta
+
+        from .habits import ConversationHabits
+        from .state import timestamp
+        preferences = ConversationHabits(self.mind).read()["preferences"]
+        if preferences["exploration_paused"]:
+            return {"state": "waiting", "reason": "owner-paused-exploration"}
+        interval = preferences["exploration_min_interval_minutes"]
+        if interval:
+            with self.mind.engine.db.connect() as conn:
+                exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_explorations'").fetchone()
+                previous = conn.execute("SELECT MAX(created_at) FROM mind_explorations WHERE scope=?", (self.mind.scope.key(),)).fetchone()[0] if exists else None
+            if previous and timestamp(previous)+timedelta(minutes=interval)>timestamp(self.mind.clock()):
+                return {"state": "waiting", "reason": "owner-exploration-interval", "next_at": (timestamp(previous)+timedelta(minutes=interval)).isoformat()}
         view = self.mind.read()
         if (view.get("action_policy") or {}).get("needs_review"):
             return {"state": "waiting", "reason": "action-policy-needs-review"}

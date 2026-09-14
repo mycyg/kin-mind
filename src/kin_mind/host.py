@@ -45,6 +45,29 @@ def dispatch(config, action, request):
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
     memory = MemoryContinuity(mind)
+    if action == "configure-habits":
+        return memory.habits.update(request)
+    if action == "reply-choice":
+        return memory.habits.choose_reply(request)
+    if action == "reply-status":
+        return memory.habits.reply_status(request["input_id"])
+    if action == "share-preflight":
+        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
+        if provider:
+            provider.timeout = 120
+        return memory.sharing.preflight(request, provider)
+    if action == "share-cancel":
+        return memory.sharing.cancel(request["draft_id"])
+    if action == "reply-references":
+        return memory.sharing.register(request)
+    if action == "graph":
+        return memory.graph.read(**request)
+    if action == "graph-detail":
+        return memory.graph.detail(request["identifier"])
+    if action == "graph-revise":
+        return memory.graph.revise(request)
+    if action == "event-thread":
+        return Contexts(mind).event_thread(**request)
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -146,6 +169,9 @@ def dispatch(config, action, request):
         actions.drain(jobs)
         if memory.settings()["semantic"]:
             memory.queue_history(jobs, config["agent_version"])
+            if memory.settings()["graph"]:
+                from .graph_migration import GraphMigration
+                GraphMigration(mind).queue_history(jobs, config["agent_version"])
         result = jobs.run_one(DeepSeek.from_engine(engine))
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":

@@ -79,6 +79,21 @@ for a, b in zip(ids, ids[1:]):
     engine.relate(a, "related", b)
 if not Organizer(engine).list(Scope()):
     Organizer(engine).create(Scope(), "记忆与连续性", ids, "family")
+# A synthetic event/receipt chain exercises the same graph as the private host.
+from kin_mind.memory import MemoryContinuity
+from kin_mind.state import Mind
+
+mind = Mind(engine, Scope())
+with engine.db.connect() as conn:
+    initialized = conn.execute("SELECT 1 FROM mind_state WHERE scope=?",(mind.scope.key(),)).fetchone()
+if not initialized:
+    mind.initialize(agent_version="console-synthetic-v1", evidence_ids=[ids[0]])
+memory = MemoryContinuity(mind)
+memory.configure({"records":True,"graph":True,"sharing":True,"graph_recall":True})
+event = memory.ingest({"id":"console-migration-event","kind":"owner-message","text":"共同检查数据库迁移结果", "at":"2026-09-01T01:00:00.000000+00:00", "task_id":"synthetic-migration"})
+with engine.db.connect(write=True) as conn:
+    units = memory.sharing.units(conn,event["event_id"],["隔离目录中的恢复验证已经通过。"],[event["source_id"]],owner_kind="work")
+memory.ingest({"id":"console-migration-delivery","kind":"delivery","at":"2026-09-01T01:05:00.000000+00:00","channel":"synthetic", "delivery_id":"synthetic-batch", "bubble_id":"synthetic-bubble", "text":"隔离目录中的恢复验证已经通过。", "state":"accepted", "message_id":"synthetic-message", "references":[{"unit_id":units[0]["id"],"version":1}]})
 uvicorn.run(
     create_app(engine=engine, token="test-console-local", workers=False),
     host="127.0.0.1",

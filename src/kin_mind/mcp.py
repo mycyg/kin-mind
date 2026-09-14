@@ -8,6 +8,45 @@ from .state import AffectiveEvent, DesireChange, Mind
 
 def register_mind_tools(server, engine):
     @server.tool()
+    def update_conversation_habits(scope: Scope, request: dict) -> dict:
+        """Apply explicit user preferences from conversation. Needs command_id, expected_revision, evidence_ids, reason and preferences. Supports exploration_frequency, exploration_directions, exploration_min_interval_minutes, exploration_paused and reply_choice (always/autonomous). Returns a durable revision; core persona remains separate."""
+        from .habits import ConversationHabits
+        return ConversationHabits(Mind(engine, scope)).update(request)
+
+    @server.tool()
+    def choose_reply(scope: Scope, request: dict) -> dict:
+        """Choose reply, silent or merged for the current received input_id. Include a brief public decision reason, and merged_into for merged. The owner can allow autonomous silence in casual conversation. A new input gets its own choice. This records a decision, never sends text or invents a delivery failure."""
+        from .habits import ConversationHabits
+        return ConversationHabits(Mind(engine, scope)).choose_reply(request)
+
+    @server.tool()
+    def read_graph(scope: Scope, focus: str | None = None, query: str = "", since: str | None = None, until: str | None = None, layer: str | None = None, kind: str | None = None, cursor: int = 0, limit: int = 150, hops: int = 1) -> dict:
+        """Read sourced event/entity relationships, separate subjective associations, and finding-level delivery coverage. At most three hops and 300 nodes per page; use cursor or focused expansion for older history."""
+        from .memory import MemoryContinuity
+        memory = MemoryContinuity(Mind(engine, scope))
+        result = memory.graph.read(focus=focus, query=query, since=since, until=until, layer=layer, kind=kind, cursor=cursor, limit=limit, hops=hops)
+        result["nodes"] = [memory.sharing.decorate(n) for n in result["nodes"]]
+        return result
+
+    @server.tool()
+    def read_event_thread(scope: Scope, identifier: str, query: str = "", cursor: int = 0, budget: int = 2000) -> dict:
+        """Follow a sourced event through participants, work, findings, delivery and feedback. Page within the memory budget; uncertainty and prior sharing stay attached to the finding."""
+        from .context import Contexts
+        return Contexts(Mind(engine, scope)).event_thread(identifier, query=query, cursor=cursor, budget=budget)
+
+    @server.tool()
+    def revise_graph(scope: Scope, request: dict) -> dict:
+        """Correct/retract/restore a graph object, merge identities/events, or split/undo a prior command. Requires command_id, id, expected_revision, evidence_ids and reason. Merge also needs target_id/target_revision; undo needs previous_command_id. Preserves original evidence and inverse revisions."""
+        from .graph import EventGraph
+        return EventGraph(Mind(engine, scope)).revise(request)
+
+    @server.tool()
+    def register_reply_references(scope: Scope, request: dict) -> dict:
+        """Register public bubbles and their finding references before replying. Use current reply_id and bubbles [{text,references:[{unit_id,version,mode,reason}]}]. Exact text binds references to the delivered bubble. This tool registers only; it does not send or certify receipt. Old findings use a sourced continuation mode."""
+        from .sharing import ShareLedger
+        return ShareLedger(Mind(engine, scope)).register(request)
+
+    @server.tool()
     def read_share_history(scope: Scope, query: str = "", identifier: str | None = None, cursor: int = 0, budget: int = 2000) -> dict:
         """Read what Kin has actually sent, with topic continuity and platform receipts. Use before calling an old finding new. A receipt is not phone read status; semantic summaries retain sources. Follow cursor or an omitted ID for more evidence."""
         from .context import Contexts
