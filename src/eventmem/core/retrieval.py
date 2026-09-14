@@ -95,7 +95,7 @@ def valid(data, request):
     return None
 
 
-def candidates(engine, request):
+def candidates(engine, request, *, full_lexical=False):
     trace = {"channels": {}, "filtered": [], "ranked": [], "mode": request.mode}
     ranks: dict[str, float] = defaultdict(float)
     docs: dict[str, dict] = {}
@@ -162,7 +162,7 @@ def candidates(engine, request):
                     words = [request.query.lower()]
                 if words:
                     match = " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
-                    if request.mode == "fast":
+                    if request.mode == "fast" and not full_lexical:
                         # Fast lexical candidates are bounded recent matches. Deep
                         # retrieval scores the full match set with FTS5 BM25.
                         rows = conn.execute(
@@ -348,6 +348,14 @@ def candidates(engine, request):
 
 
 def recall(engine, request: RecallRequest):
+    from kin_mind.context import Contexts, enabled
+    if enabled(engine, request.scope):
+        from kin_mind.state import Mind
+        result = Contexts(Mind(engine, request.scope)).build(query=request.query,
+            purpose="read" if request.phase in {"search", "read"} else "startup" if request.phase in {"startup", "compact"} else "chat",
+            session=request.session or "", budget=request.budget, history=request.history,
+            allow_model=request.phase in {"search", "read"})
+        return {**result, "items": result.get("index", []), "generation": engine.db.generation(), "accounts": {"memory": result["tokens"]}}
     started = time.perf_counter()
     engine.interactive_until = time.monotonic() + 2
     policy = DEFAULTS.get(request.scenario, DEFAULTS["tool"]) | engine.settings(

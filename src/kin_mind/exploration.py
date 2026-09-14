@@ -20,6 +20,7 @@ from pydantic import Field, field_validator
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model, SourceInput
 
+from .memory import MemoryContinuity
 from .state import DesireChange
 
 
@@ -364,7 +365,7 @@ class Explorations:
         source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
             scope=self.mind.scope, authority="model", kind="observation", session=eid,
             text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
-            occurred_at=self.mind.clock(), extract=True,
+            occurred_at=self.mind.clock(), extract=not MemoryContinuity(self.mind).settings()['semantic'],
             metadata={"host_event": "exploration-result", "provider": "kimi-cli", "exploration_id": eid,
                       "exploration_target": target, "observation_ids": observation_ids,
                       "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])}))

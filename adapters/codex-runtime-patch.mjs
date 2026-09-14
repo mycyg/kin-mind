@@ -70,7 +70,7 @@ export function patchCodexRuntime(source) {
 }
 
 export function installCodexRuntimePatch(file) {
-  const original = fs.readFileSync(file,'utf8'), patched = patchCodexRuntime(original);
+  const original = fs.readFileSync(file,'utf8'), patched = patchMemoryRuntime(patchCodexRuntime(original));
   if (original === patched) return;
   const hash = createHash('sha256').update(original).digest('hex').slice(0,16);
   const backup = file + '.kin-routing-backup-' + hash;
@@ -78,4 +78,36 @@ export function installCodexRuntimePatch(file) {
   const temporary = file + '.kin-routing-' + process.pid;
   fs.writeFileSync(temporary, patched, {mode:fs.statSync(file).mode & 0o777});
   fs.renameSync(temporary,file);
+}
+
+/** Private ACP extension: run native compaction without a synthetic user turn. */
+export function patchMemoryRuntime(source) {
+  const marker='// KIN_MEMORY_COMPACTION_V1';
+  if(source.includes(marker))return source;
+  const method=`
+  async kinCompact(sessionId, operationId, checkOnly = false) {
+    const state = this.sessions.get(sessionId);
+    if (state?.kinCompactionReceipt?.operationId === operationId) return state.kinCompactionReceipt;
+    if (checkOnly) return {completed: false, operationId, actual_session: sessionId};
+    if (state?.kinCompactionOperation === operationId) throw new Error("KIN_COMPACTION_UNCONFIRMED");
+    const before = await this.kinRuntime(sessionId);
+    if (!before.known || before.active || before.backgroundTasks || before.nativeStatus !== "idle") throw new Error("KIN_COMPACTION_BUSY");
+    state.kinCompactionOperation = operationId;
+    await this.codexAcpClient.runCompact(sessionId);
+    const after = await this.kinRuntime(sessionId);
+    if (!after.known || after.threadId !== sessionId || after.nativeSessionId !== sessionId || after.model !== before.model) throw new Error("KIN_COMPACTION_UNCONFIRMED");
+    state.kinCompactionReceipt = {completed: true, operationId, actual_session: sessionId, model: after.model, at: new Date().toISOString()};
+    return state.kinCompactionReceipt;
+  }
+`;
+  const entry='  async kinLastReply(sessionId) {';
+  const dispatch='    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);';
+  const register='.onRequest("_kin/runtime",';
+  for(const value of [entry,dispatch,register])if(source.split(value).length!==2)throw Error('ACP compaction extension needs compatibility review');
+  source=source.replace(entry,method+'\n'+entry)
+    .replace(dispatch,dispatch+'\n    if (method === "_kin/compact") return await this.kinCompact(params.sessionId, params.operationId, params.checkOnly);')
+    .replace(register,'.onRequest("_kin/compact", external_exports.object({sessionId: external_exports.string(),operationId: external_exports.string(),checkOnly: external_exports.boolean().optional()}), (ctx) => getAgent().extMethod("_kin/compact", ctx.params))'+register);
+  source=source.replace('text: item?.text?.slice(-4000) ?? ""','text: item?.text ?? ""');
+  const offset=source.startsWith('#!')?source.indexOf('\n')+1:0;
+  return source.slice(0,offset)+marker+'\n'+source.slice(offset);
 }

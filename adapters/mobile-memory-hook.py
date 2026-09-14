@@ -63,9 +63,37 @@ def main():
     try:
         raw = filtered_event(json.load(sys.stdin), args.events)
         if raw:
+            # The bridge now owns conversation ingestion and one combined memory
+            # budget. Generic hooks still journal tools, without a second context
+            # injection or duplicate owner/assistant semantic extraction.
+            import sqlite3
+            try:
+                from eventmem.core.models import Scope
+                scope_key = Scope.model_validate_json(args.scope).key()
+                database = args.root / 'memory.sqlite3'
+                if not database.is_file():
+                    raise OSError('Memory database is unavailable')
+                with sqlite3.connect(str(database)) as conn:
+                    conn.execute('PRAGMA query_only=ON')
+                    configured = conn.execute('SELECT data FROM mind_memory_config WHERE scope=?', (scope_key,)).fetchone()
+                managed = bool(configured and json.loads(configured[0]).get('context'))
+            except (OSError, sqlite3.Error):
+                managed = False
+            if managed:
+                if raw.get('hook_event_name') in {'SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact', 'PreToolUse'}:
+                    print('{}')
+                    return
+                from eventmem.hooks.codex import deliver, normalize
+                normalized = normalize(raw, scope=json.loads(args.scope), scenario=args.scenario)
+                if normalized:
+                    event, payload = normalized
+                    payload.update(memory_context_managed=True, extract=False)
+                    deliver(event, payload, root=args.root, url=args.url)
+                print('{}')
+                return
             from eventmem.hooks.codex import run
             result = run(raw, root=args.root, url=args.url, scope=json.loads(args.scope), scenario=args.scenario)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - native hook must return a redacted failure
         print("Mobile memory hook unavailable (" + type(error).__name__ + ").", file=sys.stderr)
     print(json.dumps(result, ensure_ascii=False))
 

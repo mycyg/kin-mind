@@ -22,6 +22,7 @@ from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .exploration_decisions import SharingDecision, apply_decisions
+from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 
@@ -78,6 +79,8 @@ class Appraisal(Model):
     concerns: list[ConcernProposal] = Field(default_factory=list, max_length=6)
     rhythm: RhythmProposal | None = None
     sharing: list[SharingDecision] = Field(default_factory=list, max_length=4)
+    memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
+    next_review_minutes: StrictInt = Field(default=20, ge=20, le=120)
 
     @field_validator("motivations")
     @classmethod
@@ -136,6 +139,20 @@ exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果�
 用户交办工作缺必要条件时由原任务及时询问，不受自主联系阈值阻塞。自主愿望的求助继续使用contact意图。没有需要分享或求助的内容时，wishes可以为空。保持所有旧分数和历史，仅更新有依据的项目。
 """
 
+SYSTEM += """
+关联记忆启用时，memory_context给出待处理事件、最新互动、作品和已分享记录；它们是同一条语义处理流程。
+在memory.notes保存有来源的简短记忆，memory.links关联已有记录，memory.disclosures补齐已有share_id的主题、摘要、关联和mode。
+mode为new/development/reflection/reminiscence/duplicate；新进展、新感想、回忆可以重提旧事，但不能把原样分享当成新发现。
+做过、说过做了、已生成文件、服务器接收、手机已读分别看宿主证据；文件和ZIP指纹匹配已有作品时延续它的制作交付史。
+用户说忙或助手说等你回来不代表永久停止分享；只有用户明确要求暂停/停止才形成相应偏好。助手的措辞不自动变成用户约束。
+批次可能包含较早的消息。以recent_interaction里的最新上下文检查旧问题是否已经回应，已回应的内容不再新建未来回复愿望。
+memory.notes中的evidence_ids来自本轮new_evidence；关于已有作品与分享的链接可以使用memory_context中的id。只记录公开结论，不记录推理过程。
+idle-review是非对话时自主起念，允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整；它不是用户新消息。
+next_review_minutes由你在20到120之间选择，决定下一次安静时重新想一想的时间，不是发消息时刻。新事件仍可更早触发。
+delivery仅结算回执；发送状态由宿主保存，memory.disclosures可以整理已发内容，不能靠回执创造新话题。
+memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新情绪、不新建或恢复愿望；它不是新经历。
+"""
+
 
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
@@ -154,32 +171,37 @@ def appraisal_context(context):
             "label", "value", "projected_value", "baseline", "half_life_hours", "target",
             "basis", "observed_at", "needs_review", "agent_version", "evidence_ids",
         }}
-        projected["reason"] = value.get("reason", "")[:300]
+        projected["reason"] = value.get("reason", "")
         if value.get("motivation"):
-            projected["motivation"] = {**value["motivation"], "reason": value["motivation"].get("reason", "")[:180]}
+            projected["motivation"] = value["motivation"]
         state["dimensions"][key] = projected
     state["desires"] = []
-    for desire in original.get("desires", []):
+    all_desires = original.get("desires", [])
+    active_desires = [d for d in all_desires if d.get("status") in {"wanted", "waiting", "in_progress"} and not d.get("expired")]
+    completed_desires = [d for d in all_desires if d not in active_desires]
+    chosen_desires = sorted(active_desires, key=lambda d: (d.get("updated_at", ""), d["id"]), reverse=True)[:16] + completed_desires[-8:]
+    for desire in chosen_desires:
         active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
         keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review", "exploration_target", "exploration_id"}
         if active:
             keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
         projected = {k: v for k, v in desire.items() if k in keys}
-        projected["content"] = desire.get("content", "")[:2000 if active else 180]
+        projected["content"] = desire.get("content", "")
         if active:
-            projected["reason"] = desire.get("reason", "")[:300]
+            projected["reason"] = desire.get("reason", "")
             projected["evidence_ids"] = [r["record_id"] for r in desire.get("evidence", [])]
         state["desires"].append(projected)
+    state["desire_window"] = {"included": len(chosen_desires), "total": len(all_desires), "remaining_in_storage": len(all_desires) - len(chosen_desires)}
     # Keep the decision window bounded; evidence dedup and revision history do
     # not depend on which concerns happen to fit this request.
     concerns = original.get("concerns", [])
-    query = " ".join(s.get("text", "")[:2000] for s in context.get("new_evidence", []))
+    query = " ".join(s.get("text", "") for s in context.get("new_evidence", []))
     relevant = {c["id"] for c in select_concerns(concerns, query, limit=8)}
     linked = {cid for d in state["desires"] if d["status"] in {"wanted", "waiting", "in_progress"} for cid in d.get("concern_ids", [])}
     chosen = sorted(concerns, key=lambda c: (
         c["id"] in relevant, c["id"] in linked,
         c["status"] in {"active", "easing"}, c.get("updated_at", ""), c["id"],
-    ), reverse=True)[:32]
+    ), reverse=True)[:12 if context.get("memory_context") else 32]
     state["concerns"] = [{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review", "owner_request")} for c in chosen]
     state["concern_window"] = {"included": len(chosen), "total": len(concerns)}
     if original.get("action_policy"):
@@ -218,15 +240,88 @@ class DeepSeek:
         provider.engine = engine
         return provider
 
-    def appraise(self, context):
+    def structured(self, name, schema, system, context, *, max_tokens=16384):
+        """Share the verified Flash/max transport; accept only the named tool result."""
         started = time.monotonic()
-        policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
-        request_context = appraisal_context(context)
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
         try:
             with httpx.Client(timeout=self.timeout, transport=self.transport) as client:
+                response = client.post(self.endpoint + "/v1/messages",
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+                    json={"model": "deepseek-flash", "max_tokens": max_tokens, "system": system,
+                          "messages": [{"role": "user", "content": dumps(context)}],
+                          "tools": [{"name": name, "description": "Submit sourced structured results", "input_schema": schema.model_json_schema()}],
+                          "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": "max"}})
+            if response.status_code != 200:
+                raise RuntimeError("deepseek-http-" + str(response.status_code))
+            body = response.json()
+            if body.get("model") != "deepseek-flash" or body.get("stop_reason") == "max_tokens":
+                raise RuntimeError("deepseek-incomplete-or-unverified")
+            calls = [b for b in body.get("content", []) if b.get("type") == "tool_use" and b.get("name") == name]
+            if len(calls) != 1:
+                raise RuntimeError("deepseek-missing-structured-result")
+            result = schema.model_validate(calls[0]["input"])
+            return result, {"provider": "deepseek", "model": body["model"], "reasoning": "max", "request_id": body.get("id"),
+                            "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
+                            "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        except httpx.TimeoutException:
+            raise RuntimeError("deepseek-timeout") from None
+        except httpx.HTTPError:
+            raise RuntimeError("deepseek-network-error") from None
+
+    def appraise(self, context):
+        started = time.monotonic()
+        policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
+        request_context = appraisal_context(context)
+        if hasattr(self, "engine") and request_context.get("memory_context"):
+            from eventmem.core.models import Scope
+            from eventmem.core.retrieval import tokens
+
+            from .computer import redact
+            from .context import Contexts
+            from .state import Mind
+            request_context = redact(request_context)
+            if tokens(dumps(request_context)) > 24000:
+                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=60, transport=self.transport)
+                compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
+                # The state/IDs stay structured; the long evidence is summarized
+                # once across this batch, preserving source authority separately.
+                evidence = request_context["new_evidence"]
+                items = [{"id": s["id"], "revision": 1, "basis": s.get("authority", "inferred"), "text": s["text"]} for s in evidence]
+                memory_data = request_context["memory_context"]
+                # These are complete decision records, not the entire work/share
+                # ledger. Summarize long latest interactions in the same request.
+                for kind in ("recent_interaction", "works", "shares"):
+                    for index, value in enumerate(memory_data[kind]):
+                        identifier = value.get("id") or kind + ":" + str(index)
+                        items.append({"id": identifier, "revision": value.get("revision", 1), "basis": "observed" if kind != "recent_interaction" else "reported", "text": dumps(value)})
+                projected_state = request_context["state"]
+                for kind in ("desires", "concerns"):
+                    for value in projected_state.get(kind, []):
+                        items.append({"id": kind + ":" + value["id"], "revision": value.get("revision", 1), "basis": value.get("basis", "inferred"), "text": dumps(value)})
+                    projected_state[kind] = [{k: v for k, v in value.items() if k in {"id", "revision", "status", "kind", "evidence_ids", "needs_review"}} for value in projected_state.get(kind, [])]
+                for dimension, value in projected_state.get("dimensions", {}).items():
+                    if value.get("reason"):
+                        items.append({"id": "dimension:" + dimension, "text": value.pop("reason"), "basis": "inferred"})
+                unique = {i["id"]: i for i in items}
+                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor)
+                if result["omitted_ids"]:
+                    raise RuntimeError("deepseek-evidence-compression-pending")
+                request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]
+                request_context["evidence_summary"] = result["text"]
+                request_context["memory_context"]["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in request_context["memory_context"]["pending_events"]]
+                for kind in ("recent_interaction", "works", "shares"):
+                    memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
+                request_context["compression_receipt"] = result.get("receipt")
+                if tokens(dumps(request_context)) > 24000:
+                    raise RuntimeError("deepseek-appraisal-budget-pending")
+        key = os.environ.get(self.key_env)
+        if not key:
+            raise RuntimeError("deepseek-key-unavailable")
+        try:
+            with httpx.Client(timeout=max(30, self.timeout - (time.monotonic() - started)), transport=self.transport) as client:
                 response = client.post(
                     self.endpoint + "/v1/messages",
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
@@ -301,6 +396,7 @@ class Appraisals:
     def __init__(self, mind, *, exploration_capabilities=None):
         self.mind, self.engine = mind, mind.engine
         self.exploration_capabilities = exploration_capabilities or {}
+        self.memory = MemoryContinuity(mind)
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA)
 
@@ -313,6 +409,7 @@ class Appraisals:
                 [
                     self.mind.scope.key(),
                     sorted({(r["source_id"], r["hash"]) for r in refs}),
+                    *(["memory-backfill"] if stimulus == "memory-backfill" else []),
                 ]
             )[:32]
         )
@@ -368,9 +465,10 @@ class Appraisals:
         return clean[0] if job_id and clean else clean
 
     def run_one(self, provider):
+        semantic_enabled = self.memory.settings()["semantic"]
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute(
-                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?)) ORDER BY available LIMIT 1",
+                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?)) ORDER BY CASE WHEN json_extract(data,'$.stimulus')='memory-backfill' THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time()),
             ).fetchone()
             if not row:
@@ -381,13 +479,29 @@ class Appraisals:
                 (self.mind.scope.key(), time.time()),
             ).fetchone():
                 return {"state": "busy"}
+            data = json.loads(row["data"])
+            if semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}:
+                batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND (json_extract(data,'$.stimulus') IS NULL OR json_extract(data,'$.stimulus') IN ('assistant-result','runtime-result','delivery')) ORDER BY available LIMIT 11",
+                                     (self.mind.scope.key(), time.time(), row["id"])).fetchall()
+                ids = list(data["evidence_ids"])
+                stimuli = {data.get("stimulus")}
+                batch_ids = []
+                for child in batch:
+                    combined = list(dict.fromkeys(ids + json.loads(child["data"])["evidence_ids"]))
+                    if len(combined) > 40:
+                        break
+                    ids = combined; batch_ids.append(child["id"])
+                    stimuli.add(json.loads(child["data"]).get("stimulus"))
+                data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus="delivery" if stimuli == {"delivery"} else "interaction-batch")
+                conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                for child_id in batch_ids:
+                    conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=?", (child_id,))
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
                 # The host's absolute worker deadline is request timeout + 60s;
                 # keep the lease beyond that deadline, including HTTP keepalives.
                 (time.time() + max(180, float(getattr(provider, "timeout", 90)) + 90), row["id"]),
             )
-        data = json.loads(row["data"])
         try:
             # If a process died after commit, use the durable command receipt.
             key = self.mind._key(row["id"])
@@ -398,13 +512,46 @@ class Appraisals:
             if done:
                 data["result"] = json.loads(done[0])
             else:
+                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
+                    with self.engine.db.connect() as conn:
+                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
+                    if not remaining:
+                        data["result"] = {"already_integrated": True}
+                        with self.engine.db.connect(write=True) as conn:
+                            for identifier in [row["id"], *data.get("batch_ids", [])]:
+                                conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), identifier))
+                        return self.status(row["id"])
+                    data["evidence_ids"] = remaining
                 view = self.mind.read()
                 view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
+                memory_context = self.memory.semantic_context() if semantic_enabled else None
+                historical = data.get("stimulus") == "memory-backfill"
+                if memory_context and historical:
+                    memory_context["through_seq"] = memory_context["cursor"]
+                    memory_context["pending_events"] = []
+                    with self.engine.db.connect() as conn:
+                        placeholders = ",".join("?" for _ in data["evidence_ids"])
+                        old = conn.execute(f"SELECT data FROM mind_runtime_events WHERE scope=? AND json_extract(data,'$.source_id') IN ({placeholders})", [self.mind.scope.key(), *data["evidence_ids"]]).fetchall()
+                        shares = {json.loads(r[0]).get("receipt", {}).get("share_id") for r in old} - {None}
+                        memory_context["shares"] = [self.memory._get(conn, identifier) for identifier in shares]
+                if memory_context:
+                    # The source cursor advances only across events actually given
+                    # to this evaluation; out-of-window history remains pending.
+                    extra = [e["source_id"] for e in memory_context["pending_events"]]
+                    joined = list(dict.fromkeys([*data["evidence_ids"], *extra]))
+                    if len(joined) <= 50:
+                        data["evidence_ids"] = joined
+                        if data.get("stimulus") == "delivery" and any(e.get("kind") in {"owner-message", "assistant-message", "task-result", "artifact-created", "artifact-observed"} for e in memory_context["pending_events"]):
+                            data["stimulus"] = "interaction-batch"
+                    else:
+                        memory_context["through_seq"] = memory_context["cursor"]
+                        memory_context["pending_events"] = []
                 with self.engine.db.connect() as conn:
                     refs = self.mind._evidence(conn, data["evidence_ids"])
                     if not self.mind._fresh(conn, refs):
                         raise Conflict("source-needs-review")
+                    before_state = self.mind._load(conn)
                 for ref in refs:
                     sources.append(
                         {
@@ -413,12 +560,16 @@ class Appraisals:
                             "metadata": ref["metadata"],
                             "text": self.engine.source(
                                 ref["source_id"], content=True
-                            ).read_text()[:20000],
+                            ).read_text(),
                         }
                     )
-                proposal, receipt = provider.appraise(
-                    {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
-                )
+                model_context = {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
+                if memory_context:
+                    model_context["memory_context"] = memory_context
+                memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
+                proposal, receipt = provider.appraise(model_context)
+                if historical:
+                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": []})
                 exploration_ids = [s["metadata"]["exploration_id"] for s in sources
                                    if s["metadata"].get("exploration_id")]
                 primary_result = exploration_ids[0] if data.get("stimulus") == "exploration-result" and exploration_ids else None
@@ -454,12 +605,17 @@ class Appraisals:
                 def apply(conn, state, eid):
                     roots = self.mind._evidence(conn, data["evidence_ids"])
                     allowed = self.mind._continuity_sources(conn, state, roots) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
-                    self.mind._apply_event(conn, state, event, eid, allowed)
-                    apply_decisions(self.mind, conn, state, proposal.sharing, event, receipt, data.get("stimulus"))
+                    latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
+                    new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
+                    effective_event = event.model_copy(update={"motivations": {}, "values": {k: v for k, v in event.values.items() if k not in {"initiative", "curiosity"}}}) if new_interaction else event
+                    if not historical:
+                        self.mind._apply_event(conn, state, effective_event, eid, allowed)
+                    if not new_interaction:
+                        apply_decisions(self.mind, conn, state, proposal.sharing, event, receipt, data.get("stimulus"))
                     if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery":
                         for concern in proposal.concerns:
                             self.mind._apply_concern(conn, state, concern, eid, effective_version, fallback=roots, allowed=allowed)
-                    for index, wish in enumerate([] if data.get("stimulus") == "delivery" else proposal.wishes):
+                    for index, wish in enumerate([] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes):
                         if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
                             wish = wish.model_copy(update={"exploration_id": primary_result})
                         if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
@@ -517,9 +673,31 @@ class Appraisals:
                             eid,
                         )
                         state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
-                    return {"provider": receipt, "proposal": proposal.model_dump()}
+                    if memory_context:
+                        # A later bubble may extend the same share while DS runs.
+                        # Keep that share pending for the next batch; independent
+                        # records and affect can commit without redoing the call.
+                        disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
+                        self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), roots, eid,
+                            memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical)
+                    return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction)}
 
-                data["result"] = self.mind._mutate(event, "affect", apply)
+                def rebase(conn, state):
+                    # Contact bookkeeping may advance the global revision during
+                    # a long model call. Rebase only when its real inputs match.
+                    keys = ("dimensions", "profile_version", "action_policy", "autonomy")
+                    if any(state.get(k) != before_state.get(k) for k in keys):
+                        return False
+                    for update in proposal.wish_updates:
+                        if state["desires"].get(update.desire_id) != before_state["desires"].get(update.desire_id):
+                            return False
+                    for concern in proposal.concerns:
+                        identifier = getattr(concern, "concern_id", None)
+                        if identifier and state.get("concerns", {}).get(identifier) != before_state.get("concerns", {}).get(identifier):
+                            return False
+                    return semantic_enabled
+
+                data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             data.pop("error", None)
             state = "complete"
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
@@ -540,6 +718,12 @@ class Appraisals:
                     row["id"],
                 ),
             )
+            if state == "complete":
+                for child_id in data.get("batch_ids", []):
+                    child = conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (child_id,)).fetchone()
+                    if child:
+                        child_data = {**json.loads(child[0]), "receipt": data.get("receipt"), "result": {"batch_id": row["id"], "event_id": data["result"].get("event_id")}}
+                        conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(child_data), child_id))
         return self.status(row["id"])
 
 

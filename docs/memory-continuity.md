@@ -1,0 +1,67 @@
+# Linked memory, disclosure history and bounded recall
+
+Kin retains the difference between making something, describing it, sending it and receiving a response. A later reading of the same archive can follow its original creation and delivery history. Remembering an index, reading a summary, reading an original, using evidence in an answer and sharing it are separate access records.
+
+```mermaid
+flowchart LR
+  H[Host events and receipts] --> J[Durable journal]
+  J --> W[Work versions and share ledger]
+  J --> D[DeepSeek semantic assessment]
+  W --> D
+  D --> M[Linked memories, concerns and wishes]
+  M --> R[Question-driven recall]
+  W --> R
+  R --> C[Budget and sourced compression]
+  C --> T[Shared conversation]
+  D --> I[Next idle review: 20–120 minutes]
+  I --> D
+```
+
+## Records and evidence
+
+`kin_mind.memory.MemoryContinuity` stores immutable host events and revisioned work, artifact, topic and share nodes in the existing scoped SQLite database. File SHA-256 and ZIP member-content fingerprints recognize renaming and repackaging. A host snapshots observed bytes before deferred ingestion; a changed fingerprint is rejected. Archive fingerprinting reads members without extracting or executing them.
+
+Only an authenticated host can ingest operation or delivery events. Assistant prose remains a model account. Semantic evaluation may connect accounts and add summaries, but cannot invent a platform message ID, change acceptance or mark a message read. A partial multi-bubble send retains each stable bubble ID and receipt. An uncertain send remains uncertain; journal recovery never calls a transport API.
+
+The ledger includes ordinary replies, proactive messages and file sends. DS labels disclosures as new, development, reflection, reminiscence or duplicate and links prior shares. Old topics remain available for a new thought or a deliberate memory. A title-only match does not certify that the original was read.
+
+## One semantic queue
+
+An enabled scope batches pending interaction and receipt events into the existing DeepSeek Flash/max appraisal. Memory notes, links, share interpretations, affect, concerns and wishes commit in one transaction. Source identity and revision are checked at commit. Bookkeeping changes that do not touch actual appraisal dependencies can be rebased; a newly arrived owner message defers new action intentions to its own assessment.
+
+The persistent cursor limits a batch to complete events. Latest interactions accompany delayed events, so an old reply is not blindly recreated as a future wish. The assistant saying “I'll tell you later” is an account of its own arrangement, not an owner contact restriction. Receipt-only events settle existing intentions without creating topics.
+
+DS chooses the next idle review within 20–120 minutes; the first review defaults to 20. A local minute tick queues one due event, even if both motivation values and targets are below threshold. Restart uses the same due-event identity. Evaluation is distinct from sending: initiative 75, host preferences, quiet hours and the work lock still govern contact. Exploration remains question-driven and is performed by Kimi under the existing 20-minute execution budget.
+
+## Recall and context budgets
+
+The tools `read_continuity_context`, `read_work_history` and `read_share_history` support same-turn recall of earlier work, people, promises and events. They expose stable identifiers, evidence status and continuation cursors. Exact IDs, full-history lexical ranking and existing record relationships supply candidates; DS-generated source-backed notes provide semantic links. The chat model can refine a query or follow evidence for up to three automatic rounds before preserving an unresolved question. The generic deep retrieval facilities remain available in scopes using the inherited retrieval interface.
+
+Automatic context is limited to three relevant works, five relevant shares and a compact state/concern view. It no longer appends two complete exploration results to every reply.
+
+| Context | Default tokens |
+| --- | ---: |
+| New or compacted window | 2,000 |
+| Ordinary chat additions | 800 |
+| Proactive draft | 2,500 |
+| Work background | 4,000 |
+| Explicit history page | 2,000 |
+| Automatic additions per native window | 12,000 |
+
+The automatic budget includes the renderer's envelope. A content revision is automatically injected once per native window; explicit reads bypass that de-duplication. Near 10,000 accumulated tokens, the host requests native compaction at an idle boundary, checking work tasks, queued inputs, tools and deliveries. It resets the window only after a receipt for the original native session. An uncertain receipt is reconciled under its existing operation ID; restarting does not certify success.
+
+DeepSeek compression applies to *incoming* evidence; native compaction applies to history *already in* the conversation. Complete events or paragraphs are compressed before reduction. Summaries retain coverage IDs, source revisions, confirmation status, time, negation, conditions and outcomes. Originals are retained. Invalid output, changed sources or a timeout falls back to fitting complete evidence items with explicit omissions and a continuation. The implementation never substitutes a character-cut fragment for a meaningful source passage.
+
+Caches are bound to scope, input revisions, query purpose, budget and compression prompt version. Background overviews may be reused with an “overview” coverage label; explicit queries can still read the originals. Source correction, deletion or a mismatched revision invalidates dependent cached results. All model interfaces accept named structured results; reasoning blocks are excluded.
+
+## Host integration and migration
+
+New host actions: `runtime-event`, `memory-context`, `prepare-memory`, `memory-compact-ack`, `share-history`, `work-history`, and `configure-memory`. The host event journal is independent of transport retries. `adapters/memory-events.mjs` also snapshots file observations and reconciles local outbox records. `adapters/context-compaction.mjs` serializes native compaction with the existing router.
+
+Feature flags `records`, `semantic`, `context` and `idle` default to false. Enable records first, then semantic integration, then context and idle reviews after synthetic and private validation. Turning a feature off retains its records and old API fields. Each phone host must expose the three new tools and render `memory_context.rendered_text` verbatim as data, rather than appending full old findings again.
+
+`kin_mind.backfill.HistoryImport` imports host-supplied events and selected source namespaces with a persistent cursor. Backfill preserves original timestamps and marks historical data. It creates no new emotion, contact or exploration wish and cannot change a completed wish. The lower-priority semantic history queue yields to live inputs. Deferred sources keep a review record.
+
+Run `PYTHONPATH=src python examples/memory_benchmark.py` for a synthetic 10,000-share/1,000-work check. `tests/test_memory_continuity.py` covers archive identity, partial receipts, source corrections, failed compression, idle reviews, delayed input, backfill and evidence status. The adapter tests cover journal recovery, immutable observed bytes and native compaction under work locks. Provider latency and cache usage must also be measured in the private deployment; the synthetic benchmark makes no API request.
+
+The public repository contains mechanisms and synthetic fixtures. Actual files, shared experiences, recipients and credentials remain private.

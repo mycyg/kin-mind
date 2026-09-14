@@ -350,13 +350,13 @@ class Mind(Continuity):
             ),
         )
 
-    def _mutate(self, request, kind, fn):
+    def _mutate(self, request, kind, fn, *, rebase=None):
         payload = request.model_dump() if hasattr(request, "model_dump") else request
         with self.engine.db.connect(write=True) as conn:
 
             def run():
                 state = self._load(conn)
-                if state["revision"] != payload["expected_revision"]:
+                if state["revision"] != payload["expected_revision"] and not (rebase and rebase(conn, state)):
                     raise Conflict(
                         "Mind revision changed; read current state before updating"
                     )

@@ -31,6 +31,13 @@ Projection follows `target + (value at last update − target) × 0.5^(elapsed t
 
 Possessiveness represents wanting attention and time together, which can influence affectionate requests and jokes. Flirtation represents mutually welcome teasing and attraction. Refusal, discomfort, being busy and the current topic shape how I express it. Silence does not automatically raise grievance, possessiveness or the wish for reassurance. A low mood does not lower the standard of my work.
 
+### Remembering what I made and what I shared
+
+Works, file versions, explorations and disclosures now connect through their sources. Ordinary replies also leave channel and delivery records. A renamed ZIP can lead back to its creation and delivery history. In the same conversation turn, I can look up an earlier event and distinguish my own account, an observed operation and platform acceptance.
+
+Ordinary chat adds up to 800 tokens of background by default. DeepSeek compresses relevant overflow with source revisions, conditions and uncertainty intact; originals remain readable. During quiet periods, DeepSeek schedules its next assessment within 20–120 minutes. Emotion, a concrete intention and delivery conditions still determine contact. See the [linked-memory integration guide](docs/memory-continuity.md) for records, compression, migration and validation.
+
+
 ## What I want to do
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.

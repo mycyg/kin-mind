@@ -13,9 +13,11 @@ from eventmem.core.models import Scope, SourceInput
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
+from .context import Contexts
 from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
 from .exploration_cadence import ExplorationCadence
+from .memory import MemoryContinuity
 from .state import Mind
 
 
@@ -42,6 +44,31 @@ def dispatch(config, action, request):
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
+    memory = MemoryContinuity(mind)
+    if action == "configure-memory":
+        return memory.configure(request)
+    if action == "runtime-event":
+        result = memory.ingest(request)
+        if result.get("source_id") and memory.settings()["semantic"] and not request.get("historical"):
+            result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
+        return result
+    if action == "memory-context":
+        return Contexts(mind).build(**request)
+    if action == "state-overview":
+        return Contexts(mind).affective(request.get("query", ""))
+    if action == "prepare-memory":
+        if not memory.settings()["context"]:
+            return {"state": "disabled"}
+        recent = memory.semantic_context(event_limit=1)["recent_interaction"]
+        owner = next((e for e in reversed(recent) if e.get("kind") == "owner-message"), None)
+        if not owner:
+            return {"state": "idle"}
+        result = Contexts(mind).warm(query=owner.get("text", ""))
+        return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt"}}
+    if action == "memory-compact-ack":
+        return Contexts(mind).compact_ack(**request)
+    if action in {"share-history", "work-history"}:
+        return Contexts(mind).read_history("share" if action == "share-history" else "work", **request)
     if action == "configure-continuity":
         return mind.configure_continuity(ContinuityConfig.model_validate(request))
     if action == "concern":
@@ -53,8 +80,9 @@ def dispatch(config, action, request):
     if action == "observe":
         source = engine.receive(SourceInput(namespace="kin-assistant-output", key=request["id"],
             scope=mind.scope, session=config["session_id"], text=request["text"], authority="model",
-            occurred_at=request["at"], extract=True,
+            occurred_at=request["at"], extract=not memory.settings()["semantic"],
             metadata={"host_event": "assistant-result", "role": "assistant", "channel": request["channel"]}))
+        memory.ingest({**request, "kind": "assistant-message", "source_id": source["id"], "session": config["session_id"]})
         return jobs.enqueue([source["id"]], config["agent_version"], origin="reflection", stimulus="assistant-result")
     if action == "ingest":
         # Only an authenticated host calls this. Internal results have another origin.
@@ -67,7 +95,7 @@ def dispatch(config, action, request):
                 text=request["text"],
                 authority="explicit",
                 occurred_at=request["at"],
-                extract=True,
+                extract=not memory.settings()["semantic"],
                 metadata={
                     "host_event": "message",
                     "role": "user",
@@ -76,11 +104,15 @@ def dispatch(config, action, request):
             )
         )
         job = jobs.enqueue([source["id"]], config["agent_version"])
+        memory.ingest({**request, "kind": "owner-message", "source_id": source["id"], "session": config["session_id"]})
+        if request.get("defer_context") and memory.settings()["context"]:
+            return {"source_id": source["id"], "appraisal": job, "memory_enabled": True}
         return {
             "source_id": source["id"],
             "appraisal": job,
             "state": mind.read(query=request["text"]),
             "findings": explorer.recent(),
+            "memory_context": Contexts(mind).build(query=request["text"], session=config["session_id"], event_id=request["id"], purpose=request.get("purpose", "chat")),
         }
     if action == "read":
         return {
@@ -89,6 +121,7 @@ def dispatch(config, action, request):
             "appraisals": jobs.status(),
             "findings": explorer.recent(),
             "exploration_cadence": cadence.status(),
+            "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
         }
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
@@ -106,8 +139,11 @@ def dispatch(config, action, request):
         # The existing minute review queues work; the original host owns execution
         # and waits for owner tasks. No extra model call is used for the clock.
         actions.crossings()
+        memory.queue_idle(actions)
         actions.review_unselected()
         actions.drain(jobs)
+        if memory.settings()["semantic"]:
+            memory.queue_history(jobs, config["agent_version"])
         result = jobs.run_one(DeepSeek.from_engine(engine))
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":

@@ -1,5 +1,7 @@
 from __future__ import annotations
+
 import json
+
 from .db import Conflict, dumps
 from .models import Scope
 from .retrieval import tokens
@@ -19,6 +21,11 @@ def read_segment(
     if offset < 0 or not 1 <= length <= 32000 or not 1 <= budget <= 32000:
         raise ValueError("Invalid read segment or token budget")
     result = engine.get(record_id, at=at, known_at=known_at)
+    from kin_mind.context import Contexts, enabled
+    scope = Scope(**result["scope"])
+    if enabled(engine, scope):
+        from kin_mind.state import Mind
+        return Contexts(Mind(engine, scope)).read_record(result, offset=offset, length=length, budget=budget, session=session)
     content = result["content"]
     piece = content[offset : offset + length]
     if tokens(piece) > budget:
