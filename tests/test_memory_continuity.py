@@ -72,6 +72,31 @@ def test_receipt_states_are_durable_and_do_not_invent_read(system):
         memory.ingest({**base, "id": "missing-id", "state": "accepted"})
 
 
+def test_appraisal_keeps_delivery_evidence_but_projects_repeated_model_usage():
+    from copy import deepcopy
+
+    from eventmem.core.db import dumps
+    from eventmem.core.retrieval import tokens
+    from kin_mind.appraisal import appraisal_context
+
+    share = {"id": "share-old", "revision": 3, "source_ids": ["src-delivery"],
+             "state": "accepted", "summary": "Already shared; the task is unfinished.",
+             "bubbles": {"bubble-one": {"text": "It is not complete yet.", "message_id": "receipt-one"}},
+             "assessment_receipt": {"model": "deepseek-flash", "verified_at": "2026-09-14T00:00:00Z",
+                                    "usage": {"synthetic-accounting": "meter " * 4000}}}
+    original = {"stimulus": "delivery", "state": {}, "memory_context": {"shares": [share]}}
+    frozen = deepcopy(original)
+    result = appraisal_context(original)
+    view = result["memory_context"]["shares"][0]
+    assert original == frozen
+    assert view["source_ids"] == share["source_ids"]
+    assert view["summary"] == share["summary"]
+    assert view["bubbles"] == share["bubbles"]
+    assert view["state"] == "accepted"
+    assert view["assessment_provenance"]["model"] == "deepseek-flash"
+    assert tokens(dumps(result)) < tokens(dumps(original)) / 4
+
+
 def test_idle_reassessment_without_a_drive_crossing(system):
     mind, memory, _, clock = system
     actions = ActionEvents(mind)

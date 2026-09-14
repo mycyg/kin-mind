@@ -158,6 +158,20 @@ memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新�
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
     result = dict(context)
+    if isinstance(context.get("memory_context"), dict):
+        memory_context = dict(context["memory_context"])
+        shares = []
+        for original_share in memory_context.get("shares", []):
+            share = dict(original_share)
+            receipt = share.pop("assessment_receipt", None)
+            if receipt:
+                # Per-request token accounting is durable audit data. Repeating
+                # it for every share adds no evidence about what was delivered.
+                share["assessment_provenance"] = {k: receipt[k] for k in
+                    ("provider", "model", "verified_at", "agent_version") if k in receipt}
+            shares.append(share)
+        memory_context["shares"] = shares
+        result["memory_context"] = memory_context
     if not isinstance(context.get("state"), dict):
         return result
     original = context["state"]
