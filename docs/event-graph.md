@@ -93,3 +93,5 @@ Run `pytest`, `node --test adapters/*.test.mjs` and the console's Playwright sui
 See [the recorded validation results](event-graph-validation.md) for measured results and the limits of those measurements.
 
 Pending ordinary replies retain their public body, task association and stable transport ID across restarts. The host rechecks the original input and active task before retrying a completed semantic review. Uncertain transport receipts remain held for reconciliation.
+
+A full automatic-context window resumes native compaction at an idle turn boundary, even while a persistent work task remains open. Running tools, queued turns, unresolved native operations and background tasks still hold it. The host verifies the same model, session and task snapshot before resetting the injection ledger; restart reloads the pending window epoch.

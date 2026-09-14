@@ -20,13 +20,16 @@ export class ContextCompaction {
         return {state:'waiting',reason:'compaction-receipt-unconfirmed'};
       }
       const before=await this.inspect();
-      if(this.router.busy(before)||this.router.tasks().length)return {state:'waiting',reason:'owner-work'};
+      const tasks=this.router.tasks();
+      const toolsRunning=tasks.some(t=>Object.values(t.tools??{}).some(tool=>!['completed','failed'].includes(tool.status)));
+      if(this.router.busy(before)||toolsRunning)return {state:'waiting',reason:'owner-work'};
+      const taskSnapshot=JSON.stringify(tasks);
       const operationId='memory-compact:'+epoch;
       this.state={state:'running',epoch,operationId,sessionId:this.sessionId};atomicJson(this.file,this.state);
       try {
         const receipt=await this.compact(operationId);
         const after=await this.inspect();
-        if(!receipt?.completed||receipt.actual_session!==this.sessionId||!after.known||after.sessionId!==this.sessionId||after.model!==before.model)throw Error('Compaction receipt mismatch');
+        if(!receipt?.completed||receipt.actual_session!==this.sessionId||!after.known||after.sessionId!==this.sessionId||after.model!==before.model||JSON.stringify(this.router.tasks())!==taskSnapshot)throw Error('Compaction receipt mismatch');
         const result=await this.ack({session:this.sessionId,epoch:operationId,actual_session:receipt.actual_session,completed:true});
         this.state={...this.state,state:'complete',receipt,result};atomicJson(this.file,this.state);return this.state;
       } catch(error) {

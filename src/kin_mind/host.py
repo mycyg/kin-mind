@@ -77,6 +77,9 @@ def dispatch(config, action, request):
         return result
     if action == "memory-context":
         return Contexts(mind).build(**request)
+    if action == "memory-window":
+        window = Contexts(mind).window(config["session_id"])
+        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":
