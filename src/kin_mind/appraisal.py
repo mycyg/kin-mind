@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
 
-from eventmem.core.db import Conflict, digest, dumps
+from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
@@ -610,6 +611,9 @@ class Appraisals:
                 effective_version = self.exploration_capabilities.get("version") or (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
                 receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
                 data["receipt"] = receipt
+                # Keep the structured judgment for auditing a failed atomic
+                # commit; model reasoning is never part of this record.
+                data["proposed_result"] = proposal.model_dump()
                 event = AffectiveEvent(
                     command_id=row["id"],
                     agent_version=effective_version,
@@ -728,6 +732,8 @@ class Appraisals:
                 if type(error) is RuntimeError and str(error).startswith("deepseek-")
                 else type(error).__name__
             )
+            if isinstance(error, Missing):
+                data["missing_reference"] = str(error) if re.fullmatch(r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}", str(error)) else "unresolved-reference"
             state = "pending"
         with self.engine.db.connect(write=True) as conn:
             conn.execute(

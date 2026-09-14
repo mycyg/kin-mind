@@ -280,3 +280,25 @@ def test_compression_reports_safe_provider_failure_and_restores_timeout(system):
     assert result["reason"] == "deepseek-timeout"
     assert result["omitted_ids"] == ["long"]
     assert provider.timeout == 600
+
+
+def test_semantic_links_accept_original_source_identifiers(system):
+    from kin_mind.memory import MemoryNote
+    mind, memory, source, _ = system
+    sid = source("source-linked", "The original request and its meaning.")
+    with mind.engine.db.connect(write=True) as conn:
+        refs = mind._evidence(conn, [sid])
+        memory.apply_assessment(conn, MemoryAssessment(notes=[MemoryNote(key="original", title="Original account", content="A source-linked interpretation.", evidence_ids=[sid], about_ids=[sid])]), refs, "event-source-alias", 0, 20, {"model":"deepseek-flash"})
+        assert memory._record_ids(conn, sid) == [refs[0]["record_id"]]
+
+
+def test_explicit_history_budget_counts_the_mcp_json_envelope(system):
+    import json
+
+    from eventmem.core.retrieval import tokens
+    mind, memory, _, _ = system
+    for i in range(20):
+        memory.ingest({"id":f"page-{i}", "kind":"delivery", "at":mind.clock(), "text":"A complete synthetic note with a stable delivery record.", "state":"accepted", "message_id":f"receipt-{i}"})
+    result=Contexts(mind).read_history("share", budget=2000)
+    assert tokens(json.dumps(result,ensure_ascii=False,indent=2)) <= 2000
+    assert result["cursor"] is not None

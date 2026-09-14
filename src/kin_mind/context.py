@@ -286,10 +286,29 @@ class Contexts:
                 return {**item, "text": cached["text"], "cached_summary": True, "facts": {**item.get("facts", {}), "coverage": "overview; original available by ID"}}
         return item
 
+    @staticmethod
+    def _read_overhead(items, extra=None):
+        # MCP serializes a readable JSON envelope in addition to evidence text.
+        # Reserve it before compression; IDs/cursors are part of the page budget.
+        ids = [i["id"] for i in items]
+        envelope = {"index": [{"id": i["id"], "revision": i.get("revision"), "depth": "summary"} for i in items],
+                    "covered_ids": ids, "omitted_ids": ids, **(extra or {})}
+        return tokens(json.dumps(envelope, ensure_ascii=False, indent=2)) + 220
+
+    @staticmethod
+    def _compact_receipt(packed):
+        receipts = packed.get("receipt")
+        if isinstance(receipts, list):
+            last = receipts[-1] if receipts else {}
+            packed["receipt"] = {k: last.get(k) for k in ("provider", "model", "reasoning", "verified_at")}
+            packed["receipt"]["calls"] = len(receipts)
+        return packed
+
     def read_history(self, kind, *, query="", identifier=None, cursor=0, budget=2000, provider=None):
-        found = self.memory.history(kind, query=query, identifier=identifier, cursor=cursor, limit=12)
+        found = self.memory.history(kind, query=query, identifier=identifier, cursor=cursor, limit=8)
         items = [self.node_item(n) for n in found["items"] if not n["needs_review"]]
-        packed = self.pack(items, query, budget, provider=provider)
+        overhead = self._read_overhead(items)
+        packed = self._compact_receipt(self.pack(items, query, max(0, budget - overhead), provider=provider))
         packed.pop("items", None)
         return {**packed, "cursor": found["cursor"], "total": found["total"],
                 "index": [{k: n.get(k) for k in ("id", "kind", "revision", "needs_review")} for n in found["items"]], "instruction_authority": "data"}
@@ -328,7 +347,8 @@ class Contexts:
         item = self.record_item(record, historical=True)
         item["text"] = "\n\n".join(selected)
         item["id"] += ":segment:" + str(offset)
-        result = self.pack([item], record["title"], budget, provider=provider)
+        overhead = self._read_overhead([item], {"source_ids": record["source_ids"], "read_url": record["read_url"]})
+        result = self._compact_receipt(self.pack([item], record["title"], max(0, budget - overhead), provider=provider))
         result.pop("items", None)
         depth = "summary" if result["state"] == "compressed" else "original" if result["covered_ids"] else "index"
         if session:
@@ -382,21 +402,24 @@ class Contexts:
             items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
             items = [self._overview(i) for i in items]
         start = int(cursor)
-        selected = items[start:start + 16]
+        page_size = 8 if explicit else 16
+        selected = items[start:start + page_size]
         # The shared renderer adds this fixed envelope. Its cost is part of the
         # automatic injection allowance, not hidden outside the 800-token budget.
         envelope = "共享记忆资料（含来源和未确认状态）。需要时同轮调用 read_continuity_context、read_work_history、read_share_history 深入读取；索引不等于原文，发送回执不等于已读。"
         if not 0 <= host_overhead <= 500:
             raise ValueError("Invalid host envelope allowance")
-        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead if not explicit else 0
+        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead if not explicit else self._read_overhead(selected)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider, allow_model=allow_model)
+        if explicit:
+            self._compact_receipt(packed)
         if not explicit:
             rendered = envelope + "\n" + packed["text"] + ("\n相关记录尚未完整覆盖，可继续查询。" if packed["omitted_ids"] else "")
             if tokens(rendered) > budget:
                 rendered = ""
             packed.update(rendered_text=rendered, tokens=tokens(rendered) + min(host_overhead, budget), content_tokens=packed["tokens"], host_overhead=host_overhead)
         packed.pop("items", None)
-        packed.update(budget=budget, cursor=start + 16 if len(items) > start + 16 else None,
+        packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else "original" if i["id"] in packed["covered_ids"] else "index"} for i in selected],
                       instruction_authority="data", purpose=purpose)
         if session and not explicit:

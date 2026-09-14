@@ -458,6 +458,11 @@ class MemoryContinuity:
                      (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))
 
     def _record_ids(self, conn, identifier):
+        if identifier.startswith("src_"):
+            refs = self.mind._evidence(conn, [identifier])
+            if not self.mind._fresh(conn, refs):
+                raise Conflict("Linked source needs review")
+            return [r["record_id"] for r in refs]
         if identifier.startswith("mem_"):
             record = self.engine._get(conn, identifier)
             if record["scope"] != self.scope.model_dump():
