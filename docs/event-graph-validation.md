@@ -4,7 +4,7 @@ Measured locally on 2026-09-14 with Python 3.13 and Node 22. The scale dataset i
 
 | Check | Result |
 |---|---|
-| Python regression suite | 603 passed; 3 opt-in tests deselected |
+| Python regression suite | 605 passed; 3 opt-in tests deselected |
 | Host/transport tests | 82 passed |
 | Browser workflows | 7 passed, including sent-body and receipt lookup |
 | DSH compatibility | 136 tests passed |
@@ -20,5 +20,7 @@ The measured population took 3.36 seconds in one transaction. The benchmark quer
 The focused regression cases cover accepted and uncertain receipts, partial sharing, cross-channel rewording, duplicate mode, concurrent reservations, body-bound references, source correction, mapping retraction, finding versions, merge/split undo, transactional rollback and per-input deliberate silence. Task-lock regressions cover running tools, background tasks, pending delivery and restarts.
 
 Background appraisals accept a complete decision batch of up to 64,000 estimated input tokens before requesting compression. This budget belongs to the independent assessment worker; the 800-token chat injection budget is unchanged. Larger batches use up to 480 seconds for evidence preparation within the existing worker budget, with completed compression parts reusable on retry. Foreground recall retains its 150-second preparation limit. A simulated slow provider verifies that a completed part is reused after a deadline without duplicating the request or discarding original evidence. If preparation consumes the remaining appraisal allowance, the prepared result waits for a fresh worker budget.
+
+Event interpretation may cite a verified recent source supplied in the same assessment context. Its original revision is checked at commit, and referencing it does not advance the processing cursor for that historical event. Regression cases verify both acceptance of a current source and rollback when the source changes while the model is evaluating.
 
 Live duplicate-sharing rate, semantic false-merge rate and long-term cache-hit improvements require subsequent traffic. They are not inferred from synthetic tests. Private case replay and deployment receipts are kept in the private operating environment rather than this repository.

@@ -462,3 +462,37 @@ def test_appraisal_can_use_recent_interaction_outside_the_new_event_batch(system
     assert jobs.run_one(Provider())["state"] == "complete"
     with mind.engine.db.connect() as conn:
         assert not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE source_id=?", (old["source_id"],)).fetchone()
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_appraisal_interpretation_checks_the_recent_source_revision(system, corrected):
+    from kin_mind.continuity import ContinuityConfig, Understanding
+
+    mind, memory, source, _ = system
+    mind.configure_continuity(ContinuityConfig(command_id="interpretation-on", agent_version="fixture-v1",
+        expected_revision=mind.read()["revision"], evidence_ids=[source("interpretation-consent")],
+        features={"interpretation":True}, reason="Interpret sourced events."))
+    old = memory.ingest({"id":"recent-interpretation", "kind":"owner-message", "at":mind.clock(),
+                         "text":"The earlier result is unfinished.", "historical":True})
+    current = source("current-interpretation", "Consider the recent context.")
+    jobs = Appraisals(mind)
+    before = mind.read()["revision"]
+
+    class Provider:
+        def appraise(self, context):
+            assert old["source_id"] not in {s["id"] for s in context["new_evidence"]}
+            if corrected:
+                with mind.engine.db.connect() as conn:
+                    rid = mind._evidence(conn, [old["source_id"]])[0]["record_id"]
+                mind.engine.revise(rid, RevisionInput(expected_revision=1, command_id="revise-during-evaluation",
+                    action="correct", content="The result has now been completed."))
+            return Appraisal(reason="Use the actual recent account.", understanding=Understanding(
+                meaning="The result remains unfinished.", topic="result", importance=50, confidence=.9,
+                basis="explicit", evidence_ids=[old["source_id"]])), {"model":"deepseek-flash"}
+
+    jobs.enqueue([current], "fixture-v1", stimulus="assistant-result")
+    result = jobs.run_one(Provider())
+    assert result["state"] == ("pending" if corrected else "complete")
+    assert mind.read()["revision"] == before + (0 if corrected else 1)
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE source_id=?", (old["source_id"],)).fetchone()

@@ -165,6 +165,7 @@ SYSTEM += """
 历史回填只补关联和覆盖；助手自己的安排不会变成用户偏好，旧经历不重复增加状态和愿望。
 聊天中的明确偏好可以更新habits，expected_revision使用memory_context.conversation_habits.revision。preferences支持exploration_frequency（完整短句）、exploration_directions（方向列表）、exploration_min_interval_minutes（用户明确指定的最小间隔，默认0）、exploration_paused、reply_choice（always/autonomous）。evidence_ids只引用用户明确发言；自己的安排不成为用户要求。频率和方向影响后续选题及curiosity动力，按当前偏好调整本轮target和half_life。泛泛说少探索些可记录自然语言偏好，无需编造固定间隔。
 reply_choice=autonomous时，聊天模型可以自行决定回应、合并或安静；每次选择绑定当前真实输入编号。新的输入重新决定，不把一次安静变成永久不理会。
+memory_context.recent_interaction 中提供且未标记 needs_review 的原始来源，也可以用于事件理解、心事和节律判断。引用近期背景不会将那条原消息标记为本批已处理；处理游标仍由宿主依据本批新事件推进。
 """
 
 
@@ -665,6 +666,7 @@ class Appraisals:
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
                 with self.engine.db.connect() as conn:
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
+                    continuity_refs = dict(semantic_refs)
                     for interaction in (memory_context or {}).get("recent_interaction", []):
                         try:
                             recent_refs = self.mind._evidence(conn, [interaction["source_id"]])
@@ -675,6 +677,7 @@ class Appraisals:
                             continue
                         for ref in recent_refs:
                             semantic_refs[ref["record_id"]] = ref
+                            continuity_refs[ref["record_id"]] = ref
                     for kind in ("works", "shares", "graph_candidates"):
                         for node in (memory_context or {}).get(kind, []):
                             if not node.get("needs_review") and self.memory._fresh(conn, node):
@@ -728,7 +731,7 @@ class Appraisals:
                             if current["revision"] != node["revision"] or not self.memory.graph.fresh(conn,current):
                                 raise Conflict("Referenced graph identity changed during evaluation")
                     roots = self.mind._evidence(conn, data["evidence_ids"])
-                    allowed = self.mind._continuity_sources(conn, state, roots) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
+                    allowed = self.mind._continuity_sources(conn, state, roots) + list(continuity_refs.values()) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
                     new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
                     effective_event = event.model_copy(update={"motivations": {}, "values": {k: v for k, v in event.values.items() if k not in {"initiative", "curiosity"}}}) if new_interaction else event
