@@ -412,23 +412,31 @@ class MemoryContinuity:
             if any(r["source_id"] not in allowed_sources and r["record_id"] not in allowed_records for r in selected) or not self.mind._fresh(conn, selected):
                 raise Conflict("Semantic evidence is outside the evaluated source set")
             return selected
+        aliases = {note.key: "mem_" + digest([self.scope.key(), event_id, note.key])[:32] for note in assessment.notes}
+        if len(aliases) != len(assessment.notes):
+            raise Conflict("Memory note keys must be unique in an assessment")
+        resolve = lambda identifier: aliases.get(identifier, identifier)
         for note in assessment.notes:
             sources = evidence(note.evidence_ids)
-            node_id = "mem_" + digest([self.scope.key(), event_id, note.key])[:32]
-            record = self.engine._insert(conn, RecordInput(id=node_id, scope=self.scope, kind=note.kind,
+            node_id = aliases[note.key]
+            self.engine._insert(conn, RecordInput(id=node_id, scope=self.scope, kind=note.kind,
                 title=note.title, content=note.content, source_ids=sorted({r["source_id"] for r in sources}),
                 evidence_ids=sorted({r["record_id"] for r in sources}), generated=True, confirmation="inferred",
-                attributes={"semantic_event": event_id, "key": note.key, "model": receipt.get("model"), "about_ids": note.about_ids}))
+                attributes={"semantic_event": event_id, "key": note.key, "model": receipt.get("model"), "about_ids": [resolve(i) for i in note.about_ids]}))
+        # All note IDs exist before any forward reference is resolved.
+        for note in assessment.notes:
             for identifier in note.about_ids:
-                for root in self._record_ids(conn, identifier):
-                    self.engine._relation(conn, record["id"], "about", root, {"basis": "inferred", "event_id": event_id})
+                for root in self._record_ids(conn, resolve(identifier)):
+                    if aliases[note.key] != root:
+                        self.engine._relation(conn, aliases[note.key], "about", root, {"basis": "inferred", "event_id": event_id})
         for link in assessment.links:
             evidence(link.evidence_ids)
-            for left in self._record_ids(conn, link.subject):
-                for right in self._record_ids(conn, link.object):
+            for left in self._record_ids(conn, resolve(link.subject)):
+                for right in self._record_ids(conn, resolve(link.object)):
                     if left != right:
                         self.engine._relation(conn, left, link.relation, right, {"basis": "inferred", "event_id": event_id, "evidence_ids": link.evidence_ids})
         for proposal in assessment.disclosures:
+            proposal = proposal.model_copy(update={"about_ids": [resolve(i) for i in proposal.about_ids]})
             share = self._get(conn, proposal.share_id)
             if share["kind"] != "share" or not self._fresh(conn, share):
                 raise Conflict("Disclosure needs current delivery evidence")

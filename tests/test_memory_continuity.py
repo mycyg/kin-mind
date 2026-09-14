@@ -283,12 +283,12 @@ def test_compression_reports_safe_provider_failure_and_restores_timeout(system):
 
 
 def test_semantic_links_accept_original_source_identifiers(system):
-    from kin_mind.memory import MemoryNote
+    from kin_mind.memory import MemoryLink, MemoryNote
     mind, memory, source, _ = system
     sid = source("source-linked", "The original request and its meaning.")
     with mind.engine.db.connect(write=True) as conn:
         refs = mind._evidence(conn, [sid])
-        memory.apply_assessment(conn, MemoryAssessment(notes=[MemoryNote(key="original", title="Original account", content="A source-linked interpretation.", evidence_ids=[sid], about_ids=[sid])]), refs, "event-source-alias", 0, 20, {"model":"deepseek-flash"})
+        memory.apply_assessment(conn, MemoryAssessment(notes=[MemoryNote(key="original", title="Original account", content="A source-linked interpretation.", evidence_ids=[sid], about_ids=[sid, "followup"]), MemoryNote(key="followup", title="Follow-up", content="Another interpretation.", evidence_ids=[sid])], links=[MemoryLink(subject="followup", object="original", evidence_ids=[sid])]), refs, "event-source-alias", 0, 20, {"model":"deepseek-flash"})
         assert memory._record_ids(conn, sid) == [refs[0]["record_id"]]
 
 
