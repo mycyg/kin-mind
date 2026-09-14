@@ -216,6 +216,18 @@ def appraisal_context(context):
             "version", "trigger", "provider", "reasoning", "configured_at", "needs_review",
         }}
     result["state"] = state
+    # Several dimensions often carry the same complete appraisal account.
+    # Reference it once without changing or shortening its meaning.
+    reasons = [d.get("reason", "") for d in state["dimensions"].values()]
+    shared = {}
+    for dimension in state["dimensions"].values():
+        reason = dimension.get("reason")
+        if reason and reasons.count(reason) > 1:
+            key = digest(reason)[:16]
+            shared[key] = dimension.pop("reason")
+            dimension["reason_ref"] = key
+    if shared:
+        state["shared_reasons"] = shared
     result["context_projection"] = "affect-decision-v3"
     return result
 
@@ -290,7 +302,7 @@ class DeepSeek:
             from .context import Contexts
             from .state import Mind
             request_context = redact(request_context)
-            if tokens(dumps(request_context)) > 24000:
+            if tokens(dumps(request_context)) > 32000:
                 compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=150, transport=self.transport)
                 compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
                 # The state/IDs stay structured; the long evidence is summarized
@@ -305,6 +317,8 @@ class DeepSeek:
                         identifier = value.get("id") or kind + ":" + str(index)
                         items.append({"id": identifier, "revision": value.get("revision", 1), "basis": "observed" if kind != "recent_interaction" else "reported", "text": dumps(value)})
                 projected_state = request_context["state"]
+                for key, reason in projected_state.pop("shared_reasons", {}).items():
+                    items.append({"id": "shared-reason:" + key, "text": reason, "basis": "inferred"})
                 for kind in ("desires", "concerns"):
                     for value in projected_state.get(kind, []):
                         items.append({"id": kind + ":" + value["id"], "revision": value.get("revision", 1), "basis": value.get("basis", "inferred"), "text": dumps(value)})
@@ -322,7 +336,7 @@ class DeepSeek:
                 for kind in ("recent_interaction", "works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 request_context["compression_receipt"] = result.get("receipt")
-                if tokens(dumps(request_context)) > 24000:
+                if tokens(dumps(request_context)) > 32000:
                     raise RuntimeError("deepseek-appraisal-budget-pending")
         key = os.environ.get(self.key_env)
         if not key:
