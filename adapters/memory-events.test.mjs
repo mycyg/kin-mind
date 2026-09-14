@@ -14,7 +14,20 @@ test('journal survives failures without retrying platform sends',async()=>{
     await assert.rejects(()=>journal.drain());assert.equal(fs.readdirSync(directory).length,1);
     let received;
     const restarted=new MemoryEventJournal({directory,call:async(action,input)=>{received=input;return{state:'recorded'};}});
-    assert.equal((await restarted.drain()).recorded,1);assert.equal(received.message_id,'p1');assert.equal(fs.readdirSync(directory).length,0);
+    assert.equal((await restarted.drain()).recorded,1);assert.equal(received.message_id,'p1');
+    const replay=new MemoryEventJournal({directory,call:async()=>{throw Error('Committed event must not be reingested');}});
+    assert.equal(replay.append(event).state,'recorded');assert.equal((await replay.drain()).recorded,0);
+    assert.throws(()=>replay.append({...event,text:'changed'}),/conflict/);
+  } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('new host events take priority over a historical outbox backlog',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-priority-')),seen=[];
+  try {
+    const journal=new MemoryEventJournal({directory,call:async(_,e)=>{seen.push(e.id);return{state:'recorded'};}});
+    journal.append({id:'old',kind:'delivery',at:'2026-01-01T00:00:00Z',historical:true});
+    journal.append({id:'new',kind:'delivery',at:'2026-09-14T00:00:00Z'});
+    await journal.drain(1);assert.deepEqual(seen,['new']);
+    await journal.drain(1);assert.deepEqual(seen,['new','old']);
   } finally {fs.rmSync(directory,{recursive:true,force:true});}
 });
 test('actual edit provenance differs from merely observing a file',()=>{

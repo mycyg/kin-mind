@@ -14,6 +14,11 @@ export class MemoryEventJournal {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
     const file=path.join(this.directory,hash(event.id)+'.json'),body=JSON.stringify(canonical(event));
+    const receipt=path.join(this.directory,'receipts',hash(event.id)+'.json');
+    if(fs.existsSync(receipt)) {
+      if(JSON.parse(fs.readFileSync(receipt,'utf8')).digest!==hash(body))throw Error('Memory event ID conflicts with committed contents');
+      return {state:'recorded',id:event.id};
+    }
     if(fs.existsSync(file)) {
       if(fs.readFileSync(file,'utf8')!==body)throw Error('Memory event ID conflicts with earlier contents');
       return {state:'queued',id:event.id};
@@ -31,10 +36,14 @@ export class MemoryEventJournal {
     try {
       const files=fs.existsSync(this.directory)?fs.readdirSync(this.directory).filter(n=>n.endsWith('.json')):[];
       const entries=files.map(n=>({file:path.join(this.directory,n),event:JSON.parse(fs.readFileSync(path.join(this.directory,n),'utf8'))}));
-      entries.sort((a,b)=>a.event.at.localeCompare(b.event.at)||a.event.id.localeCompare(b.event.id));
+      entries.sort((a,b)=>Number(Boolean(a.event.historical))-Number(Boolean(b.event.historical))||a.event.at.localeCompare(b.event.at)||a.event.id.localeCompare(b.event.id));
       for(const {file,event} of entries.slice(0,limit)) {
         const receipt=await this.call('runtime-event',event);
         if(receipt.state!=='recorded')return {state:receipt.state??'pending',recorded};
+        const directory=path.join(this.directory,'receipts');fs.mkdirSync(directory,{recursive:true,mode:0o700});
+        const committed=path.join(directory,path.basename(file)),temporary=committed+'.'+process.pid+'.tmp';
+        fs.writeFileSync(temporary,JSON.stringify({id:event.id,digest:hash(JSON.stringify(canonical(event)))}),{mode:0o600});
+        fs.renameSync(temporary,committed);
         fs.unlinkSync(file);recorded++;
       }
       return {state:'drained',recorded,pending:Math.max(0,entries.length-recorded)};
