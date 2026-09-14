@@ -114,6 +114,8 @@ class DesireChange(Model):
     expires_at: str | None = None
     completion: str | None = Field(default=None, min_length=1, max_length=1000)
     concern_ids: list[str] | None = Field(default=None, max_length=10)
+    exploration_target: Literal["knowledge", "computer"] | None = None
+    exploration_id: str | None = Field(default=None, max_length=100)
     reason: str = Field(min_length=1, max_length=1200)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
@@ -125,6 +127,10 @@ class DesireChange(Model):
         if self.wait_condition is not None and self.action != "wait":
             raise ValueError("Only waiting desires have a resume condition")
         if self.action == "create":
+            if self.exploration_target and self.kind != "explore":
+                raise ValueError("Only exploration wishes have an exploration target")
+            if self.exploration_id and self.kind != "contact":
+                raise ValueError("Only contact wishes link a communication decision")
             if self.desire_id or any(
                 getattr(self, k) is None
                 for k in (
@@ -443,13 +449,22 @@ class Mind(Continuity):
 
         return self._mutate(request, "behavior-policy", apply)
 
-    def _desire_ready(self, conn, desire, at):
+    def _desire_ready(self, conn, desire, at, *, state=None):
+        state = state or self._load(conn)
+        if desire.get("exploration_id"):
+            from .exploration_decisions import require_share
+            try:
+                decision = require_share(self, conn, state, desire["exploration_id"])
+                if desire.get("sharing_revision") != decision["revision"]:
+                    return False
+            except Conflict:
+                return False
         return (
             desire["kind"] == "contact"
             and desire["status"] == "wanted"
             and timestamp(desire["expires_at"]) > timestamp(at)
             and self._fresh(conn, desire["evidence"])
-            and (not desire.get("concern_revisions") or self._concern_links_fresh(conn, self._load(conn), desire))
+            and (not desire.get("concern_revisions") or self._concern_links_fresh(conn, state, desire))
         )
 
     def _initiative_value(self, conn, state, at):
@@ -502,7 +517,7 @@ class Mind(Continuity):
                 *[
                     max(d["strength"], self._autonomy(conn, state).get("initiative_target", 0))
                     for d in state["desires"].values()
-                    if self._desire_ready(conn, d, at)
+                    if self._desire_ready(conn, d, at, state=state)
                 ],
             ]
         )
@@ -578,6 +593,13 @@ class Mind(Continuity):
 
     def _apply_desire(self, conn, state, request, event_id):
         refs = self._evidence(conn, request.evidence_ids)
+        if request.exploration_id:
+            from .exploration_decisions import require_share
+            decision = require_share(self, conn, state, request.exploration_id)
+            if request.action == "create" and any(d.get("exploration_id") == request.exploration_id
+                                                  and d.get("sharing_revision") == decision["revision"]
+                                                  for d in state["desires"].values()):
+                raise Conflict("This sharing decision already has a contact intent")
         link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
         at = self.clock()
         self._retarget(conn, state, at)
@@ -601,12 +623,21 @@ class Mind(Continuity):
                         "completion",
                     )
                 },
+                exploration_target=request.exploration_target or "knowledge",
+                exploration_id=request.exploration_id,
             )
         else:
             did = request.desire_id
             if did not in state["desires"]:
                 raise Missing("Desire is outside this scope or missing")
             desire = state["desires"][did]
+            if request.exploration_target and desire["kind"] != "explore":
+                raise Conflict("Only exploration wishes have an exploration target")
+            if request.exploration_id and desire["kind"] != "contact":
+                raise Conflict("Only contact wishes link a communication decision")
+            if desire.get("exploration_id") and request.action in {"start", "resume", "update"}:
+                from .exploration_decisions import require_share
+                require_share(self, conn, state, request.exploration_id or desire["exploration_id"])
             if desire["status"] in {"completed", "abandoned"}:
                 raise Conflict(
                     "A finished desire stays in history; create a new desire"
@@ -629,11 +660,13 @@ class Mind(Continuity):
                                     condition=request.wait_condition or "new_evidence",
                                     retry_after_seconds=request.retry_after_seconds), at)
             if request.action == "update":
-                for k in ("content", "topic", "strength", "expires_at", "completion"):
+                for k in ("content", "topic", "strength", "expires_at", "completion", "exploration_target", "exploration_id"):
                     if getattr(request, k) is not None:
                         desire[k] = getattr(request, k)
             desire["revision"] += 1
         desire = state["desires"][did]
+        if desire.get("exploration_id") and request.action in {"create", "start", "resume", "update"}:
+            desire["sharing_revision"] = state["exploration_decisions"][desire["exploration_id"]]["revision"]
         if request.concern_ids is not None:
             links = self._resolve_concern_links(conn, state, request.concern_ids)
             desire.update(concern_ids=list(links), concern_revisions=links)
@@ -919,6 +952,8 @@ class Mind(Continuity):
                     details = json.loads(receipt[0])
                     result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
             state = self._load(conn)
+            from .exploration_decisions import decision_view
+            result["exploration_decisions"] = decision_view(self, conn, state)
             behavior = state.get("behavior", {})
             if behavior and self._fresh(conn, behavior["evidence"]):
                 result["interaction_style"] = interaction_style(result["dimensions"], behavior)

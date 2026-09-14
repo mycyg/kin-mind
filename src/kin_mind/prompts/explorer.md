@@ -20,5 +20,8 @@ update memory/emotions. Use at most the supplied deadline. Stop when there is a
 useful result. If sources cannot be accessed, say so; do not invent findings.
 Return only a final JSON object with keys summary (string), findings (array of
 strings), sources (array of {url, title}), open_questions (array of strings),
-and suggested_share (string or null). Distinguish verified findings from inference.
+suggested_share (string or null), and optional assistance_needed (null or an object
+with action, reason and completion strings). A missing condition can be reported
+without deciding that Kin must ask the owner. Kin may share, defer or keep a result.
+Distinguish verified findings from inference.
 Do not include private reasoning, tool transcripts or role-play.

@@ -34,7 +34,11 @@ def load_config(path):
 def dispatch(config, action, request):
     engine = Engine(Path(config["root"]))
     mind = Mind(engine, Scope.model_validate(config["scope"]))
-    jobs = Appraisals(mind)
+    jobs = Appraisals(mind, exploration_capabilities={
+        "computer": bool(config.get("computer_exploration", {}).get("enabled")),
+        "decisions": bool(config.get("exploration_decisions_enabled")),
+        "version": config.get("agent_version"),
+    })
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
@@ -81,12 +85,19 @@ def dispatch(config, action, request):
     if action == "read":
         return {
             "state": mind.read(history=request.get("history", 0), query=request.get("query", "")),
+            "exploration_capabilities": jobs.exploration_capabilities,
             "appraisals": jobs.status(),
             "findings": explorer.recent(),
             "exploration_cadence": cadence.status(),
         }
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
+    if action == "computer-context":
+        from .computer import ComputerReader
+        computer = config.get("computer_exploration", {})
+        if not computer.get("enabled"):
+            return {"state": "unavailable", "reason": "computer-exploration-disabled"}
+        return ComputerReader({**computer, "ledger": str(Path(config["root"]) / "computer-context.json")}).context()
     if action == "configure-behavior":
         return mind.configure_behavior(request)
     if action == "configure-contact":
@@ -129,6 +140,7 @@ def dispatch(config, action, request):
             brief=request.get("brief"),
             desire_id=request.get("desire_id"),
             budget_seconds=request.get("budget_seconds", 1200),
+            computer=config.get("computer_exploration"),
         )
     if action == "candidate":
         return mind.contact_candidate()

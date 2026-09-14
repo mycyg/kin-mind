@@ -6,8 +6,10 @@ import json
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -28,6 +30,8 @@ class Citation(Model):
     @field_validator("url")
     @classmethod
     def source_url(cls, value):
+        if value == "computer://current-context":
+            return value
         if value.startswith("file://"):
             parsed = urlparse(value)
             if parsed.netloc not in {"", "localhost"}:
@@ -40,12 +44,19 @@ class Citation(Model):
         return value
 
 
+class AssistanceHint(Model):
+    action: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
+    completion: str = Field(min_length=1, max_length=500)
+
+
 class Findings(Model):
     summary: str = Field(min_length=1, max_length=6000)
     findings: list[str] = Field(max_length=30)
     sources: list[Citation] = Field(max_length=30)
     open_questions: list[str] = Field(max_length=20)
     suggested_share: str | None = Field(default=None, max_length=2000)
+    assistance_needed: AssistanceHint | None = None
 
 
 def final_result(line):
@@ -84,14 +95,55 @@ def run_kimi(
     canceled=lambda: False,
     model=None,
     profile=None,
+    computer=None,
 ):
     if not 1 <= budget_seconds <= 1200:
         raise ValueError("Exploration budget must be between 1 and 1200 seconds")
+    started = time.monotonic()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     skills = directory / "empty-skills"
     skills.mkdir(exist_ok=True)
     profile = profile or Path(__file__).with_name("prompts") / "explorer.md"
+    ledger = None
+    child_env = {k: v for k, v in os.environ.items() if k not in {"EVENTMEM_API_KEY", "ANTHROPIC_API_KEY"}}
+    if computer:
+        from .computer import ComputerReader
+        profile = Path(__file__).with_name("prompts") / "computer-explorer.md"
+        ledger = directory / "computer-observations.json"
+        computer = {**computer, "ledger": str(ledger)}
+        config_file = directory / "computer-reader.json"
+        config_file.write_text(dumps(computer))
+        config_file.chmod(0o600)
+        mcp_dir = directory / ".kimi-code"
+        mcp_dir.mkdir(exist_ok=True, mode=0o700)
+        # Print-mode sessions can omit untrusted project MCP servers. Give this
+        # helper its own user-level configuration instead of modifying global
+        # trust, plugins or permission rules. OAuth stays in its existing store.
+        kimi_home = Path(computer.get("kimi_home") or os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code")
+        if (kimi_home / "config.toml").exists():
+            config_text = (kimi_home / "config.toml").read_text()
+            config_text += '\n[[permission.rules]]\ndecision = "allow"\npattern = "mcp__kin_computer__*"\n'
+            (mcp_dir / "config.toml").write_text(config_text)
+            (mcp_dir / "config.toml").chmod(0o600)
+        for name in ("credentials", "region"):
+            original = kimi_home / name
+            destination = mcp_dir / name
+            if original.exists() and not destination.exists():
+                if original.is_dir():
+                    destination.symlink_to(original.resolve(), target_is_directory=True)
+                else:
+                    shutil.copyfile(original, destination)
+                    destination.chmod(0o600)
+        child_env["KIMI_CODE_HOME"] = str(mcp_dir.resolve())
+        (mcp_dir / "mcp.json").write_text(dumps({"mcpServers": {"kin_computer": {
+            "command": sys.executable, "args": ["-m", "kin_mind.computer", str(config_file)],
+            "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+            "toolTimeoutMs": 15000,
+        }}}))
+        (mcp_dir / "mcp.json").chmod(0o600)
+        topic = {**topic, "computer_context": ComputerReader(computer).context(),
+                 "authorized_roots": computer.get("roots", []), "previous_observations": computer.get("previous", [])}
     prompt = (
         "Research the following source-backed question. Time budget: "
         + str(budget_seconds)
@@ -111,7 +163,6 @@ def run_kimi(
     ]
     if model:
         argv += ["--model", model]
-    started = time.monotonic()
     result = None
     buffer = b""
     with tempfile.TemporaryFile() as diagnostic:
@@ -122,11 +173,7 @@ def run_kimi(
             stdout=subprocess.PIPE,
             stderr=diagnostic,
             start_new_session=True,
-            env={
-                k: v
-                for k, v in os.environ.items()
-                if k not in {"EVENTMEM_API_KEY", "ANTHROPIC_API_KEY"}
-            },
+            env=child_env,
         )
         state = "failed"
         try:
@@ -155,6 +202,7 @@ def run_kimi(
                                         "content_type": type(
                                             frame.get("content")
                                         ).__name__,
+                                        "tools": [t.get("function", {}).get("name") for t in frame.get("tool_calls", [])],
                                     }
                                 )
                                 frames = frames[-20:]
@@ -206,6 +254,7 @@ def run_kimi(
             "seconds": round(time.monotonic() - started, 2),
             "provider": "kimi-cli",
             "model": model or "configured-default",
+            **({"observations": list(json.loads(ledger.read_text()).values())} if ledger and ledger.exists() else {}),
             "result": result.model_dump() if result else None,
             "partial": state != "complete",
         }
@@ -239,7 +288,7 @@ class Explorations:
 
     def run(
         self, executable, directory, agent_version, *, canceled=lambda: False,
-        model=None, runner=run_kimi, brief=None, budget_seconds=1200, desire_id=None,
+        model=None, runner=run_kimi, brief=None, budget_seconds=1200, desire_id=None, computer=None,
     ):
         from .actions import ActionEvents
         actions = ActionEvents(self.mind)
@@ -249,13 +298,16 @@ class Explorations:
         if canceled():
             return {"state": "waiting", "reason": "owner-task"}
         desire = candidate["desire"]
+        target = desire.get("exploration_target", "knowledge")
+        if target == "computer" and not (computer or {}).get("enabled"):
+            return {"state": "waiting", "reason": "computer-exploration-disabled"}
         if desire_id and desire_id != desire["id"]:
             return {"state": "waiting", "reason": "exploration-intent-changed"}
         # The selected wish is the reviewed brief; an external wake cannot replace it.
         budget_seconds = min(1200, max(1, int(budget_seconds)))
         at = self.mind.clock()
         eid = "explore_" + digest([self.mind.scope.key(), desire["id"], desire["revision"]])[:32]
-        data = {"desire_id": desire["id"], "selected_brief": desire["content"],
+        data = {"desire_id": desire["id"], "selected_brief": desire["content"], "exploration_target": target,
                 "topic_selected_by": "deepseek-appraisal", "agent_version": agent_version,
                 "evidence_ids": [r["record_id"] for r in desire["evidence"]]}
         request = DesireChange(command_id=eid+":start", agent_version=agent_version,
@@ -285,9 +337,14 @@ class Explorations:
         except Conflict:
             return {"state": "waiting", "reason": "exploration-claim-changed"}
         try:
+            options = {}
+            if target == "computer":
+                previous = [v for item in self.recent(8) for v in item.get("observations", [])][-60:]
+                options["computer"] = {**computer, "previous": [
+                    {k: v[k] for k in ("id", "locator", "version", "title", "observed_at")} for v in previous]}
             output = runner(executable, {"question": desire["content"], "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
-                budget_seconds=budget_seconds, canceled=canceled, model=model)
+                budget_seconds=budget_seconds, canceled=canceled, model=model, **options)
             data.update(output)
             state = output["state"]
         except Exception as error:  # noqa: BLE001 - owned helper boundary; retain a redacted failure receipt
@@ -295,22 +352,34 @@ class Explorations:
             data.update(error=type(error).__name__, partial=True, result=None)
         # A result without a definitive answer still supports reflection and sharing.
         # Only final reports and execution receipts enter memory, never tool traces.
+        observation_ids = []
+        for observation in data.get("observations", []):
+            observed = self.engine.receive(SourceInput(namespace="kin-computer-observation", key=observation["id"],
+                scope=self.mind.scope, authority="document", kind="observation", session=eid,
+                text=dumps({k:v for k,v in observation.items() if k not in {"observed_at", "first_observed_at", "changed_since_last_observation"}}),
+                occurred_at=observation["observed_at"], extract=False,
+                metadata={"host_event": "computer-observation", "actor": observation["actor"],
+                          "locator": observation["locator"], "resource_version": observation["version"]}))
+            observation_ids.append(observed["id"])
         source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
             scope=self.mind.scope, authority="model", kind="observation", session=eid,
             text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
             occurred_at=self.mind.clock(), extract=True,
-            metadata={"host_event": "exploration-result", "provider": "kimi-cli",
+            metadata={"host_event": "exploration-result", "provider": "kimi-cli", "exploration_id": eid,
+                      "exploration_target": target, "observation_ids": observation_ids,
                       "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])}))
         data["source_id"] = source["id"]
+        data["observation_ids"] = observation_ids
         with self.engine.db.connect(write=True) as conn:
             current = self.mind._load(conn)
             active = current["desires"].get(desire["id"])
             if active and active["revision"] == data["desire_revision"] and active["status"] == "in_progress":
                 event_id = "mind_" + digest([eid, "settled"])[:32]
-                action = "complete" if state == "complete" and data.get("result") else "resume" if state == "preempted" else "wait"
+                needs_condition = bool((data.get("result") or {}).get("assistance_needed"))
+                action = "complete" if state == "complete" and data.get("result") and not needs_condition else "resume" if state == "preempted" else "wait"
                 update = DesireChange(command_id=eid+":settled", agent_version=agent_version,
                     expected_revision=current["revision"], evidence_ids=[source["id"], *data["evidence_ids"]],
-                    action=action, desire_id=desire["id"], reason="Exploration execution: "+state)
+                    action=action, desire_id=desire["id"], reason="Exploration awaits a reported condition" if needs_condition else "Exploration execution: "+state)
                 self.mind._apply_desire(conn, current, update, event_id)
                 current["revision"] += 1
                 current["updated_at"] = self.mind.clock()
@@ -318,5 +387,6 @@ class Explorations:
                 self.mind._history(conn, event_id, current, "exploration-result", data)
             conn.execute("UPDATE mind_explorations SET state=?,data=? WHERE id=?", (state, dumps(data), eid))
             actions.emit(conn, "exploration-result", eid, {"exploration_id": eid, "state": state,
-                "evidence_ids": [source["id"], *data["evidence_ids"]], "agent_version": agent_version})
+                # The action dispatcher adds one internal event source.
+                "evidence_ids": list(dict.fromkeys([source["id"], *observation_ids, *data["evidence_ids"]]))[:49], "agent_version": agent_version})
         return dict(data, id=eid, state=state)

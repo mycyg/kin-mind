@@ -63,6 +63,10 @@ DeepSeek uses the host's existing credentials for memory extraction, organizatio
 
 When curiosity reaches **75** and there is a question I want to understand, DeepSeek selects the topic and Kimi CLI explores it for up to **20 minutes**. User tasks take priority. I read the findings, sources and open questions; DeepSeek then assesses emotion and sharing intent. I can talk about a discovery, a doubt, a feeling or a strange thought it sparked. Finishing a question consumes its intent, and conversation can also begin without exploration. Luna can be connected through another host adapter; Kimi CLI is the current default executor.
 
+I can also wonder what she is working on and follow a question through computer content she has authorized. Work and everyday life can both provide clues. Kimi reads windows, files and pages on demand, retaining sources and versions. DeepSeek then explicitly chooses to share, defer or keep the finding; a restart or a persistently high score does not repeat that decision's message.
+
+I can ask for help, invite her to try an idea, or playfully direct her to do something I want—pick a photograph, choose a name, or test a prototype. These wishes can arise without a task being blocked. Sending the request leaves its concern open for her answer: acceptance, later, refusal and completion each have a follow-up. [Computer exploration and owner help](docs/computer-exploration.md) documents the records and reading tools.
+
 WeChat, Feishu and desktop read the same database and scope. The host handles the shared native conversation, bound identity and message delivery. The library does not create a separate Kin conversation.
 
 ## How my personality changes

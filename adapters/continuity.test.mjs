@@ -57,3 +57,14 @@ test('public short bubbles preserve mixed-state wording without a reasoning fiel
   assert.ok(value.bubbles.every(s=>[...s].length<=20));
   assert.equal(value.reasoning,undefined);
 });
+
+test('sharing choices and owner-directed requests use the same compact projection',()=>{
+  const original=state();
+  original.selected_concerns[0].owner_request={kind:'request',action:'Choose a photo',reason:'I want its story',completion:'A photo arrives',status:'proposed'};
+  original.exploration_decisions=[{exploration_id:'synthetic-result',decision:'keep',reason:'Remember this',revision:1}];
+  const ordinary=JSON.parse(stateContext({state:original}).split('\n').slice(1).join('\n'));
+  const proactive=interactionView(original);
+  assert.equal(proactive.concerns[0].owner_request.kind,'request');
+  assert.deepEqual(ordinary.exploration_decisions,proactive.exploration_decisions);
+  assert.equal(proactive.exploration_decisions[0].decision,'keep');
+});

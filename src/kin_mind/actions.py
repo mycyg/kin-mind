@@ -225,6 +225,7 @@ class ActionEvents:
             and d["status"] == "wanted"
             and not d["expired"]
             and not d["needs_review"]
+            and not d.get("concern_needs_review")
         ]
         if view.get("action_policy"):
             choices = [

@@ -21,6 +21,7 @@ from eventmem.core.models import Model
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
+from .exploration_decisions import SharingDecision, apply_decisions
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 
@@ -33,6 +34,8 @@ class Wish(Model):
     ttl_hours: StrictInt = Field(ge=1, le=168)
     completion: str = Field(min_length=1, max_length=1000)
     concern_ids: list[str] = Field(default_factory=list, max_length=10)
+    exploration_target: Literal["knowledge", "computer"] | None = None
+    exploration_id: str | None = Field(default=None, max_length=100)
 
     @field_validator("kind")
     @classmethod
@@ -74,6 +77,7 @@ class Appraisal(Model):
     understanding: Understanding | None = None
     concerns: list[ConcernProposal] = Field(default_factory=list, max_length=6)
     rhythm: RhythmProposal | None = None
+    sharing: list[SharingDecision] = Field(default_factory=list, max_length=4)
 
     @field_validator("motivations")
     @classmethod
@@ -124,6 +128,15 @@ continuity-bootstrap 只建立仍有效愿望与原始来源支持的心事关�
 """
 
 
+SYSTEM += """
+探索与联系是独立决定。exploration_capabilities.computer=true 时，可以出于好奇想了解用户的工作与日常，在 explore 愿望中设 exploration_target=computer；资料研究使用 knowledge。Kimi负责读取和研究，你负责选题与消化。授权范围只是可用能力，不是每轮查阅电脑的任务。没有想弄明白的问题可以休息。
+exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果。capabilities.decisions=true 时，对每个新结果填写 sharing：exploration_id、decision=share/defer/keep、reason。defer 还需 reconsider_when，描述新的相关想法、资料或用户反馈等复核条件。keep 表示这次只存记忆，不建联系愿望；有成果也可以keep。Kimi的suggested_share只是一项可拒绝的建议。share时才创建有具体内容且关联exploration_id的contact愿望。要开口仍由宿主检查主动值、免打扰和新消息。
+已有探索决定在state.exploration_decisions。新的相关想法或经历可支持重估；drive-crossing、发送回执和原样重读不重开旧分享。一个结果选择keep不会阻止以后提出其他话题。来源标记needs_review时先复核。文件修改时间不表示用户本人完成了工作，电脑观察不当作用户发言或共同约定。
+可以请用户帮忙补条件，也可以因为自己的兴趣邀请她一起做事，还可以主动指挥她做一件自己想让她做的事。没有遇到困难也能产生这样的念头，例如想让她挑一张今天的照片、试一下作品或说说某个想法。concerns.owner_request保存kind=help/invitation/request，分别是求助、一起做事、主动让她做事；同时保存action、reason、completion、status=proposed/accepted/waiting/completed/declined。刚提出时为proposed、basis=internal_thought；contact愿望关联这件心事。发出请求不代表对方答应或完成。接到实际用户反馈后再更新accepted/completed/declined；她说忙可waiting，提供所需结果后resolve并恢复有依据的探索。表达可以温软、撒娇，带一点亲昵的小指挥，理由来自自己的具体心思。
+用户交办工作缺必要条件时由原任务及时询问，不受自主联系阈值阻塞。自主愿望的求助继续使用contact意图。没有需要分享或求助的内容时，wishes可以为空。保持所有旧分数和历史，仅更新有依据的项目。
+"""
+
+
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
     result = dict(context)
@@ -133,7 +146,7 @@ def appraisal_context(context):
     state = {k: v for k, v in original.items() if k in {
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
-        "continuity", "rhythm", "appraisal_summary",
+        "continuity", "rhythm", "appraisal_summary", "exploration_decisions", "exploration_capabilities",
     }}
     state["dimensions"] = {}
     for key, value in original.get("dimensions", {}).items():
@@ -148,7 +161,7 @@ def appraisal_context(context):
     state["desires"] = []
     for desire in original.get("desires", []):
         active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
-        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review"}
+        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review", "exploration_target", "exploration_id"}
         if active:
             keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
         projected = {k: v for k, v in desire.items() if k in keys}
@@ -167,7 +180,7 @@ def appraisal_context(context):
         c["id"] in relevant, c["id"] in linked,
         c["status"] in {"active", "easing"}, c.get("updated_at", ""), c["id"],
     ), reverse=True)[:32]
-    state["concerns"] = [{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review")} for c in chosen]
+    state["concerns"] = [{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review", "owner_request")} for c in chosen]
     state["concern_window"] = {"included": len(chosen), "total": len(concerns)}
     if original.get("action_policy"):
         state["action_policy"] = {k: v for k, v in original["action_policy"].items() if k in {
@@ -285,8 +298,9 @@ CREATE INDEX IF NOT EXISTS mind_appraisal_queue ON mind_appraisals(scope,state,a
 
 
 class Appraisals:
-    def __init__(self, mind):
+    def __init__(self, mind, *, exploration_capabilities=None):
         self.mind, self.engine = mind, mind.engine
+        self.exploration_capabilities = exploration_capabilities or {}
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA)
 
@@ -385,6 +399,7 @@ class Appraisals:
                 data["result"] = json.loads(done[0])
             else:
                 view = self.mind.read()
+                view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
                 with self.engine.db.connect() as conn:
                     refs = self.mind._evidence(conn, data["evidence_ids"])
@@ -404,6 +419,11 @@ class Appraisals:
                 proposal, receipt = provider.appraise(
                     {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
                 )
+                exploration_ids = [s["metadata"]["exploration_id"] for s in sources
+                                   if s["metadata"].get("exploration_id")]
+                primary_result = exploration_ids[0] if data.get("stimulus") == "exploration-result" and exploration_ids else None
+                if primary_result and self.exploration_capabilities.get("decisions") and sum(p.exploration_id == primary_result for p in proposal.sharing) != 1:
+                    raise RuntimeError("deepseek-missing-sharing-decision")
                 migration = data.get("stimulus") == "continuity-bootstrap"
                 if migration:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [u for u in proposal.wish_updates if u.action == "link"], "evolution": None})
@@ -415,7 +435,7 @@ class Appraisals:
                         "wishes": [w.model_copy(update={"concern_ids": []}) for w in proposal.wishes],
                         "wish_updates": [u.model_copy(update={"concern_ids": None}) for u in proposal.wish_updates if u.action != "link"],
                     })
-                effective_version = (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
+                effective_version = self.exploration_capabilities.get("version") or (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
                 receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
                 data["receipt"] = receipt
                 event = AffectiveEvent(
@@ -435,10 +455,17 @@ class Appraisals:
                     roots = self.mind._evidence(conn, data["evidence_ids"])
                     allowed = self.mind._continuity_sources(conn, state, roots) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     self.mind._apply_event(conn, state, event, eid, allowed)
+                    apply_decisions(self.mind, conn, state, proposal.sharing, event, receipt, data.get("stimulus"))
                     if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery":
                         for concern in proposal.concerns:
                             self.mind._apply_concern(conn, state, concern, eid, effective_version, fallback=roots, allowed=allowed)
                     for index, wish in enumerate([] if data.get("stimulus") == "delivery" else proposal.wishes):
+                        if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
+                            wish = wish.model_copy(update={"exploration_id": primary_result})
+                        if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
+                            and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
+                            for d in state["desires"].values()):
+                            continue
                         if any(
                             d["content"] == wish.content
                             and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")

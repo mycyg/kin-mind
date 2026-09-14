@@ -44,6 +44,14 @@ class RhythmProposal(Model):
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
+class OwnerRequest(Model):
+    kind: Literal["help", "invitation", "request"]
+    action: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
+    completion: str = Field(min_length=1, max_length=500)
+    status: Literal["proposed", "accepted", "waiting", "completed", "declined"] = "proposed"
+
+
 class ConcernProposal(Model):
     action: Literal["create", "update", "ease", "resolve", "reopen", "archive"]
     concern_id: str | None = None
@@ -59,6 +67,7 @@ class ConcernProposal(Model):
     confidence: FiniteFloat | None = Field(default=None, ge=0, le=1)
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
     reason: str = Field(min_length=1, max_length=600)
+    owner_request: OwnerRequest | None = None
 
     @model_validator(mode="after")
     def shape(self):
@@ -158,7 +167,7 @@ def select_concerns(concerns, query="", limit=3):
     )
     return [
         {
-            k: c[k]
+            k: c.get(k)
             for k in (
                 "id",
                 "revision",
@@ -171,6 +180,7 @@ def select_concerns(concerns, query="", limit=3):
                 "basis",
                 "confidence",
                 "evidence_ids",
+                "owner_request",
             )
         }
         for c in active[:limit]
@@ -309,6 +319,13 @@ class Continuity:
             raise Conflict("Only a closed concern can reopen")
         if change.action == "resolve" and not new_refs:
             raise Conflict("Resolution requires a new outcome or correction source")
+        if change.owner_request:
+            request = change.owner_request
+            if request.status in {"accepted", "completed", "declined"} and not any(
+                r["authority"] == "explicit" and r.get("metadata", {}).get("role") == "user"
+                for r in new_refs
+            ):
+                raise Conflict("Owner participation needs a new explicit owner response")
         at = self.clock()
         entry = (
             concern_projection(current, at)
@@ -337,11 +354,15 @@ class Continuity:
             value = getattr(change, name)
             if value is not None:
                 entry[name] = value
+        if change.owner_request:
+            entry["owner_request"] = change.owner_request.model_dump()
         if entry["basis"] == "explicit" and not any(
             r["authority"] == "explicit" for r in refs
         ):
             raise Conflict("Explicit interpretation requires an explicit source")
         if change.action == "resolve":
+            if entry.get("owner_request") and entry["owner_request"]["status"] not in {"completed", "declined"}:
+                raise Conflict("Sending a request does not resolve the awaited owner outcome")
             if low_confidence(entry):
                 raise Conflict("Unverified interpretation cannot resolve a concern")
             entry.update(status="resolved", intensity=0, resolution_evidence=refs)
