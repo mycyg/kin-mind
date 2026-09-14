@@ -55,8 +55,10 @@ class GraphMigration:
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name='event-graph-v1'", (self.scope.key(),)).fetchone()
             progress = json.loads(row[0]) if row else {"explorations_done": [], "runtime_cursor": None, "relation_cursor": None}
+            explorations_pending = False
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_explorations'").fetchone():
-                for row in conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state IN ('complete','failed','interrupted') ORDER BY created_at DESC", (self.scope.key(),)).fetchall():
+                exploration_rows = conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state IN ('complete','failed','interrupted') ORDER BY created_at DESC", (self.scope.key(),)).fetchall()
+                for row in exploration_rows:
                     if row["id"] in progress["explorations_done"]:
                         continue
                     try:
@@ -71,6 +73,7 @@ class GraphMigration:
                     progress["explorations_done"].append(row["id"])
                     if counts["explorations"] >= limit:
                         break
+                explorations_pending = any(r["id"] not in progress["explorations_done"] for r in exploration_rows)
             if progress["runtime_cursor"] is None:
                 progress["runtime_cursor"] = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM mind_runtime_events WHERE scope=?", (self.scope.key(),)).fetchone()[0]
             rows = conn.execute("SELECT seq,id,data FROM mind_runtime_events WHERE scope=? AND seq<? ORDER BY seq DESC LIMIT ?", (self.scope.key(), progress["runtime_cursor"], limit)).fetchall()
@@ -115,7 +118,7 @@ class GraphMigration:
                 progress["relation_cursor"] = row["rowid"]
             progress["relations_done"] = len(rows) < limit
             conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)", (self.scope.key(), "event-graph-v1", progress["runtime_cursor"], dumps(progress)))
-        return {"state": "complete" if progress["runtime_done"] and progress["relations_done"] else "pending", **counts, "progress": progress}
+        return {"state": "complete" if progress["runtime_done"] and progress["relations_done"] and not explorations_pending else "pending", **counts, "progress": progress}
 
     def match_shares(self, provider, owner_id, *, limit=24, force=False, max_batches=2, share_ids=None):
         """Checkpoint small, complete public-bubble batches; never send or rescore affect."""

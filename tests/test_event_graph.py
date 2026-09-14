@@ -280,3 +280,21 @@ def test_history_queue_is_newest_first_persistent_and_does_not_change_affect(sys
     assert migration.queue_history(jobs,'fixture')['state']=='complete'
     assert all(c[1]['stimulus']=='memory-backfill' for c in calls)
     assert mind.read()['revision']==before
+
+
+def test_exploration_only_migration_finishes_every_page(system):
+    import json
+    from kin_mind.exploration import Explorations
+    from kin_mind.graph_migration import GraphMigration
+    mind,memory,source,_=system
+    Explorations(mind)
+    sid=source('old-explorations','Two distinct synthetic observations')
+    with mind.engine.db.connect(write=True) as conn:
+        for i in range(2):
+            data={'source_id':sid,'result':{'findings':[f'Synthetic finding {i}']}}
+            conn.execute('INSERT INTO mind_explorations VALUES(?,?,?,?,?)',(f'explore_only_{i}',mind.scope.key(),'complete',mind.clock(),json.dumps(data)))
+    migration=GraphMigration(mind)
+    assert migration.batch(1)['state']=='pending'
+    assert migration.batch(1)['state']=='complete'
+    with mind.engine.db.connect() as conn:
+        assert memory.sharing.coverage(conn,'explore_only_1')['total']==1
