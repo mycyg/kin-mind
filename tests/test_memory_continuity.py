@@ -380,3 +380,26 @@ def test_appraisal_can_link_recalled_delivery_evidence_without_marking_it_fully_
     assert jobs.run_one(Provider())["state"] == "complete"
     with mind.engine.db.connect() as conn:
         assert not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE source_id=?", (old["source_id"],)).fetchone()
+
+
+def test_appraisal_can_use_recent_interaction_outside_the_new_event_batch(system):
+    from kin_mind.memory import MemoryNote
+    mind, memory, source, _ = system
+    old = memory.ingest({"id": "recent-reference", "kind": "owner-message", "at": mind.clock(),
+                         "text": "The earlier result is still unfinished.", "historical": True})
+    current = source("current-message", "Remember what we discussed.")
+    jobs = Appraisals(mind)
+    memory_context = memory.semantic_context()
+    memory_context["works"], memory_context["shares"] = [], []
+    jobs.memory.semantic_context = lambda: memory_context
+    class Provider:
+        def appraise(self, context):
+            assert old["source_id"] not in {s["id"] for s in context["new_evidence"]}
+            assert any(s["source_id"] == old["source_id"] for s in context["memory_context"]["recent_interaction"])
+            return Appraisal(reason="Relate current conversation to its actual recent source.", memory=MemoryAssessment(notes=[
+                MemoryNote(key="recent-context", title="An unfinished result", content="The previous result is still unfinished.",
+                           evidence_ids=[old["source_id"]])])), {"model": "deepseek-flash"}
+    jobs.enqueue(agent_version="fixture-v1", evidence_ids=[current], stimulus="assistant-result")
+    assert jobs.run_one(Provider())["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE source_id=?", (old["source_id"],)).fetchone()

@@ -613,6 +613,16 @@ class Appraisals:
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
                 with self.engine.db.connect() as conn:
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
+                    for interaction in (memory_context or {}).get("recent_interaction", []):
+                        try:
+                            recent_refs = self.mind._evidence(conn, [interaction["source_id"]])
+                            if not self.mind._fresh(conn, recent_refs):
+                                raise Conflict("Recent interaction source needs review")
+                        except (Missing, Conflict):
+                            interaction["needs_review"] = True
+                            continue
+                        for ref in recent_refs:
+                            semantic_refs[ref["record_id"]] = ref
                     for kind in ("works", "shares"):
                         for node in (memory_context or {}).get(kind, []):
                             if self.memory._fresh(conn, node):
