@@ -146,11 +146,23 @@ class Contexts:
                 # Per-call work is bounded; the remaining complete items have a
                 # continuation cursor instead of a partially cut source account.
                 receipts, entries, omitted = [], [], list(dict.fromkeys(unprocessed))
+                deadline = time.monotonic() + 150
+                def compress(payload):
+                    remaining = deadline - time.monotonic()
+                    if remaining < 1:
+                        raise RuntimeError("deepseek-compression-deadline")
+                    previous_timeout = getattr(provider, "timeout", None)
+                    if previous_timeout is not None:
+                        provider.timeout = min(previous_timeout, remaining)
+                    try:
+                        return provider.structured("submit_compression", Compression, COMPRESSION_SYSTEM, payload, max_tokens=65536)
+                    finally:
+                        if previous_timeout is not None:
+                            provider.timeout = previous_timeout
                 provenance_cost = sum(tokens(dumps({"id": i["id"], "revision": i.get("revision"), "basis": i.get("basis", "inferred"), **i.get("facts", {})})) for i in items) + 20
                 summary_budget = max(32, budget - provenance_cost)
                 for batch in batches[:3]:
-                    value, receipt = provider.structured("submit_compression", Compression, COMPRESSION_SYSTEM,
-                        {"query": query, "budget_tokens": max(32, summary_budget // max(1, min(3, len(batches)))), "items": batch}, max_tokens=16384)
+                    value, receipt = compress({"query": query, "budget_tokens": max(32, summary_budget // max(1, min(3, len(batches)))), "items": batch})
                     ids = {i["id"]: i["origin_id"] for i in batch}
                     covered = [identifier for e in value.entries for identifier in e.item_ids]
                     if set(covered) & set(value.omitted_ids) or set(covered + value.omitted_ids) != set(ids):
@@ -165,8 +177,7 @@ class Contexts:
                 if len(batches) > 1 and entries:
                     reduced = [{"id": "group:" + str(i), "text": e["summary"], "item_ids": e["item_ids"]} for i, e in enumerate(entries)]
                     # Summary of summaries is still tied to original dependencies.
-                    value, receipt = provider.structured("submit_compression", Compression, COMPRESSION_SYSTEM,
-                        {"query": query, "budget_tokens": summary_budget, "items": reduced}, max_tokens=16384)
+                    value, receipt = compress({"query": query, "budget_tokens": summary_budget, "items": reduced})
                     groups = {x["id"]: x["item_ids"] for x in reduced}
                     chosen = [i for e in value.entries for i in e.item_ids]
                     if set(chosen) & set(value.omitted_ids) or set(chosen + value.omitted_ids) != set(groups):
@@ -195,7 +206,7 @@ class Contexts:
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": len(receipts), "state": result["state"]})
                 return result
             except Exception as error:  # noqa: BLE001 - worker boundary, redacted failure type only
-                failure = type(error).__name__
+                failure = str(error) if isinstance(error, RuntimeError) and re.fullmatch(r"deepseek-[a-z0-9-]+", str(error)) else type(error).__name__
         else:
             failure = "deferred" if not allow_model else "budget"
         lines, covered = [], []

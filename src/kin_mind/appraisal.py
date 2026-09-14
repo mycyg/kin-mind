@@ -160,6 +160,13 @@ def appraisal_context(context):
     if not isinstance(context.get("state"), dict):
         return result
     original = context["state"]
+    if context.get("stimulus") == "memory-backfill":
+        # Backfill interprets recorded history; current mood and the complete
+        # wish inventory are neither evidence for it nor targets of this pass.
+        result["state"] = {k: original[k] for k in ("scope", "agent_version", "revision", "persona_contract") if k in original}
+        result["definitions"] = {}
+        result["context_projection"] = "memory-history-v1"
+        return result
     state = {k: v for k, v in original.items() if k in {
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
@@ -284,7 +291,7 @@ class DeepSeek:
             from .state import Mind
             request_context = redact(request_context)
             if tokens(dumps(request_context)) > 24000:
-                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=60, transport=self.transport)
+                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=150, transport=self.transport)
                 compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
@@ -308,7 +315,7 @@ class DeepSeek:
                 unique = {i["id"]: i for i in items}
                 result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor)
                 if result["omitted_ids"]:
-                    raise RuntimeError("deepseek-evidence-compression-pending")
+                    raise RuntimeError("deepseek-evidence-compression-pending:" + result.get("reason", result["state"]))
                 request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]
                 request_context["evidence_summary"] = result["text"]
                 request_context["memory_context"]["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in request_context["memory_context"]["pending_events"]]

@@ -253,3 +253,30 @@ def test_file_version_mismatch_is_deferred_instead_of_misattributed(system, tmp_
     file.write_text("later")
     with pytest.raises(Conflict):
         memory.ingest({"id": "changed", "kind": "artifact-created", "at": mind.clock(), "artifact": fingerprint})
+
+
+def test_history_projection_retains_evidence_without_reappraising_current_mood(system):
+    from kin_mind.appraisal import appraisal_context
+    mind, _, _, _ = system
+    source = {"id": "old-source", "text": "This was delivered yesterday, not today."}
+    context = appraisal_context({"stimulus": "memory-backfill", "state": mind.read(),
+                                 "new_evidence": [source], "definitions": {"mood": "current mood"}})
+    assert context["new_evidence"] == [source]
+    assert context["state"]["scope"] == mind.scope.model_dump()
+    assert "dimensions" not in context["state"]
+    assert not context["definitions"]
+
+
+def test_compression_reports_safe_provider_failure_and_restores_timeout(system):
+    mind, _, _, _ = system
+    class TimeoutProvider:
+        timeout = 600
+        def structured(self, *args, **kwargs):
+            assert self.timeout <= 150
+            assert kwargs["max_tokens"] == 65536
+            raise RuntimeError("deepseek-timeout")
+    provider = TimeoutProvider()
+    result = Contexts(mind).pack([{"id": "long", "text": "Whole evidence sentence. " * 300}], "recall", 200, provider=provider)
+    assert result["reason"] == "deepseek-timeout"
+    assert result["omitted_ids"] == ["long"]
+    assert provider.timeout == 600
