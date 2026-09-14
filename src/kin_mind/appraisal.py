@@ -28,6 +28,8 @@ from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 
+APPRAISAL_INPUT_BUDGET = 64000
+
 
 class Wish(Model):
     content: str = Field(min_length=1, max_length=2000)
@@ -349,8 +351,11 @@ class DeepSeek:
             from .context import Contexts
             from .state import Mind
             request_context = redact(request_context)
-            if tokens(dumps(request_context)) > 32000:
-                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=150, transport=self.transport)
+            if tokens(dumps(request_context)) > APPRAISAL_INPUT_BUDGET:
+                # Background evidence preparation has a separate budget from a
+                # foreground recall. Completed parts survive the worker boundary.
+                preparation_seconds = min(480, max(30, self.timeout - 120))
+                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=min(240, preparation_seconds), transport=self.transport)
                 compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
@@ -374,7 +379,7 @@ class DeepSeek:
                     if value.get("reason"):
                         items.append({"id": "dimension:" + dimension, "text": value.pop("reason"), "basis": "inferred"})
                 unique = {i["id"]: i for i in items}
-                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor)
+                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor, work_seconds=preparation_seconds)
                 if result["omitted_ids"]:
                     raise RuntimeError("deepseek-evidence-compression-pending:" + result.get("reason", result["state"]))
                 request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]
@@ -384,8 +389,13 @@ class DeepSeek:
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
                 request_context["compression_receipt"] = result.get("receipt")
-                if tokens(dumps(request_context)) > 32000:
+                if tokens(dumps(request_context)) > APPRAISAL_INPUT_BUDGET:
                     raise RuntimeError("deepseek-appraisal-budget-pending")
+                if time.monotonic() - started > self.timeout - 120:
+                    # A slow provider can keep an HTTP stream alive beyond its
+                    # inactivity timeout. Keep the prepared cache and give the
+                    # subsequent appraisal a fresh worker budget on retry.
+                    raise RuntimeError("deepseek-appraisal-preparation-complete")
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")

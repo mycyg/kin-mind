@@ -344,6 +344,65 @@ def test_compression_reports_safe_provider_failure_and_restores_timeout(system):
     assert provider.timeout == 600
 
 
+def test_background_compression_resumes_parts_with_its_own_deadline(system, monkeypatch):
+    from eventmem.core.retrieval import tokens
+
+    mind, _, _, _ = system
+    elapsed = [0.0]
+    monkeypatch.setattr("kin_mind.context.time.monotonic", lambda: elapsed[0])
+    text = "A complete sourced observation. "
+    while tokens(text) < 10000:
+        text += "A complete sourced observation. " * 100
+    items = [{"id": "first", "text": text}, {"id": "second", "text": text}]
+
+    class SlowCompressor(Compressor):
+        timeout = 600
+
+        def structured(self, *args, **kwargs):
+            elapsed[0] += 160
+            return super().structured(*args, **kwargs)
+
+    provider = SlowCompressor()
+    contexts = Contexts(mind)
+    first = contexts.pack(items, "What happened?", 4000, provider=provider)
+    assert first["reason"] == "deepseek-compression-deadline"
+    assert provider.calls == 1 and provider.timeout == 600
+    resumed = contexts.pack(items, "What happened?", 4000, provider=provider, work_seconds=480)
+    assert resumed["state"] == "compressed" and not resumed["omitted_ids"]
+    assert resumed["receipt"][0]["cache_hit"] and resumed["receipt"][0]["requests"] == 0
+    assert provider.calls == 3 and provider.timeout == 600
+
+
+def test_background_appraisal_does_not_compress_a_batch_that_fits_its_budget(system, monkeypatch):
+    import json
+
+    import httpx
+
+    from eventmem.core.retrieval import tokens
+    from kin_mind.appraisal import APPRAISAL_INPUT_BUDGET, DeepSeek
+
+    mind, memory, _, _ = system
+    text = "The original evidence is retained. "
+    while tokens(text) < 40000:
+        text += "The original evidence is retained. " * 100
+    monkeypatch.setenv("SYNTHETIC_APPRAISAL_KEY", "synthetic-key")
+    calls = []
+
+    def respond(request):
+        payload = json.loads(request.content)
+        calls.append(payload["tools"][0]["name"])
+        sent = json.loads(payload["messages"][0]["content"])
+        assert sent["new_evidence"][0]["text"] == text
+        assert 32000 < tokens(payload["messages"][0]["content"]) < APPRAISAL_INPUT_BUDGET
+        assert payload["output_config"]["effort"] == "max"
+        return httpx.Response(200, json={"model":"deepseek-flash", "id":"synthetic-receipt", "stop_reason":"tool_use", "content":[{"type":"tool_use", "name":"submit_appraisal", "input":{"reason":"The sourced batch is complete."}}]})
+
+    provider = DeepSeek("https://api.deepseek.com/anthropic", "deepseek-flash", "SYNTHETIC_APPRAISAL_KEY", timeout=600, transport=httpx.MockTransport(respond))
+    provider.engine = mind.engine
+    _, receipt = provider.appraise({"state":mind.read(), "new_evidence":[{"id":"synthetic-source", "text":text}], "memory_context":memory.semantic_context()})
+    assert calls == ["submit_appraisal"] and receipt["model"] == "deepseek-flash"
+
+
 def test_semantic_links_accept_original_source_identifiers(system):
     from kin_mind.memory import MemoryLink, MemoryNote
     mind, memory, source, _ = system

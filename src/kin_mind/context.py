@@ -108,10 +108,12 @@ class Contexts:
                     return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True):
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150):
         """A cache entry covers exact input revisions and query purpose, not DB age."""
         if not 0 <= budget <= 32000:
             raise ValueError("Invalid context budget")
+        if not 1 <= work_seconds <= 600:
+            raise ValueError("Invalid compression work deadline")
         started = time.monotonic()
         stale_ids = [i["id"] for i in items if not self._current(i)]
         items = [redact(i) for i in items if i["id"] not in stale_ids]
@@ -158,7 +160,7 @@ class Contexts:
                 # Per-call work is bounded; the remaining complete items have a
                 # continuation cursor instead of a partially cut source account.
                 receipts, entries, omitted = [], [], list(dict.fromkeys(unprocessed))
-                deadline = time.monotonic() + 150
+                deadline = time.monotonic() + work_seconds
                 def compress(payload):
                     ids = {item["id"] for item in payload["items"]}
                     payload = {**payload, "allowed_item_ids": sorted(ids)}
