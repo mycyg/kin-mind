@@ -136,6 +136,8 @@ def dispatch(config, action, request):
     if action == "configure-contact":
         return mind.configure_contact(request)
     if action == "review":
+        if config.get("review_paused"):
+            return {"state": "paused", "reason": "host-maintenance"}
         # The existing minute review queues work; the original host owns execution
         # and waits for owner tasks. No extra model call is used for the clock.
         actions.crossings()
