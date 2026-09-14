@@ -118,6 +118,26 @@ class Compressor:
         return Compression(entries=[CompressedEntry(item_ids=[i["id"] for i in context["items"]], summary="Kin created the file; delivery failed. The user has not confirmed reading it.")]), {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "max"}
 
 
+def test_compression_repairs_coverage_once_without_promoting_a_bad_summary(system):
+    mind, _, _, _ = system
+    class Repairable:
+        calls = 0
+        def structured(self, name, schema, system, context, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return Compression(entries=[CompressedEntry(item_ids=["wrong-source-id"], summary="Untrusted first result")]), {}
+            assert context["validation"]["missing_ids"] == ["input-one"]
+            assert context["allowed_item_ids"] == ["input-one"]
+            return Compression(entries=[CompressedEntry(item_ids=["input-one"], summary="The file was created; sending failed.")]), {"model": "deepseek-flash"}
+    provider = Repairable()
+    result = Contexts(mind).pack([{"id": "input-one", "text": "The file was created; sending failed. " * 100}], "delivery", 200, provider=provider)
+    assert result["state"] == "compressed"
+    assert result["covered_ids"] == ["input-one"] and not result["omitted_ids"]
+    assert provider.calls == 2
+    assert result["receipt"][0]["coverage_repairs"] == 1
+    assert "Untrusted" not in result["text"]
+
+
 def test_compression_cache_sources_correction_and_no_text_slicing(system):
     mind, _, source, _ = system
     sid = source("long", "Kin created the file. Delivery failed.\n\n" + "Supporting detail about the task.\n\n" * 70)
