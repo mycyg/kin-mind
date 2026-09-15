@@ -34,17 +34,41 @@ def load_config(path):
 
 
 def dispatch(config, action, request):
+    registry = config.get("session_registry_file")
+    if registry and Path(registry).exists():
+        binding = json.loads(Path(registry).read_text())["binding"]
+        config = {**config, "session_id": binding["threadId"]}
     engine = Engine(Path(config["root"]))
     mind = Mind(engine, Scope.model_validate(config["scope"]))
+    session_context = None
+    observation_file = config.get("session_observation_file")
+    if observation_file and Path(observation_file).exists():
+        session_context = json.loads(Path(observation_file).read_text())
     jobs = Appraisals(mind, exploration_capabilities={
         "computer": bool(config.get("computer_exploration", {}).get("enabled")),
         "decisions": bool(config.get("exploration_decisions_enabled")),
         "version": config.get("agent_version"),
-    })
+    }, session_context=session_context)
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
     memory = MemoryContinuity(mind)
+    if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
+        from .session_checkpoint import SessionCheckpoint
+        checkpoints = SessionCheckpoint(mind)
+        if action == "session-validate":
+            return checkpoints.validate(request["checkpoint"])
+        if action == "session-snapshot":
+            return checkpoints.snapshot(request.get("pending"))
+        return checkpoints.build(request["snapshot"], request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine))
+    if action == "session-review":
+        if not config.get("adaptive_sessions") or not session_context:
+            return {"state": "disabled"}
+        source = engine.receive(SourceInput(namespace="kin-session-maintenance", key=request["id"],
+            session=config["session_id"], scope=mind.scope, authority="operation", kind="observation", extract=False,
+            text="宿主请求检查当前原生会话。依据 session_context 判断压缩与接续；此事件不是用户消息，也不改变情绪和愿望。",
+            metadata={"session_snapshot_id": session_context["id"], "maintenance_only": True}))
+        return jobs.enqueue([source["id"]], config["agent_version"], origin="reflection", stimulus="session-maintenance")
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":
@@ -76,10 +100,12 @@ def dispatch(config, action, request):
             result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
         return result
     if action == "memory-context":
+        if config.get("adaptive_sessions"):
+            request["native_pressure_managed"] = True
         return Contexts(mind).build(**request)
     if action == "memory-window":
         window = Contexts(mind).window(config["session_id"])
-        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000}
+        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":window["used"]>=12000}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":
@@ -93,6 +119,8 @@ def dispatch(config, action, request):
         return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt"}}
     if action == "memory-compact-ack":
         return Contexts(mind).compact_ack(**request)
+    if action == "memory-injection-ack":
+        return Contexts(mind).injection_ack(**request)
     if action in {"share-history", "work-history"}:
         return Contexts(mind).read_history("share" if action == "share-history" else "work", **request)
     if action == "configure-continuity":

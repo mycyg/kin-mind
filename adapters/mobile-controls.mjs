@@ -1,11 +1,11 @@
 export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
-  const canonical=runtime.known?runtime.sessionId===sessionId&&runtime.threadId===sessionId&&runtime.nativeSessionId===sessionId:null;
+  const canonical=runtime.known?runtime.sessionId===sessionId&&runtime.threadId===sessionId&&runtime.nativeSessionId===(state.nativeSessionId??sessionId):null;
   const actual={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,fastMode:runtime.fastMode,
     verified:Boolean(runtime.known&&runtime.profileReady!==false&&canonical),loaded,canonicalMatch:canonical,
     checkedAt:runtime.checkedAt,active:runtime.active,backgroundTasks:runtime.backgroundTasks,handoffTasks:runtime.handoffTasks};
   const lastTransition=state.transition?{...state.transition,recordKind:'historical-transition',
     matchesCurrentModel:Boolean(actual.verified&&state.transition.to===actual.model),runtimeCheckedAt:actual.checkedAt}:null;
-  return {mode:state.mode,exitRequested:state.exitRequested,actual,sessionId,lastTransition,
+  return {mode:state.mode,exitRequested:state.exitRequested,actual,sessionId,conversationId:state.conversationId,generation:state.generation,nativeSessionId:state.nativeSessionId??sessionId,lastTransition,
     // Compatibility alias; actual remains the only current-model evidence.
     transition:lastTransition,
     tasks:Object.values(state.tasks).filter(t=>!['completed','canceled'].includes(t.status)).map(t=>({id:t.id,status:t.status,summary:t.summary,inputVersion:t.inputVersion,completionRequested:Boolean(t.completion),handoff:t.handoff?.state})),

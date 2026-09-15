@@ -72,6 +72,9 @@ class WishUpdate(Model):
         return self
 
 
+from .session_advice import SESSION_ADVICE_PROMPT, SessionAdvice, advice_record
+
+
 class Appraisal(Model):
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
@@ -86,6 +89,7 @@ class Appraisal(Model):
     memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
     next_review_minutes: StrictInt = Field(default=20, ge=20, le=120)
     habits: HabitProposal | None = None
+    session_advice: SessionAdvice | None = None
 
     @field_validator("motivations")
     @classmethod
@@ -408,7 +412,7 @@ class DeepSeek:
                     json={
                         "model": self.model,
                         "max_tokens": 131072,
-                        "system": SYSTEM + persona_prompt(policy),
+                        "system": SYSTEM + SESSION_ADVICE_PROMPT + persona_prompt(policy),
                         "messages": [{"role": "user", "content": dumps(request_context)}],
                         "tools": [
                             {
@@ -473,9 +477,10 @@ CREATE INDEX IF NOT EXISTS mind_appraisal_queue ON mind_appraisals(scope,state,a
 
 
 class Appraisals:
-    def __init__(self, mind, *, exploration_capabilities=None):
+    def __init__(self, mind, *, exploration_capabilities=None, session_context=None):
         self.mind, self.engine = mind, mind.engine
         self.exploration_capabilities = exploration_capabilities or {}
+        self.session_context = session_context
         self.memory = MemoryContinuity(mind)
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA)
@@ -548,7 +553,7 @@ class Appraisals:
         semantic_enabled = self.memory.settings()["semantic"]
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute(
-                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?)) ORDER BY CASE WHEN json_extract(data,'$.stimulus')='memory-backfill' THEN 1 ELSE 0 END,available LIMIT 1",
+                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?)) ORDER BY CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN -1 WHEN json_extract(data,'$.stimulus')='memory-backfill' THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time()),
             ).fetchone()
             if not row:
@@ -615,7 +620,8 @@ class Appraisals:
                 view = self.mind.read()
                 view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
-                memory_context = self.memory.semantic_context() if semantic_enabled else None
+                maintenance = data.get("stimulus") == "session-maintenance"
+                memory_context = self.memory.semantic_context() if semantic_enabled and not maintenance else None
                 historical = data.get("stimulus") == "memory-backfill"
                 if memory_context and historical:
                     memory_context["through_seq"] = memory_context["cursor"]
@@ -661,6 +667,13 @@ class Appraisals:
                         }
                     )
                 model_context = {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
+                if self.session_context and not historical:
+                    model_context["session_context"] = self.session_context
+                if maintenance:
+                    # A pressure edge needs a small operational judgment. It
+                    # must not wait for unrelated historical evidence packing.
+                    model_context = {"state": {"revision": view["revision"], "scope": view["scope"]},
+                                     "new_evidence": sources, "stimulus": "session-maintenance", "session_context": self.session_context}
                 if memory_context:
                     model_context["memory_context"] = memory_context
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
@@ -684,6 +697,8 @@ class Appraisals:
                                 for ref in self.mind._evidence(conn, self.memory._record_ids(conn, node["id"])):
                                     semantic_refs[ref["record_id"]] = ref
                 proposal, receipt = provider.appraise(model_context)
+                if maintenance and proposal.session_advice is None:
+                    raise RuntimeError("deepseek-missing-session-advice")
                 if historical:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None})
                 exploration_ids = [s["metadata"]["exploration_id"] for s in sources
@@ -722,6 +737,9 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
+                    if data.get("stimulus") == "session-maintenance":
+                        state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        return {"provider": receipt, "session_advice": state["session_advice"], "maintenance_only": True}
                     referenced_graph = {v for n in proposal.memory.graph.nodes for v in (n.id,n.owner_id) if v}
                     referenced_graph.update(v for e in proposal.memory.graph.edges for v in (e.subject,e.object))
                     referenced_graph.update(r.unit_id for m in proposal.memory.coverage.mappings for r in m.references)
@@ -815,6 +833,8 @@ class Appraisals:
                             memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots)
                     if proposal.habits:
                         self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
+                    if proposal.session_advice and self.session_context and not historical:
+                        state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
                     return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction)}
 
                 def rebase(conn, state):
@@ -832,7 +852,7 @@ class Appraisals:
                             return False
                     return semantic_enabled
 
-                data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+                data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             data.pop("error", None)
             state = "complete"
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt

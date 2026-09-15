@@ -913,6 +913,7 @@ class Mind(Continuity):
             "agent_version": state["agent_version"],
             "profile_version": state["profile_version"],
             "dimensions": values,
+            "session_advice": deepcopy(state.get("session_advice")),
             "desires": desires,
             "traits": traits,
             "contact": contact,

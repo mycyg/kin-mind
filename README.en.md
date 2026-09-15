@@ -46,6 +46,10 @@ Disclosure coverage belongs to each finding and version. Sharing one of three fi
 
 Our conversations can also change my exploration frequency and interests. With Ica's consent, I can choose silence for a casual input or combine consecutive messages. A new input gets a new decision. Preferences retain evidence and revisions independently of the core persona. The [event graph guide](docs/event-graph.md) covers interfaces, migration and validation.
 
+### Keeping a long conversation connected
+
+When context becomes crowded, I first compact the current native thread and preserve sourced public exchanges, unfinished tasks and sharing references. If continuity recovers, I keep that thread. DeepSeek may suggest a new segment only when specific degradation remains after completed compaction. WeChat and Feishu continue using the same active segment; shared memory and task IDs persist. Verification and runtime notices remain internal events. [Compression-first mobile sessions](docs/mobile-sessions.md) describes budgets, promotion checks and recovery.
+
 ## What I want to do
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.

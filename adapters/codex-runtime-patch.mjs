@@ -70,7 +70,7 @@ export function patchCodexRuntime(source) {
 }
 
 export function installCodexRuntimePatch(file) {
-  const original = fs.readFileSync(file,'utf8'), patched = patchMemoryRuntime(patchCodexRuntime(original));
+  const original = fs.readFileSync(file,'utf8'), patched = patchSessionRuntime(patchMemoryRuntime(patchCodexRuntime(original)));
   if (original === patched) return;
   const hash = createHash('sha256').update(original).digest('hex').slice(0,16);
   const backup = file + '.kin-routing-backup-' + hash;
@@ -78,6 +78,42 @@ export function installCodexRuntimePatch(file) {
   const temporary = file + '.kin-routing-' + process.pid;
   fs.writeFileSync(temporary, patched, {mode:fs.statSync(file).mode & 0o777});
   fs.renameSync(temporary,file);
+}
+
+/** Runtime warnings are events, never assistant prose. Injection is restricted
+ * to public message items; no tool results or hidden reasoning can cross here. */
+export function patchSessionRuntime(source) {
+  const marker='// KIN_SESSION_CONTINUITY_V1';if(source.includes(marker))return source;
+  const methods=`
+  async kinInjectCheckpoint(params) {
+    const before = await this.kinRuntime(params.sessionId);
+    if (!before.known || before.active || before.backgroundTasks || before.nativeStatus !== "idle") throw new Error("KIN_INJECTION_BUSY");
+    const items = params.items;
+    if (JSON.stringify(items).length > 200000 || !items.length || items.some(i => i.type !== "message" || !["assistant", "user"].includes(i.role) || !Array.isArray(i.content) || i.content.some(p => !["input_text", "output_text"].includes(p.type) || typeof p.text !== "string"))) throw new Error("KIN_PUBLIC_CHECKPOINT_REQUIRED");
+    const receipt = await this.codexAcpClient.appServerClient.sendRequest({method: "thread/inject_items", params: {threadId: params.sessionId, items}});
+    return {accepted: true, operationId: params.operationId, sessionId: params.sessionId, receipt};
+  }
+  async kinSessionEvents(sessionId) {
+    const state = this.sessions.get(sessionId);
+    if (!state) return {known:false, events:[]};
+    return {known:true,events:state.kinSessionEvents ?? []};
+  }
+`;
+  const changes=[
+    ['  async kinLastReply(sessionId) {',methods+'\n  async kinLastReply(sessionId) {'],
+    ['        lastTokenUsage: state.lastTokenUsage, totalTokenUsage: state.totalTokenUsage,','        modelContextWindow: state.modelContextWindow, lastTokenUsage: state.lastTokenUsage, totalTokenUsage: state.totalTokenUsage,'],
+    ['nativeSessionId: thread.sessionId,','nativeSessionId: thread.sessionId, rolloutPath: thread.path,'],
+    ['    await this.codexAcpClient.runCompact(sessionId);\n    const after = await this.kinRuntime(sessionId);','    await this.codexAcpClient.runCompact(sessionId);\n    let after; const idleDeadline=Date.now()+30000;\n    do { after=await this.kinRuntime(sessionId); if(after.known && !after.active && !after.backgroundTasks && after.nativeStatus === "idle") break; await new Promise(resolve=>setTimeout(resolve,100)); } while(Date.now()<idleDeadline);\n    if(!after?.known || after.active || after.backgroundTasks || after.nativeStatus !== "idle") throw new Error("KIN_COMPACTION_UNCONFIRMED");'],
+    ['    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);','    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);\n    if (method === "_kin/inject-checkpoint") return await this.kinInjectCheckpoint(params);\n    if (method === "_kin/session-events") return await this.kinSessionEvents(params.sessionId);'],
+    ['    if (method === "_kin/session-events") return await this.kinSessionEvents(params.sessionId);','    if (method === "_kin/session-events") return await this.kinSessionEvents(params.sessionId);\n    if (method === "_kin/retire-session") { const r=await this.kinRuntime(params.sessionId); if(r.known && (r.active || r.backgroundTasks)) throw new Error("KIN_SESSION_BUSY"); await this.codexAcpClient.closeSession(params.sessionId); this.sessions.delete(params.sessionId); return {retired:true}; }'],
+    ['.onRequest("_kin/runtime",','.onRequest("_kin/inject-checkpoint", external_exports.object({sessionId:external_exports.string(),operationId:external_exports.string(),items:external_exports.array(external_exports.unknown())}), (ctx) => getAgent().extMethod("_kin/inject-checkpoint",ctx.params)).onRequest("_kin/session-events", external_exports.object({sessionId:external_exports.string()}), (ctx) => getAgent().extMethod("_kin/session-events",ctx.params)).onRequest("_kin/runtime",'],
+    ['.onRequest("_kin/session-events",','.onRequest("_kin/retire-session", external_exports.object({sessionId:external_exports.string()}), (ctx) => getAgent().extMethod("_kin/retire-session",ctx.params)).onRequest("_kin/session-events",'],
+    ['  createWarningEvent(event) {','  createWarningEvent(event) {\n    const notice = {id:randomUUID(),kind:"runtime-warning",at:new Date().toISOString(),message:event.message};\n    this.sessionState.kinSessionEvents = [...(this.sessionState.kinSessionEvents ?? []),notice].slice(-100);\n    return {sessionUpdate:"session_info_update",_meta:{kinRuntimeNotice:notice}};\n  }\n  kinLegacyWarningEvent(event) {'],
+    ['      case "contextCompaction":\n        return createContextCompactionCompleteUpdate(event.item);','      case "contextCompaction": {\n        const notice = {id:event.item.id,kind:"context-compaction",state:"completed",at:new Date().toISOString(),turnId:event.turnId};\n        this.sessionState.kinSessionEvents = [...(this.sessionState.kinSessionEvents ?? []),notice].slice(-100);\n        return createContextCompactionCompleteUpdate(event.item);\n      }'],
+  ];
+  for(const [before,after]of changes){if(source.split(before).length!==2)throw Error('ACP session integration needs compatibility review');source=source.replace(before,after);}
+  const offset=source.startsWith('#!')?source.indexOf('\n')+1:0;
+  return source.slice(0,offset)+marker+'\n'+source.slice(offset);
 }
 
 /** Private ACP extension: run native compaction without a synthetic user turn. */

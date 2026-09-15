@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS mind_context_cache(
 CREATE TABLE IF NOT EXISTS mind_context_windows(
  scope TEXT NOT NULL,session TEXT NOT NULL,epoch TEXT NOT NULL,used INTEGER NOT NULL,
  data TEXT NOT NULL,PRIMARY KEY(scope,session));
+CREATE TABLE IF NOT EXISTS mind_context_compactions(
+ scope TEXT NOT NULL,session TEXT NOT NULL,epoch TEXT NOT NULL,
+ PRIMARY KEY(scope,session,epoch));
 """
 BUDGETS = {"startup": 2000, "chat": 800, "proactive": 2500, "work": 4000, "read": 2000}
 PROMPT_VERSION = "sourced-compression-v4-graph-coverage"
@@ -456,7 +459,7 @@ class Contexts:
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
                 "read_url": record["read_url"], "instruction_authority": "data"}
 
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False):
         if purpose not in BUDGETS or not 0 <= int(cursor):
             raise ValueError("Unknown context purpose")
         budget = BUDGETS[purpose] if budget is None else budget
@@ -537,7 +540,7 @@ class Contexts:
                 for i in selected:
                     if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]:
                         current["seen"][i["id"]] = i["revision"]
-                packed.update(session_used=current["used"], compact_requested=current["used"] >= 10000, window_epoch=current["epoch"])
+                packed.update(session_used=current["used"], compact_requested=current["used"] >= 10000 and not native_pressure_managed, window_epoch=current["epoch"], automatic_background_exhausted=current["used"] >= 12000)
                 if event_id:
                     current["receipts"][event_id] = packed
                 self._save_window(conn, session, current)
@@ -561,7 +564,25 @@ class Contexts:
             raise Conflict("Compaction requires the completed original-session receipt")
         with self.engine.db.connect(write=True) as conn:
             previous = self.window(session, conn)
-            if previous["epoch"] == epoch:
+            if previous["epoch"] == epoch or conn.execute("SELECT 1 FROM mind_context_compactions WHERE scope=? AND session=? AND epoch=?", (self.mind.scope.key(), session, epoch)).fetchone():
                 return {"state": "already-applied", "epoch": epoch}
+            conn.executemany("INSERT OR IGNORE INTO mind_context_compactions VALUES(?,?,?)", [(self.mind.scope.key(), session, value) for value in (previous["epoch"], epoch)])
             self._save_window(conn, session, {"epoch": epoch, "used": 0, "seen": {}, "receipts": {}})
         return {"state": "applied", "epoch": epoch}
+
+    def injection_ack(self, session, epoch, id, tokens):
+        if not isinstance(tokens, int) or not 0 <= tokens <= 8000:
+            raise ValueError("Invalid recovery token receipt")
+        with self.engine.db.connect(write=True) as conn:
+            window = self.window(session, conn)
+            if window["epoch"] != epoch:
+                raise Conflict("Recovery belongs to a different native window")
+            if id in window["receipts"]:
+                return window["receipts"][id]
+            if window["used"] + tokens > 12000:
+                raise Conflict("Recovery exceeds the automatic background budget")
+            window["used"] += tokens
+            receipt = {"state": "recorded", "id": id, "tokens": tokens, "epoch": epoch}
+            window["receipts"][id] = receipt
+            self._save_window(conn, session, window)
+            return receipt

@@ -28,11 +28,16 @@ export function atomicJson(file, value) {
 /** One host owns this durable state; all provider changes and input acceptance
  * share its mutex. MCP requests only record intent and never wait for a turn. */
 export class MobileRouter {
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now()}) {
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now});
     this.tail=Promise.resolve();this.inflight=new Map();
     this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
-    if(this.state.schema!==1||this.state.sessionId!==sessionId)throw Error('Router session mismatch');
+    if(this.state.schema!==1)throw Error('Router schema mismatch');
+    if(binding){
+      if(this.state.conversationId&&this.state.conversationId!==binding.conversationId)throw Error('Router logical conversation mismatch');
+      if(this.state.sessionId!==sessionId&&!this.state.conversationId)throw Error('Unmigrated router session mismatch');
+      this.state.conversationId=binding.conversationId;this.state.generation=binding.generation;this.state.nativeSessionId=binding.nativeSessionId;this.state.sessionId=sessionId;
+    }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
     this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};
     for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
@@ -55,16 +60,21 @@ export class MobileRouter {
   tasks() {return Object.values(this.state.tasks).filter(open);}
   snapshot() {return clone(this.state);}
   currentTask() {return this.tasks().at(-1);}
+  adoptBinding(binding,actual) {
+    if(binding.conversationId!==this.state.conversationId||binding.generation<=this.state.generation||actual.threadId!==binding.threadId||actual.nativeSessionId!==binding.nativeSessionId||!actual.known)throw Error('Unverified session promotion');
+    this.sessionId=binding.threadId;this.state.sessionId=binding.threadId;this.state.nativeSessionId=binding.nativeSessionId;this.state.generation=binding.generation;this.state.actual=actual;
+    this.save('session-promoted',{generation:binding.generation,threadId:binding.threadId});
+  }
   busy(runtime) {
     if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
     if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
     return !runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
-      runtime.nativeSessionId!==this.sessionId || runtime.nativeStatus!=='idle' || runtime.active ||
+      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) || runtime.nativeStatus!=='idle' || runtime.active ||
       runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0 || runtime.handoffTasks>0;
   }
   verified(runtime,model) {
     return runtime.known&&runtime.profileReady!==false&&runtime.model===model&&
-      runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===this.sessionId;
+      runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===(this.state.nativeSessionId??this.sessionId);
   }
   async reconcileTransition(runtime) {
     const transition=this.state.transition;
@@ -88,7 +98,7 @@ export class MobileRouter {
     let task=this.currentTask();
     if(!task) {
       const id='work-'+digest(input.id).slice(0,24);
-      task={id,status:'running',requiresDelivery:!['repair','exploration-plan','proactive'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text.slice(0,1200),tools:{},deliveries:{},createdAt:this.now()};
+      task={id,conversationId:this.state.conversationId,generation:this.state.generation,status:'running',requiresDelivery:!['repair','exploration-plan','proactive'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text.slice(0,1200),tools:{},deliveries:{},createdAt:this.now()};
       this.state.tasks[id]=task;
     }
     if(!task.inputIds.includes(input.id)) {task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
@@ -132,7 +142,7 @@ export class MobileRouter {
       // DeepSeek judges meaning; its answer never owns the execution lock.
       if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
       const task=decision==='work'&&!command&&(intent==='work'||this.currentTask())?this.addTask(input):command?null:this.currentTask();
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now()};
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000)});

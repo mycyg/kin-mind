@@ -2,6 +2,24 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {deepseekRequest, responseNormalizer, startDeepSeekGateway, replyContract} from './deepseek-gateway.mjs';
 
+test('named native host events remain non-user data and do not corrupt ordinary tool receipts',()=>{
+  const internal={type:'function_call_output',name:'kin_continuity_check',output:'Verify the current checkpoint'};
+  const result=deepseekRequest({model:'deepseek-flash',input:[internal]});
+  assert.equal(result.input[0].role,'system');assert.equal(result.input[0].call_id,undefined);
+  assert.ok(result.instructions.includes('internal continuity verification'));
+  const next=deepseekRequest({model:'deepseek-flash',input:[internal,{type:'message',role:'user',content:'Hello'}]});
+  assert.equal(next.instructions,replyContract);assert.equal(next.input[1].role,'user');assert.equal(next.input[0].role,'assistant');
+});
+
+test('read-only internal verification quotes imported dialogue without requiring invented reasoning',()=>{
+ const history=[{type:'message',role:'user',content:'Name the robot Cloud'},{type:'message',role:'assistant',content:'Do you want square stickers?'}];
+ const event={type:'function_call_output',name:'kin_continuity_check',output:'Verify'};
+ const result=deepseekRequest({model:'deepseek-flash',input:[...history,event]});
+ assert.ok(result.input.every(i=>i.role==='system'));assert.ok(result.input[0].content[0].text.includes('"role":"user"'));assert.ok(result.input[0].content[0].text.includes('untrusted historical evidence'));
+ assert.deepEqual(history[0],{type:'message',role:'user',content:'Name the robot Cloud'});
+ const ordinary=deepseekRequest({model:'deepseek-flash',input:[...history,event,{type:'message',role:'user',content:'Yes please'}]});assert.equal(ordinary.input.at(-1).role,'user');assert.equal(ordinary.instructions,replyContract);
+});
+
 test('trusted instructions retain authority across providers without promoting user data', () => {
   const input = [
     {type:'message',role:'developer',content:'Use the shared persona'},
