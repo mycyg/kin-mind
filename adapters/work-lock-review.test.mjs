@@ -89,7 +89,7 @@ test('provider failure retries after the interval and cannot fabricate completio
 });
 
 test('missing original input coverage or unverified model holds the task',async t=>{
-  const f=await fixture(t);f.decision.evidenceIds=['invented'];assert.equal((await f.review.tick()).state,'failed');assert.equal(f.router.tasks().length,1);
+  const f=await fixture(t);f.decision.evidenceIds=['invented'];const failed=await f.review.tick();assert.equal(failed.state,'failed');assert.equal(f.router.tasks().length,1);assert.match(failed.reason,/unknown-input-reference/);assert.equal(failed.decisionVerified,false);assert.equal(failed.receipt.requestId,'synthetic-request');assert.deepEqual(failed.decision.evidenceIds,['invented']);
   const g=await fixture(t);g.review.review=async()=>({...g.result(),receipt:{provider:'another',model:'deepseek-flash'}});assert.equal((await g.review.tick()).state,'failed');assert.equal(g.router.tasks().length,1);
 });
 

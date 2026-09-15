@@ -4,7 +4,7 @@ import {atomicJson,ROUTER_MODELS} from './mobile-router.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({reviewPolicyVersion:2,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:3,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
 
 /** DeepSeek supplies the semantic judgment; the host owns execution and receipts.
  * Reviews run outside the router mutex and never take over a native user turn. */
@@ -56,8 +56,14 @@ export class WorkLockReview {
       attempt=this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',checkedAt:this.now(),attempts:(previous?.attempts??0)+1});
       const result=await this.review(evidence.input),d=result.decision;
       const inputIds=new Set(snapshot.task.inputIds),discardable=new Set((evidence.input.cancellableDeferred??[]).map(x=>x.id));
-      if(!['keep','complete','not_a_task'].includes(d?.disposition)||!d.reason?.trim()||!Array.isArray(d.evidenceIds)||!d.evidenceIds.length||d.evidenceIds.some(id=>!inputIds.has(id))||!Array.isArray(d.remaining)||!Array.isArray(d.discardDraftIds)||d.discardDraftIds.some(id=>!discardable.has(id))||result.receipt?.provider!=='deepseek'||result.receipt?.model!=='deepseek-flash'||result.receipt?.reasoning!=='max'||!result.receipt?.requestId)throw Error('Unverified work review result');
-      attempt=this.save({...attempt,decision:d,receipt:result.receipt,state:'reviewed'});
+      // Retain the structured proposal even when its references fail validation.
+      // This audit never contains model text/thinking blocks.
+      attempt=this.save({...attempt,decision:d,receipt:result.receipt,state:'received',decisionVerified:false});
+      if(!['keep','complete','not_a_task'].includes(d?.disposition)||!d.reason?.trim()||!Array.isArray(d.evidenceIds)||!d.evidenceIds.length||!Array.isArray(d.remaining)||!Array.isArray(d.discardDraftIds))throw Error('Unverified work review result: invalid-decision-shape');
+      if(d.evidenceIds.some(id=>!inputIds.has(id)))throw Error('Unverified work review result: unknown-input-reference');
+      if(d.discardDraftIds.some(id=>!discardable.has(id)))throw Error('Unverified work review result: unknown-deferred-reference');
+      if(result.receipt?.provider!=='deepseek'||result.receipt?.model!=='deepseek-flash'||result.receipt?.reasoning!=='max'||!result.receipt?.requestId)throw Error('Unverified work review result: provider-receipt-mismatch');
+      attempt=this.save({...attempt,state:'reviewed',decisionVerified:true});
       if(this.closed)return this.save({...attempt,state:'interrupted',retryAt:this.now()});
       return await this.router.locked(async()=>{
         const task=this.router.currentTask(),runtime=await this.router.inspect();

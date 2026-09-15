@@ -23,7 +23,7 @@ test('invalid or absent structured result fails closed',async()=>{
 
 test('work lock review uses DeepSeek max and retains only structured judgment plus a provider receipt',async()=>{
   const reviewer=createMobileReviewer({key:'synthetic',fetchImpl:async(url,options)=>{
-    const body=JSON.parse(options.body);assert.equal(body.model,'deepseek-flash');assert.equal(body.output_config.effort,'max');assert.equal(body.tools[0].name,'review_work_lock');assert.equal(body.max_tokens,65536);
+    const body=JSON.parse(options.body);assert.equal(body.model,'deepseek-flash');assert.equal(body.output_config.effort,'max');assert.equal(body.tools[0].name,'review_work_lock');assert.equal(body.max_tokens,65536);assert.deepEqual(body.tools[0].input_schema.properties.evidenceIds.items.enum,['owner-input']);assert.equal(body.tools[0].input_schema.properties.discardDraftIds.maxItems,0);
     return Response.json({id:'verified-request',model:'deepseek-flash',usage:{input_tokens:100},content:[{type:'thinking',thinking:'private synthetic reasoning'},{type:'tool_use',name:'review_work_lock',input:{disposition:'not_a_task',reason:'An optional interest',evidenceIds:['owner-input'],remaining:[],discardDraftIds:[]}}]});
   }});
   const r=await reviewer.reviewWork({inputs:[{id:'owner-input',text:'Explore when idle'}]});assert.equal(r.receipt.reasoning,'max');assert.equal(r.receipt.requestId,'verified-request');assert.equal(r.decision.disposition,'not_a_task');assert.ok(!JSON.stringify(r).includes('private synthetic reasoning'));
