@@ -4,7 +4,7 @@ import {atomicJson,ROUTER_MODELS} from './mobile-router.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:2,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
 
 /** DeepSeek supplies the semantic judgment; the host owns execution and receipts.
  * Reviews run outside the router mutex and never take over a native user turn. */
@@ -94,7 +94,7 @@ export class WorkLockReview {
         return this.save({...attempt,state:'applied',appliedAt:this.now()});
       });
     } catch(error) {
-      return attempt?this.save({...attempt,state:'failed',reason:error.message,retryAt:this.now()+this.retryMs}):{state:'waiting',reason:'work-evidence-unavailable'};
+      return attempt?this.save({...attempt,state:'failed',reason:error.message,receipt:error.receipt??attempt.receipt,retryAt:this.now()+this.retryMs}):{state:'waiting',reason:'work-evidence-unavailable'};
     } finally {this.running=false;}
   }
 }

@@ -107,6 +107,14 @@ exploration wishes. It returns `keep`, `complete` or `not_a_task`. A held task i
 reviewed again after twenty minutes even if its inputs have not changed. Failed
 reviews use the same interval; busy native work only incurs a local check.
 
+Work review allows 65,536 output tokens and an eight-minute request deadline so
+`max` reasoning has room to finish its structured decision. This is within the
+provider's [documented output limit](https://api-docs.deepseek.com/quick_start/pricing/).
+An output-limit stop is rejected even if a tool result appears syntactically
+complete. The receipt records stop reason and token usage without retaining
+reasoning text. A review-protocol version change invalidates the earlier review
+key, allowing corrected reviewers to reassess a previously failed attempt.
+
 The host rechecks the exact task/input version, actual runtime and evidence
 after the model returns, under the same mutex used for new input and model
 switches. A changed input, unfinished tool, background terminal, missing evidence
