@@ -25,11 +25,12 @@ export class MindLoop {
     this.reviewRunning=true;
     try {
       for(let i=0;i<8&&!this.closed;i++) {
+        this.recordStatus?.({appraisalProgress:{state:'running',checkedAt:new Date().toISOString()}});
         const result=await this.call('review',{});
-        this.recordStatus?.({appraisal:result});
+        this.recordStatus?.({appraisal:result,appraisalProgress:{state:result.state,checkedAt:new Date().toISOString()}});
         if(result.state!=='complete')break;
       }
-    } catch {this.recordStatus?.({appraisal:{state:'failed',reason:'host-review-error'}});}
+    } catch {this.recordStatus?.({appraisal:{state:'failed',reason:'host-review-error'},appraisalProgress:{state:'failed',checkedAt:new Date().toISOString()}});}
     finally {this.reviewRunning=false;void this.tick();}
   }
   async tick() {
