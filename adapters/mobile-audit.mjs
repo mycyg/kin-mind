@@ -2,6 +2,15 @@ import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 import {atomicJson} from './mobile-router.mjs';
 
+export function appraisalProgress(operations, mind={}) {
+  const running=operations?.queues?.find(q=>q.lane==='action'&&q.state==='running'&&q.count>0);
+  if(running)return {state:'running',at:running.attempt_started_at??null,leaseExpiresUnix:running.lease_expires_unix??null};
+  const success=operations?.action?.last_success,progress=mind.appraisalProgress;
+  if(success&&(!progress?.checkedAt||Date.parse(progress.checkedAt)<=Date.parse(success)))return {state:'complete',at:success};
+  if(progress?.checkedAt)return {state:progress.state,at:progress.checkedAt};
+  return {state:'unknown',at:null,lastRecordedResult:mind.appraisal?.state??null};
+}
+
 /** Health reviews never change the conversation provider. Repair requests are
  * durable internal jobs which the shared conversation accepts when idle. */
 export class MobileAudit {

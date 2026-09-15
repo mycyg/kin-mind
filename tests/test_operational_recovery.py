@@ -79,6 +79,15 @@ class Provider:
                              "provider": "deepseek", "model": "deepseek-flash", "reasoning": "max", "request_id": "fixture"}
 
 
+def test_action_contract_excludes_unused_graph_schema():
+    from kin_mind.appraisal import appraisal_schema
+    full, action = appraisal_schema(), appraisal_schema(True)
+    assert action["properties"]["memory"]["additionalProperties"] is False
+    assert "MemoryAssessment" not in action["$defs"]
+    assert len(dumps(action)) < len(dumps(full))
+    assert {"values", "wishes", "next_review_minutes"} <= action["properties"].keys()
+
+
 def test_action_commits_and_enrichment_is_atomic_durable_separate(system):
     mind, memory, source, clock = system
     memory.configure({"operational_lanes": True})

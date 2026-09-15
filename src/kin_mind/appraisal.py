@@ -173,6 +173,32 @@ memory_context.recent_interaction 中提供且未标记 needs_review 的原始�
 """
 
 
+def appraisal_schema(operational=False):
+    schema = Appraisal.model_json_schema()
+    if not operational:
+        return schema
+    # The action lane has no graph-writing obligation. Do not ask a max
+    # reasoning model to plan fields which this transaction will not apply.
+    schema["properties"]["memory"] = {"type": "object", "properties": {}, "additionalProperties": False}
+    definitions = schema.pop("$defs", {})
+    used = set()
+    def visit(value):
+        if isinstance(value, dict):
+            ref = value.get("$ref", "")
+            if ref.startswith("#/$defs/") and ref[8:] not in used:
+                key = ref[8:]
+                used.add(key)
+                visit(definitions[key])
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(schema)
+    schema["$defs"] = {key: definitions[key] for key in sorted(used)}
+    return schema
+
+
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
     result = dict(context)
@@ -418,7 +444,7 @@ class DeepSeek:
                             {
                                 "name": "submit_appraisal",
                                 "description": "Submit a validated state proposal",
-                                "input_schema": Appraisal.model_json_schema(),
+                                "input_schema": appraisal_schema(context.get("operational_only", False)),
                             }
                         ],
                         "tool_choice": {"type": "auto"},
@@ -619,6 +645,8 @@ class Appraisals:
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=?", (child_id,))
+            data["attempt_started_at"] = self.mind.clock()
+            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
                 # The host's absolute worker deadline is request timeout + 60s;

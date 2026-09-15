@@ -3,7 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileAudit} from './mobile-audit.mjs';
+import {MobileAudit,appraisalProgress} from './mobile-audit.mjs';
+
+test('collection time cannot promote an old failed appraisal into a fresh failure',()=>{
+  const old={at:'2026-09-15T15:00:00Z',appraisal:{state:'failed'}};
+  assert.equal(appraisalProgress({},old).state,'unknown');
+  assert.equal(appraisalProgress({},old).at,null);
+  assert.equal(appraisalProgress({action:{last_success:'2026-09-15T14:59:00Z'}},old).state,'complete');
+  const current=appraisalProgress({queues:[{lane:'action',state:'running',count:1,attempt_started_at:'2026-09-15T14:58:00Z',lease_expires_unix:1789000000}]},old);
+  assert.equal(current.state,'running');
+  assert.equal(current.at,'2026-09-15T14:58:00Z');
+});
 
 test('four-hour review is durable and unchanged failures cannot create repair loops',async t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-audit-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));

@@ -77,6 +77,12 @@ enrichment progress, exploration and accepted contact records without messages
 or model reasoning. The native runtime separately reports execution, current
 model, task review and notification receipts.
 
+Queue availability, attempt start, lease expiry, last successful result and
+collection time are separate fields. A fresh collection does not turn an old
+failure into a new one, and an old queued job may have a newly started attempt.
+Unknown historical attempt times remain unknown. Action requests omit unused
+graph schema definitions as well as graph background.
+
 Mobile health review uses a 64K output ceiling and an eight-minute deadline.
 Failures retry after five, fifteen and then fifteen minutes; success restores
 the four-hour cycle. A fault identity survives changing timestamps. Host control
@@ -87,6 +93,9 @@ Deploy after synthetic tests and a private replay: back up the database and
 mutable host state, verify restoration, stop only verified owned idle processes,
 migrate once, then resume the same native conversation. Do not clear a live
 task lock manually. Record both the model review and actual switch/send receipts.
+An exclusive process file prevents duplicate starters from replacing the active
+PID; shutdown removes only the process's own file. Retired standalone channel
+failover services remain disabled when shared-session routing replaces them.
 Keep a four-hour observation spanning at least two autonomous decisions.
 The daily desktop fallback remains separate and proposes improvements for
 owner approval.
