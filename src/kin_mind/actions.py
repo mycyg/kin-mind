@@ -241,6 +241,8 @@ class ActionEvents:
             and not d["needs_review"]
             and not d.get("concern_needs_review")
         ]
+        with self.mind.engine.db.connect() as conn:
+            choices = [d for d in choices if not self.mind._action_review_pending(conn, d)]
         if view.get("action_policy"):
             choices = [
                 d

@@ -13,7 +13,8 @@ export class NativeContextDelivery {
   async deliver(context) {
     if(!context?.id)return {state:'skipped'};
     const runtime=await this.runtime();
-    if(!runtime.known||runtime.active||!runtime.rolloutPath||runtime.threadId!==context.session)throw Error('Context native boundary unverified');
+    if(!runtime.known||!runtime.rolloutPath||runtime.threadId!==context.session)throw Error('Context native boundary unverified');
+    if(runtime.active)return {state:'deferred',reason:'native-turn-active',id:context.id};
     for(const pending of await this.call('context-delivery-pending',{session:context.session})){
       const receipt=await this.reconcile(pending,runtime);
       if(receipt.state!=='accepted')return {state:'waiting',reason:'previous-context-unconfirmed',id:pending.id};

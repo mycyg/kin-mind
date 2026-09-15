@@ -42,7 +42,7 @@ export class MobileRouter {
     for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
-    for(const record of Object.values(this.state.inputs))if(record.state==='submitting')record.state='unconfirmed';
+    for(const record of Object.values(this.state.inputs)){if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';}
     if(this.state.transition?.state==='switching')this.state.transition.state='unconfirmed';
     this.save('startup');
   }
@@ -112,6 +112,7 @@ export class MobileRouter {
       if(previous) {
         if(previous.hash!==hash)throw Error('Input id reused with different content');
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
+        if(previous.state==='failed-before-submit'){previous.state='selected';this.save('input-preparation-retry',{id:input.id});}
         return clone(previous);
       }
       const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
@@ -119,7 +120,7 @@ export class MobileRouter {
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason;
+      let decision,reason,classifierUnconfirmed=false;
       if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
@@ -136,12 +137,14 @@ export class MobileRouter {
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
-        } catch {decision='work';reason='classifier-unconfirmed';}
+        } catch {decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;}
       }
       const intent=decision;
       // DeepSeek judges meaning; its answer never owns the execution lock.
       if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
-      const task=decision==='work'&&!command&&(intent==='work'||this.currentTask())?this.addTask(input):command?null:this.currentTask();
+      const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
+      if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
+      if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
       const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
@@ -196,16 +199,18 @@ export class MobileRouter {
             } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
           }
         } else this.state.actual=runtime;
-        if(target===ROUTER_MODELS.work&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.addTask(input).id;
+        if(target===ROUTER_MODELS.work&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
         if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
         if(input.kind==='proactive'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
-        record.state='submitting';record.model=target;this.save('input-submitting',{id:input.id});
+        record.state='preparing';record.model=target;this.save('input-preparing',{id:input.id});
+        const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
+        if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
         try {
-          const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null});
+          const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null},markSubmitted);
           if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
           record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
           return{route,model:target};
-        } catch {record.state='unconfirmed';this.save('input-unconfirmed',{id:input.id});throw Error('Input acceptance requires reconciliation');}
+        } catch(error) {record.state=record.submissionStartedAt?'unconfirmed':'failed-before-submit';record.failureStage=record.submissionStartedAt?'native-submit':'preparation';this.save('input-'+record.state,{id:input.id});throw Error(record.submissionStartedAt?'Input acceptance requires reconciliation':'Input preparation failed before native submission',{cause:error});}
       });
       if(outcome)return outcome;
       await this.waitForIdle();
@@ -240,7 +245,10 @@ export class MobileRouter {
       this.state.configRevision++;
       const result={state:'pending',mode:request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
         sourceInputId:request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id,notify:request.notify===true,at:this.now()};
-      for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto'].includes(prior.mode)){prior.state='superseded';prior.supersededBy=request.commandId;}
+      for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto'].includes(prior.mode)){
+        if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
+        prior.state='superseded';prior.supersededBy=request.commandId;
+      }
       this.state.requests[request.commandId]=result;this.save('mode-request',{commandId:request.commandId,mode:request.mode});
       return clone(result);
   }
@@ -316,13 +324,13 @@ export class MobileRouter {
   }
   queueNotice(key,kind,extra={}) {
     const id='kin-mode-'+digest([this.sessionId,key,kind]).slice(0,40);
-    this.state.notices[id]??={id,kind,state:'pending',createdAt:this.now(),...extra};return this.state.notices[id];
+    this.state.notices[id]??={id,kind,state:'pending',sourceInputId:this.state.inputs[key]?key:this.state.requests[key]?.sourceInputId,createdAt:this.now(),...extra};return this.state.notices[id];
   }
   modeApplied(request,runtime) {
     request.state='applied';request.appliedAt=this.now();
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
       sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id};
-    if(request.notify)this.queueNotice(request.commandId,'mode-applied',{requestId:request.commandId,target:runtime.model});
+    if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model});
   }
   acceptControl(record,runtime) {
     if(['work','auto'].includes(record.command)) {
@@ -330,7 +338,7 @@ export class MobileRouter {
       if(this.busy(runtime)||this.tasks().length)this.queueNotice(record.id,'mode-pending');
     } else if(record.command==='watch') {
       const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto'].includes(r.mode));
-      if(request){request.notify=true;this.queueNotice(record.id,'mode-pending',{requestId:request.commandId});}
+      if(request){request.notify=true;request.notificationSubscribers=[...new Set([...(request.notificationSubscribers??[]),record.id])];this.queueNotice(record.id,'mode-pending',{requestId:request.commandId});}
       else this.queueNotice(record.id,'status');
     } else this.queueNotice(record.id,'status');
   }
@@ -360,7 +368,7 @@ export class MobileRouter {
       });
       if(!notice)continue;
       let receipt;
-      try {receipt=notice.sendNow?await send({id,text:notice.text,kind:'runtime-status'}):await lookup(id);}
+      try {receipt=notice.sendNow?await send({id,text:notice.text,kind:'runtime-status',sourceInputId:notice.sourceInputId,notificationSubscribers:notice.subscriberIds??[]}):await lookup(id);}
       catch {receipt=await lookup(id).catch(()=>null);}
       await this.locked(async()=>{
         const n=this.state.notices[id];
@@ -379,8 +387,8 @@ export class MobileRouter {
       if(task&&open(task)) {
         if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();delete task.turnEndedAt;}
         if(kind==='prompt-end') {task.turnEndedAt=this.now();task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
-        if(kind==='tool')task.tools[data.id]={status:data.status??task.tools[data.id]?.status??'pending'};
-        if(kind==='delivery')task.deliveries[data.id]={state:data.state,messageId:data.messageId,at:this.now()};
+        if(kind==='tool')task.tools[data.id]={status:data.status??task.tools[data.id]?.status??'pending',...(data.reason?{reason:data.reason}: {})};
+        if(kind==='delivery')task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,at:this.now()};
       }
       this.save(kind);
     });

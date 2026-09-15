@@ -64,12 +64,12 @@ test('new owner input while DeepSeek is judging supersedes its completion decisi
   resolve(f.result());assert.equal((await pending).state,'superseded');assert.equal(f.router.currentTask().inputVersion,2);assert.equal(f.runtime.model,'gpt-6-astra');
 });
 
-test('changed source evidence, a new background tool, and failed tools cannot close work',async t=>{
+test('changed source evidence, a new background tool, cannot close work while terminal failures remain reviewable',async t=>{
   const f=await fixture(t);f.review.review=async()=>{f.evidence.input.inputs[0].text='Corrected actual work request';return f.result();};
   assert.equal((await f.review.tick()).state,'superseded');assert.equal(f.router.tasks().length,1);
   const g=await fixture(t);g.review.review=async()=>{g.runtime.backgroundTasks=1;return g.result();};
   assert.equal((await g.review.tick()).state,'waiting');assert.equal(g.router.tasks().length,1);
-  const h=await fixture(t);h.router.currentTask().tools.failed={status:'failed'};await h.review.tick();assert.equal(h.calls(),0);
+  const h=await fixture(t);h.router.currentTask().tools.failed={status:'failed'};await h.review.tick();assert.equal(h.calls(),1);
 });
 
 test('only a never-submitted superseded chat draft can be discarded with a not_a_task judgment',async t=>{
@@ -99,4 +99,21 @@ test('assistant completion proposal cannot bypass installed DeepSeek review',asy
   await f.router.reconcile();assert.equal(f.router.tasks().length,1);
   f.decision.disposition='keep';f.decision.remaining=['Actual requested result is missing'];
   assert.equal((await f.review.tick()).state,'kept');await f.router.reconcile();assert.equal(f.router.tasks().length,1);
+});
+
+test('replacement settlement is atomic with every delivery proof',async t=>{
+  const f=await fixture(t),task=f.router.currentTask();
+  f.decision.disposition='complete';
+  task.deliveries.upload={state:'unconfirmed'};
+  task.deliveries.other={state:'unconfirmed'};
+  f.evidence.receipts.upload={state:'not-submitted',fulfilledBy:[{messageId:'replacement',verified:true}]};
+  f.evidence.receipts.other={state:'unconfirmed'};
+  assert.equal((await f.review.tick()).reason,'delivery-unconfirmed');
+  assert.equal(task.deliveries.upload.state,'unconfirmed');
+  assert.equal(task.deliveries.upload.fulfilledBy,undefined);
+  f.evidence.receipts.other={state:'not-submitted',fulfilledBy:[{messageId:'another-replacement',verified:true}]};
+  f.advance(20*60000);
+  assert.equal((await f.review.tick()).state,'applied');
+  assert.equal(task.deliveries.upload.state,'not-submitted');
+  assert.equal(task.deliveries.upload.fulfilledBy[0].messageId,'replacement');
 });

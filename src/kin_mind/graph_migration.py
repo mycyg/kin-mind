@@ -24,8 +24,11 @@ class GraphMigration:
             row = conn.execute("SELECT cursor,data FROM mind_memory_migrations WHERE scope=? AND name=?", (self.scope.key(),name)).fetchone()
             cursor,data = (row[0],json.loads(row[1])) if row else (None,{})
         if data.get("job_id"):
-            if jobs.status(data["job_id"])["state"] != "complete":
+            job_state = jobs.status(data["job_id"])["state"]
+            if job_state not in {"complete", "needs-repair"}:
                 return {"state":"pending","job_id":data["job_id"]}
+            if job_state == "needs-repair":
+                data.setdefault("deferred_repairs", []).append(data["job_id"])
             cursor = data["through_seq"]
         sources, size, through = [], 0, cursor
         with self.engine.db.connect() as conn:
@@ -43,7 +46,7 @@ class GraphMigration:
                     break
                 sources.append(source_id);size+=cost;through=row["seq"]
         receipt=jobs.enqueue(list(dict.fromkeys(sources)),agent_version,origin="reflection",stimulus="memory-backfill") if sources else None
-        data={"through_seq":through or cursor,"job_id":receipt["id"] if receipt else None,"state":"pending" if rows else "complete"}
+        data={"deferred_repairs":data.get("deferred_repairs",[]),"through_seq":through or cursor,"job_id":receipt["id"] if receipt else None,"state":"pending" if rows else "complete"}
         with self.engine.db.connect(write=True) as conn:
             conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)",(self.scope.key(),name,through or cursor,dumps(data)))
         return data

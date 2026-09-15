@@ -4,7 +4,7 @@ import {atomicJson,ROUTER_MODELS} from './mobile-router.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({reviewPolicyVersion:3,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:4,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
 
 /** DeepSeek supplies the semantic judgment; the host owns execution and receipts.
  * Reviews run outside the router mutex and never take over a native user turn. */
@@ -19,33 +19,33 @@ export class WorkLockReview {
   }
   close(){this.closed=true;}
   save(attempt){this.state.attempts[attempt.id]=attempt;this.state.latest=attempt.id;atomicJson(this.file,this.state);fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify(attempt)+'\n',{mode:0o600});return attempt;}
-  view(){const a=this.state.attempts[this.state.latest];return a?{state:a.state,taskId:a.taskId,inputVersion:a.inputVersion,disposition:a.decision?.disposition,reason:a.reason??a.decision?.reason,model:a.receipt?.model,reasoning:a.receipt?.reasoning,verifiedAt:a.receipt?.verifiedAt,checkedAt:a.checkedAt,retryAt:a.retryAt}: {state:'not-needed'};}
+  view(){const a=this.state.attempts[this.state.latest];return a?{state:a.state,taskId:a.taskId,inputVersion:a.inputVersion,disposition:a.decision?.disposition,reason:a.reason??a.decision?.reason,model:a.receipt?.model,reasoning:a.receipt?.reasoning,verifiedAt:a.receipt?.verifiedAt,checkedAt:a.checkedAt,lastCheckAt:this.state.lastCheckAt??a.checkedAt,retryAt:a.retryAt??(a.checkedAt+this.retryMs)}: {state:'not-needed'};}
   blocked(task,runtime) {
     if(this.router.busy(runtime))return 'native-work-active-or-unknown';
     if(!this.router.verified(runtime,ROUTER_MODELS.work))return 'work-model-unverified';
     if(task.stopReason!=='end_turn'||!task.turnEndedAt)return 'native-turn-not-finished';
     if(this.now()-task.turnEndedAt<2000)return 'delivery-settling';
     if(task.handoff&&task.handoff.state!=='accepted')return 'handoff-not-settled';
-    if(Object.values(task.tools??{}).some(t=>t.status!=='completed'))return 'tool-not-completed';
-    if(task.inputIds.some(id=>this.router.state.inputs[id]?.state!=='accepted'))return 'input-not-confirmed';
+    if(Object.values(task.tools??{}).some(t=>!['completed','failed','canceled','cancelled'].includes(t.status)))return 'tool-not-terminal';
+    if(task.inputIds.some(id=>!['accepted','failed-before-submit','superseded-before-submit'].includes(this.router.state.inputs[id]?.state)))return 'input-not-confirmed';
     if(task.cancelRequested)return 'owner-cancel-pending';
     return null;
   }
   async tick() {
     if(this.closed||this.running)return {state:'busy'};
-    this.running=true;let attempt;
+    this.running=true;this.state.lastCheckAt=this.now();let attempt;
     try {
       const snapshot=await this.router.locked(async()=>{
         const task=this.router.currentTask();
         if(!task||task.requiresDelivery===false)return null;
         const runtime=await this.router.inspect(),reason=this.blocked(task,runtime);
-        return {task:copy(task),inputs:task.inputIds.map(id=>copy(this.router.state.inputs[id])),key:fingerprint(this.router,task),reason};
+        return {task:copy(task),inputs:[...task.inputIds,...(task.contextInputIds??[])].map(id=>copy(this.router.state.inputs[id])),key:fingerprint(this.router,task),reason};
       });
       if(!snapshot)return {state:'not-needed'};
       const id='work-review-'+snapshot.key;
       const previous=this.state.attempts[id];
       if(snapshot.reason){
-        if(previous?.state==='waiting'&&previous.reason===snapshot.reason)return previous;
+        if(previous?.state==='waiting'&&previous.reason===snapshot.reason){this.state.lastCheckAt=this.now();atomicJson(this.file,this.state);return previous;}
         return this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,state:'waiting',reason:snapshot.reason,checkedAt:this.now()});
       }
       if(previous&&(previous.state==='applied'||previous.retryAt>this.now()))return previous;
@@ -55,7 +55,7 @@ export class WorkLockReview {
       if(JSON.stringify(evidence.input).length>64000||snapshot.inputs.length>128)return this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,state:'waiting',reason:'review-context-needs-summary',checkedAt:this.now()});
       attempt=this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',checkedAt:this.now(),attempts:(previous?.attempts??0)+1});
       const result=await this.review(evidence.input),d=result.decision;
-      const inputIds=new Set(snapshot.task.inputIds),discardable=new Set((evidence.input.cancellableDeferred??[]).map(x=>x.id));
+      const inputIds=new Set([...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])]),discardable=new Set((evidence.input.cancellableDeferred??[]).map(x=>x.id));
       // Retain the structured proposal even when its references fail validation.
       // This audit never contains model text/thinking blocks.
       attempt=this.save({...attempt,decision:d,receipt:result.receipt,state:'received',decisionVerified:false});
@@ -78,10 +78,15 @@ export class WorkLockReview {
         if(hash(fresh)!==attempt.evidenceHash)return this.save({...attempt,state:'superseded',reason:'evidence-changed-during-review',retryAt:this.now()});
         const changedRuntime=this.blocked(task,await this.router.inspect());
         if(changedRuntime)return this.save({...attempt,state:'waiting',reason:changedRuntime,retryAt:this.now()+this.retryMs});
-        const canceled=[];
+        const canceled=[],replacements=[];
         for(const [deliveryId,delivery] of Object.entries(task.deliveries??{})) {
           const proof=fresh.receipts?.[deliveryId];
           if(delivery.state==='accepted'&&delivery.messageId&&proof?.state==='accepted'&&proof.messageId===delivery.messageId)continue;
+          // Failed upload attempts are terminal. An independently verified
+          // replacement must satisfy the same artifact before work can close.
+          if(proof?.state==='not-submitted'&&proof.fulfilledBy?.length&&proof.fulfilledBy.every(p=>p.messageId&&p.verified)){
+            replacements.push([deliveryId,proof.fulfilledBy]);continue;
+          }
           if(d.disposition!=='not_a_task'||!d.discardDraftIds.includes(deliveryId)||proof?.state!=='not-submitted')return this.save({...attempt,state:'waiting',reason:'delivery-unconfirmed',retryAt:this.now()+this.retryMs});
           canceled.push(deliveryId);
         }
@@ -93,6 +98,7 @@ export class WorkLockReview {
         }
         const finalBlock=this.blocked(task,await this.router.inspect());
         if(finalBlock){this.router.save('work-review-held',{taskId:task.id,reason:finalBlock});return this.save({...attempt,state:'waiting',reason:finalBlock,retryAt:this.now()+this.retryMs});}
+        for(const [deliveryId,fulfilledBy] of replacements)Object.assign(task.deliveries[deliveryId],{state:'not-submitted',fulfilledBy,workReviewId:id});
         task.status=d.disposition==='not_a_task'?'canceled':'completed';
         task.completedAt=this.now();task.workReview={id,disposition:d.disposition,reason:d.reason,evidenceIds:d.evidenceIds,receipt:result.receipt,inputVersion:task.inputVersion,canceledDraftIds:canceled};
         this.router.save('work-reviewed',{taskId:task.id,reviewId:id,disposition:d.disposition});

@@ -57,8 +57,8 @@ export class MemoryEventJournal {
   }
 }
 export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,artifact}={}) {
-  const state=record.state==='accepted'?'accepted':record.state==='unconfirmed'?'unconfirmed':'prepared';
-  const at=state==='accepted'?record.acceptedAt:state==='unconfirmed'?record.checkedAt:record.attemptedAt;
+  const state=record.state==='accepted'?'accepted':record.state==='unconfirmed'?'unconfirmed':record.state==='not-submitted'?'canceled':'prepared';
+  const at=state==='accepted'?record.acceptedAt:['unconfirmed','canceled'].includes(state)?record.checkedAt:record.attemptedAt;
   if(!at)throw Error('Delivery observation needs the persisted receipt timestamp');
   return {id:`delivery:${channel}:${record.id}:${state}`,kind:'delivery',at,
     channel,delivery_id:batchId??record.memoryBatchId??record.id,bubble_id:record.id,

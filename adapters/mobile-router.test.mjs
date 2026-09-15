@@ -12,12 +12,48 @@ function fixture(t, options={}) {
   const runtime={known:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',model:'gpt-6-astra',active:false,backgroundTasks:0,queued:0,pendingDeliveries:0};
   const switched=[];
   const args={file:path.join(root,'state.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),
-    classify:async({text})=>{classificationCalls++;const control={'现在是什么模型':'status','切过去给我说一声哦😯':'watch','退出正经模式':'auto','进入正经模式':'work'}[text];return control?{route:'control',control,reason:'synthetic semantic result'}:{route:text.includes('code')?'work':'chat',reason:'synthetic'};},
+    classify:async({text})=>{classificationCalls++;const control={'现在是什么模型':'status','切过去给我说一声哦😯':'watch','退出正经模式':'auto','进入正经模式':'work'}[text];return control?{route:'control',control,reason:'synthetic semantic result'}:{route:/code|test/.test(text)?'work':'chat',reason:'synthetic'};},
     switchModel:async model=>{switched.push(model);runtime.model=model;return{...runtime};},
     waitForIdle:async()=>{throw Error('waiting');},now:()=>++now,...options};
   const router=new MobileRouter(args);
   return{router,runtime,switched,args,classificationCalls:()=>classificationCalls};
 }
+
+test('casual and unknown follow-ups preserve completion while execution remains GPT',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const task=f.router.currentTask();
+  await f.router.requestMode({commandId:'finish',mode:'auto',reason:'delivered',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  const completion=structuredClone(task.completion),version=task.inputVersion;
+  await f.router.dispatch({id:'chat',text:'haha'},async()=> 'steered');
+  f.router.classify=async()=>{throw Error('classification timeout');};
+  await f.router.dispatch({id:'unknown',text:'How is the switch?'},async()=> 'new-turn');
+  assert.equal(task.inputVersion,version);assert.deepEqual(task.completion,completion);
+  assert.equal(f.runtime.model,'gpt-6-astra');assert.deepEqual(task.contextInputIds,['chat','unknown']);
+});
+
+test('pre-submit errors can retry once, post-submit ambiguity never replays',async t=>{
+  const f=fixture(t);const input={id:'one',text:'write code',submissionProtocol:'host-boundary-v1'};
+  await assert.rejects(()=>f.router.dispatch(input,async()=>{throw Error('optional restore failed');}),/before native/);
+  assert.equal(f.router.state.inputs.one.state,'failed-before-submit');
+  let calls=0;
+  await f.router.dispatch(input,async(_,started)=>{started();calls++;return 'new-turn';});
+  await f.router.dispatch(input,async()=>assert.fail('duplicate'));
+  assert.equal(calls,1);
+  await assert.rejects(()=>f.router.dispatch({...input,id:'two'},async(_,started)=>{started();throw Error('lost receipt');}),/reconciliation/);
+  await assert.rejects(()=>f.router.dispatch({...input,id:'two'},async()=>assert.fail('ambiguous retry')),/reconciliation/);
+});
+
+test('internal completion preserves an owner switch notification across restart',async t=>{
+  const f=fixture(t);
+  await f.router.requestMode({commandId:'owner-request',mode:'auto',reason:'Switch and tell me',notify:true});
+  await f.router.requestMode({commandId:'host-finished',mode:'auto',reason:'Work verified',notify:false});
+  const restored=new MobileRouter(f.args);
+  await restored.applyPendingMode();
+  let sends=0;
+  await restored.flushNotices({send:async()=>{sends++;return{state:'accepted',messageId:'notice'};},lookup:async()=>null});
+  await restored.flushNotices({send:async()=>assert.fail('replayed'),lookup:async()=>null});
+  assert.equal(sends,1);assert.equal(f.runtime.model,'deepseek-flash');assert.equal(restored.sessionId,'synthetic');
+});
 
 test('internal outreach defers for work and never switches an active provider',async t=>{
   const f=fixture(t);await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');

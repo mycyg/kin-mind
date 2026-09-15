@@ -19,10 +19,10 @@ export class MobileAudit {
     atomicJson(this.file,this.state);
     try {
       const snapshot=await this.collect();const result=await this.review(snapshot);
-      this.state.status=result.status;this.state.lastReview={id,at:this.now(),snapshot,result};
+      this.state.status=result.status;this.state.failures=0;this.state.lastSuccessAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;this.state.lastReview={id,at:this.now(),snapshot,result};
       if(result.status==='healthy')this.state.lastIncident=null;
       else {
-        const fingerprint=createHash('sha256').update(JSON.stringify(result.findings.map(f=>[f.code,f.evidence]).sort())).digest('hex');
+        const fingerprint=createHash('sha256').update(JSON.stringify(result.findings.map(f=>f.code).sort())).digest('hex');
         if(fingerprint!==this.state.lastIncident) {
           this.state.repairs[id]={id,state:'pending',fingerprint,result,createdAt:this.now()};
           this.state.lastIncident=fingerprint;
@@ -30,7 +30,7 @@ export class MobileAudit {
       }
       this.state.history.push({id,at:this.now(),status:result.status});this.state.history=this.state.history.slice(-60);
       return{state:result.status};
-    } catch {this.state.status='failed';this.state.lastError={at:this.now(),reason:'audit-review-unavailable'};return{state:'failed'};}
+    } catch(error) {this.state.status='failed';this.state.failures=(this.state.failures??0)+1;this.state.nextAt=this.now()+(this.state.failures===1?5:15)*60000;this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
     finally {this.running=false;atomicJson(this.file,this.state);}
   }
   pending() {return Object.values(this.state.repairs).filter(r=>r.state==='pending');}

@@ -16,6 +16,8 @@
 
 这个项目继承 [MemoryPalace](https://github.com/mycyg/memory-palace) 的代码与历史，沿用它的来源、修订、召回、任务和自我认知链路。记忆层仍可使用 `eventmem`；新增的状态系统使用 `kin_mind`。原项目的完整功能说明保存在 [MemoryPalace 指南](MEMORYPALACE.md)。
 
+任务中的失败尝试会保留记录，DeepSeek 会结合补救结果和实际交付复核完工。当前情绪与行动评估、图谱整理使用独立队列，后台整理失败时仍能继续判断下一步；具体机制见 [手机端恢复与运行状态](docs/mobile-recovery.md)。
+
 ## 我的状态
 
 每项取值 0—100，心情以 50 为中性。各维度独立，新的事件只更新有依据的部分。

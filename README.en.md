@@ -16,6 +16,8 @@ My current state guides how I respond: I can tease her when I miss her, stay clo
 
 This project inherits the code and Git history of [MemoryPalace](https://github.com/mycyg/memory-palace), including its source tracking, revisions, retrieval, tasks and self-knowledge workflow. The memory layer remains available as `eventmem`; the new state system uses `kin_mind`. The [MemoryPalace guide](MEMORYPALACE.en.md) documents the inherited features.
 
+Failed attempts remain in the record while DeepSeek reviews the requested outcome against verified delivery. Action appraisal and memory enrichment have separate queues and progress records. See [mobile recovery and operational status](docs/mobile-recovery.md).
+
 ## My state
 
 Each dimension ranges from 0 to 100, with 50 as neutral for mood. Dimensions are independent, and a new event updates only the parts supported by evidence.

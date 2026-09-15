@@ -23,3 +23,13 @@ test('healthy reviews remain quiet; review failure does not retry every minute',
   now+=4*3600000;await audit.tick();assert.equal(audit.state.status,'failed');
   now+=60000;await audit.tick();assert.equal(calls,2);
 });
+
+test('failed audits retry at five then fifteen minutes and return to four hours',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-audit-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  let now=0,calls=0;
+  const a=new MobileAudit({file:path.join(root,'audit.json'),now:()=>now,collect:async()=>({}),
+    review:async()=>{if(++calls<3)throw Error('incomplete');return{status:'healthy',findings:[]};}});
+  await a.tick();assert.equal(a.state.nextAt,300000);
+  now=300000;await a.tick();assert.equal(a.state.nextAt,now+900000);
+  now=a.state.nextAt;await a.tick();assert.equal(a.state.nextAt,now+14400000);assert.equal(a.state.failures,0);
+});

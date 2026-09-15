@@ -164,7 +164,7 @@ memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新�
 
 SYSTEM += """
 事件图谱的候选在memory_context.graph_candidates。memory.graph.nodes保存event/thread/entity/finding/association；相同事情优先引用已有id与expected_revision，新记录用本批key。短时间相邻只是候选，按明确内容和来源关联，不强行串联。参与角色在memory.graph.edges.role中描述，人物身份与事件角色分别保存。
-关系使用participates/part_of/continues/responds_to/produces/delivers/shares/corrects/resolves/supports/refutes/causes/association/follows/about/related。发生先后用follows；因果需单独依据。主观联想为internal_thought和association，不当作已发生事实。每条关系给出evidence_ids与简短reason，公开判断不含推理轨迹。
+关系使用participates/part_of/continues/responds_to/produces/delivers/shares/corrects/resolves/supports/refutes/causes/association/follows/about/related。发生先后用follows；因果需单独依据。主观联想为internal_thought和association，不当作已发生事实。每条关系给出evidence_ids与简短reason，公开判断不含推理轨迹。graph.nodes和graph.edges的basis只用explicit、documented、inferred、internal_thought；工具记录依据写documented，自己的猜测写inferred。例如 {"subject":"existing_event_id","object":"existing_work_id","relation":"produces","basis":"documented","evidence_ids":["provided_source_id"],"reason":"工具回执证明生成此作品"}。
 探索结果已拆为稳定finding编号与content_version。memory.coverage.mappings将share_id中的实际bubble_id关联到具体unit_id/version；仅覆盖正文确实讲到的内容，文件交付不能覆盖报告所有发现。confidence不足时保留待核对。改写同一发现仍属于旧内容；development/reflection/reminiscence/retelling写明与上次分享的关系。普通回复也计入分享，分享决定不是发送回执。
 历史回填只补关联和覆盖；助手自己的安排不会变成用户偏好，旧经历不重复增加状态和愿望。
 聊天中的明确偏好可以更新habits，expected_revision使用memory_context.conversation_habits.revision。preferences支持exploration_frequency（完整短句）、exploration_directions（方向列表）、exploration_min_interval_minutes（用户明确指定的最小间隔，默认0）、exploration_paused、reply_choice（always/autonomous）。evidence_ids只引用用户明确发言；自己的安排不成为用户要求。频率和方向影响后续选题及curiosity动力，按当前偏好调整本轮target和half_life。泛泛说少探索些可记录自然语言偏好，无需编造固定间隔。
@@ -204,7 +204,7 @@ def appraisal_context(context):
     if not isinstance(context.get("state"), dict):
         return result
     original = context["state"]
-    if context.get("stimulus") == "memory-backfill":
+    if context.get("stimulus") in {"memory-backfill", "memory-enrichment"}:
         # Backfill interprets recorded history; current mood and the complete
         # wish inventory are neither evidence for it nor targets of this pass.
         result["state"] = {k: original[k] for k in ("scope", "agent_version", "revision", "persona_contract") if k in original}
@@ -412,7 +412,7 @@ class DeepSeek:
                     json={
                         "model": self.model,
                         "max_tokens": 131072,
-                        "system": SYSTEM + SESSION_ADVICE_PROMPT + persona_prompt(policy),
+                        "system": SYSTEM + SESSION_ADVICE_PROMPT + persona_prompt(policy) + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else ""),
                         "messages": [{"role": "user", "content": dumps(request_context)}],
                         "tools": [
                             {
@@ -440,7 +440,20 @@ class DeepSeek:
             ]
             if len(calls) != 1:
                 raise RuntimeError("deepseek-missing-structured-result")
-            proposal = Appraisal.model_validate(calls[0]["input"])
+            raw_proposal = calls[0]["input"]
+            if context.get("operational_only"):
+                raw_proposal = {**raw_proposal, "memory": {}}
+            try:
+                proposal = Appraisal.model_validate(raw_proposal)
+            except ValidationError as error:
+                # One bounded schema repair, using structured judgments only.
+                if context.get("stimulus") not in {"memory-enrichment", "memory-backfill"}:
+                    raise
+                issues = [{"loc": list(e["loc"]), "type": e["type"]} for e in error.errors(include_input=False)]
+                fixed, _ = self.structured("repair_appraisal", Appraisal,
+                    "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning.",
+                    {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
+                proposal = Appraisal.model_validate(fixed)
             return proposal, {
                 "provider": "deepseek",
                 "model": body["model"],
@@ -549,25 +562,35 @@ class Appraisals:
         ]
         return clean[0] if job_id and clean else clean
 
-    def run_one(self, provider):
-        semantic_enabled = self.memory.settings()["semantic"]
+    def run_one(self, provider, *, lane=None):
+        settings = self.memory.settings()
+        semantic_enabled = settings["semantic"]
+        lanes = settings["operational_lanes"]
+        if lane not in {None, "action", "enrichment"}:
+            raise ValueError("Unknown appraisal lane")
+        lane_filter = ""
+        if lanes and lane:
+            lane_filter = " AND COALESCE(json_extract(data,'$.stimulus'),'') " + ("IN" if lane == "enrichment" else "NOT IN") + " ('memory-backfill','memory-enrichment')"
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute(
-                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?)) ORDER BY CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN -1 WHEN json_extract(data,'$.stimulus')='memory-backfill' THEN 1 ELSE 0 END,available LIMIT 1",
+                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + " ORDER BY CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN -1 WHEN json_extract(data,'$.stimulus')='idle-review' THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time()),
             ).fetchone()
             if not row:
                 return {"state": "idle"}
             data = json.loads(row["data"])
             maintenance = data.get("stimulus") == "session-maintenance"
+            enrichment = data.get("stimulus") in {"memory-backfill", "memory-enrichment"}
+            operational = lanes and not maintenance and not enrichment
+            historical = enrichment
             # Operational judgments do not change affect or wishes. With
             # dependency-aware commits they may inspect the native window
             # while a long memory batch is being compressed. Each lane retains
             # one durable lease; all writes still use the same transaction.
             if conn.execute(
                 "SELECT 1 FROM mind_appraisals WHERE scope=? AND state='running' AND lease>=? "
-                "AND (?=0 OR CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN 1 ELSE 0 END=?)",
-                (self.mind.scope.key(), time.time(), int(semantic_enabled), int(maintenance)),
+                "AND (?=0 OR CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN 1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 2 ELSE 0 END=?)",
+                (self.mind.scope.key(), time.time(), int(semantic_enabled), 1 if maintenance else 2 if enrichment else 0),
             ).fetchone():
                 return {"state": "busy"}
             if semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}:
@@ -626,9 +649,9 @@ class Appraisals:
                 view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
                 maintenance = data.get("stimulus") == "session-maintenance"
-                memory_context = self.memory.semantic_context() if semantic_enabled and not maintenance else None
-                historical = data.get("stimulus") == "memory-backfill"
-                if memory_context and historical:
+                memory_context = data.get("frozen_memory_context") or ((self.memory.semantic_context(event_limit=0, operational=True) if operational else self.memory.semantic_context()) if semantic_enabled and not maintenance else None)
+                historical = data.get("stimulus") in {"memory-backfill", "memory-enrichment"}
+                if memory_context and historical and not data.get("frozen_memory_context"):
                     memory_context["through_seq"] = memory_context["cursor"]
                     memory_context["pending_events"] = []
                     with self.engine.db.connect() as conn:
@@ -643,7 +666,7 @@ class Appraisals:
                             if node["kind"] in {"finding", "exploration", "work"}:
                                 node["share_coverage"] = self.memory.sharing.coverage(conn, node["id"])
                         memory_context["graph_candidates"] = graph
-                if memory_context:
+                if memory_context and not data.get("frozen_memory_context"):
                     # The source cursor advances only across events actually given
                     # to this evaluation; out-of-window history remains pending.
                     extra = [e["source_id"] for e in memory_context["pending_events"]]
@@ -655,6 +678,10 @@ class Appraisals:
                     else:
                         memory_context["through_seq"] = memory_context["cursor"]
                         memory_context["pending_events"] = []
+                if lanes and memory_context and not data.get("frozen_memory_context"):
+                    data["frozen_memory_context"] = memory_context
+                    with self.engine.db.connect(write=True) as conn:
+                        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 with self.engine.db.connect() as conn:
                     refs = self.mind._evidence(conn, data["evidence_ids"])
                     if not self.mind._fresh(conn, refs):
@@ -671,7 +698,7 @@ class Appraisals:
                             ).read_text(),
                         }
                     )
-                model_context = {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus")}
+                model_context = {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus"), "operational_only": operational}
                 if self.session_context and not historical:
                     model_context["session_context"] = self.session_context
                 if maintenance:
@@ -701,7 +728,18 @@ class Appraisals:
                             if not node.get("needs_review") and self.memory._fresh(conn, node):
                                 for ref in self.mind._evidence(conn, self.memory._record_ids(conn, node["id"])):
                                     semantic_refs[ref["record_id"]] = ref
-                proposal, receipt = provider.appraise(model_context)
+                if data.get("stimulus") == "memory-enrichment" and data.get("seed_memory") and not data.get("seed_rejected"):
+                    try:
+                        proposal = Appraisal(reason="Reuse verified semantic result", memory=MemoryAssessment.model_validate(data["seed_memory"]))
+                        receipt = data["seed_receipt"]
+                    except ValidationError:
+                        data["seed_rejected"] = True
+                        proposal, receipt = provider.appraise(model_context)
+                else:
+                    proposal, receipt = provider.appraise(model_context)
+                deferred_memory = proposal.memory.model_dump() if operational else None
+                if operational:
+                    proposal = proposal.model_copy(update={"memory": MemoryAssessment()})
                 if maintenance and proposal.session_advice is None:
                     raise RuntimeError("deepseek-missing-session-advice")
                 if historical:
@@ -829,7 +867,17 @@ class Appraisals:
                             eid,
                         )
                         state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
-                    if memory_context:
+                    if operational:
+                        self.memory.commit_action(conn, roots, eid, 20 if new_interaction else proposal.next_review_minutes, receipt)
+                        # Enrichment uses the same original sources but a separate
+                        # id/lease. Its durable job is atomic with the action result.
+                        enrichment_id = "enrich_" + digest([row["id"], "memory-v1"])[:32]
+                        enrichment_data = {"evidence_ids": data["evidence_ids"], "agent_version": effective_version,
+                            "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
+                            "seed_memory": deferred_memory if deferred_memory != MemoryAssessment().model_dump() else None, "seed_receipt": receipt}
+                        conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                            (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
+                    elif memory_context:
                         # A later bubble may extend the same share while DS runs.
                         # Keep that share pending for the next batch; independent
                         # records and affect can commit without redoing the call.
@@ -869,7 +917,13 @@ class Appraisals:
             )
             if isinstance(error, Missing):
                 data["missing_reference"] = str(error) if re.fullmatch(r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}", str(error)) else "unresolved-reference"
-            state = "pending"
+            if lanes and historical and row["attempts"] >= 1:
+                state = "needs-repair"
+                data["repair_reason"] = data["error"]
+            else:
+                state = "pending"
+            if lanes and isinstance(error, Conflict):
+                data.pop("frozen_memory_context", None)
         with self.engine.db.connect(write=True) as conn:
             conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,data=? WHERE id=?",

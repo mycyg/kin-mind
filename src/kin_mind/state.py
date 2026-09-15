@@ -1054,6 +1054,7 @@ class Mind(Continuity):
                     "state": active["state"],
                     "owner_epoch": json.loads(active["data"])["owner_epoch"],
                 }
+
             if self._action_review_pending(conn):
                 return {"eligible": False, "reason": "action-appraisal-pending"}
             if view["dimensions"]["initiative"]["needs_review"]:
@@ -1061,7 +1062,7 @@ class Mind(Continuity):
             if view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
                 return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
-                d for d in view["desires"] if self._desire_ready(conn, d, self.clock())
+                d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
             ]
             if not ready:
                 return {"eligible": False, "reason": "no-actionable-desire", "waiting_desires": waiting}
@@ -1086,12 +1087,13 @@ class Mind(Continuity):
             ).fetchone()
             if existing:
                 raise Conflict("An unresolved contact attempt already exists")
+
             if self._action_review_pending(conn):
                 raise Conflict("Action appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
             ready = [
-                d for d in view["desires"] if self._desire_ready(conn, d, self.clock())
+                d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
             ]
             if (
                 not ready
@@ -1170,8 +1172,21 @@ class Mind(Continuity):
             raise Missing("Contact attempt is outside this scope or missing")
         return json.loads(row[0])
 
-    def _action_review_pending(self, conn):
-        return bool(conn.execute("SELECT 1 FROM mind_action_events WHERE scope=? AND state IN ('pending','queued') LIMIT 1", (self.scope.key(),)).fetchone())
+    def _action_review_pending(self, conn, desire=None):
+        rows = conn.execute("SELECT kind,data FROM mind_action_events WHERE scope=? AND state IN ('pending','queued')", (self.scope.key(),)).fetchall()
+        config = conn.execute("SELECT data FROM mind_memory_config WHERE scope=?", (self.scope.key(),)).fetchone() if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_memory_config'").fetchone() else None
+        if not (config and json.loads(config[0]).get("operational_lanes")):
+            return bool(rows)
+        # A timer or another idea does not revoke a verified intent. Explicit
+        # intent/source dependencies still hold it until their review completes.
+        if not desire:
+            return False
+        refs = {v for r in desire.get("evidence", []) for v in (r["record_id"], r["source_id"])}
+        for row in rows:
+            data = json.loads(row["data"])
+            if data.get("desire_id") == desire["id"] or refs.intersection(data.get("invalidated_source_ids", [])):
+                return True
+        return False
 
     def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, partial=False, canceled_bubbles=0, aborted_before_send=False):
         decision = ContactDecision.model_validate(decision) if decision is not None else None

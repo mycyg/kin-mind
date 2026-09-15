@@ -8,22 +8,50 @@ const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('h
 
 /** Owner-bound evidence readers are injected by the private host. No model
  * is allowed to supply a filesystem path, recipient or delivery receipt. */
-export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare}) {
+export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement}) {
   const deferredFile=id=>path.join(deferredDirectory,createHash('sha256').update(id).digest('hex')+'.pending.json');
   const outbox=id=>read(path.join(outboxDirectory,id+'.json'));
   const deferredView=entry=>entry?{state:entry.state,request:entry.request,delivery:entry.delivery,ownerEpoch:entry.ownerEpoch}:null;
   async function collect(snapshot) {
-    const ids=snapshot.task.inputIds;
+    const ids=[...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])];
+    const allMessages=fs.existsSync(outboxDirectory)?fs.readdirSync(outboxDirectory).filter(f=>f.endsWith('.json')).map(f=>read(path.join(outboxDirectory,f))).filter(Boolean):[];
+    const byMessage=new Map(allMessages.filter(r=>r.state==='accepted'&&r.messageId).map(r=>[r.messageId,r]));
+    const acceptedFiles=Object.values(snapshot.task.deliveries??{}).filter(d=>d.state==='accepted'&&d.messageId)
+      .map(d=>byMessage.get(d.messageId)).filter(r=>r?.artifact);
     const inputs=ids.map(id=>{
       if(!/^[\w:-]+$/.test(id))throw Error('Invalid host input id');
-      const source=read(path.join(inputDirectory,id+'.json'));
-      if(!source||source.id!==id||source.canonicalSessionId!==sessionId||!source.senderId||typeof source.text!=='string')throw Error('Authenticated input missing');
+      let source=read(path.join(inputDirectory,id+'.json'));
       const route=snapshot.inputs.find(x=>x.id===id);
-      return{id,text:source.text,createdAt:source.createdAt,sourceHash:digest(source),classification:route?.reason,kind:route?.kind};
+      if(!source&&failedInputDirectory&&route?.state==='failed-before-submit') {
+        const failed=read(path.join(failedInputDirectory,id+'.json'));
+        try{source=typeof failed?.raw==='string'?JSON.parse(failed.raw):failed?.raw;}catch{}
+      }
+      if(!source||source.id!==id||source.canonicalSessionId!==sessionId||!source.senderId||typeof source.text!=='string')throw Error('Authenticated input missing');
+      return{id,text:source.text,createdAt:source.createdAt,sourceHash:digest(source),classification:route?.reason,kind:route?.kind,workRequirement:snapshot.task.inputIds.includes(id),submissionState:route?.state};
     });
     const receipts={},outputs=[],cancellableDeferred=[],deferredProofs={};
     for(const [id,delivery] of Object.entries(snapshot.task.deliveries??{})) {
-      const message=outbox(id);
+      const reconciliation=reconciliationFile?read(reconciliationFile)?.deliveries?.[id]:null;
+      const message=outbox(delivery.outboxId??reconciliation?.attemptId??id)??byMessage.get(delivery.messageId);
+      if(reconciliation&&verifyReplacement) {
+        const proof=await verifyReplacement(reconciliation,message);
+        if(proof?.state==='not-submitted'&&proof.fulfilledBy?.length) {
+          receipts[id]=proof;outputs.push({id,failedAttempt:message?.media,replacement:proof,receivedByServer:false});continue;
+        }
+      }
+      if(message?.stage==='upload-failed'&&message.submissionStarted===false&&verifyReplacement) {
+        const groups=new Map();
+        for(const item of acceptedFiles){
+          const match=/^(.*)\.(\d{3})$/.exec(item.media?.name??'');
+          if(match){const list=groups.get(match[1])??[];list.push({record:item,part:Number(match[2])});groups.set(match[1],list);}
+        }
+        const candidates=[...acceptedFiles.map(r=>[r.id]),...([...groups.values()].map(parts=>{
+          parts.sort((a,b)=>a.part-b.part);return parts.every((p,i)=>p.part===i+1)?parts.map(p=>p.record.id):[];
+        }).filter(g=>g.length))];
+        let proof;
+        for(const replacementIds of candidates){try{proof=await verifyReplacement({attemptId:message.id,replacementIds},message);break;}catch{/* Other artifacts are not equivalent evidence. */}}
+        if(proof?.fulfilledBy?.length){receipts[id]=proof;outputs.push({id,failedAttempt:message.media,replacement:proof,receivedByServer:false});continue;}
+      }
       if(message?.state==='accepted'&&message.messageId&&message.messageId===delivery.messageId) {
         receipts[id]={state:'accepted',messageId:message.messageId,sourceHash:digest(message)};
         outputs.push({id,text:message.text??'',file:message.media?{type:message.media.type,name:message.media.name}:null,receivedByServer:true});
@@ -43,7 +71,10 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
     const reply=await lastReply();
     const background=(await wishes()).filter(w=>w.kind==='explore'&&['wanted','waiting','in_progress'].includes(w.status)&&!w.expired&&!w.needs_review)
       .map(w=>({id:w.id,kind:w.kind,status:w.status,topic:w.topic,content:w.content,sourceInputIds:(w.evidence??[]).map(e=>e.source_key).filter(id=>ids.includes(id))})).filter(w=>w.sourceInputIds.length);
-    return {input:{task:{id:snapshot.task.id,inputVersion:snapshot.task.inputVersion,summary:snapshot.task.summary,completionProposal:snapshot.task.completion??null,stopReason:snapshot.task.stopReason,tools:snapshot.task.tools},inputs,outputs,
+    const toolEntries=Object.entries(snapshot.task.tools??{});
+    return {input:{task:{id:snapshot.task.id,inputVersion:snapshot.task.inputVersion,summary:snapshot.task.summary,completionProposal:snapshot.task.completion??null,stopReason:snapshot.task.stopReason,
+      toolSummary:{total:toolEntries.length,completed:toolEntries.filter(([,t])=>t.status==='completed').length},
+      tools:Object.fromEntries(toolEntries.filter(([,t])=>t.status!=='completed'))},inputs,outputs,
       lastPublicReply:reply?{text:reply.text,status:reply.status,turnId:reply.turnId}:null,
       backgroundWishes:background,cancellableDeferred},receipts,deferredProofs};
   }

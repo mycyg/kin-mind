@@ -507,7 +507,7 @@ def test_minute_review_queues_authorized_exploration_once(setup, tmp_path, monke
     monkeypatch.setattr(host, "Engine", lambda root: mind.engine)
     monkeypatch.setattr(host, "Mind", lambda engine, scope: mind)
     monkeypatch.setattr(host.DeepSeek, "from_engine", lambda engine: None)
-    monkeypatch.setattr(host.Appraisals, "run_one", lambda self, provider: {"state": "idle"})
+    monkeypatch.setattr(host.Appraisals, "run_one", lambda self, provider, *, lane: {"state": "idle"} if lane == "action" else {"state": "wrong-lane"})
     config = {"root": str(tmp_path), "scope": mind.scope.model_dump(),
               "exploration_stop_file": str(tmp_path / "stop")}
     wish(mind, source, "reviewed-question", kind="explore")

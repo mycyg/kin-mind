@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS mind_semantic_cursor(
 CREATE TABLE IF NOT EXISTS mind_semantic_sources(
  scope TEXT NOT NULL,source_id TEXT NOT NULL,event_id TEXT NOT NULL,
  PRIMARY KEY(scope,source_id));
+CREATE TABLE IF NOT EXISTS mind_action_schedule(
+ scope TEXT PRIMARY KEY,next_review TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mind_memory_access(
  scope TEXT NOT NULL,session TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,
  depth TEXT NOT NULL,at TEXT NOT NULL,PRIMARY KEY(scope,session,id,revision,depth));
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
  scope TEXT NOT NULL,name TEXT NOT NULL,cursor INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,name));
 """
 
-DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False,
+DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
             "sharing": False, "graph": False, "associations": False, "graph_recall": False,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -144,7 +146,7 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality"):
+        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
@@ -154,6 +156,8 @@ class MemoryContinuity:
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
             due = (timestamp(self.mind.clock()) + timedelta(minutes=config["first_review_minutes"])).isoformat()
             conn.execute("INSERT OR IGNORE INTO mind_semantic_cursor(scope,next_review,data) VALUES(?,?,?)",
+                         (self.scope.key(), due, "{}"))
+            conn.execute("INSERT OR IGNORE INTO mind_action_schedule(scope,next_review,data) VALUES(?,?,?)",
                          (self.scope.key(), due, "{}"))
         return config
 
@@ -298,7 +302,7 @@ class MemoryContinuity:
                              expected_bubbles=event.get("expected_bubbles", share.get("expected_bubbles")),
                              source_ids=list(dict.fromkeys([*share["source_ids"], source_id])), record_ids=list(dict.fromkeys([*share["record_ids"], root])))
                 complete = not share["expected_bubbles"] or len(share["bubbles"]) >= share["expected_bubbles"]
-                share["state"] = "accepted" if states == {"accepted"} and complete else "partial" if "accepted" in states else "unconfirmed" if "unconfirmed" in states else "prepared"
+                share["state"] = "accepted" if states == {"accepted"} and complete else "partial" if "accepted" in states else "unconfirmed" if "unconfirmed" in states else "canceled" if states == {"canceled"} else "prepared"
                 if work_id:
                     share["about_ids"] = list(dict.fromkeys([*share["about_ids"], work_id]))
                 self._put(conn, share)
@@ -370,18 +374,18 @@ class MemoryContinuity:
             total, nodes = len(nodes), nodes[int(cursor):int(cursor) + limit]
         return {"items": nodes, "cursor": int(cursor) + limit if total > int(cursor) + limit else None, "total": total}
 
-    def semantic_context(self, query="", event_limit=24):
+    def semantic_context(self, query="", event_limit=24, *, operational=False):
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT * FROM mind_semantic_cursor WHERE scope=?", (self.scope.key(),)).fetchone()
             cursor = dict(row) if row else {"seq": 0, "next_review": self.mind.clock(), "revision": 0, "data": "{}"}
             pending = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND COALESCE(json_extract(data,'$.historical'),0)=0 ORDER BY seq LIMIT ?", (self.scope.key(), cursor["seq"], event_limit)).fetchall()
-            recent = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND kind IN ('owner-message','assistant-message','delivery') ORDER BY occurred_at DESC,seq DESC LIMIT 16", (self.scope.key(),)).fetchall()
+            recent = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND kind IN ('owner-message','assistant-message','delivery') ORDER BY occurred_at DESC,seq DESC LIMIT ?", (self.scope.key(), 8 if operational else 16)).fetchall()
             latest_owner_seq = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope.key(),)).fetchone()[0]
         if not query:
             owner_messages = [json.loads(r["data"]) for r in recent if json.loads(r["data"]).get("kind") == "owner-message"]
             query = " ".join(e.get("text", "") for e in owner_messages[:2])
         with self.engine.db.connect() as conn:
-            graph_context = self.graph.candidates(conn, query) if self.settings(conn)["graph"] or self.settings(conn)["sharing"] else []
+            graph_context = self.graph.candidates(conn, query) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
             for node in graph_context:
                 node["needs_review"] = not self.graph.fresh(conn, node)
                 if node["kind"] in {"finding", "exploration", "work"}:
@@ -391,8 +395,8 @@ class MemoryContinuity:
                 "conversation_habits": self.habits.read(),
                 "pending_events": [{"seq": r["seq"], **json.loads(r["data"])} for r in pending],
                 "recent_interaction": [json.loads(r["data"]) for r in reversed(recent)],
-                "works": self.history("work", query=query, limit=3)["items"],
-                "shares": self.history("share", query=query, limit=12)["items"],
+                "works": [] if operational else self.history("work", query=query, limit=3)["items"],
+                "shares": [] if operational else self.history("share", query=query, limit=12)["items"],
                 "next_review": cursor["next_review"], "revision": cursor["revision"], "latest_owner_seq": latest_owner_seq}
 
     def queue_history(self, jobs, agent_version):
@@ -403,8 +407,10 @@ class MemoryContinuity:
             cursor, data = (row["cursor"], json.loads(row["data"])) if row else (0, {})
         if data.get("job_id"):
             job = jobs.status(data["job_id"])
-            if job["state"] != "complete":
+            if job["state"] not in {"complete", "needs-repair"}:
                 return {"state": "pending", "job_id": data["job_id"]}
+            if job["state"] == "needs-repair":
+                data.setdefault("deferred_repairs", []).append(data["job_id"])
             cursor = data["through_seq"]
         with self.engine.db.connect() as conn:
             rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND json_extract(data,'$.historical')=1 ORDER BY seq LIMIT 16", (self.scope.key(), cursor)).fetchall()
@@ -412,7 +418,7 @@ class MemoryContinuity:
             return {"state": "complete", "cursor": cursor}
         sources = list(dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows))
         receipt = jobs.enqueue(sources, agent_version, origin="reflection", stimulus="memory-backfill")
-        data = {"job_id": receipt["id"], "through_seq": rows[-1]["seq"]}
+        data = {"job_id": receipt["id"], "through_seq": rows[-1]["seq"], "deferred_repairs": data.get("deferred_repairs", [])}
         with self.engine.db.connect(write=True) as conn:
             conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)", (self.scope.key(), "semantic", cursor, dumps(data)))
         return {"state": "pending", **data}
@@ -422,7 +428,8 @@ class MemoryContinuity:
         if not config["idle"] or not config["semantic"]:
             return None
         with self.engine.db.connect() as conn:
-            row = conn.execute("SELECT * FROM mind_semantic_cursor WHERE scope=?", (self.scope.key(),)).fetchone()
+            table = "mind_action_schedule" if config["operational_lanes"] else "mind_semantic_cursor"
+            row = conn.execute(f"SELECT * FROM {table} WHERE scope=?", (self.scope.key(),)).fetchone()
         return dict(row) if row and timestamp(row["next_review"]) <= timestamp(self.mind.clock()) else None
 
     def queue_idle(self, actions):
@@ -437,6 +444,16 @@ class MemoryContinuity:
             return actions.emit(conn, "idle-review", due["next_review"], {
                 "evidence_ids": [r["record_id"] for r in refs], "agent_version": state["agent_version"],
                 "reason": "Reconsider current interests and motives without inventing an owner message", "due_at": due["next_review"]})
+
+    def commit_action(self, conn, refs, event_id, next_minutes, receipt):
+        """The action clock progresses even when historical enrichment cannot."""
+        config = self.settings(conn)
+        minutes = max(config["review_min_minutes"], min(config["review_max_minutes"], next_minutes))
+        next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
+        conn.execute("INSERT INTO mind_action_schedule VALUES(?,?,1,?) ON CONFLICT(scope) DO UPDATE SET next_review=excluded.next_review,revision=revision+1,data=excluded.data",
+                     (self.scope.key(), next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes, "last_success": self.mind.clock()})))
+        for ref in refs:
+            conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None):
         """Called inside the same transaction as affect/concerns/wishes."""

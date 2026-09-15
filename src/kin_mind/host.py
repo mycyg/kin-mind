@@ -53,6 +53,12 @@ def dispatch(config, action, request):
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
     memory = MemoryContinuity(mind)
+    if action == "operational-status":
+        from .operational_status import operational_status
+        return operational_status(mind)
+    if action == "recover-operational":
+        from .recovery import migrate_operational
+        return migrate_operational(mind, workers_stopped=request.get("workers_stopped"))
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
         checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])
@@ -207,6 +213,10 @@ def dispatch(config, action, request):
         return mind.configure_behavior(request)
     if action == "configure-contact":
         return mind.configure_contact(request)
+    if action == "review-enrichment":
+        if config.get("review_paused") or not memory.settings()["operational_lanes"]:
+            return {"state": "paused"}
+        return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment")
     if action == "review":
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
@@ -221,7 +231,7 @@ def dispatch(config, action, request):
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
-        result = jobs.run_one(DeepSeek.from_engine(engine))
+        result = jobs.run_one(DeepSeek.from_engine(engine), lane="action")
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":
             wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"
