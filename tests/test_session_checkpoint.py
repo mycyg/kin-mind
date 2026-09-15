@@ -102,3 +102,31 @@ def test_session_maintenance_is_prioritized_small_and_does_not_update_affect(sys
     assert mind.read()['session_advice']['decision']['action'] == 'compact'
     with pytest.raises(ValueError):
         Contexts(mind).injection_ack('s', 'e', 'x', -1)
+
+
+def test_readonly_session_review_can_finish_during_memory_inference_without_recomputing_it(system):
+    mind, _, source, _ = system
+    jobs = Appraisals(mind, session_context={'id': 'observation', 'binding': {'generation': 1}})
+    work = jobs.enqueue([source('normal interaction')], 'fixture-v1')
+    calls = []
+
+    class SessionReviewer:
+        def appraise(self, context):
+            calls.append('session')
+            jobs.enqueue([source('second internal check')], 'fixture-v1', origin='reflection', stimulus='session-maintenance')
+            assert jobs.run_one(self)['state'] == 'busy'
+            return Appraisal(reason='Keep', session_advice=SessionAdvice(action='keep', reason='Healthy')), {'model': 'deepseek-flash', 'reasoning': 'max'}
+
+    class MemoryReviewer:
+        def appraise(self, context):
+            calls.append('memory')
+            check = jobs.enqueue([source('internal check')], 'fixture-v1', origin='reflection', stimulus='session-maintenance')
+            assert jobs.run_one(SessionReviewer())['state'] == 'complete'
+            assert jobs.status(check['id'])['state'] == 'complete'
+            assert jobs.status(work['id'])['state'] == 'running'
+            return Appraisal(reason='No state change'), {'model': 'deepseek-flash', 'reasoning': 'max'}
+
+    assert jobs.run_one(MemoryReviewer())['state'] == 'complete'
+    assert calls == ['memory', 'session']
+    assert jobs.status(work['id'])['state'] == 'complete'
+    assert mind.read()['session_advice']['decision']['action'] == 'keep'

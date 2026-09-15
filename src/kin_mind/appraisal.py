@@ -558,13 +558,18 @@ class Appraisals:
             ).fetchone()
             if not row:
                 return {"state": "idle"}
-            # Only one reviewer per scope, including another bridge/MCP process.
+            data = json.loads(row["data"])
+            maintenance = data.get("stimulus") == "session-maintenance"
+            # Operational judgments do not change affect or wishes. With
+            # dependency-aware commits they may inspect the native window
+            # while a long memory batch is being compressed. Each lane retains
+            # one durable lease; all writes still use the same transaction.
             if conn.execute(
-                "SELECT 1 FROM mind_appraisals WHERE scope=? AND state='running' AND lease>=?",
-                (self.mind.scope.key(), time.time()),
+                "SELECT 1 FROM mind_appraisals WHERE scope=? AND state='running' AND lease>=? "
+                "AND (?=0 OR CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN 1 ELSE 0 END=?)",
+                (self.mind.scope.key(), time.time(), int(semantic_enabled), int(maintenance)),
             ).fetchone():
                 return {"state": "busy"}
-            data = json.loads(row["data"])
             if semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}:
                 batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND (json_extract(data,'$.stimulus') IS NULL OR json_extract(data,'$.stimulus') IN ('assistant-result','runtime-result','delivery')) ORDER BY available LIMIT 11",
                                      (self.mind.scope.key(), time.time(), row["id"])).fetchall()

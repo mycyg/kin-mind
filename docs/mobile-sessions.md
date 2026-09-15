@@ -10,6 +10,8 @@ The host estimates pressure from the verified effective window, current input us
 
 A local minute tick reads lifecycle and usage records. It does not request a model on each tick. New pressure edges and sourced review requests enter the durable appraisal queue; session-maintenance jobs use a small operational view and cannot change affect, wishes, contact preferences or user activity. Normal appraisals may include the same observation. Advice is bound to an observation hash, so a newer input or task revision can invalidate it before action.
 
+With dependency-aware semantic commits enabled, one operational session judgment may run while one memory batch is being prepared. Separate durable leases keep both lanes bounded; commits remain transactional and serialized. A long evidence-compression job therefore cannot block a native-window check. Other appraisal types retain the existing single-lane behavior.
+
 ## Checkpoints and budgets
 
 `SessionCheckpoint` joins durable public runtime events with the pending journal. It retains the preceding question, short user answers and associated reply bubbles. Runtime warnings and uncertain sends cannot become successful public dialogue. Repeated user words remain separate events; matching model-output/delivery records can share one displayed utterance.
