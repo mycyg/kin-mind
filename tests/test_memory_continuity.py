@@ -403,6 +403,51 @@ def test_background_appraisal_does_not_compress_a_batch_that_fits_its_budget(sys
     assert calls == ["submit_appraisal"] and receipt["model"] == "deepseek-flash"
 
 
+def test_complete_appraisal_evidence_can_cross_three_batches_and_reuse_finished_parts(system, monkeypatch):
+    from eventmem.core.retrieval import tokens
+
+    mind, _, _, _ = system
+    text = "A complete source event. " * 2100
+    assert 8000 < tokens(text) < 12000
+    items = [{"id": f"event-{n}", "text": text} for n in range(4)]
+    clock = [0]
+    monkeypatch.setattr("kin_mind.context.time.monotonic", lambda: clock[0])
+
+    class Slow(Compressor):
+        def structured(self, *args, **kwargs):
+            clock[0] += 60
+            return super().structured(*args, **kwargs)
+
+    provider = Slow()
+    contexts = Contexts(mind)
+    partial = contexts.pack(items, "Full appraisal evidence", 4000, provider=provider, require_all=True)
+    assert partial["omitted_ids"] and provider.calls == 3
+    resumed = Contexts(mind).pack(items, "Full appraisal evidence", 4000, provider=provider, require_all=True, work_seconds=480)
+    assert resumed["state"] == "compressed" and not resumed["omitted_ids"]
+    assert set(resumed["covered_ids"]) == {item["id"] for item in items}
+    assert provider.calls == 5  # Three cached batches, fourth batch and reduction.
+    assert all(r["cache_hit"] for r in resumed["receipt"][:3])
+    again = contexts.pack(items, "Full appraisal evidence", 4000, provider=provider, require_all=True)
+    assert again["cache_hit"] and provider.calls == 5
+
+
+def test_full_evidence_does_not_accept_or_cache_a_model_omission(system):
+    mind, _, _, _ = system
+    class Omits(Compressor):
+        def structured(self, name, schema, system, context, **kwargs):
+            self.calls += 1
+            assert context["require_all"]
+            return Compression(omitted_ids=context["allowed_item_ids"]), {}
+    provider = Omits()
+    contexts = Contexts(mind)
+    items = [{"id": "evidence", "text": "A whole event. " * 300}]
+    first = contexts.pack(items, "Appraise all", 200, provider=provider, require_all=True)
+    assert first["reason"] == "deepseek-compression-invalid-coverage"
+    assert first["omitted_ids"] == ["evidence"]
+    second = contexts.pack(items, "Appraise all", 200, provider=provider, require_all=True)
+    assert not second["cache_hit"] and provider.calls == 4
+
+
 def test_semantic_links_accept_original_source_identifiers(system):
     from kin_mind.memory import MemoryLink, MemoryNote
     mind, memory, source, _ = system

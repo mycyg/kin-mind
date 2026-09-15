@@ -380,7 +380,7 @@ class DeepSeek:
                     if value.get("reason"):
                         items.append({"id": "dimension:" + dimension, "text": value.pop("reason"), "basis": "inferred"})
                 unique = {i["id"]: i for i in items}
-                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor, work_seconds=preparation_seconds)
+                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor, work_seconds=preparation_seconds, require_all=True)
                 if result["omitted_ids"]:
                     raise RuntimeError("deepseek-evidence-compression-pending:" + result.get("reason", result["state"]))
                 request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]

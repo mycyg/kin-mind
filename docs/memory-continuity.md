@@ -54,6 +54,15 @@ DeepSeek compression applies to *incoming* evidence; native compaction applies t
 
 Caches are bound to scope, input revisions, query purpose, budget and compression prompt version. Background overviews may be reused with an “overview” coverage label; explicit queries can still read the originals. Source correction, deletion or a mismatched revision invalidates dependent cached results. All model interfaces accept named structured results; reasoning blocks are excluded.
 
+Background appraisal requests full evidence coverage with `require_all=True`.
+It processes every complete batch within its preparation deadline, retains
+completed batch receipts across retries, and reduces all batch summaries together.
+The full-coverage cache has a separate identity; a partial summary cannot satisfy
+that request or be cached as its final result. Missing model coverage receives a
+bounded correction attempt. This lets a large appraisal continue beyond three
+batches while keeping the context budget, original sources and explicit pending
+state when preparation has not finished.
+
 ## Host integration and migration
 
 New host actions: `runtime-event`, `memory-context`, `prepare-memory`, `memory-compact-ack`, `share-history`, `work-history`, and `configure-memory`. The host event journal is independent of transport retries. `adapters/memory-events.mjs` also snapshots file observations and reconciles local outbox records. `adapters/context-compaction.mjs` serializes native compaction with the existing router.

@@ -108,7 +108,7 @@ class Contexts:
                     return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150):
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False):
         """A cache entry covers exact input revisions and query purpose, not DB age."""
         if not 0 <= budget <= 32000:
             raise ValueError("Invalid context budget")
@@ -121,12 +121,12 @@ class Contexts:
         raw = "\n".join(self._line(i) for i in items)
         if tokens(raw) <= budget:
             return {"text": raw, "tokens": tokens(raw), "state": "original", "covered_ids": list(source), "omitted_ids": stale_ids, "needs_review_ids": stale_ids, "items": items, "cache_hit": False}
-        cache_id = digest([self.mind.scope.key(), PROMPT_VERSION, query, budget, items])
+        cache_id = digest([self.mind.scope.key(), PROMPT_VERSION, query, budget, items, *(["complete-evidence-v1"] if require_all else [])])
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
         if row:
             result = json.loads(row[0])
-            if all(self._current(i) for i in items):
+            if all(self._current(i) for i in items) and (not require_all or not result.get("omitted_ids")):
                 return {**result, "cache_hit": True}
         if allow_model and budget >= 128 and items:
             try:
@@ -163,13 +163,14 @@ class Contexts:
                 deadline = time.monotonic() + work_seconds
                 def compress(payload):
                     ids = {item["id"] for item in payload["items"]}
-                    payload = {**payload, "allowed_item_ids": sorted(ids)}
+                    payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "Every input must be represented in a summary. Merge related or duplicate material while retaining each input ID; this evidence review cannot finish with omitted inputs."} if require_all else {})}
                     part_key = digest(["compression-part", self.mind.scope.key(), PROMPT_VERSION, getattr(provider,"model",None), payload])
                     with self.engine.db.connect() as connection:
                         cached = connection.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (part_key,self.mind.scope.key())).fetchone()
                     if cached:
                         cached = json.loads(cached[0])
-                        return Compression.model_validate(cached["value"]), {**cached["receipt"], "cache_hit": True, "requests": 0}
+                        if not require_all or not cached["value"].get("omitted_ids"):
+                            return Compression.model_validate(cached["value"]), {**cached["receipt"], "cache_hit": True, "requests": 0}
                     repair_receipts = []
                     for attempt in range(2):
                         remaining = deadline - time.monotonic()
@@ -185,7 +186,7 @@ class Contexts:
                                 provider.timeout = previous_timeout
                         covered = {identifier for entry in value.entries for identifier in entry.item_ids}
                         omitted_ids = set(value.omitted_ids)
-                        if not covered & omitted_ids and covered | omitted_ids == ids:
+                        if not covered & omitted_ids and covered | omitted_ids == ids and (not require_all or not omitted_ids):
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
                             with self.engine.db.connect(write=True) as connection:
                                 connection.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (part_key,self.mind.scope.key(),dumps({"value":value.model_dump(),"receipt":receipt}),self.mind.clock()))
@@ -194,14 +195,15 @@ class Contexts:
                         # Reuse only the structured proposal, never reasoning.
                         # A failed repair remains pending with original evidence.
                         payload = {**payload, "rejected_result": value.model_dump(), "validation": {
-                            "missing_ids": sorted(ids - covered - omitted_ids),
+                            "missing_ids": sorted(ids - covered if require_all else ids - covered - omitted_ids),
                             "unknown_ids": sorted((covered | omitted_ids) - ids),
                             "overlapping_ids": sorted(covered & omitted_ids)}}
                     raise RuntimeError("deepseek-compression-invalid-coverage")
                 provenance_cost = sum(tokens(dumps({"id": i["id"], "revision": i.get("revision"), "basis": i.get("basis", "inferred"), **i.get("facts", {})})) for i in items) + 20
                 summary_budget = max(32, budget - provenance_cost)
-                for batch in batches[:3]:
-                    value, receipt = compress({"query": query, "budget_tokens": max(32, summary_budget // max(1, min(3, len(batches)))), "items": batch})
+                selected_batches = batches if require_all else batches[:3]
+                for batch in selected_batches:
+                    value, receipt = compress({"query": query, "budget_tokens": max(32, summary_budget // max(1, len(selected_batches))), "items": batch})
                     ids = {i["id"]: i["origin_id"] for i in batch}
                     covered = [identifier for e in value.entries for identifier in e.item_ids]
                     if set(covered) & set(value.omitted_ids) or set(covered + value.omitted_ids) != set(ids):
@@ -211,7 +213,7 @@ class Contexts:
                         entries.append({"item_ids": origins, "summary": entry.summary})
                     omitted.extend(ids[i] for i in value.omitted_ids)
                     receipts.append(receipt)
-                for batch in batches[3:]:
+                for batch in batches[len(selected_batches):]:
                     omitted.extend(i["origin_id"] for i in batch)
                 if len(batches) > 1 and entries:
                     reduced = [{"id": "group:" + str(i), "text": e["summary"], "item_ids": e["item_ids"]} for i, e in enumerate(entries)]
@@ -239,7 +241,7 @@ class Contexts:
                 result = {"text": text, "tokens": tokens(text), "state": "compressed" if lines else "insufficient",
                           "covered_ids": list(dict.fromkeys(covered)), "omitted_ids": list(dict.fromkeys([*omitted, *[i for i in source if i not in covered]])),
                           "items": selected, "receipt": receipts, "cache_hit": False, "elapsed_ms": round((time.monotonic() - started) * 1000)}
-                if lines:
+                if lines and (not require_all or not result["omitted_ids"]):
                     with self.engine.db.connect(write=True) as conn:
                         conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (cache_id, self.mind.scope.key(), dumps(result), self.mind.clock()))
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": sum(r.get("requests", 1) for r in receipts), "state": result["state"]})
