@@ -6,6 +6,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {checkpointMarker} from './native-window.mjs';
+import {currentCheckpoint} from './mobile-session-host.mjs';
 const hash=t=>createHash('sha256').update(t).digest('hex');
 function system(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-context-test-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -30,3 +31,4 @@ test('a quoted marker without the frozen body is not a receipt',async t=>{const 
 test('a busy or wrong native thread cannot receive context',async()=>{const host=new NativeContextDelivery({runtime:async()=>({known:true,active:true,threadId:'another'}),call:async()=>{throw Error('must not call');}});await assert.rejects(()=>host.deliver({id:'a',session:'thread'}),/boundary/);});
 test('a new native thread without a rollout file accepts its first append',async t=>{const s=system(t);fs.unlinkSync(s.file);assert.equal((await s.newHost().deliver(s.context)).state,'accepted');assert.deepEqual(s.stats(),{writes:1,count:20});});
 test('a user quotation of the exact frozen payload is not host proof',async t=>{const s=system(t);fs.writeFileSync(s.file,JSON.stringify({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:s.context.text}]}})+'\n');assert.equal((await checkpointMarker(s.file,s.context.marker,{textHash:s.context.text_hash,role:'assistant'})).found,false);});
+test('a completed old restoration does not hide the current rolling manifest',()=>{const old={id:'old'},fresh={id:'current'};assert.equal(currentCheckpoint({restoreCheckpoint:old,rollingCheckpoint:fresh,restorePending:false}),fresh);assert.equal(currentCheckpoint({restoreCheckpoint:old,rollingCheckpoint:fresh,restorePending:true}),old);});

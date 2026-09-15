@@ -13,6 +13,8 @@ const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 
 export function registryBinding(file,fallback){return fs.existsSync(file)?read(file).binding:fallback;}
 
+export function currentCheckpoint(state){return state.restorePending&&state.restoreCheckpoint?state.restoreCheckpoint:state.rollingCheckpoint??state.candidate?.checkpoint??state.restoreCheckpoint;}
+
 export async function loadCandidateSession({client,connection,binding,candidate,cwd,gateway}) {
   client.beginSessionReplay();
   try {await connection.loadSession({sessionId:binding.threadId,cwd,mcpServers:[]});}
@@ -107,7 +109,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
-      const cp=manager.state.restoreCheckpoint??manager.state.rollingCheckpoint??manager.state.candidate?.checkpoint;if(!cp)return null;
+      const cp=currentCheckpoint(manager.state);if(!cp)return null;
       if(sourceCursor!==null){if(!Number.isInteger(sourceCursor)||sourceCursor<0)throw Error('Invalid source cursor');const all=Object.entries(cp.sourceRevisions);return {checkpointId:cp.id,sources:all.slice(sourceCursor,sourceCursor+10).map(([id,revision])=>({id,revision})),nextSourceCursor:sourceCursor+10<all.length?sourceCursor+10:null};}
       return {...cp.payload,state:cp.complete?'ready':'incomplete',tokens:cp.tokens,coverage:cp.coverage.state,manifestVersion:cp.manifestVersion??null,memoryCoverage:cp.memoryCoverage,metrics:cp.metrics,watermarks:cp.watermarks,sourceCount:Object.keys(cp.sourceRevisions).length,readSourceCursor:0};
     },

@@ -281,3 +281,12 @@ def test_cached_compression_reports_zero_new_model_requests(system):
     second = ctx.pack(items, 'delivery status', 400, provider=provider, require_all=True)
     assert first['model_requests'] == 1 and not first['omitted_ids']
     assert second['cache_hit'] and second['model_requests'] == 0 and provider.calls == 1
+
+
+def test_checkpoint_from_an_older_host_configuration_requires_refresh(system):
+    mind, _, _, _ = system
+    old = SessionCheckpoint(mind, agent_version='host-old')
+    snapshot = old.snapshot([{'id':'q','kind':'owner-message','at':mind.clock(),'text':'Hello'}])
+    checkpoint = old.build(snapshot,binding(),budget=2000,allow_model=False)
+    assert old.validate(checkpoint)['valid']
+    assert not SessionCheckpoint(mind,agent_version='host-new').validate(checkpoint)['valid']

@@ -186,10 +186,15 @@ class SessionCheckpoint:
     def validate(self, checkpoint):
         contexts = Contexts(self.mind)
         stale = [i['id'] for i in checkpoint.get('contextDependencies', []) if not contexts._current(i)]
-        valid = contexts._current({"dependencies": checkpoint.get("sourceDependencies", [])}) and not stale
+        with self.mind.engine.db.connect() as conn:
+            state = self.mind._load(conn)
+        current_version = (self.agent_version or state['agent_version']) + ':' + state['profile_version']
+        config_changed = bool(checkpoint.get('configVersion') and checkpoint['configVersion'] != current_version)
+        valid = contexts._current({"dependencies": checkpoint.get("sourceDependencies", [])}) and not stale and not config_changed
         result = {'valid': valid}
         if self.memory.settings().get('continuity_quality'):
             result['quality'] = {'basis': 'dependency-and-receipt-check', 'stale_ids': stale,
+                'config_changed': config_changed,
                 'critical_coverage': checkpoint.get('complete'), 'model_recall_accuracy': 'not-measured',
                 'extra_model_requests': 0, 'next_action': 'recall-corrected-sources' if not valid else 'keep'}
         return result
