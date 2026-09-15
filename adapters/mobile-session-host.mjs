@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {SessionManager} from './session-manager.mjs';
-import {NativeWindow,checkpointMarker} from './native-window.mjs';
+import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeBoundary} from './session-policy.mjs';
@@ -27,6 +27,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   const file=config.session_registry_file??path.join(root,'state/conversation-registry.json');
   const observationFile=config.session_observation_file??path.join(root,'state/session-observation.json');
   await routing.ensureSession('kin-host:session-management');
+  await router.restoreRoutingProfile();
   const initial=await routing.inspect();
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
   let reader,readerId,initialScan=true,closed=false,running=false;
@@ -49,7 +50,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     if(value.known&&value.rolloutPath){
       if(readerId!==value.threadId){reader=new NativeWindow({file:value.rolloutPath,threadId:value.threadId,stateFile:path.join(root,'state/native-window-'+value.threadId+'.json')});readerId=value.threadId;}
       const state=await reader.poll();
-      return {...value,modelContextWindow:value.modelContextWindow??state.modelContextWindow,lastTokenUsage:value.lastTokenUsage??state.lastTokenUsage};
+      return nativePressureRuntime(value,state);
     }
     return value;
   };

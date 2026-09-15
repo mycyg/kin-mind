@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {SessionManager} from './session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from './session-policy.mjs';
-import {NativeWindow,checkpointMarker} from './native-window.mjs';
+import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
 import {recoverSessionStore} from './mobile-session-host.mjs';
 
 function fixture(t){
@@ -26,6 +26,15 @@ function fixture(t){
 test('pressure uses current input, verified window and output reserve; cumulative use is irrelevant',()=>{
  const p=windowPressure({modelContextWindow:100000,lastTokenUsage:{inputTokens:30000,totalTokens:999999999},totalTokenUsage:{totalTokens:1e12}});
  assert.equal(p.ratio,(30000+32768+8192)/100000);assert.equal(p.level,'elevated');assert.equal(windowPressure({}).known,false);
+});
+test('restart restores the last native measurement and recognizes a compaction context estimate',()=>{
+ const runtime={modelContextWindow:null,lastTokenUsage:{inputTokens:0,outputTokens:0,totalTokens:0},totalTokenUsage:{totalTokens:1e12}};
+ const history={modelContextWindow:100000,measuredAt:'2026-09-15T01:00:00Z',lastTokenUsage:{inputTokens:0,outputTokens:0,totalTokens:30056}};
+ const value=nativePressureRuntime(runtime,history),pressure=windowPressure(value);
+ assert.equal(pressure.expectedInputTokens,30056);assert.equal(value.usageEvidence.kind,'post-compaction-context-estimate');
+ assert.equal(value.usageEvidence.measuredAt,history.measuredAt);
+ const measured=nativePressureRuntime({...runtime,lastTokenUsage:{inputTokens:40000,outputTokens:1000,totalTokens:41000}},history);
+ assert.equal(windowPressure(measured).expectedInputTokens,40000);assert.equal(measured.usageEvidence.source,'native-runtime');
 });
 test('high pressure is compacted first; fifty historical compactions do not authorize rotation',async t=>{
  const f=fixture(t);await f.advise('rotate');assert.equal((await f.manager.tick()).reason,'compact-first');assert.ok(!f.calls.includes('create'));

@@ -2,6 +2,19 @@ import fs from 'node:fs';
 import {createInterface} from 'node:readline';
 import {atomicJson} from './mobile-router.mjs';
 
+export function nativePressureRuntime(runtime,history) {
+  const live=runtime.lastTokenUsage;
+  // Reloading ACP has no in-memory usage. Native history can also report a
+  // post-compaction context estimate as input=output=0, last total>0.
+  const liveMeasured=live&&(live.inputTokens>0||live.outputTokens>0||live.totalTokens>0);
+  const usage=liveMeasured?live:history.lastTokenUsage??live;
+  const estimate=usage?.inputTokens===0&&usage.outputTokens===0&&usage.totalTokens>0?usage.totalTokens:undefined;
+  return {...runtime,modelContextWindow:runtime.modelContextWindow??history.modelContextWindow,lastTokenUsage:usage,
+    ...(estimate!==undefined?{expectedInputTokens:estimate}:{}),
+    usageEvidence:{source:liveMeasured?'native-runtime':'native-history',measuredAt:liveMeasured?runtime.checkedAt:history.measuredAt,
+      kind:estimate!==undefined?'post-compaction-context-estimate':'input-usage'}};
+}
+
 /** Read native receipts incrementally. Deliberately skip compaction summaries,
  * message bodies, reasoning and tool output. File bytes are only a read cursor. */
 export class NativeWindow {

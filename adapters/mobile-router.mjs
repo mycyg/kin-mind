@@ -287,6 +287,23 @@ export class MobileRouter {
   async readRuntime(loaded=true) {
     return this.locked(async()=>{const runtime=await this.inspect();this.observeRuntime(runtime);return publicMobileRuntime(this.state,runtime,this.sessionId,loaded);});
   }
+  async restoreRoutingProfile() {
+    return this.locked(async()=>{
+      if(this.runtimeRestored)return {state:'restored'};
+      let runtime=await this.inspect();
+      if(this.busy(runtime)||Object.values(this.state.inputs).some(i=>['selected','submitting','unconfirmed'].includes(i.state)))return {state:'waiting'};
+      runtime=await this.reconcileTransition(runtime);
+      if(this.state.transition?.state==='unconfirmed')return {state:'waiting'};
+      const target=this.tasks().length||this.state.mode==='work'?ROUTER_MODELS.work:ROUTER_MODELS.chat;
+      if(!this.verified(runtime,target)){
+        this.startTransition(runtime,target,'Restore persisted mobile routing mode','host-restart');this.save('restart-profile-requested');
+        try {runtime=await this.switchModel(target);if(!this.verified(runtime,target))throw Error('Restart profile unverified');this.finishTransition(runtime);}
+        catch(error){this.state.transition.state='unconfirmed';this.save('restart-profile-unconfirmed');throw error;}
+      }
+      this.observeRuntime(runtime);this.runtimeRestored=true;this.save('restart-profile-restored',{model:runtime.model});
+      return {state:'restored',model:runtime.model,threadId:runtime.threadId};
+    });
+  }
   async prepareModel(model) {
     return this.locked(async()=>{
       const runtime=await this.inspect();
