@@ -59,8 +59,24 @@ def dispatch(config, action, request):
         if action == "session-validate":
             return checkpoints.validate(request["checkpoint"])
         if action == "session-snapshot":
-            return checkpoints.snapshot(request.get("pending"))
-        return checkpoints.build(request["snapshot"], request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine))
+            return checkpoints.snapshot(request.get("pending"), tasks=request.get("tasks"), intent=request.get("intent"))
+        snapshot = dict(request['snapshot'])
+        if not request.get('shadow') and not memory.settings().get('manifest_restore'):
+            snapshot.pop('manifestVersion', None)
+            snapshot.pop('linked', None)
+        return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True))
+    if action == "continuity-manifest":
+        from .continuity_manifest import ContinuityManifest
+        return ContinuityManifest(mind).read(**request)
+    if action.startswith("context-delivery-"):
+        from .context_delivery import ContextDelivery
+        deliveries = ContextDelivery(Contexts(mind))
+        methods = {"context-delivery-begin": deliveries.begin, "context-delivery-ack": deliveries.acknowledge,
+                   "context-delivery-uncertain": deliveries.uncertain, "context-delivery-pending": deliveries.pending,
+                   "context-delivery-metrics": deliveries.metrics, "context-delivery-prepare": deliveries.prepare}
+        if action not in methods:
+            raise ValueError('Unknown context delivery operation')
+        return methods[action](**request)
     if action == "session-review":
         if not config.get("adaptive_sessions") or not session_context:
             return {"state": "disabled"}
@@ -102,6 +118,8 @@ def dispatch(config, action, request):
     if action == "memory-context":
         if config.get("adaptive_sessions"):
             request["native_pressure_managed"] = True
+        if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
+            request['receipt_mode'] = True
         return Contexts(mind).build(**request)
     if action == "memory-window":
         window = Contexts(mind).window(config["session_id"])

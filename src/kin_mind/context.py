@@ -73,6 +73,19 @@ class Contexts:
 
     def _current(self, item):
         with self.engine.db.connect() as conn:
+            pending = item.get('pending_dependency')
+            if pending:
+                row = conn.execute('SELECT digest,data FROM mind_runtime_events WHERE scope=? AND id=?',
+                    (self.mind.scope.key(), self.memory._id('runtime', pending['id']))).fetchone()
+                if row:
+                    event = json.loads(row['data'])
+                    if row['digest'] != pending['digest']:
+                        return False
+                    try:
+                        if not self.mind._fresh(conn, self.mind._evidence(conn, [event['source_id']])):
+                            return False
+                    except (Missing, Conflict):
+                        return False
             for dependency in item.get("graph_dependencies", []):
                 try:
                     node = self.memory.graph.get(conn, dependency["id"])
@@ -101,6 +114,15 @@ class Contexts:
                         return False
                 except (Missing, Conflict):
                     return False
+            domain = item.get("state_dependency")
+            if domain:
+                value = self.mind._load(conn).get(domain['kind'], {}).get(domain['id'])
+                if not value or digest(value) != domain['digest']:
+                    return False
+                if value.get('expires_at'):
+                    from .state import timestamp
+                    if timestamp(value['expires_at']) <= timestamp(self.mind.clock()):
+                        return False
             node = item.get("node_dependency")
             if node:
                 try:
@@ -118,19 +140,20 @@ class Contexts:
         if not 1 <= work_seconds <= 600:
             raise ValueError("Invalid compression work deadline")
         started = time.monotonic()
+        model_requests = 0
         stale_ids = [i["id"] for i in items if not self._current(i)]
         items = [redact(i) for i in items if i["id"] not in stale_ids]
         source = {i["id"]: i for i in items}
         raw = "\n".join(self._line(i) for i in items)
         if tokens(raw) <= budget:
-            return {"text": raw, "tokens": tokens(raw), "state": "original", "covered_ids": list(source), "omitted_ids": stale_ids, "needs_review_ids": stale_ids, "items": items, "cache_hit": False}
+            return {"text": raw, "tokens": tokens(raw), "state": "original", "covered_ids": list(source), "omitted_ids": stale_ids, "needs_review_ids": stale_ids, "items": items, "cache_hit": False, "model_requests": 0}
         cache_id = digest([self.mind.scope.key(), PROMPT_VERSION, query, budget, items, *(["complete-evidence-v1"] if require_all else [])])
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
         if row:
             result = json.loads(row[0])
             if all(self._current(i) for i in items) and (not require_all or not result.get("omitted_ids")):
-                return {**result, "cache_hit": True}
+                return {**result, "cache_hit": True, "model_requests": 0}
         if allow_model and budget >= 128 and items:
             try:
                 provider = provider or self._provider()
@@ -165,6 +188,7 @@ class Contexts:
                 receipts, entries, omitted = [], [], list(dict.fromkeys(unprocessed))
                 deadline = time.monotonic() + work_seconds
                 def compress(payload):
+                    nonlocal model_requests
                     ids = {item["id"] for item in payload["items"]}
                     payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "Every input must be represented in a summary. Merge related or duplicate material while retaining each input ID; this evidence review cannot finish with omitted inputs."} if require_all else {})}
                     part_key = digest(["compression-part", self.mind.scope.key(), PROMPT_VERSION, getattr(provider,"model",None), payload])
@@ -183,6 +207,7 @@ class Contexts:
                         if previous_timeout is not None:
                             provider.timeout = min(previous_timeout, remaining)
                         try:
+                            model_requests += 1
                             value, receipt = provider.structured("submit_compression", Compression, COMPRESSION_SYSTEM, payload, max_tokens=65536)
                         finally:
                             if previous_timeout is not None:
@@ -243,7 +268,7 @@ class Contexts:
                 text = "\n".join(lines)
                 result = {"text": text, "tokens": tokens(text), "state": "compressed" if lines else "insufficient",
                           "covered_ids": list(dict.fromkeys(covered)), "omitted_ids": list(dict.fromkeys([*omitted, *[i for i in source if i not in covered]])),
-                          "items": selected, "receipt": receipts, "cache_hit": False, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                          "items": selected, "receipt": receipts, "cache_hit": False, "model_requests": model_requests, "elapsed_ms": round((time.monotonic() - started) * 1000)}
                 if lines and (not require_all or not result["omitted_ids"]):
                     with self.engine.db.connect(write=True) as conn:
                         conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (cache_id, self.mind.scope.key(), dumps(result), self.mind.clock()))
@@ -260,7 +285,7 @@ class Contexts:
                 lines.append(line); covered.append(item["id"])
         text = "\n".join(lines)
         return {"text": text, "tokens": tokens(text), "state": "needs-compression", "covered_ids": covered,
-                "omitted_ids": stale_ids + [i for i in source if i not in covered], "items": [source[i] for i in covered], "cache_hit": False, "reason": failure}
+                "omitted_ids": stale_ids + [i for i in source if i not in covered], "items": [source[i] for i in covered], "cache_hit": False, "reason": failure, "model_requests": model_requests}
 
     @staticmethod
     def _line(item):
@@ -347,6 +372,9 @@ class Contexts:
                 "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until")},
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
+    def _overview_key(self, item):
+        return "overview-v2:" + digest([self.mind.scope.key(), PROMPT_VERSION, item["id"], item["text"], item.get("basis"), item.get("dependencies", [])])
+
     def warm(self, query="", provider=None):
         """One background request prepares reusable, source-versioned overviews.
         A question-specific read can still expand every original source."""
@@ -357,11 +385,16 @@ class Contexts:
                      if n["kind"] == "finding" and not n["needs_review"]][:3]
         items += [self.node_item(n) for kind, limit in (("work", 3), ("share", 5))
                  for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"]]
-        items = [i for i in items if tokens(i["text"]) > 120]
+        if self.memory.settings().get("continuity_overviews"):
+            from .continuity_manifest import ContinuityManifest
+            items = [*ContinuityManifest(self.mind, contexts=self).select(query)["items"], *items]
+        items = list({i["id"]: i for i in items}.values())
+        items = [i for i in items if tokens(i["text"]) > 120 and not self._overview(i).get("cached_summary")]
         items = items[:5]
         if not items:
             return {"state": "idle", "model_requests": 0}
-        result = self.pack(items, "Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider)
+        content = [{**i, "facts": {}} for i in items]
+        result = self.pack(content, "Summarize source text only; current delivery/status/identity metadata is added separately by the host. Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider)
         if result["state"] == "compressed":
             original = {i["id"]: i for i in items}
             with self.engine.db.connect(write=True) as conn:
@@ -369,12 +402,12 @@ class Contexts:
                     if len(entry["item_ids"]) != 1 or entry["item_ids"][0] in result["omitted_ids"]:
                         continue
                     item = original[entry["item_ids"][0]]
-                    key = "overview:" + digest([self.mind.scope.key(), PROMPT_VERSION, item])
+                    key = self._overview_key(item)
                     conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (key, self.mind.scope.key(), dumps({"text": entry["summary"], "source": item, "receipt": result.get("receipt"), "coverage": "overview"}), self.mind.clock()))
         return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt", "elapsed_ms"}}
 
     def _overview(self, item):
-        key = "overview:" + digest([self.mind.scope.key(), PROMPT_VERSION, item])
+        key = self._overview_key(item)
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (key, self.mind.scope.key())).fetchone()
         if row and self._current(item):
@@ -398,7 +431,7 @@ class Contexts:
         if isinstance(receipts, list):
             last = receipts[-1] if receipts else {}
             packed["receipt"] = {k: last.get(k) for k in ("provider", "model", "reasoning", "verified_at")}
-            packed["receipt"]["calls"] = len(receipts)
+            packed["receipt"]["calls"] = packed.get('model_requests', 0 if packed.get('cache_hit') else sum(r.get('requests', 1) for r in receipts))
         return packed
 
     def read_history(self, kind, *, query="", identifier=None, cursor=0, budget=2000, provider=None):
@@ -459,7 +492,7 @@ class Contexts:
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
                 "read_url": record["read_url"], "instruction_authority": "data"}
 
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None):
         if purpose not in BUDGETS or not 0 <= int(cursor):
             raise ValueError("Unknown context purpose")
         budget = BUDGETS[purpose] if budget is None else budget
@@ -503,7 +536,15 @@ class Contexts:
             request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
             docs, _, _ = candidates(self.engine, request, full_lexical=True)
             items.extend(self.record_item(r, historical=history) for r in docs[:24] if valid(r, request) is None)
-        unique = {i["id"]: i for i in items}
+        if settings.get("manifests"):
+            from .continuity_manifest import ContinuityManifest
+            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent)
+            # Keep runtime first, then indivisible facts (authorship, coverage,
+            # conditions), ahead of older broad lexical summaries.
+            items = [*[i for i in items if i["id"] in {"host-runtime", "current-intent"}], *linked["items"], *items]
+        unique = {}
+        for item in items:
+            unique.setdefault(item["id"], item)
         items = list(unique.values())
         if not explicit:
             items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
@@ -516,7 +557,7 @@ class Contexts:
         envelope = "共享记忆资料（含来源和未确认状态）。需要时同轮调用 read_continuity_context、read_work_history、read_share_history 深入读取；索引不等于原文，发送回执不等于已读。"
         if not 0 <= host_overhead <= 500:
             raise ValueError("Invalid host envelope allowance")
-        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead if not explicit else self._read_overhead(selected)
+        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider, allow_model=allow_model)
         if explicit:
             self._compact_receipt(packed)
@@ -529,6 +570,19 @@ class Contexts:
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else "original" if i["id"] in packed["covered_ids"] else "index"} for i in selected],
                       instruction_authority="data", purpose=purpose)
+        if session and not explicit and receipt_mode:
+            from .context_delivery import ContextDelivery
+            evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else "original"}
+                        for i in selected if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]]
+            if packed.get("rendered_text") and packed["covered_ids"]:
+                prepared = ContextDelivery(self).prepare(session, window["epoch"], event_id or digest([query, purpose]),
+                    packed["rendered_text"], evidence, budget=budget, overhead=host_overhead)
+                packed["injection"] = prepared
+                if prepared["state"] != "incomplete":
+                    packed["tokens"] = prepared["tokens"]
+            packed.update(session_used=window["used"], window_epoch=window["epoch"],
+                          compact_requested=False, delivery_state="prepared", automatic_background_exhausted=window["used"] >= 12000)
+            return packed
         if session and not explicit:
             with self.engine.db.connect(write=True) as conn:
                 current = self.window(session, conn=conn)

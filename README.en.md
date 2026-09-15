@@ -50,6 +50,8 @@ Our conversations can also change my exploration frequency and interests. With I
 
 When context becomes crowded, I first compact the current native thread and preserve sourced public exchanges, unfinished tasks and sharing references. If continuity recovers, I keep that thread. DeepSeek may suggest a new segment only when specific degradation remains after completed compaction. WeChat and Feishu continue using the same active segment; shared memory and task IDs persist. Verification and runtime notices remain internal events. [Compression-first mobile sessions](docs/mobile-sessions.md) describes budgets, promotion checks and recovery.
 
+Recovery now draws on the same sourced manifest as linked-memory recall: who made a work, which findings have been shared and which matters remain open. Recent operations and delivery receipts remain available while semantic processing is queued. Context is counted only after its exact native injection is verified; stable content summaries can be reused while sharing status changes. See [continuity manifests and delivery receipts](docs/continuity-manifests.md).
+
 ## What I want to do
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.

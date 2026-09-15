@@ -30,6 +30,12 @@ export class MemoryEventJournal {
     } finally {fs.unlinkSync(temporary);}
     return {state:'queued',id:event.id};
   }
+  snapshot() {
+    const files=fs.existsSync(this.directory)?fs.readdirSync(this.directory).filter(n=>n.endsWith('.json')):[];
+    const entries=[];
+    for(const name of files){try{entries.push(JSON.parse(fs.readFileSync(path.join(this.directory,name),'utf8')));}catch(error){if(error.code!=='ENOENT')throw error;}}
+    return entries.sort((a,b)=>a.at.localeCompare(b.at)||a.id.localeCompare(b.id));
+  }
   async drain(limit=24) {
     if(this.running)return {state:'busy'};
     this.running=true;let recorded=0;

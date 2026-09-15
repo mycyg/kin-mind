@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 """
 
 DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False,
+            "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
             "sharing": False, "graph": False, "associations": False, "graph_recall": False,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20}
@@ -143,7 +144,7 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "sharing", "graph", "associations", "graph_recall"):
+        for key in ("records", "semantic", "context", "idle", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

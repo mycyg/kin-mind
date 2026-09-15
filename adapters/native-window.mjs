@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
 import {createInterface} from 'node:readline';
 import {atomicJson} from './mobile-router.mjs';
 
@@ -50,10 +51,11 @@ export class NativeWindow {
 
 /** Injection receipt reconciliation reads only public message items and the
  * exact marker. An unknown operation is never retried on absence alone. */
-export async function checkpointMarker(file,marker) {
+export async function checkpointMarker(file,marker,{textHash,role}={}) {
+  if(!fs.existsSync(file))return {found:false,state:'unconfirmed'};
   const lines=createInterface({input:fs.createReadStream(file),crlfDelay:Infinity});
   for await(const line of lines){let item;try{item=JSON.parse(line);}catch{continue;}
-    if(item.type==='response_item'&&item.payload?.type==='message'&&['user','assistant'].includes(item.payload.role)&&item.payload.content?.some(p=>['input_text','output_text'].includes(p.type)&&p.text?.includes(marker))){lines.close();return {found:true,at:item.timestamp};}
+    if(item.type==='response_item'&&item.payload?.type==='message'&&['user','assistant'].includes(item.payload.role)&&(!role||item.payload.role===role)&&item.payload.content?.some(p=>['input_text','output_text'].includes(p.type)&&p.text?.includes(marker)&&(!textHash||createHash('sha256').update(p.text).digest('hex')===textHash))){lines.close();return {found:true,at:item.timestamp};}
   }
   return {found:false,state:'unconfirmed'};
 }

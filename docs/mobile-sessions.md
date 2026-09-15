@@ -20,6 +20,8 @@ Full source dependencies, hashes and revisions remain in the private registry. T
 
 The 12,000-token automatic-background budget is separate from native context pressure. Only a native compaction completion can reset that ledger. Durable epoch receipts make delayed duplicates harmless, including duplicates from an earlier window. A restored checkpoint is reconciled by its persisted native marker and accounted once. Source corrections invalidate the checkpoint and its dependent summaries.
 
+See [continuity manifests and verified delivery](continuity-manifests.md) for the shared linked working set, pending operation facts, exact native injection receipts, source-dependent caches and independent rollout switches.
+
 ## Execution and recovery
 
 | Boundary | Host behavior |

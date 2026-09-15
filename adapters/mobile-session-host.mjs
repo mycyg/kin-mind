@@ -3,6 +3,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {SessionManager} from './session-manager.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
+import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeBoundary} from './session-policy.mjs';
@@ -50,10 +51,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       config:{model_catalog_json:path.join(root,'mobile-models.json'),'model_providers.kin_session_gateway':{name:'Kin session gateway',base_url:routing.gateway.baseUrl,env_key:'KIN_SESSION_GATEWAY_TOKEN',wire_api:'responses',requires_openai_auth:false}}}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{
-    const directory=bridge.mindHost?.memoryJournal?.directory;
-    const pending=directory&&fs.existsSync(directory)?fs.readdirSync(directory).filter(n=>n.endsWith('.json')).map(n=>read(path.join(directory,n))).filter(e=>['owner-message','assistant-message','delivery'].includes(e.kind)):[];
-    const snapshot=await mindCall('session-snapshot',{pending});
+    const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
     const state=router.snapshot(),inputs=Object.values(state.inputs),tasks=router.tasks();
+    const snapshot=await mindCall('session-snapshot',{pending,tasks});
     const outstanding=inputs.filter(i=>['selected','submitting','unconfirmed'].includes(i.state));
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
     snapshot.cursors={...snapshot.cursors,inputs:digest(inputs.map(i=>[i.id,i.state,i.hash])),tasks:digest(tasks),config:state.configRevision??0};
@@ -68,6 +68,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     }
     return value;
   };
+  const background=new NativeContextDelivery({call:mindCall,
+    runtime:async()=>{const current=await routing.ensureSession('kin-host:context-status');return current.agentInfo.connection.extMethod('_kin/runtime',{sessionId:manager.fence().threadId});},
+    inject:async request=>{const current=await routing.ensureSession('kin-host:context');return current.agentInfo.connection.extMethod('_kin/inject-checkpoint',request);}});
   const manager=new SessionManager({file,binding:{threadId:initial.threadId,nativeSessionId:initial.nativeSessionId},coordinator:router,inspect,collect,config:config.session_management??{},
     checkpoint:async(snapshot,binding,budget)=>mindCall('session-checkpoint',{snapshot,binding,budget:router.tasks().length?Math.max(budget,4000):budget}),
     compact:async operationId=>{const session=await routing.ensureSession('kin-host:compact');return session.agentInfo.connection.extMethod('_kin/compact',{sessionId:manager.fence().threadId,operationId});},
@@ -75,7 +78,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       const id=receipt.nativeEventId??receipt.operationId;
       const result=await mindCall('memory-compact-ack',{session:receipt.actual_session,epoch:id,actual_session:receipt.actual_session,completed:true});
       manager.state.restoreEpoch=id;manager.state.restoreRequired=true;
-      if(checkpoint){manager.state.restoreCheckpoint=checkpoint;manager.state.restorePending=true;}
+      manager.state.restoreCheckpoint=checkpoint??null;manager.state.restorePending=Boolean(checkpoint);
       manager.save('restore-checkpoint-pending');
       return result;
     },
@@ -101,11 +104,12 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     }});
   router.state.conversationId=manager.fence().conversationId;router.state.generation=manager.fence().generation;router.state.nativeSessionId=manager.fence().nativeSessionId;router.save('logical-conversation-bound');
   const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1);return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,pressure:s.observation?.pressure,advice:s.advice,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
+    deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
-      const cp=manager.state.restoreCheckpoint??manager.state.candidate?.checkpoint;if(!cp)return null;
+      const cp=manager.state.restoreCheckpoint??manager.state.rollingCheckpoint??manager.state.candidate?.checkpoint;if(!cp)return null;
       if(sourceCursor!==null){if(!Number.isInteger(sourceCursor)||sourceCursor<0)throw Error('Invalid source cursor');const all=Object.entries(cp.sourceRevisions);return {checkpointId:cp.id,sources:all.slice(sourceCursor,sourceCursor+10).map(([id,revision])=>({id,revision})),nextSourceCursor:sourceCursor+10<all.length?sourceCursor+10:null};}
-      return {...cp.payload,state:cp.complete?'ready':'incomplete',tokens:cp.tokens,coverage:cp.coverage.state,sourceCount:Object.keys(cp.sourceRevisions).length,readSourceCursor:0};
+      return {...cp.payload,state:cp.complete?'ready':'incomplete',tokens:cp.tokens,coverage:cp.coverage.state,manifestVersion:cp.manifestVersion??null,memoryCoverage:cp.memoryCoverage,metrics:cp.metrics,watermarks:cp.watermarks,sourceCount:Object.keys(cp.sourceRevisions).length,readSourceCursor:0};
     },
     notice:params=>{const update=params.update;
       // Native maintenance notifications cannot wait on the router mutex held
@@ -127,6 +131,13 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
           const cp=await manager.checkpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
           if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready');}
         }
+        if(snapshot.manifestVersion&&safeBoundary({...snapshot,runtime}).safe){
+          const key=digest(snapshot.cursors);
+          if(manager.state.rollingCursor!==key){
+            const cp=await mindCall('session-checkpoint',{snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
+            manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared');
+          }
+        }
         await manager.observe(runtime,snapshot);if(manager.state.observation)atomicJson(observationFile,manager.state.observation);
         const {state}=await mindCall('read');const advice=state?.session_advice;
         if(advice&&manager.state.observation&&advice.eventId!==manager.state.lastAdviceEvent){
@@ -142,9 +153,30 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     },
     async restoreBeforeDispatch(){
       // Called inside the router's dispatch coordinator; never request DS here.
-      const cp=manager.state.restoreCheckpoint;if(!manager.state.restorePending||!cp)return;
-      if(!(await mindCall('session-validate',{checkpoint:cp})).valid){manager.state.restorePending=false;manager.state.restoreCheckpoint=null;manager.save('restore-source-invalidated');return;}
+      // A native auto-compaction can finish between minute ticks and inputs.
+      // Reconcile its lifecycle before consulting the current window ledger.
+      await inspect();
+      if(!initialScan)for(const event of reader?.state.events??[])if(!manager.state.compactions.some(c=>c.nativeEventId===event.id))await manager.nativeCompaction(event);
+      if(!manager.state.restoreRequired&&!manager.state.restorePending)return;
+      let cp=manager.state.restoreCheckpoint;
+      if(!manager.state.restorePending||!cp||!(await mindCall('session-validate',{checkpoint:cp})).valid){
+        manager.state.restorePending=false;manager.state.restoreCheckpoint=null;manager.save('restore-source-refresh');
+        const snapshot=await collect();
+        cp=await mindCall('session-checkpoint',{snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false});
+        if(!cp.complete)throw Error('Restore coverage pending outside dispatch');
+        manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('fresh-restore-checkpoint-ready');
+      }
       const runtime=await inspect();if(!runtime.known||runtime.active||runtime.backgroundTasks||!runtime.rolloutPath)throw Error('Recovery boundary unconfirmed');
+      if(cp.manifestVersion){
+        const prepared=await mindCall('context-delivery-prepare',{session:runtime.threadId,epoch:manager.state.restoreEpoch,
+          event_id:'restore:'+cp.id,text:JSON.stringify(cp.payload),items:cp.contextDependencies??[],
+          budget:Math.max(manager.state.config.restoreBudget,router.tasks().length?4000:0),kind:'restore',manifest_id:cp.id});
+        if(prepared.state==='incomplete')throw Error('Restore envelope exceeds budget');
+        const receipt=await background.deliver(prepared);
+        if(receipt.state!=='accepted')throw Error('Restore receipt remains unconfirmed');
+        manager.state.restoration={id:prepared.id,state:'complete',checkpointId:cp.id,receipt:{state:receipt.state,textHash:receipt.text_hash}};
+        manager.state.restorePending=false;manager.state.restoreRequired=false;manager.save('manifest-restore-complete');return;
+      }
       const operationId='restore:'+digest([cp.id,manager.state.restoreEpoch]);
       let op=manager.state.restoration;
       const marker='kin-checkpoint:'+operationId;
