@@ -70,6 +70,11 @@ not block another verified intent. A pending review of that intent or an
 invalidated source still blocks it. Sending retains owner-epoch, source,
 deduplication, work-lock, threshold and quiet-hour checks.
 
+New exploration results join the due operational priority queue so their share,
+defer or keep decisions do not wait behind an older interaction backlog. They
+still respect the active action lease and retry backoff; a failed urgent result
+does not stop the next due batch.
+
 ## Visibility and deployment
 
 `operational-status` reports queue counts, action success and next review,

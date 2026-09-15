@@ -599,7 +599,7 @@ class Appraisals:
             lane_filter = " AND COALESCE(json_extract(data,'$.stimulus'),'') " + ("IN" if lane == "enrichment" else "NOT IN") + " ('memory-backfill','memory-enrichment')"
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute(
-                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + " ORDER BY CASE WHEN json_extract(data,'$.stimulus')='session-maintenance' THEN -1 WHEN json_extract(data,'$.stimulus')='idle-review' THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
+                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + " ORDER BY CASE WHEN json_extract(data,'$.stimulus') IN ('session-maintenance','idle-review','exploration-result') THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time()),
             ).fetchone()
             if not row:

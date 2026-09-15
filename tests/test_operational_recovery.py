@@ -88,6 +88,33 @@ def test_action_contract_excludes_unused_graph_schema():
     assert {"values", "wishes", "next_review_minutes"} <= action["properties"].keys()
 
 
+def test_exploration_result_precedes_backlog_without_defeating_retry_backoff(system):
+    mind, memory, source, _clock = system
+    memory.configure({"operational_lanes": True})
+    jobs = Appraisals(mind)
+    old = jobs.enqueue([source("old-interaction")], "fixture-v1")
+    current = jobs.enqueue([source("new-exploration")], "fixture-v1", stimulus="exploration-result")
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (old["id"],))
+
+    class PendingResult(Provider):
+        def appraise(self, context):
+            if context["stimulus"] == "exploration-result":
+                self.calls.append(context)
+                raise RuntimeError("synthetic-result-retry")
+            return super().appraise(context)
+
+    provider = PendingResult()
+    result = jobs.run_one(provider, lane="action")
+    assert result["id"] == current["id"]
+    assert result["state"] == "pending"
+    assert provider.calls[0]["stimulus"] == "exploration-result"
+    assert jobs.status(old["id"])["attempts"] == 0
+    # A failed urgent result keeps its backoff; it cannot starve due old work.
+    assert jobs.run_one(provider, lane="action")["id"] == old["id"]
+    assert jobs.status(old["id"])["state"] == "complete"
+
+
 def test_action_commits_and_enrichment_is_atomic_durable_separate(system):
     mind, memory, source, clock = system
     memory.configure({"operational_lanes": True})
