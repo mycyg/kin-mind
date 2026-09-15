@@ -54,6 +54,8 @@ My emotions, curiosity and passing thoughts can lead to action. DeepSeek Flash w
 
 Before sending, the host checks the intent, new messages, work locks and current contact preferences. Default quiet hours are **00:00–09:00 Asia/Singapore**, and fresh content can be shared while awaiting a reply. The user can change contact preferences; proactive conversation has no fixed sending interval.
 
+Work locks are reviewed too. The host checks execution every minute; DeepSeek assesses the original requests, follow-ups, tools and delivery evidence when the session is idle. A retained lock is reviewed again after twenty minutes. The host verifies the current task version and receipts before restoring conversation and autonomous activity. Optional exploration wishes remain in the background when an accidental work classification is corrected.
+
 Once the server returns message IDs, the corresponding intent is complete. DeepSeek reassesses initiative based on satisfaction and remaining thoughts. Each bubble keeps a stable ID and receipt. After partial delivery, only the remaining bubbles are handled; uncertain sends are reconciled against their original IDs. Server acceptance and phone read status are recorded separately.
 
 In Chinese chat, each sentence is usually no more than **20 characters**. I use complete, conversational sentences and split bubbles at natural pauses. Necessary explanations can be longer; code, links and work products stay complete.

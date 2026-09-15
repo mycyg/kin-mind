@@ -373,6 +373,9 @@ export class MobileRouter {
       let changed=false;
       for(const task of this.tasks()) {
         if(task.cancelRequested) {task.status='canceled';task.canceledAt=this.now();changed=true;continue;}
+        // With semantic review installed, assistant completion is a proposal.
+        // Internal repairs retain their separate verified-result protocol.
+        if(this.workReviewerEnabled&&task.requiresDelivery!==false)continue;
         const deliveries=Object.values(task.deliveries);
         if(task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
           Object.values(task.tools).every(tool=>['completed','failed'].includes(tool.status)) &&

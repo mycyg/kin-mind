@@ -22,7 +22,7 @@ Entering work mode takes effect at an idle boundary. An exit request remains
 pending until the task is delivered. A completion proposal alone does not release
 work: the host requires `completedTaskId` and `completedInputVersion`, then checks native turn completion, tool states,
 background terminals and confirmed delivery receipts. New input invalidates an
-earlier completion proposal. Unknown runtime, failed work and uncertain delivery
+earlier completion proposal. When `WorkLockReview` is installed, owner-task completion also requires a DeepSeek judgment; the assistant proposal remains supporting evidence. Unknown runtime, failed work and uncertain delivery
 retain the task. An explicit owner cancellation releases it only after execution
 has stopped. A platform receipt is not a read receipt.
 
@@ -98,6 +98,32 @@ message. Interrupted provider replacement requires reconciliation rather than a
 new conversation.
 
 ## Review cadence
+
+`WorkLockReview` checks the work lifecycle locally every minute and after new
+input, a completed native turn or a delivery update. At a verified idle boundary,
+DeepSeek Flash / max assesses the original authenticated inputs, their follow-ups,
+public answers, tool status, actual delivery receipts and linked background
+exploration wishes. It returns `keep`, `complete` or `not_a_task`. A held task is
+reviewed again after twenty minutes even if its inputs have not changed. Failed
+reviews use the same interval; busy native work only incurs a local check.
+
+The host rechecks the exact task/input version, actual runtime and evidence
+after the model returns, under the same mutex used for new input and model
+switches. A changed input, unfinished tool, background terminal, missing evidence
+or uncertain send preserves GPT-6. Deferred share approval is recorded as
+`deferred`, separately from a transport request in progress. DeepSeek may discard
+an older ordinary acknowledgement only when it judges the task `not_a_task`, a
+later authenticated input supersedes it and the host proves transport never
+started. Files and work deliveries cannot use that exception. Closing an accidental
+lock preserves its inputs and the independent exploration wishes.
+
+Assessment receipts, evidence hashes, decisions and recheck times survive restart.
+They remain available in the private runtime's `workReview` view and audit log.
+The reviewer does not send owner messages or create a second native conversation.
+The original thread resumes its verified conversation model after the host closes
+the task. Normal assistant completion cannot bypass an installed work reviewer;
+explicit owner cancellation and host-verified internal repairs retain their own
+lifecycle paths.
 
 `MobileAudit` performs a durable four-hour review of structured health evidence.
 The DeepSeek reviewer has no repair or messaging tools. It returns findings with
