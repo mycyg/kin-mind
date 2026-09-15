@@ -10,9 +10,10 @@ from .memory import MemoryContinuity
 
 
 class SessionCheckpoint:
-    def __init__(self, mind):
+    def __init__(self, mind, *, agent_version=None):
         self.mind = mind
         self.memory = MemoryContinuity(mind)
+        self.agent_version = agent_version
 
     def snapshot(self, pending=None):
         with self.mind.engine.db.connect() as conn:
@@ -54,7 +55,10 @@ class SessionCheckpoint:
                           "sourceId": event.get("source_id", event["id"]), "basis": "owner-statement" if role == "user" else "public-output",
                           "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record"})
         items.reverse()
-        config_version = state["agent_version"] + ":" + state["profile_version"]
+        # The host's loaded configuration is authoritative. An appraisal's
+        # first commit can update the state's historical agent stamp, which
+        # must not invalidate advice that already used the loaded version.
+        config_version = (self.agent_version or state["agent_version"]) + ":" + state["profile_version"]
         cursor = digest([[item["id"], item["revision"]] for item in items])
         return {"configVersion": config_version, "cursors": {"public": cursor}, "items": items, "invalidatedSources": reviewed,
                 "sourceRevisions": {i["id"]: i["revision"] for i in items}, "scope": self.mind.scope.model_dump(),

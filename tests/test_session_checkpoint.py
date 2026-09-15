@@ -46,6 +46,22 @@ def test_pending_public_journal_is_available_before_semantic_queue_and_receipts_
     assert snapshot['items'][0]['delivery'] == 'not-confirmed-by-this-record'
 
 
+def test_first_appraisal_after_host_upgrade_does_not_invalidate_its_own_config_snapshot(system):
+    mind, _, source, _ = system
+    api = SessionCheckpoint(mind, agent_version='host-v2')
+    before = api.snapshot()
+    jobs = Appraisals(mind, exploration_capabilities={'version': 'host-v2'}, session_context={'id': 'observation', 'binding': {'generation': 1}})
+    jobs.enqueue([source('maintenance')], 'host-v2', origin='reflection', stimulus='session-maintenance')
+
+    class Reviewer:
+        def appraise(self, context):
+            return Appraisal(reason='Keep current thread', session_advice=SessionAdvice(action='keep', reason='No degradation')), {'model': 'deepseek-flash', 'reasoning': 'max'}
+
+    assert jobs.run_one(Reviewer())['state'] == 'complete'
+    assert mind.read()['agent_version'] == 'host-v2'
+    assert api.snapshot()['configVersion'] == before['configVersion']
+
+
 def test_overbudget_checkpoint_waits_without_truncating_the_last_exchange(system):
     mind, _, _, _ = system
     api = SessionCheckpoint(mind)

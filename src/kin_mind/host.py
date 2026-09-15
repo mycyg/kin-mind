@@ -55,7 +55,7 @@ def dispatch(config, action, request):
     memory = MemoryContinuity(mind)
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
-        checkpoints = SessionCheckpoint(mind)
+        checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])
         if action == "session-validate":
             return checkpoints.validate(request["checkpoint"])
         if action == "session-snapshot":
