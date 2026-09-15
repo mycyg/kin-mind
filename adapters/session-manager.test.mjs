@@ -6,7 +6,7 @@ import path from 'node:path';
 import {SessionManager} from './session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from './session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
-import {recoverSessionStore} from './mobile-session-host.mjs';
+import {recoverSessionStore,loadCandidateSession} from './mobile-session-host.mjs';
 
 function fixture(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-sessions-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -35,6 +35,17 @@ test('restart restores the last native measurement and recognizes a compaction c
  assert.equal(value.usageEvidence.measuredAt,history.measuredAt);
  const measured=nativePressureRuntime({...runtime,lastTokenUsage:{inputTokens:40000,outputTokens:1000,totalTokens:41000}},history);
  assert.equal(windowPressure(measured).expectedInputTokens,40000);assert.equal(measured.usageEvidence.source,'native-runtime');
+});
+test('candidate activation suppresses history replay and restores the verified mobile profile',async()=>{
+ const calls=[],gateway={baseUrl:'http://synthetic.invalid',token:'synthetic-token',reasoningEffort:'max'};
+ const actual={known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',nativeStatus:'idle',model:'gpt-6-astra',reasoningEffort:'medium',providerOverride:false};
+ let suppressed=false;const client={beginSessionReplay(){suppressed=true;},async endSessionReplay(){suppressed=false;calls.push('drained');}};
+ const connection={async loadSession(){assert.ok(suppressed);calls.push('load');},async extMethod(method){calls.push(method);if(method==='providers/set'){actual.providerOverride=true;actual.providerBaseUrl=gateway.baseUrl;}return {...actual};},
+ async setSessionConfigOption({configId,value}){actual[configId==='reasoning_effort'?'reasoningEffort':configId]=value;return {configOptions:[{id:configId,value}]};}};
+ const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate:{verification:{model:'deepseek-flash',reasoningEffort:'max',fastMode:'off'}},cwd:'/synthetic',gateway});
+ assert.equal(result.actual.model,'deepseek-flash');assert.equal(result.actual.profileReady,true);assert.deepEqual(calls.slice(0,2),['load','drained']);assert.equal(suppressed,false);
+ connection.loadSession=async()=>{throw Error('load failed');};
+ await assert.rejects(loadCandidateSession({client,connection,binding:{threadId:'new'},candidate:{},cwd:'/synthetic',gateway}),/load failed/);assert.equal(suppressed,false);
 });
 test('high pressure is compacted first; fifty historical compactions do not authorize rotation',async t=>{
  const f=fixture(t);await f.advise('rotate');assert.equal((await f.manager.tick()).reason,'compact-first');assert.ok(!f.calls.includes('create'));

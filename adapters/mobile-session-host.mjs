@@ -6,10 +6,24 @@ import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-wind
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeBoundary} from './session-policy.mjs';
+import {switchCodexModel} from './codex-models.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 
 export function registryBinding(file,fallback){return fs.existsSync(file)?read(file).binding:fallback;}
+
+export async function loadCandidateSession({client,connection,binding,candidate,cwd,gateway}) {
+  client.beginSessionReplay();
+  try {await connection.loadSession({sessionId:binding.threadId,cwd,mcpServers:[]});}
+  finally {await client.endSessionReplay();}
+  // ACP may restore its launch profile. Reapply the verified mobile profile
+  // before dispatch opens, without generating a synthetic user turn.
+  const expected=candidate.verification;
+  const actual=await switchCodexModel({connection,sessionId:binding.threadId,model:expected.model,gateway,workFast:expected.fastMode==='on'});
+  const options=await connection.setSessionConfigOption({sessionId:binding.threadId,configId:'reasoning_effort',value:expected.reasoningEffort});
+  if(!actual.known||actual.threadId!==binding.threadId||actual.nativeSessionId!==binding.nativeSessionId||actual.model!==expected.model||actual.reasoningEffort!==expected.reasoningEffort||(actual.fastMode??'off')!==expected.fastMode)throw Error('Promoted native runtime unverified');
+  return {actual,configOptions:options.configOptions};
+}
 
 export function recoverSessionStore(registry,saved,ownerId){
   const candidate=registry?.candidate,binding=registry?.binding;
@@ -76,10 +90,8 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       if(!session||session.processing||session.queue.length)throw Error('Host became busy before promotion');
       const connection=session.agentInfo.connection;
       if(!(await mindCall('session-validate',{checkpoint:candidate.checkpoint})).valid)throw Error('Checkpoint sources changed before promotion');
-      session.client.beginReplay();let loaded;
-      try{loaded=await connection.loadSession({sessionId:binding.threadId,cwd:path.join(root,'conversation'),mcpServers:[]});}finally{session.client.endReplay();}
-      const actual=await connection.extMethod('_kin/runtime',{sessionId:binding.threadId});
-      if(!actual.known||actual.threadId!==binding.threadId||actual.nativeSessionId!==binding.nativeSessionId||actual.model!==candidate.verification.model)throw Error('Promoted native runtime unverified');
+      const loaded=await loadCandidateSession({client:session.client,connection,binding,candidate,cwd:path.join(root,'conversation'),gateway:routing.gateway});
+      const {actual}=loaded;
       session.agentInfo.sessionId=binding.threadId;session.configOptions=loaded.configOptions;session.agentInfo.configOptions=loaded.configOptions;
       await bridge.sessionManager.opts.persistSessionId(bridge.ownerId,binding.threadId);session.sessionIdPersisted=true;
       if(router.state.generation!==binding.generation)router.adoptBinding(binding,actual);
