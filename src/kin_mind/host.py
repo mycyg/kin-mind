@@ -59,6 +59,9 @@ def dispatch(config, action, request):
     if action == "recover-operational":
         from .recovery import migrate_operational
         return migrate_operational(mind, workers_stopped=request.get("workers_stopped"))
+    if action == "recover-history":
+        from .recovery import recover_history
+        return recover_history(mind, **request)
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
         checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])
@@ -122,11 +125,12 @@ def dispatch(config, action, request):
             result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
         return result
     if action == "memory-context":
+        from .dialogue import clock_context
         if config.get("adaptive_sessions"):
             request["native_pressure_managed"] = True
         if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
             request['receipt_mode'] = True
-        return Contexts(mind).build(**request)
+        return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
     if action == "memory-window":
         window = Contexts(mind).window(config["session_id"])
         return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":window["used"]>=12000}

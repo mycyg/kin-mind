@@ -261,11 +261,12 @@ class EventGraph:
             self.link(conn, identifier, "part_of", tid, refs, reason="Same host task identifier")
         return node
 
-    def apply(self, conn, proposal, refs, event_id, receipt):
+    def apply(self, conn, proposal, refs, event_id, receipt, *, external_aliases=None):
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
-        aliases = {n.key: n.id or self.identifier(n.kind, [event_id, n.key]) for n in proposal.nodes}
-        if len(aliases) != len(proposal.nodes):
+        node_aliases = {n.key: n.id or self.identifier(n.kind, [event_id, n.key]) for n in proposal.nodes}
+        if len(node_aliases) != len(proposal.nodes) or node_aliases.keys() & (external_aliases or {}).keys():
             raise Conflict("Graph keys must be unique")
+        aliases = {**(external_aliases or {}), **node_aliases}
         for item in proposal.nodes:
             evidence = self.proof(conn, item.evidence_ids, allowed)
             identifier = aliases[item.key]
@@ -308,7 +309,7 @@ class EventGraph:
                 basis = "inferred"
             self.link(conn, aliases.get(edge.subject, edge.subject), edge.relation, aliases.get(edge.object, edge.object), evidence,
                 basis=basis, reason=edge.reason, role=edge.role, confidence=edge.confidence, valid_from=edge.valid_from, valid_until=edge.valid_until, event_id=event_id)
-        return {"node_ids": list(aliases.values()), "edge_count": len(proposal.edges)}
+        return {"node_ids": list(node_aliases.values()), "edge_count": len(proposal.edges)}
 
     def candidates(self, conn, query="", limit=40):
         limit = min(40, max(1, limit))

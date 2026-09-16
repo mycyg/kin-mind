@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
+import {conversationClock} from './conversation-time.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
@@ -132,7 +133,7 @@ export class MobileRouter {
           let timer;
           const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
           let result;
-          try {result=await Promise.race([this.classify({text:input.text,recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
+          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
           finally {clearTimeout(timer);}
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
@@ -148,7 +149,7 @@ export class MobileRouter {
       const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
-        this.state.recent.push({role:'user',text:input.text.slice(0,4000)});
+        this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
         this.state.recent=this.state.recent.slice(-16);
       }
       this.save('input-selected',{id:input.id,route:decision,reason});return clone(record);
@@ -383,7 +384,7 @@ export class MobileRouter {
   observe(kind,data={}) {
     return this.locked(async()=>{
       const task=data.taskId?this.state.tasks[data.taskId]:this.currentTask();
-      if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000)});this.state.recent=this.state.recent.slice(-16);}
+      if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
         if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();delete task.turnEndedAt;}
         if(kind==='prompt-end') {task.turnEndedAt=this.now();task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}

@@ -6,6 +6,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.retrieval import tokens
 
 from .context import Contexts
+from .dialogue import dialogue_rows, split_recent, utc_time
 from .memory import MemoryContinuity
 
 
@@ -16,8 +17,8 @@ class SessionCheckpoint:
         self.agent_version = agent_version
 
     def snapshot(self, pending=None, *, tasks=None, intent=None):
+        rows = dialogue_rows(self.mind, exchanges=8, include_historical=False)
         with self.mind.engine.db.connect() as conn:
-            rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND kind IN ('owner-message','assistant-message','delivery') AND COALESCE(json_extract(data,'$.historical'),0)=0 ORDER BY occurred_at DESC,seq DESC LIMIT 24", (self.mind.scope.key(),)).fetchall()
             state = self.mind._load(conn)
         pending = pending or []
         events = {json.loads(r["data"])["id"]: json.loads(r["data"]) for r in rows}
@@ -27,7 +28,7 @@ class SessionCheckpoint:
         items = []
         texts = {}
         reviewed = []
-        for event in sorted(events.values(), key=lambda e: (e["at"], e["id"]), reverse=True):
+        for event in sorted(events.values(), key=lambda e: (utc_time(e["at"]), e["id"]), reverse=True):
             if not event.get("text") or event.get("kind") == "delivery" and event.get("state") != "accepted":
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
@@ -42,6 +43,7 @@ class SessionCheckpoint:
             if event.get("origin") == "runtime-notice" or event["text"].startswith("Warning: Heads up: Long threads"):
                 continue
             dependencies = []
+            received_at = event.get("received_at")
             if event.get("source_id"):
                 try:
                     with self.mind.engine.db.connect() as conn:
@@ -49,14 +51,16 @@ class SessionCheckpoint:
                         if not self.mind._fresh(conn, refs):
                             raise Conflict("Corrected source")
                         dependencies = [{"id": ref["record_id"], "revision": ref["revision"]} for ref in refs]
+                        received_at = received_at or refs[0].get("received_at")
                 except (Conflict, Missing):
                     reviewed.append(event["id"])
                     continue
             items.append({"id": event["id"], "revision": digest([event, dependencies]), "role": role, "text": event["text"], "at": event["at"], "dependencies": dependencies,
+                          "occurred_at": utc_time(event["at"]), "received_at": utc_time(received_at),
                           "sourceId": event.get("source_id", event["id"]), "basis": "owner-statement" if role == "user" else "public-output",
                           "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record"})
         items.reverse()
-        items = items[-24:]
+        items, _ = split_recent(items, exchanges=8)
         linked, watermarks = None, None
         if self.memory.settings().get('manifests'):
             from .continuity_manifest import ContinuityManifest
@@ -102,14 +106,9 @@ class SessionCheckpoint:
                 nativeCoverage='unknown; critical facts restored from canonical sources')
             checkpoint['sourceRevisions'].update({i['id']: i['revision'] for i in selected})
 
-        # The last complete exchange carries the referent of short replies.
-        last_user = next((index for index in range(len(raw)-1, -1, -1) if raw[index]["role"] == "user"), 0)
-        # Keep the question before a short user answer as well as every bubble
-        # in its response. A bare last-two-items slice can lose that referent.
-        start = max(0, last_user - 1)
-        while start > 0 and raw[start-1]["role"] == "assistant":
-            start -= 1
-        recent, older = raw[start:], raw[:start]
+        # The last four complete exchanges survive compression verbatim,
+        # including every bubble and the antecedent of short owner replies.
+        recent, older = split_recent(raw)
         checkpoint["sourceDependencies"] = list({(d["id"], d["revision"]): d for item in raw for d in item.get("dependencies", [])}.values())
         checkpoint["invalidatedSources"] = snapshot.get("invalidatedSources", [])
         checkpoint["items"] = recent
@@ -176,7 +175,7 @@ class SessionCheckpoint:
         return {'kind': 'internal-continuity-checkpoint', 'marker': 'kin-checkpoint:restore:' + 'f' * 64,
                 'checkpointId': checkpoint.get('id', 'checkpoint:' + 'f' * 64),
                 'conversationId': checkpoint['conversationId'], 'generation': checkpoint['generation'], 'configVersion': checkpoint['configVersion'],
-                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at') if k in item} for item in checkpoint['items']],
+                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at', 'occurred_at', 'received_at') if k in item} for item in checkpoint['items']],
                 'tasks': [{k: task[k] for k in ('id', 'inputVersion', 'status', 'goal', 'summary', 'acceptance', 'remaining', 'result') if k in task} for task in checkpoint.get('tasks', [])],
                 'inputStates': [{k: item[k] for k in ('id', 'state', 'taskId') if k in item} for item in selected.values()],
                 'readSources': 'read_conversation_checkpoint', 'shared': checkpoint['shared'],

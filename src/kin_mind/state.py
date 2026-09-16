@@ -236,6 +236,7 @@ class Mind(Continuity):
             "authority": data["authority"],
             "session": row["session"],
             "occurred_at": row["occurred_at"],
+            "received_at": row["received_at"],
             "namespace": row["namespace"],
             "source_key": row["source_key"],
             "metadata": data.get("metadata", {}),

@@ -18,6 +18,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.models import Model, RecordInput, SourceInput
 
 from .computer import redact
+from .dialogue import recent_dialogue
 from .graph import EventGraph, GraphAssessment, query_terms
 from .habits import ConversationHabits
 from .sharing import CoverageAssessment, ShareLedger
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS mind_runtime_events(
  seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,scope TEXT NOT NULL,
  kind TEXT NOT NULL,occurred_at TEXT NOT NULL,digest TEXT NOT NULL,data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS mind_runtime_scope ON mind_runtime_events(scope,seq);
+CREATE INDEX IF NOT EXISTS mind_runtime_time ON mind_runtime_events(scope,julianday(occurred_at),seq);
 CREATE TABLE IF NOT EXISTS mind_memory_nodes(
  id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,revision INTEGER NOT NULL,
  updated_at TEXT NOT NULL,data TEXT NOT NULL);
@@ -201,11 +203,24 @@ class MemoryContinuity:
         timestamp(event["at"])
         event = redact(event)
         event_id = self._id("runtime", event["id"])
-        fingerprint = digest(event)
+        # Receipt metadata is recorded on the first commit. A delivery retry
+        # may observe a later receipt time without changing the original event.
+        fingerprint = digest({k:v for k,v in event.items() if k not in {"received_at", "time_basis"}})
+        def same_observation(old):
+            if old["digest"] == fingerprint:
+                return True
+            # Older hosts included receipt metadata in the immutable digest.
+            stored, original = json.loads(old["data"]), dict(event)
+            for key in ("received_at", "time_basis"):
+                if key in stored:
+                    original[key] = stored[key]
+                else:
+                    original.pop(key, None)
+            return old["digest"] == digest(original)
         with self.engine.db.connect() as conn:
             old = conn.execute("SELECT * FROM mind_runtime_events WHERE id=?", (event_id,)).fetchone()
             if old:
-                if old["digest"] != fingerprint:
+                if not same_observation(old):
                     raise Conflict("Runtime event id belongs to different data")
                 return {"id": event_id, "seq": old["seq"], "state": "recorded", **json.loads(old["data"])["receipt"]}
         artifact = dict(event.get("artifact") or {})
@@ -232,7 +247,7 @@ class MemoryContinuity:
             # Another host may have committed while file/source IO ran.
             old = conn.execute("SELECT * FROM mind_runtime_events WHERE id=?", (event_id,)).fetchone()
             if old:
-                if old["digest"] != fingerprint:
+                if not same_observation(old):
                     raise Conflict("Conflicting runtime event")
                 return {"id": event_id, "seq": old["seq"], "state": "recorded", **json.loads(old["data"])["receipt"]}
             refs = self.mind._evidence(conn, [source_id])
@@ -379,11 +394,11 @@ class MemoryContinuity:
             row = conn.execute("SELECT * FROM mind_semantic_cursor WHERE scope=?", (self.scope.key(),)).fetchone()
             cursor = dict(row) if row else {"seq": 0, "next_review": self.mind.clock(), "revision": 0, "data": "{}"}
             pending = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND COALESCE(json_extract(data,'$.historical'),0)=0 ORDER BY seq LIMIT ?", (self.scope.key(), cursor["seq"], event_limit)).fetchall()
-            recent = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND kind IN ('owner-message','assistant-message','delivery') ORDER BY occurred_at DESC,seq DESC LIMIT ?", (self.scope.key(), 8 if operational else 16)).fetchall()
             latest_owner_seq = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope.key(),)).fetchone()[0]
+        recent = recent_dialogue(self.mind)
         if not query:
-            owner_messages = [json.loads(r["data"]) for r in recent if json.loads(r["data"]).get("kind") == "owner-message"]
-            query = " ".join(e.get("text", "") for e in owner_messages[:2])
+            owner_messages = [e for e in recent if e.get("kind") == "owner-message"]
+            query = " ".join(e.get("text", "") for e in owner_messages[-2:])
         with self.engine.db.connect() as conn:
             graph_context = self.graph.candidates(conn, query) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
             for node in graph_context:
@@ -394,7 +409,7 @@ class MemoryContinuity:
                 "graph_candidates": graph_context,
                 "conversation_habits": self.habits.read(),
                 "pending_events": [{"seq": r["seq"], **json.loads(r["data"])} for r in pending],
-                "recent_interaction": [json.loads(r["data"]) for r in reversed(recent)],
+                "recent_interaction": recent,
                 "works": [] if operational else self.history("work", query=query, limit=3)["items"],
                 "shares": [] if operational else self.history("share", query=query, limit=12)["items"],
                 "next_review": cursor["next_review"], "revision": cursor["revision"], "latest_owner_seq": latest_owner_seq}
@@ -465,9 +480,18 @@ class MemoryContinuity:
             if any(r["source_id"] not in allowed_sources and r["record_id"] not in allowed_records for r in selected) or not self.mind._fresh(conn, selected):
                 raise Conflict("Semantic evidence is outside the evaluated source set")
             return selected
-        aliases = {note.key: "mem_" + digest([self.scope.key(), event_id, note.key])[:32] for note in assessment.notes}
-        if len(aliases) != len(assessment.notes):
+        note_aliases = {note.key: "mem_" + digest([self.scope.key(), event_id, note.key])[:32] for note in assessment.notes}
+        if len(note_aliases) != len(assessment.notes):
             raise Conflict("Memory note keys must be unique in an assessment")
+        config = self.settings(conn)
+        graph = assessment.graph
+        if not config["associations"]:
+            graph = graph.model_copy(update={"nodes": [n for n in graph.nodes if n.kind != "association" and n.basis != "internal_thought"],
+                "edges": [e for e in graph.edges if e.relation != "association" and e.basis != "internal_thought"]})
+        graph_aliases = {n.key: n.id or self.graph.identifier(n.kind, [event_id, n.key]) for n in graph.nodes} if config["graph"] else {}
+        if graph_aliases.keys() & note_aliases.keys():
+            raise Conflict("Memory and graph keys must be unique in an assessment")
+        aliases = {**note_aliases, **graph_aliases}
         resolve = lambda identifier: aliases.get(identifier, identifier)
         for note in assessment.notes:
             sources = evidence(note.evidence_ids)
@@ -476,7 +500,11 @@ class MemoryContinuity:
                 title=note.title, content=note.content, source_ids=sorted({r["source_id"] for r in sources}),
                 evidence_ids=sorted({r["record_id"] for r in sources}), generated=True, confirmation="inferred",
                 attributes={"semantic_event": event_id, "key": note.key, "model": receipt.get("model"), "about_ids": [resolve(i) for i in note.about_ids]}))
-        # All note IDs exist before any forward reference is resolved.
+        # Materialize both kinds of nodes before resolving cross-kind links.
+        # This remains inside the caller's transaction: a bad edge rolls back
+        # notes and graph nodes together, including their revision history.
+        if config["graph"]:
+            self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases)
         for note in assessment.notes:
             for identifier in note.about_ids:
                 for root in self._record_ids(conn, resolve(identifier)):
@@ -508,13 +536,6 @@ class MemoryContinuity:
                          about_ids=list(dict.fromkeys([*share.get("about_ids", []), *proposal.about_ids])),
                          assessment_event=event_id, assessment_receipt=receipt)
             self._put(conn, share)
-        config = self.settings(conn)
-        if config["graph"]:
-            graph = assessment.graph
-            if not config["associations"]:
-                graph = graph.model_copy(update={"nodes": [n for n in graph.nodes if n.kind != "association" and n.basis != "internal_thought"],
-                    "edges": [e for e in graph.edges if e.relation != "association" and e.basis != "internal_thought"]})
-            self.graph.apply(conn, graph, refs, event_id, receipt)
         if config["sharing"]:
             allowed_shares = {m.share_id for m in assessment.coverage.mappings
                 if any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, self._get(conn, m.share_id)["source_ids"]))}

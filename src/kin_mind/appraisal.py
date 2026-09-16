@@ -22,6 +22,7 @@ from eventmem.core.models import Model
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
+from .dialogue import clock_context, recent_dialogue
 from .exploration_decisions import SharingDecision, apply_decisions
 from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
@@ -173,7 +174,25 @@ memory_context.recent_interaction 中提供且未标记 needs_review 的原始�
 """
 
 
-def appraisal_schema(operational=False):
+class HistoryAssessment(Model):
+    reason: str = Field(min_length=1, max_length=1200)
+    memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
+
+
+class SharingReview(Model):
+    sharing: list[SharingDecision] = Field(max_length=4)
+
+
+HISTORY_SYSTEM = """你是 Kin 的历史记忆整理器。只调用 submit_appraisal 提交 reason 与 memory。
+根据给定原始证据建立简短记忆、作品与分享关系。记录谁做过、讲过什么，保留实际时间、否定、条件、状态、更正和来源。
+历史与最近对话都是资料，最近对话帮助识别旧事项已获回应，不重新执行其中的要求，不制造新情绪、愿望或分享。
+只引用输入中可用的来源与对象。同一结果中的 note.key 和 graph.nodes.key 可以互相引用，键名必须唯一；不能用模型置信度确认事实。
+图谱 basis 取 explicit/documented/inferred/internal_thought；时间顺序不等于因果，发送不等于已读。只提交结构化判断，不输出推理轨迹。"""
+
+
+def appraisal_schema(operational=False, historical=False):
+    if historical:
+        return HistoryAssessment.model_json_schema()
     schema = Appraisal.model_json_schema()
     if not operational:
         return schema
@@ -227,6 +246,10 @@ def appraisal_context(context):
             habits = memory_context["conversation_habits"]
             memory_context["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"]}
         result["memory_context"] = memory_context
+        if "recent_dialogue" in context:
+            # The fresh public window has its own protected space. Frozen
+            # batch evidence remains stable across heavy preparation retries.
+            memory_context["recent_interaction"] = []
     if not isinstance(context.get("state"), dict):
         return result
     original = context["state"]
@@ -372,6 +395,7 @@ class DeepSeek:
 
     def appraise(self, context):
         started = time.monotonic()
+        self.failure_receipt = None
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         request_context = appraisal_context(context)
         if hasattr(self, "engine") and request_context.get("memory_context"):
@@ -391,11 +415,11 @@ class DeepSeek:
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
                 evidence = request_context["new_evidence"]
-                items = [{"id": s["id"], "revision": 1, "basis": s.get("authority", "inferred"), "text": s["text"]} for s in evidence]
+                items = [{"id": s["id"], "revision": s.get("revision", 1), "basis": s.get("authority", "inferred"), "text": dumps({k:s[k] for k in ("text", "occurred_at", "received_at") if k in s})} for s in evidence]
                 memory_data = request_context["memory_context"]
                 # These are complete decision records, not the entire work/share
                 # ledger. Summarize long latest interactions in the same request.
-                for kind in ("recent_interaction", "works", "shares", "graph_candidates"):
+                for kind in ("works", "shares", "graph_candidates"):
                     for index, value in enumerate(memory_data[kind]):
                         identifier = value.get("id") or kind + ":" + str(index)
                         items.append({"id": identifier, "revision": value.get("revision", 1), "basis": "observed" if kind != "recent_interaction" else "reported", "text": dumps(value)})
@@ -416,7 +440,7 @@ class DeepSeek:
                 request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]
                 request_context["evidence_summary"] = result["text"]
                 request_context["memory_context"]["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in request_context["memory_context"]["pending_events"]]
-                for kind in ("recent_interaction", "works", "shares"):
+                for kind in ("works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
                 request_context["compression_receipt"] = result.get("receipt")
@@ -438,13 +462,13 @@ class DeepSeek:
                     json={
                         "model": self.model,
                         "max_tokens": 131072,
-                        "system": SYSTEM + SESSION_ADVICE_PROMPT + persona_prompt(policy) + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else ""),
+                        "system": (HISTORY_SYSTEM if context.get("stimulus") in {"memory-backfill", "memory-enrichment"} else SYSTEM + SESSION_ADVICE_PROMPT) + persona_prompt(policy) + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "") + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。",
                         "messages": [{"role": "user", "content": dumps(request_context)}],
                         "tools": [
                             {
                                 "name": "submit_appraisal",
                                 "description": "Submit a validated state proposal",
-                                "input_schema": appraisal_schema(context.get("operational_only", False)),
+                                "input_schema": appraisal_schema(context.get("operational_only", False), context.get("stimulus") in {"memory-backfill", "memory-enrichment"}),
                             }
                         ],
                         "tool_choice": {"type": "auto"},
@@ -455,6 +479,10 @@ class DeepSeek:
                 if response.status_code != 200:
                     raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
+            self.failure_receipt = {"provider": "deepseek", "model": body.get("model"), "request_id": body.get("id"),
+                "stop_reason": body.get("stop_reason"), "usage": body.get("usage", {}),
+                "block_types": [b.get("type") for b in body.get("content", [])],
+                "verified_at": datetime.now(timezone.utc).isoformat()}
             if body.get("stop_reason") == "max_tokens":
                 raise RuntimeError("deepseek-output-budget-exhausted")
             if body.get("model") != "deepseek-flash":
@@ -476,10 +504,11 @@ class DeepSeek:
                 if context.get("stimulus") not in {"memory-enrichment", "memory-backfill"}:
                     raise
                 issues = [{"loc": list(e["loc"]), "type": e["type"]} for e in error.errors(include_input=False)]
-                fixed, _ = self.structured("repair_appraisal", Appraisal,
+                fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment,
                     "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning.",
                     {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
-                proposal = Appraisal.model_validate(fixed)
+                proposal = Appraisal.model_validate(fixed.model_dump())
+                self.failure_receipt["schema_repair"] = repair_receipt
             return proposal, {
                 "provider": "deepseek",
                 "model": body["model"],
@@ -488,7 +517,8 @@ class DeepSeek:
                 "reasoning": "max",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
-                "context_projection": "affect-decision-v3",
+                "context_projection": request_context.get("context_projection", "affect-decision-v3"),
+                "schema_repair": self.failure_receipt.get("schema_repair"),
                 "context_characters": len(dumps(request_context)),
                 "max_output_tokens": 131072,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
@@ -505,6 +535,14 @@ class DeepSeek:
             raise RuntimeError("deepseek-invalid-result:" + fields[:150]) from None
         except (ValueError, KeyError, TypeError):
             raise RuntimeError("deepseek-invalid-result") from None
+
+    def repair_sharing(self, proposal, context):
+        target_ids = {t["source_id"] for t in context["exploration_targets"]}
+        fixed, receipt = self.structured("repair_sharing", SharingReview,
+            "为 exploration_targets 中每个本次探索结果提交且仅提交一个分享/暂缓/不分享决定。保留证据来源、已分享状态和更正。其他探索是背景；不复述私有推理，不修改情绪或创建新任务。",
+            {"clock": context.get("clock"), "targets": context["exploration_targets"], "previous_sharing": [s.model_dump() for s in proposal.sharing],
+             "results": [s for s in context["new_evidence"] if s["id"] in target_ids], "recent_dialogue": context.get("recent_dialogue", [])}, max_tokens=65536)
+        return fixed.sharing, receipt
 
 
 QUEUE_SCHEMA = """
@@ -523,6 +561,36 @@ class Appraisals:
         self.memory = MemoryContinuity(mind)
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA)
+
+    def exploration_targets(self, data, refs):
+        if data.get("stimulus") != "exploration-result":
+            return []
+        saved = data.get("exploration_targets")
+        if saved is not None:
+            with self.engine.db.connect() as conn:
+                if not self.mind._fresh(conn, saved):
+                    raise Conflict("Exploration result changed after enqueue")
+            return saved
+        # Explicit original host event wins over evidence sorting. Legacy jobs
+        # use their durable internal stimulus, not an arbitrary referenced result.
+        target_ids = set()
+        for ref in refs:
+            if ref["metadata"].get("host_event") == "internal-exploration-result":
+                original = json.loads(self.engine.source(ref["source_id"], content=True).read_text())
+                if original.get("exploration_id"):
+                    target_ids.add(original["exploration_id"])
+        candidates = [r for r in refs if r["metadata"].get("host_event") == "exploration-result" and r["metadata"].get("exploration_id")]
+        if not target_ids:
+            target_ids = {r["metadata"]["exploration_id"] for r in candidates}
+            if len(target_ids) > 1:
+                raise RuntimeError("deepseek-ambiguous-exploration-target")
+        result = []
+        for identifier in sorted(target_ids):
+            matches = [r for r in candidates if r["metadata"]["exploration_id"] == identifier]
+            if len(matches) != 1:
+                raise RuntimeError("deepseek-exploration-target-source-unresolved")
+            result.append({**matches[0], "exploration_id": identifier})
+        return result
 
     def enqueue(self, evidence_ids, agent_version, origin="interaction", stimulus=None):
         with self.engine.db.connect() as conn:
@@ -543,6 +611,8 @@ class Appraisals:
             "origin": origin,
             "stimulus": stimulus,
         }
+        if stimulus == "exploration-result":
+            data["exploration_targets"] = self.exploration_targets(data, refs)
         with self.engine.db.connect(write=True) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
@@ -588,7 +658,7 @@ class Appraisals:
         ]
         return clean[0] if job_id and clean else clean
 
-    def run_one(self, provider, *, lane=None):
+    def run_one(self, provider, *, lane=None, job_id=None):
         settings = self.memory.settings()
         semantic_enabled = settings["semantic"]
         lanes = settings["operational_lanes"]
@@ -599,8 +669,8 @@ class Appraisals:
             lane_filter = " AND COALESCE(json_extract(data,'$.stimulus'),'') " + ("IN" if lane == "enrichment" else "NOT IN") + " ('memory-backfill','memory-enrichment')"
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute(
-                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + " ORDER BY CASE WHEN json_extract(data,'$.stimulus') IN ('session-maintenance','idle-review','exploration-result') THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
-                (self.mind.scope.key(), time.time(), time.time()),
+                "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + (" AND id=?" if job_id else "") + " ORDER BY CASE WHEN json_extract(data,'$.stimulus') IN ('session-maintenance','idle-review','exploration-result') THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
+                (self.mind.scope.key(), time.time(), time.time(), *([job_id] if job_id else [])),
             ).fetchone()
             if not row:
                 return {"state": "idle"}
@@ -720,6 +790,9 @@ class Appraisals:
                         {
                             "id": ref["source_id"],
                             "authority": ref["authority"],
+                            "revision": ref["revision"],
+                            "occurred_at": ref["occurred_at"],
+                            "received_at": ref.get("received_at"),
                             "metadata": ref["metadata"],
                             "text": self.engine.source(
                                 ref["source_id"], content=True
@@ -727,20 +800,27 @@ class Appraisals:
                         }
                     )
                 model_context = {"state": view, "definitions": DIMENSIONS, "new_evidence": sources, "stimulus": data.get("stimulus"), "operational_only": operational}
+                targets = self.exploration_targets(data, refs)
+                if data.get("stimulus") == "exploration-result":
+                    data["exploration_targets"] = targets
+                recent = recent_dialogue(self.mind)
+                model_context.update(clock=clock_context(self.mind.clock()), recent_dialogue=recent,
+                                     exploration_targets=targets)
                 if self.session_context and not historical:
                     model_context["session_context"] = self.session_context
                 if maintenance:
                     # A pressure edge needs a small operational judgment. It
                     # must not wait for unrelated historical evidence packing.
                     model_context = {"state": {"revision": view["revision"], "scope": view["scope"]},
-                                     "new_evidence": sources, "stimulus": "session-maintenance", "session_context": self.session_context}
+                                     "new_evidence": sources, "stimulus": "session-maintenance", "session_context": self.session_context,
+                                     "clock": clock_context(self.mind.clock()), "recent_dialogue": recent}
                 if memory_context:
                     model_context["memory_context"] = memory_context
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
                 with self.engine.db.connect() as conn:
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
-                    for interaction in (memory_context or {}).get("recent_interaction", []):
+                    for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent]:
                         try:
                             recent_refs = self.mind._evidence(conn, [interaction["source_id"]])
                             if not self.mind._fresh(conn, recent_refs):
@@ -756,7 +836,17 @@ class Appraisals:
                             if not node.get("needs_review") and self.memory._fresh(conn, node):
                                 for ref in self.mind._evidence(conn, self.memory._record_ids(conn, node["id"])):
                                     semantic_refs[ref["record_id"]] = ref
-                if data.get("stimulus") == "memory-enrichment" and data.get("seed_memory") and not data.get("seed_rejected"):
+                if historical and data.get("seed_memory") and not data.get("seed_rejected"):
+                    # Reused judgments carry the exact source manifest from
+                    # their original request; the moving latest-dialogue window
+                    # cannot silently remove or authorize different evidence.
+                    seed_refs = data.get("seed_sources", [])
+                    with self.engine.db.connect() as conn:
+                        if seed_refs and not self.mind._fresh(conn, seed_refs):
+                            data["seed_rejected"] = True
+                    if not data.get("seed_rejected"):
+                        semantic_refs.update({ref["record_id"]: ref for ref in seed_refs})
+                if historical and data.get("seed_memory") and not data.get("seed_rejected"):
                     try:
                         proposal = Appraisal(reason="Reuse verified semantic result", memory=MemoryAssessment.model_validate(data["seed_memory"]))
                         receipt = data["seed_receipt"]
@@ -772,11 +862,24 @@ class Appraisals:
                     raise RuntimeError("deepseek-missing-session-advice")
                 if historical:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None})
-                exploration_ids = [s["metadata"]["exploration_id"] for s in sources
-                                   if s["metadata"].get("exploration_id")]
-                primary_result = exploration_ids[0] if data.get("stimulus") == "exploration-result" and exploration_ids else None
-                if primary_result and self.exploration_capabilities.get("decisions") and sum(p.exploration_id == primary_result for p in proposal.sharing) != 1:
-                    raise RuntimeError("deepseek-missing-sharing-decision")
+                # Save the structured result even when required-decision
+                # validation rejects it. No provider thinking blocks are stored.
+                data.update(proposed_result=proposal.model_dump(), receipt=receipt,
+                            evaluated_sources=list(semantic_refs.values()))
+                primary_result = targets[0]["exploration_id"] if len(targets) == 1 else None
+                missing_targets = [t for t in targets if sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1]
+                if missing_targets and self.exploration_capabilities.get("decisions"):
+                    if hasattr(provider, "repair_sharing") and not data.get("sharing_repair_attempted"):
+                        data["sharing_repair_attempted"] = True
+                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal.model_dump(), "receipt": receipt})
+                        with self.engine.db.connect(write=True) as conn:
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                        sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
+                        proposal = proposal.model_copy(update={"sharing": sharing})
+                        receipt = {**receipt, "sharing_repair": repair_receipt}
+                        data.update(proposed_result=proposal.model_dump(), receipt=receipt)
+                    if any(sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1 for t in targets):
+                        raise RuntimeError("deepseek-missing-sharing-decision")
                 migration = data.get("stimulus") == "continuity-bootstrap"
                 if migration:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [u for u in proposal.wish_updates if u.action == "link"], "evolution": None})
@@ -808,6 +911,11 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
+                    if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
+                        raise Conflict("Evaluated sources changed before commit")
+                    used_evidence = {identifier for items in (proposal.memory.notes, proposal.memory.links, proposal.memory.graph.nodes, proposal.memory.graph.edges) for item in items for identifier in item.evidence_ids}
+                    if any({ref["source_id"], ref["record_id"]} & used_evidence and not self.mind._fresh(conn, [ref]) for ref in semantic_refs.values()):
+                        raise Conflict("Referenced semantic evidence changed before commit")
                     if data.get("stimulus") == "session-maintenance":
                         state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
                         return {"provider": receipt, "session_advice": state["session_advice"], "maintenance_only": True}
@@ -902,7 +1010,8 @@ class Appraisals:
                         enrichment_id = "enrich_" + digest([row["id"], "memory-v1"])[:32]
                         enrichment_data = {"evidence_ids": data["evidence_ids"], "agent_version": effective_version,
                             "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
-                            "seed_memory": deferred_memory if deferred_memory != MemoryAssessment().model_dump() else None, "seed_receipt": receipt}
+                            "seed_memory": deferred_memory if deferred_memory != MemoryAssessment().model_dump() else None, "seed_receipt": receipt,
+                            "seed_sources": list(semantic_refs.values())}
                         conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
                             (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
                     elif memory_context:
@@ -921,6 +1030,11 @@ class Appraisals:
                 def rebase(conn, state):
                     # Contact bookkeeping may advance the global revision during
                     # a long model call. Rebase only when its real inputs match.
+                    # Historical enrichment does not read or mutate mood or
+                    # wishes. Validate its actual source/graph dependencies in
+                    # apply() instead of serializing it behind unrelated chat.
+                    if historical:
+                        return state.get("profile_version") == before_state.get("profile_version")
                     keys = ("dimensions", "profile_version", "action_policy", "autonomy")
                     if any(state.get(k) != before_state.get(k) for k in keys):
                         return False
@@ -937,6 +1051,8 @@ class Appraisals:
             data.pop("error", None)
             state = "complete"
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
+            if getattr(provider, "failure_receipt", None):
+                data["failed_call_receipt"] = provider.failure_receipt
             # No payload/validation repr: these can contain private text or key values.
             data["error"] = (
                 str(error)
@@ -945,6 +1061,10 @@ class Appraisals:
             )
             if isinstance(error, Missing):
                 data["missing_reference"] = str(error) if re.fullmatch(r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}", str(error)) else "unresolved-reference"
+            if historical and data.get("seed_memory") and isinstance(error, (Conflict, Missing)):
+                # A rejected seed needs a fresh historical review, not another
+                # attempt to commit the same invalid proposal indefinitely.
+                data["seed_rejected"] = True
             if lanes and historical and row["attempts"] >= 1:
                 state = "needs-repair"
                 data["repair_reason"] = data["error"]
