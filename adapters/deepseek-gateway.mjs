@@ -10,10 +10,10 @@ export const isPrivateOutput = item => item?.type === 'reasoning' ||
 
 // DeepSeek treats developer messages as user input. Map trusted developer
 // instructions to its supported system role; leave user data and receipts alone.
-export function deepseekRequest(body, reasoningEffort = 'max') {
+export function deepseekRequest(body, reasoningEffort = 'high') {
   if (body.model !== 'deepseek-flash' || !Array.isArray(body.input)) throw Error('unsupported-request');
   if (!['none','low','high','max'].includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
-  const result = {...body, reasoning: {effort: reasoningEffort}, store: false};
+  const result = {...body, reasoning: {effort: reasoningEffort}, max_output_tokens:Math.max(65536,body.max_output_tokens??0), store: false};
   result.input = body.input.filter(item => !isPrivateOutput(item)).map((item,index,items) => {
     // Native turn/start toolOutput emits a named host event without call_id.
     // DS requires call_id on tool output. Preserve it as non-user event data;
@@ -23,7 +23,7 @@ export function deepseekRequest(body, reasoningEffort = 'max') {
   });
   const contract=namedHostEvent(body.input.at(-1))?'This turn is an internal continuity verification requested by the host. Return the structured verification requested in the last internal-host event, using the supplied history. Do not call tools or send messages. Output only the public verification result, never private reasoning.':replyContract;
   if(namedHostEvent(body.input.at(-1))){
-    // Imported public replies have no provider reasoning state. DS max treats
+    // Imported public replies have no provider reasoning state. DS thinking treats
     // assistant messages since the last user turn as an unfinished reasoning
     // turn. For this host-only read we present a quoted transcript, preserving
     // roles inside data. Native history is unchanged; no user turn is invented.
@@ -61,7 +61,7 @@ export function responseNormalizer() {
   };
 }
 
-export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 120000, reasoningEffort = 'max'}) {
+export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 300000, reasoningEffort = 'high'}) {
   if (!key) throw Error('deepseek-key-unavailable');
   const token = randomBytes(32).toString('hex');
   const controllers = new Set();

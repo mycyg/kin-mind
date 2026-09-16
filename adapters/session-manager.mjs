@@ -83,7 +83,7 @@ export class SessionManager {
   }
   advise(advice,receipt,snapshotId) {
     if(!advice||!['keep','recall','compact','prepare','rotate','defer'].includes(advice.action)||!advice.reason?.trim()||!Array.isArray(advice.evidenceIds))throw Error('Invalid session advice');
-    if(receipt?.model!=='deepseek-flash'||receipt.reasoning!=='max')throw Error('Session advice provider unverified');
+    if(receipt?.model!=='deepseek-flash'||receipt.reasoning!=='high')throw Error('Session advice provider unverified');
     if(this.state.observation?.id!==snapshotId)return {state:'stale',reason:'observation-changed'};
     for(const finding of advice.findings??[]){
       const source=this.state.observation.recent?.find(i=>i.id===finding.sourceId&&i.role==='user'&&i.text?.includes(finding.quote));

@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {splitChatText} from './chat-bubbles.mjs';
 
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
-export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'})}) {
+export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),now=()=>Date.now()}) {
   const active=new Map();
   const digest=value=>createHash('sha256').update(value).digest('hex');
   async function run({id,text,bubbles,references=[],channel,guard=()=>true,superseded=false}) {
@@ -17,6 +17,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         id:'kin-bubble-'+digest(id+'\0'+index).slice(0,48),text,references:references[index]??[],state:'unsent'}))};
       await write(id,batch);
     }
+    // Reconcile first, then review every unsent bubble before exposing an
+    // introduction. A late review failure must not strand the promised body.
     for(const item of batch.items) {
       if(['accepted','canceled'].includes(item.state))continue;
       if(item.state==='unsent'&&superseded){item.state='canceled';await write(id,batch);continue;}
@@ -24,12 +26,27 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         const known=await receipt(item.id,batch.channel);
         if(known?.state==='accepted'&&known.messageId)Object.assign(item,{state:'accepted',messageId:known.messageId});
         else {batch.state='unconfirmed';await write(id,batch);return result(batch);}
-      } else {
+        await write(id,batch);
+      }
+    }
+    const checkedItems=new Map();
+    for(const [index,item] of batch.items.entries()) {
+      if(item.state==='unsent') {
         if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
-        if(item.reviewNotBefore&&Date.now()<item.reviewNotBefore){batch.state='pending';return result(batch);}
-        const checked=await preflight({draft_id:batch.id,text:item.text,references:item.references??[],channel:batch.channel});
-        if(checked.state==='duplicate'){item.state='canceled';item.reason=checked.reason;await write(id,batch);continue;}
-        if(checked.state!=='ready'){item.reviewNotBefore=Date.now()+20*60000;batch.reason=checked.reason;batch.state='pending';await write(id,batch);return result(batch);}
+        if(item.reviewNotBefore&&now()<item.reviewNotBefore){batch.state='pending';return result(batch);}
+        const checked=await preflight({draft_id:batch.id,text:item.text,references:item.references??[],channel:batch.channel,
+          batch_text:batch.items.map(i=>i.text).join('\n\n'),bubble_index:index});
+        if(['duplicate','silent','merged'].includes(checked.state)) {
+          for(const pending of batch.items.filter(i=>i.state==='unsent'))Object.assign(pending,{state:'canceled',reason:checked.reason??checked.state});
+          batch.reason=checked.reason??checked.state;await write(id,batch);break;
+        }
+        if(checked.state!=='ready'){item.reviewNotBefore=now()+(checked.retryAfterMs??60000);batch.reason=checked.reason;batch.state='pending';await write(id,batch);return result(batch);}
+        checkedItems.set(item.id,checked);
+      }
+    }
+    for(const item of batch.items) {
+      if(item.state==='unsent') {
+        const checked=checkedItems.get(item.id);
         item.references=checked.references??item.references??[];
         if(checked.text&&checked.text!==item.text){item.originalText=item.text;item.text=checked.text;}
         // A new owner input can arrive while semantic preflight is running.
@@ -43,7 +60,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       }
       await write(id,batch);
     }
-    batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'canceled';await write(id,batch);return result(batch);
+    batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'canceled';delete batch.reason;await write(id,batch);return result(batch);
   }
   function result(batch){const ids=batch.items.filter(x=>x.state==='accepted').map(x=>x.messageId);return {
     id:batch.id,state:batch.state,reason:batch.reason,channel:batch.channel,messageId:batch.state==='accepted'?ids[0]:undefined,

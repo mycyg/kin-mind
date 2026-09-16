@@ -39,9 +39,26 @@ export class ReplyGuard {
       }
       result=await this.call('share-preflight',{...request,outbox:await this.outbox(),allow_model:true});
     } catch {result={state:'pending',reason:'share-review-unavailable'};}
-    return this.save(file,{...result,...(result.state==='pending'?{retryAt:this.clock()+20*60000}:{})});
+    return this.save(file,{...result,...(result.state==='pending'?{retryAfterMs:60000,retryAt:this.clock()+60000}:{})});
   }
   save(file,value){const temporary=file+'.'+process.pid+'.tmp';fs.writeFileSync(temporary,JSON.stringify(value),{mode:0o600});fs.renameSync(temporary,file);return value;}
+  async checkGroup(requests) {
+    const checked=[];
+    for(const request of requests) {
+      const result=await this.check({...request,batch_text:requests.map(r=>r.text).join('\n\n')});
+      if(result.state!=='ready')return result;
+      checked.push(result);
+    }
+    return {state:'ready',checked};
+  }
+  deferGroup(entries,ownerEpoch) {
+    const first=entries[0];
+    if(!first)return;
+    const saved=this.defer(first.request,first.delivery,ownerEpoch);
+    const file=path.join(this.directory,createHash('sha256').update(first.delivery.id).digest('hex')+'.pending.json');
+    if(saved.entries)return saved;
+    return this.save(file,{...saved,entries:entries.map(e=>({...e,state:'unsent'})),retryAt:this.clock()+60000});
+  }
   defer(request,delivery,ownerEpoch) {
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
     const file=path.join(this.directory,createHash('sha256').update(delivery.id).digest('hex')+'.pending.json');
@@ -56,8 +73,9 @@ export class ReplyGuard {
       const files=fs.readdirSync(this.directory).filter(n=>n.endsWith('.pending.json'));
       for(const name of files) {
         const file=path.join(this.directory,name);let entry=JSON.parse(fs.readFileSync(file,'utf8'));
-        if(!['pending','prepared'].includes(entry.state)||entry.retryAt>this.clock())continue;
+        if(!['pending','prepared',...(entry.entries?['unconfirmed']:[])].includes(entry.state)||entry.retryAt>this.clock())continue;
         if(handled++>=limit)break;
+        if(entry.entries){await this.resumeGroup(file,entry,{guard,send});continue;}
         let permission=await guard(entry);
         if(permission==='wait')continue;
         if(permission==='cancel'){await this.call('share-cancel',{draft_id:entry.request.draft_id});this.save(file,{...entry,state:'canceled'});continue;}
@@ -76,5 +94,36 @@ export class ReplyGuard {
       }
       return {state:handled?'checked':'idle',checked:Math.min(handled,limit)};
     } finally {this.resuming=false;}
+  }
+  async resumeGroup(file,entry,{guard,send}) {
+    for(const item of entry.entries.filter(e=>e.state==='unconfirmed')) {
+      const receipt=(await this.outbox()).find(r=>r.id===item.delivery.id);
+      if(receipt?.state!=='accepted'||!receipt.message_id)return;
+      Object.assign(item,{state:'accepted',receipt});this.save(file,{...entry,state:'pending'});
+    }
+    const permission=await guard(entry);
+    if(permission==='wait')return;
+    if(permission==='cancel') {
+      for(const item of entry.entries.filter(e=>e.state==='unsent'))await this.call('share-cancel',{draft_id:item.request.draft_id});
+      this.save(file,{...entry,state:'canceled'});return;
+    }
+    const unsent=entry.entries.filter(e=>e.state==='unsent');
+    const review=await this.checkGroup(unsent.map(e=>e.request));
+    if(review.state!=='ready') {
+      this.save(file,{...entry,state:review.state==='pending'?'pending':review.state,retryAt:this.clock()+60000});return;
+    }
+    for(const [index,item] of unsent.entries()) {
+      if(await guard(entry)!=='send')return;
+      const checked=review.checked[index];
+      item.delivery={...item.delivery,text:checked.text??item.request.text,references:checked.references??[]};
+      // A crash after transport starts must reconcile the original ID.
+      item.state='unconfirmed';this.save(file,{...entry,state:'unconfirmed'});
+      try {
+        const receipt=await send(item.delivery);item.receipt=receipt;
+        if(receipt.state!=='accepted'||!receipt.messageId){this.save(file,{...entry,state:'unconfirmed'});return;}
+        item.state='accepted';this.save(file,{...entry,state:'pending'});
+      }catch{this.save(file,{...entry,state:'unconfirmed'});return;}
+    }
+    this.save(file,{...entry,state:'accepted'});
   }
 }

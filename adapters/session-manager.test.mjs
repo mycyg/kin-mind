@@ -10,7 +10,7 @@ import {recoverSessionStore,loadCandidateSession} from './mobile-session-host.mj
 
 function fixture(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-sessions-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
- const clock={now:20000000},runtime={known:true,threadId:'old',sessionId:'old',nativeSessionId:'old',model:'deepseek-flash',reasoningEffort:'max',fastMode:'off',nativeStatus:'idle',modelContextWindow:100000,lastTokenUsage:{inputTokens:70000}};
+ const clock={now:20000000},runtime={known:true,threadId:'old',sessionId:'old',nativeSessionId:'old',model:'deepseek-flash',reasoningEffort:'high',fastMode:'off',nativeStatus:'idle',modelContextWindow:100000,lastTokenUsage:{inputTokens:70000}};
  const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[];
  const config={...SESSION_DEFAULTS,prepare:true,rotate:true};
  const options={file:path.join(dir,'registry.json'),binding:{threadId:'old',nativeSessionId:'old',conversationId:'logical'},coordinator:{locked:f=>f()},inspect:async()=>({...runtime}),collect:async()=>structuredClone(context),now:()=>clock.now,config,lease:false,
@@ -19,7 +19,7 @@ function fixture(t){
   createCandidate:async()=>{calls.push('create');return {threadId:'new',nativeSessionId:'new'};},injectCandidate:async()=>{calls.push('inject');return {verified:true};},verifyCandidate:async({checkpoint})=>({verified:true,checkpointId:checkpoint.id,model:runtime.model,reasoningEffort:runtime.reasoningEffort,fastMode:runtime.fastMode}),
   promote:async()=>{calls.push('promote');return {verified:true,threadId:'new'};},reviewRequested:async()=>calls.push('review')};
  const manager=new SessionManager(options);
- const advise=async(action,evidenceIds=[])=>{await manager.observe(runtime,context);return manager.advise({action,reason:'Synthetic review',evidenceIds,compactionId:manager.state.compactions.at(-1)?.id},{model:'deepseek-flash',reasoning:'max'},manager.state.observation.id);};
+ const advise=async(action,evidenceIds=[])=>{await manager.observe(runtime,context);return manager.advise({action,reason:'Synthetic review',evidenceIds,compactionId:manager.state.compactions.at(-1)?.id},{model:'deepseek-flash',reasoning:'high'},manager.state.observation.id);};
  const degraded=()=>{clock.now+=2000000;manager.evidence({id:'failure',sourceId:'owner-correction',revision:1,kind:'reference-error',basis:'owner-statement',at:clock.now});};
  return {manager,options,clock,runtime,context,calls,advise,degraded,dir};
 }
@@ -37,12 +37,12 @@ test('restart restores the last native measurement and recognizes a compaction c
  assert.equal(windowPressure(measured).expectedInputTokens,40000);assert.equal(measured.usageEvidence.source,'native-runtime');
 });
 test('candidate activation suppresses history replay and restores the verified mobile profile',async()=>{
- const calls=[],gateway={baseUrl:'http://synthetic.invalid',token:'synthetic-token',reasoningEffort:'max'};
+ const calls=[],gateway={baseUrl:'http://synthetic.invalid',token:'synthetic-token',reasoningEffort:'high'};
  const actual={known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',nativeStatus:'idle',model:'gpt-6-astra',reasoningEffort:'medium',providerOverride:false};
  let suppressed=false;const client={beginSessionReplay(){suppressed=true;},async endSessionReplay(){suppressed=false;calls.push('drained');}};
  const connection={async loadSession(){assert.ok(suppressed);calls.push('load');},async extMethod(method){calls.push(method);if(method==='providers/set'){actual.providerOverride=true;actual.providerBaseUrl=gateway.baseUrl;}return {...actual};},
  async setSessionConfigOption({configId,value}){actual[configId==='reasoning_effort'?'reasoningEffort':configId]=value;return {configOptions:[{id:configId,value}]};}};
- const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate:{verification:{model:'deepseek-flash',reasoningEffort:'max',fastMode:'off'}},cwd:'/synthetic',gateway});
+ const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate:{verification:{model:'deepseek-flash',reasoningEffort:'high',fastMode:'off'}},cwd:'/synthetic',gateway});
  assert.equal(result.actual.model,'deepseek-flash');assert.equal(result.actual.profileReady,true);assert.deepEqual(calls.slice(0,2),['load','drained']);assert.equal(suppressed,false);
  connection.loadSession=async()=>{throw Error('load failed');};
  await assert.rejects(loadCandidateSession({client,connection,binding:{threadId:'new'},candidate:{},cwd:'/synthetic',gateway}),/load failed/);assert.equal(suppressed,false);

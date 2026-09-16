@@ -9,6 +9,7 @@ from kin_mind.context import Contexts
 from kin_mind.graph import GraphAssessment, GraphEdge, GraphNode
 from kin_mind.memory import MemoryAssessment, MemoryContinuity
 from kin_mind.sharing import ContentReference, CoverageAssessment, CoverageMapping
+from kin_mind.sharing import ShareCheck
 from kin_mind.state import Mind
 
 
@@ -25,6 +26,27 @@ def system(tmp_path):
     mind.initialize(agent_version="fixture-v1", evidence_ids=[initial])
     memory.configure({"records": True, "semantic": True, "context": True, "graph": True, "sharing": True, "graph_recall": True, "associations": True})
     return mind, memory, source, clock
+
+
+def test_share_review_keeps_whole_reply_and_reports_incomplete_results(system):
+    _, memory, _, _ = system
+    request = {'draft_id': 'draft', 'text': 'Complete creative body', 'batch_text': 'Here is the requested draft:\n\nComplete creative body', 'review_required': True}
+    class Reviewer:
+        timeout = 600
+        fail = True
+        def structured(self, name, schema, system, context, **options):
+            assert self.timeout == 240 and options['max_tokens'] == 65536
+            assert context['reply_context'] == request['batch_text']
+            if self.fail:
+                raise RuntimeError('deepseek-incomplete-or-unverified')
+            return ShareCheck(decision='ordinary', reason='Requested creative draft'), {'model': 'deepseek-flash'}
+    reviewer = Reviewer()
+    result = memory.sharing.preflight(request, provider=reviewer)
+    assert result == {'state': 'pending', 'reason': 'deepseek-incomplete-or-unverified'}
+    assert reviewer.timeout == 600
+    reviewer.fail = False
+    result = memory.sharing.preflight(request, provider=reviewer)
+    assert result['state'] == 'ready' and result['text'] == request['text']
 
 
 def findings(system):

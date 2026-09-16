@@ -13,6 +13,14 @@ TIMEZONE = "Asia/Singapore"
 RECENT_EXCHANGES = 4
 
 
+def is_public_dialogue(event):
+    return (event.get('kind') in {'owner-message', 'assistant-message', 'delivery'}
+            and bool(event.get('text')) and not event.get('internal')
+            and event.get('origin') not in {'runtime-notice', 'runtime-status', 'host-control'}
+            and (event.get('kind') != 'delivery' or event.get('state') == 'accepted')
+            and not event['text'].startswith('Warning: Heads up: Long threads'))
+
+
 def utc_time(value):
     if not value:
         return None
@@ -91,11 +99,7 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
             event = json.loads(row["data"])
             if event['id'] in redundant:
                 continue
-            if not event.get("text") or event.get("origin") == "runtime-notice" or event.get("internal"):
-                continue
-            if event["kind"] == "delivery" and event.get("state") != "accepted":
-                continue
-            if event["text"].startswith("Warning: Heads up: Long threads"):
+            if not is_public_dialogue(event):
                 continue
             try:
                 refs = mind._evidence(conn, [event["source_id"]])

@@ -41,7 +41,7 @@ class ActionEvents:
                 "version": request["agent_version"],
                 "trigger": "affect",
                 "provider": "deepseek-flash",
-                "reasoning": "max",
+                "reasoning": "high",
                 "configured_at": self.mind.clock(),
                 "evidence": refs,
                 "reason": request["reason"],

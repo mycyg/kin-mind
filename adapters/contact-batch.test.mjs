@@ -4,6 +4,25 @@ import {createContactBatch} from './contact-batch.mjs';
 import {splitChatText} from './chat-bubbles.mjs';
 import {parseContactDraft} from './contact-draft.mjs';
 
+test('review the complete reply before sending its introduction; restart resumes in order',async()=>{
+ const journal=new Map(),sent=[];let ready=false,now=0;
+ const opts={read:id=>structuredClone(journal.get(id)),write:(id,v)=>journal.set(id,structuredClone(v)),now:()=>now,
+   preflight:async r=>r.text==='The full body'&&!ready?{state:'pending',reason:'deepseek-incomplete-or-unverified'}:{state:'ready'},
+   send:async r=>{sent.push(r.text);return {state:'accepted',messageId:r.id};}};
+ const draft={id:'whole',bubbles:['Here it is:','The full body','Closing sentence']};
+ assert.equal((await createContactBatch(opts)(draft)).state,'pending');assert.deepEqual(sent,[]);
+ ready=true;now=60001;
+ assert.equal((await createContactBatch(opts)({id:'whole'})).state,'accepted');assert.deepEqual(sent,draft.bubbles);
+ await createContactBatch(opts)({id:'whole'});assert.equal(sent.length,3);
+});
+
+test('duplicate body does not leave a new orphan introduction',async()=>{
+ let state,calls=0;
+ const send=createContactBatch({read:()=>state,write:(_,v)=>{state=v;},preflight:async r=>({state:r.text==='body'?'duplicate':'ready'}),send:async()=>{calls++;}});
+ const result=await send({id:'duplicate',bubbles:['Introduction:','body']});
+ assert.equal(result.state,'canceled');assert.equal(calls,0);
+});
+
 test('partial receipt reconciles the same ID then sends only unsent bubbles after restart',async()=>{
   const journal=new Map(),receipts=new Map(),sent=[];let fail=true;
   const args={read:id=>structuredClone(journal.get(id)),write:(id,b)=>journal.set(id,structuredClone(b)),

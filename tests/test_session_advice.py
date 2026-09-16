@@ -12,7 +12,7 @@ def context():
 
 def test_rotation_requires_actual_compaction_and_later_evidence():
     proposal = SessionAdvice(action="rotate", reason="Observed reference error", evidenceIds=["correction-1"], compactionId="compact-1")
-    receipt = {"model": "deepseek-flash", "reasoning": "max"}
+    receipt = {"model": "deepseek-flash", "reasoning": "high"}
     assert advice_record(proposal, context(), receipt, "event-1")["snapshotId"] == "snapshot-v1"
     missing = context()
     missing["lastCompaction"] = None

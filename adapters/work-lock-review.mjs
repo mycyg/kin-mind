@@ -62,7 +62,7 @@ export class WorkLockReview {
       if(!['keep','complete','not_a_task'].includes(d?.disposition)||!d.reason?.trim()||!Array.isArray(d.evidenceIds)||!d.evidenceIds.length||!Array.isArray(d.remaining)||!Array.isArray(d.discardDraftIds))throw Error('Unverified work review result: invalid-decision-shape');
       if(d.evidenceIds.some(id=>!inputIds.has(id)))throw Error('Unverified work review result: unknown-input-reference');
       if(d.discardDraftIds.some(id=>!discardable.has(id)))throw Error('Unverified work review result: unknown-deferred-reference');
-      if(result.receipt?.provider!=='deepseek'||result.receipt?.model!=='deepseek-flash'||result.receipt?.reasoning!=='max'||!result.receipt?.requestId)throw Error('Unverified work review result: provider-receipt-mismatch');
+      if(result.receipt?.provider!=='deepseek'||result.receipt?.model!=='deepseek-flash'||result.receipt?.reasoning!=='high'||!result.receipt?.requestId)throw Error('Unverified work review result: provider-receipt-mismatch');
       attempt=this.save({...attempt,state:'reviewed',decisionVerified:true});
       if(this.closed)return this.save({...attempt,state:'interrupted',retryAt:this.now()});
       return await this.router.locked(async()=>{

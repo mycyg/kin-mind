@@ -51,7 +51,7 @@ test('provider reasoning is excluded without changing messages and tool receipts
   const input = [{type:'message',role:'user',content:[{type:'input_text',text:'hello'}]}, {type:'reasoning',encrypted_content:'opaque'}, {type:'function_call',call_id:'one',name:'read'}, {type:'function_call_output',call_id:'one',output:'ok'}];
   const request = deepseekRequest({model:'deepseek-flash',input,reasoning:{effort:'high'},service_tier:'fast'});
   assert.deepEqual(request.input, [input[0], input[2], input[3]]);
-  assert.deepEqual(request.reasoning, {effort:'max'});
+  assert.deepEqual(request.reasoning, {effort:'high'});
   assert.equal(request.service_tier, undefined);
   assert.equal(input.length, 4);
 });
@@ -77,6 +77,6 @@ test('local gateway authenticates requests and enforces the configured effort at
     assert.equal(response.status,200);
     assert.equal((await response.json()).output.length,1);
     assert.equal(sent.url,'https://api.deepseek.com/responses');
-    assert.equal(JSON.parse(sent.options.body).reasoning.effort,'max');
+    assert.equal(JSON.parse(sent.options.body).reasoning.effort,'high');
   } finally {await gateway.close();}
 });

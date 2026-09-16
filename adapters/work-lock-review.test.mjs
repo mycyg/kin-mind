@@ -18,7 +18,7 @@ async function fixture(t) {
   time+=3000;
   const evidence={input:{inputs:[{id:'input-1',text:'You may explore when idle'}],cancellableDeferred:[]},receipts:{'reply-1':{state:'accepted',messageId:'receipt-1'}}};
   let decision={disposition:'not_a_task',reason:'Optional autonomy preference, acknowledged in the delivered reply',evidenceIds:['input-1'],remaining:[],discardDraftIds:[]};
-  const result=()=>({decision:structuredClone(decision),receipt:{provider:'deepseek',model:'deepseek-flash',reasoning:'max',requestId:'synthetic-request',verifiedAt:'2026-01-01T00:00:00Z'}});
+  const result=()=>({decision:structuredClone(decision),receipt:{provider:'deepseek',model:'deepseek-flash',reasoning:'high',requestId:'synthetic-request',verifiedAt:'2026-01-01T00:00:00Z'}});
   const reviewArgs={router,file:path.join(root,'reviews.json'),collect:async()=>structuredClone(evidence),review:async()=>{calls++;return result();},now:()=>time};
   return {router,runtime,args,reviewArgs,evidence,result,decision,setDecision:d=>decision=d,review:new WorkLockReview(reviewArgs),calls:()=>calls,advance:n=>time+=n};
 }
@@ -28,7 +28,7 @@ test('DeepSeek can close an accidental chat lock after verified delivery and res
   const r=await f.review.tick();assert.equal(r.state,'applied');assert.equal(f.router.tasks().length,0);
   assert.equal(f.router.state.tasks[tid].status,'canceled');assert.equal(f.router.state.inputs['input-1'].state,'accepted');
   await f.router.applyPendingMode();assert.equal(f.runtime.model,'deepseek-flash');assert.equal(f.router.sessionId,'synthetic');
-  assert.equal(f.review.view().model,'deepseek-flash');assert.equal(f.review.view().reasoning,'max');
+  assert.equal(f.review.view().model,'deepseek-flash');assert.equal(f.review.view().reasoning,'high');
 });
 
 test('a real finished task uses semantic and delivery evidence, never just end_turn',async t=>{

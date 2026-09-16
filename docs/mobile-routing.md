@@ -101,7 +101,7 @@ new conversation.
 
 `WorkLockReview` checks the work lifecycle locally every minute and after new
 input, a completed native turn or a delivery update. At a verified idle boundary,
-DeepSeek Flash / max assesses the original authenticated inputs, their follow-ups,
+DeepSeek Flash / high assesses the original authenticated inputs, their follow-ups,
 public answers, tool status, actual delivery receipts and linked background
 exploration wishes. It returns `keep`, `complete` or `not_a_task`. A held task is
 reviewed again after twenty minutes even if its inputs have not changed. Failed
@@ -149,6 +149,19 @@ with `max` thinking and a structured tool result. The conversation gateway
 uses the [Responses endpoint](https://api-docs.deepseek.com/guides/responses_api/).
 
 ## Validation
+
+Every verified model change creates one durable owner notification, including
+automatic routing, work completion and restart reconciliation. A same-model
+profile refresh creates no switch notice. Explicit subscriptions share the
+transition notice; uncertain sends reconcile the same outbox ID. Delayed notices
+distinguish the earlier transition from the current verified model. These control
+notices stay outside the recent public dialogue used for recall and appraisal.
+
+DeepSeek uses high reasoning throughout the gateway, classifier, work review,
+health review and memory evaluation. Output ceilings are 16K for routing, at
+least 64K for native chat and structured memory requests, and 128K for appraisal
+and work review. Output truncation remains a failed result. Latency limits are
+independent of token ceilings; classification retains its bounded fallback.
 
 Run `node --test adapters/*.test.mjs` for synthetic routing, delivery, concurrency,
 gateway and cadence checks. Before enabling a host, additionally verify a live

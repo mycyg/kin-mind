@@ -2,7 +2,7 @@
 
 A delivered task can retain a work lock when an earlier tool or upload failed.
 The lifecycle now distinguishes terminal execution, verified task completion and
-platform delivery. DeepSeek Flash/max judges the goal; the host owns the proof
+platform delivery. DeepSeek Flash/high judges the goal; the host owns the proof
 and the serialized provider transition.
 
 ## Work and delivery

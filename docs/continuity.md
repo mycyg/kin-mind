@@ -7,7 +7,7 @@ until a sourced configuration change enables them.
 
 ## One assessment, one transaction
 
-The existing DeepSeek Flash/max request can return `understanding`, `concerns`
+The existing DeepSeek Flash/high request can return `understanding`, `concerns`
 and `rhythm` alongside scores, motivations and wishes. Understanding records a
 short meaning, topic, importance, confidence, basis and source IDs. The bases
 are `explicit`, `inferred` and `internal_thought`; an explicit interpretation

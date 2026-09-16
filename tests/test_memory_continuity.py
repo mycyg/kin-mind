@@ -132,7 +132,7 @@ class Compressor:
         self.calls = 0
     def structured(self, name, schema, system, context, **kwargs):
         self.calls += 1
-        return Compression(entries=[CompressedEntry(item_ids=[i["id"] for i in context["items"]], summary="Kin created the file; delivery failed. The user has not confirmed reading it.")]), {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "max"}
+        return Compression(entries=[CompressedEntry(item_ids=[i["id"] for i in context["items"]], summary="Kin created the file; delivery failed. The user has not confirmed reading it.")]), {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "high"}
 
 
 def test_compression_repairs_coverage_once_without_promoting_a_bad_summary(system):
@@ -394,7 +394,7 @@ def test_background_appraisal_does_not_compress_a_batch_that_fits_its_budget(sys
         sent = json.loads(payload["messages"][0]["content"])
         assert sent["new_evidence"][0]["text"] == text
         assert 32000 < tokens(payload["messages"][0]["content"]) < APPRAISAL_INPUT_BUDGET
-        assert payload["output_config"]["effort"] == "max"
+        assert payload["output_config"]["effort"] == "high"
         return httpx.Response(200, json={"model":"deepseek-flash", "id":"synthetic-receipt", "stop_reason":"tool_use", "content":[{"type":"tool_use", "name":"submit_appraisal", "input":{"reason":"The sourced batch is complete."}}]})
 
     provider = DeepSeek("https://api.deepseek.com/anthropic", "deepseek-flash", "SYNTHETIC_APPRAISAL_KEY", timeout=600, transport=httpx.MockTransport(respond))

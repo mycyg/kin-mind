@@ -1,5 +1,5 @@
 export function profileReady(runtime,gateway) {
-  if(runtime.model==='deepseek-flash')return runtime.providerOverride===true&&runtime.providerBaseUrl===gateway.baseUrl&&runtime.reasoningEffort===(gateway.reasoningEffort??'max');
+  if(runtime.model==='deepseek-flash')return runtime.providerOverride===true&&runtime.providerBaseUrl===gateway.baseUrl&&runtime.reasoningEffort===(gateway.reasoningEffort??'high');
   if(runtime.model==='gpt-6-astra')return runtime.providerOverride===false&&runtime.reasoningEffort==='medium';
   return false;
 }
@@ -11,7 +11,7 @@ export async function switchCodexModel({connection,sessionId,model,gateway,workF
     await connection.extMethod('providers/set',{providerId:'openai',apiType:'openai',baseUrl:gateway.baseUrl,headers:{Authorization:'Bearer '+gateway.token}});
   } else await connection.extMethod('providers/disable',{providerId:'openai'});
   await connection.setSessionConfigOption({sessionId,configId:'model',value:model});
-  await connection.setSessionConfigOption({sessionId,configId:'reasoning_effort',value:model==='deepseek-flash'?(gateway.reasoningEffort??'max'):'medium'});
+  await connection.setSessionConfigOption({sessionId,configId:'reasoning_effort',value:model==='deepseek-flash'?(gateway.reasoningEffort??'high'):'medium'});
   if(model==='gpt-6-astra'&&typeof workFast==='boolean')await connection.setSessionConfigOption({sessionId,configId:'fast-mode',value:workFast?'on':'off'});
   const actual=await connection.extMethod('_kin/runtime',{sessionId});
   actual.profileReady=profileReady(actual,gateway);

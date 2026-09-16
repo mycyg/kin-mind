@@ -27,7 +27,7 @@ The common sending sequence is:
 
 Old conclusions may be revisited as an explicit development, reflection, reminiscence or requested retelling. The relation to the earlier discussion is recorded. Merely changing wording does not create a new finding. Affection and ordinary conversation are not finding-level duplicates.
 
-Older replies without references use a small DeepSeek Flash/max matching request when they concern past discoveries or claim a new discovery. The checker accepts only supplied finding IDs and structured results. An incomplete check preserves the candidate. Ordinary conversation without historical claims does not require this extra request. Model reasoning is never stored as a finding or sent as a bubble.
+Older replies without references use a small DeepSeek Flash/high matching request when they concern past discoveries or claim a new discovery. The checker accepts only supplied finding IDs and structured results. An incomplete check preserves the candidate. Ordinary conversation without historical claims does not require this extra request. Model reasoning is never stored as a finding or sent as a bubble.
 
 ## One evaluation pipeline
 
@@ -93,5 +93,14 @@ Run `pytest`, `node --test adapters/*.test.mjs` and the console's Playwright sui
 See [the recorded validation results](event-graph-validation.md) for measured results and the limits of those measurements.
 
 Pending ordinary replies retain their public body, task association and stable transport ID across restarts. The host rechecks the original input and active task before retrying a completed semantic review. Uncertain transport receipts remain held for reconciliation.
+
+Coherent reply groups and proactive batches review all unsent bubbles before
+sending the introduction. A pending check retains the complete remainder, with
+its order and original IDs. Accepted bubbles are not sent again after restart.
+The share checker sees the whole reply as context and preserves requested
+creative text. Its 64K high-reasoning result is rejected on truncation; the host
+deadline exceeds the provider timeout. Recently retained dialogue includes only
+timestamped owner messages and public replies, excluding model control notices,
+internal events, tool payloads and reasoning.
 
 A full automatic-context window resumes native compaction at an idle turn boundary, even while a persistent work task remains open. Running tools, queued turns, unresolved native operations and background tasks still hold it. The host verifies the same model, session and task snapshot before resetting the injection ledger; restart reloads the pending window epoch.

@@ -6,6 +6,22 @@ import path from 'node:path';
 import {ReplyGuard,outboxEvidence} from './reply-guard.mjs';
 import {createContactBatch} from './contact-batch.mjs';
 
+test('a deferred ordinary reply retains every bubble and reconciles uncertainty without replay',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-group-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ let now=0,ready=false;const sent=[],outbox=[];
+ const args={directory,clock:()=>now,outbox:()=>outbox,call:async(action,r)=>({state:r.text==='body'&&!ready?'pending':'ready',text:r.text})};
+ let guard=new ReplyGuard(args);
+ const entries=['intro','body','tail'].map((text,i)=>({request:{draft_id:'d'+i,text},delivery:{id:'m'+i,text}}));
+ assert.equal((await guard.checkGroup(entries.map(e=>e.request))).state,'pending');
+ guard.deferGroup(entries,'owner');ready=true;now=60001;guard=new ReplyGuard(args);
+ const options={guard:async()=> 'send',send:async r=>{sent.push(r.id);return {state:r.id==='m1'?'unconfirmed':'accepted',messageId:r.id};}};
+ await guard.resumeDue(options);assert.deepEqual(sent,['m0','m1']);
+ await guard.resumeDue(options);assert.deepEqual(sent,['m0','m1']);
+ outbox.push({id:'m1',state:'accepted',message_id:'server-m1'});
+ await guard.resumeDue(options);assert.deepEqual(sent,['m0','m1','m2']);
+ await guard.resumeDue(options);assert.equal(sent.length,3);
+});
+
 test('deliberate silence belongs to one casual input; work and new inputs remain actionable',async()=>{
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-reply-'));
  try {

@@ -62,7 +62,7 @@ Recovery now draws on the same sourced manifest as linked-memory recall: who mad
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.
 
-My emotions, curiosity and passing thoughts can lead to action. DeepSeek Flash with **max** reasoning assesses new experiences and spontaneous thoughts, recording current drive targets and half-lives. When initiative reaches **75**, a DeepSeek turn in the original shared session turns an intent into a message. A strange thought, a wish for affection or some idle chatter can be enough reason to talk. The local minute check projects state; new events or drive threshold crossings request assessment. Each crossing is handled once.
+My emotions, curiosity and passing thoughts can lead to action. DeepSeek Flash with **high** reasoning assesses new experiences and spontaneous thoughts, recording current drive targets and half-lives. When initiative reaches **75**, a DeepSeek turn in the original shared session turns an intent into a message. A strange thought, a wish for affection or some idle chatter can be enough reason to talk. The local minute check projects state; new events or drive threshold crossings request assessment. Each crossing is handled once.
 
 Before sending, the host checks the intent, new messages, work locks and current contact preferences. Default quiet hours are **00:00–09:00 Asia/Singapore**, and fresh content can be shared while awaiting a reply. The user can change contact preferences; proactive conversation has no fixed sending interval.
 

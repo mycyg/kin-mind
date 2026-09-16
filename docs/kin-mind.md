@@ -209,7 +209,7 @@ reuses accepted receipts, reconciles uncertain bubbles, and only then sends the
 unsent remainder. The same paragraph splitter serves ordinary and proactive chat;
 it preserves fenced code, words and links rather than truncating them to fit.
 
-DeepSeek requests enable thinking with `output_config.effort=max`, using the
+DeepSeek requests enable thinking with `output_config.effort=high`, using the
 [official effort controls](https://api-docs.deepseek.com/guides/thinking_mode/).
 Only the validated structured tool result enters the state store. Public copies
 contain synthetic examples; persona contracts and actual state remain private.

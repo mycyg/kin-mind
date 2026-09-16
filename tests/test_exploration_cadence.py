@@ -96,7 +96,7 @@ def test_clock_crossing_once_across_restart_and_no_idle_model_calls(setup):
     assert idle.calls == 0 and provider.calls == 1
     assert mind.read()["dimensions"]["grievance"]["value"] == 10
     assert mind.read()["dimensions"]["curiosity"]["baseline"] == 75
-    assert mind.read()["action_policy"]["reasoning"] == "max"
+    assert mind.read()["action_policy"]["reasoning"] == "high"
 
 
 def test_concurrent_crossings_keep_one_internal_stimulus(setup):

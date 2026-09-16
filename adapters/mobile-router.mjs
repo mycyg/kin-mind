@@ -82,6 +82,7 @@ export class MobileRouter {
     if(transition?.state!=='unconfirmed'||this.busy(runtime))return runtime;
     const expected=this.tasks().length?ROUTER_MODELS.work:runtime.model;
     if(Object.values(ROUTER_MODELS).includes(expected)&&this.verified(runtime,expected)) {
+      this.finishTransition(runtime);
       transition.state=runtime.model===transition.to?'applied-reconciled':'failed-restored';
       this.state.actual=runtime;this.save('switch-reconciled',{model:runtime.model});return runtime;
     }
@@ -92,7 +93,7 @@ export class MobileRouter {
     try {
       const actual=await this.switchModel(ROUTER_MODELS.work);
       if(!this.verified(actual,ROUTER_MODELS.work))throw Error('Unverified recovery');
-      this.state.actual=actual;transition.state='failed-restored';this.save('switch-recovered');return actual;
+      this.finishTransition(actual);transition.state='failed-restored';this.save('switch-recovered');return actual;
     } catch {this.save('switch-recovery-unconfirmed');return runtime;}
   }
   addTask(input) {
@@ -194,7 +195,7 @@ export class MobileRouter {
               const current=await this.inspect();if(this.busy(current))throw Error('busy');
               const restored=await this.switchModel(ROUTER_MODELS.work);
               if(!this.verified(restored,ROUTER_MODELS.work))throw Error('restore-unconfirmed');
-              this.state.actual=restored;this.state.transition.state='failed-restored';this.state.transition.actualModel=restored.model;this.state.transition.verifiedAt=restored.checkedAt;target=ROUTER_MODELS.work;
+              this.finishTransition(restored);this.state.transition.state='failed-restored';target=ROUTER_MODELS.work;
               if(!record.taskId&&!record.command)record.taskId=this.addTask(input).id;
               this.save('switch-failed-restored');
             } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
@@ -285,9 +286,16 @@ export class MobileRouter {
   }
   finishTransition(actual) {
     this.state.actual=actual;Object.assign(this.state.transition,{state:'applied',actualModel:actual.model,verifiedAt:actual.checkedAt,appliedAt:this.now()});
+    const transition=this.state.transition;
+    if(transition.from&&transition.from!==actual.model&&this.verified(actual,actual.model)) {
+      const view=publicMobileRuntime(this.state,actual,this.sessionId);
+      const notice=this.queueNotice(transition.id,'model-switched',{transitionId:transition.id,sourceInputId:this.state.inputs[transition.sourceId]?transition.sourceId:this.state.requests[transition.sourceId]?.sourceInputId,
+        target:actual.model,from:transition.from,runtime:view.actual,text:runtimeReply(view,{switched:true})});
+      transition.noticeId=notice.id;
+    }
   }
   observeRuntime(runtime) {
-    if(runtime.known&&this.state.actual?.known&&this.state.actual.model!==runtime.model&&this.state.transition?.state!=='switching'&&this.state.transition?.state!=='unconfirmed'&&this.state.transition?.to!==runtime.model) {
+    if(this.verified(runtime,runtime.model)&&this.state.actual?.known&&this.state.actual.model!==runtime.model&&this.state.transition?.state!=='switching'&&this.state.transition?.state!=='unconfirmed') {
       this.startTransition(this.state.actual,runtime.model,'Observed native model change','runtime-observation');
       this.finishTransition(runtime);this.state.transition.state='observed';this.save('runtime-model-observed');
     }
@@ -331,7 +339,10 @@ export class MobileRouter {
     request.state='applied';request.appliedAt=this.now();
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
       sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id};
-    if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model});
+    const transition=this.state.transition;
+    const notice=transition?.sourceId===request.commandId&&this.state.notices[transition.noticeId];
+    if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
+    else if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model});
   }
   acceptControl(record,runtime) {
     if(['work','auto'].includes(record.command)) {
@@ -362,7 +373,11 @@ export class MobileRouter {
         const runtime=await this.inspect();const view=publicMobileRuntime(this.state,runtime,this.sessionId);
         if(!view.actual.verified)return null;
         if(n.kind==='mode-applied'&&runtime.model!==n.target){n.state='superseded';this.save('notice-superseded',{id});return null;}
-        if(n.state==='retry'){delete n.text;delete n.runtime;}
+        if(n.kind==='model-switched'&&runtime.model!==n.target) {
+          const past=runtimeReply({actual:n.runtime,tasks:[]},{switched:true}).replace('已经切到 ','此前已切到 ');
+          n.text=past+' '+runtimeReply(view);
+        }
+        if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
         n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
         n.runtime??=view.actual;n.state='sending';n.attempts=(n.attempts??0)+1;
         this.save('notice-sending',{id});return {...clone(n),sendNow:true};
@@ -374,7 +389,7 @@ export class MobileRouter {
       await this.locked(async()=>{
         const n=this.state.notices[id];
         if(receipt?.state==='accepted'&&receipt.messageId){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();
-          if(!n.replyRecorded){this.state.recent.push({role:'assistant',text:n.text.slice(0,4000)});this.state.recent=this.state.recent.slice(-16);n.replyRecorded=true;}}
+          n.replyRecorded=true;}
         else if(receipt?.state==='not-started'&&n.attempts<3){n.state='retry';n.nextAttemptAt=this.now()+2000*n.attempts;}
         else {n.state='unconfirmed';n.nextAttemptAt=this.now()+30000;}
         this.save('notice-settled',{id,state:n.state});

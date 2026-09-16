@@ -49,7 +49,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
   let reader,readerId,initialScan=true,closed=false,running=false;
   const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
-    configForModel:model=>({modelProvider:model==='deepseek-flash'?'kin_session_gateway':'openai',reasoningEffort:model==='deepseek-flash'?'max':'medium',fastMode:model==='gpt-6-astra'&&routerConfig.workFast?'on':'off',
+    configForModel:model=>({modelProvider:model==='deepseek-flash'?'kin_session_gateway':'openai',reasoningEffort:model==='deepseek-flash'?'high':'medium',fastMode:model==='gpt-6-astra'&&routerConfig.workFast?'on':'off',
       config:{model_catalog_json:path.join(root,'mobile-models.json'),'model_providers.kin_session_gateway':{name:'Kin session gateway',base_url:routing.gateway.baseUrl,env_key:'KIN_SESSION_GATEWAY_TOKEN',wire_api:'responses',requires_openai_auth:false}}}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{

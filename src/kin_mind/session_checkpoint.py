@@ -6,7 +6,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.retrieval import tokens
 
 from .context import Contexts
-from .dialogue import dialogue_rows, redundant_public_summaries, split_recent, utc_time
+from .dialogue import dialogue_rows, is_public_dialogue, redundant_public_summaries, split_recent, utc_time
 from .memory import MemoryContinuity
 
 
@@ -30,7 +30,7 @@ class SessionCheckpoint:
         texts = {}
         reviewed = []
         for event in sorted(events.values(), key=lambda e: (utc_time(e["at"]), e["id"]), reverse=True):
-            if event['id'] in redundant or event.get('internal'):
+            if event['id'] in redundant or not is_public_dialogue(event):
                 continue
             if not event.get("text") or event.get("kind") == "delivery" and event.get("state") != "accepted":
                 continue

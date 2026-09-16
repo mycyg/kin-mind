@@ -76,7 +76,7 @@ class Provider:
             raise RuntimeError("deepseek-evidence-compression-pending")
         return Appraisal(reason="Synthetic current decision", values={"initiative": 77} if context.get("operational_only") else {},
                          next_review_minutes=25, memory=MemoryAssessment()), {
-                             "provider": "deepseek", "model": "deepseek-flash", "reasoning": "max", "request_id": "fixture"}
+                             "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high", "request_id": "fixture"}
 
 
 def test_action_contract_excludes_unused_graph_schema():

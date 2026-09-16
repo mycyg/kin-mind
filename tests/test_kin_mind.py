@@ -319,7 +319,7 @@ def test_deepseek_contract_and_redaction(monkeypatch):
         body = json.loads(request.content)
         assert body["tool_choice"]["type"] == "auto"
         assert body["thinking"]["type"] == "enabled"
-        assert body["output_config"]["effort"] == "max"
+        assert body["output_config"]["effort"] == "high"
         assert body["max_tokens"] == 131072
         return httpx.Response(
             200,

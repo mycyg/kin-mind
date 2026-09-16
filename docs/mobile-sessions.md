@@ -4,7 +4,7 @@ The host keeps a long-lived logical conversation across its channels. Each nativ
 
 ## Decision order
 
-DeepSeek Flash / max proposes `keep`, `recall`, `compact`, `defer`, `prepare` or `rotate` in the existing appraisal flow. Missing evidence calls for recall. Context pressure calls for compression of the current native thread. A new segment requires a completed compaction in the current generation and specific, still-valid degradation evidence observed afterwards.
+DeepSeek Flash / high proposes `keep`, `recall`, `compact`, `defer`, `prepare` or `rotate` in the existing appraisal flow. Missing evidence calls for recall. Context pressure calls for compression of the current native thread. A new segment requires a completed compaction in the current generation and specific, still-valid degradation evidence observed afterwards.
 
 The host estimates pressure from the verified effective window, current input usage and reserved output/tool space. Defaults request review at 65%, with 85% classified as critical. Cumulative billing, rollout size, elapsed time, generic warnings and compaction counts do not authorize rotation. A successful compaction preserves the current thread and task IDs. The 30-minute cooldown allows observation before another compaction.
 

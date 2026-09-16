@@ -27,7 +27,7 @@ The ledger includes ordinary replies, proactive messages and file sends. DS labe
 
 ## One semantic queue
 
-An enabled scope batches pending interaction and receipt events into the existing DeepSeek Flash/max appraisal. Memory notes, links, share interpretations, affect, concerns and wishes commit in one transaction. Source identity and revision are checked at commit. Bookkeeping changes that do not touch actual appraisal dependencies can be rebased; a newly arrived owner message defers new action intentions to its own assessment.
+An enabled scope batches pending interaction and receipt events into the existing DeepSeek Flash/high appraisal. Memory notes, links, share interpretations, affect, concerns and wishes commit in one transaction. Source identity and revision are checked at commit. Bookkeeping changes that do not touch actual appraisal dependencies can be rebased; a newly arrived owner message defers new action intentions to its own assessment.
 
 The persistent cursor limits a batch to complete events. Latest interactions accompany delayed events, so an old reply is not blindly recreated as a future wish. The assistant saying “I'll tell you later” is an account of its own arrangement, not an owner contact restriction. Receipt-only events settle existing intentions without creating topics.
 

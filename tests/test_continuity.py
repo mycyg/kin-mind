@@ -657,7 +657,7 @@ def test_private_reasoning_never_enters_continuity_result(monkeypatch):
     )
     proposal, receipt = provider.appraise({"state": {"dimensions": {}}})
     assert "SYNTHETIC_PRIVATE_TRACE" not in json.dumps([proposal.model_dump(), receipt])
-    assert len(seen) == 1 and seen[0]["output_config"]["effort"] == "max"
+    assert len(seen) == 1 and seen[0]["output_config"]["effort"] == "high"
     assert seen[0]["max_tokens"] == 131072
     assert receipt["elapsed_ms"] >= 0
 

@@ -7,6 +7,7 @@ from kin_mind.appraisal import Appraisal, Appraisals
 from kin_mind.context import Contexts
 from kin_mind.session_advice import SessionAdvice
 from kin_mind.session_checkpoint import SessionCheckpoint
+from kin_mind.dialogue import recent_dialogue
 
 
 @pytest.fixture
@@ -46,6 +47,28 @@ def test_pending_public_journal_is_available_before_semantic_queue_and_receipts_
     assert snapshot['items'][0]['delivery'] == 'not-confirmed-by-this-record'
 
 
+def test_control_notifications_and_private_fields_never_enter_recent_public_bubbles(system):
+    mind, memory, _, clock = system
+    events = [
+        {'id': 'user', 'kind': 'owner-message', 'text': 'Continue the story.'},
+        {'id': 'answer', 'kind': 'assistant-message', 'text': 'The next chapter.', 'reasoning_content': 'PRIVATE_REASONING', 'tool_result': 'PRIVATE_TOOL'},
+        {'id': 'notice', 'kind': 'assistant-message', 'origin': 'runtime-status', 'text': 'CONTROL_NOTICE'},
+        {'id': 'private', 'kind': 'assistant-message', 'internal': True, 'text': 'PRIVATE_EVALUATION'},
+    ]
+    for event in events:
+        clock[0] += timedelta(seconds=1)
+        memory.ingest({**event, 'at': mind.clock()})
+    recent = recent_dialogue(mind)
+    assert [e['text'] for e in recent] == ['Continue the story.', 'The next chapter.']
+    assert all(e['occurred_at'] and e['received_at'] for e in recent)
+    snapshot = SessionCheckpoint(mind).snapshot([
+        {'id': 'tool', 'kind': 'tool_call', 'text': 'PRIVATE_TOOL', 'at': mind.clock()},
+        {'id': 'notice-pending', 'kind': 'delivery', 'state': 'accepted', 'origin': 'runtime-status', 'text': 'CONTROL_NOTICE', 'at': mind.clock()},
+    ])
+    assert [e['text'] for e in snapshot['items']] == [e['text'] for e in recent]
+    assert 'PRIVATE_' not in str(snapshot['items'])
+
+
 def test_first_appraisal_after_host_upgrade_does_not_invalidate_its_own_config_snapshot(system):
     mind, _, source, _ = system
     api = SessionCheckpoint(mind, agent_version='host-v2')
@@ -55,7 +78,7 @@ def test_first_appraisal_after_host_upgrade_does_not_invalidate_its_own_config_s
 
     class Reviewer:
         def appraise(self, context):
-            return Appraisal(reason='Keep current thread', session_advice=SessionAdvice(action='keep', reason='No degradation')), {'model': 'deepseek-flash', 'reasoning': 'max'}
+            return Appraisal(reason='Keep current thread', session_advice=SessionAdvice(action='keep', reason='No degradation')), {'model': 'deepseek-flash', 'reasoning': 'high'}
 
     assert jobs.run_one(Reviewer())['state'] == 'complete'
     assert mind.read()['agent_version'] == 'host-v2'
@@ -93,7 +116,7 @@ def test_session_maintenance_is_prioritized_small_and_does_not_update_affect(sys
         def appraise(self, context):
             assert context['stimulus'] == 'session-maintenance'
             assert 'memory_context' not in context and 'dimensions' not in context['state']
-            return Appraisal(reason='Compact first', values={'mood': 0}, session_advice=SessionAdvice(action='compact', reason='Window pressure')), {'model': 'deepseek-flash', 'reasoning': 'max'}
+            return Appraisal(reason='Compact first', values={'mood': 0}, session_advice=SessionAdvice(action='compact', reason='Window pressure')), {'model': 'deepseek-flash', 'reasoning': 'high'}
     result = jobs.run_one(Reviewer())
     assert result['state'] == 'complete', result
     assert jobs.status(maintenance['id'])['state'] == 'complete'
@@ -115,7 +138,7 @@ def test_readonly_session_review_can_finish_during_memory_inference_without_reco
             calls.append('session')
             jobs.enqueue([source('second internal check')], 'fixture-v1', origin='reflection', stimulus='session-maintenance')
             assert jobs.run_one(self)['state'] == 'busy'
-            return Appraisal(reason='Keep', session_advice=SessionAdvice(action='keep', reason='Healthy')), {'model': 'deepseek-flash', 'reasoning': 'max'}
+            return Appraisal(reason='Keep', session_advice=SessionAdvice(action='keep', reason='Healthy')), {'model': 'deepseek-flash', 'reasoning': 'high'}
 
     class MemoryReviewer:
         def appraise(self, context):
@@ -124,7 +147,7 @@ def test_readonly_session_review_can_finish_during_memory_inference_without_reco
             assert jobs.run_one(SessionReviewer())['state'] == 'complete'
             assert jobs.status(check['id'])['state'] == 'complete'
             assert jobs.status(work['id'])['state'] == 'running'
-            return Appraisal(reason='No state change'), {'model': 'deepseek-flash', 'reasoning': 'max'}
+            return Appraisal(reason='No state change'), {'model': 'deepseek-flash', 'reasoning': 'high'}
 
     assert jobs.run_one(MemoryReviewer())['state'] == 'complete'
     assert calls == ['memory', 'session']

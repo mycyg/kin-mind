@@ -196,7 +196,7 @@ def appraisal_schema(operational=False, historical=False):
     schema = Appraisal.model_json_schema()
     if not operational:
         return schema
-    # The action lane has no graph-writing obligation. Do not ask a max
+    # The action lane has no graph-writing obligation. Do not ask a high
     # reasoning model to plan fields which this transaction will not apply.
     schema["properties"]["memory"] = {"type": "object", "properties": {}, "additionalProperties": False}
     definitions = schema.pop("$defs", {})
@@ -360,8 +360,8 @@ class DeepSeek:
         provider.engine = engine
         return provider
 
-    def structured(self, name, schema, system, context, *, max_tokens=16384):
-        """Share the verified Flash/max transport; accept only the named tool result."""
+    def structured(self, name, schema, system, context, *, max_tokens=65536):
+        """Share the verified Flash/high transport; accept only the named tool result."""
         started = time.monotonic()
         key = os.environ.get(self.key_env)
         if not key:
@@ -373,7 +373,7 @@ class DeepSeek:
                     json={"model": "deepseek-flash", "max_tokens": max_tokens, "system": system,
                           "messages": [{"role": "user", "content": dumps(context)}],
                           "tools": [{"name": name, "description": "Submit sourced structured results", "input_schema": schema.model_json_schema()}],
-                          "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": "max"}})
+                          "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": "high"}})
             if response.status_code != 200:
                 raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
@@ -385,7 +385,7 @@ class DeepSeek:
             if len(calls) != 1:
                 raise RuntimeError("deepseek-missing-structured-result")
             result = schema.model_validate(calls[0]["input"])
-            return result, {"provider": "deepseek", "model": body["model"], "reasoning": "max", "request_id": body.get("id"),
+            return result, {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
                             "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
                             "elapsed_ms": round((time.monotonic() - started) * 1000)}
         except httpx.TimeoutException:
@@ -476,7 +476,7 @@ class DeepSeek:
                         ],
                         "tool_choice": {"type": "auto"},
                         "thinking": {"type": "enabled"},
-                        "output_config": {"effort": "max"},
+                        "output_config": {"effort": "high"},
                     },
                 )
                 if response.status_code != 200:
@@ -517,7 +517,7 @@ class DeepSeek:
                 "model": body["model"],
                 "usage": body.get("usage", {}),
                 "request_id": body.get("id"),
-                "reasoning": "max",
+                "reasoning": "high",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
                 "context_projection": request_context.get("context_projection", "affect-decision-v3"),

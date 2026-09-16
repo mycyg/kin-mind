@@ -1,6 +1,6 @@
 # Computer exploration, sharing choices and owner help
 
-DeepSeek Flash/max chooses a question and its purpose in the existing appraisal.
+DeepSeek Flash/high chooses a question and its purpose in the existing appraisal.
 `exploration_target` is `knowledge` (the backward-compatible default) or
 `computer`. Kimi executes the question for at most 1,200 seconds. A computer
 question can concern the owner's authorized work or everyday activity. A high
