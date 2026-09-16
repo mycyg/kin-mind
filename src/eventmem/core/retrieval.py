@@ -354,7 +354,7 @@ def recall(engine, request: RecallRequest):
         result = Contexts(Mind(engine, request.scope)).build(query=request.query,
             purpose="read" if request.phase in {"search", "read"} else "startup" if request.phase in {"startup", "compact"} else "chat",
             session=request.session or "", budget=request.budget, history=request.history,
-            allow_model=request.phase in {"search", "read"})
+            allow_model=request.phase in {"search", "read"}, mode="deep" if request.mode == "deep" else "light")
         return {**result, "items": result.get("index", []), "generation": engine.db.generation(), "accounts": {"memory": result["tokens"]}}
     started = time.perf_counter()
     engine.interactive_until = time.monotonic() + 2

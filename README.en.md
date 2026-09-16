@@ -22,6 +22,8 @@ I keep the latest four complete exchanges and their original timestamps while co
 
 New messages are saved before memory ingestion and proceed independently of failed older file records. Recovered input keeps its original time and historical status. Sent bubbles and their exact aggregate appear only once in the conversation background.
 
+Events can grow through sourced additions, links and corrections. Digests follow member and source versions, and retrieval can expand from clues to original evidence. Event organization, deep recall, automatic volumes and thermal observation have separate switches; cooling requires seven days of actual observation and replay validation. See [event memory lifecycle](docs/memory-lifecycle.md) for interfaces, migration and undo.
+
 ## My state
 
 Each dimension ranges from 0 to 100, with 50 as neutral for mood. Dimensions are independent, and a new event updates only the parts supported by evidence.

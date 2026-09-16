@@ -29,10 +29,10 @@ def register_mind_tools(server, engine):
         return result
 
     @server.tool()
-    def read_event_thread(scope: Scope, identifier: str, query: str = "", cursor: int = 0, budget: int = 2000) -> dict:
-        """Follow a sourced event through participants, work, findings, delivery and feedback. Page within the memory budget; uncertainty and prior sharing stay attached to the finding."""
+    def read_event_thread(scope: Scope, identifier: str, query: str = "", cursor: int = 0, budget: int = 2000, detail: str = "summary", expected_revision: int | None = None, access_origin: str = "user_query", usage_id: str | None = None) -> dict:
+        """Follow a sourced event through participants, work, findings, delivery and feedback. detail selects index, summary (default), or complete original sources. expected_revision detects concurrent changes. Set access_origin=maintenance for autonomous/background reads, and reuse usage_id on retries. Page within the memory budget; stale summaries, uncertainty and prior sharing remain labelled."""
         from .context import Contexts
-        return Contexts(Mind(engine, scope)).event_thread(identifier, query=query, cursor=cursor, budget=budget)
+        return Contexts(Mind(engine, scope)).event_thread(identifier, query=query, cursor=cursor, budget=budget, detail=detail, expected_revision=expected_revision, access_origin=access_origin, usage_id=usage_id)
 
     @server.tool()
     def revise_graph(scope: Scope, request: dict) -> dict:
@@ -59,10 +59,10 @@ def register_mind_tools(server, engine):
         return Contexts(Mind(engine, scope)).read_history("work", query=query, identifier=identifier, cursor=cursor, budget=budget)
 
     @server.tool()
-    def read_continuity_context(scope: Scope, query: str, cursor: int = 0, budget: int = 2000, history: bool = False) -> dict:
-        """Actively recall relevant past events, promises, works and shares in this same turn. Follow source IDs from summaries to originals before claiming an uncertain fact. Use up to three automatic search rounds, then preserve unresolved uncertainty. Budget overflow uses sourced DeepSeek compression or a continuation; seeing an index is not reading the original."""
+    def read_continuity_context(scope: Scope, query: str, cursor: int = 0, budget: int = 2000, history: bool = False, mode: str = "auto", access_origin: str = "user_query", usage_id: str | None = None) -> dict:
+        """Actively recall relevant past events, promises, works and shares in this same turn. mode is auto (default), light (local), or deep (hybrid search and optional ranking). Set access_origin=maintenance for autonomous/background reads; reuse usage_id on retries. Follow source IDs from summaries to originals before claiming an uncertain fact. Use up to three search rounds, then preserve unresolved uncertainty. Budget overflow uses sourced DeepSeek compression or a continuation; seeing an index is not reading the original."""
         from .context import Contexts
-        return Contexts(Mind(engine, scope)).build(query=query, purpose="read", cursor=cursor, budget=budget, history=history, allow_model=True)
+        return Contexts(Mind(engine, scope)).build(query=query, purpose="read", cursor=cursor, budget=budget, history=history, allow_model=True, mode=mode, access_origin=access_origin, usage_id=usage_id)
 
     @server.tool()
     def read_affective_state(scope: Scope, history: int = 0, query: str = "") -> dict:

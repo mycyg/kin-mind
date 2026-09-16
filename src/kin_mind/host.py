@@ -68,6 +68,9 @@ def dispatch(config, action, request):
         if action == "session-validate":
             return checkpoints.validate(request["checkpoint"])
         if action == "session-snapshot":
+            if memory.settings()["event_lifecycle"] and isinstance(request.get("foreground"), bool):
+                from .lifecycle import foreground_lease
+                foreground_lease(engine, mind.scope.key(), "host:" + config["session_id"], active=request["foreground"], seconds=120)
             return checkpoints.snapshot(request.get("pending"), tasks=request.get("tasks"), intent=request.get("intent"))
         snapshot = dict(request['snapshot'])
         if not request.get('shadow') and not memory.settings().get('manifest_restore'):
@@ -117,6 +120,10 @@ def dispatch(config, action, request):
         return memory.graph.revise(request)
     if action == "event-thread":
         return Contexts(mind).event_thread(**request)
+    if action in {"lifecycle-status", "lifecycle-backfill"}:
+        from .lifecycle import EventLifecycle
+        lifecycle = EventLifecycle(mind, memory.graph)
+        return lifecycle.status() if action == "lifecycle-status" else lifecycle.backfill(**request)
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -126,6 +133,12 @@ def dispatch(config, action, request):
         return result
     if action == "memory-context":
         from .dialogue import clock_context
+        from .adaptive_recall import select_mode
+        requested_mode = request.get("mode", "auto")
+        if request.get("purpose") == "read" and requested_mode == "auto":
+            requested_mode = "deep"
+        if memory.settings()["adaptive_recall"] and select_mode(request.get("query", ""), requested_mode, request.get("history", False)) == "deep":
+            request.setdefault("allow_model", True)
         if config.get("adaptive_sessions"):
             request["native_pressure_managed"] = True
         if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':

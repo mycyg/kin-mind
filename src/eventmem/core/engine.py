@@ -299,6 +299,8 @@ class Engine:
             return self.command(conn, f"record:{command_id}", record.model_dump(), run)
 
     def _dirty(self, conn, data):
+        from kin_mind.lifecycle import record_changed
+        record_changed(conn, data)
         conn.execute(
             "INSERT INTO dirty VALUES(?,?) ON CONFLICT(record_id) DO UPDATE SET revision=excluded.revision",
             (data["id"], data["revision"]),
@@ -692,6 +694,8 @@ class Engine:
                 if row:
                     conn.execute("DELETE FROM search WHERE rowid=?", (row[0],))
                     old_data = self._get(conn, current)
+                    from kin_mind.lifecycle import record_deleted
+                    record_deleted(conn, old_data, now())
                     if old_data["locator"].get("blob"):
                         blobs_to_remove.add(old_data["locator"]["blob"])
                 family_ids = [
@@ -793,10 +797,10 @@ class Engine:
                 if path.name not in used and path.stat().st_mtime < time.time() - 60:
                     path.unlink(missing_ok=True)
 
-    def enqueue(self, kind, payload, key, dependencies=(), *, conn=None):
+    def enqueue(self, kind, payload, key, dependencies=(), *, conn=None, priority=100):
         if conn is None:
             with self.db.connect(write=True) as transaction:
-                return self.enqueue(kind, payload, key, dependencies, conn=transaction)
+                return self.enqueue(kind, payload, key, dependencies, conn=transaction, priority=priority)
         jid = "job_" + digest(key)[:32]
         existing = conn.execute(
             "SELECT kind,payload FROM jobs WHERE id=?", (jid,)
@@ -807,8 +811,8 @@ class Engine:
             raise Conflict("Job key reused with a different task")
         stamp = now()
         conn.execute(
-            "INSERT OR IGNORE INTO jobs(id,kind,unique_key,payload,state,available,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?,?)",
-            (jid, kind, key, dumps(payload), time.time(), stamp, stamp),
+            "INSERT OR IGNORE INTO jobs(id,kind,unique_key,payload,state,available,created_at,updated_at,priority) VALUES(?,?,?,?,'pending',?,?,?,?)",
+            (jid, kind, key, dumps(payload), time.time(), stamp, stamp, priority),
         )
         for dependency in dependencies:
             conn.execute(

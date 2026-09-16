@@ -1243,6 +1243,37 @@ export const operations = {
           "default": 2000,
           "title": "Budget"
         }
+      },
+      {
+        "name": "detail",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "enum": [
+            "index",
+            "summary",
+            "original"
+          ],
+          "type": "string",
+          "default": "summary",
+          "title": "Detail"
+        }
+      },
+      {
+        "name": "expected_revision",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Revision"
+        }
       }
     ],
     "body": {}

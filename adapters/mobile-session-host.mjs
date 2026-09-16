@@ -55,7 +55,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   const collect=async()=>{
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
     const state=router.snapshot(),inputs=Object.values(state.inputs),tasks=router.tasks();
-    const snapshot=await mindCall('session-snapshot',{pending,tasks});
+    const session=bridge.sessionManager.getSession(bridge.ownerId);
+    const foreground=Boolean(session?.processing||session?.queue?.length||tasks.length);
+    const snapshot=await mindCall('session-snapshot',{pending,tasks,foreground});
     const outstanding=inputs.filter(i=>['selected','submitting','unconfirmed'].includes(i.state));
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
     snapshot.cursors={...snapshot.cursors,inputs:digest(inputs.map(i=>[i.id,i.state,i.hash])),tasks:digest(tasks),config:state.configRevision??0};

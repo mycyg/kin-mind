@@ -128,6 +128,8 @@ class Database:
         self.blobs.mkdir(exist_ok=True, mode=0o700)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            from kin_mind.lifecycle_schema import initialize
+            initialize(conn)
         os.chmod(self.path, 0o600)
 
     @contextmanager

@@ -2659,6 +2659,8 @@ export interface operations {
                 query?: string;
                 cursor?: number;
                 budget?: number;
+                detail?: "index" | "summary" | "original";
+                expected_revision?: number | null;
             };
             header?: never;
             path: {

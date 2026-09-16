@@ -25,14 +25,17 @@ class Providers:
     can change canonical state. Generated text never supplies executable instructions.
     """
 
-    def __init__(self, engine):
+    def __init__(self, engine, timeout=None):
         self.engine = engine
+        self.timeout = timeout
 
     def role(self, name):
         config = self.engine.settings("models").get(name)
         if not config:
             raise NotConfigured(f"Configure model role: {name}")
         role = ModelRole.model_validate(config)
+        if self.timeout is not None:
+            role = role.model_copy(update={"timeout_seconds": max(.1, min(role.timeout_seconds, self.timeout))})
         if role.api_key_env and not os.environ.get(role.api_key_env):
             raise NotConfigured(f"Set environment variable for role: {name}")
         return role

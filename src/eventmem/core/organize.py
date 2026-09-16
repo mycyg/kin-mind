@@ -12,7 +12,7 @@ def prepare_communities(engine, scope):
 
     with engine.db.connect() as conn:
         dirty = conn.execute(
-            "SELECT r.id,r.data,d.revision FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND r.deleted=0 AND r.status='active' ORDER BY r.id LIMIT 2000",
+            "SELECT r.id,r.data,d.revision FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND r.deleted=0 AND r.status='active' AND d.revision=r.revision ORDER BY r.id LIMIT 2000",
             (scope.key(),),
         ).fetchall()
         ids = {r["id"] for r in dirty}

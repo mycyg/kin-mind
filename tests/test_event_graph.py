@@ -49,6 +49,19 @@ def test_share_review_keeps_whole_reply_and_reports_incomplete_results(system):
     assert result['state'] == 'ready' and result['text'] == request['text']
 
 
+def test_sharing_semantics_do_not_depend_on_trigger_words(system):
+    _, memory, _, _ = system
+    seen = []
+    class Reviewer:
+        timeout = 120
+        def structured(self, name, schema, prompt, context, **options):
+            seen.append(context['public_text'])
+            return ShareCheck(decision='uncertain', reason='Missing original evidence'), {'model': 'synthetic'}
+    result = memory.sharing.preflight({'draft_id': 'no-keyword', 'text': '那些颜色原来藏着这样的规律。'}, provider=Reviewer())
+    assert seen == ['那些颜色原来藏着这样的规律。']
+    assert result['state'] == 'pending' and result['reason'] == 'Missing original evidence'
+
+
 def findings(system):
     mind, memory, source, _ = system
     sid = source("observations", "The synthetic exploration has three independent observations.")

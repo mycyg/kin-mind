@@ -87,6 +87,8 @@ class EventGraph:
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
         with self.engine.db.connect() as conn:
             conn.executescript(SCHEMA)
+            from .lifecycle_schema import initialize_graph_refs
+            initialize_graph_refs(conn)
 
     def identifier(self, kind, key):
         return "graph_" + kind + "_" + digest([self.scope.key(), key])[:28]
@@ -122,7 +124,13 @@ class EventGraph:
             if old:
                 conn.execute("DELETE FROM mind_graph_search WHERE id=?", (value["id"],))
             conn.execute("INSERT INTO mind_graph_search VALUES(?,?)", (value["id"], tokenize(" ".join(str(value.get(k, "")) for k in ("title", "text", "aliases")))))
+            conn.execute("DELETE FROM mind_graph_record_refs WHERE scope=? AND node_id=?", (self.scope.key(), value["id"]))
+            record_ids = set(value.get("record_ids", [])) | {r["record_id"] for r in value.get("evidence", [])}
+            conn.executemany("INSERT OR IGNORE INTO mind_graph_record_refs VALUES(?,?,?)",
+                             [(self.scope.key(), rid, value["id"]) for rid in record_ids])
         conn.execute("INSERT INTO mind_graph_revisions VALUES(?,?,?,?)", (value["id"], value["revision"], "edge" if edge else "node", dumps(value)))
+        from .lifecycle import graph_changed
+        graph_changed(conn, self.scope.key(), value, old, self.mind.clock())
         return value
 
     def proof(self, conn, identifiers, allowed=None):
@@ -422,6 +430,35 @@ class EventGraph:
                     if edge["subject"] == edge["object"]:
                         edge["state"] = "retracted"
                     changed.append(self._put(conn, edge, edge=True))
+            elif action == "split_event":
+                if current["kind"] != "event" or current["state"] != "active":
+                    raise Conflict("Only event membership can be split")
+                selected = request.get("member_ids", [])
+                if not selected or len(selected) != len(set(selected)) or not request.get("title"):
+                    raise ValueError("Event split requires unique members and a title")
+                all_edges = [json.loads(r[0]) for r in conn.execute(
+                    "SELECT data FROM mind_graph_edges WHERE scope=? AND object=? AND predicate='part_of' AND state='active'",
+                    (self.scope.key(), identifier))]
+                if not set(selected) < {e["subject"] for e in all_edges}:
+                    raise Conflict("Split members must be a proper subset")
+                split_id = self.identifier("event", ["split", request["command_id"]])
+                try:
+                    self.get(conn, split_id)
+                    raise Conflict("Split identity already exists")
+                except Missing:
+                    pass
+                before[split_id] = None
+                split = self._put(conn, {"id": split_id, "kind": "event", "title": request["title"],
+                    "basis": current.get("basis", "inferred"), "lifecycle": current.get("lifecycle", "open"),
+                    "occurred_at": min(self.get(conn, i)["occurred_at"] for i in selected),
+                    "text": "", "split_from": identifier, "membership_authority": "graph", "record_ids": [],
+                    "merge_sources": [], "aliases": [], "source_ids": sorted({r["source_id"] for r in proof}), "evidence": proof})
+                changed.append(split)
+                for edge in all_edges:
+                    if edge["subject"] in selected:
+                        before[edge["id"]] = edge
+                        changed.append(self._put(conn, {**edge, "object": split_id}, edge=True))
+                current = {**current, "membership_command": request["command_id"]}
             elif action in {"undo", "split"}:
                 prior = conn.execute("SELECT data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["previous_command_id"])).fetchone()
                 if not prior:
@@ -432,7 +469,8 @@ class EventGraph:
                         raise Conflict("Affected graph objects changed since the command")
                 for nid, value in old["before"].items():
                     before[nid] = self.get(conn, nid)
-                    changed.append(self._put(conn, {**value, "revision_reason": request["reason"]}, edge=value.get("kind") == "edge"))
+                    restored = value if value is not None else {**before[nid], "state": "retracted"}
+                    changed.append(self._put(conn, {**restored, "revision_reason": request["reason"]}, edge=restored.get("kind") == "edge"))
                 current = None
             elif action in {"correct", "retract", "restore"}:
                 allowed = {"title", "text", "reason", "role", "basis", "confidence", "valid_from", "valid_until", "occurred_at", "aliases"}
@@ -464,6 +502,6 @@ class EventGraph:
                 raise ValueError("Unknown graph revision action")
             if current:
                 changed.append(self._put(conn, {**current, "revision_reason": request["reason"], "evidence": proof, "source_ids": sorted({r["source_id"] for r in proof})}, edge=current.get("kind") == "edge"))
-            result = {"state": "applied", "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
+            result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
             conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), command_hash, dumps(result)))
             return result

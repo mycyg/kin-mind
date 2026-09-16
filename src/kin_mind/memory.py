@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
             "sharing": False, "graph": False, "associations": False, "graph_recall": False,
+            "event_lifecycle": False, "adaptive_recall": False, "auto_volumes": False,
+            "temperature_shadow": False, "temperature_ranking": False,
+            "temperature_shadow_started_at": None, "temperature_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20}
 
@@ -88,12 +91,16 @@ class Disclosure(Model):
     mode: Literal["new", "development", "reflection", "reminiscence", "duplicate"] = "new"
 
 
+from .lifecycle import EventRoute
+
+
 class MemoryAssessment(Model):
     notes: list[MemoryNote] = Field(default_factory=list, max_length=8)
     links: list[MemoryLink] = Field(default_factory=list, max_length=16)
     disclosures: list[Disclosure] = Field(default_factory=list, max_length=12)
     graph: GraphAssessment = Field(default_factory=GraphAssessment)
     coverage: CoverageAssessment = Field(default_factory=CoverageAssessment)
+    event_routes: list[EventRoute] = Field(default_factory=list, max_length=12)
 
 
 def fingerprint_file(path):
@@ -155,14 +162,36 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality"):
+        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
-            config = self.settings(conn) | values
+            previous = self.settings(conn)
+            config = previous | values
+            if config["temperature_shadow"] and (not previous["temperature_shadow"] or not config["temperature_shadow_started_at"]):
+                config["temperature_shadow_started_at"] = self.mind.clock()
+                config["temperature_validation"] = None
+            if config["temperature_ranking"]:
+                from .lifecycle import observation_days
+                started, validation = config["temperature_shadow_started_at"], config["temperature_validation"] or {}
+                if (not config["temperature_shadow"] or not started or
+                    timestamp(self.mind.clock()) - timestamp(started) < timedelta(days=7) or
+                    observation_days(conn, self.scope.key(), started, self.mind.clock()) < 7):
+                    raise Conflict("Cooling needs seven full days of shadow observation")
+                if (validation.get("critical_recall") != 1 or validation.get("recall_at_8", 0) < .9 or
+                    any(validation.get(k) != 0 for k in ("wrong_merges", "unsupported_upgrades", "stale_facts", "background_reinforcement")) or
+                    not validation.get("evaluated_at") or timestamp(validation["evaluated_at"]) < timestamp(started) + timedelta(days=7)):
+                    raise Conflict("Cooling needs a current successful replay validation")
             if not 20 <= config["review_min_minutes"] <= config["first_review_minutes"] <= config["review_max_minutes"] <= 120:
                 raise ValueError("Review range must be within 20..120 minutes")
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
+            if values.get("event_lifecycle") is False:
+                conn.execute("DELETE FROM mind_foreground_leases WHERE scope=?", (self.scope.key(),))
+            for flag, kind in (("event_lifecycle", "event_digest"), ("event_lifecycle", "lifecycle_backfill"), ("auto_volumes", "lifecycle_volumes"), ("temperature_shadow", "lifecycle_temperature")):
+                if values.get(flag):
+                    conn.execute("UPDATE jobs SET state='pending',error=NULL WHERE kind=? AND state='waiting_config' "
+                                 "AND error=? AND json_extract(payload,'$.scope')=json(?)",
+                                 (kind, "Lifecycle feature disabled: " + flag, self.scope.key()))
             due = (timestamp(self.mind.clock()) + timedelta(minutes=config["first_review_minutes"])).isoformat()
             conn.execute("INSERT OR IGNORE INTO mind_semantic_cursor(scope,next_review,data) VALUES(?,?,?)",
                          (self.scope.key(), due, "{}"))
@@ -410,10 +439,48 @@ class MemoryContinuity:
             graph_context = self.graph.candidates(conn, query) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
             for node in graph_context:
                 node["needs_review"] = not self.graph.fresh(conn, node)
+                if self.settings(conn)["event_lifecycle"] and node["kind"] == "event" and not node["needs_review"]:
+                    from .lifecycle import EventLifecycle
+                    from .adaptive_recall import evidence_excerpt
+                    members = EventLifecycle(self.mind, self.graph).snapshot(conn, node["id"])["records"]
+                    node["identity_evidence"] = [{"id": r["id"], "revision": r["revision"],
+                        "basis": r["confirmation"], "occurred_at": r["valid_from"],
+                        "text": evidence_excerpt(r["content"], query)[0], "excerpt_only": evidence_excerpt(r["content"], query)[1]}
+                        for r in sorted(members.values(), key=lambda r: r["valid_from"], reverse=True)[:2]]
                 if node["kind"] in {"finding", "exploration", "work"}:
                     node["share_coverage"] = self.sharing.coverage(conn, node["id"])
+            topic_candidates = []
+            if self.settings(conn)["auto_volumes"] and graph_context:
+                from .adaptive_recall import evidence_excerpt
+                anchors = list(dict.fromkeys(rid for n in graph_context for rid in [
+                    *n.get("record_ids", []), *[r["record_id"] for r in n.get("evidence", [])],
+                    *[r["id"] for r in n.get("identity_evidence", [])]]))[:80]
+                if anchors:
+                    slots = ",".join("?" for _ in anchors)
+                    families = conn.execute("SELECT data FROM families WHERE scope=? AND kind='family' AND state='candidate' "
+                        f"AND EXISTS (SELECT 1 FROM json_each(families.data,'$.members') WHERE value IN ({slots})) "
+                        "ORDER BY revision DESC,id LIMIT 4", [self.scope.key(), *anchors]).fetchall()
+                    for row in families:
+                        family = json.loads(row[0])
+                        members = []
+                        for rid in family["members"][:12]:
+                            try:
+                                refs = self.mind._evidence(conn, [rid])
+                                if not self.mind._fresh(conn, refs):
+                                    continue
+                                record = self.engine._get(conn, rid)
+                            except (Conflict, Missing):
+                                continue
+                            excerpt, partial = evidence_excerpt(record["content"], query, budget=250)
+                            members.append({"id": rid, "revision": record["revision"], "basis": record["confirmation"],
+                                "text": excerpt, "excerpt_only": partial, "occurred_at": record["valid_from"]})
+                        if len(members) >= 2:
+                            topic_candidates.append({"id": family["id"], "revision": family["revision"], "title": family["title"],
+                                "candidate_only": True, "members": members, "omitted_count": len(family["members"]) - len(members)})
         return {"cursor": cursor["seq"], "through_seq": pending[-1]["seq"] if pending else cursor["seq"],
                 "graph_candidates": graph_context,
+                "topic_candidates": topic_candidates,
+                "event_lifecycle_enabled": self.settings()["event_lifecycle"],
                 "conversation_habits": self.habits.read(),
                 "pending_events": [{"seq": r["seq"], **json.loads(r["data"])} for r in pending],
                 "recent_interaction": recent,
@@ -512,6 +579,9 @@ class MemoryContinuity:
         # notes and graph nodes together, including their revision history.
         if config["graph"]:
             self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases)
+        if config["event_lifecycle"] and assessment.event_routes:
+            from .lifecycle import EventLifecycle
+            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases)
         for note in assessment.notes:
             for identifier in note.about_ids:
                 for root in self._record_ids(conn, resolve(identifier)):
@@ -578,9 +648,14 @@ class MemoryContinuity:
             raise Conflict("Linked memory needs review")
         return node.get("record_ids", []) or [r["record_id"] for r in self.mind._evidence(conn, node["source_ids"])]
 
-    def access(self, session, identifier, revision, depth):
+    def access(self, session, identifier, revision, depth, *, origin="automatic_injection", usage_id=None):
         if depth not in {"index", "summary", "original", "used", "shared"}:
             raise ValueError("Unknown access depth")
         with self.engine.db.connect(write=True) as conn:
             conn.execute("INSERT OR IGNORE INTO mind_memory_access VALUES(?,?,?,?,?,?)",
                          (self.scope.key(), session, identifier, revision, depth, self.mind.clock()))
+            if depth != "index" and self.settings(conn)["temperature_shadow"]:
+                from .lifecycle import record_usage
+                record_usage(conn, self.scope.key(), identifier,
+                             usage_id or digest([session, identifier, revision, depth, self.mind.clock()[:10]]),
+                             origin, self.mind.clock(), {"depth": depth, "revision": revision})

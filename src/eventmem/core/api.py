@@ -656,10 +656,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         return memory.sharing.decorate(memory.graph.detail(identifier))
 
     @app.get("/v1/graph/thread/{identifier}", operation_id="read_event_thread")
-    def read_event_thread(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", cursor: int = Query(0, ge=0), budget: int = Query(2000, ge=128, le=32000)) -> dict:
+    def read_event_thread(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", cursor: int = Query(0, ge=0), budget: int = Query(2000, ge=128, le=32000), detail: Literal["index", "summary", "original"] = "summary", expected_revision: int | None = None) -> dict:
         from kin_mind.context import Contexts
         from kin_mind.state import Mind
-        return Contexts(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).event_thread(identifier, query=query, cursor=cursor, budget=budget)
+        return Contexts(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).event_thread(identifier, query=query, cursor=cursor, budget=budget, detail=detail, expected_revision=expected_revision)
 
     @app.post("/v1/graph/revisions", operation_id="revise_graph")
     def revise_graph(request: GraphCommand) -> dict:

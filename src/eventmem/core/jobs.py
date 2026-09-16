@@ -23,16 +23,26 @@ class Worker:
         if self.engine.interactive_until > time.monotonic():
             return None
         with self.engine.db.connect(write=True) as conn:
+            foreground = bool(conn.execute("SELECT 1 FROM mind_foreground_leases WHERE expires_at>? LIMIT 1", (time.time(),)).fetchone())
+            expired = conn.execute("SELECT * FROM jobs WHERE state='running' AND lease_until<? AND attempts>=max_attempts",
+                                   (time.time(),)).fetchall()
             conn.execute(
                 "UPDATE jobs SET state='failed',error='Lease expired after maximum attempts' WHERE state='running' AND lease_until<? AND attempts>=max_attempts",
                 (time.time(),),
             )
+            for lost in expired:
+                if lost["kind"] == "event_digest" or lost["kind"].startswith("lifecycle_"):
+                    from kin_mind.lifecycle import job_failed
+                    job_failed(conn, lost, "failed", "Lease expired after maximum attempts")
             conn.execute(
                 "UPDATE jobs SET state='failed',error='Dependency failed or canceled' WHERE state='pending' AND EXISTS(SELECT 1 FROM job_dependencies d JOIN jobs parent ON parent.id=d.dependency_id WHERE d.job_id=jobs.id AND parent.state IN ('failed','canceled'))"
             )
             row = conn.execute(
-                "SELECT * FROM jobs j WHERE ((state IN ('pending','retry') AND available<=?) OR (state='running' AND lease_until<?)) AND NOT EXISTS(SELECT 1 FROM job_dependencies d LEFT JOIN jobs parent ON parent.id=d.dependency_id WHERE d.job_id=j.id AND (parent.state IS NULL OR parent.state!='complete')) ORDER BY available,id LIMIT 1",
-                (time.time(), time.time()),
+                "SELECT * FROM jobs j WHERE ((state IN ('pending','retry') AND available<=?) OR (state='running' AND lease_until<?)) AND "
+                "(kind!='event_digest' OR NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.kind='event_digest' AND busy.state='running' AND busy.lease_until>strftime('%s','now'))) AND "
+                "(?=0 OR priority<=30) AND "
+                "NOT EXISTS(SELECT 1 FROM job_dependencies d LEFT JOIN jobs parent ON parent.id=d.dependency_id WHERE d.job_id=j.id AND (parent.state IS NULL OR parent.state!='complete')) ORDER BY priority,available,id LIMIT 1",
+                (time.time(), time.time(), int(foreground)),
             ).fetchone()
             if not row:
                 return None
@@ -113,6 +123,9 @@ class Worker:
                             job["id"],
                         ),
                     )
+                    if job["kind"] == "event_digest" or job["kind"].startswith("lifecycle_"):
+                        from kin_mind.lifecycle import job_failed
+                        job_failed(conn, job, state, error)
         finally:
             done.set()
             heartbeat.join(timeout=1)
@@ -121,6 +134,9 @@ class Worker:
     def prepare(self, job):
         engine, kind = self.engine, job["kind"]
         payload = json.loads(job["payload"])
+        if kind == "event_digest" or kind.startswith("lifecycle_"):
+            from kin_mind.lifecycle import prepare_job
+            return prepare_job(engine, job, payload)
         if kind == "parse":
             from .media import parse
 
@@ -549,8 +565,10 @@ class Worker:
         from datetime import datetime, timedelta, timezone
 
         with self.engine.db.connect(write=True) as conn:
+            from kin_mind.lifecycle import schedule
+            schedule(self.engine, conn, now())
             scopes = conn.execute(
-                "SELECT r.scope,COUNT(*),MAX(d.revision) FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.deleted=0 GROUP BY r.scope LIMIT 30"
+                "SELECT r.scope,COUNT(*),MAX(d.revision) FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.deleted=0 AND r.status='active' AND d.revision=r.revision GROUP BY r.scope LIMIT 30"
             ).fetchall()
             for scope, count, _ in scopes:
                 if count >= max(2, config.get("organize_batch", 20)):
@@ -559,10 +577,11 @@ class Worker:
                         (scope,),
                     ).fetchone()
                     if not active:
+                        versions = conn.execute("SELECT d.record_id,d.revision FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND r.deleted=0 AND r.status='active' AND d.revision=r.revision ORDER BY d.record_id", (scope,)).fetchall()
                         self.engine.enqueue(
                             "organize",
                             {"scope": json.loads(scope)},
-                            f"auto-organize:{digest(scope)}:{self.engine.db.generation(conn)}",
+                            f"auto-organize:{digest(scope)}:{digest([tuple(v) for v in versions])}",
                             conn=conn,
                         )
                 if config.get("narratives", False):

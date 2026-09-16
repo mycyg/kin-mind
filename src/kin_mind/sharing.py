@@ -155,6 +155,11 @@ class ShareLedger:
         data = {**data, "revision": old.get("revision", 0)+1}
         conn.execute("INSERT OR REPLACE INTO mind_share_coverage VALUES(?,?,?,?,?,?,?,?,?)", (*keys, data["share_id"], data["state"], data["at"], dumps(data)))
         conn.execute("INSERT INTO mind_coverage_revisions VALUES(?,?,?,?,?,?)", (self.scope.key(),data["unit_id"],data["version"],data["bubble_id"],data["revision"],dumps(data)))
+        if data["state"] == "accepted" and data.get("message_id") and not data.get("needs_review"):
+            from .lifecycle import configured, record_usage
+            if configured(conn, self.scope.key(), "temperature_shadow"):
+                record_usage(conn, self.scope.key(), data["unit_id"], data["bubble_id"],
+                             "reply_reference", data["at"], {"message_id": data["message_id"], "version": data["version"]})
         return data
 
     def settle(self, conn, share, *, mappings=None):
@@ -241,15 +246,14 @@ class ShareLedger:
             candidates = [n for n in self.graph.candidates(conn, text) if n["kind"] == "finding"]
             # Exact quotations are an evidence-preserving fast path, including
             # older callers that have not yet attached structured references.
-            if not references:
+            if not references and provider is None:
                 value = normalized(text)
                 references = [{"unit_id": n["id"], "version": n.get("content_version", 1), "mode": "new"} for n in candidates if len(normalized(n.get("text", ""))) >= 16 and normalized(n["text"]) in value]
             context = [{"id": n["id"], "version": n.get("content_version", 1), "text": n.get("text", ""), "coverage": self.coverage(conn, n["id"])} for n in candidates[:12]]
         semantic = None
-        from .graph import query_terms
-        words = set(query_terms(text))
-        overlaps = any(len(words & set(query_terms(n.get("text", "")))) >= 4 for n in candidates)
-        review_needed = bool(request.get("review_required") or overlaps or re.search(r"新(?:鲜事|发现|进展)|我(?:又|刚|后来)?.{0,6}(?:查|研究|发现)|之前.{0,6}(?:分享|作品|探索)", text))
+        # Semantic review is selected by the calling model/host and available
+        # evidence, not a phrase list or a hand-tuned word-overlap threshold.
+        review_needed = bool(provider is not None or request.get("review_required"))
         if not references and review_needed:
             if provider is None:
                 return {"state": "pending", "reason": "share-semantic-review-required", "candidates": context}

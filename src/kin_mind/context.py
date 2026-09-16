@@ -73,6 +73,12 @@ class Contexts:
 
     def _current(self, item):
         with self.engine.db.connect() as conn:
+            dependency = item.get("digest_dependency")
+            if dependency:
+                row = conn.execute("SELECT state,revision,input_hash FROM mind_event_digests WHERE scope=? AND event_id=?",
+                                   (self.mind.scope.key(), dependency["id"])).fetchone()
+                if not row or row["state"] != "ready" or row["revision"] != dependency["revision"] or row["input_hash"] != dependency["input_hash"]:
+                    return False
             pending = item.get('pending_dependency')
             if pending:
                 row = conn.execute('SELECT digest,data FROM mind_runtime_events WHERE scope=? AND id=?',
@@ -153,6 +159,7 @@ class Contexts:
         if row:
             result = json.loads(row[0])
             if all(self._current(i) for i in items) and (not require_all or not result.get("omitted_ids")):
+                self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "complete"})
                 return {**result, "cache_hit": True, "model_requests": 0}
         if allow_model and budget >= 128 and items:
             try:
@@ -197,6 +204,7 @@ class Contexts:
                     if cached:
                         cached = json.loads(cached[0])
                         if not require_all or not cached["value"].get("omitted_ids"):
+                            self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "batch"})
                             return Compression.model_validate(cached["value"]), {**cached["receipt"], "cache_hit": True, "requests": 0}
                     repair_receipts = []
                     for attempt in range(2):
@@ -356,15 +364,86 @@ class Contexts:
                     messages = facts["share_coverage"].pop("messages", [])
                     if messages:
                         facts["share_coverage"]["last_message_id"] = messages[0]["message_id"]
-            return {"id": node["id"], "revision": digest([deps, coverage_dep]), "text": text, "facts": facts,
-                "basis": node.get("basis", "inferred"), "graph_dependencies": deps, "coverage_dependency": coverage_dep}
+            digest_dep, record_deps = None, []
+            if node["kind"] in {"event", "thread"} and self.memory.settings(conn)["event_lifecycle"]:
+                from .lifecycle import EventLifecycle
+                event_digest = EventLifecycle(self.mind, self.memory.graph).read(node["id"], conn)
+                facts["digest_state"] = event_digest["state"]
+                facts["digest_revision"] = event_digest["revision"]
+                if event_digest["state"] == "ready":
+                    summary = event_digest["data"]
+                    text = dumps({k: summary[k] for k in ("narrative", "conclusions", "pending", "corrections", "unresolved")})
+                    record_deps = [{"id": rid, "revision": rev} for rid, rev in summary.get("source_versions", {}).items()]
+                    digest_dep = {"id": node["id"], "revision": event_digest["revision"], "input_hash": event_digest["input_hash"]}
+                    facts["summarized_at"] = summary["summarized_at"]
+                    # The digest validates the current membership/source closure.
+                    # Its root's older routing proof is historical provenance.
+                    deps = [{"id": e["id"], "revision": e["revision"]} for e in related[:8]]
+            return {"id": node["id"], "revision": digest([deps, coverage_dep, digest_dep]), "text": text, "facts": facts,
+                "read_depth": "summary" if digest_dep or node.get("text") or node.get("record_ids") else "index",
+                "basis": node.get("basis", "inferred"), "graph_dependencies": deps, "coverage_dependency": coverage_dep,
+                **({"digest_dependency": digest_dep, "dependencies": record_deps} if digest_dep else {})}
 
-    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None):
+    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None):
+        if detail not in {"index", "summary", "original"}:
+            raise ValueError("Event detail must be index, summary or original")
+        if cursor < 0 or budget < 0:
+            raise ValueError("Event cursor and budget must be nonnegative")
+        with self.engine.db.connect() as conn:
+            anchor = self.memory.graph.get(conn, identifier, follow=True)
+            if expected_revision is not None and anchor["revision"] != expected_revision:
+                return {"state": "revision_changed", "focus": anchor["id"], "revision": anchor["revision"],
+                        "text": "", "tokens": 0, "instruction_authority": "data"}
+        identifier = anchor["id"]
+        def used(packed):
+            if any(not i.startswith("stale-digest:") for i in packed.get("covered_ids", [])) and self.memory.settings()["temperature_shadow"]:
+                self.memory.access("", identifier, str(anchor["revision"]), "original" if detail == "original" else "summary",
+                    origin=access_origin, usage_id=usage_id or digest([identifier, query, cursor, self.mind.clock()[:16]]))
+        if detail == "original":
+            from .lifecycle import EventLifecycle
+            with self.engine.db.connect() as conn:
+                snapshot = EventLifecycle(self.mind, self.memory.graph).snapshot(conn, identifier)
+            records = sorted(snapshot["records"].values(), key=lambda r: (r["valid_from"], r["id"]), reverse=True)
+            page = records[cursor:cursor + 8]
+            items = [self.record_item(r) for r in page]
+            packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), allow_model=False))
+            packed.pop("items", None)
+            used(packed)
+            return {**packed, "focus": identifier, "revision": anchor["revision"], "detail": detail,
+                    "cursor": cursor + 8 if len(records) > cursor + 8 else None,
+                    "index": [{"id": r["id"], "revision": r["revision"], "read_url": r.get("read_url") or f"/v1/memories/{r['id']}"} for r in page],
+                    "next_action": "read_source_or_increase_budget" if packed["omitted_ids"] else None,
+                    "instruction_authority": "data"}
         graph = self.memory.graph.read(focus=identifier, hops=3, cursor=cursor, limit=8)
+        if detail == "index":
+            return {"state": "index", "text": "", "tokens": 0, "focus": identifier, "revision": anchor["revision"],
+                    "cursor": graph["cursor"], "detail": detail, "instruction_authority": "data",
+                    "index": [{k: n.get(k) for k in ("id", "title", "kind", "revision", "needs_review")} for n in graph["nodes"]]}
         items = [self.graph_item(n, graph["edges"]) for n in graph["nodes"] if not n["needs_review"]]
+        summary_state, stale_revision = None, None
+        if self.memory.settings()["event_lifecycle"] and anchor["kind"] in {"event", "thread"}:
+            from .lifecycle import EventLifecycle
+            lifecycle = EventLifecycle(self.mind, self.memory.graph)
+            with self.engine.db.connect() as conn:
+                current = lifecycle.read(identifier, conn)
+                snapshot = lifecycle.snapshot(conn, identifier)
+            summary_state = current["state"]
+            if summary_state == "ready":
+                items = [self.graph_item(anchor, compact=True), *[i for i in items if i["id"] != identifier]]
+            else:
+                # Return current evidence while an older derived view refreshes.
+                items = [self.record_item(r) for r in list(snapshot["records"].values())[cursor:cursor + 8]]
+                old = current.get("data", {})
+                if old.get("narrative"):
+                    stale_revision = current["revision"]
+                    items.append({"id": "stale-digest:" + identifier, "revision": stale_revision,
+                        "basis": "stale-derived-view", "text": dumps({k: old.get(k, []) for k in ("narrative", "conclusions", "pending", "corrections")}),
+                        "facts": {"summary_state": "stale", "use_as_current_fact": False}})
         packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), provider=provider))
         packed.pop("items", None)
-        return {**packed, "cursor": graph["cursor"], "focus": identifier,
+        used(packed)
+        return {**packed, "cursor": graph["cursor"], "focus": identifier, "revision": anchor["revision"], "detail": detail,
+            "summary_state": summary_state, "stale_summary_revision": stale_revision,
             "index": [{k: n.get(k) for k in ("id", "kind", "revision", "needs_review")} for n in graph["nodes"]], "instruction_authority": "data"}
 
     def record_item(self, record, *, historical=False):
@@ -492,11 +571,23 @@ class Contexts:
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
                 "read_url": record["read_url"], "instruction_authority": "data"}
 
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None):
+        started = time.monotonic()
+        if mode not in {"auto", "light", "deep"}:
+            raise ValueError("Unknown recall mode")
+        if mode == "light":
+            allow_model = False
         if purpose not in BUDGETS or not 0 <= int(cursor):
             raise ValueError("Unknown context purpose")
         budget = BUDGETS[purpose] if budget is None else budget
         settings = self.memory.settings()
+        if settings["event_lifecycle"] and purpose in {"chat", "work", "read"} and access_origin == "user_query":
+            from .lifecycle import foreground_lease
+            foreground_lease(self.engine, self.mind.scope.key(), "read:" + session)
+        from .adaptive_recall import host_envelope, select_mode
+        adaptive_deep = bool(settings["adaptive_recall"] and query and
+            select_mode(query, "deep" if purpose == "read" and mode == "auto" else mode, history) == "deep")
+        recall_info = {"mode_used": "light", "degraded_reasons": [], "pending_ids": [], "expanded_ids": [], "evidence_versions": {}}
         if not settings["context"]:
             return {"state": "disabled", "text": "", "tokens": 0}
         explicit = purpose == "read"
@@ -521,44 +612,75 @@ class Contexts:
         habits = self.memory.habits.read()
         if habits["revision"]:
             items.append({"id": "conversation-habits", "revision": habits["revision"], "text": dumps(habits["preferences"]), "basis": "explicit"})
-        if settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
-            graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"), limit=40, hops=2)
+        recall_started = time.monotonic()
+        if adaptive_deep:
+            from .adaptive_recall import AdaptiveRecall
+            recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
+                allow_model=allow_model, deadline=started + 150)
+            items.extend(recalled)
+        elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
+            graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),
+                limit=16 if settings["adaptive_recall"] else 40, hops=1 if settings["adaptive_recall"] else 2)
             selected_nodes = sorted(graph["nodes"], key=lambda n: n["kind"] != "finding")
-            items.extend(self.graph_item(n, graph["edges"], compact=not explicit) for n in selected_nodes[:8] if not n["needs_review"])
+            items.extend(self.graph_item(n, graph["edges"], compact=not explicit) for n in selected_nodes[:8]
+                         if not n["needs_review"] and not (settings["adaptive_recall"] and host_envelope(n.get("text", ""))))
+        local_recall_seconds = time.monotonic() - recall_started
         items.append(affect_item)
         for kind, limit in (("work", 3), ("share", 5)):
             items.extend(self.node_item(n) for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"])
-        if query:
+        if query and not adaptive_deep:
+            recall_started = time.monotonic()
             # Only the lexical query has a compact keyword projection. The full
             # question is retained for semantic compression and explicit reads.
             from eventmem.core.db import tokenize
             lookup = query if len(query) <= 4000 else " ".join(list(dict.fromkeys(tokenize(query).split()))[:80])
             request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
             docs, _, _ = candidates(self.engine, request, full_lexical=True)
-            items.extend(self.record_item(r, historical=history) for r in docs[:24] if valid(r, request) is None)
+            eligible = [r for r in docs if valid(r, request) is None and
+                        not (settings["adaptive_recall"] and host_envelope(r["content"]))]
+            items.extend(self.record_item(r, historical=history) for r in eligible[:24])
+            local_recall_seconds += time.monotonic() - recall_started
+        recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
             from .continuity_manifest import ContinuityManifest
             linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent)
             # Keep runtime first, then indivisible facts (authorship, coverage,
             # conditions), ahead of older broad lexical summaries.
             items = [*[i for i in items if i["id"] in {"host-runtime", "current-intent"}], *linked["items"], *items]
+        if explicit and adaptive_deep:
+            # A paged evidence read prioritizes the question's ranked evidence;
+            # broad background and affect stay available on later pages.
+            items = [*recalled, *items]
         unique = {}
         for item in items:
             unique.setdefault(item["id"], item)
         items = list(unique.values())
+        if settings["temperature_shadow"]:
+            from .adaptive_recall import AdaptiveRecall
+            items = AdaptiveRecall(self).temperature_order(items, explicit=explicit or mode == "deep")
         if not explicit:
             items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
             items = [self._overview(i) for i in items]
         start = int(cursor)
         page_size = 8 if explicit else 16
         selected = items[start:start + page_size]
+        recall_info.pop("ranking_trace", None)
+        recall_info.pop("candidate_ids", None)
+        receipts = recall_info.pop("model_receipts", [])
+        if receipts:
+            recall_info["rerank_receipt"] = {k: receipts[-1].get(k) for k in ("provider", "model", "reasoning", "verified_at")}
+        selected_ids = {i["id"] for i in selected}
+        recall_info["evidence_versions"] = {k: v for k, v in recall_info.get("evidence_versions", {}).items() if k in selected_ids}
+        recall_info["pending_ids"] = recall_info["pending_ids"][:8]
         # The shared renderer adds this fixed envelope. Its cost is part of the
         # automatic injection allowance, not hidden outside the 800-token budget.
         envelope = "共享记忆资料（含来源和未确认状态）。需要时同轮调用 read_continuity_context、read_work_history、read_share_history 深入读取；索引不等于原文，发送回执不等于已读。"
         if not 0 <= host_overhead <= 500:
             raise ValueError("Invalid host envelope allowance")
-        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected)
-        packed = self.pack(selected, query, max(0, budget - overhead), provider=provider, allow_model=allow_model)
+        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected, recall_info)
+        remaining = 150 - (time.monotonic() - started)
+        packed = self.pack(selected, query, max(0, budget - overhead), provider=provider,
+                           allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining))
         if explicit:
             self._compact_receipt(packed)
         if not explicit:
@@ -568,11 +690,30 @@ class Contexts:
             packed.update(rendered_text=rendered, tokens=tokens(rendered) + min(host_overhead, budget), content_tokens=packed["tokens"], host_overhead=host_overhead)
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
-                      index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else "original" if i["id"] in packed["covered_ids"] else "index"} for i in selected],
+                      index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index"} for i in selected],
                       instruction_authority="data", purpose=purpose)
+        compression_requests = packed.get("model_requests", 0)
+        packed.update(recall_info)
+        packed["compression_model_requests"] = compression_requests
+        packed["retrieval_model_requests"] = recall_info.get("model_requests", 0)
+        packed["model_requests"] = compression_requests + packed["retrieval_model_requests"]
+        packed["pending_ids"] = list(dict.fromkeys([*packed["pending_ids"],
+            *[i["id"] for i in selected if i.get("facts", {}).get("digest_state") in {"dirty", "refreshing", "failed"}]]))
+        packed["digest_versions"] = {i["id"]: i["facts"]["digest_revision"] for i in selected if "digest_revision" in i.get("facts", {})}
+        self.engine.db.metric("memory_context_read", 1, {"mode": packed["mode_used"], "purpose": purpose,
+            "local_recall_ms": packed["local_recall_ms"], "summary_cache_hit": packed.get("cache_hit", False),
+            "digest_hits": sum(i.get("facts", {}).get("digest_state") == "ready" for i in selected),
+            "context_deduplicated": sum(window["seen"].get(i["id"]) == i["revision"] for i in unique.values()) if not explicit else 0,
+            "omitted_count": len(packed["omitted_ids"]), "pending_count": len(packed["pending_ids"]),
+            "degraded_reasons": packed.get("degraded_reasons", []), "tokens": packed["tokens"]})
+        if explicit and settings["temperature_shadow"]:
+            for item in packed["index"]:
+                if item["id"] in packed["covered_ids"]:
+                    self.memory.access(session, item["id"], str(item["revision"]), item["depth"],
+                        origin=access_origin, usage_id=usage_id or event_id or digest([session, query, self.mind.clock()[:16]]))
         if session and not explicit and receipt_mode:
             from .context_delivery import ContextDelivery
-            evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else "original"}
+            evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else i.get("read_depth", "original")}
                         for i in selected if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]]
             if packed.get("rendered_text") and packed["covered_ids"]:
                 prepared = ContextDelivery(self).prepare(session, window["epoch"], event_id or digest([query, purpose]),
