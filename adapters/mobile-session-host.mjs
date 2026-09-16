@@ -6,7 +6,7 @@ import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-wind
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
-import {safeBoundary} from './session-policy.mjs';
+import {safeBoundary,checkpointBudget} from './session-policy.mjs';
 import {switchCodexModel} from './codex-models.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
@@ -172,7 +172,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       if(cp.manifestVersion){
         const prepared=await mindCall('context-delivery-prepare',{session:runtime.threadId,epoch:manager.state.restoreEpoch,
           event_id:'restore:'+cp.id,text:JSON.stringify(cp.payload),items:cp.contextDependencies??[],
-          budget:Math.max(manager.state.config.restoreBudget,router.tasks().length?4000:0),kind:'restore',manifest_id:cp.id});
+          budget:checkpointBudget(cp,Math.max(manager.state.config.restoreBudget,router.tasks().length?4000:0)),kind:'restore',manifest_id:cp.id});
         if(prepared.state==='incomplete')throw Error('Restore envelope exceeds budget');
         const receipt=await background.deliver(prepared);
         if(receipt.state!=='accepted')throw Error('Restore receipt remains unconfirmed');

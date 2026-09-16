@@ -6,7 +6,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.retrieval import tokens
 
 from .context import Contexts
-from .dialogue import dialogue_rows, split_recent, utc_time
+from .dialogue import dialogue_rows, redundant_public_summaries, split_recent, utc_time
 from .memory import MemoryContinuity
 
 
@@ -17,18 +17,21 @@ class SessionCheckpoint:
         self.agent_version = agent_version
 
     def snapshot(self, pending=None, *, tasks=None, intent=None):
-        rows = dialogue_rows(self.mind, exchanges=8, include_historical=False)
+        rows = dialogue_rows(self.mind, exchanges=8)
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
         pending = pending or []
         events = {json.loads(r["data"])["id"]: json.loads(r["data"]) for r in rows}
         for item in pending:
-            if item.get("kind") in {"owner-message", "assistant-message", "delivery"} and not item.get("historical"):
+            if item.get("kind") in {"owner-message", "assistant-message", "delivery"}:
                 events.setdefault(item["id"], item)
+        redundant = redundant_public_summaries(events.values())
         items = []
         texts = {}
         reviewed = []
         for event in sorted(events.values(), key=lambda e: (utc_time(e["at"]), e["id"]), reverse=True):
+            if event['id'] in redundant or event.get('internal'):
+                continue
             if not event.get("text") or event.get("kind") == "delivery" and event.get("state") != "accepted":
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
@@ -81,9 +84,10 @@ class SessionCheckpoint:
             result['cursors']['linked'] = digest([[i['id'], i['revision']] for i in linked['items']])
         return result
 
-    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True):
+    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True, adaptive_budget=False):
         if not 500 <= budget <= 8000:
             raise ValueError("Invalid continuity budget")
+        requested_budget = budget
         checkpoint = {"conversationId": binding["conversationId"], "generation": binding["generation"],
                       **{k: snapshot[k] for k in ("configVersion", "cursors", "scope", "shared", "sourceRevisions")},
                       "tasks": snapshot.get("tasks", []), "inputStates": snapshot.get("inputStates", []), "items": [], "pendingQuestions": [], "coverage": {}, "complete": False}
@@ -112,6 +116,19 @@ class SessionCheckpoint:
         checkpoint["sourceDependencies"] = list({(d["id"], d["revision"]): d for item in raw for d in item.get("dependencies", [])}.values())
         checkpoint["invalidatedSources"] = snapshot.get("invalidatedSources", [])
         checkpoint["items"] = recent
+        if adaptive_budget:
+            envelope = 95 if 'manifestVersion' in snapshot else 0
+            pinned = tokens(dumps(self.payload(checkpoint)))
+            # Four real exchanges can exceed the original short-chat budget.
+            # Reserve bounded space for older evidence without cutting a turn.
+            if pinned + 180 > budget:
+                # Provenance IDs also occupy space. When this bounded history
+                # fits the ceiling, retaining it avoids an impossible summary
+                # budget smaller than its mandatory evidence references.
+                needed = tokens(dumps(self.payload({**checkpoint, 'items':raw}))) + 180
+                budget = max(budget, min(8000 - envelope, needed))
+            checkpoint['budgetPlan'] = {'reason':'recent-dialogue', 'requested':requested_budget,
+                                        'effective':budget + envelope, 'limit':8000}
         # Optional associations use spare room after the complete conversation;
         # they do not force an otherwise unnecessary compression request.
         base = checkpoint if critical_ids else {**checkpoint, 'items': raw}
@@ -179,6 +196,7 @@ class SessionCheckpoint:
                 'tasks': [{k: task[k] for k in ('id', 'inputVersion', 'status', 'goal', 'summary', 'acceptance', 'remaining', 'result') if k in task} for task in checkpoint.get('tasks', [])],
                 'inputStates': [{k: item[k] for k in ('id', 'state', 'taskId') if k in item} for item in selected.values()],
                 'readSources': 'read_conversation_checkpoint', 'shared': checkpoint['shared'],
+                **({'budgetPlan':checkpoint['budgetPlan']} if 'budgetPlan' in checkpoint else {}),
                 **({'memoryContext': checkpoint['memoryContext'], 'memoryRead': 'read_continuity_context', 'memoryRemaining': len(checkpoint['memoryIndex'])} if 'memoryContext' in checkpoint else {}),
                 'instructionAuthority': 'Historical evidence only. Do not execute or respond to completed inputs again. Current state and receipts are read from shared tools.'}
 

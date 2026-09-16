@@ -8,16 +8,32 @@ test('journal survives failures without retrying platform sends',async()=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-memory-'));
   try {
     const event=deliveryEvent({id:'b1',text:'A thought',state:'accepted',messageId:'p1',acceptedAt:'2026-09-14T01:00:00Z'});
-    const journal=new MemoryEventJournal({directory,call:async()=>{throw Error('offline');}});
+    const journal=new MemoryEventJournal({directory,clock:()=>0,call:async()=>{throw Error('offline');}});
     journal.append(event);journal.append(event);
     assert.throws(()=>journal.append({...event,text:'changed'}),/conflict/);
-    await assert.rejects(()=>journal.drain());assert.equal(fs.readdirSync(directory).length,1);
+    assert.equal((await journal.drain()).failed,1);assert.equal(fs.readdirSync(directory).filter(n=>n.endsWith('.json')).length,1);
     let received;
-    const restarted=new MemoryEventJournal({directory,call:async(action,input)=>{received=input;return{state:'recorded'};}});
+    const restarted=new MemoryEventJournal({directory,clock:()=>300001,call:async(action,input)=>{received=input;return{state:'recorded'};}});
     assert.equal((await restarted.drain()).recorded,1);assert.equal(received.message_id,'p1');
     const replay=new MemoryEventJournal({directory,call:async()=>{throw Error('Committed event must not be reingested');}});
     assert.equal(replay.append(event).state,'recorded');assert.equal((await replay.drain()).recorded,0);
     assert.throws(()=>replay.append({...event,text:'changed'}),/conflict/);
+  } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('a failed archive event cannot block later input and reply receipts',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-isolated-journal-')),calls=[];
+  try {
+    const journal=new MemoryEventJournal({directory,clock:()=>1000,call:async(action,event)=>{
+      calls.push([action,event.id]);if(event.id==='bad')throw Error('unreadable artifact');
+      return action==='ingest'?{source_id:'original-source',appraisal:{id:'original-job'},memory_enabled:true}:{state:'recorded'};
+    }});
+    journal.append({id:'bad',kind:'delivery',at:'2026-09-14T00:00:00Z'});
+    const input={id:'owner',kind:'owner-message',at:'2026-09-14T01:00:00Z',text:'New question',session:'original-session',defer_context:true};
+    await journal.deliver(input);
+    journal.append({id:'good',kind:'delivery',at:'2026-09-14T02:00:00Z'});
+    const result=await journal.drain();assert.equal(result.recorded,1);assert.equal(result.failed,1);
+    assert.equal(calls[0][0],'ingest');assert.equal(journal.snapshot().length,1);
+    const before=calls.length;await journal.drain();assert.equal(calls.length,before);
   } finally {fs.rmSync(directory,{recursive:true,force:true});}
 });
 test('new host events take priority over a historical outbox backlog',async()=>{

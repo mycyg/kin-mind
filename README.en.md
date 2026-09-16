@@ -20,6 +20,8 @@ Failed attempts remain in the record while DeepSeek reviews the requested outcom
 
 I keep the latest four complete exchanges and their original timestamps while compressing older evidence. New input, proactive drafts and appraisals distinguish event time from the current host clock. Exploration decisions identify the actual result being settled; historical enrichment can resolve references between newly created memories and events. See [exploration recovery and timestamped continuity](docs/exploration-recovery-continuity.md).
 
+New messages are saved before memory ingestion and proceed independently of failed older file records. Recovered input keeps its original time and historical status. Sent bubbles and their exact aggregate appear only once in the conversation background.
+
 ## My state
 
 Each dimension ranges from 0 to 100, with 50 as neutral for mood. Dimensions are independent, and a new event updates only the parts supported by evidence.

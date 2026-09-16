@@ -39,12 +39,18 @@ export function safeBoundary({runtime,tasks=[],inputs=[],notices=[],contactRunni
   return {safe:true};
 }
 
+export function checkpointBudget(checkpoint,budget) {
+  const plan=checkpoint?.budgetPlan;
+  if(plan?.reason==='recent-dialogue'&&plan.requested===budget&&Number.isInteger(plan.effective)&&plan.effective>=budget&&plan.effective<=8000&&plan.limit===8000)return plan.effective;
+  return budget;
+}
+
 export function validateCheckpoint(checkpoint,{binding,cursors,configVersion,budget}) {
   if(!checkpoint||checkpoint.conversationId!==binding.conversationId||checkpoint.generation!==binding.generation)return 'checkpoint-identity-mismatch';
   if(checkpoint.configVersion!==configVersion)return 'checkpoint-config-changed';
   if(JSON.stringify(checkpoint.cursors)!==JSON.stringify(cursors))return 'checkpoint-increments-pending';
   if(!checkpoint.complete||checkpoint.needsReview||!checkpoint.sourceRevisions||!checkpoint.items?.length)return 'checkpoint-coverage-incomplete';
-  if(!Number.isFinite(checkpoint.tokens)||checkpoint.tokens>budget)return 'checkpoint-budget';
+  if(!Number.isFinite(checkpoint.tokens)||checkpoint.tokens>checkpointBudget(checkpoint,budget))return 'checkpoint-budget';
   if(checkpoint.items.some(i=>!['user','assistant'].includes(i.role)||!i.id||!i.revision||typeof i.text!=='string'||i.channel&&i.channel!=='final'))return 'checkpoint-public-history-only';
   if((checkpoint.pendingQuestions??[]).some(q=>!checkpoint.items.some(i=>i.id===q.sourceId)))return 'checkpoint-reference-missing';
   return null;

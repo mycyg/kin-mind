@@ -454,6 +454,9 @@ class DeepSeek:
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
+        if request_context.get('clock', {}).get('authority') == 'host-clock':
+            elapsed = int(max(0, time.monotonic() - started))
+            request_context['clock'] = clock_context((timestamp(request_context['clock']['current_time']) + timedelta(seconds=elapsed)).isoformat())
         try:
             with httpx.Client(timeout=max(30, self.timeout - (time.monotonic() - started)), transport=self.transport) as client:
                 response = client.post(

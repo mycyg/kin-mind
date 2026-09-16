@@ -2,6 +2,7 @@ import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import fs from 'node:fs';
 import {checkpointMarker} from './native-window.mjs';
+import {conversationClock} from './conversation-time.mjs';
 
 /** A mobile-only, read-only app-server instance. It never owns a channel or an
  * MCP credential. Native API responses are the authority for its thread IDs. */
@@ -43,7 +44,8 @@ export class NativeCandidate {
     if(native.path&&fs.existsSync(native.path)&&(await checkpointMarker(native.path,marker)).found)return {verified:true,operationId,source:'native-history'};
     const items=checkpoint.items.map(item=>({type:'message',role:item.role,content:[{type:item.role==='user'?'input_text':'output_text',text:item.text}]}));
     const metadata=checkpoint.payload?{...checkpoint.payload,publicHistory:undefined}:{kind:'internal-continuity-checkpoint',checkpointId:checkpoint.id,configVersion:checkpoint.configVersion,scope:checkpoint.scope,conversationId:checkpoint.conversationId,tasks:checkpoint.tasks,shared:checkpoint.shared,inputStates:checkpoint.inputStates};
-    items.push({type:'message',role:'assistant',content:[{type:'output_text',text:JSON.stringify({...metadata,marker,messageIds:checkpoint.items.map(i=>i.id)})}]});
+    items.push({type:'message',role:'assistant',content:[{type:'output_text',text:JSON.stringify({...metadata,marker,messageIds:checkpoint.items.map(i=>i.id),
+      messageTimes:checkpoint.items.map(i=>({id:i.id,occurred_at:i.occurred_at??i.at??null,received_at:i.received_at??null})),clock:conversationClock({kind:'continuity-restore'})})}]});
     await this.request('thread/inject_items',{threadId:native.threadId,items});
     const proof=native.path?await checkpointMarker(native.path,marker):{found:false};
     return {verified:proof.found,accepted:true,operationId,at:proof.at,checkpointId:checkpoint.id};

@@ -73,7 +73,7 @@ def dispatch(config, action, request):
         if not request.get('shadow') and not memory.settings().get('manifest_restore'):
             snapshot.pop('manifestVersion', None)
             snapshot.pop('linked', None)
-        return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True))
+        return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
     if action == "continuity-manifest":
         from .continuity_manifest import ContinuityManifest
         return ContinuityManifest(mind).read(**request)
@@ -173,7 +173,7 @@ def dispatch(config, action, request):
                 namespace="kin-owner-input",
                 key=request["id"],
                 scope=mind.scope,
-                session=config["session_id"],
+                session=request.get("session") or config["session_id"],
                 text=request["text"],
                 authority="explicit",
                 occurred_at=request["at"],
@@ -186,7 +186,7 @@ def dispatch(config, action, request):
             )
         )
         job = jobs.enqueue([source["id"]], config["agent_version"])
-        memory.ingest({**request, "kind": "owner-message", "source_id": source["id"], "session": config["session_id"]})
+        memory.ingest({**request, "kind": "owner-message", "source_id": source["id"], "session": request.get("session") or config["session_id"]})
         if request.get("defer_context") and memory.settings()["context"]:
             return {"source_id": source["id"], "appraisal": job, "memory_enabled": True}
         return {

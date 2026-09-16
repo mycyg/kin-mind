@@ -9,7 +9,7 @@ function canonical(value) {
   return value;
 }
 export class MemoryEventJournal {
-  constructor({directory,call}) {this.directory=directory;this.call=call;this.running=false;}
+  constructor({directory,call,clock=Date.now}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;}
   append(event) {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
@@ -36,23 +36,45 @@ export class MemoryEventJournal {
     for(const name of files){try{entries.push(JSON.parse(fs.readFileSync(path.join(this.directory,name),'utf8')));}catch(error){if(error.code!=='ENOENT')throw error;}}
     return entries.sort((a,b)=>a.at.localeCompare(b.at)||a.id.localeCompare(b.id));
   }
+  acknowledge(event) {
+    const file=path.join(this.directory,hash(event.id)+'.json'),directory=path.join(this.directory,'receipts');
+    const body=JSON.stringify(canonical(event));
+    if(fs.existsSync(file)&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event changed before acknowledgement');
+    fs.mkdirSync(directory,{recursive:true,mode:0o700});
+    const receipt=path.join(directory,path.basename(file)),temporary=receipt+'.'+process.pid+'.tmp';
+    fs.writeFileSync(temporary,JSON.stringify({id:event.id,digest:hash(body)}),{mode:0o600});fs.renameSync(temporary,receipt);
+    fs.rmSync(file,{force:true});fs.rmSync(path.join(this.directory,'errors',path.basename(file)),{force:true});
+  }
+  async deliver(event) {
+    this.append(event);
+    const owner=event.kind==='owner-message';
+    const receipt=await this.call(owner?'ingest':'runtime-event',event);
+    if(owner?!(receipt.source_id&&receipt.appraisal?.id):receipt.state!=='recorded')throw Error('Memory ingestion awaits a receipt');
+    this.acknowledge(event);return receipt;
+  }
   async drain(limit=24) {
     if(this.running)return {state:'busy'};
-    this.running=true;let recorded=0;
+    this.running=true;let recorded=0,failed=0,attempted=0;
     try {
       const files=fs.existsSync(this.directory)?fs.readdirSync(this.directory).filter(n=>n.endsWith('.json')):[];
       const entries=files.map(n=>({file:path.join(this.directory,n),event:JSON.parse(fs.readFileSync(path.join(this.directory,n),'utf8'))}));
       entries.sort((a,b)=>Number(Boolean(a.event.historical))-Number(Boolean(b.event.historical))||a.event.at.localeCompare(b.event.at)||a.event.id.localeCompare(b.event.id));
-      for(const {file,event} of entries.slice(0,limit)) {
-        const receipt=await this.call('runtime-event',event);
-        if(receipt.state!=='recorded')return {state:receipt.state??'pending',recorded};
-        const directory=path.join(this.directory,'receipts');fs.mkdirSync(directory,{recursive:true,mode:0o700});
-        const committed=path.join(directory,path.basename(file)),temporary=committed+'.'+process.pid+'.tmp';
-        fs.writeFileSync(temporary,JSON.stringify({id:event.id,digest:hash(JSON.stringify(canonical(event)))}),{mode:0o600});
-        fs.renameSync(temporary,committed);
-        fs.unlinkSync(file);recorded++;
+      for(const {file,event} of entries) {
+        if(attempted>=limit)break;
+        if(!fs.existsSync(file))continue;
+        const errorFile=path.join(this.directory,'errors',path.basename(file));
+        const prior=fs.existsSync(errorFile)?JSON.parse(fs.readFileSync(errorFile,'utf8')):{};
+        if(prior.nextAt>this.clock())continue;
+        attempted++;
+        try {await this.deliver(event);recorded++;}
+        catch(error){
+          failed++;fs.mkdirSync(path.dirname(errorFile),{recursive:true,mode:0o700});
+          const attempts=(prior.attempts??0)+1;
+          fs.writeFileSync(errorFile,JSON.stringify({id:event.id,attempts,reason:error.name??'Error',checkedAt:this.clock(),nextAt:this.clock()+(attempts===1?5:15)*60000}),{mode:0o600});
+        }
       }
-      return {state:'drained',recorded,pending:Math.max(0,entries.length-recorded)};
+      const pending=this.snapshot().length;
+      return {state:pending?'pending':'drained',recorded,failed,pending};
     } finally {this.running=false;}
   }
 }

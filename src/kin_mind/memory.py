@@ -109,20 +109,27 @@ def fingerprint_file(path):
               "path": str(path)}
     if zipfile.is_zipfile(path):
         members, total = [], 0
-        with zipfile.ZipFile(path) as archive:
-            infos = [x for x in archive.infolist() if not x.is_dir()]
-            if len(infos) > 10000 or sum(x.file_size for x in infos) > 512 * 1024 * 1024:
-                result["member_status"] = "budget-exceeded"
-                return result
-            for info in infos:
-                member = hashlib.sha256()
-                with archive.open(info) as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        total += len(chunk)
-                        if total > 512 * 1024 * 1024:
-                            raise ValueError("Archive expanded beyond declared budget")
-                        member.update(chunk)
-                members.append({"name": info.filename, "sha256": member.hexdigest(), "bytes": info.file_size})
+        try:
+            with zipfile.ZipFile(path) as archive:
+                infos = [x for x in archive.infolist() if not x.is_dir()]
+                if len(infos) > 10000 or sum(x.file_size for x in infos) > 512 * 1024 * 1024:
+                    result["member_status"] = "budget-exceeded"
+                    return result
+                for info in infos:
+                    member = hashlib.sha256()
+                    with archive.open(info) as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            total += len(chunk)
+                            if total > 512 * 1024 * 1024:
+                                raise ValueError("Archive expanded beyond declared budget")
+                            member.update(chunk)
+                    members.append({"name": info.filename, "sha256": member.hexdigest(), "bytes": info.file_size})
+        except (OSError, EOFError, RuntimeError, zipfile.BadZipFile) as error:
+            # A split archive tail may have an EOCD but no local members.
+            # Its byte hash still proves the delivered file; it cannot prove
+            # member contents until the complete archive is available.
+            result.update(member_status="unavailable", member_error=type(error).__name__)
+            return result
         # Member names remain evidence, while the bag of member contents handles
         # renamed root folders and changed ZIP compression/timestamps.
         result.update(members=members, members_sha256=digest(sorted((x["sha256"], x["bytes"]) for x in members)))

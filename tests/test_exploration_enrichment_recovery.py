@@ -106,10 +106,45 @@ def test_four_exchanges_keep_every_bubble_with_original_times(system):
     assert clock_context("2026-09-15T23:59:00Z")["local_time"] == "2026-09-16T07:59:00+08:00"
 
 
+def test_restored_inputs_and_accepted_bubbles_survive_once_in_checkpoint(system):
+    mind, memory, _, clock = system
+    for turn in range(4):
+        clock[0] += timedelta(minutes=1)
+        memory.ingest({'id':f'u{turn}', 'kind':'owner-message', 'at':mind.clock(),
+                       'text':f'Original question {turn}', 'historical':True})
+        bubbles = [f'Answer {turn} part {n}' for n in range(3)]
+        for n, text in enumerate(bubbles):
+            clock[0] += timedelta(seconds=4)
+            memory.ingest({'id':f'b{turn}-{n}', 'kind':'delivery', 'at':mind.clock(),
+                           'text':text, 'state':'accepted','message_id':f'm{turn}-{n}'})
+        clock[0] += timedelta(seconds=1)
+        memory.ingest({'id':f'a{turn}', 'kind':'assistant-message', 'at':mind.clock(),
+                       'text':'\n\n'.join(bubbles)})
+    recent=recent_dialogue(mind)
+    assert sum(i['role']=='user' for i in recent)==4
+    assert sum(i['role']=='assistant' for i in recent)==12
+    snapshot=SessionCheckpoint(mind).snapshot()
+    assert len(snapshot['items'])==16
+    assert all(i['occurred_at'] and i['received_at'] for i in snapshot['items'])
+
+
 def test_history_schema_has_no_irrelevant_state_or_action_fields():
     schema = appraisal_schema(historical=True)
     assert set(schema["properties"]) == {"reason", "memory"}
     assert "Wish" not in schema.get("$defs", {})
+
+
+def test_host_can_expand_restore_budget_for_complete_recent_exchanges(system):
+    mind, _, _, _ = system
+    api=SessionCheckpoint(mind)
+    snapshot=api.snapshot([{'id':'recent','kind':'owner-message','at':mind.clock(),
+                            'text':'The original recent conversation is preserved. '*600}])
+    binding={'conversationId':'fixture','generation':1}
+    fixed=api.build(snapshot,binding,budget=2000,allow_model=False)
+    expanded=api.build(snapshot,binding,budget=2000,allow_model=False,adaptive_budget=True)
+    assert not fixed['complete'] and expanded['complete']
+    assert 2000 < expanded['budgetPlan']['effective'] <= 8000
+    assert expanded['payload']['publicHistory'][0]['text']==snapshot['items'][0]['text']
 
 
 def test_repeat_input_preserves_the_first_receipt_time(system):
@@ -123,6 +158,26 @@ def test_repeat_input_preserves_the_first_receipt_time(system):
         memory.ingest({**event, "text": "Different input"})
 
 
+def test_split_zip_tail_keeps_delivery_fingerprint_without_claiming_members(system, tmp_path):
+    import hashlib
+    import io
+    import zipfile
+    from kin_mind.memory import fingerprint_file
+    _, memory, _, _ = system
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, 'w') as z:
+        z.writestr('large-result.txt', b'A' * 20000)
+    part = archive.getvalue()[15000:]
+    path = tmp_path/'archive.part003';path.write_bytes(part)
+    assert zipfile.is_zipfile(path)
+    result = fingerprint_file(path)
+    assert result['sha256'] == hashlib.sha256(part).hexdigest()
+    assert result['member_status'] == 'unavailable' and 'members' not in result
+    receipt = memory.ingest({'id':'split-delivery','kind':'delivery','at':'2026-09-14T03:00:00Z',
+                             'artifact':{'path':str(path)},'state':'accepted','message_id':'actual-platform-id'})
+    assert receipt['state'] == 'recorded'
+
+
 def test_compression_never_replaces_recent_turns_or_their_times_with_ids(system, monkeypatch):
     import httpx
     from kin_mind.appraisal import DeepSeek
@@ -134,8 +189,11 @@ def test_compression_never_replaces_recent_turns_or_their_times_with_ids(system,
             memory.ingest({"id": f"{n}-{kind}", "kind": kind, "text": f"{kind} original turn {n}", "at": mind.clock()})
     recent = recent_dialogue(mind)
     packed = []
+    elapsed = [0]
+    monkeypatch.setattr('kin_mind.appraisal.time.monotonic', lambda: elapsed[0])
     def pack(self, items, *args, **kwargs):
         packed.extend(items)
+        elapsed[0] = 125
         return {"text": "A complete older evidence summary.", "omitted_ids": [], "receipt": {"model": "synthetic"}}
     monkeypatch.setattr(Contexts, "pack", pack)
     monkeypatch.setenv("SYNTHETIC_KEY", "synthetic")
@@ -151,7 +209,7 @@ def test_compression_never_replaces_recent_turns_or_their_times_with_ids(system,
     request = json.loads(sent[0]["messages"][0]["content"])
     assert packed and request["recent_dialogue"] == recent
     assert not {r["id"] for r in recent} & {r["id"] for r in packed}
-    assert request["clock"]["current_time"] == clock_context(mind.clock())["current_time"]
+    assert request["clock"]["current_time"] == clock_context((clock[0]+timedelta(seconds=125)).isoformat())["current_time"]
     assert "HIDDEN_NOT_PUBLIC" not in dumps([result.model_dump(), receipt])
 
 

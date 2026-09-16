@@ -8,9 +8,15 @@ The host-only `recover-history` command takes unique `job_ids`, a sourced `comma
 
 ## Dialogue and clocks
 
+Owner input enters a durable journal before memory ingestion. It does not wait behind older artifact or delivery events. Failed journal entries keep their original identity and retry independently after five minutes, then fifteen minutes; later inputs and receipts continue. A split ZIP tail can contain a directory without its member bytes. Such a file retains its actual byte fingerprint and delivery receipt, while member coverage remains unavailable.
+
 Appraisals read a fresh window of the latest four available real dialogue exchanges on every attempt, independently of frozen historical batches. Consecutive user messages belong to one input block; assistant bubbles do not consume the turn count. Retrieval pages beyond a single bubble window. Imported real conversations retain their historical identity; internal notices, unconfirmed deliveries and tool reasoning do not become public dialogue.
 
 DeepSeek compression leaves this recent window verbatim. Older evidence may be summarized with its original source times. Session checkpoints likewise keep the latest four exchanges, all their bubbles and the preceding question; older exchanges can be compressed. If the required evidence exceeds the budget, restoration reports incomplete coverage rather than truncating or claiming success.
+
+The host can expand its normal 2,000-token restoration allowance to fit the pinned exchanges, with a hard limit of 8,000 tokens and a saved `budgetPlan`. Validation and delivery use that same allowance; injected tokens still count toward the native window ledger. Older history uses remaining space and DeepSeek compression. This prevents ordinary multi-bubble history from permanently blocking restoration without allowing unbounded context growth.
+
+Recovered real input is eligible for this historical view, while remaining excluded from new-input execution and emotional replay. An exact aggregate of nearby accepted bubbles appears only once in the view. Its original output source and each delivery record remain in storage; uncertain or partial text matches do not establish receipt coverage.
 
 Time fields have distinct meanings:
 

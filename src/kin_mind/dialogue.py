@@ -44,6 +44,28 @@ def split_recent(items, exchanges=RECENT_EXCHANGES):
     return items[start:], items[:start]
 
 
+def redundant_public_summaries(events):
+    """Recognize a public turn aggregate already represented by sent bubbles.
+
+    Require exact ordered text and nearby receipt times. This only removes a
+    duplicate view; original operation and source records remain untouched.
+    """
+    redundant, deliveries = set(), []
+    for event in sorted(events, key=lambda e: (utc_time(e['at']), e['id'])):
+        if event.get('kind') == 'owner-message':
+            deliveries = []
+        elif event.get('kind') == 'delivery' and event.get('state') == 'accepted' and event.get('text'):
+            deliveries.append(event)
+        elif event.get('kind') == 'assistant-message' and event.get('text'):
+            stamp = datetime.fromisoformat(utc_time(event['at']))
+            nearby = [e for e in deliveries if 0 <= (stamp-datetime.fromisoformat(utc_time(e['at']))).total_seconds() <= 180]
+            for start in range(len(nearby)):
+                if '\n\n'.join(e['text'] for e in nearby[start:]) == event['text']:
+                    redundant.add(event['id'])
+                    break
+    return redundant
+
+
 def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
     """Page past multi-bubble output instead of counting bubbles as turns."""
     with mind.engine.db.connect() as conn:
@@ -62,10 +84,13 @@ def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
 
 def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
     rows = dialogue_rows(mind, exchanges=exchanges)
+    redundant = redundant_public_summaries([json.loads(r['data']) for r in rows])
     with mind.engine.db.connect() as conn:
         items, seen = [], {}
         for row in reversed(rows):
             event = json.loads(row["data"])
+            if event['id'] in redundant:
+                continue
             if not event.get("text") or event.get("origin") == "runtime-notice" or event.get("internal"):
                 continue
             if event["kind"] == "delivery" and event.get("state") != "accepted":
