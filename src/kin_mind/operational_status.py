@@ -13,9 +13,21 @@ def operational_status(mind):
         enriched = conn.execute("SELECT id,json_extract(data,'$.receipt.verified_at') at FROM mind_appraisals WHERE scope=? AND state='complete' AND json_extract(data,'$.stimulus') IN ('memory-enrichment','memory-backfill') ORDER BY at DESC LIMIT 1", (scope,)).fetchone()
         exploration = conn.execute("SELECT id,state,created_at FROM mind_explorations WHERE scope=? ORDER BY created_at DESC LIMIT 1", (scope,)).fetchone() if "mind_explorations" in tables else None
         contact = conn.execute("SELECT id,state,data FROM mind_contacts WHERE scope=? AND state='accepted' ORDER BY rowid DESC LIMIT 1", (scope,)).fetchone()
+        autonomy = {}
+        for table, label in (("mind_plans", "plans"), ("mind_plan_runs", "executions"), ("mind_procedures", "procedures")):
+            if table in tables:
+                field = "state" if table == "mind_plan_runs" else "status"
+                autonomy[label] = {r[0]: r[1] for r in conn.execute(f"SELECT {field},COUNT(*) FROM {table} WHERE scope=? GROUP BY {field}", (scope,))}
+        if "mind_model_leases" in tables:
+            import time
+            autonomy["background_model_slots"] = conn.execute("SELECT COUNT(*) FROM mind_model_leases WHERE expires_at>?", (time.time(),)).fetchone()[0]
+        if "mind_reinforcement" in tables:
+            autonomy["effective_use_events"] = conn.execute("SELECT COUNT(*) FROM mind_reinforcement WHERE scope=?", (scope,)).fetchone()[0]
+        if "mind_strength_observations" in tables:
+            autonomy["strength_observation_days"] = {r[0]: r[1] for r in conn.execute("SELECT version,COUNT(*) FROM mind_strength_observations WHERE scope=? GROUP BY version", (scope,))}
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
-    return {"checked_at": mind.clock(), "queues": [dict(r) for r in rows],
+    return {"checked_at": mind.clock(), "autonomy": autonomy, "queues": [dict(r) for r in rows],
             "timing_contract": "oldest_available_unix is queue age, not current execution start; a missing attempt_started_at is unknown. Use lease_expires_unix for running-worker deadline.",
             "action": {"last_success": action.get("last_success"), "next_review": schedule["next_review"] if schedule else None,
                        "revision": schedule["revision"] if schedule else None, "model": action.get("receipt", {}).get("model")},

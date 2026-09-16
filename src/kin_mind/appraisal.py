@@ -28,6 +28,8 @@ from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
+from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
+from .model_runtime import request_client
 
 APPRAISAL_INPUT_BUDGET = 64000
 
@@ -91,6 +93,10 @@ class Appraisal(Model):
     next_review_minutes: StrictInt = Field(default=20, ge=20, le=120)
     habits: HabitProposal | None = None
     session_advice: SessionAdvice | None = None
+    recall_needs: list[RecallNeed] = Field(default_factory=list, max_length=3)
+    plan_changes: list[PlanChange] = Field(default_factory=list, max_length=8)
+    action_decisions: list[ActionDecision] = Field(default_factory=list, max_length=12)
+    procedure_candidates: list[ProcedureCandidate] = Field(default_factory=list, max_length=4)
 
     @field_validator("motivations")
     @classmethod
@@ -116,12 +122,13 @@ SYSTEM = """你是 Kin 的记忆与情绪评估器。根据提供的新经历提
 探索愿望必须有真实问题。授权开放探索时，新题不必来自旧聊天，也不必围绕智能体、记忆或接口；授权的来源不等于题目的来源。探索结果可引发有具体发现的分享愿望，但结果不是已核实的用户事实。
 用户说去忙不表示永久禁止分享；不要把普通聊天虚构为现实会面。已讲过的结论应放弃重复分享愿望；新发现可产生新愿望。时间增长由确定性公式处理，不为时间流逝调用模型打分。
 愿望状态变化必须写入 wish_updates；reason 里说完成、等待或放弃不能代替状态操作。内容已在普通对话讲过时，撤下对应 contact 愿望，使用 abandon，不伪造主动发送回执。wait 必须说明恢复条件：已有内容的临时推迟使用 wait_condition=time 和 retry_after_seconds；等用户回应使用 owner_reply；缺内容或资料使用 new_evidence。普通出门或去忙不等于永久等待；明确停止或未回复等待仍须遵守。道晚安会结束当晚的话题窗口，不把它保留成用户欠下的会面。已结束的愿望不得换标题重建。time 等待由宿主在条件到达后复核，new_evidence 等待需要新的相关来源。
-主动值达 75 是联系动力门槛，不要求等四小时；免打扰和未回复等待由宿主执行。
+联系与探索由有效的 DS 决策推动；免打扰和未回复等待由宿主执行。
 人格变化只有在给定的行为检验与三个独立原始互动支持时才提出；否则 evolution 为 null。
 只调用 submit_appraisal 提交结果。reason 简短说明依据，不输出推理链。"""
 
 SYSTEM += """
-当前行动规则：联系由主动值、探索由好奇心驱动，二者阈值均为75。不存在四小时探索或聊天门槛。
+当前行动规则：联系、探索与创作由你结合记忆、最近对话和心思决定；分数是参考，没有75分行动门槛。低分也可以行动，高分也可以等待，不为通过门槛改分。
+分数持续变化：结合新聊天、记忆、执行结果与当下心思调整 values 和 motivations，允许升高与回落。action_decisions.strength 是这个步骤当前的愿望强度（0—100），执行、等待或放弃时都可以更新；它不决定行动权限。未填写时保留已有强度，新愿望参考当前对应动力，不能固定成同一个分数。
 你负责起念、评估、选题与分享意图；Kimi只执行你确定的问题。一个怪念头、想撒娇、想逗伴侣或闲扯都能成为contact愿望，聊天不必追求意义。没有新聊天时，drive-crossing也允许你从已有兴趣和情绪生出自己的新念头，标明这是自己的想法，不能写成用户的新经历。
 为initiative和curiosity提供本轮motivations：target是想达到的动力，half_life_minutes从20、60、180选择，reason写明依据。它们只改变本轮短期动力，不调整长期性格底色。准备开口或探索时可直接更新values到相应强度，不必等待计时；想休息时可以下降。时间本身由宿主计算。
 探索意图的content写清想弄明白的问题和查证范围，completion写清带回什么；结果回来后可以聊发现、疑问、感想或由此想到的怪念头。可以没有宏大结论，不必等用户先聊同一个话题或给分享时机。有自己的想法即可提出contact愿望，生成面向对方的话语交给共享会话。
@@ -143,10 +150,10 @@ continuity-bootstrap 只建立仍有效愿望与原始来源支持的心事关�
 
 SYSTEM += """
 探索与联系是独立决定。exploration_capabilities.computer=true 时，可以出于好奇想了解用户的工作与日常，在 explore 愿望中设 exploration_target=computer；资料研究使用 knowledge。Kimi负责读取和研究，你负责选题与消化。授权范围只是可用能力，不是每轮查阅电脑的任务。没有想弄明白的问题可以休息。
-exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果。capabilities.decisions=true 时，对每个新结果填写 sharing：exploration_id、decision=share/defer/keep、reason。defer 还需 reconsider_when，描述新的相关想法、资料或用户反馈等复核条件。keep 表示这次只存记忆，不建联系愿望；有成果也可以keep。Kimi的suggested_share只是一项可拒绝的建议。share时才创建有具体内容且关联exploration_id的contact愿望。要开口仍由宿主检查主动值、免打扰和新消息。
+exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果。capabilities.decisions=true 时，对每个新结果填写 sharing：exploration_id、decision=share/defer/keep、reason。defer 还需 reconsider_when，描述新的相关想法、资料或用户反馈等复核条件。keep 表示这次只存记忆，不建联系愿望；有成果也可以keep。Kimi的suggested_share只是一项可拒绝的建议。share时才创建有具体内容且关联exploration_id的contact愿望。要开口由宿主检查有效决策、免打扰和新消息。
 已有探索决定在state.exploration_decisions。新的相关想法或经历可支持重估；drive-crossing、发送回执和原样重读不重开旧分享。一个结果选择keep不会阻止以后提出其他话题。来源标记needs_review时先复核。文件修改时间不表示用户本人完成了工作，电脑观察不当作用户发言或共同约定。
 可以请用户帮忙补条件，也可以因为自己的兴趣邀请她一起做事，还可以主动指挥她做一件自己想让她做的事。没有遇到困难也能产生这样的念头，例如想让她挑一张今天的照片、试一下作品或说说某个想法。concerns.owner_request保存kind=help/invitation/request，分别是求助、一起做事、主动让她做事；同时保存action、reason、completion、status=proposed/accepted/waiting/completed/declined。刚提出时为proposed、basis=internal_thought；contact愿望关联这件心事。发出请求不代表对方答应或完成。接到实际用户反馈后再更新accepted/completed/declined；她说忙可waiting，提供所需结果后resolve并恢复有依据的探索。表达可以温软、撒娇，带一点亲昵的小指挥，理由来自自己的具体心思。
-用户交办工作缺必要条件时由原任务及时询问，不受自主联系阈值阻塞。自主愿望的求助继续使用contact意图。没有需要分享或求助的内容时，wishes可以为空。保持所有旧分数和历史，仅更新有依据的项目。
+用户交办工作缺必要条件时由原任务及时询问，不受自主联系决定阻塞。自主愿望的求助继续使用contact意图。没有需要分享或求助的内容时，wishes可以为空。保持所有旧分数和历史，仅更新有依据的项目。
 """
 
 SYSTEM += """
@@ -221,9 +228,24 @@ def appraisal_schema(operational=False, historical=False):
     return schema
 
 
+SYSTEM += """
+自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料缺口用 recall_needs 请求补读，不用关键词或分数替代判断。补读用完仍不确定时选择等待。
+plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。
+到期只触发复核。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时逐项列出已满足的原有 preconditions；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
+同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
+procedure_learning=true 时，从实际任务结果提出 procedure_candidates，result_ids 仅使用真实任务/产物/发送回执编号。方法保存条件、步骤、工具环境、成功标准、失败反例；候选不等于当前可执行方法，独立验证由宿主完成。已有方法先读适用条件，再在行动中选择 procedure_ids；不能修改人设或新增权限。
+这些字段在功能未启用、历史整理或纯会话维护时留空；无需每次都安排事情。reason 只写简短公开结论，不输出推理轨迹。宿主不使用分数阈值，行动只依据有效决策及现有免打扰、联系偏好和用户优先约定。
+"""
+
+
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
     result = dict(context)
+    if context.get("autonomy_context"):
+        from .decision_context import compact_plan
+        autonomy = dict(context["autonomy_context"])
+        autonomy["plans"] = {**autonomy["plans"], "plans": [compact_plan(p) for p in autonomy["plans"]["plans"]]}
+        result["autonomy_context"] = autonomy
     if isinstance(context.get("memory_context"), dict):
         memory_context = dict(context["memory_context"])
         shares = []
@@ -299,7 +321,7 @@ def appraisal_context(context):
     # not depend on which concerns happen to fit this request.
     concerns = original.get("concerns", [])
     query = " ".join(s.get("text", "") for s in context.get("new_evidence", []))
-    relevant = {c["id"] for c in select_concerns(concerns, query, limit=8)}
+    relevant = set() if context.get("autonomy_context", {}).get("semantic_actions") else {c["id"] for c in select_concerns(concerns, query, limit=8)}
     linked = {cid for d in state["desires"] if d["status"] in {"wanted", "waiting", "in_progress"} for cid in d.get("concern_ids", [])}
     chosen = sorted(concerns, key=lambda c: (
         c["id"] in relevant, c["id"] in linked,
@@ -369,8 +391,20 @@ class DeepSeek:
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
+        cache_key, generation = None, None
+        if hasattr(self, "engine"):
+            with self.engine.db.connect() as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_semantic_cache'").fetchone():
+                    generation = conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0]
+                    cache_key = digest([name, system, schema.model_json_schema(), context, self.endpoint, "deepseek-flash/high"])
+                    cached = conn.execute("SELECT data FROM mind_semantic_cache WHERE id=? AND generation=? AND expires_at>?",
+                        (cache_key, generation, time.time())).fetchone()
+                    if cached:
+                        value = json.loads(cached[0])
+                        return schema.model_validate(value["result"]), {**value["receipt"], "cache_hit": True,
+                            "usage": {}, "usage_status": "reused", "elapsed_ms": 0}
         try:
-            with httpx.Client(timeout=self.timeout, transport=self.transport) as client:
+            with request_client(self, self.timeout, name) as client:
                 response = client.post(self.endpoint + "/v1/messages",
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                     json={"model": "deepseek-flash", "max_tokens": max_tokens, "system": system,
@@ -391,9 +425,16 @@ class DeepSeek:
             if len(calls) != 1:
                 raise RuntimeError("deepseek-missing-structured-result")
             result = schema.model_validate(calls[0]["input"])
-            return result, {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
-                            "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
-                            "elapsed_ms": round((time.monotonic() - started) * 1000)}
+            receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
+                       "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
+                       "elapsed_ms": round((time.monotonic() - started) * 1000), "cache_hit": False}
+            if cache_key and time.monotonic() <= getattr(self, "absolute_deadline", float("inf")):
+                with self.engine.db.connect(write=True) as conn:
+                    if conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0] == generation:
+                        conn.execute("DELETE FROM mind_semantic_cache WHERE expires_at<=?", (time.time(),))
+                        conn.execute("INSERT OR REPLACE INTO mind_semantic_cache VALUES(?,?,?,?)", (cache_key, generation, time.time()+300,
+                            dumps({"result": result.model_dump(), "receipt": receipt})))
+            return result, receipt
         except httpx.TimeoutException:
             raise RuntimeError("deepseek-timeout") from None
         except httpx.HTTPError:
@@ -417,6 +458,7 @@ class DeepSeek:
                 # foreground recall. Completed parts survive the worker boundary.
                 preparation_seconds = min(480, max(30, self.timeout - 120))
                 compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=min(240, preparation_seconds), transport=self.transport)
+                compressor.engine, compressor.background = self.engine, getattr(self, "background", False)
                 compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
@@ -464,7 +506,7 @@ class DeepSeek:
             elapsed = int(max(0, time.monotonic() - started))
             request_context['clock'] = clock_context((timestamp(request_context['clock']['current_time']) + timedelta(seconds=elapsed)).isoformat())
         try:
-            with httpx.Client(timeout=max(30, self.timeout - (time.monotonic() - started)), transport=self.transport) as client:
+            with request_client(self, max(30, self.timeout - (time.monotonic() - started)), "submit_appraisal") as client:
                 response = client.post(
                     self.endpoint + "/v1/messages",
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
@@ -668,6 +710,7 @@ class Appraisals:
         return clean[0] if job_id and clean else clean
 
     def run_one(self, provider, *, lane=None, job_id=None):
+        provider.background = True
         settings = self.memory.settings()
         semantic_enabled = settings["semantic"]
         lanes = settings["operational_lanes"]
@@ -825,6 +868,22 @@ class Appraisals:
                                      "clock": clock_context(self.mind.clock()), "recent_dialogue": recent}
                 if memory_context:
                     model_context["memory_context"] = memory_context
+                if settings["semantic_actions"] and not historical and not maintenance:
+                    from .plans import AutonomousPlans
+                    from .procedures import Procedures
+                    model_context["autonomy_context"] = {"semantic_actions": True,
+                        "plans_enabled": settings["autonomous_plans"], "creation_enabled": settings["creative_execution"],
+                        "procedure_learning": settings["procedure_learning"],
+                        "plans": AutonomousPlans(self.mind).read(limit=40),
+                        "procedures": Procedures(self.mind).read(limit=12),
+                        "execution_environment": self.engine.settings("execution_environment"),
+                        "capabilities": self.exploration_capabilities,
+                        "recall_budget": {"rounds": 3, "seconds": 150}}
+                if settings["usage_reinforcement"] and memory_context:
+                    from .reinforcement import strengths
+                    identifiers = [n["id"] for k in ("works", "shares", "graph_candidates") for n in memory_context.get(k, [])]
+                    with self.engine.db.connect() as conn:
+                        model_context["effective_memory_use"] = strengths(conn, self.mind.scope.key(), identifiers, self.mind.clock())
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
                 with self.engine.db.connect() as conn:
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
@@ -855,6 +914,9 @@ class Appraisals:
                                 if ref["revision"] != record["revision"]:
                                     raise Conflict("Topic candidate evidence changed during preparation")
                                 semantic_refs[ref["record_id"]] = ref
+                    for plan in model_context.get("autonomy_context", {}).get("plans", {}).get("plans", []):
+                        if not plan["needs_review"]:
+                            semantic_refs.update({ref["record_id"]: ref for ref in plan["evidence"]})
                 if historical and data.get("seed_memory") and not data.get("seed_rejected"):
                     # Reused judgments carry the exact source manifest from
                     # their original request; the moving latest-dialogue window
@@ -874,13 +936,16 @@ class Appraisals:
                         proposal, receipt = provider.appraise(model_context)
                 else:
                     proposal, receipt = provider.appraise(model_context)
+                if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
+                    from .decision_context import expand
+                    proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
                 deferred_memory = proposal.memory.model_dump() if operational else None
                 if operational:
                     proposal = proposal.model_copy(update={"memory": MemoryAssessment()})
                 if maintenance and proposal.session_advice is None:
                     raise RuntimeError("deepseek-missing-session-advice")
                 if historical:
-                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None})
+                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": [], "recall_needs": []})
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal.model_dump(), receipt=receipt,
@@ -930,6 +995,9 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
+                    owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
+                    if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_started_at") != data.get("attempt_started_at"):
+                        raise Conflict("Appraisal lease no longer owns this proposal")
                     if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
                         raise Conflict("Evaluated sources changed before commit")
                     used_evidence = {identifier for items in (proposal.memory.notes, proposal.memory.links, proposal.memory.graph.nodes, proposal.memory.graph.edges, proposal.memory.event_routes) for item in items for identifier in item.evidence_ids}
@@ -957,6 +1025,25 @@ class Appraisals:
                     allowed = self.mind._continuity_sources(conn, state, roots) + list(continuity_refs.values()) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
                     new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
+                    if settings["autonomous_plans"] and not historical and not new_interaction:
+                        from .plans import AutonomousPlans
+                        plans = AutonomousPlans(self.mind)
+                        for index, change in enumerate(proposal.plan_changes):
+                            plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
+                        decision_revisions = {}
+                        for index, decision in enumerate(proposal.action_decisions):
+                            original_revision = decision.expected_revision
+                            if decision.plan_id in decision_revisions:
+                                original, current_revision = decision_revisions[decision.plan_id]
+                                if original_revision != original:
+                                    raise Conflict("Inconsistent plan decision base revision")
+                                decision = decision.model_copy(update={"expected_revision": current_revision})
+                            updated = plans.decide(conn, decision, eid + ":decision:" + str(index), receipt, list(semantic_refs.values()))
+                            decision_revisions[decision.plan_id] = (original_revision, updated["revision"])
+                    if settings["procedure_learning"] and not historical and not new_interaction:
+                        from .procedures import Procedures
+                        for index, candidate in enumerate(proposal.procedure_candidates):
+                            Procedures(self.mind).propose(conn, candidate, eid + ":method:" + str(index), receipt, list(semantic_refs.values()))
                     effective_event = event.model_copy(update={"motivations": {}, "values": {k: v for k, v in event.values.items() if k not in {"initiative", "curiosity"}}}) if new_interaction else event
                     if not historical:
                         self.mind._apply_event(conn, state, effective_event, eid, allowed)
@@ -1122,6 +1209,7 @@ class DailyReview:
             )
 
     def run(self, provider, agent_version):
+        provider.background = True
         from zoneinfo import ZoneInfo
 
         from eventmem.core.self_knowledge import SelfKnowledge, metadata

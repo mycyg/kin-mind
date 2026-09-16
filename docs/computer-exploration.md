@@ -105,7 +105,7 @@ decision requires new sourced information. Clock crossings, receipt events and
 replayed evidence do not create another revision or another contact.
 
 A new contact wish links `exploration_id`. Before claiming and sending, the
-host rechecks the decision revision, source freshness, initiative threshold 75,
+host rechecks the decision revision, source freshness, a current DS action decision when `semantic_actions` is enabled,
 work locks, owner activity, quiet hours and original delivery identity. A later
 keep/defer decision invalidates an already drafted message. Successful delivery
 does not automatically manufacture another topic. Partial or uncertain receipts

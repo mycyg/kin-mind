@@ -61,10 +61,14 @@ class Providers:
                 "Authorization": "Bearer "
                 + ensure_started(self.engine.db.root, config.endpoint, config.model)
             }
+        from contextlib import nullcontext
+        from kin_mind.model_runtime import model_slot
+        with self.engine.db.connect() as conn:
+            has_shared_slots = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_model_leases'").fetchone())
         start = time.perf_counter()
         for attempt in range(2 if local else 1):
             try:
-                with httpx.Client(
+                with (model_slot(self, role) if has_shared_slots and config.model.startswith("deepseek") else nullcontext()), httpx.Client(
                     timeout=config.timeout_seconds,
                     follow_redirects=False,
                     trust_env=not local,

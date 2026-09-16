@@ -172,8 +172,9 @@ def project(entry, at):
 class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
+        from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA)
+            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA)
 
     def _load(self, conn):
         row = conn.execute(
@@ -451,6 +452,15 @@ class Mind(Continuity):
         return self._mutate(request, "behavior-policy", apply)
 
     def _desire_ready(self, conn, desire, at, *, state=None):
+        from .autonomy_schema import enabled
+        if enabled(conn, self.scope.key()):
+            receipt = desire.get("decision_receipt", {})
+            current = state or self._load(conn)
+            if receipt.get("provider") != "deepseek" or receipt.get("agent_version") != current["agent_version"]:
+                return False
+            from .plans import AutonomousPlans
+            if not AutonomousPlans(self).linked_ready(conn, desire):
+                return False
         if state is None and (desire.get("exploration_id") or desire.get("concern_revisions")):
             state = self._load(conn)
         if desire.get("exploration_id"):
@@ -1058,9 +1068,11 @@ class Mind(Continuity):
 
             if self._action_review_pending(conn):
                 return {"eligible": False, "reason": "action-appraisal-pending"}
-            if view["dimensions"]["initiative"]["needs_review"]:
+            from .autonomy_schema import enabled
+            semantic = enabled(conn, self.scope.key())
+            if not semantic and view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
-            if view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
+            if not semantic and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
                 return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
@@ -1093,6 +1105,8 @@ class Mind(Continuity):
                 raise Conflict("Action appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
+            from .autonomy_schema import enabled
+            semantic = enabled(conn, self.scope.key())
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
             ]
@@ -1100,9 +1114,8 @@ class Mind(Continuity):
                 not ready
                 or (view.get("action_policy") or {}).get("needs_review")
                 or view["contact"].get("preference", {}).get("needs_review")
-                or view["dimensions"]["initiative"]["needs_review"]
-                or view["dimensions"]["initiative"]["projected_value"]
-                < view["contact"]["threshold"]
+                or (not semantic and (view["dimensions"]["initiative"]["needs_review"]
+                or view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]))
             ):
                 raise Conflict("The contact threshold or desire is no longer current")
             desire = min(
@@ -1147,6 +1160,8 @@ class Mind(Continuity):
             desire = state["desires"].get(attempt["desire_id"])
             view = self._view(conn, state, self.clock())
             value = view["dimensions"]["initiative"]
+            from .autonomy_schema import enabled
+            semantic = enabled(conn, self.scope.key())
             valid = (
                 attempt["state"] == "drafting"
                 and not (view.get("action_policy") or {}).get("needs_review")
@@ -1155,8 +1170,8 @@ class Mind(Continuity):
                 and desire
                 and desire["revision"] == attempt["desire_revision"]
                 and self._desire_ready(conn, desire, self.clock())
-                and not value["needs_review"]
-                and value["projected_value"] >= state["profile"]["contact"]["threshold"]
+                and (semantic or (not value["needs_review"]
+                and value["projected_value"] >= state["profile"]["contact"]["threshold"]))
             )
             return {
                 "eligible": bool(valid),
@@ -1260,6 +1275,10 @@ class Mind(Continuity):
             if state == "accepted":
                 current = self._load(conn)
                 desire = current["desires"][attempt["desire_id"]]
+                from .plans import AutonomousPlans
+                AutonomousPlans(self).settle_linked(conn, desire, {"id": attempt_id,
+                    "complete": not partial, "kind": "delivery", "message_ids": message_ids or [message_id],
+                    "partial": partial, "visibility": "unverified"})
                 desire.update(
                     status="completed",
                     delivery={

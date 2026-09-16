@@ -122,7 +122,7 @@ export class MobileRouter {
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,classifierUnconfirmed=false;
+      let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'};
       if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
@@ -139,6 +139,7 @@ export class MobileRouter {
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
+          if(['light','deep'].includes(result.recall?.mode))recall={...result.recall,decisionSource:'deepseek-input-classification'};
         } catch {decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;}
       }
       const intent=decision;
@@ -147,7 +148,7 @@ export class MobileRouter {
       const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
       if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
       if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});

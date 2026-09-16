@@ -316,6 +316,9 @@ class Explorations:
             action="start", desire_id=desire["id"], reason="Host claimed the reviewed exploration intent")
 
         def claim(conn, current, event_id):
+            from .plans import AutonomousPlans
+            if not AutonomousPlans(self.mind).linked_ready(conn, current["desires"][desire["id"]]):
+                raise Conflict("Exploration plan changed before claim")
             if conn.execute("SELECT 1 FROM mind_explorations WHERE scope=? AND state='running'", (self.mind.scope.key(),)).fetchone():
                 raise Conflict("Exploration worker already active")
             result = self.mind._apply_desire(conn, current, request, event_id)
@@ -343,7 +346,9 @@ class Explorations:
                 previous = [v for item in self.recent(8) for v in item.get("observations", [])][-60:]
                 options["computer"] = {**computer, "previous": [
                     {k: v[k] for k in ("id", "locator", "version", "title", "observed_at")} for v in previous]}
-            output = runner(executable, {"question": desire["content"], "topic": desire["topic"],
+            from .decision_context import execution_brief
+            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"])
+            output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=canceled, model=model, **options)
             data.update(output)
@@ -382,6 +387,9 @@ class Explorations:
                     expected_revision=current["revision"], evidence_ids=[source["id"], *data["evidence_ids"]],
                     action=action, desire_id=desire["id"], reason="Exploration awaits a reported condition" if needs_condition else "Exploration execution: "+state)
                 self.mind._apply_desire(conn, current, update, event_id)
+                from .plans import AutonomousPlans
+                AutonomousPlans(self.mind).settle_linked(conn, active, {"id": eid, "kind": "exploration-result",
+                    "complete": action == "complete", "source_id": source["id"], "state": state})
                 current["revision"] += 1
                 current["updated_at"] = self.mind.clock()
                 self.mind._save(conn, current)

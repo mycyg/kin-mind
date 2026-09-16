@@ -691,6 +691,24 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         from kin_mind.state import Mind
         return ConversationHabits(Mind(engine, request.scope)).choose_reply(request.request)
 
+    @app.get("/v1/autonomy/plans", operation_id="read_autonomous_plans")
+    def read_autonomous_plans(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", identifier: str | None = None, status: str | None = None, cursor: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=100), history: bool = False) -> dict:
+        from kin_mind.plans import AutonomousPlans
+        from kin_mind.state import Mind
+        return AutonomousPlans(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).read(identifier, status=status, cursor=cursor, limit=limit, history=history)
+
+    @app.post("/v1/autonomy/plans", operation_id="manage_autonomous_plan")
+    def manage_autonomous_plan(request: GraphCommand) -> dict:
+        from kin_mind.plans import AutonomousPlans
+        from kin_mind.state import Mind
+        return AutonomousPlans(Mind(engine, request.scope)).manage(request.request)
+
+    @app.get("/v1/autonomy/procedures", operation_id="read_procedure_memory")
+    def read_procedure_memory(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", identifier: str | None = None, limit: int = Query(12, ge=1, le=100)) -> dict:
+        from kin_mind.procedures import Procedures
+        from kin_mind.state import Mind
+        return Procedures(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).read(query, identifier, limit=limit)
+
     @app.put("/v1/contact/policies", operation_id="configure_contact")
     def configure_contact(request: ContactPolicy) -> dict:
         return Scheduler(engine).policy(request)

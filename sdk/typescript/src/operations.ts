@@ -1385,6 +1385,218 @@ export const operations = {
       "required": true
     }
   },
+  "read_autonomous_plans": {
+    "method": "GET",
+    "path": "/v1/autonomy/plans",
+    "parameters": [
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "personal",
+          "title": "Project"
+        }
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Persona"
+        }
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Collection"
+        }
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "real",
+          "title": "World"
+        }
+      },
+      {
+        "name": "identifier",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Identifier"
+        }
+      },
+      {
+        "name": "status",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status"
+        }
+      },
+      {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "title": "Cursor"
+        }
+      },
+      {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 100,
+          "minimum": 1,
+          "default": 24,
+          "title": "Limit"
+        }
+      },
+      {
+        "name": "history",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean",
+          "default": false,
+          "title": "History"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "manage_autonomous_plan": {
+    "method": "POST",
+    "path": "/v1/autonomy/plans",
+    "parameters": [],
+    "body": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      }
+    }
+  },
+  "read_procedure_memory": {
+    "method": "GET",
+    "path": "/v1/autonomy/procedures",
+    "parameters": [
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "personal",
+          "title": "Project"
+        }
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Persona"
+        }
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "default",
+          "title": "Collection"
+        }
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "real",
+          "title": "World"
+        }
+      },
+      {
+        "name": "query",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "",
+          "title": "Query"
+        }
+      },
+      {
+        "name": "identifier",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Identifier"
+        }
+      },
+      {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 100,
+          "minimum": 1,
+          "default": 12,
+          "title": "Limit"
+        }
+      }
+    ],
+    "body": {}
+  },
   "configure_contact": {
     "method": "PUT",
     "path": "/v1/contact/policies",

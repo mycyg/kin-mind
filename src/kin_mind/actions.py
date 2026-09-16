@@ -37,9 +37,11 @@ class ActionEvents:
                 score=self.mind._initiative_value(conn, state, self.mind.clock()),
                 at=self.mind.clock(),
             )
+            from .autonomy_schema import enabled
+            semantic = enabled(conn, self.mind.scope.key())
             state["action_policy"] = {
                 "version": request["agent_version"],
-                "trigger": "affect",
+                "trigger": "semantic-decision" if semantic else "affect",
                 "provider": "deepseek-flash",
                 "reasoning": "high",
                 "configured_at": self.mind.clock(),
@@ -50,8 +52,8 @@ class ActionEvents:
             state["profile"]["contact"].pop("reset", None)
             state["profile"]["contact"]["reset_policy"] = "deepseek-appraisal"
             state["profile"]["exploration"] = {
-                "trigger": "curiosity",
-                "threshold": 75,
+                "trigger": "semantic-decision" if semantic else "curiosity",
+                "threshold": None if semantic else 75,
                 "budget_seconds": 1200,
             }
             state["profile_version"] = digest(
@@ -79,6 +81,10 @@ class ActionEvents:
         queued = []
         with self.mind.engine.db.connect(write=True) as conn:
             state = self.mind._load(conn)
+            from .autonomy_schema import enabled
+            if enabled(conn, self.mind.scope.key()):
+                # Scores are context. Only due reviews and new evidence wake DS.
+                return queued
             if not state.get("action_policy") or not self.mind._fresh(
                 conn, state["action_policy"]["evidence"]
             ):
@@ -88,7 +94,7 @@ class ActionEvents:
                 motive = entry.get("motivation")
                 threshold = state["profile"][
                     "contact" if name == "initiative" else "exploration"
-                ].get("threshold", 75)
+                ].get("threshold") or 75
                 # A high level is not a new event. Repeated reads and restarts keep
                 # the same episode key; an appraisal starting high cannot self-loop.
                 if not motive or not entry["score"] < threshold <= project(
@@ -176,10 +182,13 @@ class ActionEvents:
 
     def review_unselected(self):
         view = self.mind.read()
+        from .autonomy_schema import enabled
+        with self.mind.engine.db.connect() as conn:
+            semantic = enabled(conn, self.mind.scope.key())
         if (
             not view.get("action_policy")
             or view["action_policy"]["needs_review"]
-            or view["dimensions"]["curiosity"]["value"] < 75
+            or (not semantic and view["dimensions"]["curiosity"]["value"] < 75)
         ):
             return
         with self.mind.engine.db.connect(write=True) as conn:
@@ -221,9 +230,10 @@ class ActionEvents:
         if (view.get("action_policy") or {}).get("needs_review"):
             return {"state": "waiting", "reason": "action-policy-needs-review"}
         score = view["dimensions"]["curiosity"]
-        if score["needs_review"] or score["projected_value"] < view["exploration"].get(
-            "threshold", 75
-        ):
+        from .autonomy_schema import enabled
+        with self.mind.engine.db.connect() as conn:
+            semantic = enabled(conn, self.mind.scope.key())
+        if not semantic and (score["needs_review"] or score["projected_value"] < (view["exploration"].get("threshold") or 75)):
             return {
                 "state": "waiting",
                 "reason": "curiosity-below-threshold-or-stale",
@@ -243,11 +253,14 @@ class ActionEvents:
         ]
         with self.mind.engine.db.connect() as conn:
             choices = [d for d in choices if not self.mind._action_review_pending(conn, d)]
+            from .plans import AutonomousPlans
+            choices = [d for d in choices if AutonomousPlans(self.mind).linked_ready(conn, d)]
         if view.get("action_policy"):
             choices = [
                 d
                 for d in choices
                 if d.get("decision_receipt", {}).get("provider") == "deepseek"
+                and (not semantic or d.get("decision_receipt", {}).get("agent_version") == view["agent_version"])
             ]
         if not choices:
             return {"state": "waiting", "reason": "no-exploration-intent"}

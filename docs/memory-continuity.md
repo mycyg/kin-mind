@@ -31,7 +31,7 @@ An enabled scope batches pending interaction and receipt events into the existin
 
 The persistent cursor limits a batch to complete events. Latest interactions accompany delayed events, so an old reply is not blindly recreated as a future wish. The assistant saying “I'll tell you later” is an account of its own arrangement, not an owner contact restriction. Receipt-only events settle existing intentions without creating topics.
 
-DS chooses the next idle review within 20–120 minutes; the first review defaults to 20. A local minute tick queues one due event, even if both motivation values and targets are below threshold. Restart uses the same due-event identity. Evaluation is distinct from sending: initiative 75, host preferences, quiet hours and the work lock still govern contact. Exploration remains question-driven and is performed by Kimi under the existing 20-minute execution budget.
+DS chooses the next idle review within 20–120 minutes; the first review defaults to 20. A local minute tick queues one due event, even if both motivation values and targets are below threshold. Restart uses the same due-event identity. Evaluation is distinct from sending: a current DS decision under `semantic_actions`, host preferences, quiet hours and the work lock govern contact. Scores still rise and fall through sourced appraisal and time projection. Exploration remains question-driven and is performed by Kimi under the existing 20-minute execution budget.
 
 ## Recall and context budgets
 

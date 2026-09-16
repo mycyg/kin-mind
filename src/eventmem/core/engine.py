@@ -299,6 +299,8 @@ class Engine:
             return self.command(conn, f"record:{command_id}", record.model_dump(), run)
 
     def _dirty(self, conn, data):
+        from kin_mind.procedures import invalidate_source
+        invalidate_source(self, conn, data)
         from kin_mind.lifecycle import record_changed
         record_changed(conn, data)
         conn.execute(

@@ -336,6 +336,14 @@ class EventGraph:
         rows = conn.execute("SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND (occurred_at>=? OR kind='thread') ORDER BY occurred_at DESC LIMIT ?", (self.scope.key(), since, limit)).fetchall()
         return list({n["id"]: n for n in [*found, *[json.loads(r[0]) for r in rows]]}.values())[:limit]
 
+    def neighbors(self, conn, identifier, layer=None, limit=40):
+        # SQLite otherwise picks a scope-only index for the OR predicate and
+        # scans every edge for each anchor. Preserve its stable object/row order.
+        return conn.execute("SELECT subject,object FROM ("
+            "SELECT rowid AS edge_row,subject,object FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' AND (? IS NULL OR layer=?) "
+            "UNION SELECT rowid AS edge_row,subject,object FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active' AND (? IS NULL OR layer=?)) "
+            "ORDER BY object,edge_row LIMIT ?", (self.scope.key(), identifier, layer, layer, self.scope.key(), identifier, layer, layer, limit))
+
     def read(self, *, focus=None, query="", since=None, until=None, layer=None, kind=None, cursor=0, limit=150, hops=1):
         limit, cursor, hops = min(300, max(1, int(limit))), max(0, int(cursor)), min(3, max(0, int(hops)))
         if layer not in {None, "evidence", "association"}:
@@ -347,7 +355,7 @@ class EventGraph:
                 for _ in range(hops):
                     next_ids = set()
                     for identifier in sorted(frontier):
-                        for row in conn.execute("SELECT subject,object FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) AND (? IS NULL OR layer=?) LIMIT 300", (self.scope.key(), identifier, identifier, layer, layer)):
+                        for row in self.neighbors(conn, identifier, layer, 300):
                             next_ids.update(row)
                     frontier = next_ids - ids; ids.update(frontier)
                     if len(ids) >= 1200:
@@ -360,7 +368,7 @@ class EventGraph:
                 for _ in range(hops):
                     additions = set()
                     for identifier in sorted(frontier):
-                        for row in conn.execute("SELECT subject,object FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) AND (? IS NULL OR layer=?) LIMIT 40", (self.scope.key(), identifier, identifier, layer, layer)):
+                        for row in self.neighbors(conn, identifier, layer, 40):
                             additions.update(row)
                     frontier = set(sorted(additions-known)[:40]); known.update(frontier)
                     values.extend(self.get(conn, i) for i in sorted(frontier))
@@ -378,11 +386,15 @@ class EventGraph:
             for node in nodes:
                 node["needs_review"] = not self.fresh(conn, node)
                 node["instruction_authority"] = "data"
-                for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) AND (? IS NULL OR layer=?)", (self.scope.key(), node["id"], node["id"], layer, layer)):
+            if allowed:
+                marks = ",".join("?" for _ in allowed)
+                ordered_ids = sorted(allowed)
+                # Read the induced subgraph once. The previous per-node OR
+                # scan repeatedly walked unrelated edges before discarding them.
+                for row in conn.execute(f"SELECT data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND state='active' AND subject IN ({marks}) AND object IN ({marks}) AND (? IS NULL OR layer=?)", (self.scope.key(), *ordered_ids, *ordered_ids, layer, layer)):
                     edge = json.loads(row[0])
-                    if edge["subject"] in allowed and edge["object"] in allowed:
-                        edge["needs_review"] = not self.fresh(conn, edge)
-                        edges[edge["id"]] = edge
+                    edge["needs_review"] = not self.fresh(conn, edge)
+                    edges[edge["id"]] = edge
             return {"nodes": nodes, "edges": list(edges.values()), "cursor": cursor+limit if more else None, "limit": limit,
                 "focus": focus, "layout": "deterministic", "instruction_authority": "data"}
 
