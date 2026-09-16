@@ -14,7 +14,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled
-from .state import timestamp
+from .state import project, timestamp
 
 
 def local_time(value):
@@ -169,6 +169,8 @@ class AutonomousPlans:
             step["state"] = "ready"
         plan["revision"] += 1
         step["revision"] += 1
+        if d.strength is not None:
+            step["strength"] = d.strength
         step["decision"] = {**d.model_dump(), "id": "decision_" + digest([command, plan["id"], step["id"]])[:32],
                             "plan_revision": plan["revision"], "step_revision": step["revision"], "evidence": refs,
                             "owner_epoch": self.owner_epoch(conn), "receipt": receipt, "at": self.mind.clock(),
@@ -402,21 +404,37 @@ class AutonomousPlans:
             if not enabled(conn, self.scope, "autonomous_plans"):
                 return created
             state = self.mind._load(conn)
-            for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall():
+            for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status IN ('active','completed')", (self.scope,)).fetchall():
                 plan = json.loads(row[0])
                 for step in plan["steps"]:
-                    if step["actor"] not in {"contact", "explore"} or self.waiting_reason(conn, plan, step):
+                    decision = step.get("decision", {})
+                    if step["actor"] not in {"contact", "explore"} or not decision:
                         continue
+                    ready = not self.waiting_reason(conn, plan, step)
+                    if not ready:
+                        if decision.get("action") not in {"wait", "abandon"}:
+                            continue
+                        if (decision.get("plan_revision") != plan["revision"]
+                            or decision.get("agent_version") != state["agent_version"]
+                            or decision.get("owner_epoch") != self.owner_epoch(conn)
+                            or not self.mind._fresh(conn, plan["evidence"] + decision["evidence"])):
+                            continue
                     did = step.get("desire_id") or (plan.get("desire_id") if len(plan["steps"]) == 1 else None)
                     desire = state["desires"].get(did)
+                    if not ready and not desire:
+                        continue
                     if desire and desire.get("plan_decision_id") == step["decision"]["id"]:
                         continue
-                    if desire and desire["status"] in {"in_progress", "completed"}:
+                    if desire and desire["status"] in {"in_progress", "completed", "abandoned"}:
                         continue
+                    strength = step.get("strength")
+                    if strength is None:
+                        dimension = "initiative" if step["actor"] == "contact" else "curiosity"
+                        strength = desire["strength"] if desire else round(project(state["dimensions"][dimension], self.mind.clock()))
                     command = step["decision"]["id"] + ":wish"
                     args = dict(command_id=command, agent_version=state["agent_version"], expected_revision=state["revision"],
                         evidence_ids=[r["record_id"] for r in step["decision"]["evidence"]], reason=step["decision"]["reason"],
-                        content=step["goal"], topic=plan["goal"][:500], kind=step["actor"], strength=50,
+                        content=step["goal"], topic=plan["goal"][:500], kind=step["actor"], strength=strength,
                         expires_at=plan["next_review_at"], completion=step["completion"])
                     if desire:
                         args.update(action="update", desire_id=did)
@@ -424,7 +442,8 @@ class AutonomousPlans:
                         args.update(action="create")
                     result = self.mind._apply_desire(conn, state, DesireChange(**args), command)
                     did = result["desire_id"]
-                    state["desires"][did].update(status="wanted", plan_id=plan["id"], plan_step_id=step["id"],
+                    status = "wanted" if ready else "abandoned" if decision["action"] == "abandon" else "waiting"
+                    state["desires"][did].update(status=status, plan_id=plan["id"], plan_step_id=step["id"],
                         plan_decision_id=step["decision"]["id"], decision_receipt=step["decision"]["receipt"],
                         delivery_artifacts=step.get("delivery_artifacts", []))
                     step["desire_id"] = did
@@ -432,6 +451,7 @@ class AutonomousPlans:
                     conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (dumps(plan), plan["id"]))
                     created.append(did)
             if created:
+                self.mind._retarget(conn, state, self.mind.clock())
                 state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
                 self.mind._save(conn, state)
         return created

@@ -11,7 +11,7 @@ from eventmem.core.models import Scope, SourceInput
 from kin_mind.actions import ActionEvents
 from kin_mind.memory import MemoryContinuity
 from kin_mind.plans import AutonomousPlans
-from kin_mind.state import Mind
+from kin_mind.state import AffectiveEvent, Mind
 
 
 @pytest.fixture
@@ -164,6 +164,60 @@ def test_scores_are_context_not_action_gates(env, score, action, eligible):
         mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="synthetic-receipt")
         assert plans.read(plan["id"])["plans"][0]["steps"][0]["state"] == "completed"
         assert not mind.contact_candidate()["eligible"]
+
+
+def test_scores_and_desire_strength_rise_and_fall_without_authorizing_action(env):
+    mind, plans, source, clock, initial = env
+    plan = create(env, actor="contact")
+    desire_id = None
+    for index, (score, action, target) in enumerate([(12, "execute", 92), (99, "wait", 19), (19, "execute", 7)]):
+        evidence = source("new-context-" + str(index))
+        mind.record(AffectiveEvent(command_id="affect-" + str(index), agent_version="planning-v1",
+            expected_revision=mind.read()["revision"], evidence_ids=[evidence], reason="New sourced experience changes current motivation",
+            values={"initiative": score, "curiosity": score},
+            motivations={key: {"target": target, "half_life_minutes": 20, "reason": "Current intention"} for key in ("initiative", "curiosity")}))
+        plan = decide(env, plan, action, evidence=[evidence], strength=score)
+        plans.sync_wishes()
+        current = mind.read()
+        assert current["dimensions"]["initiative"]["value"] == score
+        assert current["dimensions"]["curiosity"]["value"] == score
+        assert mind.contact_candidate()["eligible"] is (action == "execute")
+        with mind.engine.db.connect() as conn:
+            wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+        assert wish["strength"] == score
+        assert wish["status"] == ("wanted" if action == "execute" else "waiting")
+        assert desire_id in {None, wish["id"]}
+        desire_id = wish["id"]
+        clock[0] += timedelta(minutes=20)
+        projected = mind.read()["dimensions"]
+        assert projected["initiative"]["value"] == pytest.approx((score + target) / 2)
+        assert projected["curiosity"]["value"] == pytest.approx((score + target) / 2)
+        assert plans.claim("contact", "clock-alone")["state"] == "waiting"
+    history = plans.read(plan["id"], history=True)["plans"][0]["history"]
+    assert [p["steps"][0]["strength"] for p in history if p["steps"][0].get("decision")] == [12, 99, 19]
+
+
+def test_omitted_strength_uses_current_motivation_then_preserves_existing_wish(env):
+    mind, plans, source, clock, initial = env
+    mind.record(AffectiveEvent(command_id="curious", agent_version="planning-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[source("an-intriguing-question")], values={"curiosity": 23}, reason="Current curiosity is modest"))
+    plan = decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+    assert wish["strength"] == 23
+    plan = decide(env, plan, "wait", strength=81)
+    plans.sync_wishes()
+    plan = decide(env, plan, "execute")
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        assert mind._load(conn)["desires"][wish["id"]]["strength"] == 81
+
+
+@pytest.mark.parametrize("strength", [-1, 101, 75.5, "75"])
+def test_decision_strength_is_a_bounded_integer(env, strength):
+    with pytest.raises(ValueError):
+        decide(env, create(env), strength=strength)
 
 
 def test_partial_contact_does_not_complete_plan(env):

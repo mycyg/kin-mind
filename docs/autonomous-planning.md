@@ -2,6 +2,8 @@
 
 Kin forms goals and reviews actions with DeepSeek Flash / high. Memories, four recent timestamped public turns, unresolved matters, artifacts, exploration outcomes, sharing receipts, plans and available capabilities enter the existing appraisal. A score is context, never an execution threshold. A missing or stale decision waits for review.
 
+Affect scores and short-term motivation targets continue to rise or fall with sourced conversation, memory and outcomes, and evolve over time using their configured half-lives. DS may update `action_decisions.strength` (0–100) even when waiting or abandoning. Existing wish strength is retained if omitted; a new wish uses its current motivation instead of a fixed default. Neither a high nor a low score grants or revokes execution by itself.
+
 ## Decisions, plans and execution
 
 The `semantic_actions` flag replaces the legacy 75-point contact/exploration gates at candidate selection, claim and pre-send validation. Quiet hours, current contact preferences, user work priority, channel permissions and source/version validation remain authoritative. Normal chat reuses the existing input classifier's `recall` decision; it does not add a fixed model call. Optional memory expansion is capped at three rounds and 150 seconds, with each reranker capped at 30 seconds. Optional failures return verified local evidence and explicit gaps.

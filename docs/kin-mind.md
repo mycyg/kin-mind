@@ -80,7 +80,7 @@ revision while retaining history; intervening personality revisions require revi
 
 ## Exploration
 
-`Explorations` claims an unexpired question selected by DeepSeek when curiosity is at least 75. The worker claim and desire transition are atomic. There is no elapsed-time admission gate; the 1,200-second maximum remains in the profile. `run_kimi` starts the
+`Explorations` claims an unexpired question selected by DeepSeek. With `semantic_actions` enabled, a current DS decision replaces the legacy curiosity threshold; scores remain dynamic context. The worker claim and desire transition are atomic. There is no elapsed-time admission gate; the 1,200-second maximum remains in the profile. `run_kimi` starts the
 installed CLI with a dedicated [agent profile](https://moonshotai.github.io/kimi-code/en/customization/agents.html)
 that allows Read, Grep, Glob, WebSearch and FetchURL. It excludes write, shell,
 subagent and messaging tools and overrides automatic skill discovery. These are
@@ -122,8 +122,9 @@ It performs these operations:
 1. Ingest authenticated owner messages as real user sources. Internal wakes and
    exploration reports have independent event categories and do not change the
    owner's last-input timestamp or release unanswered-outreach waiting.
-2. Check the score after updates and on a 60-second timer. Reserve one contact
-   candidate only when initiative is at least 75 and an actionable wish exists.
+2. Project dynamic scores after updates and on a 60-second timer. With
+   `semantic_actions` enabled, reserve a contact only with a current DS decision
+   and an actionable wish; the disabled legacy path retains its score gate.
 3. Ask the **original** shared session for a draft, capturing output locally. Do not
    forward draft commentary, files or intermediate output to the phone.
 4. Recheck desire revision/expiry/source validity, owner input epoch, active work,

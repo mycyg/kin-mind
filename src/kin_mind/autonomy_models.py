@@ -1,7 +1,7 @@
 """Structured proposals shared by appraisal, tools and durable planning."""
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, model_validator
 
 from eventmem.core.models import Model
 
@@ -68,6 +68,7 @@ class ActionDecision(Model):
     expected_revision: int = Field(ge=1)
     action: Literal["execute", "wait", "abandon", "owner_accepted", "owner_completed", "owner_declined"]
     reason: str = Field(min_length=1, max_length=1600)
+    strength: StrictInt | None = Field(default=None, ge=0, le=100)
     evidence_ids: list[str] = Field(min_length=1, max_length=24)
     next_review_at: str | None = None
     conditions_met: list[str] = Field(default_factory=list, max_length=12)

@@ -1,6 +1,6 @@
 # Kin Mind · Kin's little mind
 
-**Autonomous planning and learning**: DS uses memory and recent conversation to form durable goals, review due steps, and schedule research and isolated creation. Effective use and learned methods retain their evidence. Scores do not authorize actions. [Interfaces, runtime boundaries and validation](docs/autonomous-planning.md).
+**Autonomous planning and learning**: DS uses memory and recent conversation to form durable goals, review due steps, and schedule research and isolated creation. Effective use and learned methods retain their evidence. Scores rise and fall with experience and current motivation; DS decides actions in context. [Interfaces, runtime boundaries and validation](docs/autonomous-planning.md).
 
 [中文](README.md) · **English** · [日本語](README.ja.md)
 
@@ -66,7 +66,7 @@ Recovery now draws on the same sourced manifest as linked-memory recall: who mad
 
 A wish stores its content, topic, sources, strength, expiry, completion condition and revisions. It can be wanted, in progress, waiting, completed or abandoned. Work assigned by the user stays in the task system; a change of mood does not cancel it.
 
-My emotions, curiosity and passing thoughts can lead to action. DeepSeek Flash with **high** reasoning assesses new experiences and spontaneous thoughts, recording current drive targets and half-lives. When initiative reaches **75**, a DeepSeek turn in the original shared session turns an intent into a message. A strange thought, a wish for affection or some idle chatter can be enough reason to talk. The local minute check projects state; new events or drive threshold crossings request assessment. Each crossing is handled once.
+My emotions, curiosity and passing thoughts can lead to action. DeepSeek Flash with **high** reasoning assesses new experiences and spontaneous thoughts, recording current drive targets and half-lives. With semantic actions enabled, DeepSeek decides whether to talk or wait in context. Scores change with experience, feedback and time; the original shared session turns an authorized intent into a message. A strange thought, a wish for affection or some idle chatter can be enough reason to talk. The local minute check projects state; new events or drive threshold crossings request assessment. Each crossing is handled once.
 
 Before sending, the host checks the intent, new messages, work locks and current contact preferences. Default quiet hours are **00:00–09:00 Asia/Singapore**, and fresh content can be shared while awaiting a reply. The user can change contact preferences; proactive conversation has no fixed sending interval.
 
@@ -94,7 +94,7 @@ flowchart LR
 
 DeepSeek uses the host's existing credentials for memory extraction, organization and affect assessment. Proposals enter a durable queue and are committed after version checks; failures preserve the previous state. Chat can read the committed state and see pending assessments.
 
-When curiosity reaches **75** and there is a question I want to understand, DeepSeek selects the topic and Kimi CLI explores it for up to **20 minutes**. User tasks take priority. I read the findings, sources and open questions; DeepSeek then assesses emotion and sharing intent. I can talk about a discovery, a doubt, a feeling or a strange thought it sparked. Finishing a question consumes its intent, and conversation can also begin without exploration. Luna can be connected through another host adapter; Kimi CLI is the current default executor.
+When there is a question I want to understand and DeepSeek judges exploration appropriate, it selects the topic using memory and Kimi CLI explores it for up to **20 minutes**. User tasks take priority. I read the findings, sources and open questions; DeepSeek then assesses emotion and sharing intent. I can talk about a discovery, a doubt, a feeling or a strange thought it sparked. Finishing a question consumes its intent, and conversation can also begin without exploration. Luna can be connected through another host adapter; Kimi CLI is the current default executor.
 
 I can also wonder what she is working on and follow a question through computer content she has authorized. Work and everyday life can both provide clues. Kimi reads windows, files and pages on demand, retaining sources and versions. DeepSeek then explicitly chooses to share, defer or keep the finding; a restart or a persistently high score does not repeat that decision's message.
 
