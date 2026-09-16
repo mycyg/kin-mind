@@ -70,3 +70,16 @@ test('each bubble carries the durable memory batch and expected count',async()=>
   await run({id:'synthetic-batch',channel:'synthetic',bubbles:['First thought.','Its continuation.']});
   assert.deepEqual(sent.map(r=>[r.memoryBatchId,r.expectedBubbles]),[['synthetic-batch',2],['synthetic-batch',2]]);
 });
+
+test('file preflight happens before the introduction and unknown delivery only reconciles',async()=>{
+ let journal;const sent=[];let verified=false,ack=false;
+ const run=createContactBatch({read:()=>journal,write:(_,v)=>{journal=v;},verifyFile:async()=>({state:verified?'ready':'pending',retryAfterMs:0}),
+ receipt:async()=>ack?{state:'accepted',messageId:'file-receipt'}:null,
+ send:async r=>{sent.push(r);if(r.file)throw Error('uncertain');return{state:'accepted',messageId:'intro'};}});
+ const request={id:'file-plan',channel:'synthetic',bubbles:['Here is the file.'],files:[{sha256:'verified-hash',path:'fixture'}]};
+ assert.equal((await run(request)).state,'pending');assert.equal(sent.length,0);
+ verified=true;assert.equal((await run({id:request.id})).state,'unconfirmed');assert.equal(sent.length,2);
+ assert.equal((await run({id:request.id})).state,'unconfirmed');assert.equal(sent.length,2);
+ ack=true;assert.equal((await run({id:request.id})).state,'accepted');assert.equal(sent.length,2);
+ assert.equal(sent[1].expectedBubbles,2);
+});

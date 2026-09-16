@@ -708,7 +708,7 @@ def test_semantic_identity_requires_the_cited_prior_revision(system):
     assert result["state"] == "defer"
 
 
-def test_host_auto_deep_enables_ranking_but_keeps_light_local(system, monkeypatch):
+def test_host_semantic_deep_enables_ranking_but_keeps_auto_local(system, monkeypatch):
     from kin_mind.host import dispatch
     mind, _, _, _, _ = system
     seen = []
@@ -717,8 +717,8 @@ def test_host_auto_deep_enables_ranking_but_keeps_light_local(system, monkeypatc
         return {}
     monkeypatch.setattr(Contexts, "build", build)
     config = {"root": str(mind.engine.db.root), "scope": mind.scope.model_dump(), "agent_version": "fixture", "session_id": "fixture"}
+    dispatch(config, "memory-context", {"query": "把它接着做下去呀", "purpose": "chat", "mode": "deep"})
     dispatch(config, "memory-context", {"query": "还记得上次星图吗", "purpose": "chat"})
-    dispatch(config, "memory-context", {"query": "今天的云好漂亮", "purpose": "chat"})
     dispatch(config, "memory-context", {"query": "星图", "purpose": "read", "mode": "deep", "allow_model": False})
     assert seen[0]["allow_model"] is True
     assert not seen[1].get("allow_model")
@@ -788,7 +788,7 @@ def test_first_successful_ranking_can_expand_after_an_earlier_timeout(system, mo
             if self.calls == 1:
                 raise TimeoutError()
             ordered = sorted(payload["candidates"], key=lambda r: "继续讨论星图" not in r["text"])
-            return RecallRanking(ids=[r["id"] for r in ordered],
+            return RecallRanking(ids=[r["id"] for r in ordered[:8]],
                                  followups=[RecallFollowup(candidate_id=ordered[0]["id"], direction="after")]), {}
     _, info = AdaptiveRecall(Contexts(mind)).collect("星图后来怎样了？", mode="deep", allow_model=True, provider=Recovering())
     assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
@@ -823,7 +823,7 @@ def test_model_selects_followup_without_a_keyword_trigger(system, monkeypatch):
         def structured(self, name, schema, prompt, payload, **kwargs):
             ranked_inputs.append([r["text"] for r in payload["candidates"]])
             ordered = sorted(payload["candidates"], key=lambda r: ("最后确定" not in r["text"], "色卡" not in r["text"]))
-            return RecallRanking(ids=[r["id"] for r in ordered],
+            return RecallRanking(ids=[r["id"] for r in ordered[:8]],
                                  followups=[RecallFollowup(candidate_id=ordered[0]["id"], direction="after")]), {}
     items, info = AdaptiveRecall(Contexts(mind)).collect("把色卡那句话的上下文找完整。", mode="deep", allow_model=True, provider=Ranker())
     assert "最后确定用蓝紫色" not in ranked_inputs[0]

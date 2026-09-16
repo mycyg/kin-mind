@@ -62,6 +62,9 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             "event_lifecycle": False, "adaptive_recall": False, "auto_volumes": False,
             "temperature_shadow": False, "temperature_ranking": False,
             "temperature_shadow_started_at": None, "temperature_validation": None,
+            "semantic_actions": False, "autonomous_plans": False, "creative_execution": False,
+            "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
+            "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20}
 
@@ -162,12 +165,18 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking"):
+        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
             previous = self.settings(conn)
             config = previous | values
+            if config["usage_reinforcement"] and not previous["usage_reinforcement"]:
+                config["reinforcement_started_at"] = self.mind.clock()
+                config["reinforcement_validation"] = None
+            if config["reinforcement_ranking"]:
+                from .reinforcement import validate_enable
+                validate_enable(conn, self.scope.key(), config, self.mind.clock())
             if config["temperature_shadow"] and (not previous["temperature_shadow"] or not config["temperature_shadow_started_at"]):
                 config["temperature_shadow_started_at"] = self.mind.clock()
                 config["temperature_validation"] = None
@@ -654,8 +663,9 @@ class MemoryContinuity:
         with self.engine.db.connect(write=True) as conn:
             conn.execute("INSERT OR IGNORE INTO mind_memory_access VALUES(?,?,?,?,?,?)",
                          (self.scope.key(), session, identifier, revision, depth, self.mind.clock()))
-            if depth != "index" and self.settings(conn)["temperature_shadow"]:
+            if depth != "index" and (self.settings(conn)["temperature_shadow"] or self.settings(conn)["usage_reinforcement"]):
                 from .lifecycle import record_usage
+                from .reinforcement import input_key
                 record_usage(conn, self.scope.key(), identifier,
-                             usage_id or digest([session, identifier, revision, depth, self.mind.clock()[:10]]),
+                             input_key(conn, self.scope.key(), usage_id) or digest([session, self.mind.clock()[:10]]),
                              origin, self.mind.clock(), {"depth": depth, "revision": revision})

@@ -2,19 +2,22 @@ import {createHash} from 'node:crypto';
 import {splitChatText} from './chat-bubbles.mjs';
 
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
-export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),now=()=>Date.now()}) {
+export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),verifyFile=async()=>{throw Error('File delivery is not configured');},now=()=>Date.now()}) {
   const active=new Map();
   const digest=value=>createHash('sha256').update(value).digest('hex');
-  async function run({id,text,bubbles,references=[],channel,guard=()=>true,superseded=false}) {
+  async function run({id,text,bubbles,files=[],references=[],channel,guard=()=>true,superseded=false}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
+    const contentDigest=parts?digest(JSON.stringify(files.length?{parts,files}:parts)):null;
     if(batch) {
-      if(parts&&batch.digest!==digest(JSON.stringify(parts)))throw Error('contact-batch-content-conflict');
+      if(parts&&batch.digest!==contentDigest)throw Error('contact-batch-content-conflict');
       if(references.length&&batch.referenceDigest&&batch.referenceDigest!==digest(JSON.stringify(references)))throw Error('contact-batch-reference-conflict');
     } else {
       if(!Array.isArray(parts)||!parts.length||parts.some(x=>typeof x!=='string'||!x.trim()))throw Error('contact-batch-empty');
-      batch={id,channel,referenceDigest:digest(JSON.stringify(references)),digest:digest(JSON.stringify(parts)),state:'pending',items:parts.map((text,index)=>({
+      if(!Array.isArray(files)||files.length>24)throw Error('contact-batch-invalid-files');
+      batch={id,channel,referenceDigest:digest(JSON.stringify(references)),digest:contentDigest,state:'pending',items:parts.map((text,index)=>({
         id:'kin-bubble-'+digest(id+'\0'+index).slice(0,48),text,references:references[index]??[],state:'unsent'}))};
+      batch.items.push(...files.map((file,index)=>({id:'kin-file-'+digest(id+'\0'+index+'\0'+file.sha256).slice(0,48),file,state:'unsent'})));
       await write(id,batch);
     }
     // Reconcile first, then review every unsent bubble before exposing an
@@ -34,8 +37,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(item.state==='unsent') {
         if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
         if(item.reviewNotBefore&&now()<item.reviewNotBefore){batch.state='pending';return result(batch);}
-        const checked=await preflight({draft_id:batch.id,text:item.text,references:item.references??[],channel:batch.channel,
-          batch_text:batch.items.map(i=>i.text).join('\n\n'),bubble_index:index});
+        const checked=item.file?await verifyFile(item.file):await preflight({draft_id:batch.id,text:item.text,references:item.references??[],channel:batch.channel,
+          batch_text:batch.items.filter(i=>!i.file).map(i=>i.text).join('\n\n'),bubble_index:index});
         if(['duplicate','silent','merged'].includes(checked.state)) {
           for(const pending of batch.items.filter(i=>i.state==='unsent'))Object.assign(pending,{state:'canceled',reason:checked.reason??checked.state});
           batch.reason=checked.reason??checked.state;await write(id,batch);break;
@@ -53,7 +56,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
         item.state='pending';await write(id,batch);
         try {
-          const sent=await send({id:item.id,text:item.text,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:batch.id});
+          const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:batch.id});
           if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
           Object.assign(item,{state:'accepted',messageId:sent.messageId});
         } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}

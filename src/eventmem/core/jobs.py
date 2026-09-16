@@ -39,7 +39,7 @@ class Worker:
             )
             row = conn.execute(
                 "SELECT * FROM jobs j WHERE ((state IN ('pending','retry') AND available<=?) OR (state='running' AND lease_until<?)) AND "
-                "(kind!='event_digest' OR NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.kind='event_digest' AND busy.state='running' AND busy.lease_until>strftime('%s','now'))) AND "
+                "(kind!='event_digest' OR ((SELECT COUNT(*) FROM jobs busy WHERE busy.kind='event_digest' AND busy.state='running' AND busy.lease_until>strftime('%s','now'))<2 AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.kind='event_digest' AND busy.state='running' AND busy.lease_until>strftime('%s','now') AND json_extract(busy.payload,'$.event_id')=json_extract(j.payload,'$.event_id') AND json_extract(busy.payload,'$.scope')=json_extract(j.payload,'$.scope')))) AND "
                 "(?=0 OR priority<=30) AND "
                 "NOT EXISTS(SELECT 1 FROM job_dependencies d LEFT JOIN jobs parent ON parent.id=d.dependency_id WHERE d.job_id=j.id AND (parent.state IS NULL OR parent.state!='complete')) ORDER BY priority,available,id LIMIT 1",
                 (time.time(), time.time(), int(foreground)),
@@ -84,7 +84,9 @@ class Worker:
         heartbeat = threading.Thread(target=self.renew, args=(job, done), daemon=True)
         heartbeat.start()
         try:
-            apply = self.prepare(job)
+            from kin_mind.model_runtime import background_calls
+            with background_calls():
+                apply = self.prepare(job)
             with self.engine.db.connect(write=True) as conn:
                 if not self.owns(conn, job):
                     return True
@@ -97,7 +99,9 @@ class Worker:
         except Exception as exc:
             with self.engine.db.connect(write=True) as conn:
                 if self.owns(conn, job):
+                    capacity_wait = str(exc) in {"deepseek-background-capacity", "deepseek-foreground-priority"}
                     state = (
+                        "retry" if capacity_wait else
                         "waiting_config"
                         if isinstance(exc, (NotConfigured, ImportError))
                         else "canceled"
@@ -106,6 +110,8 @@ class Worker:
                         if job["attempts"] >= job["max_attempts"]
                         else "retry"
                     )
+                    if capacity_wait:
+                        conn.execute("UPDATE jobs SET attempts=MAX(0,attempts-1) WHERE id=?", (job["id"],))
                     error = (
                         str(exc)
                         if isinstance(
@@ -134,6 +140,9 @@ class Worker:
     def prepare(self, job):
         engine, kind = self.engine, job["kind"]
         payload = json.loads(job["payload"])
+        if kind == "procedure_replay":
+            from kin_mind.procedures import prepare_replay
+            return prepare_replay(engine, payload)
         if kind == "event_digest" or kind.startswith("lifecycle_"):
             from kin_mind.lifecycle import prepare_job
             return prepare_job(engine, job, payload)

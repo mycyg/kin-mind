@@ -143,6 +143,8 @@ def record_usage(conn, scope, identifier, usage_id, origin, at, data=None):
     for used_id in ids:
         conn.execute("INSERT OR IGNORE INTO mind_event_usage VALUES(?,?,?,?,?,?)",
                      (scope, used_id, usage_id, origin, at, dumps(data or {})))
+        from .reinforcement import record
+        record(conn, scope, used_id, usage_id, origin, at, data)
 
 
 def foreground_lease(engine, scope, session, *, active=True, seconds=180):
@@ -405,6 +407,7 @@ class EventLifecycle:
         projection = provider is None and len(inputs) == 1 and len(inputs[0]["text"]) <= 3000
         if not projection:
             provider = provider or DeepSeek.from_engine(self.engine)
+            provider.background = True
             provider.timeout = min(300, getattr(provider, "timeout", 300))
         if tokens(dumps(inputs)) > 64000:
             packed = Contexts(self.mind).pack(
@@ -561,6 +564,8 @@ class EventLifecycle:
                                   "time_needs_review": bool(times) and not known, "historical_access": False})))
         def apply(conn):
             conn.executemany("INSERT INTO mind_memory_temperature VALUES(?,?,?,?,?,?) ON CONFLICT(scope,identifier) DO UPDATE SET tier=excluded.tier,protected=excluded.protected,updated_at=excluded.updated_at,data=excluded.data", values)
+            from .reinforcement import observe, strengths
+            observe(conn, self.scope.key(), at, {"strengths": strengths(conn, self.scope.key(), [i["id"] for i in [*records, *nodes]], at), "ranking_active": False})
         return apply
 
     def status(self):

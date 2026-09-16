@@ -157,8 +157,8 @@ class ShareLedger:
         conn.execute("INSERT INTO mind_coverage_revisions VALUES(?,?,?,?,?,?)", (self.scope.key(),data["unit_id"],data["version"],data["bubble_id"],data["revision"],dumps(data)))
         if data["state"] == "accepted" and data.get("message_id") and not data.get("needs_review"):
             from .lifecycle import configured, record_usage
-            if configured(conn, self.scope.key(), "temperature_shadow"):
-                record_usage(conn, self.scope.key(), data["unit_id"], data["bubble_id"],
+            if configured(conn, self.scope.key(), "temperature_shadow") or configured(conn, self.scope.key(), "usage_reinforcement"):
+                record_usage(conn, self.scope.key(), data["unit_id"], data.get("usage_id") or data["share_id"],
                              "reply_reference", data["at"], {"message_id": data["message_id"], "version": data["version"]})
         return data
 
@@ -181,6 +181,10 @@ class ShareLedger:
                     "at": bubble["at"], "mode": ref.mode, "reason": mapping.reason if mapping else ref.reason,
                     "basis": "semantic-mapping" if mapping else "registered-reference", "confidence": mapping.confidence if mapping else 1,
                     "needs_review": bool(mapping and mapping.confidence < 0.8), "visibility": "unverified"}
+                registered = conn.execute("SELECT reply_id FROM mind_reply_references r WHERE scope=? AND EXISTS "
+                    "(SELECT 1 FROM json_each(r.data,'$.bubbles') b WHERE json_extract(b.value,'$.text_hash')=?) "
+                    "ORDER BY json_extract(data,'$.at') DESC LIMIT 1", (self.scope.key(), body_hash(bubble.get("text", "")))).fetchone()
+                data["usage_id"] = registered[0] if registered else share.get("delivery_id") or share["id"]
                 refs = self.graph.available_proof(conn, share["source_ids"])
                 edge = self.graph.link(conn, ref.unit_id, "shares", share["id"], refs, role=bid, basis="inferred" if mapping else "observed", reason=data["reason"] or "Registered content reference and delivery receipt")
                 data.update(relation_id=edge["id"], relation_revision=edge["revision"])

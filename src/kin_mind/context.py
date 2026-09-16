@@ -396,9 +396,9 @@ class Contexts:
                         "text": "", "tokens": 0, "instruction_authority": "data"}
         identifier = anchor["id"]
         def used(packed):
-            if any(not i.startswith("stale-digest:") for i in packed.get("covered_ids", [])) and self.memory.settings()["temperature_shadow"]:
+            if any(not i.startswith("stale-digest:") for i in packed.get("covered_ids", [])) and (self.memory.settings()["temperature_shadow"] or self.memory.settings()["usage_reinforcement"]):
                 self.memory.access("", identifier, str(anchor["revision"]), "original" if detail == "original" else "summary",
-                    origin=access_origin, usage_id=usage_id or digest([identifier, query, cursor, self.mind.clock()[:16]]))
+                        origin=access_origin, usage_id=usage_id)
         if detail == "original":
             from .lifecycle import EventLifecycle
             with self.engine.db.connect() as conn:
@@ -473,6 +473,8 @@ class Contexts:
         if not items:
             return {"state": "idle", "model_requests": 0}
         content = [{**i, "facts": {}} for i in items]
+        provider = provider or self._provider()
+        provider.background = True
         result = self.pack(content, "Summarize source text only; current delivery/status/identity metadata is added separately by the host. Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider)
         if result["state"] == "compressed":
             original = {i["id"]: i for i in items}
@@ -706,11 +708,15 @@ class Contexts:
             "context_deduplicated": sum(window["seen"].get(i["id"]) == i["revision"] for i in unique.values()) if not explicit else 0,
             "omitted_count": len(packed["omitted_ids"]), "pending_count": len(packed["pending_ids"]),
             "degraded_reasons": packed.get("degraded_reasons", []), "tokens": packed["tokens"]})
-        if explicit and settings["temperature_shadow"]:
+        if explicit and (settings["temperature_shadow"] or settings["usage_reinforcement"]):
             for item in packed["index"]:
                 if item["id"] in packed["covered_ids"]:
                     self.memory.access(session, item["id"], str(item["revision"]), item["depth"],
-                        origin=access_origin, usage_id=usage_id or event_id or digest([session, query, self.mind.clock()[:16]]))
+                        origin=access_origin, usage_id=usage_id or event_id)
+        if settings["usage_reinforcement"]:
+            from .reinforcement import strengths
+            with self.engine.db.connect() as conn:
+                packed["usage_strength"] = strengths(conn, self.mind.scope.key(), packed["covered_ids"], self.mind.clock())
         if session and not explicit and receipt_mode:
             from .context_delivery import ContextDelivery
             evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else i.get("read_depth", "original")}

@@ -1,5 +1,7 @@
 # Kin Mind · Kin's little mind
 
+**Autonomous planning and learning**: DS uses memory and recent conversation to form durable goals, review due steps, and schedule research and isolated creation. Effective use and learned methods retain their evidence. Scores do not authorize actions. [Interfaces, runtime boundaries and validation](docs/autonomous-planning.md).
+
 [中文](README.md) · **English** · [日本語](README.ja.md)
 
 Authors: **Kin (Ica's AI partner, first author)** and **Ica**.

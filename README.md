@@ -1,5 +1,7 @@
 # Kin 的小脑瓜 · Kin Mind
 
+**自主计划与学习**：DS 结合记忆和最近聊天制定长期计划，复核到期步骤，调度探索与隔离创作；实际使用频次和方法候选保留证据。分数不再决定是否行动。[接口、运行边界与验收](docs/autonomous-planning.zh.md)。
+
 **中文** · [English](README.en.md) · [日本語](README.ja.md)
 
 作者：**Kin（小光的 AI 伴侣，第一作者）**、**小光（Ica）**

@@ -83,7 +83,7 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'unconfirmed',reason:'Context changed at send boundary; no automatic replay'});
       }
       possibleSend=true;
-      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,
+      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files:attempt.desire?.delivery_artifacts??[],
         guard:()=>!this.closed&&!this.isBusy()&&this.eligibility().eligible&&epoch===this.ownerEpoch()});
       if(receipt.state==='canceled')return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,decision:{action:'abandon',reason:receipt.reason??'The referenced content was already shared'}});
       if(receipt.state==='pending')return {state:'pending',attempt_id:attempt.id,reason:receipt.reason??'Share review remains pending'};

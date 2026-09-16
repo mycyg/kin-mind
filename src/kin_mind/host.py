@@ -40,6 +40,39 @@ def dispatch(config, action, request):
         config = {**config, "session_id": binding["threadId"]}
     engine = Engine(Path(config["root"]))
     mind = Mind(engine, Scope.model_validate(config["scope"]))
+    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
+        from .plans import AutonomousPlans
+        from .procedures import Procedures
+        plans = AutonomousPlans(mind)
+        if action == "autonomous-plans":
+            return plans.read(**request)
+        if action == "manage-autonomous-plan":
+            return plans.manage(request)
+        if action == "plan-migrate":
+            return plans.migrate_desires()
+        if action == "plan-renew":
+            return plans.renew(**request)
+        if action == "plan-recover":
+            return plans.recover(**request)
+        if action == "plan-interrupt":
+            return plans.settle(request["run_id"], request["owner"], request["fence"], state="interrupted",
+                result={"checkpoint_retained": True, "reason": "executor-stopped-before-settlement"})
+        if action == "plan-result":
+            from .creation import accept_result
+            return accept_result(mind, config, request)
+        if action == "plan-claim":
+            from .decision_context import execution_brief
+            result = plans.claim(**request)
+            if result["state"] == "claimed":
+                result["brief"] = execution_brief(mind, question=result["step"]["goal"],
+                    evidence_ids=[r["record_id"] for r in result["run"]["decision"]["evidence"]],
+                    plan=result["plan"], step=result["step"])
+            return result
+        if action == "procedure-memory":
+            return Procedures(mind).read(**request)
+        if action == "procedure-trial":
+            return Procedures(mind).record_trial(**request)
+        raise ValueError("Unknown autonomy operation")
     session_context = None
     observation_file = config.get("session_observation_file")
     if observation_file and Path(observation_file).exists():
@@ -240,6 +273,9 @@ def dispatch(config, action, request):
         # The existing minute review queues work; the original host owns execution
         # and waits for owner tasks. No extra model call is used for the clock.
         actions.crossings()
+        from .plans import AutonomousPlans
+        plans = AutonomousPlans(mind)
+        plans.tick(actions)
         memory.queue_idle(actions)
         actions.review_unselected()
         actions.drain(jobs)
@@ -249,6 +285,7 @@ def dispatch(config, action, request):
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
         result = jobs.run_one(DeepSeek.from_engine(engine), lane="action")
+        plans.sync_wishes()
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":
             wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"

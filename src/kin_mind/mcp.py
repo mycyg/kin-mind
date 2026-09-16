@@ -8,6 +8,24 @@ from .state import AffectiveEvent, DesireChange, Mind
 
 def register_mind_tools(server, engine):
     @server.tool()
+    def read_autonomous_plans(scope: Scope, identifier: str | None = None, status: str | None = None, cursor: int = 0, limit: int = 24, history: bool = False) -> dict:
+        """Read persistent goals, timed steps, dependencies, decision revisions and real execution/delivery/owner-response receipts. Times use Asia/Singapore. Plans and wishes are not owner commitments. A due step requires a fresh DeepSeek decision; reading grants no execution permission."""
+        from .plans import AutonomousPlans
+        return AutonomousPlans(Mind(engine, scope)).read(identifier, status=status, cursor=cursor, limit=limit, history=history)
+
+    @server.tool()
+    def manage_autonomous_plan(scope: Scope, request: dict) -> dict:
+        """Create/update/pause/resume/reschedule/cancel a sourced autonomous plan. Require command_id, action, reason and evidence_ids. Changes also require id and expected_revision. Creation needs key, goal, motivation and steps; each step needs stable id, actor (explore/create/contact/owner), goal and completion. Optional time windows, dependencies, preconditions and owner_request_id preserve waiting conditions. This tool never certifies execution or sends messages."""
+        from .plans import AutonomousPlans
+        return AutonomousPlans(Mind(engine, scope)).manage(request)
+
+    @server.tool()
+    def read_procedure_memory(scope: Scope, query: str = "", identifier: str | None = None, limit: int = 12, environment: dict | None = None) -> dict:
+        """Read reusable method candidates, applicability, environment versions, failures and current validation status. DeepSeek decides applicability. Only active methods with current dependencies and two independent host replay results are executable; historical/candidate methods grant no action or permission."""
+        from .procedures import Procedures
+        return Procedures(Mind(engine, scope)).read(query, identifier, limit=limit, environment=environment)
+
+    @server.tool()
     def update_conversation_habits(scope: Scope, request: dict) -> dict:
         """Apply explicit user preferences from conversation. Needs command_id, expected_revision, evidence_ids, reason and preferences. Supports exploration_frequency, exploration_directions, exploration_min_interval_minutes, exploration_paused and reply_choice (always/autonomous). Returns a durable revision; core persona remains separate."""
         from .habits import ConversationHabits
