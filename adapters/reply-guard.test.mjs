@@ -268,3 +268,17 @@ test('a review that cannot be reached judged nothing: the wait grows, the group 
  down=false;now+=15*60000;await guard.resumeDue(options);
  assert.equal(guard.manifests.read('reply-outage').state,'accepted');assert.deepEqual(transport.platform.delivered.map(d=>d.body),['one','two']);
 });
+
+test('a host with no old journal directory still resumes its manifests',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-manifest-nojournal-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ let now=0;
+ const guard=new ReplyGuard({directory:path.join(root,'never-created'),manifestDirectory:path.join(root,'reply-manifests'),clock:()=>now,...quiet,
+  call:async(action,r)=>action==='reply-status'?{action:'reply'}:{state:'ready',text:r.text}});
+ const transport=createFakeTransport({directory:path.join(root,'outbox'),clock:()=>now});
+ guard.defer({draft_id:'late-d',reply_id:'current',text:'late'},{id:'late-m',text:'late',kind:'reply',memoryBatchId:'reply-late',expectedBubbles:1},'owner');
+ assert.equal(fs.existsSync(path.join(root,'never-created')),false);
+ now=21*60000;
+ const resumed=await guard.resumeDue({guard:async()=>'send',send:transport});
+ assert.equal(resumed.state,'checked');
+ assert.deepEqual(transport.platform.delivered.map(d=>d.body),['late']);
+});

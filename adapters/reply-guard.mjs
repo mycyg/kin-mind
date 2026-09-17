@@ -227,7 +227,9 @@ export class ReplyGuard {
     return this.save(file,{state:'pending',request,delivery,ownerEpoch,at:this.clock(),retryAt:this.clock()+20*60000});
   }
   async resumeDue({guard,send,limit=2}) {
-    if(this.resuming||!fs.existsSync(this.directory))return {state:'idle'};
+    // The old journal's directory is only the old journal's: a host that never deferred a
+    // bubble has none, and its manifests are resumed all the same.
+    if(this.resuming||(!this.manifests&&!fs.existsSync(this.directory)))return {state:'idle'};
     this.resuming=true;let handled=0;
     try {
       if(this.manifests) {
