@@ -2,9 +2,12 @@
 import json
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import record, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import RecordInput
 
 from .autonomy_models import ProcedureCandidate
+from .autonomy_schema import optimized
 
 
 class Procedures:
@@ -69,10 +72,17 @@ class Procedures:
         outcomes = [self.outcome(conn, identifier) for identifier in p.result_ids]
         refs += self.mind._evidence(conn, [o["source_id"] for o in outcomes])
         identifier = p.id or "procedure_" + digest([self.scope, p.key])[:32]
+        # This family stored no digest at all: the same command id used to return the previous
+        # method whatever the payload said. Without a side row that legacy behavior is kept.
+        stamp = fingerprint("procedure", self.scope, p.model_dump(),
+                            enabled=optimized(conn, self.scope, "idempotency_fingerprint"))
         old = conn.execute("SELECT data FROM mind_procedures WHERE scope=? AND id=?", (self.scope, identifier)).fetchone()
         if old:
             previous = json.loads(old[0])
             if previous["command_id"] == command:
+                if not unchanged(conn, stamp, command):
+                    raise Conflict("Procedure command changed", kind="runtime",
+                                   code="payload-changed", target=identifier)
                 return previous
             if p.expected_revision != previous["revision"]:
                 raise Conflict("Procedure changed during evaluation", target=identifier,
@@ -82,6 +92,7 @@ class Procedures:
                   "command_id": command, "receipt": receipt, "outcomes": outcomes,
                   "agent_version": self.mind._load(conn)["agent_version"]}
         self._save(conn, result)
+        record(conn, stamp, command, self.mind.clock())
         if len({o["case_id"] for o in outcomes}) >= 2:
             self.engine.enqueue("procedure_replay", {"scope": self.mind.scope.model_dump(), "id": identifier, "revision": version},
                 "procedure-replay:" + identifier + ":" + str(version), conn=conn, priority=120)

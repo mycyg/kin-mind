@@ -15,6 +15,7 @@ from test_appraisal_retry_policy import Failing, requeue, saved
 from test_operational_recovery import Provider
 
 from eventmem.core.db import Conflict, Missing, dumps
+from eventmem.core.idempotency import record, stamp
 from eventmem.core.models import SourceInput
 from kin_mind.appraisal import MAX_PREPARATION_CONFLICTS, Appraisals, error_detail
 from kin_mind.autonomy_schema import optimized
@@ -242,6 +243,39 @@ def test_a_commit_by_another_attempt_completes_this_one_from_its_receipt(system)
     # No second call, and the judgment that committed is not scored again.
     assert len(provider.calls) == 1 and mind.read()["revision"] == revision
     assert "error" not in result and "error_detail" not in result
+
+
+def test_a_fingerprinted_commit_by_another_attempt_completes_this_one_the_same_way(system):
+    """Stage 2 WP3: the winning attempt now leaves a fingerprint row as well. A later attempt
+    whose proposal reads differently is still 'already committed', never a revision."""
+    mind, memory, source, _clock = system
+    memory.configure({"operational_lanes": True})
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source("raced-with-fingerprint")], "fixture-v1")
+    committed = {"event_id": "mind_fixture_committed_elsewhere", "revision": 9}
+    key = mind._key(job["id"])
+
+    class Racing(Provider):
+        def appraise(self, context):
+            result = super().appraise(context)
+            other = stamp("mind-state", mind.scope.key(),
+                          {"command_id": job["id"], "expected_revision": 1, "reason": "另一次尝试的判断"})
+            with mind.engine.db.connect(write=True) as conn:
+                conn.execute("INSERT OR IGNORE INTO commands VALUES(?,?,?)",
+                             (key, "another-attempt-digest", dumps(committed)))
+                record(conn, other, key, mind.clock())
+            return result
+
+    provider = Racing()
+    revision = mind.read()["revision"]
+    result = jobs.run_one(provider, lane="action")
+    assert result["state"] == "complete" and result["result"] == committed
+    assert result["completed_from"] == "already-committed"
+    assert len(provider.calls) == 1 and mind.read()["revision"] == revision
+    with mind.engine.db.connect() as conn:
+        # Nothing superseded it: an appraisal finishes from its receipt instead of revising.
+        assert conn.execute("SELECT supersedes FROM mind_command_fingerprints WHERE id=?",
+                            (key,)).fetchone()["supersedes"] is None
 
 
 def test_conflict_and_missing_take_the_same_optional_facts(system):

@@ -8,8 +8,11 @@ from typing import Literal
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
+from eventmem.core.idempotency import record, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
 
+from .autonomy_schema import optimized
 from .state import timestamp
 
 SCHEMA = """
@@ -416,10 +419,15 @@ class EventGraph:
             raise ValueError("Graph revisions need command_id and reason")
         command_hash = digest(request)
         with self.engine.db.connect(write=True) as conn:
+            # The expected node and merge-target revisions gate this command; the action,
+            # the reason and the correction itself are what it is.
+            stamp = fingerprint("graph-revision", self.scope.key(), request,
+                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
             prior = conn.execute("SELECT digest,data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["command_id"])).fetchone()
             if prior:
-                if prior[0] != command_hash:
-                    raise Conflict("Graph command ID reused with other data")
+                if not unchanged(conn, stamp, request["command_id"], legacy=(prior[0], command_hash)):
+                    raise Conflict("Graph command ID reused with other data", kind="runtime",
+                                   code="payload-changed", target=request["command_id"])
                 return json.loads(prior[1])
             proof = self.proof(conn, request.get("evidence_ids", []))
             identifier = request["id"]; current = self.get(conn, identifier)
@@ -520,4 +528,5 @@ class EventGraph:
                 changed.append(self._put(conn, {**current, "revision_reason": request["reason"], "evidence": proof, "source_ids": sorted({r["source_id"] for r in proof})}, edge=current.get("kind") == "edge"))
             result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
             conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), command_hash, dumps(result)))
+            record(conn, stamp, request["command_id"], self.mind.clock())
             return result

@@ -197,11 +197,14 @@ REGISTRY = {
     "Share reference needs review": ("runtime", "reference-needs-review", "reuse"),
     "Coverage mapping is outside evaluated delivery evidence": ("semantic", "evidence-out-of-bounds", "block"),
     "Coverage mapping refers to an unknown bubble": ("semantic", "bubble-unknown", "block"),
-    "Registered reply body changed": ("runtime", "payload-changed", "block"),
+    # A reply body is frozen content, not a command: the same code covers the identical
+    # freeze in reply_review.preflight, which raises it with explicit keywords.
+    "Registered reply body changed": ("runtime", "reply-content-changed", "block"),
     # --- procedures.py ---
     "Procedure is missing or outside this scope": ("semantic", "procedure-unknown", "section"),
     "Artifact presence alone does not verify a method outcome": ("semantic", "insufficient-authority", "section"),
     "Method learning requires an actual verified result": ("semantic", "insufficient-authority", "section"),
+    "Procedure command changed": ("runtime", "payload-changed", "block"),
     "Procedure changed during evaluation": ("runtime", "procedure-revision-changed", "reuse"),
     "Procedure learning is disabled": ("runtime", "feature-disabled", "block"),
     "Procedure needs review": ("runtime", "procedure-needs-review", "reuse"),

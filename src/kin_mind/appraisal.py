@@ -1588,7 +1588,9 @@ class Appraisals:
                         data["rejected_sections"] = rejected
 
                     def apply_habits():
-                        self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
+                        # The host issues this command id from the appraisal itself, so a later
+                        # judgment that rewrites the same preferences is an explicit revision.
+                        self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])}, revise=True)
                     if isolation and proposal.habits:
                         # Owner preferences are upstream of autonomous action, so they are settled first.
                         section("habits", apply_habits)

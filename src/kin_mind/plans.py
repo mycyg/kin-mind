@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import record, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled, optimized
@@ -193,13 +195,19 @@ class AutonomousPlans:
         raw = PlanChange.model_validate({k: v for k, v in request.items() if k != "command_id"}).model_dump()
         key = "plan_command_" + digest([self.scope, command])[:32]
         with self.engine.db.connect(write=True) as conn:
+            # The expected revision fences the change; it is not what the change is. A client
+            # that retries the same change after rereading the plan gets its original receipt.
+            stamp = fingerprint("plan-change", self.scope, raw,
+                                enabled=optimized(conn, self.scope, "idempotency_fingerprint"))
             prior = conn.execute("SELECT digest,result FROM commands WHERE id=?", (key,)).fetchone()
             if prior:
-                if prior[0] != digest(raw):
-                    raise Conflict("A command ID cannot be reused for a different change")
+                if not unchanged(conn, stamp, key, legacy=(prior[0], digest(raw))):
+                    raise Conflict("A command ID cannot be reused for a different change",
+                                   kind="runtime", code="payload-changed", target=command)
                 return json.loads(prior[1])
             plan = self.change(conn, raw, command)
             conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest(raw), dumps(plan)))
+            record(conn, stamp, key, self.mind.clock())
             return plan
 
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
