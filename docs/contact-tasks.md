@@ -55,6 +55,8 @@ Call `manage_contact_task` with `scope`, `policy_ids`, `task_id`, `expected_revi
 | `cancel` | Cancel the schedule and pending deliveries |
 | `confirm` | Approve a suggestion; retain all policy and channel checks |
 
+`pause`, `resume`, `snooze` and `cancel` also return `deliveries` and `reconciliation_required`. Each pending delivery they stopped is listed with an `outcome`: `canceled` when nothing was sent, or `possibly_sent` when its request was already on the network or an earlier attempt ended without a definite refusal. Such a delivery stops retrying, stays `uncertain` until its receipt or an acknowledgment decides it, and sets `reconciliation_required`. A cancellation never reports a message as withdrawn unless it was.
+
 Only `snooze` accepts `due_at`. A `scheduled` receipt confirms storage, not sending. A delivery marked `suggested` awaits policy or confirmation requirements. A `sent` delivery records a successful callback; the callback must acknowledge only after its channel confirms the effect. Failed or uncertain delivery remains visible for reconciliation. Follow the callback idempotency contract to prevent repeated external effects.
 
 Scope and policy selection provide query isolation within the single-user database. They are not access control for unrelated memory tools. Host-specific wrappers can fix the scope and policy IDs and expose their own task aliases:

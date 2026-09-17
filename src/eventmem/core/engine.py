@@ -505,17 +505,27 @@ class Engine:
                                 conn, child, "evidence_changed", change.reason
                             )
                 if data["status"] != "active" or data["attributes"].get("completed"):
-                    conn.execute(
-                        "UPDATE outbox SET state='canceled' WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry','sending')",
+                    # The scheduler's one cancel rule: a delivery whose request may be
+                    # on the network is never called canceled.
+                    from .scheduler import withdraw
+
+                    withdraw(
+                        conn,
+                        "schedule_id IN (SELECT id FROM schedules WHERE record_id=?)",
                         (rid,),
                     )
                     conn.execute(
-                        "UPDATE schedules SET state='canceled',revision=revision+1 WHERE record_id=?",
+                        "UPDATE schedules SET state='canceled',revision=revision+1,data=json_set(data,'$.generation',COALESCE(json_extract(data,'$.generation'),0)+1) WHERE record_id=?",
                         (rid,),
                     )
                 else:
+                    # A dispatched delivery keeps its frozen body, so a retry repeats
+                    # the same bytes. One still waiting takes the new text, and a claim
+                    # on it is released so that it is frozen again from this revision.
                     conn.execute(
-                        "UPDATE outbox SET data=json_set(data,'$.text',?,'$.record_revision',?) WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry')",
+                        "UPDATE outbox SET lease_until=CASE WHEN lease_until=json_extract(data,'$.claim.lease_until') THEN NULL ELSE lease_until END,"
+                        "data=json_remove(json_set(data,'$.text',?,'$.record_revision',?),'$.claim') "
+                        "WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry') AND json_extract(data,'$.dispatch.body') IS NULL",
                         (data["content"], data["revision"], rid),
                     )
                 self.db.bump(conn)
