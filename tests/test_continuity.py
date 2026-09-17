@@ -418,8 +418,15 @@ def test_one_appraisal_commits_understanding_concern_rhythm_and_wish(enabled):
     assert jobs.run_one(reviewer)["state"] == "complete" and reviewer.calls == 1
 
 
-def test_invalid_link_rolls_back_entire_appraisal_and_audit(enabled):
+@pytest.mark.parametrize("isolated", [False, True])
+def test_invalid_link_rolls_back_entire_appraisal_and_audit(enabled, isolated):
+    """Sections are isolated by default since stage 1 (A1): the refused wish alone is undone, completely.
+    With the switch off the previous contract holds unchanged: the entire appraisal and its audit roll back."""
+    from kin_mind.memory import MemoryContinuity
+
     mind, source, _ = enabled
+    if not isolated:
+        MemoryContinuity(mind).configure({"appraisal_section_isolation": False})
     jobs = Appraisals(mind)
     jobs.enqueue([source("input")], "continuity-test-v1")
     reviewer = FakeReviewer(
@@ -453,6 +460,20 @@ def test_invalid_link_rolls_back_entire_appraisal_and_audit(enabled):
         )
     )
     before = mind.read(history=10)
+    if isolated:
+        result = jobs.run_one(reviewer)
+        after = mind.read(history=10)
+        assert result["state"] == "complete" and after["revision"] == before["revision"] + 1
+        assert result["result"]["rejected_sections"] == [
+            {"section": "wishes", "code": "missing-reference", "message": "Linked concern is missing from this scope"}
+        ]
+        # No trace of the refused wish in the state or in the one audit record; the rest is committed.
+        assert after["desires"] == [] and after["history"][0]["snapshot"]["desires"] == {}
+        assert len(after["history"]) == len(before["history"]) + 1
+        assert [c["key"] for c in after["concerns"]] == ["idea"] and after["dimensions"]["mood"]["value"] == 95
+        with mind.engine.db.connect() as conn:
+            assert conn.execute("SELECT count(*) FROM mind_concern_evidence").fetchone()[0] == 1
+        return
     assert jobs.run_one(reviewer)["state"] == "pending"
     after = mind.read(history=10)
     assert after["revision"] == before["revision"] and after["concerns"] == []

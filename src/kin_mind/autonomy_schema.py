@@ -33,6 +33,14 @@ CREATE INDEX IF NOT EXISTS mind_reinforcement_time ON mind_reinforcement(scope,i
 CREATE TABLE IF NOT EXISTS mind_strength_observations(
  scope TEXT NOT NULL,version TEXT NOT NULL,day TEXT NOT NULL,observed_at TEXT NOT NULL,
  data TEXT NOT NULL,PRIMARY KEY(scope,version,day));
+CREATE TABLE IF NOT EXISTS mind_plan_reviews(
+ plan_id TEXT NOT NULL,command_id TEXT NOT NULL,scope TEXT NOT NULL,kind TEXT NOT NULL,
+ plan_revision INTEGER NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(plan_id,command_id));
+CREATE INDEX IF NOT EXISTS mind_plan_review_time ON mind_plan_reviews(scope,plan_id,at);
+CREATE TABLE IF NOT EXISTS mind_plan_wakeups(
+ scope TEXT NOT NULL,plan_id TEXT NOT NULL,key_digest TEXT NOT NULL,reason TEXT NOT NULL,
+ at TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(scope,plan_id,key_digest));
 """
 
 
@@ -46,3 +54,8 @@ def settings(conn, scope):
 
 def enabled(conn, scope, flag="semantic_actions"):
     return settings(conn, scope).get(flag, False) is True
+
+
+def optimized(conn, scope, flag):
+    """Default-on optimization; only an explicit false restores the previous behavior."""
+    return settings(conn, scope).get(flag) is not False

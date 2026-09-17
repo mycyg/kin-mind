@@ -95,6 +95,12 @@ def dispatch(config, action, request):
     if action == "recover-history":
         from .recovery import recover_history
         return recover_history(mind, **request)
+    if action == "recover-batched":
+        from .recovery import recover_batched
+        return recover_batched(mind, **request)
+    if action == "recover-appraisals":
+        from .recovery import recover_quarantined
+        return recover_quarantined(mind, **request)
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
         checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])

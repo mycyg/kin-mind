@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
 from .autonomy_models import ActionDecision, PlanChange
-from .autonomy_schema import enabled
+from .autonomy_schema import enabled, optimized
 from .state import project, timestamp
 
 
@@ -24,6 +24,24 @@ def local_time(value):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=ZoneInfo("Asia/Singapore"))
     return dt.isoformat()
+
+
+def receipt_ids(step):
+    # Receipts are append-only. An owner response has no host identifier, so its
+    # stable serialization identifies it.
+    return [r.get("id") or r.get("run_id") or "receipt_" + digest(r)[:32] for r in step.get("receipts", [])]
+
+
+def fence(entry):
+    # A newer decision or an execution always changes at least one of these.
+    return entry and {k: entry[k] for k in ("revision", "state", "decision_id")}
+
+
+# Why a ready step may no longer run as decided; each asks for a review, not for a retry.
+REVIEW_REASONS = {"configuration-changed", "new-owner-evidence", "source-needs-review", "missed-window-review-required",
+                  "window-review-required", "procedure-needs-review"}
+# Ledger marker: the review that took this reason finished without being able to show the plan.
+UNSHOWN = "unshown:"
 
 
 class AutonomousPlans:
@@ -49,6 +67,45 @@ class AutonomousPlans:
             return 0
         return conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' "
                             "AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope,)).fetchone()[0]
+
+    def _target(self, conn, plan_id):
+        row = conn.execute("SELECT id FROM mind_plans WHERE scope=? AND (id=? OR json_extract(data,'$.key')=?)", (self.scope, plan_id, plan_id)).fetchone()
+        return self.get(conn, row[0] if row else plan_id)
+
+    def basis(self, plan, step, epoch):
+        """What a decision about this step relies on beyond the step's own revision.
+
+        Stable JSON serialization only; strings are compared exactly as stored.
+        """
+        by_id = {s["id"]: s for s in plan["steps"]}
+        return digest({
+            "definition": {k: step.get(k) for k in ("actor", "preconditions", "depends_on", "not_before", "not_after", "completion", "owner_request_id")},
+            "dependencies": [[i, by_id[i]["revision"], by_id[i]["state"], receipt_ids(by_id[i])] if i in by_id else [i, None, None, None]
+                             for i in step.get("depends_on", [])],
+            "receipts": receipt_ids(step), "goal": plan.get("goal"), "motivation": plan.get("motivation"),
+            "evidence": [[r["record_id"], r["revision"]] for r in plan.get("evidence", [])], "owner_epoch": epoch})
+
+    def _entry(self, plan, epoch):
+        return {"revision": plan["revision"], "steps": {s["id"]: {"revision": s["revision"], "state": s["state"],
+            "decision_id": s.get("decision", {}).get("id"), "strength": s.get("strength"),
+            "delivery_artifacts": [a["sha256"] for a in s.get("delivery_artifacts", [])],
+            "basis": self.basis(plan, s, epoch)} for s in plan["steps"]}}
+
+    def manifest(self, conn, plans):
+        """The host's record of the plan view a decision-maker was actually shown."""
+        epoch = self.owner_epoch(conn)
+        return {"owner_epoch": epoch, "plans": {p["id"]: self._entry(p, epoch) for p in plans}}
+
+    def refresh_view(self, conn, view, plan, command):
+        """Decisions that follow the evaluation's own plan change are made against that revision.
+
+        An idempotent create that wrote nothing vouches for nothing the model was not shown.
+        Without a recorded view the revision check alone applies, as before.
+        """
+        if view.get("owner_epoch") is not None and conn.execute("SELECT 1 FROM mind_plan_history WHERE id=? AND revision=? AND command_id=?",
+                                                               (plan["id"], plan["revision"], command)).fetchone():
+            # The owner epoch stays the one the model saw, not the one at commit.
+            view["plans"][plan["id"]] = self._entry(plan, view["owner_epoch"])
 
     def _refs(self, conn, ids, allowed=None):
         refs = self.mind._evidence(conn, ids)
@@ -108,7 +165,12 @@ class AutonomousPlans:
             if any(previous[i]["state"] in {"running", "completed", "unconfirmed"} for i in removed):
                 raise Conflict("Keep executed steps in plan history")
             plan["steps"] = updated
-        plan.update(evidence=refs, reason=p.reason, next_review_at=local_time(p.next_review_at) or self.mind.clock(),
+        review_at = local_time(p.next_review_at)
+        if not review_at or timestamp(review_at) <= timestamp(self.mind.clock()):
+            # As when omitted: review this revision now. A time already past may have fired
+            # before, and a due review wakes only once per distinct time.
+            review_at = self.mind.clock()
+        plan.update(evidence=refs, reason=p.reason, next_review_at=review_at,
                     agent_version=self.mind._load(conn)["agent_version"], decision_receipt=receipt,
                     last_reviewed_owner_epoch=self.owner_epoch(conn))
         # Any plan revision revokes all prior execution permissions, not results.
@@ -131,12 +193,13 @@ class AutonomousPlans:
             conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest(raw), dumps(plan)))
             return plan
 
-    def decide(self, conn, proposal, command, receipt, allowed):
+    def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
+        """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
+        rebased: that proof, not the model's stale expected_revision, fenced this decision."""
         d = ActionDecision.model_validate(proposal)
         if receipt.get("provider") != "deepseek" or receipt.get("reasoning") != "high":
             raise Conflict("Autonomous action requires a verified DeepSeek high decision")
-        row = conn.execute("SELECT id FROM mind_plans WHERE scope=? AND (id=? OR json_extract(data,'$.key')=?)", (self.scope, d.plan_id, d.plan_id)).fetchone()
-        plan = self.get(conn, row[0] if row else d.plan_id)
+        plan = self._target(conn, d.plan_id)
         if plan["revision"] != d.expected_revision or plan["status"] != "active":
             raise Conflict("Decision plan revision is no longer active")
         refs = self._refs(conn, d.evidence_ids, allowed)
@@ -147,7 +210,35 @@ class AutonomousPlans:
             for r in s["receipts"] if r.get("verified") for a in r.get("artifacts", [])}
         if d.artifact_hashes and (step["actor"] != "contact" or set(d.artifact_hashes) - set(available_artifacts)):
             raise Conflict("Delivery selection requires host-verified artifacts from completed steps")
-        step["delivery_artifacts"] = [available_artifacts[h] for h in dict.fromkeys(d.artifact_hashes)]
+        artifacts = [available_artifacts[h] for h in dict.fromkeys(d.artifact_hashes)]
+        version, epoch = self.mind._load(conn)["agent_version"], self.owner_epoch(conn)
+        stored = step.get("decision") or {}
+        record_only = (unchanged_view and d.action == "wait" and step["state"] == "waiting" and stored.get("action") == "wait"
+                       and (d.strength is None or d.strength == step.get("strength"))
+                       and [a["sha256"] for a in artifacts] == [a["sha256"] for a in step.get("delivery_artifacts", [])]
+                       and d.procedure_ids == stored.get("procedure_ids", []) and d.conditions_met == stored.get("conditions_met", [])
+                       and optimized(conn, self.scope, "plan_review_record_only"))
+        now = timestamp(self.mind.clock())
+        review_at = local_time(d.next_review_at) or (now + timedelta(minutes=20)).isoformat()
+        if timestamp(review_at) <= now:
+            # A due review wakes once per distinct time. A time already past may be one that has
+            # fired, which would leave this plan without any due review: treat it as omitted.
+            # The decision and the audit row keep the model's own value.
+            review_at = (now + timedelta(minutes=20)).isoformat()
+        if rebased and plan.get("next_review_at") and timestamp(plan["next_review_at"]) < timestamp(review_at):
+            # This decision never saw the intervening revision; it cannot postpone that revision's
+            # review. Where that review was asked for at once, ask at once again, as a time of its own.
+            review_at = plan["next_review_at"] if timestamp(plan["next_review_at"]) > now else self.mind.clock()
+        if record_only:
+            # The same wait again is a review, not a new plan revision: nothing another
+            # evaluation holds is invalidated, and the stored decision stays current.
+            previous = plan.get("next_review_at")
+            plan.update(next_review_at=review_at, last_reviewed_owner_epoch=epoch, agent_version=version)
+            self._record_review(conn, plan, command, "unchanged-wait", {"step_id": step["id"], "step_revision": step["revision"],
+                "decision_id": stored.get("id"), "decision": d.model_dump(), "evidence": refs, "receipt": receipt, "owner_epoch": epoch,
+                "agent_version": version, "previous_next_review_at": previous, "next_review_at": review_at, "rebased": rebased})
+            return plan
+        step["delivery_artifacts"] = artifacts
         if d.action.startswith("owner_"):
             if step["actor"] != "owner" or not any(r["authority"] == "explicit" and r.get("metadata", {}).get("role") == "user" for r in refs):
                 raise Conflict("Owner participation requires actual owner evidence")
@@ -173,10 +264,12 @@ class AutonomousPlans:
             step["strength"] = d.strength
         step["decision"] = {**d.model_dump(), "id": "decision_" + digest([command, plan["id"], step["id"]])[:32],
                             "plan_revision": plan["revision"], "step_revision": step["revision"], "evidence": refs,
-                            "owner_epoch": self.owner_epoch(conn), "receipt": receipt, "at": self.mind.clock(),
-                            "agent_version": self.mind._load(conn)["agent_version"]}
-        plan["last_reviewed_owner_epoch"] = self.owner_epoch(conn)
-        plan["next_review_at"] = local_time(d.next_review_at) or (timestamp(self.mind.clock()) + timedelta(minutes=20)).isoformat()
+                            "owner_epoch": epoch, "receipt": receipt, "at": self.mind.clock(),
+                            "agent_version": version}
+        plan["last_reviewed_owner_epoch"] = epoch
+        plan["next_review_at"] = review_at
+        # tick() compares this with the state's version; change() is not the only reviewer.
+        plan["agent_version"] = version
         # Other independent decisions are re-fenced to this atomic plan revision.
         for other in plan["steps"]:
             if other.get("decision"):
@@ -185,6 +278,146 @@ class AutonomousPlans:
             plan["status"] = "completed"
         self._save(conn, plan, command)
         return plan
+
+    def _record_review(self, conn, plan, command, kind, detail):
+        """A review that is not a revision: no history row, whose key is (id, revision)."""
+        conn.execute("UPDATE mind_plans SET next_review=?,data=? WHERE id=?", (plan.get("next_review_at"), dumps(plan), plan["id"]))
+        conn.execute("INSERT INTO mind_plan_reviews VALUES(?,?,?,?,?,?,?)",
+                     (plan["id"], command, self.scope, kind, plan["revision"], self.mind.clock(), dumps(detail)))
+        self.engine.db.bump(conn)
+
+    def decide_batch(self, conn, decisions, command, receipt, allowed, view, *, version=None, job_id=None):
+        """Apply one evaluation's decisions against the plan view it was actually shown.
+
+        A decision whose step or basis moved after that view is held, never raised: the
+        rest of the evaluation commits and one coalesced review asks again. command is
+        the prefix of each decision's command ID.
+        """
+        shown, bases, held, reviews = (view or {}).get("plans", {}), {}, [], {}
+        for index, decision in enumerate(decisions):
+            d = ActionDecision.model_validate(decision)
+            plan = self._target(conn, d.plan_id)
+            base = bases.get(plan["id"])
+            if base is None:
+                # Every decision of this batch is judged against the same pre-batch plan, so an
+                # earlier decision of the batch is not mistaken for someone else's change.
+                base = bases[plan["id"]] = {"expected": d.expected_revision, "revision": plan["revision"],
+                                            "steps": self._entry(plan, self.owner_epoch(conn))["steps"]}
+            elif d.expected_revision != base["expected"]:
+                raise Conflict("Inconsistent plan decision base revision")
+            stale = base["expected"] != base["revision"]
+            seen, actual = shown.get(plan["id"], {}).get("steps", {}).get(d.step_id), base["steps"].get(d.step_id)
+            if plan["status"] != "active":
+                code = "plan-inactive"
+            elif not seen:
+                # No host record of what was shown: only an exact revision is proof, as before.
+                code = "view-missing" if stale else None
+            elif fence(seen) != fence(actual):
+                code = "step-touched"
+            elif seen["basis"] != actual["basis"]:
+                code = "basis-changed"
+            else:
+                code = None
+            if code:
+                held.append({"plan_id": plan["id"], "step_id": d.step_id, "code": code,
+                             "expected": {"plan_revision": d.expected_revision, "step": fence(seen), "basis": seen and seen["basis"]},
+                             "actual": {"plan_revision": base["revision"], "status": plan["status"], "step": fence(actual), "basis": actual and actual["basis"]}})
+                if plan["status"] == "active":
+                    reviews.setdefault(plan["id"], []).append({"step_id": d.step_id, "code": code})
+                continue
+            self.decide(conn, d.model_copy(update={"expected_revision": plan["revision"]}), command + str(index), receipt, allowed,
+                        unchanged_view=bool(seen), rebased=stale)
+        if reviews:
+            from .actions import ActionEvents
+            actions = ActionEvents(self.mind)
+            for identifier, codes in reviews.items():
+                # Only a review that has yet to read the plan can carry the question: this evaluation's
+                # own event is about to finish, and a running one may have read the plan before this commit.
+                if not self._review_in_flight(conn, identifier, exclude_job=job_id)[1]:
+                    self._emit_review(conn, actions, self.get(conn, identifier), [identifier, "held", command], "held-decision",
+                                      version or self.mind._load(conn)["agent_version"], held=codes)
+        return held
+
+    def register_review(self, conn, plan_ids, command, receipt, version=None):
+        """A completed review saw these plans under this configuration.
+
+        Held or absent decisions must not leave the plan recorded under a configuration that
+        has already reviewed it; the wake-up ledger only keeps that from waking a review twice.
+        """
+        version, registered = version or self.mind._load(conn)["agent_version"], []
+        for identifier in plan_ids:
+            row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, identifier)).fetchone()
+            plan = json.loads(row[0]) if row else None
+            if not plan or plan.get("agent_version") == version:
+                continue
+            previous, plan["agent_version"] = plan.get("agent_version"), version
+            self._record_review(conn, plan, command, "version-seen", {"previous_agent_version": previous, "agent_version": version, "receipt": receipt})
+            registered.append(identifier)
+        return registered
+
+    def _dead_reviews(self, conn, plan_id):
+        """Review events of this plan that will never read it; the reasons they answered for are open again.
+
+        drain() sets aside a pending or queued event once its evidence is no longer current, and
+        its evaluation can neither load nor commit on that evidence. An evaluation that already
+        finished, or was set aside for repair, did answer: its reasons stay answered.
+        """
+        jobs, dead = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisals'").fetchone(), set()
+        for row in conn.execute("SELECT id,state,data FROM mind_action_events WHERE scope=? AND kind='plan-review' AND state IN ('pending','queued','needs-review') "
+                                "AND json_extract(data,'$.plan_id')=?", (self.scope, plan_id)).fetchall():
+            data = json.loads(row["data"])
+            state = conn.execute("SELECT state FROM mind_appraisals WHERE id=?", (data["job_id"],)).fetchone() if jobs and data.get("job_id") else None
+            if state and state[0] not in {"pending", "running"}:
+                continue
+            try:
+                current = row["state"] != "needs-review" and self.mind._fresh(conn, self.mind._evidence(conn, data.get("evidence_ids", [])))
+            except (Conflict, Missing, KeyError):
+                current = False
+            if not current:
+                dead.add(row["id"])
+        return dead
+
+    def _review_in_flight(self, conn, plan_id, *, exclude_job=None, dead=None):
+        """(event id, unstarted) of this plan's live pending/queued review; (None, False) without one.
+
+        unstarted: its evaluation has yet to read anything (not drained, or its job is pending
+        with no context kept from an earlier attempt), so it will see every fact that is true
+        now. A running evaluation may have read the plan before that fact. So may a retry that
+        keeps its frozen context: it reads the plan again, but still discards its plan decisions
+        over any owner message newer than that context. An unstarted review is preferred.
+        """
+        jobs, started = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisals'").fetchone(), None
+        dead = self._dead_reviews(conn, plan_id) if dead is None else dead
+        for row in conn.execute("SELECT id,data FROM mind_action_events WHERE scope=? AND kind='plan-review' AND state IN ('pending','queued') "
+                                "AND json_extract(data,'$.plan_id')=? ORDER BY created_at,id", (self.scope, plan_id)).fetchall():
+            if row["id"] in dead:
+                continue
+            job = json.loads(row["data"]).get("job_id")
+            if not job:
+                return row["id"], True
+            if job == exclude_job:
+                continue
+            state = conn.execute("SELECT state,json_extract(data,'$.frozen_memory_context') IS NOT NULL FROM mind_appraisals WHERE id=?", (job,)).fetchone() if jobs else None
+            if not state or state[0] not in {"pending", "running"}:
+                # drain() has yet to close an event whose appraisal finished or was set aside.
+                continue
+            if state[0] == "pending" and not state[1]:
+                return row["id"], True
+            started = started or row["id"]
+        return started, False
+
+    def _emit_review(self, conn, actions, plan, key, reason, version, **extra):
+        # Invalid old evidence is retained in the plan, not passed as
+        # authoritative current evidence to the action queue.
+        sources = []
+        for ref in plan["evidence"]:
+            try:
+                if self.mind._fresh(conn, self.mind._evidence(conn, [ref["record_id"]])):
+                    sources.append(ref["record_id"])
+            except (Missing, Conflict):
+                pass
+        return actions.emit(conn, "plan-review", key, {"plan_id": plan["id"], "plan_revision": plan["revision"], "evidence_ids": sources,
+            "agent_version": version, "reason": reason, **extra})
 
     def waiting_reason(self, conn, plan, step):
         if not enabled(conn, self.scope, "autonomous_plans"):
@@ -222,7 +455,26 @@ class AutonomousPlans:
                 return "procedure-needs-review"
         return None
 
-    def read(self, identifier=None, *, status=None, cursor=0, limit=24, history=False):
+    def review_target(self, job_id):
+        """The review event this appraisal answers and the plan it was woken for; None for any other appraisal."""
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT id,data FROM mind_action_events WHERE scope=? AND kind='plan-review' AND json_extract(data,'$.job_id')=? "
+                               "ORDER BY created_at,id LIMIT 1", (self.scope, job_id)).fetchone()
+        return {"event_id": row["id"], "plan_id": json.loads(row["data"]).get("plan_id")} if row else None
+
+    def reopen_wakeups(self, conn, target):
+        """A review that could not show its own plan answered for nothing: the reasons it took are open again.
+
+        Deleting them would not reopen anything. The same reasons give the same event key, and that
+        event exists and is complete. Kept under a marker no event carries, tick() finds them open and
+        takes them over, which is an event of its own.
+        """
+        if not conn.execute("SELECT 1 FROM mind_plans WHERE scope=? AND id=?", (self.scope, target["plan_id"])).fetchone():
+            return conn.execute("DELETE FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, target["plan_id"])).rowcount
+        return conn.execute("UPDATE mind_plan_wakeups SET event_id=? WHERE scope=? AND plan_id=? AND event_id=?",
+                            (UNSHOWN + target["event_id"], self.scope, target["plan_id"], target["event_id"])).rowcount
+
+    def read(self, identifier=None, *, status=None, cursor=0, limit=24, history=False, manifest=False, first=None):
         with self.engine.db.connect() as conn:
             if identifier:
                 plans = [self.get(conn, identifier)]
@@ -230,47 +482,89 @@ class AutonomousPlans:
                 rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? " + ("AND status=? " if status else "") +
                                     "ORDER BY next_review,id LIMIT ? OFFSET ?", (self.scope, *([status] if status else []), min(100, max(1, limit)), max(0, cursor))).fetchall()
                 plans = [json.loads(r[0]) for r in rows]
+            taken = len(plans)
+            lead = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, first)).fetchone() if first and not identifier else None
+            if lead:
+                # The plan a review was woken for leads its own view, however many plans are due before it.
+                # The window keeps its size, and the cursor counts only plans taken in their usual order.
+                usual = [p for p in plans if p["id"] != first]
+                rest = usual[:min(100, max(1, limit)) - 1]
+                taken, plans = len(rest) + (len(usual) < len(plans)), [json.loads(lead[0]), *rest]
             for plan in plans:
                 plan["needs_review"] = not self.mind._fresh(conn, plan["evidence"])
                 for step in plan["steps"]:
                     step["waiting_reason"] = self.waiting_reason(conn, plan, step)
                 if history:
                     plan["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plan_history WHERE id=? ORDER BY revision", (plan["id"],))]
-        return {"plans": plans, "next_cursor": cursor + len(plans) if len(plans) == limit else None, "timezone": "Asia/Singapore"}
+            # Same snapshot as the plans themselves, so it describes exactly what is returned.
+            shown = self.manifest(conn, plans) if manifest else None
+        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == limit else None, "timezone": "Asia/Singapore"}
+        return {**result, "manifest": shown} if manifest else result
+
+    def _source_state(self, conn, ref):
+        """What freshness of this evidence rests on: a later state of it is a different fact."""
+        current = conn.execute("SELECT revision,deleted FROM records WHERE id=? AND scope=?", (ref["record_id"], self.scope)).fetchone()
+        # A newer version of the same source leaves the old record untouched, and a validity
+        # window ends without any write; the record's own version shows neither.
+        newer = conn.execute("SELECT id FROM sources WHERE namespace=? AND source_key=? AND scope=? AND deleted=0 AND id<>? AND received_at>"
+                             "(SELECT received_at FROM sources WHERE id=?) ORDER BY received_at DESC,id DESC LIMIT 1",
+                             (ref["namespace"], ref["source_key"], self.scope, ref["source_id"], ref["source_id"])).fetchone()
+        return [ref["record_id"], list(current) if current else None, newer[0] if newer else None, self.mind._fresh(conn, [ref])]
+
+    def _wakeups(self, conn, plan, epoch, version):
+        """Every reason to look at this plan again that is true now, each as a stable key.
+
+        A key names the fact itself, never the plan revision or a count of reviews: a review
+        that leaves the fact as it was must not wake another one.
+        """
+        reasons = []
+        if plan.get("next_review_at") and timestamp(plan["next_review_at"]) <= timestamp(self.mind.clock()):
+            reasons.append(["due", plan["next_review_at"]])
+        if not self.mind._fresh(conn, plan["evidence"]):
+            reasons.append(["sources", [self._source_state(conn, ref) for ref in plan["evidence"]]])
+        if plan.get("last_reviewed_owner_epoch") != epoch:
+            reasons.append(["owner_epoch", epoch])
+        if plan.get("agent_version") != version:
+            reasons.append(["agent_version", version])
+        for step in plan["steps"]:
+            reason = self.waiting_reason(conn, plan, step) if step["state"] == "ready" else None
+            if reason in REVIEW_REASONS:
+                reasons.append(["step", step["id"], reason, step["revision"]])
+        return reasons
 
     def tick(self, actions):
-        """Clock/input changes enqueue one versioned review, never a catch-up send."""
+        """Clock/input changes enqueue one versioned review, never a catch-up send.
+
+        Edge-triggered: a reason wakes a review once, when no review has been started for it.
+        A condition that merely stays true after its review wakes nothing.
+        """
         emitted = []
         with self.engine.db.connect(write=True) as conn:
             if not enabled(conn, self.scope, "autonomous_plans"):
                 return emitted
-            epoch = self.owner_epoch(conn)
+            epoch, version = self.owner_epoch(conn), self.mind._load(conn)["agent_version"]
             for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall():
                 plan = json.loads(row[0])
-                reasons = [self.waiting_reason(conn, plan, s) for s in plan["steps"] if s["state"] == "ready"]
-                source_changed = not self.mind._fresh(conn, plan["evidence"])
-                changed = source_changed or plan.get("last_reviewed_owner_epoch") != epoch or plan.get("agent_version") != self.mind._load(conn)["agent_version"] or any(r in {"configuration-changed", "new-owner-evidence", "source-needs-review", "missed-window-review-required", "window-review-required", "procedure-needs-review"} for r in reasons)
-                due = plan.get("next_review_at") and timestamp(plan["next_review_at"]) <= timestamp(self.mind.clock())
-                if not (due or changed):
+                reasons = self._wakeups(conn, plan, epoch, version)
+                if not reasons:
                     continue
-                sources = [r["record_id"] for r in plan["evidence"]]
-                # Invalid old evidence is retained in the plan, not passed as
-                # authoritative current evidence to the action queue.
-                valid_sources = []
-                for i in sources:
-                    try:
-                        if self.mind._fresh(conn, self.mind._evidence(conn, [i])):
-                            valid_sources.append(i)
-                    except (Missing, Conflict):
-                        pass
-                sources = valid_sources
-                current_versions = []
-                for ref in plan["evidence"]:
-                    current = conn.execute("SELECT revision,deleted FROM records WHERE id=? AND scope=?", (ref["record_id"], self.scope)).fetchone()
-                    current_versions.append([ref["record_id"], list(current) if current else None])
-                emitted.append(actions.emit(conn, "plan-review", [plan["id"], plan["revision"], epoch, current_versions],
-                    {"plan_id": plan["id"], "plan_revision": plan["revision"], "evidence_ids": sources,
-                     "agent_version": self.mind._load(conn)["agent_version"], "reason": "due-or-changed-evidence"}))
+                answered = dict(conn.execute("SELECT key_digest,event_id FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, plan["id"])).fetchall())
+                dead = self._dead_reviews(conn, plan["id"])
+                new = [r for r in reasons if answered.get(digest(r)) is None or answered[digest(r)] in dead or answered[digest(r)].startswith(UNSHOWN)]
+                review, unstarted = self._review_in_flight(conn, plan["id"], dead=dead)
+                if new and not review:
+                    # Taking over from a review that never read the plan is an event of its own.
+                    taken = sorted({answered[digest(r)] for r in new if digest(r) in answered})
+                    review, unstarted = self._emit_review(conn, actions, plan, [plan["id"], "wake", sorted(digest(r) for r in new), taken],
+                        "due-or-changed-evidence", version, wakeups=reasons), True
+                if new and unstarted:
+                    # That review has yet to read the plan, so it sees every reason true now. A running
+                    # one may have read it earlier: its reasons stay open and wake a review of their own.
+                    for reason in new:
+                        conn.execute("INSERT OR REPLACE INTO mind_plan_wakeups VALUES(?,?,?,?,?,?)",
+                                     (self.scope, plan["id"], digest(reason), dumps(reason), self.mind.clock(), review))
+                if review:
+                    emitted.append(review)
         return emitted
 
     def claim(self, actor, owner, *, foreground=False):

@@ -63,10 +63,16 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             "temperature_shadow": False, "temperature_ranking": False,
             "temperature_shadow_started_at": None, "temperature_validation": None,
             "semantic_actions": False, "autonomous_plans": False, "creative_execution": False,
+            # Default-on optimization: an unchanged wait is recorded without a plan revision.
+            "plan_review_record_only": True,
+            # Default-on: one refused proposal section no longer fails the whole appraisal.
+            "appraisal_section_isolation": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
-            "review_max_minutes": 120, "first_review_minutes": 20}
+            "review_max_minutes": 120, "first_review_minutes": 20,
+            # Charged appraisal attempts before a job is quarantined for repair.
+            "max_charged_attempts": 5}
 
 
 class MemoryNote(Model):
@@ -165,7 +171,7 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning"):
+        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
@@ -193,6 +199,8 @@ class MemoryContinuity:
                     raise Conflict("Cooling needs a current successful replay validation")
             if not 20 <= config["review_min_minutes"] <= config["first_review_minutes"] <= config["review_max_minutes"] <= 120:
                 raise ValueError("Review range must be within 20..120 minutes")
+            if type(config["max_charged_attempts"]) is not int or not 1 <= config["max_charged_attempts"] <= 20:
+                raise ValueError("Charged appraisal attempts must be between 1 and 20")
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
             if values.get("event_lifecycle") is False:
                 conn.execute("DELETE FROM mind_foreground_leases WHERE scope=?", (self.scope.key(),))

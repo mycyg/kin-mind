@@ -108,7 +108,13 @@ def tokenize(text: str) -> str:
 
 
 class Conflict(Exception):
-    pass
+    """Static host message plus optional structured facts. The message stays the
+    only positional argument, so str() and the HTTP 409 mapping never change."""
+
+    def __init__(self, message="", *, code=None, target=None, expected=None, actual=None):
+        super().__init__(message)
+        self.code, self.target = code, target
+        self.expected, self.actual = expected, actual
 
 
 class Missing(Exception):

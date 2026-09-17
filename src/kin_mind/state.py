@@ -228,7 +228,7 @@ class Mind(Continuity):
             or record["status"] != "active"
             or not SelfKnowledge._current(record, self.clock())
         ):
-            raise Conflict("Evidence is not current")
+            raise Conflict("Evidence is not current", code="evidence-not-current", target=rid)
         return {
             "source_id": sid,
             "hash": row["hash"],
@@ -360,7 +360,9 @@ class Mind(Continuity):
                 state = self._load(conn)
                 if state["revision"] != payload["expected_revision"] and not (rebase and rebase(conn, state)):
                     raise Conflict(
-                        "Mind revision changed; read current state before updating"
+                        "Mind revision changed; read current state before updating",
+                        code="mind-revision-changed", target=self.scope.key(),
+                        expected=payload["expected_revision"], actual=state["revision"],
                     )
                 event_id = (
                     "mind_" + digest([self.scope.key(), payload["command_id"]])[:32]
