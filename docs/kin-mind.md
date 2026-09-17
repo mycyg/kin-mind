@@ -109,7 +109,7 @@ compression serves a waiting reader and an idle queue alike.
 
 | Lane | Admission | Declared by |
 |---|---|---|
-| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; `share-preflight` and `share-preflight-group`; core recall; the Node classifier and chat turns |
+| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; `share-preflight` and `share-preflight-group`; core recall; the Node classifier and chat turns; the [reply-tail decision](mobile-routing.md#the-unsent-rest-of-an-interrupted-reply), whether it rides on the classifier or is asked on its own |
 | `user-work` | one reserved slot, **exempt from the foreground yield** | the review that decides whether a held work task is finished |
 | `background` | `meta.kin_background_model_limit`, and only while no foreground session holds a lease anywhere on the machine | appraisals and everything nested in them, the daily review, event digests, procedure replay, completion review, prewarming, coverage backfill, core jobs, a context whose `access_origin` is `maintenance`, proactive drafts, the Node health audit |
 
@@ -340,6 +340,40 @@ actual DeepSeek model is verified; active work defers it without changing GPT.
 reuses accepted receipts, reconciles uncertain bubbles, and only then sends the
 unsent remainder. The same paragraph splitter serves ordinary and proactive chat;
 it preserves fenced code, words and links rather than truncating them to fit.
+
+The draft is persisted before anything is exposed, and the whole group is then
+reviewed once, before its first bubble leaves: released, held with a visible
+reason, or refused as a whole. None of `duplicate`, `silent` or `merged` applies
+to a single bubble, so a refusal cancels every bubble that was never exposed
+under one reason and keeps that reason on the finished batch; what was already
+sent stays sent. The verdict is persisted with the batch, so a group that has
+been reviewed is never charged for a second review and a group that has begun is
+never cut again. A hold that spent a model call is asked again a bounded number
+of times with a doubling wait, and after that the group is refused under
+`contact-review-held-too-long` rather than held for ever; a verdict that judged
+nothing because the reviewer was never reached backs off the same way but spends
+none of those tries, and the eligibility, guard and local file checks cost
+nothing at all.
+
+Freezing is also where a body too long for the channel is cut, using the same
+fragment rule and the same transport identities as a phone reply, so each
+fragment becomes an ordinary journal entry with its own frozen ID and the
+existing replay sends the same bodies in the same order. Only the first fragment
+carries the bubble's references. Content that no cut can fit stays whole and is
+sent as one file, with no words of the host's own. Receipts are read through the
+same classifier the sender uses, so the journal and the transport can never
+disagree about one receipt: a receipt proving nothing was submitted lets this
+pass send the same frozen ID again under the verdict the group already has, a
+refusal cancels that bubble alone while the rest of the group goes on, and an
+unknown outcome — or no receipt where the reader looked — leaves the batch
+unconfirmed for an operator, resending nothing and giving up on nothing.
+
+The draft parser reads the whole concatenated model output and takes the decision
+from the JSON object that output ends with, fence marks aside, trying each
+opening brace from the last one backwards until a slice parses. Concatenating
+first means a decision split across segments still arrives whole; requiring it to
+end the output means a stale earlier draft followed by unusable text is never
+revived. No body is ever shortened by the parser.
 
 DeepSeek requests enable thinking with `output_config.effort=high`, using the
 [official effort controls](https://api-docs.deepseek.com/guides/thinking_mode/).

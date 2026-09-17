@@ -24,7 +24,7 @@ job preparation and a pending result's commit. Disabled jobs park in
 `waiting_config` and can resume after re-enabling the feature.
 
 The same configuration, written through the host action `configure-memory`,
-carries the conflict-handling switches, which default to **on**:
+carries the switches that default to **on**:
 
 | Switch | Covers | Documented in |
 | --- | --- | --- |
@@ -36,14 +36,35 @@ carries the conflict-handling switches, which default to **on**:
 | `model_lanes` | `mind_model_leases` admission with foreground, user-work and background lanes | [Kin Mind](kin-mind.md#model-lanes-and-the-lease-interface) |
 | `semantic_cache_v2` | `mind_judgment_cache` and its dependency index | [Kin Mind](kin-mind.md#deepseek-and-memory) |
 | `memory_item_isolation` | Item-level isolation in the memory section, and `mind_memory_unorganized` | [mobile recovery](mobile-recovery.md) |
+| `recall_purpose_policy` | `source_evidence_class`: the reading purpose, the evidence classes and the labels every read surface carries | [architecture](architecture.md#reading-purpose-and-evidence-classes) |
+| `chunked_reply_review` | `mind_reply_review_chunks`: a long reply reviewed chunk by chunk, and the re-review of an unsent remainder | [autonomous planning](autonomous-planning.md#reply-review-admission-waits-and-step-verification) |
 
 Each is independent, and an explicit `false` restores the previous behaviour of
 that part alone. Every table above is new, so code without these features
-ignores it and reads the columns it always read; a rollback leaves the tables
-in place, and a re-enabled switch finds its history. The conflict taxonomy that
-classifies a commit failure has no switch: it adds fields to records that
-already existed. `max_charged_attempts` is a number in the same configuration
-rather than a switch.
+ignores it and reads the columns it always read; nothing here adds a column to a
+table that already existed. A rollback leaves the tables in place, and a
+re-enabled switch finds its history. `max_charged_attempts` is a number in the
+same configuration rather than a switch.
+
+Two switches belong to the phone host's own configuration rather than to
+`configure-memory`, because the code they govern is a Node adapter and not the
+memory core. Both also default to on:
+
+| Host switch | Covers | Documented in |
+| --- | --- | --- |
+| `transport_manifest` | The durable reply-group manifest: one review, frozen bodies, fragments and receipts | [mobile recovery](mobile-recovery.md#complete-phone-replies) |
+| `reply_tail_decision` | Interrupting a group instead of cancelling it, and deciding its unsent remainder | [mobile routing](mobile-routing.md#the-unsent-rest-of-an-interrupted-reply) |
+
+Several mechanisms documented across these pages deliberately have no switch,
+because each replaces a behaviour that was wrong rather than adding one that is
+optional. The conflict taxonomy that classifies a commit failure adds fields to
+records that already existed. The outbox's single cancel rule, its dispatch
+outside the write transaction and `outbox_channel_contracts` replace a send that
+could report a delivery as canceled while its request was on the network. The
+proactive contact group's single whole-group review, the durability of the
+adapter state files, the bounded work-lock review chunks and the ordering of a
+degraded rerank likewise have none. The evidence isolation migration is not a
+switch either: it is an operator action with its own dry run and undo.
 
 Cooling additionally requires seven full elapsed days, seven consecutive completed
 daily observation receipts, and a fresh `temperature_validation` with critical
@@ -114,6 +135,18 @@ derived summary as stale. Retracted, deleted and superseded evidence cannot
 become current simply because an older summary still exists. A reverse source
 index supports invalidation without scanning every graph object's JSON.
 
+A summary is built from what happened, so the membership snapshot behind it is an
+experience read. What the [reading purpose](architecture.md#reading-purpose-and-evidence-classes)
+newly removes from that membership enters the input hash together with the rules
+version, so exactly those events become dirty and are written again, while an
+event the older prefix rule already trimmed the same way keeps its signature and
+is not rebuilt for nothing. A derived view is never corrected in place: before a
+rebuild replaces it, the text it replaces is kept in `mind_isolation_archive`
+under the rules version that retired it. While the [evidence isolation](operations.md#evidence-isolation)
+migration is unfinished, a `ready` summary is reported as pending and never
+served — not even as a stale one — because it was written under rules that are
+still being applied.
+
 ## Retrieval interfaces
 
 `read_continuity_context` / host `memory-context` accept optional
@@ -123,8 +156,19 @@ views. Old-event, promise, version, sharing or contradictory-evidence questions
 select the deeper path; an explicit light mode remains local.
 
 Deep retrieval combines lexical matches, original user statements, existing
-Qwen vectors and graph neighbors. Known legacy host envelopes are excluded from
-conversation candidates while remaining readable as original audit records.
+Qwen vectors and graph neighbors. Every lane asks one policy loaded for the
+request, so a legacy host envelope, a role configuration or a self-claim is kept
+out of an experience read and is returned, labelled, to an audit read.
+A graph read applies the same rule to its frontier: a node the purpose does not
+admit is not a bridge, so its neighbours are not reached through it, and
+candidates are filtered before the limit so a hidden projection cannot take a
+visible node's place. Edges follow their own evidence. A node that projects a
+record carries no text of its own, so a reader falls back to that record's
+content; the fallback is taken only when this read may see the record, and the
+node's basis then follows the record's class rather than the node's, which is
+what stops a whole role agreement leaving under a node's own basis.
+`graph-detail` is a read by id and therefore an audit read, carrying the node's
+`evidence_class`.
 Raw-message/event wrappers share a candidate rather than consuming two slots.
 DeepSeek selects temporal neighbors through structured `followups`, including a
 provided candidate ID and a before/after/both direction. Whole nearby original
@@ -140,8 +184,13 @@ corrections and unfinished promises in `protected_ids`; word overlap cannot pin
 an unrelated constraint above the answer's evidence.
 There are at most three retrieval rounds and a 150-second total budget. Optional
 reranking has a 30-second absolute deadline; embedding failure or invalid ranking
-returns validated local evidence with a degradation reason. All new DeepSeek
-calls use high. No reasoning trace becomes a memory source.
+returns validated local evidence with a degradation reason. When no round's
+ranking ever answered, the later rounds only reordered the same local evidence in
+order to feed one, so their reshuffling may not demote what the first round led
+with: the first round's leading eight stay in front, and whatever the later
+rounds surfaced follows them. A degraded recall is therefore never ordered worse
+than a recall that asked for no rerank at all. All new DeepSeek calls use high.
+No reasoning trace becomes a memory source.
 
 Results expose mode used, rounds, candidate/evidence versions, pending IDs,
 digest revisions, degradation reasons and separate retrieval/compression call
@@ -226,7 +275,16 @@ leases, retries, split/undo, feature fences and access-origin semantics. Existin
 mobile completeness, model notices and shared-session tests remain release gates.
 
 Rollback disables the lifecycle switches and uses versioned graph undo where
-needed; a conflict-handling switch is set to `false` on its own, as above.
+needed; a switch from either table above is set to `false` on its own, as above.
+Setting `recall_purpose_policy` to false does not delete a classification row or
+a stamp — it stops them being read, so re-enabling it finds the same classes; a
+store whose rows were written by the migration is taken back with that action's
+own `--undo`, and neither step rewrites a legacy record. Setting
+`chunked_reply_review` to false restores the single-call limits, which refuse a
+group over them outright. The phone host's `transport_manifest` and
+`reply_tail_decision` are set in its own configuration; with the first off every
+reply method behaves as it did before the manifest existed, and with only the
+second off an interrupted group is handled by the manifest alone.
 Do not restore an old production database over new conversations or receipts.
 Retain the pre-rollout SQLite backup and original source/vector storage. Automatic
 volumes and summaries are derived views; source speech and delivery evidence

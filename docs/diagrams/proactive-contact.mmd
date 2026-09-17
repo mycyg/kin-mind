@@ -7,18 +7,34 @@ flowchart TD
     A["Reminder · commitment · anniversary\nCheck-in · greeting"] --> S[("Persistent schedule\nDue time · timezone · recurrence")]
     S --> P["Role policy\nEnabled · channel · triggers · content scope\nQuiet hours · frequency · confirmation"]
     P --> V["Recheck current memory and schedule\nCanceled? Completed? Expired? Scope changed?"]
-    V -- "invalid" --> C["Cancel pending delivery"]
+    V -- "invalid" --> C["Stop the delivery\nCanceled only if nothing can have been sent"]
     V -- "valid" --> O[("Durable outbox\nStable delivery id")]
     O --> M{"Policy and channel ready?"}
     M -- "no" --> G["Suggestion and preview"]
     M -- "confirmation required" --> U["User confirms, delays or cancels"]
     U --> V
-    M -- "ready" --> CL["Commit sending claim\nRecheck again before callback"]
-    CL --> SEND["Authenticated host callback / webhook\nIdempotency-Key = delivery id"]
-    SEND --> ACK["Host transactionally deduplicates\nAcknowledgement recorded"]
-    SEND -- "timeout / crash" --> I{"Channel supports idempotency?"}
-    I -- "yes" --> RETRY["Bounded retry with the same id"]
+    M -- "ready" --> CL["Claim: lease and claim id\nNothing has gone on the network yet"]
+    CL --> DSP["Dispatch: recheck generation and eligibility\nOne guarded update to sending, with the frozen body"]
+    DSP --> SEND["Authenticated host callback / webhook\nNo transaction open · Idempotency-Key = delivery id"]
+    SEND --> ST["Settle, fenced by that dispatch's claim id\n2xx accepted · 4xx refused · anything else unknown"]
+    ST -- "accepted" --> ACK["Host transactionally deduplicates\nAcknowledgement recorded"]
+    ST -- "unknown outcome" --> I{"Declared idempotent channel\nand a verified contract?"}
+    I -- "yes" --> RETRY["Bounded retry\nSame frozen bytes, same Idempotency-Key"]
     RETRY --> V
     I -- "no" --> UNKNOWN["Delivery uncertain\nReconciliation required before resending"]
+    C -- "possibly sent" --> UNKNOWN
     ACK --> NEXT["Complete or schedule the next occurrence"]
     NEXT --> S
+
+    D["Proactive contact draft\nOwn channel, no schedule"] --> DJ[("Draft persisted\nBubbles and their frozen ids")]
+    DJ --> R{"One review of the whole group\nBefore its first bubble is exposed"}
+    R -- "refused as a whole" --> RF["Cancel every bubble never exposed\nOne reason kept on the batch"]
+    R -- "held" --> RH["Reason stays visible · doubling wait\nBounded tries, then refused"]
+    RH --> R
+    R -- "released" --> FZ["Freeze bodies and references\nCut at the channel limit\nWhat no cut fits goes whole, as one file"]
+    FZ --> FR["Send fragment by fragment\nEach an ordinary journal entry with its own frozen id"]
+    FR --> FRC{"Fragment receipt"}
+    FRC -- "accepted" --> BA["Bubble accepted with its platform message id"]
+    FRC -- "proves nothing was submitted" --> FR
+    FRC -- "refused" --> BR["That bubble is canceled\nThe rest of the group goes on"]
+    FRC -- "unknown" --> UNKNOWN

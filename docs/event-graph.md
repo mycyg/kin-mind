@@ -19,7 +19,7 @@ The common sending sequence is:
 1. Recall the finding together with authorship, corrections and previous deliveries.
 2. Register each public bubble's references, bound to its exact text.
 3. Check current coverage, durable outbox receipts and competing reservations.
-4. Freeze public text, references and bubble identifiers.
+4. Freeze public text, references, bubble identifiers and, where the channel needs more than one message, the identity of each fragment.
 5. Settle only the bubbles with actual platform receipts.
 6. Let the existing DeepSeek evaluation interpret feedback and update relationships.
 
@@ -94,13 +94,22 @@ See [the recorded validation results](event-graph-validation.md) for measured re
 
 Pending ordinary replies retain their public body, task association and stable transport ID across restarts. The host rechecks the original input and active task before retrying a completed semantic review. Uncertain transport receipts remain held for reconciliation.
 
-Coherent reply groups and proactive batches review all unsent bubbles before
-sending the introduction. A pending check retains the complete remainder, with
-its order and original IDs. Accepted bubbles are not sent again after restart.
-The share checker sees the whole reply as context and preserves requested
-creative text. Its 64K high-reasoning result is rejected on truncation; the host
-deadline exceeds the provider timeout. Recently retained dialogue includes only
-timestamped owner messages and public replies, excluding model control notices,
-internal events, tool payloads and reasoning.
+A reply group and a proactive batch are each reviewed once, as a whole, before
+the first of their bubbles is exposed, and a group that has been reviewed is
+never charged for a second review. A pending check retains the complete
+remainder, with its order and original IDs. A bubble the platform accepted is
+never rewritten and never sent again, after a restart or after the review's
+evidence has moved; only an unsent remainder can be judged afresh. The share
+checker sees the whole reply as context and preserves requested creative text.
+Its 64K high-reasoning result is rejected on truncation; the host deadline
+exceeds the provider timeout. A reply too long for one call is reviewed in
+bounded chunks rather than refused; see
+[reply review](autonomous-planning.md#reply-review-admission-waits-and-step-verification).
+The durable delivery of a reply group — frozen bodies, fragments, receipts and
+the operator commands over them — is described in
+[mobile recovery](mobile-recovery.md#complete-phone-replies), and the proactive
+batch in [Kin Mind](kin-mind.md#affect-driven-action-episodes). Recently retained
+dialogue includes only timestamped owner messages and public replies, excluding
+model control notices, internal events, tool payloads and reasoning.
 
 A full automatic-context window resumes native compaction at an idle turn boundary, even while a persistent work task remains open. Running tools, queued turns, unresolved native operations and background tasks still hold it. The host verifies the same model, session and task snapshot before resetting the injection ledger; restart reloads the pending window epoch.
