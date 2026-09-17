@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {splitChatText} from './chat-bubbles.mjs';
-import {CHANNEL_CONTRACTS,channelContract} from './channel-contract.mjs';
+import {CHANNEL_CONTRACTS,channelContract,classifyReceipt,normalizeReceipt} from './channel-contract.mjs';
 import {fragmentText,fileFragment} from './text-fragments.mjs';
 import {transportId} from './transport-manifest.mjs';
 
@@ -8,6 +8,8 @@ import {transportId} from './transport-manifest.mjs';
 const REFUSED=['duplicate','silent','merged'];
 const BEGUN=['pending','accepted','unconfirmed'];
 const HOLD_BASE_MS=60000,HOLD_MAX_MS=15*60000;
+/** A platform's own refusal code travels as a code and never as a message. */
+const platformCode=record=>{const value=String(record?.platformCode??record?.code??'');return /^[A-Za-z0-9_.:-]{1,64}$/.test(value)?value:undefined;};
 
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
 export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxHolds=6,now=()=>Date.now()}) {
@@ -56,13 +58,22 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       batch.items.push(...files.map((file,index)=>({id:'kin-file-'+digest(id+'\0'+index+'\0'+file.sha256).slice(0,48),file,state:'unsent'})));
       await write(id,batch);
     }
-    // Reconcile first: what the transport wrote down outranks the journal.
+    // Reconcile first: what the transport wrote down outranks the journal, and
+    // the transport's own rule (`classifyReceipt`) decides what it means, so
+    // this file and the sender can never disagree about one receipt.
     for(const item of batch.items) {
       if(['accepted','canceled'].includes(item.state))continue;
       if(item.state==='unsent'&&superseded){item.state='canceled';await write(id,batch);continue;}
       if(item.state!=='unsent') {
-        const known=await receipt(item.id,batch.channel);
-        if(known?.state==='accepted'&&known.messageId)Object.assign(item,{state:'accepted',messageId:known.messageId});
+        const known=await receipt(item.id,batch.channel),outcome=classifyReceipt(known);
+        if(outcome==='accepted')Object.assign(item,{state:'accepted',messageId:normalizeReceipt(known).messageId});
+        // A receipt that proves nothing was submitted: this pass sends the same
+        // frozen ID again, under the verdict the group already has.
+        else if(outcome==='never-started')item.state='unsent';
+        // A refusal is final for this bubble alone; the rest of the group goes on.
+        else if(outcome==='rejected')Object.assign(item,{state:'canceled',reason:'platform-rejected',...(platformCode(known)?{platformCode:platformCode(known)}:{})});
+        // Unknown, or no receipt where the reader looked: nothing is re-sent and
+        // nothing is given up on. An operator reconciles this one group.
         else {batch.state='unconfirmed';await write(id,batch);return result(batch);}
         await write(id,batch);
       }

@@ -267,6 +267,64 @@ test('an eligibility or guard refusal costs nothing and spends none of the group
   assert.equal(sent.length,1);assert.equal(reviews,1);
 });
 
+/** One interrupted send, then whatever the transport wrote down about it. */
+const interrupted=async(journal,receipts,sent,reviews)=>{
+  const options={...store(journal),receipt:id=>receipts.get(id)??null,
+    preflight:async request=>{reviews.push(request.entries.length);return {state:'ready'};},
+    send:async request=>{sent.push(request.id);if(sent.length===1)throw Error('connection lost');return {state:'accepted',messageId:'receipt-'+request.id};}};
+  const first=await createContactBatch(options)({id:'interrupted',bubbles:['One part.','Another part.']});
+  assert.equal(first.state,'unconfirmed');assert.equal(sent.length,1);
+  return options;
+};
+
+test('a receipt proving nothing was submitted sends the same frozen ID again',async()=>{
+  const journal=new Map(),receipts=new Map(),sent=[],reviews=[];
+  const options=await interrupted(journal,receipts,sent,reviews);
+  const ids=journal.get('interrupted').items.map(item=>item.id);
+  receipts.set(ids[0],{state:'not-submitted'});
+  const finished=await createContactBatch(options)({id:'interrupted'});
+  assert.equal(finished.state,'accepted');
+  assert.deepEqual(sent,[ids[0],ids[0],ids[1]]);            // the same frozen ID, never a new one
+  assert.equal(finished.acceptedBubbles,2);assert.equal(finished.partial,false);
+  assert.deepEqual(reviews,[2]);                            // the group's verdict is already persisted
+});
+
+test('a definitive platform refusal cancels that bubble and lets the group finish',async()=>{
+  const journal=new Map(),receipts=new Map(),sent=[],reviews=[];
+  const options=await interrupted(journal,receipts,sent,reviews);
+  const ids=journal.get('interrupted').items.map(item=>item.id);
+  receipts.set(ids[0],{state:'rejected',platformCode:'230001'});
+  const finished=await createContactBatch(options)({id:'interrupted'});
+  assert.deepEqual(sent,[ids[0],ids[1]]);                   // a refused bubble is never sent again
+  assert.equal(finished.partial,true);
+  assert.equal(finished.canceledBubbles,1);assert.equal(finished.acceptedBubbles,1);
+  assert.deepEqual(reviews,[2]);
+  const refused=journal.get('interrupted').items[0];
+  assert.equal(refused.state,'canceled');assert.equal(refused.reason,'platform-rejected');
+  assert.equal(refused.platformCode,'230001');
+  // A refusal that carries prose instead of a code keeps the reason and drops the prose.
+  const wordy=new Map(),wordyReceipts=new Map(),wordySent=[];
+  const second=await interrupted(wordy,wordyReceipts,wordySent,[]);
+  const wordyIds=wordy.get('interrupted').items.map(item=>item.id);
+  wordyReceipts.set(wordyIds[0],{state:'rejected',platformCode:'the platform said no'});
+  await createContactBatch(second)({id:'interrupted'});
+  assert.equal(wordy.get('interrupted').items[0].reason,'platform-rejected');
+  assert.equal(wordy.get('interrupted').items[0].platformCode,undefined);
+});
+
+test('a receipt that cannot tell still blocks the group and sends nothing',async()=>{
+  const journal=new Map(),receipts=new Map(),sent=[],reviews=[];
+  const options=await interrupted(journal,receipts,sent,reviews);
+  const ids=journal.get('interrupted').items.map(item=>item.id);
+  assert.equal((await createContactBatch(options)({id:'interrupted'})).state,'unconfirmed');
+  assert.deepEqual(sent,[ids[0]]);                          // no receipt where the reader looked: never a second send
+  receipts.set(ids[0],{state:'pending',submissionStarted:true});
+  assert.equal((await createContactBatch(options)({id:'interrupted'})).state,'unconfirmed');
+  assert.deepEqual(sent,[ids[0]]);
+  assert.equal(journal.get('interrupted').items[0].state,'unconfirmed');
+  assert.equal(journal.get('interrupted').items[1].state,'unsent');
+});
+
 test('file preflight happens before the introduction and unknown delivery only reconciles',async()=>{
  let journal;const sent=[];let verified=false,ack=false;
  const run=createContactBatch({read:()=>journal,write:(_,v)=>{journal=v;},verifyFile:async()=>({state:verified?'ready':'pending',retryAfterMs:0}),
