@@ -26,11 +26,16 @@ def prepare_communities(engine, scope):
             ).fetchall()
             edges.extend((r[0], r[1]) for r in rows)
         node_ids = sorted(ids | {x for e in edges for x in e})[:4000]
+        # A topic family is offered as material that was lived. A role agreement, its examples,
+        # a self-claim and a host envelope are none of those, so they are not clustered.
+        from .read_policy import ReadPolicy
+
+        policy = ReadPolicy.load(engine, scope, "experience_recall", conn=conn)
         records = {}
         for rid in node_ids:
             try:
                 data = engine._get(conn, rid)
-                if data["status"] == "active":
+                if data["status"] == "active" and policy.visible(data):
                     records[rid] = data
             except Missing:
                 pass

@@ -30,8 +30,11 @@ class ContinuityManifest:
         with mind.engine.db.connect() as conn:
             conn.executescript(SCHEMA)
 
-    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12):
+    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None):
         """Bounded candidate expansion, with open matters independent of recency."""
+        if policy is None:
+            from eventmem.core.read_policy import ReadPolicy
+            policy = ReadPolicy.load(self.mind.engine, self.mind.scope, 'experience_recall')
         items, warnings = [], []
         settings = self.memory.settings()
         terms = set(query_terms(query))
@@ -58,18 +61,18 @@ class ContinuityManifest:
                 for row in conn.execute("SELECT DISTINCT n.data FROM mind_memory_nodes n, json_each(n.data,'$.task_ids') t WHERE n.scope=? AND n.kind='work' AND t.value=? ORDER BY n.updated_at DESC LIMIT 3", (self.mind.scope.key(), task_id)):
                     node = json.loads(row[0])
                     if self.memory._fresh(conn, node):
-                        items.append({**self.ctx.node_item(node), 'priority': -1})
+                        items.append({**self.ctx.node_item(node, policy=policy), 'priority': -1})
                         focus_ids.append(node['id'])
         graph_nodes, graph_edges = {}, {}
         if settings['graph'] or settings['graph_recall']:
             views = []
             for focus in focus_ids[:6]:
                 try:
-                    views.append(self.memory.graph.read(focus=focus, limit=20, hops=2))
+                    views.append(self.memory.graph.read(focus=focus, limit=20, hops=2, policy=policy))
                 except Missing:
                     warnings.append(focus)
             if query:
-                views.append(self.memory.graph.read(query=query, limit=40, hops=2))
+                views.append(self.memory.graph.read(query=query, limit=40, hops=2, policy=policy))
             for view in views:
                 for node in view['nodes']:
                     if not node['needs_review']:
@@ -86,14 +89,14 @@ class ContinuityManifest:
                 related = any(e['subject'] in focus_ids or e['object'] in focus_ids for e in graph_edges.values() if node['id'] in {e['subject'], e['object']})
                 if not (match or related or node['id'] in focus_ids):
                     continue
-                unit = self.ctx.graph_item(node, list(graph_edges.values()), compact=True)
+                unit = self.ctx.graph_item(node, list(graph_edges.values()), compact=True, policy=policy)
                 unit['priority'] = 0 if node['id'] in focus_ids else 1 if node['kind'] in {'work','finding','thread'} else 3
                 items.append(unit)
         if query:
             for kind, count in (('work', 3), ('share', 5)):
                 for node in self.memory.history(kind, query=query, limit=count)['items']:
                     if not node['needs_review']:
-                        items.append({**self.ctx.node_item(node), 'priority': 1 if kind == 'work' else 2})
+                        items.append({**self.ctx.node_item(node, policy=policy), 'priority': 1 if kind == 'work' else 2})
         # An observed file effect is available even before the journal drains.
         # This is a bounded operation record, never arbitrary tool output.
         for event in pending:
@@ -112,7 +115,7 @@ class ContinuityManifest:
             item = {'id': 'journal:' + event['id'], 'revision': digest(redact(event)), 'text': dumps(facts),
                     'basis': 'public-output' if event['kind'] == 'task-result' else 'host-operation', 'facts': {'kind': event['kind']}, 'priority': -1,
                     'pending_dependency': {'id': event['id'], 'digest': digest(redact(event))}}
-            if self.ctx._current(item):
+            if self.ctx._current(item, policy):
                 items.append(item)
         # Raw accepted outbox receipts override stale semantic sharing views.
         # No guessed semantic match is treated as proof of coverage.
@@ -164,7 +167,10 @@ class ContinuityManifest:
                     raise Missing(identifier)
                 value = json.loads(row[0])
                 deps = value.get('contextDependencies', [])
-                return {'id': identifier, 'complete': value['complete'], 'needs_review': not all(self.ctx._current(i) for i in deps),
+                # A stored manifest that leans on something recall may no longer see needs review.
+                from eventmem.core.read_policy import ReadPolicy
+                policy = ReadPolicy.load(self.mind.engine, self.mind.scope, 'experience_recall', conn=conn)
+                return {'id': identifier, 'complete': value['complete'], 'needs_review': not all(self.ctx._current(i, policy) for i in deps),
                         'payload': value['payload'], 'coverage': value['coverage'], 'watermarks': value.get('watermarks'),
                         'sources': [{'id': i['id'], 'revision': i['revision']} for i in deps[cursor:cursor+limit]],
                         'cursor': cursor+limit if len(deps) > cursor+limit else None, 'instruction_authority': 'data'}

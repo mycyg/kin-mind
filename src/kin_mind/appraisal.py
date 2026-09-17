@@ -1357,6 +1357,7 @@ class Appraisals:
                         shares = {json.loads(r[0]).get("receipt", {}).get("share_id") for r in old} - {None}
                         memory_context["shares"] = [self.memory._get(conn, identifier) for identifier in shares]
                         historical_query = "\n".join(json.loads(r[0]).get("text", "") for r in old)
+                        # A historical appraisal reads the same way a current one does.
                         graph = self.memory.graph.candidates(conn, historical_query)
                         for node in graph:
                             node["needs_review"] = not self.memory.graph.fresh(conn, node)

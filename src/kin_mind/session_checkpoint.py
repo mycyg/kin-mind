@@ -10,6 +10,12 @@ from .dialogue import dialogue_rows, is_public_dialogue, redundant_public_summar
 from .memory import MemoryContinuity
 
 
+def read_policy(mind):
+    from eventmem.core.read_policy import ReadPolicy
+
+    return ReadPolicy.load(mind.engine, mind.scope, 'experience_recall')
+
+
 class SessionCheckpoint:
     def __init__(self, mind, *, agent_version=None):
         self.mind = mind
@@ -135,12 +141,14 @@ class SessionCheckpoint:
         memory_budget = min(1800, max(0, (budget - tokens(dumps(self.payload(base))) - 160) // (2 if critical_ids and older else 1))) if selected else 0
         memory_pack, history_requests = None, 0
         if selected:
-            memory_pack = contexts.pack([contexts._overview(i) for i in selected],
+            # A handover becomes the next session's context, so it is packed for the same read.
+            policy = read_policy(self.mind)
+            memory_pack = contexts.pack([contexts._overview(i, policy) for i in selected],
                 'Continuity facts: preserve unfinished conditions, identity, current corrections and actual sharing coverage.',
-                memory_budget, provider=provider, allow_model=allow_model and bool(critical_ids), require_all=bool(critical_ids))
+                memory_budget, provider=provider, allow_model=allow_model and bool(critical_ids), require_all=bool(critical_ids), policy=policy)
             checkpoint['memoryContext'] = memory_pack['text']
             checkpoint['memoryCoverage'] = {k: memory_pack.get(k) for k in ('state', 'covered_ids', 'omitted_ids', 'cache_hit')}
-            checkpoint['contextDependencies'] = [{**i, 'depth': 'summary' if memory_pack['state'] == 'compressed' or contexts._overview(i).get('cached_summary') else 'original'} for i in selected if i['id'] in memory_pack['covered_ids']]
+            checkpoint['contextDependencies'] = [{**i, 'depth': 'summary' if memory_pack['state'] == 'compressed' or contexts._overview(i, policy).get('cached_summary') else 'original'} for i in selected if i['id'] in memory_pack['covered_ids']]
             checkpoint['memoryIndex'] += [{'id':i['id'], 'revision':i['revision']} for i in selected if i['id'] not in memory_pack['covered_ids']]
             checkpoint['criticalMissing'] = sorted(critical_ids - set(memory_pack['covered_ids']))
             for item in selected:
@@ -202,12 +210,13 @@ class SessionCheckpoint:
 
     def validate(self, checkpoint):
         contexts = Contexts(self.mind)
-        stale = [i['id'] for i in checkpoint.get('contextDependencies', []) if not contexts._current(i)]
+        policy = read_policy(self.mind)
+        stale = [i['id'] for i in checkpoint.get('contextDependencies', []) if not contexts._current(i, policy)]
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
         current_version = (self.agent_version or state['agent_version']) + ':' + state['profile_version']
         config_changed = bool(checkpoint.get('configVersion') and checkpoint['configVersion'] != current_version)
-        valid = contexts._current({"dependencies": checkpoint.get("sourceDependencies", [])}) and not stale and not config_changed
+        valid = contexts._current({"dependencies": checkpoint.get("sourceDependencies", [])}, policy) and not stale and not config_changed
         result = {'valid': valid}
         if self.memory.settings().get('continuity_quality'):
             result['quality'] = {'basis': 'dependency-and-receipt-check', 'stale_ids': stale,

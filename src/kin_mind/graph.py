@@ -11,6 +11,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
+from eventmem.core.read_policy import ReadPolicy
 
 from .autonomy_schema import optimized
 from .state import timestamp
@@ -150,6 +151,30 @@ class EventGraph:
             raise Conflict("Graph evidence was not part of this evaluation")
         return refs
 
+    def policy(self, conn, purpose="experience_recall", policy=None):
+        return policy if policy is not None else ReadPolicy.load(self.engine, self.scope, purpose, conn=conn)
+
+    def node_records(self, conn, nodes):
+        """The records a set of nodes projects or cites, keyed by id. A projected self-knowledge
+        claim carries no marker of its own: only its record says what it is."""
+        ids = list(dict.fromkeys(i for node in nodes for i in (*node.get("record_ids", []),
+                   *(r["record_id"] for r in node.get("evidence", [])),
+                   *([node["id"]] if str(node.get("id", "")).startswith("mem_") else []))))
+        found = {}
+        for start in range(0, len(ids), 400):
+            page = ids[start:start + 400]
+            marks = ",".join("?" for _ in page)
+            for row in conn.execute(f"SELECT id,data FROM records WHERE id IN ({marks}) AND deleted=0", page):
+                found[row["id"]] = json.loads(row["data"])
+        return found
+
+    def visible(self, conn, nodes, policy):
+        """Keep the nodes and edges this read may see. Their records are loaded once."""
+        if not policy.enabled:
+            return list(nodes)
+        records = self.node_records(conn, nodes)
+        return [n for n in nodes if policy.node_visible(n, records)]
+
     def fresh(self, conn, node):
         try:
             if node.get("reference_status") in {"unverified", "archived", "superseded", "deleted"}:
@@ -177,9 +202,11 @@ class EventGraph:
             if record["scope"] != self.scope.model_dump():
                 raise Conflict("Graph reference crossed memory scopes")
             refs = self.available_proof(conn,record["source_ids"])
+            # A new projection says what its record is. Stored nodes are never rewritten here:
+            # a node whose evidence is configuration keeps its basis and is hidden at read time.
             return self._put(conn, {"id": identifier, "kind": record["kind"], "title": record["title"],
                 "text": "", "record_ids": [identifier], "source_ids": record["source_ids"], "evidence": refs,
-                "basis": record["confirmation"], "occurred_at": record["valid_from"], "reference_revision": record["revision"], "reference_status": record["status"]})
+                "basis": self.policy(conn, "audit").basis(record), "occurred_at": record["valid_from"], "reference_revision": record["revision"], "reference_status": record["status"]})
         row = conn.execute("SELECT data FROM mind_memory_nodes WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone()
         if row:
             value = json.loads(row[0])
@@ -345,8 +372,9 @@ class EventGraph:
         return {"node_ids": [aliases[n.key] for key, n in zip(node_keys, proposal.nodes) if items.kept(key)],
                 "edge_count": sum(items.kept(key) for key in edge_keys)}
 
-    def candidates(self, conn, query="", limit=40):
+    def candidates(self, conn, query="", limit=40, policy=None):
         limit = min(40, max(1, limit))
+        policy = self.policy(conn, policy=policy)
         words = query_terms(query)
         found = []
         if words:
@@ -360,7 +388,8 @@ class EventGraph:
             found = list({n["id"]:n for n in [*[json.loads(r[0]) for r in units], *found]}.values())
         since = (timestamp(self.mind.clock()) - timedelta(hours=72)).isoformat()
         rows = conn.execute("SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND (occurred_at>=? OR kind='thread') ORDER BY occurred_at DESC LIMIT ?", (self.scope.key(), since, limit)).fetchall()
-        return list({n["id"]: n for n in [*found, *[json.loads(r[0]) for r in rows]]}.values())[:limit]
+        # Filtered before the limit: a hidden projection must not take a candidate's place.
+        return self.visible(conn, list({n["id"]: n for n in [*found, *[json.loads(r[0]) for r in rows]]}.values()), policy)[:limit]
 
     def neighbors(self, conn, identifier, layer=None, limit=40):
         # SQLite otherwise picks a scope-only index for the OR predicate and
@@ -370,43 +399,55 @@ class EventGraph:
             "UNION SELECT rowid AS edge_row,subject,object FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active' AND (? IS NULL OR layer=?)) "
             "ORDER BY object,edge_row LIMIT ?", (self.scope.key(), identifier, layer, layer, self.scope.key(), identifier, layer, layer, limit))
 
-    def read(self, *, focus=None, query="", since=None, until=None, layer=None, kind=None, cursor=0, limit=150, hops=1):
+    def read(self, *, focus=None, query="", since=None, until=None, layer=None, kind=None, cursor=0, limit=150, hops=1, policy=None):
         limit, cursor, hops = min(300, max(1, int(limit))), max(0, int(cursor)), min(3, max(0, int(hops)))
         if layer not in {None, "evidence", "association"}:
             raise ValueError("Unknown graph layer")
         with self.engine.db.connect() as conn:
+            policy, paged = self.policy(conn, policy=policy), False
+            # Hidden nodes are also removed from the frontier: a configuration projection is not
+            # a bridge this read may cross, so its neighbours are not reached through it.
             if focus:
                 anchor = self.ensure(conn, focus)
-                ids, frontier = {anchor["id"]}, {anchor["id"]}
+                known, ids = {anchor["id"]: anchor}, set()
+                frontier = {n["id"] for n in self.visible(conn, [anchor], policy)}
+                ids.update(frontier)
                 for _ in range(hops):
                     next_ids = set()
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 300):
                             next_ids.update(row)
-                    frontier = next_ids - ids; ids.update(frontier)
+                    reached = [known.setdefault(i, self.get(conn, i)) for i in sorted(next_ids - ids - known.keys())]
+                    frontier = {n["id"] for n in self.visible(conn, reached, policy)}
+                    ids.update(frontier)
                     if len(ids) >= 1200:
                         break
-                values = [self.get(conn, i) for i in sorted(ids)]
+                values = [known[i] for i in sorted(ids)]
             elif query:
-                values = self.candidates(conn, query)
+                values = self.candidates(conn, query, policy=policy)
                 known = {n["id"] for n in values}
-                frontier = set(known)
+                frontier, seen = set(known), set(known)
                 for _ in range(hops):
                     additions = set()
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 40):
                             additions.update(row)
-                    frontier = set(sorted(additions-known)[:40]); known.update(frontier)
-                    values.extend(self.get(conn, i) for i in sorted(frontier))
+                    reached = [self.get(conn, i) for i in sorted(additions - seen)[:40]]
+                    seen.update(n["id"] for n in reached)
+                    frontier = {n["id"] for n in self.visible(conn, reached, policy)}
+                    known.update(frontier)
+                    values.extend(n for n in reached if n["id"] in frontier)
             else:
                 rows = conn.execute("SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND (? IS NULL OR occurred_at>=?) AND (? IS NULL OR occurred_at<=?) AND (? IS NULL OR kind=?) ORDER BY occurred_at DESC,id LIMIT ? OFFSET ?", (self.scope.key(), since, since, until, until, kind, kind, limit+1, cursor)).fetchall()
-                values = [json.loads(r[0]) for r in rows]
+                # The page is filtered after SQL applied it, so the cursor follows the rows read
+                # and a page thinned by the policy still leads to the next one.
+                paged, values = len(rows) > limit, self.visible(conn, [json.loads(r[0]) for r in rows], policy)
             values = [n for n in values if (not since or n["occurred_at"] >= since) and (not until or n["occurred_at"] <= until) and (not kind or n["kind"] == kind)]
             # Query order comes from lexical relevance, followed by graph
             # neighbors. Sorting by time here hid old, exact matches.
             if not query:
                 values.sort(key=lambda n: (n["occurred_at"], n["id"]), reverse=True)
-            more = len(values) > (cursor + limit if focus or query else limit)
+            more = paged or len(values) > (cursor + limit if focus or query else limit)
             nodes = values[cursor:cursor+limit] if focus or query else values[:limit]
             allowed, edges = {n["id"] for n in nodes}, {}
             for node in nodes:
@@ -421,6 +462,7 @@ class EventGraph:
                     edge = json.loads(row[0])
                     edge["needs_review"] = not self.fresh(conn, edge)
                     edges[edge["id"]] = edge
+                edges = {e["id"]: e for e in self.visible(conn, list(edges.values()), policy)}
             return {"nodes": nodes, "edges": list(edges.values()), "cursor": cursor+limit if more else None, "limit": limit,
                 "focus": focus, "layout": "deterministic", "instruction_authority": "data"}
 
@@ -428,6 +470,11 @@ class EventGraph:
         with self.engine.db.connect() as conn:
             value = self.get(conn, identifier)
             value["needs_review"] = not self.fresh(conn, value)
+            # A read by id is an audit read: everything is there, and what is not experience says so.
+            policy = self.policy(conn, "audit")
+            label = policy.node_label(value, self.node_records(conn, [value])) if policy.enabled else None
+            if label:
+                value["evidence_class"] = label
             value["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_revisions WHERE id=? ORDER BY revision", (identifier,))]
             if value["kind"] in {"share", "work", "artifact"}:
                 original = conn.execute("SELECT data FROM mind_memory_nodes WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone()
