@@ -564,11 +564,24 @@ class DeepSeek:
                 if context.get("stimulus") not in {"memory-enrichment", "memory-backfill"}:
                     raise
                 issues = [{"loc": list(e["loc"]), "type": e["type"]} for e in error.errors(include_input=False)]
-                fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment,
-                    "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning.",
-                    {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
+                # structured() owns its own failure receipt and clears it on
+                # success. Keep the original call independently so a valid
+                # repair cannot fail during bookkeeping or erase either cost.
+                appraisal_receipt = self.failure_receipt
+                self.failure_receipt = None
+                try:
+                    fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment,
+                        "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning.",
+                        {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
+                except Exception:
+                    appraisal_receipt["schema_repair"] = self.failure_receipt or {
+                        "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+                        "usage": None, "usage_status": "unknown", "outcome": "failed"}
+                    self.failure_receipt = appraisal_receipt
+                    raise
+                appraisal_receipt["schema_repair"] = repair_receipt
+                self.failure_receipt = appraisal_receipt
                 proposal = Appraisal.model_validate(fixed.model_dump())
-                self.failure_receipt["schema_repair"] = repair_receipt
             return proposal, {
                 "provider": "deepseek",
                 "model": body["model"],
