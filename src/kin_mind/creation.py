@@ -131,7 +131,9 @@ def accept_result(mind, config, request, provider=None):
             "phase": "needs_verification", "resume_action": "review-existing-artifacts",
             "verification_gaps": ["completion-review-unavailable"],
             "waiting_reason": "completion-review-" + type(error).__name__,
-            "review_receipt": getattr(provider, "failure_receipt", {"usage": None, "usage_status": "unknown"})})
+            # `failure_receipt` exists and is None whenever the last call succeeded, so the
+            # default of getattr() never applied: the unknown usage was lost, not defaulted.
+            "review_receipt": getattr(provider, "failure_receipt", None) or {"usage": None, "usage_status": "unknown"}})
     finally:
         done.set()
         worker.join(timeout=2)

@@ -167,8 +167,24 @@ does not stop the next due batch.
 
 ## Operator recovery
 
-Two host actions resume work an operator has approved. Both are host-only, call
-no model and write no memory of their own.
+Three host actions serve an operator here. All are host-only, call no model and
+write no memory of their own.
+
+`appraisal-attempts` reads the attempt ledger: one append-only row per attempt,
+written when that attempt ends, with its ordinal, attempt token, lane, stimulus,
+start and finish, outcome (`committed`, `failed`, `quarantined`, `discarded` or
+`abandoned`), the classification of the failure, sha256 digests of the proposal
+and of the rendered request, and every model call the attempt made — purpose,
+model, request id, elapsed time and the usage the provider reported, or an
+explicit `usage_status: "unknown"` where it reported none. It takes an optional
+`job_id` and a `limit` of 1–200. No proposal body, context body or chat text is
+stored, so the ledger is safe to read in full. The attempt that left a row
+`running` past its lease is back-filled as `abandoned` with unknown usage by the
+next claimer, and an attempt whose token was taken over is recorded as
+`discarded`. The queue row's own `error`, `failed_call_receipt`,
+`proposed_result` and `receipt` are unchanged: the ledger is history beside
+them, never a replacement. Setting `attempt_ledger` to false stops the rows
+without changing anything else.
 
 `recover-appraisals` takes 1–50 unique `job_ids`, a `command_id` and a sourced
 `source`. It returns quarantined rows of any lane to the queue in one write

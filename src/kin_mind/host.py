@@ -102,6 +102,11 @@ def dispatch(config, action, request):
     if action == "recover-appraisals":
         from .recovery import recover_quarantined
         return recover_quarantined(mind, **request)
+    if action == "appraisal-attempts":
+        # Read-only accounting: outcomes, static codes, digests and usage. No private text.
+        from .attempts import read as read_attempts
+        return read_attempts(engine, mind.scope.key(), job_id=request.get("job_id"),
+                             limit=request.get("limit", 20))
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
         checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])

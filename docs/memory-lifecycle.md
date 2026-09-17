@@ -129,9 +129,13 @@ existing 800-token allowance; the existing first-window startup allowance remain
 
 `memory_context_read` counts digest/cache use, injection deduplication and missing
 coverage. `event_digest_refreshed` records end-to-end refresh latency.
-`structured_model_usage` records actual provider request IDs and token usage;
-summary-cache hits and native cached-input tokens remain separate measurements.
-Timeouts without provider usage receipts remain unreported usage, not zero tokens.
+`structured_model_usage` records actual provider request IDs and token usage for
+every model call, the main appraisal call included; summary-cache hits and native
+cached-input tokens remain separate measurements. A call the provider reported no
+usage for writes `model_usage_unknown` and no token count at all: unreported usage
+is never a zero. That covers timeouts, network errors, HTTP failures, a missing
+tool call and an unverified model. A model role with no configured price reports
+`cost_status: "unpriced"` through `model_cost_unknown` instead of a cost of 0.0.
 
 `read_event_thread` accepts `detail=index|summary|original` and optional
 `expected_revision`. Summary is the compatible default. Revision mismatch is an
