@@ -79,6 +79,32 @@ class Provider:
                              "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high", "request_id": "fixture"}
 
 
+class CompressionProvider(Provider):
+    """Stands in for Contexts.pack: a pass caches the evidence parts it finished
+    and reports preparation as still pending. `parts=0` is a stalled pass."""
+
+    def __init__(self, mind, parts=1):
+        super().__init__()
+        self.mind, self.parts, self.failure = mind, parts, None
+
+    def appraise(self, context):
+        import uuid
+
+        from kin_mind.context import SCHEMA
+        self.calls.append(context)
+        if self.failure:
+            raise RuntimeError(self.failure)
+        with self.mind.engine.db.connect(write=True) as conn:
+            conn.executescript(SCHEMA)
+            for _ in range(self.parts):
+                conn.execute("INSERT INTO mind_context_cache VALUES(?,?,?,?)",
+                             (uuid.uuid4().hex, self.mind.scope.key(),
+                              dumps({"value": {"entries": [{"item_ids": ["src"], "summary": "A compressed part"}],
+                                               "omitted_ids": []}, "receipt": {"model": "deepseek-flash"}}),
+                              self.mind.clock()))
+        raise RuntimeError("deepseek-evidence-compression-pending:needs-compression")
+
+
 def test_action_contract_excludes_unused_graph_schema():
     from kin_mind.appraisal import appraisal_schema
     full, action = appraisal_schema(), appraisal_schema(True)
@@ -138,23 +164,35 @@ def test_action_commits_and_enrichment_is_atomic_durable_separate(system):
     assert not provider.calls[-1]["memory_context"]["graph_candidates"]
 
 
-def test_retry_freezes_evidence_and_quarantines_heavy_failure(system):
+def test_compression_progress_freezes_evidence_and_heavy_failure_quarantines(system):
+    """WP3: only a preparation pass that cached new parts keeps the frozen
+    context and stays uncharged; a real heavy failure still quarantines."""
     mind, memory, source, _ = system
     memory.configure({"operational_lanes": True})
     jobs = Appraisals(mind)
-    provider = Provider(fail_history=True)
+    provider = CompressionProvider(mind)
     first = source("first")
     job = jobs.enqueue([first], "fixture-v1", stimulus="memory-enrichment")
     result = jobs.run_one(provider)
-    assert result["state"] == "pending"
+    assert result["state"] == "pending" and result["attempts"] == 0
     original = provider.calls[-1]["new_evidence"]
     original_context = json.loads(dumps(provider.calls[-1]["memory_context"]))
     memory.ingest({"id": "unrelated", "kind": "owner-message", "text": "A later unrelated message", "at": mind.clock()})
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job["id"],))
-    assert Appraisals(mind).run_one(provider)["state"] == "needs-repair"
+    assert Appraisals(mind).run_one(provider)["state"] == "pending"
     assert provider.calls[-1]["new_evidence"] == original
     assert provider.calls[-1]["memory_context"] == original_context
+    provider.failure = "deepseek-output-budget-exhausted"
+    for expected in ("pending", "needs-repair"):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job["id"],))
+        assert Appraisals(mind).run_one(provider)["state"] == expected
+        with mind.engine.db.connect() as conn:
+            saved = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (job["id"],)).fetchone()[0])
+        # A charged failure rebuilds the context instead of resending a stale one.
+        assert "frozen_memory_context" not in saved
+    assert jobs.status(job["id"])["repair_reason"] == "deepseek-output-budget-exhausted"
 
 
 def test_pending_idle_only_blocks_its_actual_dependencies(system):

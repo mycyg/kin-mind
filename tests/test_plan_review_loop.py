@@ -700,18 +700,24 @@ def test_failed_attempt_reads_the_plan_again_so_its_retry_covers_what_appeared_m
 
 
 def test_retry_that_keeps_its_frozen_context_is_not_credited_with_a_later_owner_message(env):
-    """With operational lanes a retry keeps its first attempt's memory context, and the commit discards
-    plan decisions over any owner message newer than that context. Such a retry cannot answer for one."""
+    """With operational lanes a retry that keeps its first attempt's memory context commits no plan decision
+    over an owner message newer than that context. Since WP3 only a preparation pass that cached new evidence
+    parts keeps it (every other failure rebuilds), so that is the retry driven here."""
     env.memory.configure({"semantic": True, "operational_lanes": True})
     plan = env.decide(env.create(), "wait", strength=40, next_review_at=later(env, days=30))
     env.owner_message("first-message")
     [first] = env.plans.tick(env.actions)
     jobs = Appraisals(env.mind, exploration_capabilities={"version": env.version})
     env.actions.drain(jobs)
-    class TimesOut:
+    class PreparationPending:
         def appraise(self, context):
-            raise RuntimeError("deepseek-timeout")
-    assert jobs.run_one(TimesOut(), lane="action")["state"] == "pending"
+            from kin_mind.context import SCHEMA
+            with env.mind.engine.db.connect(write=True) as conn:
+                conn.executescript(SCHEMA)
+                conn.execute("INSERT INTO mind_context_cache VALUES(?,?,?,?)", ("part", env.mind.scope.key(),
+                             json.dumps({"value": {"entries": [], "omitted_ids": []}}), env.mind.clock()))
+            raise RuntimeError("deepseek-evidence-compression-pending:needs-compression")
+    assert jobs.run_one(PreparationPending(), lane="action")["state"] == "pending"
     assert "frozen_memory_context" in env.job(env.events()[0]["job_id"])
     env.owner_message("second-message-while-the-retry-waits")
     assert env.plans.tick(env.actions) == [first] and [r for r, event in env.wakeups(plan)] == [["owner_epoch", 1]]
