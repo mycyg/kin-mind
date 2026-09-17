@@ -97,7 +97,10 @@ def compact_plan(plan):
         step = {k:v for k,v in original.items() if k not in {"receipts", "decision", "delivery_artifacts"}}
         step["receipts"] = []
         for r in original.get("receipts", [])[-2:]:
-            value = {k:v for k,v in r.items() if k in {"id", "run_id", "state", "kind", "status", "verified", "source_id", "complete", "message_id", "reason", "waiting_reason", "summary"}}
+            value = {k:v for k,v in r.items() if k in {"id", "run_id", "state", "kind", "status", "verified", "source_id", "complete", "message_id", "reason", "waiting_reason", "summary", "phase", "verification_gaps", "resume_action", "checkpoint"}}
+            if r.get("completion_review"):
+                value["completion_review"] = {k:v for k,v in r["completion_review"].items()
+                    if k in {"complete", "reason", "remaining", "step_remaining", "downstream", "advisory"}}
             value["artifacts"] = [{k:v for k,v in a.items() if k in {"path", "sha256", "bytes"}} for a in r.get("artifacts", [])]
             step["receipts"].append(value)
         step["receipt_count"] = len(original.get("receipts", []))

@@ -38,7 +38,7 @@ def migrate_operational(mind, *, workers_stopped):
     return result
 
 
-def recover_history(mind, *, job_ids, command_id, source, workers_stopped, replacements=None):
+def recover_history(mind, *, job_ids, command_id, source, workers_stopped, replacements=None, admission_only=False):
     """Resume approved historical jobs, preserving failures and original IDs.
 
     Reused structured results still pass the normal transactional validators.
@@ -54,7 +54,7 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
     if set(replacements) - set(job_ids):
         raise ValueError("Replacement outside the approved batch")
     name = "history-recovery:" + command_id
-    fingerprint = digest([job_ids, source, replacements])
+    fingerprint = digest([job_ids, source, replacements, *([True] if admission_only else [])])
     with mind.engine.db.connect(write=True) as conn:
         previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
         if previous:
@@ -75,8 +75,10 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
                 continue
             if row["state"] != "needs-repair":
                 raise Conflict("Only quarantined historical jobs can be resumed")
+            if admission_only and data.get("error") not in {"deepseek-background-capacity", "deepseek-foreground-priority"}:
+                raise Conflict("Recovery is limited to the approved admission waits")
             chosen = replacements.get(identifier) or {"proposal": data.get("proposed_result"), "receipt": data.get("receipt"), "sources": data.get("evaluated_sources", [])}
-            proposal = Appraisal.model_validate(chosen["proposal"]) if chosen.get("proposal") else None
+            proposal = Appraisal.model_validate(chosen["proposal"]) if chosen.get("proposal") and not admission_only else None
             data.setdefault("recovery_history", []).append({"command_id": command_id, "source": source, "at": mind.clock(),
                 "attempts": row["attempts"], "error": data.get("error"), "proposed_result": data.get("proposed_result"), "receipt": data.get("receipt")})
             if proposal and chosen.get("receipt", {}).get("model") == "deepseek-flash":
@@ -87,6 +89,12 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
                             seed_sources=refs, seed_rejected=False)
             else:
                 data["seed_rejected"] = True
+            if admission_only:
+                # Previous usage and proposals stay in recovery_history. Refresh
+                # source/configuration context; never replay an unrelated proposal.
+                for field in ("error", "repair_reason", "receipt", "proposed_result", "seed_memory", "seed_receipt", "seed_sources"):
+                    data.pop(field, None)
+                data["waiting_reason"] = "admission-recovered-current-review"
             data.pop("frozen_memory_context", None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
                          (time.time(), dumps(data), identifier))

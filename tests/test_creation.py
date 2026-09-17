@@ -46,3 +46,66 @@ def test_review_timeout_keeps_checkpoint_and_releases_executor(env,tmp_path):
     assert settled['state']=='interrupted' and settled['result']['artifacts']
     assert settled['result']['review_receipt']['usage_status']=='unknown'
     assert plans.read(identifier=run['plan_id'])['plans'][0]['steps'][0]['state']=='waiting'
+
+
+def test_downstream_delivery_and_executor_notes_do_not_block_current_step(env,tmp_path):
+    mind,plans,run,result,config=ready(env,tmp_path)
+    result['remaining']=['Deliver later when appropriate', 'Owner response is still pending']
+    class Scoped(Review):
+        def structured(self,name,schema,system,context,**kwargs):
+            assert 'step_remaining' in system and 'separate downstream step' in system
+            decision,receipt=super().structured(name,schema,system,context,**kwargs)
+            return decision.model_copy(update={'downstream':context['result']['remaining']}),receipt
+    settled=accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Scoped())
+    assert settled['state']=='completed'
+    assert settled['result']['completion_review']['downstream']==result['remaining']
+
+
+def test_required_verification_gap_is_resumable_and_visible_in_compact_plan(env,tmp_path):
+    from kin_mind.decision_context import compact_plan
+    mind,plans,run,result,config=ready(env,tmp_path)
+    class Gaps(Review):
+        def structured(self,*args,**kwargs):
+            decision,receipt=super().structured(*args,**kwargs)
+            return decision.model_copy(update={'complete':False,'step_remaining':['Required rendering did not finish']}),receipt
+    settled=accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Gaps())
+    assert not settled['result']['verified'] and settled['result']['phase']=='needs_verification'
+    plan=compact_plan(plans.read(identifier=run['plan_id'])['plans'][0])
+    receipt=plan['steps'][0]['receipts'][-1]
+    assert receipt['verification_gaps']==['Required rendering did not finish']
+    assert receipt['resume_action']=='inspect-checkpoint-and-run-missing-checks'
+    assert receipt['checkpoint']==result['receipt']['workspace']
+
+
+def test_artifact_change_during_review_is_not_current_verified_evidence(env,tmp_path):
+    mind,plans,run,result,config=ready(env,tmp_path)
+    class Change(Review):
+        def structured(self,*args,**kwargs):
+            decision,receipt=super().structured(*args,**kwargs)
+            Path(result['artifacts'][0]['path']).write_text('{"total":999}')
+            return decision,receipt
+    with pytest.raises(Conflict,match='during completion review'):
+        accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Change())
+    assert plans.read(identifier=run['plan_id'])['plans'][0]['steps'][0]['state']=='running'
+
+
+def test_retry_after_artifact_ingestion_reuses_original_observation(env,tmp_path,monkeypatch):
+    from kin_mind.memory import MemoryContinuity
+    mind,plans,run,result,config=ready(env,tmp_path)
+    original=MemoryContinuity.ingest
+    failed=False
+    def interrupted(self,event):
+        nonlocal failed
+        if event['kind']=='task-result' and not failed:
+            failed=True
+            raise TimeoutError('simulated worker interruption after artifact commit')
+        return original(self,event)
+    monkeypatch.setattr(MemoryContinuity,'ingest',interrupted)
+    request={'run_id':run['id'],'owner':'worker','fence':1,'result':result}
+    with pytest.raises(TimeoutError):accept_result(mind,config,request,Review())
+    from datetime import timedelta
+    env[3][0]+=timedelta(seconds=3)
+    settled=accept_result(mind,config,request,Review())
+    assert settled['state']=='completed'
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_runtime_events WHERE kind='artifact-created'").fetchone()[0]==1

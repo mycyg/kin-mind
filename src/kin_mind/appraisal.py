@@ -10,6 +10,8 @@ import json
 import os
 import re
 import time
+import uuid
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from urllib.parse import urlparse
@@ -29,7 +31,7 @@ from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
-from .model_runtime import request_client
+from .model_runtime import request_client, model_slot, ModelAdmissionWait
 
 APPRAISAL_INPUT_BUDGET = 64000
 
@@ -424,7 +426,14 @@ class DeepSeek:
             calls = [b for b in body.get("content", []) if b.get("type") == "tool_use" and b.get("name") == name]
             if len(calls) != 1:
                 raise RuntimeError("deepseek-missing-structured-result")
-            result = schema.model_validate(calls[0]["input"])
+            try:
+                result = schema.model_validate(calls[0]["input"])
+            except ValidationError:
+                self.failure_receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high",
+                    "request_id": body.get("id"), "usage": body.get("usage"), "usage_status": "reported" if body.get("usage") else "unknown",
+                    "outcome": "schema-invalid", "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                raise
+            self.failure_receipt = None
             receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
                        "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
                        "elapsed_ms": round((time.monotonic() - started) * 1000), "cache_hit": False}
@@ -702,7 +711,7 @@ class Appraisals:
                 **{
                     k: v
                     for k, v in json.loads(r["data"]).items()
-                    if k in {"receipt", "error", "result"}
+                    if k in {"receipt", "error", "result", "waiting_reason", "admission_waits", "last_wait_at"}
                 },
             )
             for r in rows
@@ -768,6 +777,7 @@ class Appraisals:
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=?", (child_id,))
             data["attempt_started_at"] = self.mind.clock()
+            data["attempt_token"] = uuid.uuid4().hex
             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
@@ -775,6 +785,9 @@ class Appraisals:
                 # keep the lease beyond that deadline, including HTTP keepalives.
                 (time.time() + max(180, float(getattr(provider, "timeout", 90)) + 90), row["id"]),
             )
+        slots = ExitStack()
+        admission_wait = False
+        model_admitted = False
         try:
             # If a process died after commit, use the durable command receipt.
             key = self.mind._key(row["id"])
@@ -785,6 +798,11 @@ class Appraisals:
             if done:
                 data["result"] = json.loads(done[0])
             else:
+                # Admit the entire evaluation before any compression/review call.
+                # Nested calls reuse this lease, so a wait never hides partial usage.
+                slots.enter_context(model_slot(provider, "appraisal:" + row["id"]))
+                model_admitted = True
+                data.pop("waiting_reason", None)
                 if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
                     with self.engine.db.connect() as conn:
                         remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
@@ -996,7 +1014,7 @@ class Appraisals:
 
                 def apply(conn, state, eid):
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
-                    if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_started_at") != data.get("attempt_started_at"):
+                    if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")
                     if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
                         raise Conflict("Evaluated sources changed before commit")
@@ -1157,6 +1175,19 @@ class Appraisals:
                 data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             data.pop("error", None)
             state = "complete"
+        except ModelAdmissionWait as error:
+            admission_wait = not model_admitted
+            state = "pending"
+            if admission_wait:
+                data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),
+                            admission_waits=data.get("admission_waits", 0) + 1)
+            else:
+                # A nested asynchronous operation may wait after earlier calls.
+                # Preserve its charged attempt and actual/unknown usage.
+                data["error"] = "deepseek-partial-evaluation-wait"
+                if lanes and historical and row["attempts"] >= 1:
+                    state = "needs-repair"
+                    data["repair_reason"] = data["error"]
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
             if getattr(provider, "failure_receipt", None):
                 data["failed_call_receipt"] = provider.failure_receipt
@@ -1179,17 +1210,15 @@ class Appraisals:
                 state = "pending"
             if lanes and isinstance(error, Conflict):
                 data.pop("frozen_memory_context", None)
+        finally:
+            slots.close()
+        delay = min(600, 30 * 2 ** min(data.get("admission_waits", 1) - 1, 5)) if admission_wait else min(1800, 60 * 2 ** min(row["attempts"], 5))
         with self.engine.db.connect(write=True) as conn:
-            conn.execute(
-                "UPDATE mind_appraisals SET state=?,available=?,lease=0,data=? WHERE id=?",
-                (
-                    state,
-                    time.time() + min(1800, 60 * 2 ** min(row["attempts"], 5)),
-                    dumps(data),
-                    row["id"],
-                ),
-            )
-            if state == "complete":
+            changed = conn.execute(
+                "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
+                (state, time.time() + delay, int(admission_wait), dumps(data), row["id"], data["attempt_token"]),
+            ).rowcount
+            if changed and state == "complete":
                 for child_id in data.get("batch_ids", []):
                     child = conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (child_id,)).fetchone()
                     if child:
