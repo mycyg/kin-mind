@@ -11,7 +11,7 @@ def migrate_operational(mind, *, workers_stopped):
     if workers_stopped is not True:
         raise ValueError("Verify termination of the owning workers first")
     from .appraisal import Appraisals
-    Appraisals(mind)
+    jobs = Appraisals(mind)
     memory = MemoryContinuity(mind)
     name = "operational-lanes-v1"
     with mind.engine.db.connect(write=True) as conn:
@@ -28,7 +28,11 @@ def migrate_operational(mind, *, workers_stopped):
             item = json.loads(row["data"])
             conn.execute("UPDATE mind_action_events SET state='superseded' WHERE id=?", (row["id"],))
             if item.get("job_id"):
+                job = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND state IN ('pending','running')", (item["job_id"],)).fetchone()
                 conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0 WHERE id=? AND state IN ('pending','running')", (item["job_id"],))
+                if job:
+                    # A superseded parent must release what it had absorbed.
+                    jobs._settle_children(conn, item["job_id"], json.loads(job[0]), "superseded")
             superseded.append(row["id"])
         released = conn.execute("UPDATE mind_appraisals SET state='pending',lease=0,available=? WHERE scope=? AND state='running'", (time.time(), mind.scope.key())).rowcount
         conn.execute("INSERT INTO mind_action_schedule VALUES(?,?,0,?) ON CONFLICT(scope) DO UPDATE SET next_review=excluded.next_review,data=excluded.data",
@@ -100,5 +104,86 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
                          (time.time(), dumps(data), identifier))
             resumed.append(identifier)
         result = {"state": "resumed", "resumed": resumed, "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
+        conn.execute("INSERT INTO mind_memory_migrations VALUES(?,?,0,?)", (mind.scope.key(), name, dumps(result)))
+    return result
+
+
+def _committed_ancestor(conn, mind, child_id, parents):
+    """The nearest ancestor of a batched job whose commit receipt really exists."""
+    seen, current = {child_id}, parents.get(child_id)
+    while current and current not in seen:
+        seen.add(current)
+        row = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND scope=?", (current, mind.scope.key())).fetchone()
+        receipt = conn.execute("SELECT result FROM commands WHERE id=?", (mind._key(current),)).fetchone()
+        event_id = json.loads(receipt[0]).get("event_id") if receipt else None
+        if row and event_id and conn.execute("SELECT 1 FROM mind_events WHERE id=? AND scope=?", (event_id, mind.scope.key())).fetchone():
+            return current, event_id, json.loads(row[0])
+        current = parents.get(current)
+    return None, None, {}
+
+
+def _source_committed(conn, mind, source_id):
+    """Presence in the source index is not proof; its event must exist."""
+    row = conn.execute("SELECT event_id FROM mind_semantic_sources WHERE scope=? AND source_id=?", (mind.scope.key(), source_id)).fetchone()
+    return bool(row and conn.execute("SELECT 1 FROM mind_events WHERE id=? AND scope=?", (row[0], mind.scope.key())).fetchone())
+
+
+def recover_batched(mind, *, command_id, workers_stopped):
+    """Settle the jobs an interrupted parent left batched. One shot, idempotent.
+
+    A child is completed only when a really committed ancestor evaluated its
+    exact source version; everything else returns to the queue for a new
+    judgment. This operation calls no model and writes no memory of its own.
+    """
+    if workers_stopped is not True:
+        raise ValueError("Verify termination of the owning workers first")
+    if not command_id:
+        raise ValueError("Recovery requires a sourced command")
+    from .appraisal import Appraisals
+    Appraisals(mind)
+    name = "batched-recovery:" + command_id
+    with mind.engine.db.connect(write=True) as conn:
+        previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
+        if previous:
+            return json.loads(previous[0])
+        parents = {}
+        for row in conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.batch_ids') IS NOT NULL", (mind.scope.key(),)).fetchall():
+            for child_id in json.loads(row["data"]).get("batch_ids", []):
+                parents.setdefault(child_id, row["id"])
+        settled = []
+        for row in conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='batched' ORDER BY id", (mind.scope.key(),)).fetchall():
+            data = json.loads(row["data"])
+            ancestor, event_id, ancestor_data = _committed_ancestor(conn, mind, row["id"], parents)
+            try:
+                refs = mind._evidence(conn, data.get("evidence_ids", [])) if ancestor else []
+            except (Conflict, Missing):
+                refs = []
+            manifest = {(r["source_id"], r["hash"], r["revision"]) for r in ancestor_data.get("evaluated_sources", [])}
+            if not ancestor:
+                state, reason = "pending", "no-committed-ancestor"
+            elif not refs:
+                state, reason = "pending", "evidence-unresolved"
+            elif not mind._fresh(conn, refs):
+                state, reason = "pending", "source-no-longer-current"
+            elif any((r["source_id"], r["hash"], r["revision"]) not in manifest for r in refs):
+                state, reason = "pending", "outside-ancestor-manifest"
+            elif not all(_source_committed(conn, mind, r["source_id"]) for r in refs):
+                state, reason = "pending", "commit-receipt-missing"
+            else:
+                state, reason = "complete", "settled-by-committed-ancestor"
+            data["recovery_command"] = command_id
+            if state == "complete":
+                data["result"] = {"batch_id": ancestor, "event_id": event_id}
+                if ancestor_data.get("receipt"):
+                    data["receipt"] = ancestor_data["receipt"]
+                conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
+            else:
+                conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,data=? WHERE id=?",
+                             (time.time(), dumps(data), row["id"]))
+            settled.append({"id": row["id"], "state": state, "reason": reason, "ancestor": ancestor,
+                            "event_id": event_id if state == "complete" else None})
+        result = {"state": "recovered", "at": mind.clock(), "rows": settled,
+                  "completed": [s["id"] for s in settled if s["state"] == "complete"],
+                  "requeued": [s["id"] for s in settled if s["state"] == "pending"]}
         conn.execute("INSERT INTO mind_memory_migrations VALUES(?,?,0,?)", (mind.scope.key(), name, dumps(result)))
     return result
