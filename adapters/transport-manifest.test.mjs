@@ -468,3 +468,85 @@ test('one batch ID never mixes different bubbles, and the guard sees what the ol
   assert.deepEqual(w.manifests.live().filter(id=>id.startsWith('reply-legacy-c')).map(id=>w.manifests.read(id).bubbles.map(b=>b.bubble_id)).flat().sort(),['kin-chat-c0','kin-chat-c1']);
   assert.deepEqual(w.manifests.findBubble('kin-chat-c1').bubble.draft_id,'draft-kin-chat-c1');
 });
+
+test('a held group is not reviewed once a minute for ever: the wait doubles, then the group is parked until there is a new reason',async t=>{
+  const w=world(t,{retry:{maxHolds:4}}),asked=[];let verdict={state:'pending',reason:'prior-delivery-needs-review'};
+  const review=async()=>{asked.push(w.state.now);return verdict.state==='ready'?{state:'ready',checked:[{},{}]}:verdict;};
+  w.manifests.createDraft({entries:group('batch-hold',['第一句。','第二句。']),ownerEpoch:'e'});
+  await w.manifests.run('batch-hold',{transport:w.transport,review});
+  for(let tick=0;tick<600;tick++){w.state.now+=60000;await w.manifests.resumeDue({transport:w.transport,review});}
+  const start=asked[0];
+  assert.deepEqual(asked.map(at=>(at-start)/60000),[0,1,3,7],'four reviews in ten hours, each after twice the wait');
+  const parked=onDisk(w,'batch-hold');
+  assert.deepEqual([parked.state,parked.reason,parked.holds,parked.parked.reason,parked.parked.holds],['held','prior-delivery-needs-review',4,'review-hold-limit',4]);
+  assert.deepEqual(w.manifests.status().groups['batch-hold'].parked,parked.parked,'a parked group is visible in status');
+  assert.equal(w.transport.sends.length,0);
+  // The timer may still stop a parked group (a guard that says so), which costs no review at all.
+  const other=world(t,{retry:{maxHolds:1}});let reviews=0;
+  other.manifests.createDraft({entries:group('batch-stop',['一句。']),ownerEpoch:'e'});
+  await other.manifests.run('batch-stop',{transport:other.transport,review:async()=>{reviews++;return {state:'pending',reason:'held'};}});
+  other.state.now+=3600000;
+  await other.manifests.resumeDue({transport:other.transport,review:async()=>{reviews++;return {state:'pending'};},guard:async()=>({action:'interrupt',reason:'new-owner-input',inputId:'input-2'})});
+  assert.deepEqual([onDisk(other,'batch-stop').state,onDisk(other,'batch-stop').interrupted.by,reviews],['interrupted','input-2',1]);
+  // The operator is a new reason: a fresh, bounded set of tries, and this time the review passes.
+  const printed=[];
+  await operatorMain(['retry','--dir',w.directory,'--group','batch-hold'],{clock:w.clock,print:line=>printed.push(line)});
+  assert.deepEqual([JSON.parse(printed[0]).state,JSON.parse(printed[0]).parked,onDisk(w,'batch-hold').holds],['held',undefined,undefined]);
+  verdict={state:'ready'};
+  await w.manifests.resumeDue({transport:w.transport,review});
+  assert.deepEqual([asked.length,onDisk(w,'batch-hold').state],[5,'accepted']);
+  // Asking for a parked group by name is a new reason too.
+  const named=world(t,{retry:{maxHolds:1}});let ready=false;
+  const flip=async requests=>ready?{state:'ready',checked:requests.map(()=>({}))}:{state:'pending',reason:'held'};
+  named.manifests.createDraft({entries:group('batch-named',['一句。']),ownerEpoch:'e'});
+  assert.ok((await named.manifests.run('batch-named',{transport:named.transport,review:flip})).manifest.parked);
+  ready=true;
+  assert.equal((await named.manifests.run('batch-named',{transport:named.transport,review:flip})).manifest.state,'accepted');
+});
+
+test('review chunks that are already paid for are progress, not a refusal',async t=>{
+  const w=world(t,{retry:{maxHolds:2}});let reviewed=0;
+  const review=async requests=>++reviewed<5?{state:'pending',reason:'reply-review-chunks-incomplete',chunks:{reviewed,total:5}}:{state:'ready',checked:requests.map(()=>({}))};
+  w.manifests.createDraft({entries:group('batch-chunks',['一句。']),ownerEpoch:'e'});
+  await w.manifests.run('batch-chunks',{transport:w.transport,review});
+  assert.deepEqual([onDisk(w,'batch-chunks').holds,onDisk(w,'batch-chunks').parked],[0,undefined]);
+  for(let tick=0;tick<5;tick++){w.state.now+=60000;await w.manifests.resumeDue({transport:w.transport,review});}
+  assert.deepEqual([reviewed,onDisk(w,'batch-chunks').state,onDisk(w,'batch-chunks').review_progress],[5,'accepted',undefined]);
+});
+
+test('bubbles can be retired by name; a group whose remainder is still undecided stays in the live set',async t=>{
+  const w=world(t);let turn=0;
+  w.manifests.createDraft({entries:group('batch-part',['第一句。','第二句。','第三句。']),ownerEpoch:'e'});
+  await w.manifests.run('batch-part',{transport:w.transport,guard:async()=>++turn<3?'send':{action:'interrupt',reason:'new-owner-input',inputId:'input-2'}});
+  const part=await w.manifests.retireRemainder('batch-part',{reason:'tail-rewrite_remainder',superseded_by:'intent-1',only:['batch-part-draft-1']});
+  assert.deepEqual(part.manifest.bubbles.map(b=>[b.state,b.superseded_by??null]),[['accepted',null],['canceled','intent-1'],['unsent',null]]);
+  assert.deepEqual([part.manifest.state,w.canceled],['interrupted',['batch-part-draft-1']],'what was not named stays exactly as it was');
+  const resumed=await w.manifests.continueGroup('batch-part',{ownerEpoch:'e2',by:'input-2'});
+  assert.deepEqual([resumed.manifest.state,resumed.manifest.ownerEpoch,resumed.manifest.continued.by],['sending','e2','input-2']);
+  await w.manifests.mutate('batch-part',manifest=>{manifest.tail_owed={items:['batch-part-draft-1'],resurfaced:1,since:w.state.now};});
+  await w.manifests.resumeDue({transport:w.transport});
+  assert.deepEqual([onDisk(w,'batch-part').state,w.manifests.live()],['retired',['batch-part']],'an obligation that came back keeps its group live');
+  assert.deepEqual(w.manifests.status().groups['batch-part'].tail_owed,{items:1,resurfaced:1,forced:false});
+  await w.manifests.mutate('batch-part',manifest=>{delete manifest.tail_owed;});
+  assert.deepEqual(w.manifests.live(),[]);
+  // A draft carries, from its very first write, the older groups it answers for.
+  const next=w.manifests.createDraft({entries:group('batch-next',['新的回复。']),ownerEpoch:'e2',continues:[{group_id:'batch-part',intent_id:'intent-1'}]});
+  assert.deepEqual([next.continues_reply_id,next.continues],['batch-part',[{group_id:'batch-part',intent_id:'intent-1'}]]);
+  assert.equal(w.manifests.status().groups['batch-next'].continues_reply_id,'batch-part');
+});
+
+test('the operator can end the wait of an interrupted group; what the tool settles is reported and filed by the service, never by the tool',async t=>{
+  const w=world(t),printed=[],print=line=>printed.push(JSON.parse(line));
+  for(const batch of ['batch-go','batch-drop']) {
+    let turn=0;
+    w.manifests.createDraft({entries:group(batch,['第一句。','第二句。']),ownerEpoch:'e'});
+    await w.manifests.run(batch,{transport:w.transport,guard:async()=>++turn<3?'send':'interrupt'});
+  }
+  await operatorMain(['continue','--dir',w.directory,'--group','batch-go'],{clock:w.clock,print});
+  await operatorMain(['retire','--dir',w.directory,'--group','batch-drop','--reason','operator-retired'],{clock:w.clock,print});
+  assert.deepEqual(printed.map(p=>[p.group_id,p.state,p.reason]),[['batch-go','sending',null],['batch-drop','retired','operator-retired']]);
+  assert.deepEqual([w.canceled,w.manifests.live().sort()],[[],['batch-drop','batch-go']],'the tool has no memory host: it released nothing and filed nothing');
+  await w.manifests.resumeDue({transport:w.transport});
+  assert.deepEqual([w.canceled,w.manifests.live(),onDisk(w,'batch-go').state],[['batch-drop-draft-1'],[],'accepted']);
+  assert.deepEqual(w.events.filter(e=>e.delivery_id==='batch-drop').map(e=>e.state),['accepted','canceled']);
+});

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {createMobileReviewer,REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 import {createLeaseClient} from './model-lease.mjs';
 
@@ -88,4 +89,62 @@ test('without a lease client the request on the wire is exactly what it was befo
   assert.equal(plain.options.body,leased.options.body,'a lease changes the accounting, never the request');
   assert.deepEqual(Object.keys(plain.options).sort(),['body','headers','method','redirect','signal']);
   assert.equal(REVIEWER_PURPOSES.classify,'mobile-route-message');
+});
+
+// ---- reply tail: the decision rides on the routing call, or stands alone ------
+const routed=(extra={})=>Response.json({id:'request-1',model:'deepseek-flash',usage:{input_tokens:1},stop_reason:'tool_use',content:[{type:'tool_use',name:'route_message',input:{route:'chat',reason:'casual',recall:{mode:'light',query:'q',reason:'r'},...extra}}]});
+const interruptedReply={reason:'new-owner-input',sent:[{text:'The first bubble.',receipt:{messageId:'om_1',acceptedAt:'2026-01-01T00:00:00.000Z'}}],unconfirmed:[],unsent:[{text:'The second bubble.'}],decisions:['continue','rewrite_remainder','supersede']};
+
+test('with no interrupted reply the routing request is byte for byte what it was before tails existed',async()=>{
+  const bodies=[];
+  const reviewer=createMobileReviewer({key:'synthetic',fetchImpl:async(url,options)=>{bodies.push(options.body);return routed();}});
+  await reviewer.classify({text:'hello',clock:{now:'2026-01-01T00:00:00.000Z'},recent:[{role:'user',text:'earlier'}],task:null,mode:'auto',workHeld:false,timeoutMs:1000});
+  // Length and SHA-256 of this exact request, taken from the reviewer as it stood before it knew about reply tails.
+  assert.equal(bodies[0].length,2960);
+  assert.equal(createHash('sha256').update(bodies[0]).digest('hex'),'83893799c0395eee224bde698c5d196e860caf52e488bc48307ce65ea99a1db6');
+  const plain=JSON.parse(bodies[0]);
+  assert.deepEqual(Object.keys(plain.tools[0].input_schema.properties),['route','control','reason','recall']);
+  assert.ok(!bodies[0].includes('interruptedReply')&&!bodies[0].includes('tail'));
+});
+
+test('an interrupted reply rides on the routing call: optional input, optional tail output, one call, one usage row',async()=>{
+  const bodies=[],usage=[];let answer={tail:{decision:'rewrite_remainder',reason:'Fold it into the next reply'}};
+  const reviewer=createMobileReviewer({key:'synthetic',onUsage:row=>usage.push(row),fetchImpl:async(url,options)=>{bodies.push(JSON.parse(options.body));return routed(answer);}});
+  const plain=await reviewer.classify({text:'hello',recent:[],task:null,timeoutMs:1000});
+  const result=await reviewer.classify({text:'wait, one more thing',recent:[],task:null,timeoutMs:1000,interruptedReply});
+  assert.equal(plain.tail,undefined);
+  assert.deepEqual([result.route,result.tail.decision,result.tail.reason,result.tail.receipt.requestId,result.tail.receipt.provider],['chat','rewrite_remainder','Fold it into the next reply','request-1','deepseek']);
+  const [before,carried]=bodies;
+  assert.deepEqual(JSON.parse(carried.messages[0].content),{text:'wait, one more thing',recent:[],task:null,interruptedReply});
+  assert.ok(carried.system.startsWith(before.system)&&carried.system.length>before.system.length,'the routing rules are untouched; the tail rules are appended');
+  assert.deepEqual(carried.tools[0].input_schema.properties.tail.properties.decision.enum,['continue','rewrite_remainder','supersede']);
+  assert.deepEqual(carried.tools[0].input_schema.required,['route','reason','recall','tail']);
+  assert.deepEqual([carried.tools[0].name,carried.max_tokens,carried.model],[before.tools[0].name,before.max_tokens,before.model]);
+  assert.deepEqual(usage.map(row=>[row.purpose,row.lane]),[['route_message','foreground'],['route_message','foreground']],'no extra call, no extra row');
+  // Once a remainder has come back too often, the host narrows the choice and the schema follows.
+  await reviewer.classify({text:'and now?',timeoutMs:1000,interruptedReply:{...interruptedReply,resurfaced:2,decisions:['continue','supersede']}});
+  assert.deepEqual(bodies[2].tools[0].input_schema.properties.tail.properties.decision.enum,['continue','supersede']);
+  // The route stands on its own: an unusable tail is dropped, never turned into a failed classification.
+  for(const tail of [{decision:'rewrite_remainder',reason:'not among the allowed answers'},{decision:'delete_everything',reason:'x'},undefined]) {
+    answer={tail};
+    const kept=await reviewer.classify({text:'hm',timeoutMs:1000,interruptedReply:{...interruptedReply,decisions:['continue','supersede']}});
+    assert.deepEqual([kept.route,kept.tail],['chat',undefined]);
+  }
+});
+
+test('the tail decision on its own: its own tool and purpose label, the routing lane, a receipt, and a closed answer',async()=>{
+  const bodies=[],usage=[],leases=[];let answer={decision:'supersede',reason:'The owner moved on'};
+  const lease=createLeaseClient({request:async(route,body)=>{leases.push([route,body.lane,body.purpose]);return route.endsWith('acquire')
+    ?{state:'admitted',lease:{id:body.id,lane:body.lane,purpose:body.purpose,ttl_seconds:90,renew_after_seconds:30}}:{state:'released'};},setTimer:()=>0,clearTimer:()=>{}});
+  const reviewer=createMobileReviewer({key:'synthetic',lease,onUsage:row=>usage.push(row),fetchImpl:async(url,options)=>{bodies.push(JSON.parse(options.body));
+    return Response.json({id:'request-tail',model:'deepseek-flash',usage:{input_tokens:3},content:[{type:'thinking',thinking:'private synthetic reasoning'},{type:'tool_use',name:'decide_reply_tail',input:answer}]});}});
+  const decided=await reviewer.tail({interruptedReply,newMessage:null});
+  assert.deepEqual([decided.decision,decided.reason,decided.receipt.requestId],['supersede','The owner moved on','request-tail']);
+  assert.ok(!JSON.stringify(decided).includes('private synthetic reasoning'));
+  assert.deepEqual([bodies[0].tools[0].name,bodies[0].tools[0].input_schema.properties.decision.enum,bodies[0].output_config.effort],['decide_reply_tail',['continue','rewrite_remainder','supersede'],'high']);
+  assert.deepEqual(JSON.parse(bodies[0].messages[0].content),{interruptedReply,newMessage:null});
+  assert.deepEqual(leases[0],['model-leases/acquire',REVIEWER_LANES.classify,'mobile-reply-tail']);assert.equal(REVIEWER_PURPOSES.tail,'mobile-reply-tail');
+  assert.deepEqual(usage.map(row=>[row.purpose,row.lane,row.outcome,row.leaseState]),[['mobile-reply-tail','foreground','answered','admitted']],'every call of its own shows up in the usage rows under its own label');
+  answer={decision:'rewrite_remainder',reason:'not allowed any more'};
+  await assert.rejects(reviewer.tail({interruptedReply:{...interruptedReply,decisions:['continue','supersede']}}),/deepseek-invalid-tail-decision/);
 });

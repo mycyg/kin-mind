@@ -70,8 +70,10 @@ test('the work lock review asks for the reserved user-work lane, never the backg
   assert.equal(REVIEWER_LANES.reviewWork,'user-work');
   assert.deepEqual(book.of('acquire').map(a=>[a.lane,a.purpose]),[['user-work','mobile-work-lock-review']]);
   assert.equal(book.of('release').length,1);
-  // The three entry points never share a lane or a purpose label.
-  assert.equal(new Set(Object.values(REVIEWER_LANES)).size,3);
+  // The three verdicts never share a lane. The reply-tail decision is the routing call's own
+  // question asked alone: same lane, its own purpose label.
+  assert.equal(new Set(['classify','reviewWork','audit'].map(entry=>REVIEWER_LANES[entry])).size,3);
+  assert.equal(REVIEWER_LANES.tail,REVIEWER_LANES.classify);
 });
 
 test('a lost user-work lease aborts the paid call and records its usage as unknown',async()=>{

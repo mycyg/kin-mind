@@ -406,3 +406,68 @@ test('a notification in flight holds provider changes until its send settles',as
   await f.router.applyPendingMode();assert.deepEqual(f.switched,[]);
   release();await sending;await f.router.applyPendingMode();assert.deepEqual(f.switched,['deepseek-flash']);
 });
+
+// ---- reply tail port: the unsent rest of an interrupted reply rides on the routing call ----
+function tailPort(answers={}) {
+  const calls=[];
+  const method=name=>async detail=>{calls.push([name,detail]);if(answers[name] instanceof Error)throw answers[name];return typeof answers[name]==='function'?answers[name](detail):answers[name]??null;};
+  return {calls,pending:method('pending'),decided:method('decided'),missed:method('missed'),stopped:method('stopped')};
+}
+const synthetic={reason:'new-owner-input',sent:[{text:'The first bubble.',receipt:{messageId:'om_1',acceptedAt:null}}],unconfirmed:[],unsent:[{text:'The second bubble.'}],decisions:['continue','rewrite_remainder','supersede']};
+
+test('with no interrupted reply the classifier is asked exactly what it was always asked',async t=>{
+  const seen=[],classify=async input=>{seen.push(input);return {route:'chat',reason:'synthetic',tail:{decision:'supersede',reason:'nobody asked'}};};
+  const port=tailPort(),plain=fixture(t,{classify}),ported=fixture(t,{classify,replyTail:port});
+  const before=await plain.router.select({id:'one',text:'hello'}),after=await ported.router.select({id:'one',text:'hello'});
+  assert.deepEqual(Object.keys(seen[1]),['text','clock','recent','task','mode','workHeld','timeoutMs']);
+  assert.deepEqual(Object.keys(seen[1]),Object.keys(seen[0]));
+  assert.deepEqual(JSON.stringify({...seen[1],clock:null}),JSON.stringify({...seen[0],clock:null}));
+  assert.deepEqual(port.calls,[['pending',{id:'one',text:'hello'}]],'the port hears about the message and is asked nothing else');
+  assert.deepEqual([after.tail,before.tail,Object.keys(after)],[undefined,undefined,Object.keys(before)],'an unsolicited tail is never acted on');
+});
+
+test('an interrupted reply rides on the routing call, and what DeepSeek decided reaches the tail port with the input that caused it',async t=>{
+  const seen=[],port=tailPort({pending:{key:'group-a:0123456789abcdef',reply:synthetic},decided:{state:'recorded',groupId:'group-a',intentId:'tail-1'}});
+  const f=fixture(t,{replyTail:port,classify:async input=>{seen.push(input);return {route:'chat',reason:'synthetic',tail:{decision:'rewrite_remainder',reason:'Fold it in',receipt:{requestId:'request-1'}}};}});
+  const record=await f.router.select({id:'two',text:'wait, one more thing'});
+  assert.deepEqual(seen[0].interruptedReply,synthetic);assert.equal(Object.keys(seen[0]).at(-1),'interruptedReply');
+  assert.deepEqual(port.calls.map(c=>c[0]),['pending','decided']);
+  assert.deepEqual(port.calls[1][1],{inputId:'two',key:'group-a:0123456789abcdef',tail:{decision:'rewrite_remainder',reason:'Fold it in',receipt:{requestId:'request-1'}}});
+  assert.deepEqual([record.route,record.tail],['chat',{carrier:'classify',decision:'rewrite_remainder',state:'recorded',groupId:'group-a',intentId:'tail-1'}]);
+  assert.deepEqual(f.router.state.inputs.two.tail,record.tail,'the routing record says which decision rode on it');
+  await f.router.select({id:'two',text:'wait, one more thing'});
+  assert.equal(port.calls.length,2,'a duplicate input asks nobody again');
+});
+
+test('a classifier that times out, or answers without a tail, leaves the remainder to its next carrier',async t=>{
+  const offer={key:'group-a:0123456789abcdef',reply:synthetic};
+  const timeout=tailPort({pending:offer,missed:detail=>({state:'missed',reason:detail.reason})});
+  const f=fixture(t,{replyTail:timeout,classify:async()=>{throw Error('classification-timeout');}});
+  const record=await f.router.select({id:'three',text:'unclear'});
+  assert.deepEqual([record.route,record.reason,record.tail],['work','classifier-unconfirmed',{carrier:'classify',state:'missed',reason:'classifier-unconfirmed'}]);
+  assert.deepEqual(timeout.calls.at(-1),['missed',{inputId:'three',key:offer.key,reason:'classifier-unconfirmed'}]);
+  const silent=tailPort({pending:offer});
+  const g=fixture(t,{replyTail:silent,classify:async()=>({route:'chat',reason:'synthetic'})});
+  assert.deepEqual((await g.router.select({id:'four',text:'haha'})).tail,{carrier:'classify',state:'missed'});
+  assert.deepEqual(silent.calls.at(-1),['missed',{inputId:'four',key:offer.key,reason:'no-tail-decision'}]);
+});
+
+test('attachments and commands are never classified; a literal stop needs no model; other inputs never touch the tail port',async t=>{
+  const port=tailPort({pending:{key:'group-a:0123456789abcdef',reply:synthetic},stopped:{state:'recorded'}}),f=fixture(t,{replyTail:port});
+  await f.router.select({id:'file',text:'look at this',attachments:[{name:'photo'}]});
+  await f.router.select({id:'mode',text:'/mode work'});
+  await f.router.select({id:'compact',text:'/compact'});
+  const stop=await f.router.select({id:'stop',text:'停止任务'});
+  assert.deepEqual(port.calls,[['missed',{inputId:'file',reason:'not-classified'}],['missed',{inputId:'mode',reason:'not-classified'}],['missed',{inputId:'compact',reason:'not-classified'}],['stopped',{inputId:'stop'}]]);
+  assert.deepEqual([f.classificationCalls(),stop.reason,stop.tail],[0,'owner-stop-command',{carrier:'owner-stop',state:'recorded'}]);
+  for(const input of [{id:'thought',kind:'proactive',text:'An idle thought'},{id:'handoff:1',kind:'handoff',text:'continue'},{id:'result',kind:'work-result',text:'停止任务'}])await f.router.select(input);
+  assert.equal(port.calls.length,4);
+});
+
+test('a tail port that fails never decides routing',async t=>{
+  const broken=Error('tail unavailable'),port=tailPort({pending:broken,missed:broken,stopped:broken,decided:broken});
+  const f=fixture(t,{replyTail:port});
+  assert.deepEqual([(await f.router.select({id:'one',text:'hello'})).route,(await f.router.select({id:'stop',text:'/停'})).reason],['chat','owner-stop-command']);
+  await f.router.dispatch({id:'two',text:'write code'},async()=> 'new-turn');
+  assert.equal(f.router.currentTask().status,'running');
+});

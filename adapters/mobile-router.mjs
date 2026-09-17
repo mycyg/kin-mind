@@ -29,8 +29,11 @@ export function atomicJson(file, value) {
 /** One host owns this durable state; all provider changes and input acceptance
  * share its mutex. MCP requests only record intent and never wait for a turn. */
 export class MobileRouter {
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now});
+  /** `replyTail` is the host's reply-tail port (`pending`, `decided`, `missed`, `stopped`), all
+   * optional. It lets the unsent rest of an interrupted reply ride on the routing call this
+   * router makes anyway; without it nothing here changes. */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail});
     this.tail=Promise.resolve();this.inflight=new Map();
     this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
@@ -123,32 +126,52 @@ export class MobileRouter {
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
       let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'};
-      if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
+      // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
+      const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
+      let tail=null,offered=null,classified=false;
+      if(stop) {
+        for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';
+        // A literal stop needs no model: whatever is still unsent is retired by the host itself.
+        if(owner&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
+      }
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
       } else if(input.attachments?.length||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
         decision='work';reason='work-input';
       } else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
       else {
+        // An interrupted reply with nothing unknown about it rides on this call. With none,
+        // the classifier is asked exactly what it was always asked.
+        classified=true;
+        offered=owner?await port('pending',{id:input.id,text:input.text}):null;
+        if(!offered?.reply)offered=null;
         try {
           let timer;
           const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
           let result;
-          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
+          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs,...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
           finally {clearTimeout(timer);}
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
           if(['light','deep'].includes(result.recall?.mode))recall={...result.recall,decisionSource:'deepseek-input-classification'};
-        } catch {decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;}
+          if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
+            :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
+        } catch {
+          decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;
+          // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
+          if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
+        }
       }
+      // Attachments and commands are never classified, so they cannot carry a tail decision either.
+      if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
       const intent=decision;
       // DeepSeek judges meaning; its answer never owns the execution lock.
       if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
       const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
       if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
       if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
