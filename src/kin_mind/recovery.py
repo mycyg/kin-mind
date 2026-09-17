@@ -6,6 +6,10 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 
 from .memory import MemoryContinuity
 
+# Retry bookkeeping an approved resume gives back, preserved in recovery_history.
+RETRY_COUNTERS = ("error_signature", "error_repeats", "compression_waits", "compression_stalls",
+                  "compression_parts", "transient_failures", "admission_waits")
+
 
 def migrate_operational(mind, *, workers_stopped):
     if workers_stopped is not True:
@@ -96,10 +100,66 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
             if admission_only:
                 # Previous usage and proposals stay in recovery_history. Refresh
                 # source/configuration context; never replay an unrelated proposal.
-                for field in ("error", "repair_reason", "receipt", "proposed_result", "seed_memory", "seed_receipt", "seed_sources"):
+                for field in ("error", "error_detail", "repair_reason", "receipt", "proposed_result",
+                              "seed_memory", "seed_receipt", "seed_sources"):
                     data.pop(field, None)
                 data["waiting_reason"] = "admission-recovered-current-review"
             data.pop("frozen_memory_context", None)
+            # An approved resume restores the whole retry budget, like attempts=0.
+            for field in RETRY_COUNTERS:
+                data.pop(field, None)
+            conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
+                         (time.time(), dumps(data), identifier))
+            resumed.append(identifier)
+        result = {"state": "resumed", "resumed": resumed, "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
+        conn.execute("INSERT INTO mind_memory_migrations VALUES(?,?,0,?)", (mind.scope.key(), name, dumps(result)))
+    return result
+
+
+def recover_quarantined(mind, *, job_ids, command_id, source):
+    """Resume quarantined appraisals of any lane. Each one is judged afresh.
+
+    A quarantined row is held by no worker (state `needs-repair`, no lease), so
+    this needs no worker shutdown: one write transaction returns the batch to the
+    queue and the claim query takes it from there atomically. The failure stays
+    readable in `recovery_history`; no stored proposal is replayed as a seed and
+    no model is called here.
+    """
+    if not command_id or not source or not 1 <= len(job_ids) <= 50 or len(set(job_ids)) != len(job_ids):
+        raise ValueError("Recovery requires a sourced command and unique bounded jobs")
+    from .appraisal import Appraisals
+    Appraisals(mind)
+    name = "quarantine-recovery:" + command_id
+    fingerprint = digest([job_ids, source])
+    with mind.engine.db.connect(write=True) as conn:
+        previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
+        if previous:
+            result = json.loads(previous[0])
+            if result["fingerprint"] != fingerprint:
+                raise Conflict("Recovery command belongs to another batch")
+            return result
+        resumed, completed = [], []
+        for identifier in job_ids:
+            row = conn.execute("SELECT * FROM mind_appraisals WHERE id=? AND scope=?", (identifier, mind.scope.key())).fetchone()
+            if not row:
+                raise Missing(identifier)
+            data = json.loads(row["data"])
+            if row["state"] == "complete":
+                completed.append(identifier)
+                continue
+            if row["state"] != "needs-repair":
+                raise Conflict("Only a quarantined appraisal can be resumed")
+            data.setdefault("recovery_history", []).append({
+                "command_id": command_id, "source": source, "at": mind.clock(), "attempts": row["attempts"],
+                **{field: data.get(field) for field in ("error", "error_detail", "repair_reason",
+                                                        "proposed_result", "receipt", "failed_call_receipt")},
+                **{field: data[field] for field in RETRY_COUNTERS if field in data}})
+            if data.get("seed_memory"):
+                # The stored proposal stays audit data; this attempt judges again.
+                data["seed_rejected"] = True
+            for field in ("error", "error_detail", "repair_reason", "waiting_reason",
+                          "frozen_memory_context", *RETRY_COUNTERS):
+                data.pop(field, None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
                          (time.time(), dumps(data), identifier))
             resumed.append(identifier)
