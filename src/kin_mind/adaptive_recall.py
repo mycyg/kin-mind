@@ -424,8 +424,10 @@ class AdaptiveRecall:
         info["candidate_ids"] = [i["id"] for i in selected]
         info["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
         info["degraded_reasons"] = list(dict.fromkeys(info["degraded_reasons"]))
-        receipts = info.get("model_receipts", [])
-        info["usage"] = {key: sum(r.get("usage", {}).get(key, 0) or 0 for r in receipts)
+        # A receipt whose provider reported no usage counts as unreported, not as zero
+        # tokens: the totals below are then blanked and only `known_totals` is kept.
+        receipts = [r for r in info.get("model_receipts", []) if r.get("usage")]
+        info["usage"] = {key: sum(r["usage"].get(key, 0) or 0 for r in receipts)
                          for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")}
         info["usage"]["unreported_requests"] = info["model_requests"] - len(receipts)
         info["usage"]["status"] = "partial-unknown" if info["usage"]["unreported_requests"] else "reported"

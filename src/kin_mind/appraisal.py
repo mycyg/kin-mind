@@ -25,6 +25,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
+from . import attempts
 from .conflicts import classify, static_message
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .dialogue import clock_context, recent_dialogue
@@ -552,8 +553,17 @@ class DeepSeek:
                         (cache_key, generation, time.time())).fetchone()
                     if cached:
                         value = json.loads(cached[0])
+                        attempts.record_call(self, name, outcome="cache-hit", model=value["receipt"].get("model"),
+                                             request_id=value["receipt"].get("request_id"), elapsed_ms=0, usage_status="reused")
                         return schema.model_validate(value["result"]), {**value["receipt"], "cache_hit": True,
                             "usage": {}, "usage_status": "reused", "elapsed_ms": 0}
+        body, request_digest = {}, digest([name, system, context])
+        def elapsed():
+            return round((time.monotonic() - started) * 1000)
+        def record(outcome, **extra):
+            return attempts.record_call(self, name, outcome=outcome, model=body.get("model"),
+                                        request_id=body.get("id"), elapsed_ms=elapsed(),
+                                        usage=body.get("usage"), context_digest=request_digest, **extra)
         try:
             with request_client(self, self.timeout, name) as client:
                 response = client.post(self.endpoint + "/v1/messages",
@@ -563,29 +573,32 @@ class DeepSeek:
                           "tools": [{"name": name, "description": "Submit sourced structured results", "input_schema": schema.model_json_schema()}],
                           "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": "high"}})
             if response.status_code != 200:
+                # A refused request still made one: it leaves a record with unknown usage.
+                record("http-" + str(response.status_code))
                 raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
             if hasattr(self, "engine"):
                 self.engine.db.metric("structured_model_usage", 1, {"tool": name, "model": body.get("model"),
-                    "reasoning": "high", "request_id": body.get("id"), "usage": body.get("usage", {})})
+                    "reasoning": "high", "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
             if body.get("model") != "deepseek-flash" or body.get("stop_reason") == "max_tokens":
                 if hasattr(self,"engine"):
-                    self.engine.db.metric("structured_rejected", 1, {"tool":name,"reported_model":body.get("model"),"stop_reason":body.get("stop_reason"),"usage":body.get("usage",{}),"max_tokens":max_tokens})
+                    self.engine.db.metric("structured_rejected", 1, {"tool":name,"reported_model":body.get("model"),"stop_reason":body.get("stop_reason"),"max_tokens":max_tokens, **attempts.usage_entry(body.get("usage"))})
+                record("max-tokens" if body.get("stop_reason") == "max_tokens" else "model-unverified")
                 raise RuntimeError("deepseek-incomplete-or-unverified")
-            calls = [b for b in body.get("content", []) if b.get("type") == "tool_use" and b.get("name") == name]
-            if len(calls) != 1:
+            tool_calls = [b for b in body.get("content", []) if b.get("type") == "tool_use" and b.get("name") == name]
+            if len(tool_calls) != 1:
+                record("missing-tool-call")
                 raise RuntimeError("deepseek-missing-structured-result")
             try:
-                result = schema.model_validate(calls[0]["input"])
+                result = schema.model_validate(tool_calls[0]["input"])
             except ValidationError:
-                self.failure_receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high",
-                    "request_id": body.get("id"), "usage": body.get("usage"), "usage_status": "reported" if body.get("usage") else "unknown",
-                    "outcome": "schema-invalid", "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                self.failure_receipt = attempts.failure_receipt(record("schema-invalid"))
                 raise
+            record("ok")
             self.failure_receipt = None
             receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
-                       "usage": body.get("usage", {}), "verified_at": datetime.now(timezone.utc).isoformat(),
-                       "elapsed_ms": round((time.monotonic() - started) * 1000), "cache_hit": False}
+                       **attempts.usage_entry(body.get("usage")), "verified_at": datetime.now(timezone.utc).isoformat(),
+                       "elapsed_ms": elapsed(), "cache_hit": False}
             if cache_key and time.monotonic() <= getattr(self, "absolute_deadline", float("inf")):
                 with self.engine.db.connect(write=True) as conn:
                     if conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0] == generation:
@@ -594,15 +607,21 @@ class DeepSeek:
                             dumps({"result": result.model_dump(), "receipt": receipt})))
             return result, receipt
         except httpx.TimeoutException:
+            record("timeout")
             raise RuntimeError("deepseek-timeout") from None
         except httpx.HTTPError:
+            record("network-error")
             raise RuntimeError("deepseek-network-error") from None
 
     def appraise(self, context):
         started = time.monotonic()
         self.failure_receipt = None
+        # An expansion round and (WP4) a revalidation are appraisal calls with a purpose
+        # of their own; every other call takes its purpose from its tool name.
+        purpose = getattr(self, "call_purpose", None) or "appraise"
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         request_context = appraisal_context(context)
+        compression_receipt = None
         if hasattr(self, "engine") and request_context.get("memory_context"):
             from eventmem.core.models import Scope
             from eventmem.core.retrieval import tokens
@@ -617,6 +636,9 @@ class DeepSeek:
                 preparation_seconds = min(480, max(30, self.timeout - 120))
                 compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=min(240, preparation_seconds), transport=self.transport)
                 compressor.engine, compressor.background = self.engine, getattr(self, "background", False)
+                # Preparation calls belong to this attempt, including the ones a pass that
+                # ends in `compression-pending` made before it gave up.
+                compressor.attempt_calls = getattr(self, "attempt_calls", None)
                 compact = Contexts(Mind(self.engine, Scope.model_validate(context["state"]["scope"])))
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
@@ -649,7 +671,9 @@ class DeepSeek:
                 for kind in ("works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
-                request_context["compression_receipt"] = result.get("receipt")
+                # The compression receipt belongs to this attempt's calls, not to the
+                # prompt: it costs tokens and made the rendered request differ every time.
+                compression_receipt = result.get("receipt")
                 if tokens(dumps(request_context)) > APPRAISAL_INPUT_BUDGET:
                     raise RuntimeError("deepseek-appraisal-budget-pending")
                 if time.monotonic() - started > self.timeout - 120:
@@ -663,6 +687,13 @@ class DeepSeek:
         if request_context.get('clock', {}).get('authority') == 'host-clock':
             elapsed = int(max(0, time.monotonic() - started))
             request_context['clock'] = clock_context((timestamp(request_context['clock']['current_time']) + timedelta(seconds=elapsed)).isoformat())
+        rendered = dumps(request_context)
+        request_digest, body = digest(rendered), {}
+        def record(outcome, **extra):
+            """Every exit of the main call leaves one entry, priced or not, usage or not."""
+            return attempts.record_call(self, "submit_appraisal", purpose=purpose, outcome=outcome,
+                model=body.get("model"), request_id=body.get("id"), usage=body.get("usage"),
+                elapsed_ms=round((time.monotonic() - started) * 1000), context_digest=request_digest, **extra)
         try:
             with request_client(self, max(30, self.timeout - (time.monotonic() - started)), "submit_appraisal") as client:
                 response = client.post(
@@ -672,7 +703,7 @@ class DeepSeek:
                         "model": self.model,
                         "max_tokens": 131072,
                         "system": (HISTORY_SYSTEM if context.get("stimulus") in {"memory-backfill", "memory-enrichment"} else SYSTEM + SESSION_ADVICE_PROMPT) + persona_prompt(policy) + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "") + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。",
-                        "messages": [{"role": "user", "content": dumps(request_context)}],
+                        "messages": [{"role": "user", "content": rendered}],
                         "tools": [
                             {
                                 "name": "submit_appraisal",
@@ -686,24 +717,33 @@ class DeepSeek:
                     },
                 )
                 if response.status_code != 200:
+                    record("http-" + str(response.status_code))
                     raise RuntimeError("deepseek-http-" + str(response.status_code))
             body = response.json()
+            if hasattr(self, "engine"):
+                # The main call was the only one that reached no metric at all.
+                self.engine.db.metric("structured_model_usage", 1, {"tool": "submit_appraisal", "model": body.get("model"),
+                    "reasoning": "high", "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
             self.failure_receipt = {"provider": "deepseek", "model": body.get("model"), "request_id": body.get("id"),
-                "stop_reason": body.get("stop_reason"), "usage": body.get("usage", {}),
+                "stop_reason": body.get("stop_reason"), **attempts.usage_entry(body.get("usage")),
                 "block_types": [b.get("type") for b in body.get("content", [])],
                 "verified_at": datetime.now(timezone.utc).isoformat()}
             if body.get("stop_reason") == "max_tokens":
+                record("max-tokens")
                 raise RuntimeError("deepseek-output-budget-exhausted")
             if body.get("model") != "deepseek-flash":
+                record("model-unverified")
                 raise RuntimeError("deepseek-model-unverified")
-            calls = [
+            tool_calls = [
                 v
                 for v in body.get("content", [])
                 if v.get("type") == "tool_use" and v.get("name") == "submit_appraisal"
             ]
-            if len(calls) != 1:
+            if len(tool_calls) != 1:
+                record("missing-tool-call")
                 raise RuntimeError("deepseek-missing-structured-result")
-            raw_proposal = calls[0]["input"]
+            main_call = record("ok")
+            raw_proposal = tool_calls[0]["input"]
             if context.get("operational_only"):
                 raw_proposal = {**raw_proposal, "memory": {}}
             # run_one and the daily review pass their reading of the switch; a bare provider isolates.
@@ -728,6 +768,7 @@ class DeepSeek:
                 if not historical and not isolation:
                     raise
                 issues = [{"loc": list(e["loc"]), "type": e["type"]} for e in error.errors(include_input=False)]
+                main_call["outcome"] = "schema-invalid"
                 # structured() owns its own failure receipt and clears it on
                 # success. Keep the original call independently so a valid
                 # repair cannot fail during bookkeeping or erase either cost.
@@ -747,24 +788,32 @@ class DeepSeek:
                 appraisal_receipt["schema_repair"] = repair_receipt
                 self.failure_receipt = appraisal_receipt
                 proposal = Appraisal.model_validate({**fixed.model_dump(), **({"memory": {}} if context.get("operational_only") else {})})
-            return proposal, {
+            receipt = {
                 "provider": "deepseek",
                 "model": body["model"],
-                "usage": body.get("usage", {}),
+                **attempts.usage_entry(body.get("usage")),
                 "request_id": body.get("id"),
                 "reasoning": "high",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
                 "context_projection": request_context.get("context_projection", "affect-decision-v3"),
-                "schema_repair": self.failure_receipt.get("schema_repair"),
+                "schema_repair": (self.failure_receipt or {}).get("schema_repair"),
                 **({"dropped_fields": dropped} if dropped else {}),
-                "context_characters": len(dumps(request_context)),
+                **({"compression_receipt": compression_receipt} if compression_receipt else {}),
+                "context_characters": len(rendered),
+                "request_digest": request_digest,
                 "max_output_tokens": 131072,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
             }
+            # A8: this call succeeded, so nothing about it may be reported as a failed
+            # call. Its cost is in the receipt above and in the attempt's `calls[]`.
+            self.failure_receipt = None
+            return proposal, receipt
         except httpx.TimeoutException:
+            record("timeout")
             raise RuntimeError("deepseek-timeout") from None
         except httpx.HTTPError:
+            record("network-error")
             raise RuntimeError("deepseek-network-error") from None
         except ValidationError as error:
             fields = ",".join(
@@ -778,8 +827,9 @@ class DeepSeek:
     def repair_session_advice(self, advice, context, problem):
         """One bounded correction of a refused session advice. The caller validates what comes back.
 
-        structured() clears the failure receipt on success; the appraisal call's own receipt is kept
-        beside the repair's, as the schema repair does, so neither cost is lost if the commit fails.
+        A failed repair keeps its actual or unknown usage beside whatever the appraisal call
+        left; a repair that succeeded is reported by its return value alone (A8), never as a
+        failed call. Either way the call is already in this attempt's `calls[]`.
         """
         appraisal_receipt, self.failure_receipt = self.failure_receipt, None
         try:
@@ -789,7 +839,7 @@ class DeepSeek:
                                               "usage": None, "usage_status": "unknown", "outcome": "failed"}
             self.failure_receipt = {**(appraisal_receipt or {}), "advice_repair": failed}
             raise
-        self.failure_receipt = {**(appraisal_receipt or {}), "advice_repair": receipt}
+        self.failure_receipt = appraisal_receipt
         return fixed, receipt
 
     def repair_sharing(self, proposal, context):
@@ -1168,6 +1218,10 @@ class Appraisals:
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
+            ledger = attempts.enabled(conn, self.mind.scope.key())
+            # An expired `running` row means its claimer died without ending its attempt,
+            # so nothing recorded it. Back-fill that attempt before this one starts.
+            killed = {**data} if row["state"] == "running" else None
             data["attempt_started_at"] = self.mind.clock()
             data["attempt_token"] = uuid.uuid4().hex
             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
@@ -1177,7 +1231,11 @@ class Appraisals:
                 # keep the lease beyond that deadline, including HTTP keepalives.
                 (time.time() + max(180, float(getattr(provider, "timeout", 90)) + 90), row["id"]),
             )
+        if ledger and killed:
+            attempts.backfill_abandoned(self.engine, self.mind.scope.key(), row, killed, at=self.mind.clock())
         slots = ExitStack()
+        # Every model call this attempt makes, nested ones included, accumulates here.
+        calls = slots.enter_context(attempts.collect(provider))
         admission_wait = False
         uncharged_wait = False
         model_admitted = False
@@ -1206,6 +1264,11 @@ class Appraisals:
                         with self.engine.db.connect(write=True) as conn:
                             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
                             self._settle_children(conn, row["id"], data, "complete")
+                        slots.close()
+                        if ledger:
+                            # This attempt ended here, without a model call and without a charge.
+                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=True,
+                                                 historical=historical, maintenance=maintenance)
                         return self.status(row["id"])
                     data["evidence_ids"] = remaining
                 if data.get("stimulus") == FOLLOW_UP and not data.get("review_source_id"):
@@ -1910,7 +1973,29 @@ class Appraisals:
             self.engine.db.metric("appraisal_attempt_discarded", 1, {
                 "appraisal": row["id"], "reason": "attempt-token-no-longer-owns-the-row", "attempted_state": state,
                 **({"usage": receipt["usage"]} if receipt.get("usage") else {"usage_status": receipt.get("usage_status", "unknown")})})
+        if ledger:
+            # One row per attempt, written now that the attempt has ended. The queue row's
+            # own error/receipt/proposal fields are left exactly as they are.
+            self._ledger_attempt(row, data, state, calls, owned=bool(changed),
+                                 charged=not (admission_wait or uncharged_wait), historical=historical,
+                                 maintenance=maintenance)
         return self.status(row["id"])
+
+    def _ledger_attempt(self, row, data, state, calls, *, owned, charged, historical, maintenance):
+        """The attempt's durable record: outcome, classification, digests and its calls."""
+        proposal = data.get("proposed_result")
+        context_digest = next((c["context_digest"] for c in calls
+                               if c["purpose"] in {"appraise", "revalidate"} and c.get("context_digest")), None)
+        return attempts.record(self.engine, self.mind.scope.key(), {
+            "appraisal_id": row["id"], "attempt_token": data.get("attempt_token"),
+            "outcome": attempts.outcome_for(state, data, owned=owned),
+            "lane": "enrichment" if historical else "maintenance" if maintenance else "action",
+            "stimulus": data.get("stimulus"), "started_at": data.get("attempt_started_at"),
+            "finished_at": self.mind.clock(), "calls": calls, "charged": charged,
+            "attempts": row["attempts"] + int(charged), "error": data.get("error"),
+            "error_detail": data.get("error_detail"), "repair_reason": data.get("repair_reason"),
+            "waiting_reason": data.get("waiting_reason"),
+            "proposal_digest": digest(proposal) if proposal else None, "context_digest": context_digest})
 
 
 class DailyReview:
