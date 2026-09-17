@@ -585,8 +585,25 @@ export class TransportManifests {
       undelivered:all.filter(m=>m.bubbles.some(b=>['rejected','undeliverable'].includes(b.state))).map(m=>m.group_id)};
   }
   read(id){return this.load(id);}
-  findBubble(bubbleId) {
+  /** The live set first. With `settled`, the filed months are searched too, newest
+   * first and bounded: a bubble whose group was already filed away is still the
+   * evidence of what became of it, and the alternative is calling it unconfirmed
+   * for ever. A miss only leaves the caller where it was. */
+  findBubble(bubbleId,{settled=false,limit=400}={}) {
     for(const id of this.live()){const manifest=this.load(id),bubble=manifest?.bubbles.find(b=>b.bubble_id===bubbleId);if(bubble)return {manifest,bubble};}
+    if(!settled)return null;
+    let left=limit;
+    for(const month of this.doneMonths()) {
+      const directory=path.join(this.directory,'done',month);
+      let names=[];
+      try{names=fs.readdirSync(directory);}catch(error){if(error.code!=='ENOENT')throw error;}
+      for(const name of names.filter(n=>n.endsWith('.json'))) {
+        if(left--<=0)return null;
+        const filed=readJsonFile(path.join(directory,name));
+        const bubble=filed.state==='ok'?filed.value?.bubbles?.find(b=>b.bubble_id===bubbleId):null;
+        if(bubble)return {manifest:filed.value,bubble};
+      }
+    }
     return null;
   }
   leaseState(id){return inspectLease({...this.lease,directory:path.join(this.directory,'leases'),id,clock:this.clock});}

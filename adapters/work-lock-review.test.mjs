@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import {MobileRouter} from './mobile-router.mjs';
-import {WorkLockReview} from './work-lock-review.mjs';
+import {WorkLockReview,REVIEW_LIMITS} from './work-lock-review.mjs';
 import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 async function fixture(t) {
@@ -152,4 +153,95 @@ test('a refused user-work lane holds the lock and is never mistaken for a verdic
   assert.equal(result.decision,undefined);
   assert.equal(result.retryAt-result.checkedAt,5*60000);
   assert.equal(f.router.tasks().length,1);
+});
+
+// ---- no size ever leaves the lock held with no review able to run ----
+
+test('an ordinary review asks for exactly what it always asked for',async t=>{
+  const f=await fixture(t);let request;
+  f.review.review=async input=>{request=input;return f.result();};
+  assert.equal((await f.review.tick()).state,'applied');
+  assert.deepEqual(request,f.evidence.input);
+  assert.equal(request.review_chunk,undefined,'nothing is added to the small case');
+  assert.equal(createHash('sha256').update(JSON.stringify(request)).digest('hex'),
+    '7f22459b345820ed4c07de3637b01c0b8d6311d4d4cd5d8c12f4c7f6269d9eea','byte for byte the request of the previous release');
+});
+
+function oversized(f,{count=60,chars=9000}={}) {
+  f.evidence.input.inputs=[f.evidence.input.inputs[0],...Array.from({length:count},(_,n)=>({id:'context-'+n,text:'c'.repeat(chars)}))];
+  f.evidence.input.outputs=[{id:'reply-1',text:'o'.repeat(chars),receivedByServer:true}];
+}
+
+test('evidence past the single-review limits is reviewed in bounded chunks, not refused for ever',async t=>{
+  const f=await fixture(t),seen=[];
+  oversized(f);
+  assert.ok(JSON.stringify(f.evidence.input).length>REVIEW_LIMITS.bytes);
+  f.review.review=async input=>{seen.push(input);return f.result();};
+  const applied=await f.review.tick();
+  assert.equal(applied.state,'applied','the work lock is released on the merits');
+  assert.ok(seen.length>1&&seen.length<=REVIEW_LIMITS.maxChunks,'bounded number of steps');
+  assert.deepEqual(seen.map(c=>c.review_chunk.index),seen.map((_,n)=>n+1));
+  assert.equal(seen[0].review_chunk.count,seen.length);
+  assert.equal(applied.chunks,seen.length);assert.equal(applied.receipt.chunks,seen.length);
+  // Every chunk knows the whole shape, and each one after the first knows what was decided before it.
+  assert.equal(seen[0].review_chunk.outline.inputs.length,61);
+  assert.deepEqual(seen[0].review_chunk.decisions,[]);
+  assert.equal(seen[1].review_chunk.decisions[0].disposition,'not_a_task');
+  assert.equal(seen.at(-1).review_chunk.decisions.length,seen.length-1);
+  // Nothing is dropped in silence: an excerpted body says how long the original was.
+  const excerpted=seen.flatMap(c=>c.inputs).filter(i=>i.text_excerpted);
+  assert.equal(excerpted.length,60);
+  assert.ok(excerpted.every(i=>i.text_excerpted.chars===9000&&i.text.length<=REVIEW_LIMITS.excerpt+8));
+  assert.deepEqual(seen.flatMap(c=>c.inputs).map(i=>i.id),f.evidence.input.inputs.map(i=>i.id),'the host keeps global order and coverage');
+  assert.equal(f.router.tasks().length,0);
+});
+
+test('one chunk that says the work is unfinished keeps the lock',async t=>{
+  const f=await fixture(t);let answered=0;
+  oversized(f);
+  f.review.review=async()=>{
+    answered++;
+    return answered===2?{...f.result(),decision:{disposition:'keep',reason:'A requested result is still missing',evidenceIds:['input-1'],remaining:['the requested result'],discardDraftIds:[]}}:f.result();
+  };
+  const kept=await f.review.tick();
+  assert.equal(kept.state,'kept');
+  assert.equal(kept.decision.disposition,'keep');
+  assert.deepEqual(kept.decision.remaining,['the requested result']);
+  assert.equal(f.router.tasks().length,1);
+  assert.ok(answered>2,'the remaining chunks are still reviewed');
+});
+
+test('a chunk with a malformed answer is refused exactly as an unchunked one is',async t=>{
+  const f=await fixture(t);
+  oversized(f);
+  f.review.review=async input=>input.review_chunk.index===2?{...f.result(),decision:{disposition:'complete',reason:'',evidenceIds:[],remaining:[],discardDraftIds:[]}}:f.result();
+  const refused=await f.review.tick();
+  assert.equal(refused.state,'failed');
+  assert.match(refused.reason,/invalid-decision-shape/);
+  assert.equal(f.router.tasks().length,1);
+});
+
+test('a bubble the host retired is not an unconfirmed delivery and stops holding the lock',async t=>{
+  const f=await fixture(t),task=f.router.currentTask();
+  f.decision.disposition='complete';f.decision.reason='The requested result reached the owner';
+  task.deliveries.retired={state:'pending',at:100};
+  f.evidence.receipts.retired={state:'unconfirmed'};
+  const held=await f.review.tick();
+  assert.deepEqual([held.state,held.reason],['waiting','delivery-unconfirmed'],'an unexplained delivery still holds it');
+  f.evidence.receipts.retired={state:'retired',reason:'input-or-session-superseded',source:'transport-manifest'};
+  f.advance(20*60000);
+  const applied=await f.review.tick();
+  assert.equal(applied.state,'applied');
+  assert.equal(task.deliveries.retired.state,'retired');
+  assert.equal(task.deliveries.retired.reason,'input-or-session-superseded');
+  assert.deepEqual(task.workReview.retiredDeliveryIds,['retired']);
+  assert.equal(f.router.tasks().length,0);
+  // A task whose every bubble was retired has no delivery evidence at all, and keeps the lock.
+  const g=await fixture(t);
+  g.decision.disposition='complete';g.decision.reason='The requested result reached the owner';
+  g.router.currentTask().deliveries['reply-1']={state:'pending'};
+  g.evidence.receipts['reply-1']={state:'retired',reason:'input-or-session-superseded'};
+  const empty=await g.review.tick();
+  assert.deepEqual([empty.state,empty.reason],['waiting','no-delivery-evidence']);
+  assert.equal(g.router.tasks().length,1);
 });

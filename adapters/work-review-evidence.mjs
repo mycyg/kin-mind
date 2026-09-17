@@ -72,6 +72,11 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
       } else {
         // A deferred reply is a held manifest; the delivery ID is one of its bubbles. The old journal is the fallback.
         const found=!message?store()?.findBubble(id)??null:null,entry=found?null:read(deferredFile(id));
+        // Nothing here explains this delivery yet. A bubble the host retired is the one
+        // case worth looking for among the settled groups: without it this delivery stays
+        // "unconfirmed" for ever and the work lock is never released on its merits.
+        const filed=!message&&!found&&entry?.state!=='pending'?store()?.findBubble(id,{settled:true})??null:null;
+        const gone=[found,filed].find(m=>m?.bubble.state==='canceled');
         const request=found?found.bubble.request:entry?.request,inputIndex=ids.indexOf(request?.reply_id);
         const ordinary=found?deferred(found.manifest)&&found.manifest.kind==='reply'&&found.manifest.taskId===snapshot.task.id      // a manifest bubble is text by construction
           :entry?.state==='pending'&&entry.delivery?.id===id&&entry.delivery?.taskId===snapshot.task.id&&entry.delivery.kind==='reply'&&!entry.delivery.media&&!entry.delivery.artifact;
@@ -81,6 +86,11 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
           // Every fragment reached the platform; the router's own record names one of their message IDs.
           receipts[id]={state:'accepted',messageId:delivered.includes(String(delivery.messageId))?String(delivery.messageId):delivered[0],source:'transport-manifest'};
           outputs.push({id,text:found.bubble.text,file:null,receivedByServer:true});
+        } else if(gone&&!cancellable) {
+          // Retired before it began: settled, and never an obligation to deliver again.
+          const reason=/^[a-z0-9-]{1,64}$/.test(gone.bubble.reason??gone.manifest.retired?.reason??'')?gone.bubble.reason??gone.manifest.retired.reason:'retired';
+          receipts[id]={state:'retired',reason,source:'transport-manifest'};
+          outputs.push({id,retired:true,reason,receivedByServer:false});
         } else receipts[id]={state:cancellable?'not-submitted':message?.state??'unconfirmed',messageId:message?.messageId};
         if(cancellable) {
           const value={id,replyId:request.reply_id,text:request.text,reason:'A later authenticated input superseded this unsent ordinary reply candidate; classify its actual content before discarding.'};

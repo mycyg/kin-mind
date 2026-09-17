@@ -28,6 +28,7 @@ test('automatic changes notify once per verified transition, including a delayed
  const sent=[];
  await f.router.flushNotices({send:async r=>{sent.push(r);return {state:'accepted',messageId:r.id};},lookup:async()=>null});
  assert.equal(sent.length,2);assert.match(sent[0].text,/此前已切到 GPT/);assert.match(sent[0].text,/现在用的是 DeepSeek/);
+ assert.equal(f.router.lastToldModel(),'deepseek-flash','what the owner was told is the model the delivered message named as current');
  assert.equal(f.router.state.recent.some(r=>r.text===sent[0].text),false);
  const restarted=new MobileRouter(f.args);
  await restarted.flushNotices({send:async r=>{sent.push(r);},lookup:async()=>null});assert.equal(sent.length,2);
@@ -405,6 +406,116 @@ test('a notification in flight holds provider changes until its send settles',as
   await f.router.requestMode({commandId:'exit',mode:'auto',reason:'owner exits'});
   await f.router.applyPendingMode();assert.deepEqual(f.switched,[]);
   release();await sending;await f.router.applyPendingMode();assert.deepEqual(f.switched,['deepseek-flash']);
+});
+
+// ---- durable state file: one damaged revision never costs the conversation ----
+
+test('a damaged state file falls back to the revision the writer kept, and the bytes are quarantined',async t=>{
+  const f=fixture(t);
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const file=f.args.file,directory=path.dirname(file);
+  assert.equal(fs.existsSync(file+'.prev'),true,'the writer keeps the revision it replaces');
+  fs.writeFileSync(file,'{"schema":1,"tasks"');
+  const restored=new MobileRouter(f.args);
+  assert.equal(restored.tasks().length,1,'the open task is still there');
+  assert.equal(restored.state.recovery.reason,'restored-from-previous-revision');
+  assert.equal(restored.state.recovery.from,'previous');
+  const kept=fs.readdirSync(path.join(directory,'quarantine'));
+  assert.deepEqual([kept.length,restored.state.recovery.quarantined],[1,kept]);
+  assert.deepEqual((await restored.readRuntime()).recovery,restored.state.recovery,'and status can show it');
+  assert.equal(fs.readFileSync(path.join(directory,'quarantine',kept[0]),'utf8'),'{"schema":1,"tasks"','the damaged bytes are kept, never deleted');
+  assert.deepEqual(new MobileRouter(f.args).state.recovery,restored.state.recovery,'the fact stays readable after a healthy restart');
+});
+
+test('with no readable revision left the router does not invent a fresh history',async t=>{
+  const f=fixture(t);f.runtime.model='deepseek-flash';
+  await f.router.dispatch({id:'one',text:'hello'},async()=> 'new-turn');
+  const file=f.args.file;
+  fs.writeFileSync(file,'not json');fs.writeFileSync(file+'.prev','[');
+  const restored=new MobileRouter(f.args);
+  assert.equal(restored.state.recovery.reason,'state-file-unreadable');
+  assert.equal(restored.state.recovery.quarantined.length,2);
+  assert.equal(restored.state.recovery.restoredInputs,1);
+  assert.equal(restored.state.inputs.one.state,'unconfirmed','what was accepted comes back from the journal');
+  await assert.rejects(restored.dispatch({id:'one',text:'hello'},async()=>assert.fail('replayed')),/reconciliation/);
+  assert.equal((await restored.restoreRoutingProfile()).state,'waiting','no provider is switched under work nobody can see');
+  assert.deepEqual(f.switched,[]);
+  const untouched=new MobileRouter({...f.args,file:path.join(path.dirname(file),'never-written.json')});
+  assert.equal(untouched.state.recovery,undefined,'a missing file is still a fresh start');
+});
+
+test('two writers never share a temporary name, and an interrupted write leaves the file loadable',async t=>{
+  const f=fixture(t);
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const second=new MobileRouter(f.args),temporaries=[],rename=fs.renameSync;
+  fs.renameSync=(from,to)=>{temporaries.push(from);return rename(from,to);};
+  try {f.router.save('one');second.save('two');} finally {fs.renameSync=rename;}
+  assert.ok(temporaries.length>=4);
+  assert.equal(new Set(temporaries).size,temporaries.length,'same process, same second, different names');
+  fs.renameSync=(from,to)=>{if(to===f.args.file)throw Object.assign(Error('interrupted'),{code:'EIO'});return rename(from,to);};
+  try {assert.throws(()=>f.router.save('interrupted'));} finally {fs.renameSync=rename;}
+  fs.writeFileSync(f.args.file+'.999.abcdef.tmp','half a revision');
+  const after=new MobileRouter(f.args);
+  assert.equal(after.tasks().length,1);assert.equal(after.state.recovery,undefined);
+  assert.deepEqual(fs.readdirSync(path.dirname(f.args.file)).filter(n=>n.endsWith('.tmp')),['state.json.999.abcdef.tmp'],'a write cleans up after itself');
+});
+
+// ---- a restart that changes nothing the owner can see says nothing ----
+
+async function told(f,model) {
+  f.runtime.model=model;
+  await f.router.dispatch({id:'told-'+model,text:'现在是什么模型'},async()=>{});
+  await f.router.flushNotices({send:async()=>({state:'accepted',messageId:'told-'+model}),lookup:async()=>null});
+  assert.equal(f.router.lastToldModel(),model);
+}
+
+test('a restart that restores the model the owner was last told about settles without a message',async t=>{
+  const f=fixture(t);
+  await told(f,'deepseek-flash');
+  f.runtime.model='gpt-6-astra';                     // the native runtime came back on its own default
+  const restarted=new MobileRouter(f.args);
+  assert.equal((await restarted.restoreRoutingProfile()).model,'deepseek-flash');
+  const notice=Object.values(restarted.state.notices).find(n=>n.kind==='model-switched');
+  assert.deepEqual([notice.state,notice.reason,notice.text],['suppressed','restart-restored-known-model',undefined]);
+  await restarted.flushNotices({send:async()=>assert.fail('a suppressed notice is never sent'),lookup:async()=>assert.fail('and never reconciled')});
+  const view=await restarted.readRuntime();
+  assert.ok(view.notifications.some(n=>n.state==='suppressed'&&n.reason==='restart-restored-known-model'),'still visible in status');
+  await restarted.dispatch({id:'ask',text:'现在是什么模型'},async()=>{});
+  const sent=[];
+  await restarted.flushNotices({send:async n=>{sent.push(n);return{state:'accepted',messageId:'answer'};},lookup:async()=>null});
+  assert.equal(sent.length,1);assert.match(sent[0].text,/DeepSeek Flash/,'an explicit question is still answered');
+});
+
+test('a restart that restores a different model tells the owner, exactly as before',async t=>{
+  const f=fixture(t);
+  await told(f,'deepseek-flash');
+  // The mode moved on without the owner hearing about it, so the restored model is news.
+  await f.router.requestMode({commandId:'host-work',mode:'work',reason:'Verified work is under way',notify:false});
+  const restarted=new MobileRouter(f.args);
+  assert.equal((await restarted.restoreRoutingProfile()).model,'gpt-6-astra');
+  const notice=Object.values(restarted.state.notices).find(n=>n.kind==='model-switched'&&n.target==='gpt-6-astra');
+  assert.equal(notice.state,'pending');assert.match(notice.text,/已经切到 GPT/);
+  const sent=[];
+  await restarted.flushNotices({send:async n=>{sent.push(n);return{state:'accepted',messageId:'switched'};},lookup:async()=>null});
+  await restarted.flushNotices({send:async()=>assert.fail('sent twice'),lookup:async()=>null});
+  assert.equal(sent.length,1);
+});
+
+test('a restart in the middle of a real switch still tells the owner once',async t=>{
+  const f=fixture(t);
+  await told(f,'deepseek-flash');
+  f.router.state.transition={id:'switch-synthetic',state:'switching',from:'deepseek-flash',to:'gpt-6-astra',source:'input',sourceId:'told-deepseek-flash'};
+  f.router.save('synthetic-crash');
+  f.runtime.model='gpt-6-astra';
+  const restarted=new MobileRouter(f.args);
+  assert.equal(restarted.state.transition.state,'unconfirmed');
+  await restarted.reconcile();
+  const switches=Object.values(restarted.state.notices).filter(n=>n.kind==='model-switched');
+  assert.equal(switches.length,1);assert.equal(switches[0].state,'pending');
+  const sent=[];
+  await restarted.flushNotices({send:async n=>{sent.push(n);return{state:'accepted',messageId:'switched'};},lookup:async()=>null});
+  await restarted.flushNotices({send:async()=>assert.fail('sent twice'),lookup:async()=>null});
+  assert.equal(sent.length,1);assert.equal(restarted.lastToldModel(),'gpt-6-astra');
 });
 
 // ---- reply tail port: the unsent rest of an interrupted reply rides on the routing call ----

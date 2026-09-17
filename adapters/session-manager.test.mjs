@@ -119,6 +119,25 @@ test('native receipt duplicates after a later window never reset the earlier led
  const f=fixture(t);const event=id=>({id,state:'completed',threadId:'old',at:new Date(f.clock.now++).toISOString()});const a=event('a'),b=event('b');
  await f.manager.nativeCompaction(a);await f.manager.nativeCompaction(b);await f.manager.nativeCompaction(a);assert.equal(f.calls.filter(c=>c==='ack').length,2);
 });
+test('a damaged registry falls back to the revision it kept; with nothing left it refuses to open',async t=>{
+ const f=fixture(t);await f.advise('compact');await f.manager.tick();
+ const file=f.options.file,binding=f.manager.fence(),quarantine=path.join(f.dir,'quarantine');
+ assert.equal(fs.existsSync(file+'.prev'),true);
+ fs.writeFileSync(file,'{"schema":1,"binding"');
+ const restored=new SessionManager(f.options);
+ assert.deepEqual(restored.fence(),binding,'the binding survives');
+ assert.equal(restored.state.recovery.reason,'restored-from-previous-revision');
+ assert.equal(restored.assertFence(binding),true);
+ assert.deepEqual(fs.readdirSync(quarantine).length,1);
+ // A binding is a fencing token: it can never be reopened at generation one, because an
+ // older fence stored elsewhere would pass again. The bytes stay for the operator.
+ fs.writeFileSync(file,'{');fs.writeFileSync(file+'.prev','[');
+ assert.throws(()=>new SessionManager(f.options),/KIN_SESSION_REGISTRY_UNREADABLE/);
+ assert.equal(fs.readdirSync(quarantine).length,3);
+ assert.throws(()=>restored.assertFence(binding),/KIN_SESSION_REGISTRY_UNREADABLE/);
+ assert.equal(new SessionManager({...f.options,file:path.join(f.dir,'never-written.json')}).state.recovery,undefined,'a missing registry is still a fresh start');
+});
+
 test('native parser resumes complete JSONL lines and excludes reasoning from its state',async t=>{
  const f=fixture(t),file=path.join(f.dir,'rollout.jsonl'),stateFile=path.join(f.dir,'window.json');
  fs.writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id:'old'}})+'\n'+JSON.stringify({type:'compacted',timestamp:'2026-09-15T01:00:00Z',payload:{window_id:'w1',message:'PRIVATE SUMMARY'}})+'\n'+JSON.stringify({type:'event_msg',timestamp:'now',payload:{type:'token_count',info:{model_context_window:100000,last_token_usage:{input_tokens:1234}}}})+'\n'+JSON.stringify({type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:'marker-123'}]}}));

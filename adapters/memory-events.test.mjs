@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import {MemoryEventJournal,deliveryEvent,ToolArtifactObserver} from './memory-events.mjs';
 test('journal survives failures without retrying platform sends',async()=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-memory-'));
@@ -58,5 +59,47 @@ test('actual edit provenance differs from merely observing a file',()=>{
     assert.equal(fs.readFileSync(events[0].artifact.path,'utf8'),'actual output');
     observer.update({toolCallId:'shell',kind:'execute',status:'completed',locations:[{path:file}]});
     assert.equal(events[1].kind,'artifact-observed');
+  } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('the retry ledger is written atomically, stays bounded and carries no message text',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-error-ledger-'));
+  try {
+    let clock=1000;
+    const journal=new MemoryEventJournal({directory,clock:()=>clock,call:async()=>{throw Error('receipt unavailable');}});
+    for(const n of [1,2,3])journal.append({id:'event-'+n,kind:'delivery',at:'2026-01-0'+n+'T00:00:00Z',text:'A private sentence '+n});
+    assert.equal((await journal.drain()).failed,3);
+    const errors=path.join(directory,'errors'),names=fs.readdirSync(errors);
+    assert.equal(names.length,3);
+    assert.deepEqual(names.filter(n=>!n.endsWith('.json')),[],'no temporary file is left in the ledger');
+    for(const name of names) {
+      const note=JSON.parse(fs.readFileSync(path.join(errors,name),'utf8'));
+      assert.deepEqual(Object.keys(note).sort(),['attempts','checkedAt','id','nextAt','reason']);
+      assert.match(note.reason,/^[\w-]+$/);
+      assert.equal(fs.readFileSync(path.join(errors,name),'utf8').includes('private'),false);
+    }
+    // A note whose event is gone goes with it, and only the newest are kept.
+    fs.writeFileSync(path.join(errors,'0'.repeat(64)+'.json'),JSON.stringify({id:'vanished',attempts:9,checkedAt:0,nextAt:0}));
+    clock+=20*60000;
+    assert.equal((await journal.drain()).pruned,1);
+    assert.equal(fs.readdirSync(errors).length,3);
+    assert.equal(journal.pruneErrors(1),2);
+    assert.equal(fs.readdirSync(errors).length,1);
+    assert.equal(journal.snapshot().length,3,'no queued event was lost with its note');
+  } finally {fs.rmSync(directory,{recursive:true,force:true});}
+});
+test('one unreadable file never ends ingestion: it is moved aside and the rest drain',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-torn-journal-')),seen=[];
+  try {
+    const journal=new MemoryEventJournal({directory,clock:()=>0,call:async(_,event)=>{seen.push(event.id);return{state:'recorded'};}});
+    journal.append({id:'good',kind:'delivery',at:'2026-01-02T00:00:00Z'});
+    fs.writeFileSync(path.join(directory,'a'.repeat(64)+'.json'),'{"id":"torn"');
+    fs.mkdirSync(path.join(directory,'errors'),{recursive:true});
+    fs.writeFileSync(path.join(directory,'errors',createHash('sha256').update('good').digest('hex')+'.json'),'not json');
+    const result=await journal.drain();
+    assert.deepEqual([result.recorded,result.quarantined,seen],[1,1,['good']]);
+    const kept=fs.readdirSync(path.join(directory,'quarantine'));
+    assert.equal(kept.length,1);
+    assert.equal(fs.readFileSync(path.join(directory,'quarantine',kept[0]),'utf8'),'{"id":"torn"','the bytes are kept');
+    assert.equal(journal.snapshot().length,0);
   } finally {fs.rmSync(directory,{recursive:true,force:true});}
 });

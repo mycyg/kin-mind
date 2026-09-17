@@ -104,3 +104,23 @@ test('the old journal releases every bubble of a deferred group too',async t=>{
   assert.equal((await adapter.cancelDeferred('old',{reviewId:'review',evidence})).state,'canceled-before-send');
   assert.deepEqual(released,['draft-old','draft-old-1','draft-old-2']);
 });
+
+test('a bubble the host retired is settled evidence, and stays readable after its group is filed away',async t=>{
+  const f=manifestFixture(t);
+  await f.manifests.retireRemainder('reply-deferred',{reason:'input-or-session-superseded'});
+  assert.deepEqual(f.manifests.live(),[],'the group is filed away, out of the live set');
+  assert.deepEqual(f.released,['draft-0','draft-1','draft-2']);
+  const evidence=await f.adapter.collect(f.snapshot);
+  assert.deepEqual(['bubble-0','bubble-1','bubble-2'].map(id=>evidence.receipts[id]),
+    Array.from({length:3},()=>({state:'retired',reason:'input-or-session-superseded',source:'transport-manifest'})));
+  assert.deepEqual(evidence.input.cancellableDeferred,[],'there is nothing left to discard');
+  assert.deepEqual(evidence.input.outputs.filter(o=>o.retired).map(o=>o.id),['bubble-0','bubble-1','bubble-2']);
+  assert.equal(evidence.receipts.reply.state,'accepted','what was delivered is unchanged');
+});
+
+test('a group that is merely held is still unconfirmed, never mistaken for retired',async t=>{
+  const f=manifestFixture(t);
+  await f.manifests.mutate('reply-deferred',m=>{m.review={id:'review',checked_hashes:[]};},{operatorOnly:true});
+  const evidence=await f.adapter.collect(f.snapshot);
+  assert.deepEqual(['bubble-0','bubble-1','bubble-2'].map(id=>evidence.receipts[id].state),['unconfirmed','unconfirmed','unconfirmed']);
+});
