@@ -245,3 +245,43 @@ test('a bubble the host retired is not an unconfirmed delivery and stops holding
   assert.deepEqual([empty.state,empty.reason],['waiting','no-delivery-evidence']);
   assert.equal(g.router.tasks().length,1);
 });
+
+test('an unchanged verdict on an unchanged task waits twice as long each time, up to a cap, and any change to the task resets it',async t=>{
+  const f=await fixture(t);f.decision.disposition='keep';f.decision.remaining=['A research result is still pending'];
+  const waits=[];
+  for(let round=0;round<7;round++) {
+    const kept=await f.review.tick();
+    assert.equal(kept.state,'kept');assert.equal(f.calls(),round+1);
+    const wait=kept.retryAt-kept.checkedAt;waits.push(wait/60000);
+    // A moment before the wait is over nothing is asked, and nothing is paid for.
+    f.advance(wait-1);await f.review.tick();assert.equal(f.calls(),round+1);
+    f.advance(1);
+  }
+  assert.deepEqual(waits,[20,40,80,160,320,480,480],'twenty minutes, doubling, and never past eight hours');
+  // The attempt is keyed by the task fingerprint, so a new input starts the wait again.
+  await f.router.dispatch({id:'input-2',text:'and this as well'},async()=> 'new-turn');
+  const fresh=await f.review.tick();
+  assert.deepEqual([fresh.state,fresh.repeats,fresh.retryAt-fresh.checkedAt],['kept',0,20*60000]);
+  assert.equal(f.router.tasks().length,1,'when the lock is released is not what changed here');
+});
+
+test('a bubble that will never be delivered is reported to the review and no longer holds the lock',async t=>{
+  const f=await fixture(t);
+  f.decision.disposition='complete';f.decision.reason='The requested result reached the owner';
+  f.router.currentTask().deliveries['reply-2']={state:'unconfirmed'};
+  f.evidence.receipts['reply-2']={state:'rejected',reason:'platform-rejected',source:'transport-manifest'};
+  const applied=await f.review.tick();
+  assert.equal(applied.state,'applied');
+  assert.deepEqual(applied.taskId&&Object.entries(f.router.state.tasks[applied.taskId].deliveries['reply-2']).filter(([k])=>k!=='at'),
+    [['state','rejected'],['reason','platform-rejected'],['workReviewId',applied.id]]);
+  assert.deepEqual(f.router.state.tasks[applied.taskId].workReview.undeliveredDeliveryIds,['reply-2']);
+  assert.equal(f.router.tasks().length,0);
+  // The rule that something must actually have been delivered is untouched: a record that
+  // says accepted while the transport says refused is not evidence of a delivery.
+  const g=await fixture(t);
+  g.decision.disposition='complete';g.decision.reason='The requested result reached the owner';
+  g.evidence.receipts['reply-1']={state:'undeliverable',reason:'transport-unavailable',source:'transport-manifest'};
+  const empty=await g.review.tick();
+  assert.deepEqual([empty.state,empty.reason],['waiting','no-delivery-evidence']);
+  assert.equal(g.router.tasks().length,1);
+});

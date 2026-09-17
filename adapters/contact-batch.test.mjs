@@ -337,3 +337,25 @@ test('file preflight happens before the introduction and unknown delivery only r
  ack=true;assert.equal((await run({id:request.id})).state,'accepted');assert.equal(sent.length,2);
  assert.equal(sent[1].expectedBubbles,2);
 });
+
+test('a bubble that never starts is re-sent a bounded number of times, then given up on while the rest goes out',async()=>{
+  const journal=new Map(),attempts=[];
+  const args={read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),
+    receipt:id=>attempts.includes(id)?{state:'not-submitted',submissionStarted:false}:null,
+    send:async request=>{attempts.push(request.id);
+      if(request.text==='The first bubble.')throw Error('the transport never began');
+      return {state:'accepted',messageId:'server-'+request.id};}};
+  const batch=createContactBatch(args),request={id:'never-starts',bubbles:['The first bubble.','The second bubble.'],channel:'synthetic'};
+  for(let pass=0;pass<7;pass++) {
+    const result=await batch({...request,id:request.id});
+    assert.equal(result.state,'unconfirmed','the group waits while the first bubble is still being tried');
+  }
+  assert.equal(attempts.length,7,'the first send and six more, the same bound the transport gives a group');
+  const settled=await batch({id:request.id});
+  const [first,second]=journal.get(request.id).items;
+  assert.deepEqual([first.state,first.reason,first.restarts],['canceled','transport-never-started',7]);
+  assert.deepEqual([second.state,settled.state,settled.acceptedBubbles,settled.partial],['accepted','accepted',1,true]);
+  assert.equal(attempts.filter(id=>id===first.id).length,7,'no eighth attempt at the bubble that was given up on');
+  await batch({id:request.id});
+  assert.equal(attempts.length,8,'seven at the first bubble, one at the second, and nothing once the group is settled');
+});
