@@ -99,6 +99,11 @@ class Engine:
                     else "not_requested",
                 ),
             )
+            # What a source is gets decided once, as it arrives. Its row and the root record's
+            # stamp belong to the first revision, so no stored record is rewritten to mark it.
+            from .read_policy import STAMP, stamp_source
+
+            origin = stamp_source(self, conn, sid, source, record_text)
             # Deterministic text imports can be committed with the receipt.
             if attachment is None and source.text and len(source.text) <= 1_000_000:
                 confirmation = {
@@ -117,7 +122,9 @@ class Engine:
                     valid_from=source.occurred_at,
                     confirmation=confirmation,
                     generated=source.authority == "model",
-                    attributes=source.metadata,
+                    # The stamp is the engine's word: a caller cannot supply one it did not earn.
+                    attributes={k: v for k, v in source.metadata.items() if k != STAMP}
+                    | ({STAMP: origin} if origin else {}),
                 )
                 self._insert(conn, record)
                 if source.kind in {"knowledge", "checkpoint"}:
@@ -208,6 +215,17 @@ class Engine:
             if content:
                 return self.db.blobs / row["blob"]
             result = self._source(row)
+            # A provenance read says what kind of evidence this is, so a configuration is not
+            # taken for the owner's observed word. Only labelled sources gain keys.
+            from .read_policy import ReadPolicy
+
+            policy = ReadPolicy.load(self, Scope.model_validate_json(row["scope"]), "audit", conn=conn)
+            if policy.enabled:
+                root = conn.execute(
+                    "SELECT data FROM records WHERE id=? AND deleted=0",
+                    ("mem_" + digest([sid, "root"])[:32],),
+                ).fetchone()
+                policy.present_source(result, json.loads(root[0])["content"] if root else None)
             rows = [
                 r[0]
                 for r in conn.execute(
@@ -376,14 +394,25 @@ class Engine:
 
     def history(self, rid, cursor=2147483647, limit=50):
         with self.db.connect() as conn:
-            self._get(conn, rid)
-            return [
+            current = self._get(conn, rid)
+            rows = [
                 dict(r) | {"data": json.loads(r["data"])}
                 for r in conn.execute(
                     "SELECT * FROM revisions WHERE record_id=? AND revision<? ORDER BY revision DESC LIMIT ?",
                     (rid, cursor, limit),
                 )
             ]
+            # Reading the versions of a record is an audit read: every revision is there, and
+            # what is not experience says so instead of showing the stored confirmation.
+            from .read_policy import ReadPolicy
+
+            policy = ReadPolicy.load(
+                self, Scope(**current["scope"]), "audit", conn=conn
+            )
+            if policy.enabled:
+                for row in rows:
+                    policy.present(row["data"], row["data"])
+        return rows
 
     def _save_revision(self, conn, data, action, reason):
         data["revision"] += 1
@@ -516,17 +545,27 @@ class Engine:
                                 conn, child, "evidence_changed", change.reason
                             )
                 if data["status"] != "active" or data["attributes"].get("completed"):
-                    conn.execute(
-                        "UPDATE outbox SET state='canceled' WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry','sending')",
+                    # The scheduler's one cancel rule: a delivery whose request may be
+                    # on the network is never called canceled.
+                    from .scheduler import withdraw
+
+                    withdraw(
+                        conn,
+                        "schedule_id IN (SELECT id FROM schedules WHERE record_id=?)",
                         (rid,),
                     )
                     conn.execute(
-                        "UPDATE schedules SET state='canceled',revision=revision+1 WHERE record_id=?",
+                        "UPDATE schedules SET state='canceled',revision=revision+1,data=json_set(data,'$.generation',COALESCE(json_extract(data,'$.generation'),0)+1) WHERE record_id=?",
                         (rid,),
                     )
                 else:
+                    # A dispatched delivery keeps its frozen body, so a retry repeats
+                    # the same bytes. One still waiting takes the new text, and a claim
+                    # on it is released so that it is frozen again from this revision.
                     conn.execute(
-                        "UPDATE outbox SET data=json_set(data,'$.text',?,'$.record_revision',?) WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry')",
+                        "UPDATE outbox SET lease_until=CASE WHEN lease_until=json_extract(data,'$.claim.lease_until') THEN NULL ELSE lease_until END,"
+                        "data=json_remove(json_set(data,'$.text',?,'$.record_revision',?),'$.claim') "
+                        "WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?) AND state IN ('suggested','ready','retry') AND json_extract(data,'$.dispatch.body') IS NULL",
                         (data["content"], data["revision"], rid),
                     )
                 self.db.bump(conn)
@@ -623,9 +662,15 @@ class Engine:
                 + " ORDER BY id LIMIT ?",
                 values + [limit + 1],
             ).fetchall()
+            from .read_policy import ReadPolicy
+
+            # A listing is an audit read: everything is there, and what is not experience says
+            # so. Classified before the attributes are blanked, because the rules read them.
+            policy = ReadPolicy.load(self, scope, "audit", conn=conn)
         items = []
         for row in rows[:limit]:
             data = json.loads(row["data"])
+            policy.present(data, data)
             data.update(content_length=len(data["content"]), preview=True)
             data["content"] = data["content"][:2000]
             data["attributes"] = {}
@@ -758,6 +803,9 @@ class Engine:
                         "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (sid, now())
                     )
                     conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+                    conn.execute(
+                        "DELETE FROM source_evidence_class WHERE source_id=?", (sid,)
+                    )
             # Stored command responses and session sets may contain deleted text.
             conn.execute("DELETE FROM commands")
             conn.execute("DELETE FROM sessions")

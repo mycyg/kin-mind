@@ -192,6 +192,16 @@ def dispatch(config, action, request):
         from .lifecycle import EventLifecycle
         lifecycle = EventLifecycle(mind, memory.graph)
         return lifecycle.status() if action == "lifecycle-status" else lifecycle.backfill(**request)
+    if action == "migrate-evidence-isolation":
+        # Operator action. A dry run writes nothing; the impact list goes to `--output` and only
+        # its counts are printed, because the list itself can name thousands of identifiers.
+        from .isolation_migration import IsolationMigration
+        migration = IsolationMigration(mind)
+        options = {"apply": bool(request.get("apply")), "output": request.get("output")}
+        result = (migration.undo(**options) if request.get("undo")
+                  else migration.run(**options, registry_file=request.get("registry")))
+        return {k: v for k, v in result.items()
+                if k in {"migration", "operation", "state", "applied", "rules_version", "summary", "steps", "output"}}
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -397,15 +407,32 @@ def dispatch(config, action, request):
     raise ValueError("Unknown host action")
 
 
+MIGRATION_ACTION = "migrate-evidence-isolation"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    # Only `migrate-evidence-isolation` reads these; every other action takes its request on
+    # stdin as before. A dry run is the default, so nothing is written without `--apply`.
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--undo", action="store_true")
+    parser.add_argument("--output")
+    parser.add_argument("--registry")
     parser.add_argument("action")
     args = parser.parse_args()
     try:
         import sys
 
-        result = dispatch(load_config(args.config), args.action, json.load(sys.stdin))
+        # An operator runs the migration from a terminal, with no request to pipe in.
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        request = json.loads(raw) if raw.strip() else {}
+        if args.action == MIGRATION_ACTION:
+            if args.apply and args.dry_run:
+                raise ValueError("Choose either a dry run or an apply")
+            request.update(apply=args.apply, undo=args.undo, output=args.output, registry=args.registry)
+        result = dispatch(load_config(args.config), args.action, request)
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
         # Additive: the class stays the caller's contract, the taxonomy tells it

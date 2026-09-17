@@ -6,7 +6,14 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .contact_tasks import ContactTaskInput, ContactTasks
-from .models import RecallRequest, RevisionInput, ScheduleInput, Scope, SourceInput
+from .models import (
+    RecallQuery,
+    RecallRequest,
+    RevisionInput,
+    ScheduleInput,
+    Scope,
+    SourceInput,
+)
 from .self_knowledge import AssessmentInput, ClaimInput, PredictionInput, SelfKnowledge
 
 
@@ -32,9 +39,11 @@ def create_mcp(engine):
     register_mind_tools(server, engine)
 
     @server.tool()
-    def recall_memory(request: RecallRequest) -> dict:
+    def recall_memory(request: RecallQuery) -> dict:
         """Search scoped memory with a strict context budget; returns citations and read links."""
-        return engine.recall(request)
+        # The tool's request has no purpose field: what a chat model recalls is experience.
+        # `history` reaches earlier states of it, never role configuration or self-claims.
+        return engine.recall(RecallRequest(**request.model_dump()))
 
     @server.tool()
     def read_memory(
@@ -176,7 +185,7 @@ def create_mcp(engine):
         action: Literal["cancel", "pause", "resume", "snooze", "confirm"],
         due_at: str | None = None,
     ) -> dict:
-        """Change a scoped task using its current revision. snooze requires a timezone-aware due_at. Read again after a revision conflict. confirm approves a suggestion under the configured policy; it does not bypass delivery settings or confirm sending."""
+        """Change a scoped task using its current revision. snooze requires a timezone-aware due_at. Read again after a revision conflict. confirm approves a suggestion under the configured policy; it does not bypass delivery settings or confirm sending. cancel, pause, resume and snooze list the pending deliveries they stopped: canceled means nothing was sent, possibly_sent with reconciliation_required means the message may already have gone out and cannot be taken back."""
         return ContactTasks(engine, scope, policy_ids).manage(
             task_id, expected_revision, action, due_at
         )

@@ -47,7 +47,7 @@ DeepSeek's Responses API does not accept a named native `toolOutput` without a `
 
 The generic adapters are `session-manager.mjs`, `session-policy.mjs`, `native-window.mjs`, `native-candidate.mjs` and `mobile-session-host.mjs`. `codex-runtime-patch.mjs` adds usage, compaction events, bounded public injection and retirement to a compatible ACP build. Installation fails closed when expected source anchors differ; updates require a compatibility probe.
 
-Host configuration supplies private paths and the existing model catalog. It does not modify desktop Codex settings. The durable registry is the authority for `conversationId`, `generation`, `threadId` and `nativeSessionId`; these are not inferred from each other.
+Host configuration supplies private paths and the existing model catalog. It does not modify desktop Codex settings. The durable registry is the authority for `conversationId`, `generation`, `threadId` and `nativeSessionId`; these are not inferred from each other. It is written and read like every other [durable adapter state file](mobile-recovery.md#durable-adapter-state), with one exception: when neither its current revision nor the kept previous one can be read, the manager refuses to open rather than starting fresh, because that binding is a fencing token and reopening at the first generation would let an older fence pass again. A fence is always checked against the current file, never against an older revision.
 
 | Host interface | Purpose |
 | --- | --- |

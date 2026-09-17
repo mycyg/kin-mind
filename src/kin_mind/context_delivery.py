@@ -26,6 +26,11 @@ class ContextDelivery:
         with self.db.connect() as conn:
             conn.executescript(SCHEMA)
 
+    def _policy(self):
+        from eventmem.core.read_policy import ReadPolicy
+
+        return ReadPolicy.load(self.ctx.engine, self.ctx.mind.scope, 'experience_recall')
+
     def _get(self, conn, session, epoch, identifier):
         row = conn.execute('SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND id=?',
                            (self.scope, session, epoch, identifier)).fetchone()
@@ -68,8 +73,10 @@ class ContextDelivery:
             value = self._get(conn, session, epoch, id)
             if value['state'] != 'prepared':
                 return self.view(value)
-            window = self.ctx.window(session, conn)
-            if window['epoch'] != epoch or not all(self.ctx._current(i) for i in value['items']):
+            window, policy = self.ctx.window(session, conn), self._policy()
+            # A prepared injection is text about to reach the window: it is checked against
+            # the same read it was built for, so a stale one goes stale instead of arriving.
+            if window['epoch'] != epoch or not all(self.ctx._current(i, policy) for i in value['items']):
                 value['state'] = 'stale'
                 self._put(conn, value)
                 return self.view(value)
@@ -104,7 +111,8 @@ class ContextDelivery:
                 return self.view(value)
             # Sources can change after a real injection. Count the bytes that did
             # arrive, but only current evidence participates in future de-dup.
-            current = [i for i in value['items'] if self.ctx._current(i)]
+            policy = self._policy()
+            current = [i for i in value['items'] if self.ctx._current(i, policy)]
             window = self.ctx.window(session, conn)
             historical = window['epoch'] != epoch
             if not historical:

@@ -11,6 +11,7 @@ from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallRequest
+from eventmem.core.read_policy import ReadPolicy
 from eventmem.core.retrieval import candidates, tokens, valid
 
 from .computer import redact
@@ -86,7 +87,10 @@ class Contexts:
         provider.timeout = 90
         return provider
 
-    def _current(self, item):
+    def _current(self, item, policy=None):
+        """A derived view is current only while every input is one this read may still see.
+        With a policy, an item that depends on something outside its purpose is a miss, so a
+        cache written before the classification existed invalidates itself instead of replaying."""
         with self.engine.db.connect() as conn:
             dependency = item.get("digest_dependency")
             if dependency:
@@ -112,6 +116,8 @@ class Contexts:
                     node = self.memory.graph.get(conn, dependency["id"])
                     if node["revision"] != dependency["revision"] or not self.memory.graph.fresh(conn, node):
                         return False
+                    if policy is not None and not self.memory.graph.visible(conn, [node], policy):
+                        return False
                 except Missing:
                     return False
             coverage = item.get("coverage_dependency")
@@ -122,6 +128,8 @@ class Contexts:
                 try:
                     record = self.engine._get(conn, identifier)
                     if record["revision"] != revision or record["scope"] != self.mind.scope.model_dump():
+                        return False
+                    if policy is not None and not policy.visible(record, item.get("historical", False)):
                         return False
                     if record["status"] not in {"active", "unverified"} and not item.get("historical"):
                         return False
@@ -150,11 +158,13 @@ class Contexts:
                     current = self.memory._get(conn, node["id"])
                     if current["revision"] != node["revision"] or not self.memory._fresh(conn, current):
                         return False
+                    if policy is not None and not self.memory.graph.visible(conn, [current], policy):
+                        return False
                 except Missing:
                     return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False):
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None):
         """A cache entry covers exact input revisions and query purpose, not DB age."""
         if not 0 <= budget <= 32000:
             raise ValueError("Invalid context budget")
@@ -162,7 +172,10 @@ class Contexts:
             raise ValueError("Invalid compression work deadline")
         started = time.monotonic()
         model_requests = 0
-        stale_ids = [i["id"] for i in items if not self._current(i)]
+        # Half-migrated: stored text was compressed under rules that are still being applied,
+        # so every summary cache is a miss until the migration finishes.
+        strict = policy is not None and policy.strict
+        stale_ids = [i["id"] for i in items if not self._current(i, policy)]
         items = [redact(i) for i in items if i["id"] not in stale_ids]
         source = {i["id"]: i for i in items}
         raw = "\n".join(self._line(i) for i in items)
@@ -170,10 +183,10 @@ class Contexts:
             return {"text": raw, "tokens": tokens(raw), "state": "original", "covered_ids": list(source), "omitted_ids": stale_ids, "needs_review_ids": stale_ids, "items": items, "cache_hit": False, "model_requests": 0}
         cache_id = digest([self.mind.scope.key(), PROMPT_VERSION, query, budget, items, *(["complete-evidence-v1"] if require_all else [])])
         with self.engine.db.connect() as conn:
-            row = conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
+            row = None if strict else conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
         if row:
             result = json.loads(row[0])
-            if all(self._current(i) for i in items) and (not require_all or not result.get("omitted_ids")):
+            if all(self._current(i, policy) for i in items) and (not require_all or not result.get("omitted_ids")):
                 self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "complete"})
                 return {**result, "cache_hit": True, "model_requests": 0}
         if allow_model and budget >= 128 and items:
@@ -215,7 +228,7 @@ class Contexts:
                     payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "Every input must be represented in a summary. Merge related or duplicate material while retaining each input ID; this evidence review cannot finish with omitted inputs."} if require_all else {})}
                     part_key = digest(["compression-part", self.mind.scope.key(), PROMPT_VERSION, getattr(provider,"model",None), payload])
                     with self.engine.db.connect() as connection:
-                        cached = connection.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (part_key,self.mind.scope.key())).fetchone()
+                        cached = None if strict else connection.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (part_key,self.mind.scope.key())).fetchone()
                     if cached:
                         cached = json.loads(cached[0])
                         if not require_all or not cached["value"].get("omitted_ids"):
@@ -286,7 +299,7 @@ class Contexts:
                         omitted.extend(entry["item_ids"])
                         continue
                     lines.append(line); selected.append(entry); covered.extend(entry["item_ids"])
-                if not all(self._current(i) for i in items):
+                if not all(self._current(i, policy) for i in items):
                     raise Conflict("Sources changed while compressing")
                 text = "\n".join(lines)
                 result = {"text": text, "tokens": tokens(text), "state": "compressed" if lines else "insufficient",
@@ -315,7 +328,7 @@ class Contexts:
         return dumps({"id": item["id"], "revision": item.get("revision", 1), "basis": item.get("basis", "inferred"),
                       "text": item["text"], **({"facts": item["facts"]} if item.get("facts") else {})})
 
-    def node_item(self, node):
+    def node_item(self, node, *, policy=None):
         facts = {k: node[k] for k in ("state", "created_by", "channel", "visibility", "mode", "topic_id") if k in node}
         if "share_coverage" in node:
             facts["share_coverage"] = node["share_coverage"]
@@ -336,7 +349,10 @@ class Contexts:
                 records = []
                 for rid in node.get("record_ids", [])[-6:]:
                     try:
-                        records.append(self.engine._get(conn, rid)["content"])
+                        record = self.engine._get(conn, rid)
+                        # The title always stands; a member's own text only where this read may see it.
+                        if policy is None or policy.visible(record):
+                            records.append(record["content"])
                     except Missing:
                         pass
             text += "\n" + "\n".join(records)
@@ -345,15 +361,31 @@ class Contexts:
         return {"id": node["id"], "revision": node["revision"], "basis": "observed", "text": text, "facts": facts,
                 "node_dependency": {"id": node["id"], "revision": node["revision"]}}
 
-    def graph_item(self, node, edges=(), *, compact=False):
+    def graph_item(self, node, edges=(), *, compact=False, policy=None):
         with self.engine.db.connect() as conn:
             if compact:
                 edges = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) ORDER BY id LIMIT 8", (self.mind.scope.key(),node["id"],node["id"]))]
             related = [e for e in edges if node["id"] in (e["subject"], e["object"]) and self.memory.graph.fresh(conn, e)]
             facts = {k: node[k] for k in ("kind", "occurred_at", "basis", "owner_id", "created_by", "state", "entity_type", "aliases") if node.get(k) is not None}
+            basis, fallback = node.get("basis", "inferred"), []
             text = node.get("text") or node["title"]
             if not node.get("text") and node.get("record_ids"):
-                text = "\n".join(self.engine._get(conn, r)["content"] for r in node["record_ids"][:1])
+                # A projection carries no text of its own. Falling back to the raw record would
+                # carry a whole role agreement out under the node's basis, so the fallback and
+                # the basis both follow the class of the record behind it.
+                for rid in node["record_ids"][:1]:
+                    record = self.engine._get(conn, rid)
+                    if policy is not None and not policy.visible(record):
+                        continue
+                    fallback.append(record["content"])
+                    if policy is not None:
+                        found = policy.classify(record)
+                        if found.kind != "experience":
+                            basis = facts["basis"] = found.kind
+                        elif found.label:
+                            facts["evidence_label"] = found.label
+                if fallback:
+                    text = "\n".join(fallback)
             facts["relations"] = [{k: e.get(k) for k in ("id", "subject", "object", "predicate", "layer", "basis", "role", "reason")} for e in related[:8]]
             deps = [{"id": n["id"], "revision": n["revision"]} for n in [node, *related[:8]]]
             coverage_dep = None
@@ -383,6 +415,9 @@ class Contexts:
             if node["kind"] in {"event", "thread"} and self.memory.settings(conn)["event_lifecycle"]:
                 from .lifecycle import EventLifecycle
                 event_digest = EventLifecycle(self.mind, self.memory.graph).read(node["id"], conn)
+                if policy is not None and policy.strict and event_digest["state"] == "ready":
+                    # Summarized before the migration finished: shown as pending, never served.
+                    event_digest = {**event_digest, "state": "dirty"}
                 facts["digest_state"] = event_digest["state"]
                 facts["digest_revision"] = event_digest["revision"]
                 if event_digest["state"] == "ready":
@@ -395,16 +430,17 @@ class Contexts:
                     # Its root's older routing proof is historical provenance.
                     deps = [{"id": e["id"], "revision": e["revision"]} for e in related[:8]]
             return {"id": node["id"], "revision": digest([deps, coverage_dep, digest_dep]), "text": text, "facts": facts,
-                "read_depth": "summary" if digest_dep or node.get("text") or node.get("record_ids") else "index",
-                "basis": node.get("basis", "inferred"), "graph_dependencies": deps, "coverage_dependency": coverage_dep,
+                "read_depth": "summary" if digest_dep or node.get("text") or fallback else "index",
+                "basis": basis, "graph_dependencies": deps, "coverage_dependency": coverage_dep,
                 **({"digest_dependency": digest_dep, "dependencies": record_deps} if digest_dep else {})}
 
     @_lane_from_purpose("read")
-    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None):
+    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None, recall_purpose="experience_recall"):
         if detail not in {"index", "summary", "original"}:
             raise ValueError("Event detail must be index, summary or original")
         if cursor < 0 or budget < 0:
             raise ValueError("Event cursor and budget must be nonnegative")
+        policy = ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
         with self.engine.db.connect() as conn:
             anchor = self.memory.graph.get(conn, identifier, follow=True)
             if expected_revision is not None and anchor["revision"] != expected_revision:
@@ -418,11 +454,12 @@ class Contexts:
         if detail == "original":
             from .lifecycle import EventLifecycle
             with self.engine.db.connect() as conn:
-                snapshot = EventLifecycle(self.mind, self.memory.graph).snapshot(conn, identifier)
+                snapshot = EventLifecycle(self.mind, self.memory.graph).snapshot(conn, identifier, policy=policy)
+            # `snapshot` applies the policy to membership; the page is labelled from the same one.
             records = sorted(snapshot["records"].values(), key=lambda r: (r["valid_from"], r["id"]), reverse=True)
             page = records[cursor:cursor + 8]
-            items = [self.record_item(r) for r in page]
-            packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), allow_model=False))
+            items = [self.record_item(r, policy=policy) for r in page]
+            packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), allow_model=False, policy=policy))
             packed.pop("items", None)
             used(packed)
             return {**packed, "focus": identifier, "revision": anchor["revision"], "detail": detail,
@@ -430,41 +467,47 @@ class Contexts:
                     "index": [{"id": r["id"], "revision": r["revision"], "read_url": r.get("read_url") or f"/v1/memories/{r['id']}"} for r in page],
                     "next_action": "read_source_or_increase_budget" if packed["omitted_ids"] else None,
                     "instruction_authority": "data"}
-        graph = self.memory.graph.read(focus=identifier, hops=3, cursor=cursor, limit=8)
+        graph = self.memory.graph.read(focus=identifier, hops=3, cursor=cursor, limit=8, policy=policy)
         if detail == "index":
             return {"state": "index", "text": "", "tokens": 0, "focus": identifier, "revision": anchor["revision"],
                     "cursor": graph["cursor"], "detail": detail, "instruction_authority": "data",
                     "index": [{k: n.get(k) for k in ("id", "title", "kind", "revision", "needs_review")} for n in graph["nodes"]]}
-        items = [self.graph_item(n, graph["edges"]) for n in graph["nodes"] if not n["needs_review"]]
+        items = [self.graph_item(n, graph["edges"], policy=policy) for n in graph["nodes"] if not n["needs_review"]]
         summary_state, stale_revision = None, None
         if self.memory.settings()["event_lifecycle"] and anchor["kind"] in {"event", "thread"}:
             from .lifecycle import EventLifecycle
             lifecycle = EventLifecycle(self.mind, self.memory.graph)
             with self.engine.db.connect() as conn:
                 current = lifecycle.read(identifier, conn)
-                snapshot = lifecycle.snapshot(conn, identifier)
-            summary_state = current["state"]
+                snapshot = lifecycle.snapshot(conn, identifier, policy=policy)
+            summary_state = "dirty" if policy.strict and current["state"] == "ready" else current["state"]
             if summary_state == "ready":
-                items = [self.graph_item(anchor, compact=True), *[i for i in items if i["id"] != identifier]]
+                items = [self.graph_item(anchor, compact=True, policy=policy), *[i for i in items if i["id"] != identifier]]
             else:
-                # Return current evidence while an older derived view refreshes.
-                items = [self.record_item(r) for r in list(snapshot["records"].values())[cursor:cursor + 8]]
-                old = current.get("data", {})
+                # Return current evidence while an older derived view refreshes. A summary written
+                # before the migration finished is not shown even as a stale one.
+                items = [self.record_item(r, policy=policy) for r in list(snapshot["records"].values())[cursor:cursor + 8]]
+                old = {} if policy.strict else current.get("data", {})
                 if old.get("narrative"):
                     stale_revision = current["revision"]
                     items.append({"id": "stale-digest:" + identifier, "revision": stale_revision,
                         "basis": "stale-derived-view", "text": dumps({k: old.get(k, []) for k in ("narrative", "conclusions", "pending", "corrections")}),
                         "facts": {"summary_state": "stale", "use_as_current_fact": False}})
-        packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), provider=provider))
+        packed = self._compact_receipt(self.pack(items, query, max(0, budget-self._read_overhead(items)), provider=provider, policy=policy))
         packed.pop("items", None)
         used(packed)
         return {**packed, "cursor": graph["cursor"], "focus": identifier, "revision": anchor["revision"], "detail": detail,
             "summary_state": summary_state, "stale_summary_revision": stale_revision,
             "index": [{k: n.get(k) for k in ("id", "kind", "revision", "needs_review")} for n in graph["nodes"]], "instruction_authority": "data"}
 
-    def record_item(self, record, *, historical=False):
-        return {"id": record["id"], "revision": record["revision"], "text": record["content"], "basis": record["confirmation"],
-                "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until")},
+    def record_item(self, record, *, historical=False, policy=None):
+        # What is not experience is shown under its class, never as `explicit`. A caller without a
+        # policy still gets the label: classification does not depend on what the read is for.
+        found = (policy or ReadPolicy.load(self.engine, self.mind.scope, "audit")).classify(record)
+        return {"id": record["id"], "revision": record["revision"], "text": record["content"],
+                "basis": record["confirmation"] if found.kind == "experience" else found.kind,
+                "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until"),
+                          **({"evidence_label": found.label} if found.kind == "experience" and found.label else {})},
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
     def _overview_key(self, item):
@@ -473,25 +516,27 @@ class Contexts:
     def warm(self, query="", provider=None):
         """One background request prepares reusable, source-versioned overviews.
         A question-specific read can still expand every original source."""
+        # An overview is reused by ordinary recall, so it is prepared from what recall may see.
+        policy = ReadPolicy.load(self.engine, self.mind.scope, "experience_recall")
         items = []
         if self.memory.settings()["graph_recall"]:
-            graph = self.memory.graph.read(query=query, limit=40, hops=1)
-            items = [self.graph_item(n, graph["edges"], compact=True) for n in graph["nodes"]
+            graph = self.memory.graph.read(query=query, limit=40, hops=1, policy=policy)
+            items = [self.graph_item(n, graph["edges"], compact=True, policy=policy) for n in graph["nodes"]
                      if n["kind"] == "finding" and not n["needs_review"]][:3]
-        items += [self.node_item(n) for kind, limit in (("work", 3), ("share", 5))
+        items += [self.node_item(n, policy=policy) for kind, limit in (("work", 3), ("share", 5))
                  for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"]]
         if self.memory.settings().get("continuity_overviews"):
             from .continuity_manifest import ContinuityManifest
-            items = [*ContinuityManifest(self.mind, contexts=self).select(query)["items"], *items]
+            items = [*ContinuityManifest(self.mind, contexts=self).select(query, policy=policy)["items"], *items]
         items = list({i["id"]: i for i in items}.values())
-        items = [i for i in items if tokens(i["text"]) > 120 and not self._overview(i).get("cached_summary")]
+        items = [i for i in items if tokens(i["text"]) > 120 and not self._overview(i, policy).get("cached_summary")]
         items = items[:5]
         if not items:
             return {"state": "idle", "model_requests": 0}
         content = [{**i, "facts": {}} for i in items]
         provider = provider or self._provider()
         provider.background = True
-        result = self.pack(content, "Summarize source text only; current delivery/status/identity metadata is added separately by the host. Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider)
+        result = self.pack(content, "Summarize source text only; current delivery/status/identity metadata is added separately by the host. Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider, policy=policy)
         if result["state"] == "compressed":
             original = {i["id"]: i for i in items}
             with self.engine.db.connect(write=True) as conn:
@@ -503,11 +548,13 @@ class Contexts:
                     conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (key, self.mind.scope.key(), dumps({"text": entry["summary"], "source": item, "receipt": result.get("receipt"), "coverage": "overview"}), self.mind.clock()))
         return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt", "elapsed_ms"}}
 
-    def _overview(self, item):
+    def _overview(self, item, policy=None):
+        if policy is not None and policy.strict:
+            return item
         key = self._overview_key(item)
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (key, self.mind.scope.key())).fetchone()
-        if row and self._current(item):
+        if row and self._current(item, policy):
             cached = json.loads(row[0])
             if tokens(cached["text"]) < tokens(item["text"]):
                 return {**item, "text": cached["text"], "cached_summary": True, "facts": {**item.get("facts", {}), "coverage": "overview; original available by ID"}}
@@ -534,9 +581,10 @@ class Contexts:
     @_lane_from_purpose("read")
     def read_history(self, kind, *, query="", identifier=None, cursor=0, budget=2000, provider=None):
         found = self.memory.history(kind, query=query, identifier=identifier, cursor=cursor, limit=8)
-        items = [self.node_item(n) for n in found["items"] if not n["needs_review"]]
+        policy = ReadPolicy.load(self.engine, self.mind.scope, "experience_recall")
+        items = [self.node_item(n, policy=policy) for n in found["items"] if not n["needs_review"]]
         overhead = self._read_overhead(items)
-        packed = self._compact_receipt(self.pack(items, query, max(0, budget - overhead), provider=provider))
+        packed = self._compact_receipt(self.pack(items, query, max(0, budget - overhead), provider=provider, policy=policy))
         packed.pop("items", None)
         return {**packed, "cursor": found["cursor"], "total": found["total"],
                 "index": [{k: n.get(k) for k in ("id", "kind", "revision", "needs_review")} for n in found["items"]], "instruction_authority": "data"}
@@ -575,24 +623,26 @@ class Contexts:
             if selected and stop - offset > length:
                 break
             selected.append(paragraph); end = stop
-        item = self.record_item(record, historical=True)
+        # An explicit read by id is an audit read: the text is all there, labelled for what it is.
+        policy = ReadPolicy.load(self.engine, self.mind.scope, "audit")
+        item = self.record_item(record, historical=True, policy=policy)
         item["text"] = "\n\n".join(selected)
         item["id"] += ":segment:" + str(offset)
         overhead = self._read_overhead([item], {"source_ids": record["source_ids"], "read_url": record["read_url"]})
-        result = self._compact_receipt(self.pack([item], record["title"], max(0, budget - overhead), provider=provider))
+        result = self._compact_receipt(self.pack([item], record["title"], max(0, budget - overhead), provider=provider, policy=policy))
         result.pop("items", None)
         depth = "summary" if result["state"] == "compressed" else "original" if result["covered_ids"] else "index"
         if session:
             self.memory.access(session, record["id"], record["revision"], depth)
-        return {"id": record["id"], "revision": record["revision"], "confirmation": record["confirmation"],
+        return policy.present(record, {"id": record["id"], "revision": record["revision"], "confirmation": record["confirmation"],
                 "source_ids": record["source_ids"], "content": result.pop("text"), **result,
                 "content_length": len(content), "depth": depth,
                 "cursor": str(end) if result["covered_ids"] and end < len(content) else None,
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
-                "read_url": record["read_url"], "instruction_authority": "data"}
+                "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall"):
         started = time.monotonic()
         if mode not in {"auto", "light", "deep"}:
             raise ValueError("Unknown recall mode")
@@ -612,8 +662,11 @@ class Contexts:
         if not settings["context"]:
             return {"state": "disabled", "text": "", "tokens": 0}
         explicit = purpose == "read"
+        # `purpose` is the budget this context is built for; `recall_purpose` is what the recalled
+        # records may be. One policy for the whole build, handed to every record lane.
+        policy = ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
         window = self.window(session) if session else {"used": 0, "epoch": "", "seen": {}, "receipts": {}}
-        if event_id and event_id in window["receipts"]:
+        if event_id and self._receipt_current(window["receipts"].get(event_id), policy):
             return window["receipts"][event_id]
         if session and not explicit:
             if window["used"] == 0 and purpose == "chat":
@@ -637,34 +690,35 @@ class Contexts:
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
             recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
-                allow_model=allow_model, deadline=started + 150)
+                allow_model=allow_model, deadline=started + 150, policy=policy)
             items.extend(recalled)
         elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
             graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),
-                limit=16 if settings["adaptive_recall"] else 40, hops=1 if settings["adaptive_recall"] else 2)
+                limit=16 if settings["adaptive_recall"] else 40, hops=1 if settings["adaptive_recall"] else 2, policy=policy)
             selected_nodes = sorted(graph["nodes"], key=lambda n: n["kind"] != "finding")
-            items.extend(self.graph_item(n, graph["edges"], compact=not explicit) for n in selected_nodes[:8]
+            items.extend(self.graph_item(n, graph["edges"], compact=not explicit, policy=policy) for n in selected_nodes[:8]
                          if not n["needs_review"] and not (settings["adaptive_recall"] and host_envelope(n.get("text", ""))))
         local_recall_seconds = time.monotonic() - recall_started
         items.append(affect_item)
         for kind, limit in (("work", 3), ("share", 5)):
-            items.extend(self.node_item(n) for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"])
+            items.extend(self.node_item(n, policy=policy) for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"])
         if query and not adaptive_deep:
             recall_started = time.monotonic()
             # Only the lexical query has a compact keyword projection. The full
             # question is retained for semantic compression and explicit reads.
             from eventmem.core.db import tokenize
             lookup = query if len(query) <= 4000 else " ".join(list(dict.fromkeys(tokenize(query).split()))[:80])
-            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
-            docs, _, _ = candidates(self.engine, request, full_lexical=True)
-            eligible = [r for r in docs if valid(r, request) is None and
-                        not (settings["adaptive_recall"] and host_envelope(r["content"]))]
-            items.extend(self.record_item(r, historical=history) for r in eligible[:24])
+            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history, recall_purpose=recall_purpose)
+            docs, _, _ = candidates(self.engine, request, full_lexical=True, policy=policy)
+            # The policy decides about host envelopes; the prefix rule stands only with its switch off.
+            eligible = [r for r in docs if valid(r, request, policy) is None and
+                        not (settings["adaptive_recall"] and not policy.enabled and host_envelope(r["content"]))]
+            items.extend(self.record_item(r, historical=history, policy=policy) for r in eligible[:24])
             local_recall_seconds += time.monotonic() - recall_started
         recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
             from .continuity_manifest import ContinuityManifest
-            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent)
+            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy)
             # Keep runtime first, then indivisible facts (authorship, coverage,
             # conditions), ahead of older broad lexical summaries.
             items = [*[i for i in items if i["id"] in {"host-runtime", "current-intent"}], *linked["items"], *items]
@@ -681,7 +735,7 @@ class Contexts:
             items = AdaptiveRecall(self).temperature_order(items, explicit=explicit or mode == "deep")
         if not explicit:
             items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
-            items = [self._overview(i) for i in items]
+            items = [self._overview(i, policy) for i in items]
         start = int(cursor)
         page_size = 8 if explicit else 16
         selected = items[start:start + page_size]
@@ -701,7 +755,7 @@ class Contexts:
         overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected, recall_info)
         remaining = 150 - (time.monotonic() - started)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider,
-                           allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining))
+                           allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining), policy=policy)
         if explicit:
             self._compact_receipt(packed)
         if not explicit:
@@ -712,7 +766,8 @@ class Contexts:
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index"} for i in selected],
-                      instruction_authority="data", purpose=purpose)
+                      instruction_authority="data", purpose=purpose,
+                      **({"recall_purpose": recall_purpose} if recall_purpose != "experience_recall" else {}))
         compression_requests = packed.get("model_requests", 0)
         packed.update(recall_info)
         packed["compression_model_requests"] = compression_requests
@@ -752,11 +807,15 @@ class Contexts:
         if session and not explicit:
             with self.engine.db.connect(write=True) as conn:
                 current = self.window(session, conn=conn)
-                if event_id and event_id in current["receipts"]:
+                stored = current["receipts"].get(event_id) if event_id else None
+                if stored is not None and self._receipt_current(stored, policy):
                     return current["receipts"][event_id]
-                if current["epoch"] != window["epoch"] or current["used"] + packed["tokens"] > 12000:
+                # A replaced receipt gives its budget back before the new one takes its own:
+                # one event was injected once, however many times its content was invalidated.
+                refund = (stored or {}).get("tokens", 0)
+                if current["epoch"] != window["epoch"] or current["used"] - refund + packed["tokens"] > 12000:
                     raise Conflict("Context window changed; rebuild before injection")
-                current["used"] += packed["tokens"]
+                current["used"] += packed["tokens"] - refund
                 for i in selected:
                     if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]:
                         current["seen"][i["id"]] = i["revision"]
@@ -767,6 +826,34 @@ class Contexts:
             for item in packed["index"]:
                 self.memory.access(session, item["id"], str(item["revision"]), item["depth"])
         return packed
+
+    def _receipt_current(self, receipt, policy):
+        """A stored window receipt is replayed only while everything it rendered is still
+        something this read may see. A receipt written before the classification existed names
+        its evidence, so it is checked against the records and nodes themselves, not a stamp."""
+        if not isinstance(receipt, dict):
+            return False
+        index = receipt.get("index")
+        if not policy.enabled or index is None:
+            return True
+        if policy.strict:
+            return False
+        with self.engine.db.connect() as conn:
+            for entry in index:
+                identifier = entry.get("id", "")
+                if identifier.startswith("mem_"):
+                    try:
+                        if not policy.visible(self.engine._get(conn, identifier)):
+                            return False
+                    except Missing:
+                        return False
+                elif identifier.startswith("graph_"):
+                    try:
+                        if not self.memory.graph.visible(conn, [self.memory.graph.get(conn, identifier)], policy):
+                            return False
+                    except Missing:
+                        return False
+        return True
 
     def window(self, session, conn=None):
         if conn is None:

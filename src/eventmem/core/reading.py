@@ -58,6 +58,11 @@ def read_segment(
                 (session, scope, dumps(state)),
             )
         engine.feedback(record_id, "read", session)
+    from .read_policy import ReadPolicy
+
+    # A read by id is an audit read. The text is all there; what is not experience is shown
+    # under its class instead of the confirmation it was stored with.
+    ReadPolicy.load(engine, Scope(**result["scope"]), "audit").present(result, result)
     result.update(
         content=piece,
         content_length=len(content),

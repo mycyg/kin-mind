@@ -664,7 +664,7 @@ class DeepSeek:
     def appraise(self, context):
         started = time.monotonic()
         self.failure_receipt = None
-        # An expansion round and (WP4) a revalidation are appraisal calls with a purpose
+        # An expansion round and a revalidation are appraisal calls with a purpose
         # of their own; every other call takes its purpose from its tool name.
         purpose = getattr(self, "call_purpose", None) or "appraise"
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
@@ -1357,6 +1357,7 @@ class Appraisals:
                         shares = {json.loads(r[0]).get("receipt", {}).get("share_id") for r in old} - {None}
                         memory_context["shares"] = [self.memory._get(conn, identifier) for identifier in shares]
                         historical_query = "\n".join(json.loads(r[0]).get("text", "") for r in old)
+                        # A historical appraisal reads the same way a current one does.
                         graph = self.memory.graph.candidates(conn, historical_query)
                         for node in graph:
                             node["needs_review"] = not self.memory.graph.fresh(conn, node)

@@ -42,6 +42,18 @@ class ClaimInput(Model):
         return self
 
 
+class SupersessionInput(Model):
+    command_id: str = Field(min_length=1, max_length=200)
+    old_id: str
+    new_id: str
+    # Both claims are compared and swapped: a chain is repaired against the state it was read in.
+    expected_revisions: dict[str, int] = Field(min_length=2, max_length=2)
+
+
+# The reason stored on the repaired revision. A chain repair has no text of its own to quote.
+SUPERSESSION_REASON = "A later claim on the same aspect and context replaces this one"
+
+
 class PredictionInput(Model):
     command_id: str = Field(min_length=1, max_length=200)
     claim_id: str
@@ -189,6 +201,50 @@ class SelfKnowledge:
             return row
 
         return self._command("claim", request, run)
+
+    def link_supersession(self, old_id, new_id, expected_revisions, command_id):
+        """Repeat what `claim()` does to the claim it replaces, without inserting a record.
+
+        A chain repaired after the fact has no new claim to make and no current explicit
+        evidence to offer: both claims are already stored. Calling `claim()` would mint a
+        duplicate of the later one and refuse anything whose evidence has since moved on.
+        """
+        request = SupersessionInput(command_id=command_id, old_id=old_id, new_id=new_id,
+                                    expected_revisions={str(k): int(v) for k, v in dict(expected_revisions).items()})
+
+        def run(conn):
+            if request.old_id == request.new_id:
+                raise Conflict("A claim cannot supersede itself", kind="semantic", code="supersession-invalid")
+            old, new = self._get(conn, request.old_id, "claim"), self._get(conn, request.new_id, "claim")
+            for row in (old, new):
+                if request.expected_revisions.get(row["id"]) != row["revision"]:
+                    raise Conflict("Self-claim revisions changed before the supersession", kind="runtime",
+                                   code="supersession-revision-changed", target=row["id"],
+                                   expected=request.expected_revisions.get(row["id"]), actual=row["revision"])
+            prior, later = metadata(old), metadata(new)
+            if prior.get("basis") != "role" or later.get("basis") != "role":
+                raise Conflict("Only role claims are chained by a supersession", kind="semantic", code="supersession-invalid")
+            if any(prior[key].casefold() != later[key].casefold() for key in ("aspect", "context", "basis")):
+                raise Conflict("A supersession keeps the same aspect, context and basis", kind="semantic", code="supersession-invalid")
+            if old["status"] not in {"active", "unverified"}:
+                raise Conflict("Only a current claim can be superseded", kind="semantic",
+                               code="supersession-invalid", target=old["id"], actual=old["status"])
+            if new["valid_from"] <= old["valid_from"]:
+                # `valid_until` must be later than `valid_from`; a tie is left to the caller.
+                raise Conflict("A superseding claim must be valid after the one it replaces", kind="semantic",
+                               code="supersession-invalid", target=old["id"])
+            old["status"] = "superseded"
+            old["valid_until"] = new["valid_from"]
+            old["attributes"]["superseded_by"] = new["id"]
+            self.engine._save_revision(conn, old, "self_claim_replaced", SUPERSESSION_REASON)
+            self.engine._relation(conn, old["id"], "superseded_by", new["id"], {})
+            self.engine.db.bump(conn)
+            return {"state": "linked", "old_id": old["id"], "new_id": new["id"], "revision": old["revision"]}
+
+        payload = {"scope": self.scope.model_dump(), "request": request.model_dump()}
+        key = "self:supersession:" + digest([self.scope.key(), request.command_id])
+        with self.engine.db.connect(write=True) as conn:
+            return self.engine.command(conn, key, payload, lambda: run(conn))
 
     def predict(self, request: PredictionInput):
         def run(conn):

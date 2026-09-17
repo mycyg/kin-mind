@@ -464,6 +464,13 @@ class Worker:
             records = [
                 json.loads(r[0]) for r in rows if not json.loads(r[0])["generated"]
             ]
+            from .read_policy import ReadPolicy
+
+            # A narrative tells what happened. A role agreement, its examples, a self-claim or
+            # a host envelope did not happen, so none of them is handed to the narrator.
+            policy = ReadPolicy.load(engine, scope, "experience_recall")
+            if policy.enabled:
+                records = [r for r in records if policy.visible(r)]
             result = Providers(engine).json(
                 "summary" if kind != "prediction" else "prediction",
                 'Return {"content":"...","evidence_ids":[id,...]}. Write only supported observations, preserving uncertainty. Predictions must be explicitly tentative. Do not invent feelings or user commitments.',

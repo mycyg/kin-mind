@@ -344,7 +344,12 @@ class EventLifecycle:
                 results.append(result)
         return results
 
-    def snapshot(self, conn, identifier):
+    def snapshot(self, conn, identifier, policy=None):
+        """Membership and its evidence as one read may see it. A summary is built from what
+        happened, so the default is an experience read; an audit caller passes its own policy."""
+        from eventmem.core.read_policy import ReadPolicy
+
+        policy = policy if policy is not None else ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
         anchor = self.graph.get(conn, identifier, follow=True)
         nodes, edges, frontier = {anchor["id"]: anchor}, {}, {anchor["id"]}
         while frontier:
@@ -395,12 +400,20 @@ class EventLifecycle:
                     records[rid] = record
                 except Missing:
                     missing.append(rid)
-        active = {}
+        active, excluded = {}, []
         from .adaptive_recall import host_envelope
         for rid, record in records.items():
+            # With the policy on, one rule decides what a summary may be built from; with it off,
+            # the prefix heuristic this replaced still keeps host envelopes out. `excluded` counts
+            # only what the policy newly removes, so an event the old rule already trimmed the
+            # same way keeps its signature and is not rebuilt for nothing.
+            envelope = host_envelope(record["content"])
+            if not policy.visible(record) if policy.enabled else envelope:
+                if policy.enabled and not envelope:
+                    excluded.append(rid)
+                continue
             try:
-                refs = self.mind._evidence(conn, [rid])
-                if not host_envelope(record["content"]) and self.mind._fresh(conn, refs):
+                if self.mind._fresh(conn, self.mind._evidence(conn, [rid])):
                     active[rid] = record
             except (Missing, Conflict):
                 pass
@@ -412,8 +425,12 @@ class EventLifecycle:
                      [(i, e["revision"], e["state"]) for i, e in sorted(edges.items())],
                      [(i, r["revision"], r["status"], r.get("valid_until")) for i, r in sorted(records.items())],
                      sorted(missing), sources, sorted(active)]
+        if excluded:
+            # Only a summary the policy actually changed carries the rules version, so a later
+            # version re-dirties exactly those and no untouched event is rebuilt for nothing.
+            signature.append([policy.rules_version, sorted(excluded)])
         return {"event": anchor, "nodes": nodes, "edges": edges, "records": active, "all_records": records,
-                "missing": sorted(missing), "input_hash": digest(signature)}
+                "missing": sorted(missing), "excluded": sorted(excluded), "input_hash": digest(signature)}
 
     def read(self, identifier, conn=None):
         if conn is None:
@@ -428,6 +445,19 @@ class EventLifecycle:
             value["state"] = "dirty"
         value["pending"] = value["state"] != "ready"
         return value
+
+    def archive(self, conn, kind, identifier):
+        """Keep the derived text a policy change retires, before the rebuild replaces it.
+        Idempotent by (kind, identifier, revision); nothing is ever hard-deleted."""
+        from eventmem.core.read_policy import RULES_VERSION
+
+        row = conn.execute("SELECT revision,data FROM mind_event_digests WHERE scope=? AND event_id=?",
+                           (self.scope.key(), identifier)).fetchone()
+        if not row or not json.loads(row["data"] or "{}"):
+            return False
+        conn.execute("INSERT OR IGNORE INTO mind_isolation_archive VALUES(?,?,?,?,?,?,?)",
+                     (self.scope.key(), kind, identifier, row["revision"], RULES_VERSION, self.mind.clock(), row["data"]))
+        return True
 
     def prepare_digest(self, identifier, provider=None):
         from eventmem.core.retrieval import tokens
@@ -503,6 +533,8 @@ class EventLifecycle:
             row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?", (self.scope.key(), identifier)).fetchone()
             if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
                 raise Conflict("Event changed during digest generation")
+            if snapshot["excluded"]:
+                self.archive(conn, "event_digest", identifier)
             # Second phase: the digest is servable only now that the event is still the
             # one it was made from. The projection branch carries no token and is a no-op.
             from .judgment_cache import accept
@@ -529,9 +561,13 @@ class EventLifecycle:
                                  "(? IS NULL OR occurred_at<? OR (occurred_at=? AND id>?)) ORDER BY occurred_at DESC,id LIMIT ?",
                                  (self.scope.key(), after[0] if after else None, after[0] if after else None, after[0] if after else None,
                                   after[1] if after else "", limit)).fetchall()
+        from eventmem.core.read_policy import ReadPolicy
+        # One policy for the whole sweep: this connection writes, so a per-node load would
+        # rebuild the classification for every node it marks.
+        policy = ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
         for node in nodes:
             if (not conn.execute("SELECT 1 FROM mind_event_digests WHERE scope=? AND event_id=?", (self.scope.key(), node[0])).fetchone()
-                    and self.snapshot(conn, node[0])["records"]):
+                    and self.snapshot(conn, node[0], policy=policy)["records"]):
                 mark_dirty(conn, self.scope.key(), [node[0]], self.mind.clock(), "historical-backfill")
         return {"processed": len(nodes), "cursor": dumps([nodes[-1]["occurred_at"], nodes[-1]["id"]]) if len(nodes) == limit else None}
 

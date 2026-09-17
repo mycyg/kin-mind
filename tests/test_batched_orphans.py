@@ -162,7 +162,7 @@ def test_quarantined_parent_returns_its_children_to_the_queue(system):
     schedule(mind, {parent: 0, child: 1})
     assert jobs.run_one(provider)["state"] == "pending"
     assert rows(mind)[child]["state"] == "batched"
-    # Only the historical lane quarantines today (WP3 generalizes the cap), so
+    # Only the historical lane quarantines here (the cap is generalized elsewhere), so
     # the carried batch is driven through that existing quarantine branch.
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE mind_appraisals SET available=0,data=json_set(data,'$.stimulus','memory-enrichment') WHERE id=?", (parent,))

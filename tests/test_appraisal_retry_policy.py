@@ -1,5 +1,5 @@
 """Bounded appraisal retries (A4/A10/A5): every lane has a cap, preparation
-waits are not failures, and a failure is described back to the model (WP3)."""
+waits are not failures, and a failure is described back to the model."""
 
 import asyncio
 import json

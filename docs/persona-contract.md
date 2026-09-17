@@ -12,6 +12,12 @@ the SHA-256 of its UTF-8 bytes. `core` starts with `【MY_PERSONA_LOAD】` and e
 with `【/MY_PERSONA_LOAD】`. `mutable_trait_keys` names the interests or habits that
 the existing evidence-based evolution workflow may change.
 
+`approved_source` also names what a read may not take for lived experience: the
+source ids it lists, and the sources of any record id it lists, are classified as
+role configuration and are returned to a self-knowledge or audit read only. The
+contract is read leniently, so a contract awaiting host review never stops memory
+from being read. See [reading purpose and evidence classes](architecture.md#reading-purpose-and-evidence-classes).
+
 The host installs the approved core before SOUL in its instruction projections.
 The JavaScript adapter checks the exact core and hashes before synchronization.
 The Python consumers load the same scope-bound contract before model requests.

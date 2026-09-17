@@ -31,6 +31,7 @@ from .models import (
 from .organize import Organizer
 from .responses import RecallResult, RecordResult, SourceResult
 from .scheduler import Scheduler
+from .scheduler import phase as delivery_phase
 
 
 class CreateRecord(Model):
@@ -738,15 +739,19 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         cursor: str = "",
         limit: int = Query(50, ge=1, le=200),
     ) -> dict:
+        def item(row):
+            value = dict(row) | {"data": json.loads(row["data"])}
+            # Derived, never stored: the request of this 'sending' row is out.
+            label = delivery_phase(row) if table == "outbox" else None
+            return value | {"phase": label} if label else value
+
         with engine.db.connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM {table} WHERE id>? ORDER BY id LIMIT ?",
                 (cursor, limit + 1),
             ).fetchall()
             return {
-                "items": [
-                    dict(r) | {"data": json.loads(r["data"])} for r in rows[:limit]
-                ],
+                "items": [item(r) for r in rows[:limit]],
                 "cursor": rows[limit - 1]["id"] if len(rows) > limit else None,
             }
 

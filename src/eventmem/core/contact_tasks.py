@@ -200,4 +200,6 @@ class ContactTasks:
             raise ValueError("Use snooze to change the due time")
         with self.engine.db.connect() as conn:
             self._owned(conn, task_id)
+        # Passed through whole: `deliveries` and `reconciliation_required` tell the host
+        # which pending deliveries were canceled and which may already have been sent.
         return self.scheduler.control(task_id, action, expected_revision, due_at)

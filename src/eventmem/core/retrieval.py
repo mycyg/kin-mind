@@ -9,6 +9,7 @@ from functools import lru_cache
 
 from .db import Conflict, Missing, dumps, tokenize
 from .models import RecallRequest, Scope, now
+from .read_policy import ReadPolicy
 
 DEFAULTS = {
     "tool": {"startup": 2000, "passive": 256, "cumulative": 12000},
@@ -67,7 +68,9 @@ def permitted(data, request):
     )
 
 
-def valid(data, request):
+def valid(data, request, policy):
+    """`policy` is the read's ReadPolicy and has no default: a caller that validates without one
+    would decide for itself what counts as experience. `history` lifts status and expiry only."""
     if not permitted(data, request):
         return "scope"
     if (
@@ -78,8 +81,9 @@ def valid(data, request):
         return "raw_tool_requires_explicit_read"
     if data.get("attributes", {}).get("analysis_pending"):
         return "analysis_pending"
-    if data.get("attributes", {}).get("self_knowledge") and not request.history:
-        return "self_knowledge_requires_versioned_view"
+    refused = policy.refusal(data, request.history)
+    if refused:
+        return refused
     if request.kinds and data["kind"] not in request.kinds:
         return "kind"
     stamp = request.at or now()
@@ -95,10 +99,11 @@ def valid(data, request):
     return None
 
 
-def candidates(engine, request, *, full_lexical=False):
+def candidates(engine, request, *, full_lexical=False, policy=None):
     trace = {"channels": {}, "filtered": [], "ranked": [], "mode": request.mode}
     ranks: dict[str, float] = defaultdict(float)
     docs: dict[str, dict] = {}
+    loaded: dict[str, dict | None] = {}
     vector_revisions = {}
     scenario_policy = SCENARIOS.get(request.scenario, {}) | engine.settings(
         "scenarios"
@@ -109,6 +114,20 @@ def candidates(engine, request, *, full_lexical=False):
     placeholders = ",".join("?" for _ in scopes)
     with engine.db.connect() as conn:
         generation = engine.db.generation(conn)
+        if policy is None:
+            policy = ReadPolicy.load(engine, request.scope, request.recall_purpose, conn=conn)
+
+        def load(rid):
+            # One read per candidate, shared by the relation seeds and the final pass.
+            if rid not in loaded:
+                try:
+                    loaded[rid] = docs.get(rid) or engine._get(
+                        conn, rid, request.at, request.known_at
+                    )
+                except Missing:
+                    loaded[rid] = None
+            return loaded[rid]
+
         if request.known_at:
             # Historical evaluation uses revisions available at the cutoff, not a
             # current index whose future words could change candidate selection.
@@ -241,9 +260,21 @@ def candidates(engine, request, *, full_lexical=False):
                             channels["visual"].append(hit["id"])
                 except NotConfigured:
                     pass
-            seeds = list(dict.fromkeys(x for rows in channels.values() for x in rows))[
-                :40
-            ]
+            found = dict.fromkeys(x for rows in channels.values() for x in rows)
+            if policy.enabled:
+                # The policy is asked before a hit may seed the relation channel: a claim or a
+                # configuration this read refuses no longer ranks what it is related to. Status,
+                # expiry and kind still do not unseat a seed, so a superseded hit keeps leading
+                # to the record that replaced it.
+                seeds = []
+                for rid in found:
+                    data = load(rid)
+                    if data is not None and policy.refusal(data, request.history) is None:
+                        seeds.append(rid)
+                        if len(seeds) == 40:
+                            break
+            else:
+                seeds = list(found)[:40]
             if seeds:
                 marks = ",".join("?" for _ in seeds)
                 relations = conn.execute(
@@ -303,17 +334,14 @@ def candidates(engine, request, *, full_lexical=False):
                 weight = 2 if channel == "exact" else 0.25 if channel == "graph" else 1
                 ranks[rid] += weight / (60 + rank + 1)
         for rid in list(ranks):
-            try:
-                data = docs.get(rid) or engine._get(
-                    conn, rid, request.at, request.known_at
-                )
-            except Missing:
+            data = load(rid)
+            if data is None:
                 trace["filtered"].append(
                     {"id": rid, "reason": "deleted_or_index_stale"}
                 )
                 del ranks[rid]
                 continue
-            reason = valid(data, request)
+            reason = valid(data, request, policy)
             if reason:
                 trace["filtered"].append({"id": rid, "reason": reason})
                 del ranks[rid]
@@ -354,7 +382,8 @@ def recall(engine, request: RecallRequest):
         result = Contexts(Mind(engine, request.scope)).build(query=request.query,
             purpose="read" if request.phase in {"search", "read"} else "startup" if request.phase in {"startup", "compact"} else "chat",
             session=request.session or "", budget=request.budget, history=request.history,
-            allow_model=request.phase in {"search", "read"}, mode="deep" if request.mode == "deep" else "light")
+            allow_model=request.phase in {"search", "read"}, mode="deep" if request.mode == "deep" else "light",
+            recall_purpose=request.recall_purpose)
         return {**result, "items": result.get("index", []), "generation": engine.db.generation(), "accounts": {"memory": result["tokens"]}}
     started = time.perf_counter()
     engine.interactive_until = time.monotonic() + 2
@@ -387,6 +416,9 @@ def recall(engine, request: RecallRequest):
     # Serialize state updates across hosts. Recheck every candidate in the same
     # snapshot that consumes the session budget, including warm-cache returns.
     with engine.db.connect(write=bool(request.session)) as conn:
+        # The recheck judges by the policy of the snapshot it reads, on the connection it
+        # already holds; the classification behind it is cached per database generation.
+        read_policy = ReadPolicy.load(engine, request.scope, request.recall_purpose, conn=conn)
         state = {"seen": {}, "used": 0, "resident": {}, "checkpoint": None}
         if request.session:
             row = conn.execute(
@@ -408,7 +440,7 @@ def recall(engine, request: RecallRequest):
                 data = engine._get(conn, candidate["id"], request.at, request.known_at)
             except Missing:
                 continue
-            reason = valid(data, request)
+            reason = valid(data, request, read_policy)
             if reason:
                 trace["filtered"].append({"id": data["id"], "reason": reason})
                 continue
@@ -421,11 +453,8 @@ def recall(engine, request: RecallRequest):
                 trace["filtered"].append({"id": rid, "reason": "already_injected"})
                 continue
             body = data["content"]
-            prefix = f"[{rid} r{revision} {data['kind']} {data['status']}] "
-            self_info = data["attributes"].get("self_knowledge")
-            if self_info:
-                label = self_info.get("basis", self_info.get("entry", "self_knowledge"))
-                prefix += f"[{label} {data['confirmation']} {self_info.get('agent_version', 'unknown')}] "
+            # What is not experience is named by its class, never by the word `explicit`.
+            prefix = f"[{rid} r{revision} {data['kind']} {data['status']}] " + read_policy.prefix(data)
             line = prefix + body
             if tokens(line) > budget - used:
                 # Event contents remain intact behind the read link. A typed hint
@@ -450,21 +479,24 @@ def recall(engine, request: RecallRequest):
             )
             accounts[category] += length
             selected.append(
-                {
-                    k: data[k]
-                    for k in (
-                        "id",
-                        "title",
-                        "kind",
-                        "status",
-                        "revision",
-                        "source_ids",
-                        "read_url",
-                        "locator",
-                        "generated",
-                        "confirmation",
-                    )
-                }
+                read_policy.present(
+                    data,
+                    {
+                        k: data[k]
+                        for k in (
+                            "id",
+                            "title",
+                            "kind",
+                            "status",
+                            "revision",
+                            "source_ids",
+                            "read_url",
+                            "locator",
+                            "generated",
+                            "confirmation",
+                        )
+                    },
+                )
             )
             state["seen"][rid] = revision
             state["resident"][rid] = revision

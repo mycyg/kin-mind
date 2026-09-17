@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
+import {writeJsonAtomic,readJsonFile,loadJson} from './atomic-json.mjs';
 import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
 
@@ -8,6 +9,8 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
 export const ROUTER_MODELS = Object.freeze({chat:'deepseek-flash',work:'gpt-6-astra'});
+const LEDGER_TAIL_BYTES=1024*1024;
+export const NOTICE_SUPPRESSED='restart-restored-known-model';
 export function recentConversation(items) {
   const counts={user:0,assistant:0};
   return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
@@ -18,22 +21,40 @@ export function modeCommand(text) {
   if (value==='/mode auto') return 'auto';
   return null;
 }
-export function atomicJson(file, value) {
-  fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
-  const temporary=file+'.tmp-'+process.pid;
-  const fd=fs.openSync(temporary,'w',0o600);
-  try {fs.writeFileSync(fd,JSON.stringify(value,null,2));fs.fsyncSync(fd);} finally {fs.closeSync(fd);}
-  fs.renameSync(temporary,file);
+/** Every durable adapter state file is written through here: a temporary name no
+ * other writer can share, fsync before the rename, and — for the files that must
+ * survive a corrupt revision — the replaced one kept as `<file>.prev`. */
+export function atomicJson(file,value,{previous=false}={}) {writeJsonAtomic(file,value,{previous,pretty:true});}
+
+export const STATE_RECOVERY=Object.freeze({previous:'restored-from-previous-revision',none:'state-file-unreadable'});
+/** Load one durable state file: the file itself, else the `.prev` copy the writer
+ * keeps. An unreadable revision is moved to `quarantine/` beside it (never deleted)
+ * and reported as a text-free fact for status. A file written under another schema
+ * is reported to the caller, never moved: it is not damage. */
+export function loadState(file,{schema=1,validate=()=>true,now=()=>Date.now()}={}) {
+  const current=readJsonFile(file);
+  if(current.state==='ok'&&Number.isSafeInteger(current.value?.schema)&&current.value.schema!==schema)return {value:current.value,source:'current'};
+  const loaded=loadJson(file,{validate:value=>value?.schema===schema&&validate(value)===true,quarantine:path.join(path.dirname(file),'quarantine')});
+  if(loaded.source==='current'||(loaded.source==='none'&&!loaded.quarantined.length))return {value:loaded.value,source:loaded.source};
+  return {value:loaded.value,source:loaded.source,recovery:{at:now(),from:loaded.source,
+    reason:loaded.source==='previous'?STATE_RECOVERY.previous:STATE_RECOVERY.none,quarantined:loaded.quarantined.map(name=>path.basename(name))}};
 }
 
 /** One host owns this durable state; all provider changes and input acceptance
  * share its mutex. MCP requests only record intent and never wait for a turn. */
 export class MobileRouter {
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now});
+  /** `replyTail` is the host's reply-tail port (`pending`, `decided`, `missed`, `stopped`), all
+   * optional. It lets the unsent rest of an interrupted reply ride on the routing call this
+   * router makes anyway; without it nothing here changes. */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail});
     this.tail=Promise.resolve();this.inflight=new Map();
-    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
+    const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
+    this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
+    // A quarantined revision is never a silent fresh start: what happened is recorded,
+    // and with nothing left to restore the accepted inputs come back from the journal.
+    if(loaded.recovery){this.state.recovery=loaded.recovery;if(!loaded.value)this.state.recovery.restoredInputs=this.restoreLedger();}
     if(binding){
       if(this.state.conversationId&&this.state.conversationId!==binding.conversationId)throw Error('Router logical conversation mismatch');
       if(this.state.sessionId!==sessionId&&!this.state.conversationId)throw Error('Unmigrated router session mismatch');
@@ -52,8 +73,25 @@ export class MobileRouter {
     const event={at:this.now(),kind,...detail,revision:this.state.revision};
     this.state.history.push(event);
     this.state.history=this.state.history.slice(-200);
-    atomicJson(this.file,this.state);
+    atomicJson(this.file,this.state,{previous:true});
     fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify(event)+'\n',{mode:0o600});
+  }
+  /** With no revision left to restore, the append-only journal still names every
+   * input this router accepted. They come back unconfirmed, so a replayed input is
+   * refused until it is reconciled instead of being submitted a second time — and
+   * the restart profile waits rather than switching the provider under lost work. */
+  restoreLedger() {
+    let ids=[];
+    try {
+      const journal=this.file+'.events.jsonl',size=fs.statSync(journal).size,from=Math.max(0,size-LEDGER_TAIL_BYTES),handle=fs.openSync(journal,'r');
+      let body='';
+      try {const buffer=Buffer.alloc(size-from);fs.readSync(handle,buffer,0,buffer.length,from);body=buffer.toString('utf8');} finally {fs.closeSync(handle);}
+      ids=[...new Set(body.split('\n').slice(from?1:0).map(line=>{
+        try {const event=JSON.parse(line);return String(event?.kind).startsWith('input-')&&typeof event.id==='string'?event.id:null;} catch {return null;}
+      }).filter(Boolean))];
+    } catch {/* No journal: this router never accepted anything here. */}
+    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,at:this.now()};
+    return ids.length;
   }
   locked(fn) {
     const operation=this.tail.then(fn);this.tail=operation.catch(()=>{});return operation;
@@ -112,6 +150,7 @@ export class MobileRouter {
       const hash=digest([input.text,input.attachments??[]]);
       const previous=this.state.inputs[input.id];
       if(previous) {
+        if(previous.recovered)throw Error('Input acceptance requires reconciliation');
         if(previous.hash!==hash)throw Error('Input id reused with different content');
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
         if(previous.state==='failed-before-submit'){previous.state='selected';this.save('input-preparation-retry',{id:input.id});}
@@ -123,32 +162,52 @@ export class MobileRouter {
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
       let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'};
-      if(stop) {for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';}
+      // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
+      const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
+      let tail=null,offered=null,classified=false;
+      if(stop) {
+        for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';
+        // A literal stop needs no model: whatever is still unsent is retired by the host itself.
+        if(owner&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
+      }
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
       } else if(input.attachments?.length||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
         decision='work';reason='work-input';
       } else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
       else {
+        // An interrupted reply with nothing unknown about it rides on this call. With none,
+        // the classifier is asked exactly what it was always asked.
+        classified=true;
+        offered=owner?await port('pending',{id:input.id,text:input.text}):null;
+        if(!offered?.reply)offered=null;
         try {
           let timer;
           const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
           let result;
-          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs}),timeout]);}
+          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs,...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
           finally {clearTimeout(timer);}
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
           if(['light','deep'].includes(result.recall?.mode))recall={...result.recall,decisionSource:'deepseek-input-classification'};
-        } catch {decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;}
+          if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
+            :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
+        } catch {
+          decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;
+          // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
+          if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
+        }
       }
+      // Attachments and commands are never classified, so they cannot carry a tail decision either.
+      if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
       const intent=decision;
       // DeepSeek judges meaning; its answer never owns the execution lock.
       if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
       const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
       if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
       if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
@@ -290,10 +349,22 @@ export class MobileRouter {
     const transition=this.state.transition;
     if(transition.from&&transition.from!==actual.model&&this.verified(actual,actual.model)) {
       const view=publicMobileRuntime(this.state,actual,this.sessionId);
+      // A maintenance restart that puts back the model the owner was last told about
+      // changed nothing they can see: the notice is settled as suppressed, never sent.
+      const silent=transition.source==='host-restart'&&actual.model===this.lastToldModel();
       const notice=this.queueNotice(transition.id,'model-switched',{transitionId:transition.id,sourceInputId:this.state.inputs[transition.sourceId]?transition.sourceId:this.state.requests[transition.sourceId]?.sourceInputId,
-        target:actual.model,from:transition.from,runtime:view.actual,text:runtimeReply(view,{switched:true})});
+        target:actual.model,from:transition.from,runtime:view.actual,
+        ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true})})});
       transition.noticeId=notice.id;
     }
+  }
+  /** The model the owner was last told about: the most recent runtime-status notice
+   * the platform accepted. It is the only durable record here of what they heard —
+   * deliveries carry a message ID and a time, never the model that wrote them. */
+  lastToldModel() {
+    const told=Object.values(this.state.notices).filter(n=>n.state==='accepted'&&n.messageId&&(n.toldModel??n.runtime?.model))
+      .sort((a,b)=>(a.acceptedAt??0)-(b.acceptedAt??0)).at(-1);
+    return told?told.toldModel??told.runtime.model:null;
   }
   observeRuntime(runtime) {
     if(this.verified(runtime,runtime.model)&&this.state.actual?.known&&this.state.actual.model!==runtime.model&&this.state.transition?.state!=='switching'&&this.state.transition?.state!=='unconfirmed') {
@@ -380,7 +451,8 @@ export class MobileRouter {
         }
         if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
         n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
-        n.runtime??=view.actual;n.state='sending';n.attempts=(n.attempts??0)+1;
+        // Whatever else the message recalls, this is the model it names as the current one.
+        n.runtime??=view.actual;n.toldModel=view.actual.model;n.state='sending';n.attempts=(n.attempts??0)+1;
         this.save('notice-sending',{id});return {...clone(n),sendNow:true};
       });
       if(!notice)continue;
