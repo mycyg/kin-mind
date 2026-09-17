@@ -226,7 +226,11 @@ class ShareLedger:
             prior = conn.execute("SELECT digest,data FROM mind_reply_references WHERE scope=? AND reply_id=?", (self.scope.key(), reply_id)).fetchone()
             if prior:
                 if prior[0] != fingerprint:
-                    raise Conflict("Registered reply body changed")
+                    # A frozen reply body, not a command: its id is the reply's, and what
+                    # replaces it is a continuation of that reply rather than a revision of
+                    # this call. Typed here so a caller can tell the two apart.
+                    raise Conflict("Registered reply body changed", kind="runtime",
+                                   code="reply-content-changed", target=reply_id)
                 return json.loads(prior[1])
             conn.execute("INSERT INTO mind_reply_references VALUES(?,?,?,?)", (self.scope.key(), reply_id, fingerprint, dumps(data)))
             return data

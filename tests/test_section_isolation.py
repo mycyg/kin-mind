@@ -452,7 +452,7 @@ def test_database_error_inside_a_section_is_never_mistaken_for_a_refusal(env, mo
     owner = env.source("owner-chat")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
     before = env.mind.read()
-    def broken(self, conn, proposal, command_id, allowed=None):
+    def broken(self, conn, proposal, command_id, allowed=None, **_options):
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(ConversationHabits, "apply", broken)
     result, _ = run(env, lambda shown, context: Appraisal(reason="She asked", values={"mood": 99},

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .db import Conflict, Database, Deleted, Missing, digest, dumps, tokenize
 from .envelopes import current_message
+from .idempotency import record, unchanged
 from .models import RecordInput, RevisionInput, Scope, SourceInput, now
 
 
@@ -28,16 +29,22 @@ class Engine:
         self.cache_lock = threading.RLock()
         self.interactive_until = 0.0
 
-    def command(self, conn, key, payload, run):
+    def command(self, conn, key, payload, run, stamp=None):
+        """`stamp` is an optional idempotency.Stamp built by the caller, which owns the scope
+        and the host switch. Without one this compares the legacy digest of the whole payload,
+        exactly as before; with one the effective payload decides and the precondition does
+        not, so a retry that only refreshed its expected revision gets the original receipt."""
         hashed = digest(payload)
         row = conn.execute("SELECT * FROM commands WHERE id=?", (key,)).fetchone()
         if row:
-            if row["digest"] != hashed:
+            if not unchanged(conn, stamp, key, legacy=(row["digest"], hashed)):
                 # The key, not the payload: the digests stay out of the failure record.
-                raise Conflict("Idempotency key reused with different content", target=key)
+                raise Conflict("Idempotency key reused with different content",
+                               kind="runtime", code="payload-changed", target=key)
             return json.loads(row["result"])
         result = run()
         conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, hashed, dumps(result)))
+        record(conn, stamp, key, now())
         return result
 
     def receive(self, source: SourceInput, attachment: bytes | None = None) -> dict:

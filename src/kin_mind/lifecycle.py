@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import record, revision_id, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope
 
 from .state import timestamp
@@ -213,20 +215,39 @@ class EventLifecycle:
         target_anchors = anchors(target["id"])
         return bool(target_anchors and all(target_anchors & anchors(m["id"]) for m in members))
 
-    def apply_routes(self, conn, routes, refs, appraisal_id, aliases=None):
+    def apply_routes(self, conn, routes, refs, appraisal_id, aliases=None, *, revise=False):
+        """`revise`: the caller accepts an explicit revision when a route key comes back with
+        different content. The host's own commit path does; a client that supplies its own
+        command id does not, because a reused id with other content is that client's mistake."""
+        from .autonomy_schema import optimized
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
         results, aliases = [], aliases or {}
+        fingerprints = optimized(conn, self.scope.key(), "idempotency_fingerprint")
         if len({r.key for r in routes}) != len(routes):
             raise Conflict("Event route keys must be unique")
         for route in routes:
             command_id = digest([appraisal_id, route.key])
             payload_hash = digest(route.model_dump())
+            # The expected revisions are this route's precondition, checked below against the
+            # live target and thread; title, quote, reason, binding and identity are its content.
+            stamp = fingerprint("event-route", self.scope.key(), route.model_dump(), enabled=fingerprints)
+            supersedes = None
             old = conn.execute("SELECT digest,data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
-            if old:
-                if old["digest"] != payload_hash:
-                    raise Conflict("Event route command changed")
+            if old and unchanged(conn, stamp, command_id, legacy=(old["digest"], payload_hash)):
                 results.append(json.loads(old["data"]))
                 continue
+            if old:
+                if stamp is None or not revise:
+                    raise Conflict("Event route command changed", kind="runtime",
+                                   code="payload-changed", target=command_id)
+                # An explicit revision: its own command id, superseding the one it replaces,
+                # validated in full below and recorded with its own before/after.
+                supersedes, command_id = command_id, revision_id(command_id, stamp)
+                stamp = stamp._replace(supersedes=supersedes)
+                again = conn.execute("SELECT data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+                if again:
+                    results.append(json.loads(again["data"]))
+                    continue
             evidence = self.graph.proof(conn, route.evidence_ids, allowed)
             ids = route.member_ids or list(dict.fromkeys(r["record_id"] for r in evidence))
             members = [self.graph.ensure(conn, aliases.get(i, i)) for i in ids]
@@ -300,7 +321,10 @@ class EventLifecycle:
                       "identity_evidence_versions": {r["record_id"]: r["revision"] for r in refs
                           if route.identity and r["record_id"] in route.identity.prior_record_ids},
                       "reason": route.reason, "at": self.mind.clock(), "appraisal_id": appraisal_id}
+            if supersedes:
+                result["supersedes"] = supersedes
             conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
+            record(conn, stamp, command_id, self.mind.clock())
             results.append(result)
         return results
 

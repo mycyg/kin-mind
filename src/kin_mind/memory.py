@@ -615,7 +615,10 @@ class MemoryContinuity:
             self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases)
         if config["event_lifecycle"] and assessment.event_routes:
             from .lifecycle import EventLifecycle
-            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases)
+            # The host issues these command ids itself, from the appraisal and the route key.
+            # A later judgment that rewrites one of them is an explicit revision, not a client
+            # reusing an id: it is validated again in full and keeps its before/after record.
+            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases, revise=True)
         for note in assessment.notes:
             for identifier in note.about_ids:
                 for root in self._record_ids(conn, resolve(identifier)):
