@@ -12,7 +12,7 @@ const HOLD_BASE_MS=60000,HOLD_MAX_MS=15*60000;
 const platformCode=record=>{const value=String(record?.platformCode??record?.code??'');return /^[A-Za-z0-9_.:-]{1,64}$/.test(value)?value:undefined;};
 
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
-export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxHolds=6,now=()=>Date.now()}) {
+export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,preflight=async()=>({state:'ready'}),verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxHolds=6,maxFailures=6,now=()=>Date.now()}) {
   const active=new Map();
   const digest=value=>createHash('sha256').update(value).digest('hex');
   // Proactive contact leaves through the Feishu bridge; a channel with no
@@ -68,8 +68,15 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         const known=await receipt(item.id,batch.channel),outcome=classifyReceipt(known);
         if(outcome==='accepted')Object.assign(item,{state:'accepted',messageId:normalizeReceipt(known).messageId});
         // A receipt that proves nothing was submitted: this pass sends the same
-        // frozen ID again, under the verdict the group already has.
-        else if(outcome==='never-started')item.state='unsent';
+        // frozen ID again, under the verdict the group already has. A bubble that
+        // never starts is not free of the host's time, so it is offered the same
+        // bounded number of attempts the transport gives a group, and then given
+        // up on under a static reason. The rest of the group still goes out.
+        else if(outcome==='never-started') {
+          item.restarts=(item.restarts??0)+1;
+          if(item.restarts>maxFailures)Object.assign(item,{state:'canceled',reason:'transport-never-started'});
+          else item.state='unsent';
+        }
         // A refusal is final for this bubble alone; the rest of the group goes on.
         else if(outcome==='rejected')Object.assign(item,{state:'canceled',reason:'platform-rejected',...(platformCode(known)?{platformCode:platformCode(known)}:{})});
         // Unknown, or no receipt where the reader looked: nothing is re-sent and

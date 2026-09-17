@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,modeCommand,recentConversation} from './mobile-router.mjs';
+import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION} from './mobile-router.mjs';
 import {compactPrompt,publicMobileRuntime} from './mobile-controls.mjs';
 
 function fixture(t, options={}) {
@@ -561,6 +561,107 @@ test('a classifier that times out, or answers without a tail, leaves the remaind
   const g=fixture(t,{replyTail:silent,classify:async()=>({route:'chat',reason:'synthetic'})});
   assert.deepEqual((await g.router.select({id:'four',text:'haha'})).tail,{carrier:'classify',state:'missed'});
   assert.deepEqual(silent.calls.at(-1),['missed',{inputId:'four',key:offer.key,reason:'no-tail-decision'}]);
+});
+
+// ---- classify intents: stop, file sending, owner words and attachment metadata ----
+const intentClassifier=answer=>{const seen=[];return {seen,classify:async input=>{seen.push(input);
+  return {route:/code|test/.test(input.text)?'work':'chat',reason:'synthetic',recall:{mode:'light',query:'q',reason:'r'},...(typeof answer==='function'?answer(input):answer)};}};};
+
+test('with intents off an attachment is still work, and the classifier is asked exactly what it always was',async t=>{
+  const {seen,classify}=intentClassifier({stop:'current_task',file_send:{requested:true,channel:'wechat',file_ref:'r'}});
+  const f=fixture(t,{classify});
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const record=await f.router.select({id:'file',text:'look at this',attachments:[{kind:'image',name:'photo.jpg'}]});
+  assert.deepEqual([record.route,record.reason,record.fileSend,record.stop],['work','work-lock: work-input',undefined,undefined]);
+  await f.router.select({id:'plain',text:'hello'});
+  assert.deepEqual(Object.keys(seen[0]),['text','clock','recent','task','mode','workHeld','timeoutMs'],'no new key, and no intent asked for');
+  assert.equal(f.router.currentTask().cancelRequested,undefined,'an intent nobody asked for cannot stop a task');
+});
+
+test('with intents on an attachment is classified, and only its metadata is ever sent',async t=>{
+  const {seen,classify}=intentClassifier({route:'chat',reason:'a photo to look at'});
+  const f=fixture(t,{classify,classifyIntents:true});
+  const record=await f.router.select({id:'file',text:'look at this',attachments:[
+    {kind:'image',mimeType:'image/jpeg',name:'photo.jpg',bytes:12345,path:'/private/inbox/photo.jpg',data:'BASE64',encrypt_query_param:'secret'},
+    {name:'note.txt',bytes:-1,kind:'unheard-of'}]});
+  assert.deepEqual([record.route,record.reason],['chat','a photo to look at'],'the model decides chat or work with the attachments in view');
+  assert.deepEqual(seen[0].attachments,[{kind:'image',mimeType:'image/jpeg',name:'photo.jpg',bytes:12345},{kind:'other',name:'note.txt'}]);
+  const request=JSON.stringify(seen[0]);
+  for(const leaked of ['path','data','encrypt_query_param','/private/inbox','BASE64'])assert.ok(!request.includes(leaked),'no path and no content ever reaches the classifier: '+leaked);
+  assert.equal(seen[0].intents,true);
+  // Metadata only, whatever the caller passes: the request is built from four fields.
+  assert.deepEqual(attachmentMetadata([{kind:'file',mimeType:'x/y'.padEnd(200,'z'),name:'a'.repeat(200),bytes:7,url:'https://example.test/x'}]),
+    [{kind:'file',mimeType:('x/y'.padEnd(200,'z')).slice(0,100),name:'a'.repeat(120),bytes:7}]);
+  assert.deepEqual(attachmentMetadata(null),[]);
+  assert.equal(attachmentMetadata(Array.from({length:40},()=>({kind:'file'}))).length,24);
+});
+
+test('a natural-language stop is the literal command only for the owner with a task open, and only when the classifier answered',async t=>{
+  const {seen,classify}=intentClassifier({stop:'current_task'});
+  const f=fixture(t,{classify,classifyIntents:true});
+  const idle=await f.router.select({id:'idle',text:'stop what you are doing'});
+  assert.deepEqual([idle.route,idle.stop],['chat',undefined],'with no task open there is nothing to stop');
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const task=f.router.currentTask();
+  const stopped=await f.router.select({id:'stop-it',text:'ok, that is enough for now'});
+  assert.deepEqual(stopped.stop,{requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds:[task.id]});
+  assert.equal(task.cancelRequested,true,'the same flag the literal command sets');
+  assert.equal(f.router.state.inputs['stop-it'].stop.decisionSource,'deepseek-input-classification');
+  await f.router.reconcile();
+  assert.equal(f.router.state.tasks[task.id].status,'canceled');
+  // Nobody but the owner is asked for intents, so nobody but the owner can stop a task.
+  const g=fixture(t,{classify,classifyIntents:true});
+  await g.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const other=await g.router.select({id:'other',kind:'notice',text:'stop the task'});
+  assert.deepEqual([other.stop,seen.at(-1).intents],[undefined,undefined]);
+  assert.equal(g.router.currentTask().cancelRequested,undefined);
+});
+
+test('a literal stop still needs no model, and an unavailable classifier cannot stop anything',async t=>{
+  const f=fixture(t,{classifyIntents:true,classify:async()=>{throw Error('the classifier is never asked for a literal stop');}});
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const task=f.router.currentTask();
+  const stop=await f.router.select({id:'stop',text:'停止任务'});
+  assert.deepEqual([stop.reason,task.cancelRequested,f.classificationCalls()],['owner-stop-command',true,0]);
+  // The same words in ordinary language, with no classifier to read them: nothing happens.
+  const g=fixture(t,{classifyIntents:true,classify:async()=>{throw Error('classification-timeout');}});
+  await g.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const unread=await g.router.select({id:'unread',text:'ok, that is enough for now'});
+  assert.deepEqual([unread.route,unread.reason,unread.stop],['work','work-lock: classifier-unconfirmed',undefined]);
+  assert.equal(g.router.currentTask().cancelRequested,undefined);
+});
+
+test('a file the owner asked for is recorded as states and IDs; a malformed intent is dropped without failing the route',async t=>{
+  const sha='b'.repeat(64);
+  let answer={file_send:{requested:true,channel:'wechat',file_ref:'report.pdf',candidate_sha256:sha},recall:{mode:'deep',query:'q',reason:'r',owner_words:['captain','kin']}};
+  const {classify}=intentClassifier(()=>answer);
+  const f=fixture(t,{classify,classifyIntents:true});
+  const asked=await f.router.select({id:'send-it',text:'send me the report on WeChat'});
+  const {at,...recorded}=asked.fileSend;
+  assert.deepEqual(recorded,{requested:true,channel:'wechat',fileRef:'report.pdf',candidateSha256:sha,decisionSource:CLASSIFIER_DECISION});
+  assert.equal(typeof at,'number');
+  assert.deepEqual(f.router.state.inputs['send-it'].fileSend,asked.fileSend);
+  assert.deepEqual(asked.recall.owner_words,['captain','kin']);
+  assert.equal(asked.recall.decisionSource,CLASSIFIER_DECISION);
+  answer={file_send:{requested:true,channel:'carrier-pigeon',file_ref:'x'.repeat(400)},recall:{mode:'light',query:'q',reason:'r',owner_words:Array.from({length:40},()=>'w'.repeat(200))}};
+  const dropped=await f.router.select({id:'nonsense',text:'anything'});
+  assert.deepEqual([dropped.route,dropped.fileSend,dropped.recall.owner_words],['chat',undefined,undefined],'the route stands; the unusable intent is gone');
+  assert.ok(!JSON.stringify(f.router.state.inputs.nonsense).includes('w'.repeat(30)));
+});
+
+test('the host can buy one message a second classification and a longer wait, and nothing more',async t=>{
+  const waits=[];let fail=true;
+  const f=fixture(t,{classifyIntents:true,classifyRetry:({text})=>/file/.test(text),
+    classify:async input=>{waits.push(input.timeoutMs);if(fail){fail=false;throw Error('classification-timeout');}
+      return {route:'chat',reason:'a file the owner asked for',recall:{mode:'light',query:'q',reason:'r'},file_send:{requested:true,channel:'wechat',file_ref:'report.pdf'}};}});
+  const asked=await f.router.select({id:'ask',text:'send me that file'});
+  assert.deepEqual([waits,asked.route,asked.fileSend.channel],[[15000,30000],'chat','wechat'],'twice, the second time with a longer wait');
+  assert.equal(f.router.state.history.some(e=>e.kind==='classification-retried'&&e.id==='ask'),true);
+  // A message the host says nothing about is asked exactly once, and fails closed as before.
+  fail=true;
+  const plain=await f.router.select({id:'plain',text:'hello there'});
+  assert.deepEqual([plain.route,plain.reason,waits],['work','classifier-unconfirmed',[15000,30000,15000]]);
+  assert.equal(plain.fileSend,undefined,'a retry the host asked for can never grant anything');
 });
 
 test('attachments and commands are never classified; a literal stop needs no model; other inputs never touch the tail port',async t=>{
