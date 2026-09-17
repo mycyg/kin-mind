@@ -1,6 +1,7 @@
 """Purpose-typed recall: role configuration, synthetic examples, self-knowledge claims and host
 envelopes are never recalled as shared experience, whatever `history` says, and are never shown
-as `explicit`. An audit read still returns all of them, labelled. Synthetic data only."""
+as `explicit`. An audit read still returns all of them, labelled. An owner turn is never among
+them: what the owner said about a configuration is recalled, labelled. Synthetic data only."""
 from __future__ import annotations
 
 import ast
@@ -84,7 +85,7 @@ def world(tmp_path):
                                    "Installed role text: the agent speaks warmly about lantern evenings.",
                                    authority="operation", role="host", host_event="configuration-verified")
     ids["example"] = receive(engine, "chat", "example", "Example dialogue: we watched lantern boats last winter.",
-                             role="user", host_event="message", examples_are_synthetic=True)
+                             role="assistant", host_event="message", examples_are_synthetic=True)
     ids["envelope"] = receive(engine, "chat", "envelope", ENVELOPE, role="user", host_event="message")
     claim = SelfKnowledge(engine, SCOPE).claim(ClaimInput(
         command_id="role-claim", aspect="voice", context="chat", agent_version="config-1", basis="role",
@@ -232,6 +233,103 @@ def test_owner_configuration_requests_stay_experience_with_a_label(world):
         assert ids["configuration"] not in {i["id"] for i in result["items"]}
 
 
+FLAGS = ({"examples_are_synthetic": True}, {"example_kind": "dialogue"}, {"example_count": 3},
+         {"configuration_only": True})
+
+
+@pytest.mark.parametrize("flag", FLAGS)
+def test_a_flag_labels_the_owners_own_turn_and_hides_everyone_elses(tmp_path, flag):
+    """Saying that the examples above are made up is itself something the owner said. The same
+    flag on text the owner did not write, and on what a model derived from it, still hides it."""
+    engine = Engine(tmp_path / "memory")
+    asked = receive(engine, "chat", "asked", "Treat the lantern dialogues above as samples.", role="user", **flag)
+    copied = receive(engine, "chat", "copied", "Three sample lantern dialogues follow.", role="assistant", **flag)
+    guessed = receive(engine, "chat", "guessed", "A lantern sample the model wrote down.", authority="model",
+                      role="user", **flag)
+    derived = engine.add_record(RecordInput(
+        kind="fact", content="The lantern dialogues above are samples.", scope=SCOPE, generated=True,
+        source_ids=engine.get(asked)["source_ids"], attributes=dict(flag)), "derived")["id"]
+    hidden, kind = (copied, guessed, derived), "role_configuration" if "configuration_only" in flag else "synthetic_example"
+    for legacy in (False, True):
+        if legacy:
+            make_legacy(engine)
+        record = engine.get(asked)
+        policy = ReadPolicy.load(engine, SCOPE)
+        assert policy.classify(record) == ("experience", "configuration_request", "owner-configuration-request")
+        assert policy.basis(record) == record["confirmation"] == "explicit"
+        assert policy.prefix(record) == "[configuration_request] "
+        for history in (False, True):
+            result = recall(engine, history=history)
+            returned = {i["id"]: i for i in result["items"]}
+            assert returned[asked]["confirmation"] == "explicit" and "evidence_class" not in returned[asked]
+            assert returned[asked]["evidence_label"] == "configuration_request"
+            assert "] [configuration_request] Treat the lantern" in next(
+                line for line in result["text"].splitlines() if line.startswith("[" + asked))
+            assert set(hidden).isdisjoint(returned), (legacy, history)
+        assert read_segment(engine, asked)["evidence_label"] == "configuration_request"
+        assert {i["id"]: i for i in engine.list_records(SCOPE)["items"]}[asked]["evidence_label"] == "configuration_request"
+        # Reachable all along: an audit read returns every one of them, with its class.
+        audit = {i["id"]: i for i in recall(engine, history=True, recall_purpose="audit")["items"]}
+        assert all(audit[rid]["evidence_class"] == audit[rid]["confirmation"] == kind for rid in hidden)
+
+
+def test_an_envelope_and_a_self_claim_are_read_before_who_wrote_them(tmp_path):
+    """Two rules come before authorship: a host prompt stored as an owner turn, which only its
+    text tells apart, and a self-knowledge entry, whose evidence is the owner's own words."""
+    engine = Engine(tmp_path / "memory")
+    prompt = receive(engine, "chat", "prompt", ENVELOPE, role="user", host_event="message",
+                     examples_are_synthetic=True)
+    lived = receive(engine, "chat", "lived", "We walked through the lantern market together.",
+                    role="user", host_event="message")
+    claim = SelfKnowledge(engine, SCOPE).claim(ClaimInput(
+        command_id="role-claim", aspect="voice", context="chat", agent_version="config-1", basis="role",
+        claim="I describe lantern evenings warmly.", evidence_ids=[lived]))["id"]
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE records SET data=json_set(data,'$.attributes.role','user') WHERE id=?", (claim,))
+        engine.db.bump(conn)
+    policy = ReadPolicy.load(engine, SCOPE)
+    assert policy.classify(engine.get(prompt)) == ("host_envelope", None, "host-envelope-content")
+    assert policy.classify(engine.get(claim)) == ("self_knowledge", None, "self-knowledge-entry")
+    returned = {i["id"] for i in recall(engine, history=True)["items"]}
+    assert lived in returned and {prompt, claim}.isdisjoint(returned)
+
+
+def test_only_an_operator_row_hides_an_owner_turn(tmp_path):
+    """A row is where a person's review of a source is recorded, and its rule name says whether
+    a person wrote it. What the automatic classification stores never hides what the owner said."""
+    engine = Engine(tmp_path / "memory")
+    configure_registry(engine, {"private-role-store": "role_configuration"})
+    asked = receive(engine, "private-role-store", "asked", "Please keep the lantern wording.", role="user")
+    source = engine.get(asked)["source_ids"][0]
+    with engine.db.connect(write=True) as conn:
+        record_classes(engine, conn, SCOPE, [{"source_id": source, "class": "role_configuration",
+                                              "rule": "namespace-registry"}])
+    assert ReadPolicy.load(engine, SCOPE).classify(engine.get(asked)) == (
+        "experience", "configuration_request", "owner-configuration-request")
+    assert asked in {i["id"] for i in recall(engine, history=True)["items"]}
+    with engine.db.connect(write=True) as conn:
+        record_classes(engine, conn, SCOPE, [{"source_id": source, "class": "role_configuration",
+                                              "rule": "operator-review"}])
+    assert ReadPolicy.load(engine, SCOPE).classify(engine.get(asked)) == ("role_configuration", None, "operator-review")
+    assert asked not in {i["id"] for i in recall(engine, history=True)["items"]}
+    audit = {i["id"]: i for i in recall(engine, history=True, recall_purpose="audit")["items"]}
+    assert audit[asked]["evidence_class"] == "role_configuration"
+
+
+def test_a_flagged_owner_source_is_proposed_and_stamped_as_a_request(tmp_path):
+    engine = Engine(tmp_path / "memory")
+    asked = receive(engine, "chat", "asked", "Treat the lantern dialogues above as samples.",
+                    role="user", examples_are_synthetic=True)
+    record = engine.get(asked)
+    source = record["source_ids"][0]
+    with engine.db.connect() as conn:
+        row = conn.execute("SELECT class,rule FROM source_evidence_class WHERE source_id=?", (source,)).fetchone()
+        proposed = {p["source_id"]: p for p in classify_scope(engine, conn, SCOPE)}
+    # The insert stamp is the label; a class the owner's own words never earn is not stamped.
+    assert record["attributes"]["origin_kind"] == "configuration_request"
+    assert tuple(row) == (proposed[source]["class"], proposed[source]["rule"]) == ("experience", "owner-configuration-request")
+
+
 def test_new_sources_are_stamped_at_insert_without_a_revision_bump(world):
     engine, ids = world
     with engine.db.connect() as conn:
@@ -274,22 +372,27 @@ def test_new_sources_are_stamped_at_insert_without_a_revision_bump(world):
 def test_order_of_authority_between_rows_flags_envelopes_and_namespace_rules(tmp_path):
     engine = Engine(tmp_path / "memory")
     counted = receive(engine, "chat", "counted", "Three sample lantern dialogues follow.", role="user", example_count=3)
+    copied = receive(engine, "chat", "copied", "Three more sample lantern dialogues follow.", role="assistant", example_count=3)
     prompt = receive(engine, "private-role-store", "prompt", ENVELOPE, role="user", host_event="message")
     make_legacy(engine)
     configure_registry(engine, {"private-role-store": "role_configuration"})
     policy = ReadPolicy.load(engine, SCOPE)
-    assert policy.classify(engine.get(counted)) == ("synthetic_example", None, "metadata-synthetic-example")
+    # A flag says what a text is about. It never outranks the owner having said it.
+    assert policy.classify(engine.get(counted)) == ("experience", "configuration_request", "owner-configuration-request")
+    assert policy.classify(engine.get(copied)) == ("synthetic_example", None, "metadata-synthetic-example")
     # The namespace rule alone would call an owner-role turn a request. The text says envelope.
     assert policy.classify(engine.get(prompt)) == ("host_envelope", None, "host-envelope-content")
     with engine.db.connect() as conn:
         proposed = {p["source_id"]: p for p in classify_scope(engine, conn, SCOPE)}
     assert proposed[engine.get(prompt)["source_ids"][0]]["class"] == "host_envelope"
-    assert proposed[engine.get(counted)["source_ids"][0]]["class"] == "synthetic_example"
+    assert proposed[engine.get(copied)["source_ids"][0]]["class"] == "synthetic_example"
+    asked = proposed[engine.get(counted)["source_ids"][0]]
+    assert (asked["class"], asked["rule"]) == ("experience", "owner-configuration-request")
     # A stored row has the last word: an operator's review can clear what a flag would hide.
     with engine.db.connect(write=True) as conn:
-        record_classes(engine, conn, SCOPE, [{"source_id": engine.get(counted)["source_ids"][0], "class": "experience", "rule": "operator-review"}])
-    assert ReadPolicy.load(engine, SCOPE).classify(engine.get(counted)) == ("experience", None, "operator-review")
-    assert counted in {i["id"] for i in recall(engine)["items"]} and prompt not in {i["id"] for i in recall(engine, history=True)["items"]}
+        record_classes(engine, conn, SCOPE, [{"source_id": engine.get(copied)["source_ids"][0], "class": "experience", "rule": "operator-review"}])
+    assert ReadPolicy.load(engine, SCOPE).classify(engine.get(copied)) == ("experience", None, "operator-review")
+    assert {counted, copied} <= {i["id"] for i in recall(engine)["items"]} and prompt not in {i["id"] for i in recall(engine, history=True)["items"]}
 
 
 def test_insert_stamp_still_classifies_when_rows_and_rules_are_gone(tmp_path):
@@ -303,7 +406,8 @@ def test_insert_stamp_still_classifies_when_rows_and_rules_are_gone(tmp_path):
         engine.db.bump(conn)
     policy = ReadPolicy.load(engine, SCOPE)
     assert policy.classify(engine.get(dump)) == ("role_configuration", None, "insert-stamp")
-    assert policy.classify(engine.get(ask)) == ("experience", "configuration_request", "insert-stamp")
+    # The stamp is one more configuration signal on an owner turn, and only labels it.
+    assert policy.classify(engine.get(ask)) == ("experience", "configuration_request", "owner-configuration-request")
     returned = {i["id"]: i for i in recall(engine, history=True)["items"]}
     assert dump not in returned and returned[ask]["evidence_label"] == "configuration_request"
 
@@ -519,7 +623,9 @@ def test_source_rules_are_narrow_and_declarations_cannot_vouch():
     assert source_rule("examples:v2", {}, "document", rules=rules).kind == "synthetic_example"
     assert source_rule("envelopes", {"role": "user"}, "explicit", rules=rules).kind == "host_envelope"
     assert source_rule("store", {"role": "user"}, "explicit", rules=rules, text=ENVELOPE).kind == "host_envelope"
-    assert source_rule("chat", {"configuration_only": True, "role": "user"}, "explicit", rules=rules).kind == "role_configuration"
+    # A flag on the owner's own turn labels it; the same flag on anyone else's text hides it.
+    assert source_rule("chat", {"configuration_only": True, "role": "user"}, "explicit", rules=rules)[:2] == ("experience", "configuration_request")
+    assert source_rule("chat", {"configuration_only": True, "role": "assistant"}, "explicit", rules=rules).kind == "role_configuration"
     assert source_rule("chat", {"example_kind": "dialogue"}, "explicit", rules=rules).kind == "synthetic_example"
     assert source_rule("chat", {}, "explicit", source_id="src_a", approved={"src_a"}, rules=rules).rule == "persona-approved-source"
 
