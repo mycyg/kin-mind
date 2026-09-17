@@ -723,7 +723,8 @@ def test_one_batch_of_original_and_summary_has_one_evidence_identity(enabled):
 
 def test_interaction_window_spans_midnight_and_expires_after_fourteen_days(enabled):
     mind, _, clock = enabled
-    clock[0] = clock[0].replace(hour=15, minute=50, second=0, microsecond=0)
+    # The next day's 15:50 UTC: the same day's would run the clock backwards late in the UTC day.
+    clock[0] = (clock[0] + timedelta(days=1)).replace(hour=15, minute=50, second=0, microsecond=0)
     owner(mind, clock, "before-local-midnight")
     clock[0] += timedelta(minutes=20)
     owner(mind, clock, "after-local-midnight")
