@@ -8,7 +8,9 @@ from .memory import MemoryContinuity
 
 # Retry bookkeeping an approved resume gives back, preserved in recovery_history.
 RETRY_COUNTERS = ("error_signature", "error_repeats", "compression_waits", "compression_stalls",
-                  "compression_parts", "transient_failures", "admission_waits")
+                  "compression_parts", "transient_failures", "admission_waits", "light_attempts")
+# What a conflict left for the next attempt to reuse or revalidate. A resumed row is judged afresh.
+REUSE_FIELDS = ("reuse", "tier", "revalidation")
 
 
 def migrate_operational(mind, *, workers_stopped):
@@ -89,24 +91,29 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
             proposal = Appraisal.model_validate(chosen["proposal"]) if chosen.get("proposal") and not admission_only else None
             data.setdefault("recovery_history", []).append({"command_id": command_id, "source": source, "at": mind.clock(),
                 "attempts": row["attempts"], "error": data.get("error"), "proposed_result": data.get("proposed_result"), "receipt": data.get("receipt")})
+            data.pop("seed_manifest", None)
             if proposal and chosen.get("receipt", {}).get("model") == "deepseek-flash":
                 refs = chosen.get("sources", [])
                 if refs and not mind._fresh(conn, refs):
                     raise Conflict("Recovery proposal sources need review")
                 data.update(seed_memory=proposal.memory.model_dump(), seed_receipt={**chosen["receipt"], "recovery_command": command_id},
                             seed_sources=refs, seed_rejected=False)
+                if identifier not in replacements and data.get("proposal_manifest"):
+                    # The row's own stored judgment: the manifest it rests on says what it was shown,
+                    # so the resumed attempt compares its read set like any other reuse.
+                    data["seed_manifest"] = data["proposal_manifest"]
             else:
                 data["seed_rejected"] = True
             if admission_only:
                 # Previous usage and proposals stay in recovery_history. Refresh
                 # source/configuration context; never replay an unrelated proposal.
                 for field in ("error", "error_detail", "repair_reason", "receipt", "proposed_result",
-                              "seed_memory", "seed_receipt", "seed_sources"):
+                              "seed_memory", "seed_receipt", "seed_sources", "seed_manifest"):
                     data.pop(field, None)
                 data["waiting_reason"] = "admission-recovered-current-review"
             data.pop("frozen_memory_context", None)
             # An approved resume restores the whole retry budget, like attempts=0.
-            for field in RETRY_COUNTERS:
+            for field in (*RETRY_COUNTERS, *REUSE_FIELDS):
                 data.pop(field, None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
                          (time.time(), dumps(data), identifier))
@@ -158,7 +165,7 @@ def recover_quarantined(mind, *, job_ids, command_id, source):
                 # The stored proposal stays audit data; this attempt judges again.
                 data["seed_rejected"] = True
             for field in ("error", "error_detail", "repair_reason", "waiting_reason",
-                          "frozen_memory_context", *RETRY_COUNTERS):
+                          "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
                 data.pop(field, None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
                          (time.time(), dumps(data), identifier))

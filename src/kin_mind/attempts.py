@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS mind_appraisal_attempts(
 CREATE INDEX IF NOT EXISTS mind_appraisal_attempt_job ON mind_appraisal_attempts(scope,appraisal_id,ordinal);
 """
 
-# `reused` and `revalidated` are reserved for WP4's Tier A/B; nothing writes them yet.
+# `reused`: a stored proposal committed with no model call (Tier A). `revalidated`: it committed
+# after one light revalidation call (Tier B). Neither is a charged attempt.
 OUTCOMES = ("committed", "failed", "quarantined", "discarded", "abandoned", "reused", "revalidated")
 PURPOSES = ("appraise", "schema-repair", "advice-repair", "sharing-repair",
             "compression", "expansion", "revalidate", "other")
@@ -151,7 +152,9 @@ def outcome_for(state, data, *, owned):
     if not owned:
         return "discarded"
     if state == "complete":
-        return "discarded" if data.get("completed_from") == "already-committed" else "committed"
+        if data.get("completed_from") == "already-committed":
+            return "discarded"
+        return {"A": "reused", "B": "revalidated"}.get(data.get("tier"), "committed")
     if state == "needs-repair":
         return "quarantined"
     return "failed"
@@ -160,7 +163,7 @@ def outcome_for(state, data, *, owned):
 def _row(scope, entry, ordinal):
     data = {"calls": list(entry.get("calls") or []), "charged": bool(entry.get("charged"))}
     for field in ("error", "error_detail", "repair_reason", "proposal_digest",
-                  "context_digest", "waiting_reason", "attempts"):
+                  "context_digest", "waiting_reason", "attempts", "tier", "manifest_digest", "revalidation"):
         if entry.get(field) is not None:
             data[field] = entry[field]
     reported = [c for c in data["calls"] if c.get("usage_status") == "reported"]

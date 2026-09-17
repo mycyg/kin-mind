@@ -445,15 +445,15 @@ def test_every_tool_the_appraisal_path_calls_is_registered_with_a_purpose():
     import ast
     from pathlib import Path
 
-    from kin_mind import adaptive_recall, appraisal, context, decision_context
+    from kin_mind import adaptive_recall, appraisal, context, decision_context, revalidation
     names = set()
-    for module in (appraisal, context, adaptive_recall, decision_context):
+    for module in (appraisal, context, adaptive_recall, decision_context, revalidation):
         for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "structured"
                     and node.args and isinstance(node.args[0], ast.Constant)):
                 names.add(node.args[0].value)
     assert {"repair_appraisal", "repair_session_advice", "repair_sharing", "submit_compression",
-            "submit_recall_ranking"} <= names <= set(ledger.TOOL_PURPOSES)
+            "submit_recall_ranking", "revalidate_appraisal"} <= names <= set(ledger.TOOL_PURPOSES)
     assert set(ledger.TOOL_PURPOSES.values()) | {"other"} == set(ledger.PURPOSES)
 
 

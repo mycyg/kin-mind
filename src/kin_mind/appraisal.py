@@ -26,6 +26,8 @@ from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from . import attempts, judgment_cache
+from . import manifest as manifests
+from . import revalidation
 from .conflicts import classify, static_message
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .dialogue import clock_context, recent_dialogue
@@ -748,7 +750,7 @@ class DeepSeek:
                     json={
                         "model": self.model,
                         "max_tokens": 131072,
-                        "system": (HISTORY_SYSTEM if context.get("stimulus") in {"memory-backfill", "memory-enrichment"} else SYSTEM + SESSION_ADVICE_PROMPT) + persona_prompt(policy) + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "") + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。",
+                        "system": self._system(context, policy),
                         "messages": [{"role": "user", "content": rendered}],
                         "tools": [
                             {
@@ -896,6 +898,21 @@ class DeepSeek:
              "results": [s for s in context["new_evidence"] if s["id"] in target_ids], "recent_dialogue": context.get("recent_dialogue", [])}, max_tokens=65536)
         return fixed.sharing, receipt
 
+    def _system(self, context, policy):
+        historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
+        return ((HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT) + persona_prompt(policy)
+                + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
+                + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。")
+
+    def request_profile(self, context):
+        """Digests of what frames an appraisal request besides its context: the input manifest keeps
+        them, so a changed prompt, schema, model or parameter is a changed policy, never a reuse."""
+        historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
+        policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
+        return {"system": digest(self._system(context, policy)),
+                "schema": digest(appraisal_schema(context.get("operational_only", False), historical)),
+                "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": "high", "tool_choice": "auto"})}
+
 
 QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_appraisals (
@@ -1005,7 +1022,7 @@ class Appraisals:
                     for k, v in json.loads(r["data"]).items()
                     if k in {"receipt", "error", "result", "waiting_reason", "admission_waits", "last_wait_at",
                              "error_detail", "repair_reason", "compression_waits", "compression_stalls",
-                             "transient_failures", "preparation_conflicts", "completed_from"}
+                             "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts"}
                 },
             )
             for r in rows
@@ -1102,6 +1119,7 @@ class Appraisals:
         """A quarantined row is judged afresh when an operator resumes it."""
         data["repair_reason"] = reason
         data.pop("frozen_memory_context", None)
+        data.pop("reuse", None)
         return "needs-repair"
 
     def _charged_failure(self, row, data, error, *, settings, historical):
@@ -1132,7 +1150,7 @@ class Appraisals:
         """No retry can succeed: the evidence was judged already, or what this row
         was enqueued for is gone. It ends in an existing terminal state with its code."""
         data["error_detail"] = error_detail(error, str(data.get("error", "")))
-        for field in ("frozen_memory_context", "transient_failures", "error_signature", "error_repeats"):
+        for field in ("frozen_memory_context", "transient_failures", "error_signature", "error_repeats", "reuse"):
             data.pop(field, None)
         return "superseded"
 
@@ -1270,12 +1288,13 @@ class Appraisals:
             killed = {**data} if row["state"] == "running" else None
             data["attempt_started_at"] = self.mind.clock()
             data["attempt_token"] = uuid.uuid4().hex
+            data.pop("tier", None)
             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
                 # The host's absolute worker deadline is request timeout + 60s;
                 # keep the lease beyond that deadline, including HTTP keepalives.
-                (time.time() + max(180, float(getattr(provider, "timeout", 90)) + 90), row["id"]),
+                (time.time() + manifests.attempt_bound(provider), row["id"]),
             )
         if ledger and killed:
             attempts.backfill_abandoned(self.engine, self.mind.scope.key(), row, killed, at=self.mind.clock())
@@ -1289,6 +1308,9 @@ class Appraisals:
         # Everything up to the provider call is host-side assembly: a conflict raised
         # there costs nothing and is retried without spending a charged attempt.
         preparing = True
+        # A light attempt reuses or revalidates a stored proposal instead of making a full appraisal
+        # call; `committing` marks a failure of the commit itself, the only kind a later attempt may reuse.
+        light, lighting, committing, manifest, deferred_memory, flags = None, False, False, None, None, {}
         key = self.mind._key(row["id"])
         try:
             cache_mark = self._cache_mark()
@@ -1446,6 +1468,7 @@ class Appraisals:
                 with self.engine.db.connect() as conn:
                     # One reading of the switch governs the whole attempt: the provider's validation, the advice repair and the commit.
                     isolation = optimized(conn, self.mind.scope.key(), SECTION_ISOLATION)
+                    flags = manifests.switches(conn, self.mind.scope.key())
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
                     for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent]:
@@ -1479,37 +1502,40 @@ class Appraisals:
                     for plan in model_context.get("autonomy_context", {}).get("plans", {}).get("plans", []):
                         if not plan["needs_review"]:
                             semantic_refs.update({ref["record_id"]: ref for ref in plan["evidence"]})
-                if historical and data.get("seed_memory") and not data.get("seed_rejected"):
-                    # Reused judgments carry the exact source manifest from
-                    # their original request; the moving latest-dialogue window
-                    # cannot silently remove or authorize different evidence.
-                    seed_refs = data.get("seed_sources", [])
-                    with self.engine.db.connect() as conn:
-                        if seed_refs and not self.mind._fresh(conn, seed_refs):
-                            data["seed_rejected"] = True
-                    if not data.get("seed_rejected"):
-                        semantic_refs.update({ref["record_id"]: ref for ref in seed_refs})
                 provider.section_isolation = isolation
+                # The host's record of what this attempt is shown: the commit's rebase and the next
+                # attempt after a conflict both read it.
+                lane_name = "enrichment" if historical else "maintenance" if maintenance else "action"
+                manifest = manifests.record(self, provider, data, model_context, flags, refs=refs, targets=targets, sources=semantic_refs.values(),
+                                            view=view, lane=lane_name, settings=settings, isolation=isolation)
                 # The context is assembled; from here a failure may have been paid for.
                 preparing = False
                 data.pop("preparation_conflicts", None)
-                if historical and data.get("seed_memory") and not data.get("seed_rejected"):
-                    try:
-                        proposal = Appraisal(reason="Reuse verified semantic result", memory=MemoryAssessment.model_validate(data["seed_memory"]))
-                        receipt = data["seed_receipt"]
-                    except ValidationError:
-                        data["seed_rejected"] = True
-                        proposal, receipt = provider.appraise(model_context)
+                # A stored proposal is another source of the proposal, at the seam the historical seed
+                # always used: the context above was rebuilt as usual and everything below is unchanged.
+                # Its sources that are still current are merged back, so the moving dialogue window and
+                # what expand() had recalled can neither remove nor authorize different evidence.
+                stored = revalidation.candidate(data, historical)
+                if stored:
+                    lighting = stored.origin == "reuse"
+                    light = revalidation.resume(self, provider, row, data, model_context, stored, manifest=manifest, semantic_refs=semantic_refs,
+                                                continuity_refs=continuity_refs, flags=flags, lane=lane_name)
+                    lighting = lighting and light is not None
+                if light:
+                    proposal, receipt = light.proposal, light.receipt
                 else:
                     proposal, receipt = provider.appraise(model_context)
-                if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
-                    from .decision_context import expand
-                    proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
+                    if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
+                        from .decision_context import expand
+                        proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
                 # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
                 data.pop("dropped_fields", None)
                 if receipt.get("dropped_fields"):
                     data["dropped_fields"] = receipt["dropped_fields"]
                 deferred_memory = proposal.memory.model_dump() if operational else None
+                if light and light.deferred_memory:
+                    # The stored proposal was kept after its memory had been set aside for enrichment.
+                    deferred_memory = light.deferred_memory
                 if operational:
                     proposal = proposal.model_copy(update={"memory": MemoryAssessment()})
                 if maintenance and proposal.session_advice is None:
@@ -1545,6 +1571,11 @@ class Appraisals:
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal.model_dump(), receipt=receipt,
                             evaluated_sources=list(semantic_refs.values()))
+                if manifest:
+                    # The manifest this proposal rests on: this attempt's, unless the proposal was reused
+                    # without a question and so still rests on what its own model call was shown.
+                    data.update(evaluated_continuity=sorted(continuity_refs),
+                                proposal_manifest=light.manifest_digest if light and light.tier == "A" else data["manifest"])
                 primary_result = targets[0]["exploration_id"] if len(targets) == 1 else None
                 missing_targets = [t for t in targets if sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1]
                 if missing_targets and self.exploration_capabilities.get("decisions"):
@@ -1898,6 +1929,10 @@ class Appraisals:
                             **({"follow_up_id": review_id} if review_id else {})}
 
                 def rebase(conn, state):
+                    if manifest and flags[manifests.REBASE]:
+                        # The manifest's predicate: nobody wrote what this proposal writes, and nothing
+                        # this judgment type was shown of the mind state moved. Bookkeeping passes.
+                        return manifests.rebase(self.mind, manifest, before_state, state, proposal, historical=historical)
                     # Contact bookkeeping may advance the global revision during
                     # a long model call. Rebase only when its real inputs match.
                     # Historical enrichment does not read or mutate mood or
@@ -1917,6 +1952,7 @@ class Appraisals:
                             return False
                     return semantic_enabled
 
+                committing = True
                 data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
@@ -1926,7 +1962,7 @@ class Appraisals:
                 data.pop(key, None)
                 if data["result"].get(key):
                     data[key] = data["result"][key]
-            for field in ("error", "error_detail", "error_signature", "error_repeats", "transient_failures"):
+            for field in ("error", "error_detail", "error_signature", "error_repeats", "transient_failures", "reuse"):
                 data.pop(field, None)
             state = "complete"
         except ModelAdmissionWait as error:
@@ -1935,12 +1971,17 @@ class Appraisals:
             if admission_wait:
                 data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),
                             admission_waits=data.get("admission_waits", 0) + 1)
+            elif lighting:
+                # The light call could not be admitted: no full appraisal call was made, so nothing is charged.
+                data["error"], uncharged_wait = "deepseek-partial-evaluation-wait", "light"
+                state = revalidation.failed(self, data, error, light, committing)
             else:
                 # A nested asynchronous operation may wait after earlier calls.
                 # Preserve its charged attempt and actual/unknown usage.
                 data["error"] = "deepseek-partial-evaluation-wait"
                 state = self._charged_failure(row, data, error, settings=settings, historical=historical)
                 data.pop("frozen_memory_context", None)
+                data.pop("reuse", None)
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
             if getattr(provider, "failure_receipt", None):
                 data["failed_call_receipt"] = provider.failure_receipt
@@ -1964,7 +2005,7 @@ class Appraisals:
                 error.kind, error.code = "runtime", "already-committed"
                 data["result"], data["completed_from"] = committed, "already-committed"
                 for field in ("error", "error_detail", "error_signature", "error_repeats",
-                              "transient_failures", "frozen_memory_context"):
+                              "transient_failures", "frozen_memory_context", "reuse"):
                     data.pop(field, None)
                 state = "complete"
             elif data["error"].startswith("deepseek-evidence-compression-pending"):
@@ -1984,12 +2025,21 @@ class Appraisals:
             elif preparing and isinstance(error, (Conflict, Missing)):
                 uncharged_wait = "preparation"
                 state = self._preparation_conflict(data, error)
+            elif lighting:
+                # A charged attempt is one full appraisal call, and this attempt made none.
+                uncharged_wait = "light"
+                state = revalidation.failed(self, data, error, light, committing)
             else:
                 state = self._charged_failure(row, data, error, settings=settings, historical=historical)
                 if data["error"] != "deepseek-appraisal-preparation-complete":
                     # Prepared evidence is complete and cached; every other
                     # failure rebuilds the context instead of resending a stale one.
                     data.pop("frozen_memory_context", None)
+                data.pop("reuse", None)
+                if state == "pending" and committing and not light and revalidation.may_remember(error, data, flags):
+                    # The commit, not the judgment, failed, and on something the taxonomy lets a later
+                    # attempt reuse. A blocked or unknown conflict never gets here.
+                    revalidation.remember(data, data["error_detail"], deferred_memory=deferred_memory, at=self.mind.clock())
         finally:
             slots.close()
         if admission_wait:
@@ -1998,14 +2048,19 @@ class Appraisals:
             delay = min(1800, 60 * 2 ** min(data.get("transient_failures", 1) - 1, 5))
         elif uncharged_wait == "preparation":
             delay = PREPARATION_RETRY_SECONDS
+        elif uncharged_wait == "light" or (not uncharged_wait and state == "pending" and data.get("reuse")):
+            # The next attempt is a light one, or the full rerun a light attempt handed the row to.
+            delay = revalidation.LIGHT_RETRY_SECONDS
         elif uncharged_wait:
             delay = COMPRESSION_RETRY_SECONDS
         else:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
+        # A light attempt is never a charged one, whether it committed or not.
+        uncharged = bool(admission_wait or uncharged_wait or lighting)
         with self.engine.db.connect(write=True) as conn:
             changed = conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
-                (state, time.time() + delay, int(bool(admission_wait or uncharged_wait)), dumps(data), row["id"], data["attempt_token"]),
+                (state, time.time() + delay, int(uncharged), dumps(data), row["id"], data["attempt_token"]),
             ).rowcount
             if changed:
                 self._settle_children(conn, row["id"], data, state)
@@ -2015,7 +2070,7 @@ class Appraisals:
             self.engine.db.metric("appraisal_quarantined", 1, {
                 "appraisal": row["id"], "lane": "enrichment" if historical else "maintenance" if maintenance else "action",
                 "stimulus": data.get("stimulus"), "reason": data.get("repair_reason"), "error": data.get("error"),
-                "charged_attempts": row["attempts"] + int(not (admission_wait or uncharged_wait)),
+                "charged_attempts": row["attempts"] + int(not uncharged),
                 **{k: data[k] for k in ("error_detail", "error_repeats", "compression_waits", "compression_stalls",
                                         "transient_failures", "preparation_conflicts") if k in data}})
         if not changed:
@@ -2029,7 +2084,7 @@ class Appraisals:
             # One row per attempt, written now that the attempt has ended. The queue row's
             # own error/receipt/proposal fields are left exactly as they are.
             self._ledger_attempt(row, data, state, calls, owned=bool(changed),
-                                 charged=not (admission_wait or uncharged_wait), historical=historical,
+                                 charged=not uncharged, historical=historical,
                                  maintenance=maintenance)
         return self.status(row["id"])
 
@@ -2047,7 +2102,12 @@ class Appraisals:
             "attempts": row["attempts"] + int(charged), "error": data.get("error"),
             "error_detail": data.get("error_detail"), "repair_reason": data.get("repair_reason"),
             "waiting_reason": data.get("waiting_reason"),
-            "proposal_digest": digest(proposal) if proposal else None, "context_digest": context_digest})
+            "proposal_digest": digest(proposal) if proposal else None, "context_digest": context_digest,
+            # How the proposal came to this attempt, and what the host was shown: digests, tiers and
+            # verdicts only. The reasons a revalidation gave stay on the queue row.
+            "tier": data.get("tier"), "manifest_digest": data.get("manifest"),
+            "revalidation": [{k: item[k] for k in ("conflict_id", "verdict", "patched")} for item in (data.get("revalidation") or {}).get("items", [])]
+                            if data.get("tier") == "B" else None})
 
 
 class DailyReview:
