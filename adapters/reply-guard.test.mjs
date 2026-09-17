@@ -104,3 +104,17 @@ test('semantic duplicate is durable pending; genuine input-specific silence bypa
  assert.equal((await guard.checkGroup([request])).state,'pending');
  silence=true;assert.equal((await guard.checkGroup([request])).state,'silent');assert.equal(models,1);
 });
+
+test('a late input choice releases prepared unsent finding reservations',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-late-choice-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ let silent=false;const canceled=[];
+ const guard=new ReplyGuard({directory,wholeReplyReview:true,call:async(action,r)=>{
+  if(action==='reply-status')return {action:silent?'silent':'reply',input_id:'current'};
+  if(action==='share-cancel'){canceled.push(r.draft_id);return {state:'canceled'};}
+  return {state:'ready',checked:r.entries.map(e=>({...e,references:[]}))};
+ }});
+ const entries=[{request:{draft_id:'finding-draft',reply_id:'current',text:'Body'},delivery:{id:'fixed-id',text:'Body'}}];
+ const review=await guard.checkGroup(entries.map(e=>e.request));silent=true;
+ const result=await guard.deliverGroup(entries,'owner',review,{guard:async()=> 'send',send:()=>{throw Error('must not send');}});
+ assert.equal(result.state,'silent');assert.deepEqual(canceled,['finding-draft']);
+});

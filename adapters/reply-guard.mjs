@@ -101,6 +101,7 @@ export class ReplyGuard {
     // validate source/configuration versions; never rewrite an unsent suffix.
     const review=await this.checkGroup(entry.entries.map(e=>e.request),{frozen:!!entry.review});
     if(['silent','merged'].includes(review.state)){
+      for(const item of entry.entries.filter(e=>e.state==='unsent'))await this.call('share-cancel',{draft_id:item.request.draft_id});
       save({...entry,state:review.state,choice:review.choice});return;
     }
     if(review.state!=='ready'){
