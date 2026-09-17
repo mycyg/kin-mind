@@ -134,6 +134,70 @@ plus the refused sections, held sections, held decisions and dropped fields. An
 operator resume clears it, so a row judged afresh is not argued with about a
 proposal it no longer holds.
 
+A commit conflict does not have to cost a whole new judgment. While it builds
+the context, the host records an input manifest of what that attempt is shown:
+the judgment type and lane, when it was built and until when it is valid,
+digests of the prompt, schema, model parameters and projected context, policy
+and persona versions, the latest owner input, the clock, the time-derived values
+and the time boundaries shown, root evidence and every citable source as source,
+hash and revision, and per class of input the identifiers, revisions and
+enumerated states of what was shown — dimensions, wishes, concerns, sharing
+decisions, rhythm, the stage-1 plan view, methods, preferences, graph, topic,
+work and share candidates, pending events, dialogue items and the session
+snapshot. It is content addressed in `mind_appraisal_manifests`; the queue row
+keeps the digest. It holds no message body and no proposal.
+
+When a commit then fails on a conflict the taxonomy marks reusable, the row
+keeps the proposal, its receipt, the manifest it rests on and the static facts
+of the conflict in `data.reuse`. The next attempt rebuilds its context exactly
+as any attempt does and compares the two manifests. Relevance follows the
+judgment type, never what the proposal happened to output: history
+organization does not rest on mood, wishes, plans, methods, timing or the
+session; a session judgment rests on the session and its evidence alone; a
+receipt settlement does not rest on concerns or rhythm; everything else rests on
+every class it was shown, and an unknown judgment type or class is relevant.
+Inside a class only declared bookkeeping is ignored: compare-and-swap revision
+counters of objects whose shown content is identical, review times, leases and a
+decay curve re-anchored where it already was.
+
+*Tier A* commits the stored proposal with no model call when nobody wrote what it
+writes, nothing relevant moved, no owner input arrived, policy, persona,
+prompt and configuration are the same and the manifest is still valid. Validity
+ends after one ordinary attempt's bound or at the nearest time boundary the
+model was shown, whichever comes first: a reuse never accepts more staleness
+than a single attempt already accepts, and an open window with two minutes left
+is not the window with two hours left that the model judged. *Tier B* asks
+DeepSeek one light question, `revalidate_appraisal`: the stored proposal, the
+host's conflict list — object, before, after, the fragments of the proposal
+resting on it, and the evidence that may be cited now — the latest four public
+turns and the clock. Each conflict gets one verdict: `keep`, `adjust` with a
+patch confined to the listed fragment, `append`, `correct` or `link` for an
+event route only, `wait` to withdraw the fragment, or `replan`. The host refuses
+an answer that leaves a conflict unanswered, patches outside its fragment,
+patches without `adjust`, uses a route verdict elsewhere, or no longer
+validates; a refused answer and `replan` mean the next attempt judges afresh,
+with no repair call. Only an entry answered with a standing verdict has its
+compare-and-swap expectation reset to the current value. A *full rerun* follows
+a change of root evidence, policy, persona or configuration, a spent light
+budget, and every conflict that is blocked or unknown: evidence out of bounds,
+insufficient authority and a lost lease never reach DeepSeek.
+
+Whatever is reused or revalidated goes through the same commit as any proposal,
+where sources, revisions, the lease and idempotency are checked again; a verdict
+cannot make superseded evidence valid. Sources the stored proposal was given and
+that are still current are merged back into what may be cited, so evidence an
+earlier expansion round recalled does not fall out of bounds. A light attempt is
+never a charged attempt: a charged attempt remains one full appraisal call. A
+light attempt that meets a fresh reusable conflict waits about fifteen seconds
+and spends one of two light attempts per stored proposal; anything else hands
+the row to a full rerun, so the stage-1 caps still end every row. On the history
+lane that is one full call, at most two light attempts and one more full call.
+The same predicate guards the commit itself: when the mind revision moved during
+the model call, the rebase passes only if nobody wrote the dimensions, wishes or
+concerns the proposal writes and nothing this judgment type was shown of the mind
+state was written. `manifest_rebase`, `appraisal_reuse` and
+`appraisal_revalidation` default to on; all three off is the previous behavior.
+
 Absorbed appraisals settle transitively. Nested `batch_ids` are flattened when a
 candidate is absorbed, so a failed candidate's own children are absorbed with
 it, and every terminal path settles the whole closure: a completed parent
@@ -172,8 +236,10 @@ write no memory of their own.
 
 `appraisal-attempts` reads the attempt ledger: one append-only row per attempt,
 written when that attempt ends, with its ordinal, attempt token, lane, stimulus,
-start and finish, outcome (`committed`, `failed`, `quarantined`, `discarded` or
-`abandoned`), the classification of the failure, sha256 digests of the proposal
+start and finish, outcome (`committed`, `failed`, `quarantined`, `discarded`,
+`abandoned`, `reused` for a stored proposal committed with no model call or
+`revalidated` for one committed after a light revalidation), the tier, manifest
+digest and verdicts of a light attempt, the classification of the failure, sha256 digests of the proposal
 and of the rendered request, and every model call the attempt made — purpose,
 model, request id, elapsed time and the usage the provider reported, or an
 explicit `usage_status: "unknown"` where it reported none. It takes an optional
@@ -191,7 +257,8 @@ without changing anything else.
 transaction, so it needs no worker shutdown: a quarantined row is held by no
 worker, and the claim query takes it from there atomically. Each row is judged
 afresh — attempts reset to zero, the whole retry budget is restored, and a
-stored proposal stays audit data instead of being replayed as a seed. The
+stored proposal stays audit data instead of being replayed as a seed: whatever a
+conflict had kept for reuse or revalidation (`data.reuse`) is dropped. The
 failure moves into `recovery_history` with its attempts, error, `error_detail`,
 `repair_reason`, receipts and retry counters. The command is idempotent and
 fenced to its own batch: a different job list under the same `command_id` is a

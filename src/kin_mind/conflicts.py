@@ -29,7 +29,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.appraisal", "kin_mind.state", "kin_mind.graph", "kin_mind.memory",
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
-    "eventmem.core.engine",
+    "eventmem.core.engine", "kin_mind.revalidation",
 )
 
 
