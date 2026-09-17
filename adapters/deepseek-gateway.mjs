@@ -1,5 +1,14 @@
 import http from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
+import {usageRow} from './model-lease.mjs';
+
+// A native turn is attributed per session, because the two kinds are not the same
+// spend: a chat turn is what the owner is waiting for, while contact drafts,
+// creation and exploration are the host's own sessions and yield to the owner.
+export const BACKGROUND_TURN_KINDS = new Set(['contact-draft', 'creation', 'exploration']);
+export const nativeTurnPurpose = (kind = 'chat') => BACKGROUND_TURN_KINDS.has(kind)
+  ? {lane: 'background', purpose: 'native-' + kind}
+  : {lane: 'foreground', purpose: 'native-chat-turn'};
 
 export const replyContract = 'Write only messages addressed to the user: the answer or a useful progress update. Do not narrate your interpretation of the user, response planning, private analysis, or internal tool-result commentary. Earlier assistant messages may contain that narration; do not imitate it. Keep tool calls separate from user-facing text. Runtime metadata is evidence to check, not a preface to repeat. Follow the conversation language and persona. When the owner has enabled autonomous casual replies, choose_reply can record silent or merged for the current input; the host applies that decision. Each new input is considered independently, and work deliveries follow the task workflow.';
 const privateChannels = new Set(['analysis', 'reasoning', 'summary']);
@@ -61,7 +70,8 @@ export function responseNormalizer() {
   };
 }
 
-export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 300000, reasoningEffort = 'high'}) {
+export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 300000,
+  reasoningEffort = 'high', lease = null, purposeFor = () => nativeTurnPurpose()}) {
   if (!key) throw Error('deepseek-key-unavailable');
   const token = randomBytes(32).toString('hex');
   const controllers = new Set();
@@ -77,6 +87,13 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
     const abort = new AbortController(); controllers.add(abort);
     const timer = setTimeout(() => abort.abort(), timeoutMs);
     res.on('close', () => { if (!res.writableEnded) abort.abort(); });
+    // One usage row per turn that actually reached the provider, on every exit.
+    // A request that never got that far is not a call and is not billed as one.
+    let attributed = {lane: null, purpose: null}, held = null, attempted = false, reported = false;
+    const report = value => {
+      if (reported) return; reported = true;
+      onUsage(usageRow({...attributed, ...(held ? held.detail() : {}), ...value}));
+    };
     try {
       let raw = '';
       for await (const chunk of req) {
@@ -84,12 +101,25 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         if (Buffer.byteLength(raw) > 64 * 1024 * 1024) throw Error('request-too-large');
       }
       const body = deepseekRequest(JSON.parse(raw), reasoningEffort);
+      attributed = purposeFor(body) ?? nativeTurnPurpose();
+      if (lease) {
+        held = await lease.acquire({lane: attributed.lane, purpose: attributed.purpose});
+        if (!held.proceed) {
+          // Background turns yield; the owner's chat turn never reaches here.
+          report({usage: null, usageStatus: 'skipped', outcome: 'lane-skipped'});
+          res.writeHead(503, {'Content-Type': 'application/json'});
+          res.end(JSON.stringify({error: {message: 'Model lane unavailable', type: 'provider_error'}})); return;
+        }
+        held.signal?.addEventListener('abort', () => abort.abort(), {once: true});
+      }
+      attempted = true;
       const upstream = await fetchImpl('https://api.deepseek.com/responses', {
         method: 'POST', redirect: 'error', signal: abort.signal,
         headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + key},
         body: JSON.stringify(body),
       });
       if (!upstream.ok) {
+        report({usage: null, usageStatus: 'unknown', outcome: 'provider-http-' + upstream.status});
         res.writeHead(upstream.status, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({error: {message: 'DeepSeek HTTP ' + upstream.status, type: 'provider_error'}})); return;
       }
@@ -97,7 +127,7 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       if (!(upstream.headers.get('content-type') ?? '').includes('text/event-stream')) {
         const value = await upstream.json();
         value.output = (value.output ?? []).filter(item => !isPrivateOutput(item));
-        onUsage({model: value.model, usage: value.usage, requestId: value.id});
+        report({model: value.model, usage: value.usage, requestId: value.id, outcome: 'answered'});
         res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(value)); return;
       }
       res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'});
@@ -109,7 +139,11 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         const event = normalize(JSON.parse(data));
         if (!event) return;
         if (['response.completed','response.failed','response.incomplete','error'].includes(event.type)) terminal = true;
-        if (event.type === 'response.completed') onUsage({model: event.response.model, usage: event.response.usage, requestId: event.response.id});
+        // A failed or incomplete response was still a call. Whatever usage it
+        // reported is recorded; what it did not report is recorded as unknown.
+        if (['response.completed','response.failed','response.incomplete'].includes(event.type))
+          report({model: event.response?.model, usage: event.response?.usage, requestId: event.response?.id, outcome: event.type.slice(9)});
+        else if (event.type === 'error') report({usage: null, usageStatus: 'unknown', outcome: 'provider-error'});
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       };
       for await (const chunk of upstream.body) {
@@ -122,12 +156,15 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       if(!terminal)throw Error('missing-terminal-event');
       res.end();
     } catch {
+      // An abort, a timeout and a broken stream all spent a call whose usage nobody
+      // ever reported. That is unknown, not zero, and not nothing.
+      if (attempted) report({usage: null, usageStatus: 'unknown', outcome: held?.lost ? 'lease-lost' : 'transport-incomplete'});
       // Never return provider bodies, credentials, or raw conversation data in errors.
       if (!res.headersSent) {
         res.writeHead(502, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({error: {message: 'DeepSeek transport incomplete', type: 'provider_error'}}));
       } else res.end('event: error\ndata: '+JSON.stringify({type:'error',code:'incomplete_stream',message:'DeepSeek transport incomplete'})+'\n\n');
-    } finally {clearTimeout(timer); controllers.delete(abort);}
+    } finally {clearTimeout(timer); controllers.delete(abort); await held?.release();}
   });
   await new Promise((resolve, reject) => {server.once('error', reject);server.listen(0, '127.0.0.1', resolve);});
   return {
