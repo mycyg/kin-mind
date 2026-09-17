@@ -45,19 +45,48 @@ supports the official [Anthropic-compatible API](https://api-docs.deepseek.com/g
 with a typed `submit_appraisal` tool call. Credentials are sent only to the official
 HTTPS hostname. Embedding configuration remains independent.
 
+A structured tool call may be answered from the judgment cache (`mind_judgment_cache`
+and its dependency index) instead of the provider. Its key is the digest of the
+fully rendered request — tool name, system prompt, schema, context, endpoint, and
+model with its effort — and it no
+longer carries the database-wide generation, so an unrelated write elsewhere stops
+discarding a judgment that is still answerable. Four rules make dropping the
+generation safe. A caller states the judgment it is asking for — type, goal,
+completion condition and obligation version — and all four are matched alongside the
+request digest, so the verdict that a step is complete can never answer whether the
+owner's own work is complete. Acceptance has two phases: the answer is stored pending
+and becomes servable only once the caller reports that it passed the caller's own
+validation, so a result the host refused is never replayed. Each row keeps the
+identifiers its request rested on, and a revised, corrected or deleted source, or a
+graph change, purges it at once; a changed persona or scope configuration ends it as
+well. A row lives at most 300 seconds, and a caller may declare a shorter validity. A
+hit is recorded as a call with `usage_status: "reused"` and no usage, and it never
+skips the validation the caller runs before committing: an equal request proves the
+question is the same, not that the evidence behind it is still current.
+`submit_appraisal` is never served from this cache at all, because the host clock is
+part of that request; reuse on that path is the appraisal revalidation, not this.
+Setting `semantic_cache_v2` to false restores the previous generation-keyed cache in
+the older `mind_semantic_cache` table, which is otherwise left in place untouched.
+
 `Appraisals.enqueue` persists original evidence IDs. `run_one` leases one review per
-scope, makes one provider request, validates the response, and commits state and
-wish proposals in one transaction. Eight optional sections of that commit are
-applied in savepoints of their own, so a section the host refuses is undone alone
+scope, makes one provider request — or a lighter one, or none, where an attempt after
+a commit conflict may reuse what the previous attempt already judged — validates the
+response, and commits state and wish proposals in one transaction. Eight optional
+sections of that commit are applied in savepoints of their own, so a section the
+host refuses is undone alone
 and the rest of the appraisal still commits; the refusal is recorded with static
 codes and host text only, and one bounded follow-up asks again for it and for
 whatever rested on it. A changed revision requires reappraisal. A lost queue
 acknowledgement after a committed mutation reuses the command receipt.
-Failures retain previous scores and use bounded retries with backoff: every lane
-shares one cap on charged attempts, and an exhausted budget or the same error
-signature twice in a row quarantines the row in the existing `needs-repair` state
-instead of paying for it again. A sourced host action resumes a quarantined row,
-which is then judged afresh with its failure history preserved. A timer checks
+Failures retain previous scores and use bounded retries with backoff. A charged
+attempt is one full appraisal call; waiting for admission, for evidence
+compression, through a provider outage, on a conflict raised before any call, or
+on a light revalidation is uncharged, and each of those has a counter and a bound
+of its own whose end is the same quarantine in the existing `needs-repair` state.
+A sourced host action resumes a quarantined row, which is then judged afresh with
+its failure history preserved. [Mobile recovery and operational
+progress](mobile-recovery.md) holds that whole account, with the conflict taxonomy
+it rests on. A timer checks
 queue readiness; no ready evidence means no model request. Source bodies and provider
 reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending. The request includes projected scores,
@@ -70,6 +99,100 @@ so another worker cannot reclaim it before the original subprocess exits.
 This does not block the chat session. Exhaustion remains a pending appraisal,
 never an empty successful decision. Output ceilings do not require that many tokens
 to be generated.
+
+### Model lanes and the lease interface
+
+Every DeepSeek call is admitted through one ledger, `mind_model_leases`, shared by the
+Python host, the API service and the Node adapters. The lane follows the purpose the
+caller declares, never the name of the function that ends up calling the model:
+compression serves a waiting reader and an idle queue alike.
+
+| Lane | Admission | Declared by |
+|---|---|---|
+| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; `share-preflight` and `share-preflight-group`; core recall; the Node classifier and chat turns |
+| `user-work` | one reserved slot, **exempt from the foreground yield** | the review that decides whether a held work task is finished |
+| `background` | `meta.kin_background_model_limit`, and only while no foreground session holds a lease anywhere on the machine | appraisals and everything nested in them, the daily review, event digests, procedure replay, completion review, prewarming, coverage backfill, core jobs, a context whose `access_origin` is `maintenance`, proactive drafts, the Node health audit |
+
+The exemption is what prevents a deadlock. A held work task keeps a foreground lease,
+every background caller waits on it with `deepseek-foreground-priority`, and the one
+call that can release the task is that review. The foreground yield is machine-wide:
+a scope isolates data, not the model's attention, and a plan executor's claim follows
+the same rule. A caller that declares nothing keeps the behaviour it had before lanes,
+no lease at all, and leaves a `model_lane_undeclared` metric with its purpose label.
+
+Capacity comes from configuration. The host's own configuration states
+`background_model_limit` (1–8); the `recover` action, which the host already runs at
+start-up, writes it to `meta`, and any other action fills it in only when `meta` has
+none. `configure-model-capacity` changes it while the host runs and holds until the
+next restart, so change the configuration as well. An invalid configured value is
+refused with `model_capacity_invalid` rather than keeping the host down, and a
+missing limit is never a silent default:
+admission still uses 2, writes `model_capacity_unconfigured`, and `operational-status`
+reports `source: "default-unconfigured"`. `operational-status` lists each lane with its
+limit, the source of that limit and what is held, and every current holder by label,
+age and time to expiry. Purposes and holders are short labels, never text.
+
+A row lives for 90 seconds and Python renews it every 20. Expired rows, and expired
+`mind_foreground_leases` rows such as the `read:` leases nobody returns, are swept at
+every admission; that sweep is the whole of crash recovery. A renewal checks that it
+still updated a row. When it did not, the lease is lost: the late result is
+quarantined. A single call raises a `model-lease-lost` conflict instead of returning,
+and writes `model_lease_lost` with the usage its caller reported or `unknown`, never
+zero. An appraisal keeps the proposal and its receipt on the queue row and refuses
+the commit, so the judgment is auditable and never applied; once the lease is gone
+no further nested call is paid for. While an evaluation runs, a heartbeat extends the
+queue row's own lease in 180-second steps and never shortens it, so a long call cannot
+be reclaimed by another worker. No heartbeat outlives one hour: a worker that hangs
+without dying loses its row and its slot like one that crashed, only later. A thread started on a caller's behalf, such as the
+bounded rerank, is handed the caller's lease and declared lane and reuses them instead
+of taking a second slot; a thread abandoned at its deadline is no longer renewed, so
+it cannot keep a slot beyond the 90 seconds. The metrics are `model_capacity_unconfigured`,
+`model_capacity_invalid`, `model_lane_undeclared`, `model_lane_unrecorded` (a foreground
+or user-work call that went ahead while the ledger was busy), `model_lease_lost` and
+`model_call_abandoned`; each carries labels and counters only.
+
+Node never opens SQLite. The adapters use internal routes of the local API, which are
+deliberately absent from the published OpenAPI contract, with the same bearer
+credential as every `/v1` route:
+
+| Route | Request | Answers (HTTP 200) |
+|---|---|---|
+| `POST /v1/model-leases/acquire` | `{lane, purpose, holder?, id?, ttl_seconds?}` | `{state:"admitted", lease:{id, lane, purpose, expires_at, ttl_seconds, renew_after_seconds}, capacity}` · `{state:"wait", reason, retry_after_seconds, capacity}` · `{state:"disabled"}` |
+| `POST /v1/model-leases/renew` | `{id, ttl_seconds?}` | `{state:"renewed", lease}` · `{state:"lost", id}` |
+| `POST /v1/model-leases/release` | `{id}` | `{state:"released", id}` · `{state:"lost", id}` |
+| `GET /v1/model-leases` | — | the `model_lanes` block of `operational-status` |
+
+`purpose`, `holder` and a caller-chosen `id` match `[A-Za-z0-9][A-Za-z0-9:._-]*`;
+anything else is a 422. Choosing the `id` makes `acquire` repeatable after a lost
+answer and lets the caller release a lease it never saw confirmed. `ttl_seconds` is
+15–300 and defaults to 90; renew every `renew_after_seconds`. A lease is lost once its
+row is gone: the next admission of any lane deletes every row past its expiry before it
+counts, so a late renewal that still finds its row keeps it, and one that does not has
+lost a slot that may already be somebody else's. The wait reasons are
+`deepseek-background-capacity`, `deepseek-foreground-priority` and
+`deepseek-user-work-capacity`. Lease operations use a two-second `busy_timeout`: a busy
+or missing ledger answers 503 with `{state:"busy"|"unavailable", reason}` instead of
+queuing behind a writer. The fallback when the service is down is the host action
+`model-lease` with `{op:"acquire"|"renew"|"release"|"status", …}` and the same fields
+and answers; it is handled before any engine opens, and reports a busy ledger as
+`{state:"busy"}`. Its `status` answers the same block as `GET /v1/model-leases` and
+the `model_lanes` block of `operational-status`, so an operator can read the lanes
+with the service down. On `lost`, abort the request and record its usage as
+unknown. When
+neither path answers, foreground and user work go ahead and note it, and background
+work skips that run. `disabled` means `model_lanes` is off: carry on without a lease,
+as before. A rolled-back service answers 404, which is the same degraded mode.
+
+A Node adapter writes one usage row per model call, on every exit of that call, with
+the lane and purpose it declared and what the provider reported, or an explicit
+unknown where it reported nothing. A background run the ledger could not admit is
+recorded as skipped with its lane and reason, so a degraded ledger is legible rather
+than silent.
+
+The switch is `model_lanes`. The ledger is shared, so it is machine-wide: set to
+`false` in any scope it restores the previous admission everywhere, with background
+capacity only, no quarantine, no heartbeat, and a plan claim that looks at its own
+scope.
 
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without

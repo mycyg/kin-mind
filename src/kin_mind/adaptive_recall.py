@@ -58,10 +58,15 @@ def bounded(call, seconds):
     """
     if seconds <= 0 or not _remote_slots.acquire(blocking=False):
         raise TimeoutError("recall-provider-capacity")
+    from .model_lanes import handoff
+    # A thread starts with an empty context. Hand it the caller's lease and declared lane, so
+    # a rerank inside an evaluation reuses that lease instead of taking a second slot.
+    carried = handoff()
     done, result = threading.Event(), []
     def run():
         try:
-            result.append((True, call()))
+            with carried.adopt():
+                result.append((True, call()))
         except Exception as error:  # noqa: BLE001 - propagate thread exceptions to the caller
             result.append((False, error))
         finally:
@@ -69,6 +74,8 @@ def bounded(call, seconds):
             done.set()
     threading.Thread(target=run, name="kin-optional-recall", daemon=True).start()
     if not done.wait(seconds):
+        # Whatever the late thread took is no longer renewed: it cannot hold a slot for ever.
+        carried.abandon()
         raise TimeoutError("recall-provider-deadline")
     ok, value = result[0]
     if not ok:
@@ -182,12 +189,16 @@ class AdaptiveRecall:
             previous_ids = set(pool)
             info["rounds"] += 1
             request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
+            from .model_lanes import handoff
+            carried = handoff()
             def vector_candidates():
                 from eventmem.core.providers import Providers
                 from eventmem.core.vectors import VectorIndex
                 remaining = min(10, deadline - time.monotonic())
                 embedding = Providers(self.engine, timeout=remaining)
-                vectors, index = bounded(lambda: embedding.embed([lookup]), remaining)
+                # The executor's thread knows nothing of this caller's lease either.
+                with carried.adopt():
+                    vectors, index = bounded(lambda: embedding.embed([lookup]), remaining)
                 return VectorIndex(self.engine, index).search(vectors[0], scopes=[self.mind.scope.key()], limit=120)
             channel_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="kin-recall") as executor:
@@ -424,8 +435,10 @@ class AdaptiveRecall:
         info["candidate_ids"] = [i["id"] for i in selected]
         info["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
         info["degraded_reasons"] = list(dict.fromkeys(info["degraded_reasons"]))
-        receipts = info.get("model_receipts", [])
-        info["usage"] = {key: sum(r.get("usage", {}).get(key, 0) or 0 for r in receipts)
+        # A receipt whose provider reported no usage counts as unreported, not as zero
+        # tokens: the totals below are then blanked and only `known_totals` is kept.
+        receipts = [r for r in info.get("model_receipts", []) if r.get("usage")]
+        info["usage"] = {key: sum(r["usage"].get(key, 0) or 0 for r in receipts)
                          for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")}
         info["usage"]["unreported_requests"] = info["model_requests"] - len(receipts)
         info["usage"]["status"] = "partial-unknown" if info["usage"]["unreported_requests"] else "reported"

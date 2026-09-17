@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, FiniteFloat, StrictInt, field_validator, model_validator
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
@@ -355,6 +356,11 @@ class Mind(Continuity):
     def _mutate(self, request, kind, fn, *, rebase=None):
         payload = request.model_dump() if hasattr(request, "model_dump") else request
         with self.engine.db.connect(write=True) as conn:
+            from .autonomy_schema import optimized
+            # The expected revision is this command's precondition, checked inside run(); it
+            # is not what the command is. A retry that reread the state keeps its identity.
+            stamp = fingerprint("mind-state", self.scope.key(), payload,
+                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
 
             def run():
                 state = self._load(conn)
@@ -376,7 +382,7 @@ class Mind(Continuity):
                 return dict(event_id=event_id, revision=state["revision"], **result)
 
             return self.engine.command(
-                conn, self._key(payload["command_id"]), payload, run
+                conn, self._key(payload["command_id"]), payload, run, stamp=stamp
             )
 
     def configure_autonomy(self, request):

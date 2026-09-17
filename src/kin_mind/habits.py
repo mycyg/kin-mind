@@ -6,6 +6,8 @@ import json
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import record, revision_id, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
 
 SCHEMA = """
@@ -45,7 +47,11 @@ class ConversationHabits:
                 values[key] = entry["value"]
         return {"revision": row[0] if row else 0, "preferences": values, "entries": data["entries"], "instruction_authority": "data"}
 
-    def apply(self, conn, proposal, command_id, allowed=None):
+    def apply(self, conn, proposal, command_id, allowed=None, *, revise=False):
+        """`revise`: the caller accepts an explicit revision when this command id comes back
+        with different preferences. The host's own appraisal commit does; `update()`, whose
+        command id comes from a client, does not."""
+        from .autonomy_schema import optimized
         proof = self.mind._evidence(conn, proposal.evidence_ids)
         if not proof or not all(r["authority"] == "explicit" for r in proof) or not self.mind._fresh(conn, proof):
             raise Conflict("Habit changes require current explicit owner evidence")
@@ -64,22 +70,40 @@ class ConversationHabits:
             raise ValueError("Invalid explicit exploration interval")
         if "exploration_paused" in values and type(values["exploration_paused"]) is not bool:
             raise ValueError("Exploration pause is boolean")
-        fingerprint = digest(proposal.model_dump())
+        hashed = digest(proposal.model_dump())
+        # The expected revision gates this command; the preferences, evidence and reason are
+        # what it is. A retry that reread the revision keeps the receipt it already has.
+        stamp = fingerprint("habit", self.scope.key(), proposal.model_dump(),
+                            enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
+        supersedes = None
         previous = conn.execute("SELECT digest,data FROM mind_habit_commands WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
-        if previous:
-            if previous[0] != fingerprint:
-                raise Conflict("Habit command changed")
+        if previous and unchanged(conn, stamp, command_id, legacy=(previous[0], hashed)):
             return json.loads(previous[1])
+        if previous:
+            if stamp is None or not revise:
+                raise Conflict("Habit command changed", kind="runtime",
+                               code="payload-changed", target=command_id)
+            supersedes, command_id = command_id, revision_id(command_id, stamp)
+            stamp = stamp._replace(supersedes=supersedes)
+            again = conn.execute("SELECT data FROM mind_habit_commands WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+            if again:
+                return json.loads(again[0])
         current = self.read(conn)
+        # Checked at the first effect and again for every revision: a revision built on a
+        # preference revision that has moved on is refused, not silently replayed.
         if current["revision"] != proposal.expected_revision:
-            raise Conflict("Conversation preferences changed")
+            raise Conflict("Conversation preferences changed", target=self.scope.key(),
+                           expected=proposal.expected_revision, actual=current["revision"])
         entries = current["entries"]
         for key, value in values.items():
             entries[key] = {"value": value, "evidence": proof, "reason": proposal.reason, "at": self.mind.clock(), "revision": current["revision"] + 1}
         result = {"state": "applied", "revision": current["revision"] + 1, "entries": entries}
+        if supersedes:
+            result["supersedes"] = supersedes
         conn.execute("INSERT OR REPLACE INTO mind_conversation_habits VALUES(?,?,?)", (self.scope.key(), result["revision"], dumps(result)))
         conn.execute("INSERT INTO mind_habit_revisions VALUES(?,?,?)", (self.scope.key(), result["revision"], dumps(result)))
-        conn.execute("INSERT INTO mind_habit_commands VALUES(?,?,?,?)", (self.scope.key(), command_id, fingerprint, dumps(result)))
+        conn.execute("INSERT INTO mind_habit_commands VALUES(?,?,?,?)", (self.scope.key(), command_id, hashed, dumps(result)))
+        record(conn, stamp, command_id, self.mind.clock())
         return result
 
     def update(self, request):

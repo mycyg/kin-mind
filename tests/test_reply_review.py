@@ -91,3 +91,20 @@ def test_schema_repair_is_model_led_and_preserves_failed_call_usage(system):
     assert result['state']=='ready' and len(provider.calls)==2
     assert result['receipt']['schema_repair']['rejected_call']['usage']['output_tokens']==17
     assert provider.timeout==120
+
+
+def test_a_changed_reply_body_is_typed_as_frozen_content_not_as_a_changed_command(system):
+    """Stage 2 WP3: a reply body is a content freeze, not a command. Both freezes now carry
+    a code of their own, so stage 3's continuation groups can act on it instead of the host
+    turning every one of them into an endless pending retry."""
+    from kin_mind.conflicts import classify
+    mind,memory,*_=system;req=request(memory,mind);api=ReplyReviews(memory.sharing)
+    api.preflight(req,Review())
+    req['entries'][0]['text']='A different body'
+    with pytest.raises(Conflict) as frozen:api.preflight(req,Review())
+    registration={'reply_id':'turn-one','bubbles':[{'text':'A public sentence','references':[]}]}
+    memory.sharing.register(registration)
+    with pytest.raises(Conflict) as registered:
+        memory.sharing.register({**registration,'bubbles':[{'text':'Other body','references':[]}]})
+    for error in (frozen.value,registered.value):
+        assert classify(error) == ('runtime','reply-content-changed','block')

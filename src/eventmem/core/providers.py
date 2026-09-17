@@ -62,13 +62,23 @@ class Providers:
                 + ensure_started(self.engine.db.root, config.endpoint, config.model)
             }
         from contextlib import nullcontext
+
+        from kin_mind.attempts import cost_entry, token_counts
         from kin_mind.model_runtime import model_slot
         with self.engine.db.connect() as conn:
             has_shared_slots = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_model_leases'").fetchone())
         start = time.perf_counter()
+
+        def unknown_usage(outcome):
+            """A request that produced no usable reply still made a call: it is recorded
+            as unknown rather than silently left out of the accounts or counted as zero."""
+            self.engine.db.metric("model_usage_unknown", 1, {"role": role, "model": config.model,
+                                                             "outcome": outcome, "usage_status": "unknown"})
+            self.engine.db.metric("model_ms", (time.perf_counter() - start) * 1000, {"role": role})
         for attempt in range(2 if local else 1):
             try:
-                with (model_slot(self, role) if has_shared_slots and config.model.startswith("deepseek") else nullcontext()), httpx.Client(
+                # Jobs mark themselves background; anything else reaching a model here is a recall somebody waits for.
+                with (model_slot(self, role, default="foreground") if has_shared_slots and config.model.startswith("deepseek") else nullcontext()), httpx.Client(
                     timeout=config.timeout_seconds,
                     follow_redirects=False,
                     trust_env=not local,
@@ -83,13 +93,18 @@ class Providers:
                 if response.status_code >= 400:
                     if local and attempt == 0 and response.status_code == 503:
                         continue
+                    unknown_usage("http-" + str(response.status_code))
                     raise ProviderError(
                         f"Model role {role} returned HTTP {response.status_code}"
                     )
                 result = response.json()
                 break
+            except httpx.TimeoutException:
+                unknown_usage("timeout")
+                raise
             except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
                 if not local or attempt:
+                    unknown_usage("network-error")
                     raise
                 # Embedding is idempotent. Recover a crashed process once; other
                 # model requests are never replayed here.
@@ -97,25 +112,25 @@ class Providers:
                     "Authorization": "Bearer "
                     + ensure_started(self.engine.db.root, config.endpoint, config.model)
                 }
-        usage = result.get("usage", {})
-        input_tokens, output_tokens = (
-            usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-            usage.get("completion_tokens", usage.get("output_tokens", 0)),
-        )
+        counts = token_counts(result.get("usage"))
+        if counts is None:
+            # A9: a provider that reported no usage leaves an explicit unknown. Writing
+            # `model_tokens` 0 here made unattributable calls look free.
+            unknown_usage("usage-not-reported")
+            return result
+        input_tokens, output_tokens = counts
         self.engine.db.metric(
             "model_tokens",
             input_tokens + output_tokens,
-            {"role": role, "model": config.model},
+            {"role": role, "model": config.model, "usage_status": "reported"},
         )
-        self.engine.db.metric(
-            "model_cost",
-            (
-                input_tokens * config.input_price_per_million
-                + output_tokens * config.output_price_per_million
-            )
-            / 1_000_000,
-            {"role": role},
-        )
+        priced = cost_entry(input_tokens, output_tokens,
+                            config.input_price_per_million, config.output_price_per_million)
+        if priced["cost_status"] == "unpriced":
+            # An unconfigured price is not a price of zero.
+            self.engine.db.metric("model_cost_unknown", 1, {"role": role, "model": config.model, **priced})
+        else:
+            self.engine.db.metric("model_cost", priced["cost"], {"role": role, **priced})
         self.engine.db.metric(
             "model_ms", (time.perf_counter() - start) * 1000, {"role": role}
         )

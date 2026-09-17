@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {MobileRouter} from './mobile-router.mjs';
 import {WorkLockReview} from './work-lock-review.mjs';
+import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 async function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-review-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -116,4 +117,36 @@ test('replacement settlement is atomic with every delivery proof',async t=>{
   assert.equal((await f.review.tick()).state,'applied');
   assert.equal(task.deliveries.upload.state,'not-submitted');
   assert.equal(task.deliveries.upload.fulfilledBy[0].messageId,'replacement');
+});
+
+test('a completed step whose delivery is unconfirmed keeps the work lock, and no other verdict stands in for it',async t=>{
+  const f=await fixture(t);
+  f.decision.disposition='complete';f.decision.reason='The requested step itself is finished';
+  f.evidence.receipts['reply-1']={state:'unconfirmed'};
+  const held=await f.review.tick();
+  assert.equal(held.state,'waiting');
+  assert.equal(held.reason,'delivery-unconfirmed');
+  assert.equal(f.router.tasks().length,1,'a finished step is not a finished obligation');
+  // The attempt is typed by its own lane and purpose. A step verdict, a plan verdict
+  // and an owner-work verdict are three separate records, never one reused judgment.
+  assert.equal(held.lane,REVIEWER_LANES.reviewWork);
+  assert.equal(held.purpose,REVIEWER_PURPOSES.reviewWork);
+  assert.equal(new Set(Object.values(REVIEWER_PURPOSES)).size,3);
+  assert.equal(new Set(Object.values(REVIEWER_LANES)).size,3);
+  // Confirmed delivery is judged by a new review, not by replaying the earlier one.
+  f.evidence.receipts['reply-1']={state:'accepted',messageId:'receipt-1'};f.advance(20*60000);
+  assert.equal((await f.review.tick()).state,'applied');
+  assert.equal(f.calls(),2);
+});
+
+test('a refused user-work lane holds the lock and is never mistaken for a verdict',async t=>{
+  const f=await fixture(t);
+  const review=new WorkLockReview({...f.reviewArgs,review:async()=>{
+    throw Object.assign(Error('model-lane-degraded'),{leaseSkipped:true,lease:{lane:'user-work',leaseState:'degraded',leaseReason:'lease-service-unreachable'}});}});
+  const result=await review.tick();
+  assert.equal(result.state,'waiting');
+  assert.equal(result.reason,'work-review-lane-unavailable');
+  assert.equal(result.decision,undefined);
+  assert.equal(result.retryAt-result.checkedAt,5*60000);
+  assert.equal(f.router.tasks().length,1);
 });

@@ -109,7 +109,8 @@ class ShareLedger:
         ref = ContentReference.model_validate(raw)
         unit = self.graph.get(conn, ref.unit_id)
         if unit["kind"] != "finding" or ref.version != unit.get("content_version", 1):
-            raise Conflict("Share reference version is unavailable")
+            raise Conflict("Share reference version is unavailable", target=ref.unit_id,
+                           expected=ref.version, actual=unit.get("content_version", 1))
         if not self.graph.fresh(conn, unit):
             raise Conflict("Share reference needs review")
         return ref, unit
@@ -191,22 +192,30 @@ class ShareLedger:
                 self._save_coverage(conn, data)
                 conn.execute("UPDATE mind_share_reservations SET state=? WHERE scope=? AND recipient='owner' AND unit_id=? AND version=? AND draft_id=?", (bubble["state"], self.scope.key(), ref.unit_id, ref.version, bubble.get("draft_id", share.get("delivery_id"))))
 
-    def apply(self, conn, assessment, allowed_share_ids):
+    def apply(self, conn, assessment, allowed_share_ids, *, items=None):
+        """`allowed_share_ids`: the evaluated shares, or a test of one share id. `items` (memory_items.Items):
+        the memory section applies each mapping whole or not at all; without it every fault raises, as before."""
         from .memory import MemoryContinuity
+        from .memory_items import Items, positions
+        items = items or Items(conn, False)
         memory = MemoryContinuity.__new__(MemoryContinuity)
         memory.mind, memory.engine, memory.scope = self.mind, self.engine, self.scope
-        for mapping in assessment.mappings:
-            if mapping.share_id not in allowed_share_ids:
-                raise Conflict("Coverage mapping is outside evaluated delivery evidence")
-            share = memory._get(conn, mapping.share_id)
-            if mapping.bubble_id not in share.get("bubbles", {}):
-                raise Conflict("Coverage mapping refers to an unknown bubble")
-            desired = {(r.unit_id, r.version) for r in mapping.references}
-            for row in conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND share_id=? AND bubble_id=?", (self.scope.key(), mapping.share_id, mapping.bubble_id)).fetchall():
-                previous = json.loads(row[0])
-                if (previous["unit_id"], previous["version"]) not in desired:
-                    self._save_coverage(conn, {**previous, "needs_review": True, "reason": mapping.reason, "mapping_state": "retracted"})
-            self.settle(conn, share, mappings=[mapping])
+        for key, mapping in zip(positions("coverage.mappings", assessment.mappings), assessment.mappings):
+            with items.item("coverage-mapping", key, needs=[r.unit_id for r in mapping.references]) as live:
+                if not live:
+                    continue
+                evaluated = allowed_share_ids(mapping.share_id) if callable(allowed_share_ids) else mapping.share_id in allowed_share_ids
+                if not evaluated:
+                    raise Conflict("Coverage mapping is outside evaluated delivery evidence")
+                share = memory._get(conn, mapping.share_id)
+                if mapping.bubble_id not in share.get("bubbles", {}):
+                    raise Conflict("Coverage mapping refers to an unknown bubble")
+                desired = {(r.unit_id, r.version) for r in mapping.references}
+                for row in conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND share_id=? AND bubble_id=?", (self.scope.key(), mapping.share_id, mapping.bubble_id)).fetchall():
+                    previous = json.loads(row[0])
+                    if (previous["unit_id"], previous["version"]) not in desired:
+                        self._save_coverage(conn, {**previous, "needs_review": True, "reason": mapping.reason, "mapping_state": "retracted"})
+                self.settle(conn, share, mappings=[mapping])
 
     def register(self, request):
         reply_id = request.get("reply_id")
@@ -225,7 +234,11 @@ class ShareLedger:
             prior = conn.execute("SELECT digest,data FROM mind_reply_references WHERE scope=? AND reply_id=?", (self.scope.key(), reply_id)).fetchone()
             if prior:
                 if prior[0] != fingerprint:
-                    raise Conflict("Registered reply body changed")
+                    # A frozen reply body, not a command: its id is the reply's, and what
+                    # replaces it is a continuation of that reply rather than a revision of
+                    # this call. Typed here so a caller can tell the two apart.
+                    raise Conflict("Registered reply body changed", kind="runtime",
+                                   code="reply-content-changed", target=reply_id)
                 return json.loads(prior[1])
             conn.execute("INSERT INTO mind_reply_references VALUES(?,?,?,?)", (self.scope.key(), reply_id, fingerprint, dumps(data)))
             return data

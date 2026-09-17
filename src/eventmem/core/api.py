@@ -129,6 +129,19 @@ class WebSource(Model):
     title: str = ""
 
 
+class ModelLeaseRequest(Model):
+    lane: Literal["foreground", "user-work", "background"]
+    purpose: str = Field(min_length=1, max_length=120)
+    holder: str = Field(default="", max_length=120)
+    id: str | None = Field(default=None, min_length=8, max_length=120)
+    ttl_seconds: float = Field(default=90, ge=15, le=300)
+
+
+class ModelLeaseHandle(Model):
+    id: str = Field(min_length=8, max_length=120)
+    ttl_seconds: float = Field(default=90, ge=15, le=300)
+
+
 def boundary(engine, request):
     if request.event in {"end", "checkpoint", "compact"} and request.checkpoint:
         allowed = {
@@ -264,7 +277,13 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.exception_handler(Conflict)
     async def conflict(request, exc):
-        return JSONResponse({"detail": str(exc)}, status_code=409)
+        # Additive: `detail` is unchanged, the taxonomy says what moved and whether
+        # the caller may retry. Static classification only, never the payload.
+        from kin_mind.conflicts import classify
+
+        found = classify(exc)
+        return JSONResponse({"detail": str(exc), "kind": found.kind,
+                             **({"code": found.code} if found.code else {})}, status_code=409)
 
     @app.exception_handler(Missing)
     async def missing(request, exc):
@@ -750,6 +769,37 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     @app.post("/v1/contact/tick", operation_id="contact_tick")
     def contact_tick(deliver: bool = False) -> dict:
         return Scheduler(engine).tick(deliver=deliver)
+
+    # Host-internal: the Node adapters take, renew and return model leases here, because Node
+    # never opens SQLite. Not part of the public contract, so a rolled-back service answers 404
+    # and the adapters fall back to their degraded mode. A busy ledger answers 503 within two seconds.
+    def lease_answer(answer):
+        return JSONResponse(answer, status_code=503 if answer["state"] in {"busy", "unavailable"} else 200)
+
+    @app.post("/v1/model-leases/acquire", include_in_schema=False)
+    def acquire_model_lease(request: ModelLeaseRequest):
+        from kin_mind.model_lanes import Ledger
+
+        return lease_answer(Ledger(engine.db.path).acquire(
+            request.lane, request.purpose, holder=request.holder, ttl=request.ttl_seconds, lease_id=request.id))
+
+    @app.post("/v1/model-leases/renew", include_in_schema=False)
+    def renew_model_lease(request: ModelLeaseHandle):
+        from kin_mind.model_lanes import Ledger
+
+        return lease_answer(Ledger(engine.db.path).renew(request.id, ttl=request.ttl_seconds))
+
+    @app.post("/v1/model-leases/release", include_in_schema=False)
+    def release_model_lease(request: ModelLeaseHandle):
+        from kin_mind.model_lanes import Ledger
+
+        return lease_answer(Ledger(engine.db.path).release(request.id))
+
+    @app.get("/v1/model-leases", include_in_schema=False)
+    def read_model_leases():
+        from kin_mind.model_lanes import Ledger
+
+        return lease_answer(Ledger(engine.db.path).status())
 
     @app.get("/v1/overview", operation_id="overview")
     def overview() -> dict:

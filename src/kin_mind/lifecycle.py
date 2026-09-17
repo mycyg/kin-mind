@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.idempotency import record, revision_id, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope
 
 from .state import timestamp
@@ -106,6 +108,8 @@ def graph_changed(conn, scope, value, previous, at):
     for item in (value, previous or {}):
         identifiers.update(item[k] for k in ("subject", "object") if item.get(k))
     mark_dirty(conn, scope, identifiers, at, "graph-revision")
+    from .judgment_cache import invalidate
+    invalidate(conn, identifiers)
 
 
 def record_changed(conn, record):
@@ -129,6 +133,10 @@ def record_deleted(conn, record, at):
     conn.execute("UPDATE mind_event_digests SET data='{}' WHERE scope=? AND event_id IN "
                  "(SELECT event_id FROM mind_event_dependencies WHERE scope=? AND record_id=?)",
                  (scope, scope, record["id"]))
+    # Nor inside a cached judgment: an erasure purges the rows, it does not wait for a
+    # TTL. Callers cite raw sources as well as records, so both identities are purged.
+    from .judgment_cache import invalidate
+    invalidate(conn, [record["id"], *record.get("source_ids", [])])
 
 
 def record_usage(conn, scope, identifier, usage_id, origin, at, data=None):
@@ -156,6 +164,8 @@ def foreground_lease(engine, scope, session, *, active=True, seconds=180):
                          "DO UPDATE SET expires_at=excluded.expires_at", (scope, session, time.time() + seconds))
         else:
             conn.execute("DELETE FROM mind_foreground_leases WHERE scope=? AND session=?", (scope, session))
+        # A read lease is never handed back; whatever expired goes when the next one is written.
+        conn.execute("DELETE FROM mind_foreground_leases WHERE expires_at<=?", (time.time(),))
 
 
 class EventLifecycle:
@@ -213,93 +223,125 @@ class EventLifecycle:
         target_anchors = anchors(target["id"])
         return bool(target_anchors and all(target_anchors & anchors(m["id"]) for m in members))
 
-    def apply_routes(self, conn, routes, refs, appraisal_id, aliases=None):
+    def apply_routes(self, conn, routes, refs, appraisal_id, aliases=None, *, revise=False, items=None):
+        """`revise`: the caller accepts an explicit revision when a route key comes back with
+        different content. The host's own commit path does; a client that supplies its own
+        command id does not, because a reused id with other content is that client's mistake.
+        `items` (memory_items.Items): the memory section applies each route whole or not at all;
+        without it every fault raises, as it always did."""
+        from .autonomy_schema import optimized
+        from .memory_items import Items, positions
+        items = items or Items(conn, False)
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
         results, aliases = [], aliases or {}
+        fingerprints = optimized(conn, self.scope.key(), "idempotency_fingerprint")
         if len({r.key for r in routes}) != len(routes):
             raise Conflict("Event route keys must be unique")
-        for route in routes:
-            command_id = digest([appraisal_id, route.key])
-            payload_hash = digest(route.model_dump())
-            old = conn.execute("SELECT digest,data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
-            if old:
-                if old["digest"] != payload_hash:
-                    raise Conflict("Event route command changed")
-                results.append(json.loads(old["data"]))
-                continue
-            evidence = self.graph.proof(conn, route.evidence_ids, allowed)
-            ids = route.member_ids or list(dict.fromkeys(r["record_id"] for r in evidence))
-            members = [self.graph.ensure(conn, aliases.get(i, i)) for i in ids]
-            for member in members:
-                self.graph.proof(conn, member.get("source_ids", []), allowed)
-            target = self.graph.get(conn, aliases.get(route.event_id, route.event_id), follow=True) if route.event_id else None
-            if target and (target["kind"] != "event" or target["revision"] != route.expected_revision):
-                raise Conflict("Event route target changed")
-            before, changed = {}, {}
-            def remember(identifier, before=before):
-                if identifier not in before:
-                    try:
-                        before[identifier] = self.graph.get(conn, identifier)
-                    except Missing:
-                        before[identifier] = None
-            def link(subject, predicate, object_id, remember=remember, evidence=evidence, route=route, changed=changed):
-                identifier = self.graph.identifier("edge", [subject, predicate, object_id, "evidence", None])
-                remember(identifier)
-                value = self.graph.link(conn, subject, predicate, object_id, evidence,
-                                        reason=route.reason, basis="inferred", event_id=appraisal_id)
-                changed[value["id"]] = value["revision"]
-            action = route.action
-            if action in {"append", "correct"} and (not target or not self._binding(conn, route, target, members, evidence, refs)):
-                action = "defer"
-            if action == "create":
-                if target or not route.title.strip():
-                    raise ValueError("A new event needs its own title and identity")
-                identifier = self.graph.identifier("event", ["route", appraisal_id, route.key])
-                remember(identifier)
-                target = self.graph._put(conn, {"id": identifier, "kind": "event", "title": route.title,
-                    "text": "", "basis": "inferred", "source_ids": sorted({r["source_id"] for r in evidence}),
-                    "evidence": evidence, "occurred_at": min(m["occurred_at"] for m in members),
-                    "lifecycle": "open", "routing_command": command_id, "membership_authority": "graph"})
-            if action in {"create", "append", "correct"}:
-                remember(target["id"])
-                for member in members:
-                    if member["id"] == target["id"]:
-                        raise Conflict("An event cannot contain itself")
-                    if target["id"] in ancestors(conn, self.scope.key(), [member["id"]]):
+        for key, route in zip(positions("event_routes", routes), routes):
+            # Applied whole or not at all (memory_items): a route goes with any member, event or thread it names by a dropped key.
+            with items.item("event-route", key, needs=(route.event_id, route.thread_id, *route.member_ids)) as live:
+                if not live:
+                    continue
+                command_id = digest([appraisal_id, route.key])
+                payload_hash = digest(route.model_dump())
+                # The expected revisions are this route's precondition, checked below against the
+                # live target and thread; title, quote, reason, binding and identity are its content.
+                stamp = fingerprint("event-route", self.scope.key(), route.model_dump(), enabled=fingerprints)
+                supersedes = None
+                old = conn.execute("SELECT digest,data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+                if old and unchanged(conn, stamp, command_id, legacy=(old["digest"], payload_hash)):
+                    results.append(json.loads(old["data"]))
+                    continue
+                if old:
+                    if stamp is None or not revise:
+                        raise Conflict("Event route command changed", kind="runtime",
+                                       code="payload-changed", target=command_id)
+                    # An explicit revision: its own command id, superseding the one it replaces,
+                    # validated in full below and recorded with its own before/after.
+                    supersedes, command_id = command_id, revision_id(command_id, stamp)
+                    stamp = stamp._replace(supersedes=supersedes)
+                    again = conn.execute("SELECT data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+                    if again:
+                        results.append(json.loads(again["data"]))
                         continue
-                    if member["id"] in ancestors(conn, self.scope.key(), [target["id"]]):
-                        raise Conflict("Event membership would create a cycle")
-                    link(member["id"], "part_of", target["id"])
-                    if action == "correct":
-                        link(member["id"], "corrects", target["id"])
-                # Membership changes advance the event revision used by CAS readers.
-                target = self.graph._put(conn, {**target, "membership_command": command_id})
-                changed[target["id"]] = target["revision"]
-                if route.thread_id:
-                    thread = self.graph.get(conn, aliases.get(route.thread_id, route.thread_id))
-                    if thread["kind"] != "thread" or thread["revision"] != route.expected_thread_revision:
-                        raise Conflict("Event thread changed")
-                    link(target["id"], "part_of", thread["id"])
-            elif action == "link":
-                if not target:
-                    raise ValueError("Related event required")
+                evidence = self.graph.proof(conn, route.evidence_ids, allowed)
+                ids = route.member_ids or list(dict.fromkeys(r["record_id"] for r in evidence))
+                members = [self.graph.ensure(conn, aliases.get(i, i)) for i in ids]
                 for member in members:
-                    link(member["id"], "related", target["id"])
-            undo_id = "route-" + command_id if changed else None
-            if undo_id:
-                inverse = {"state": "applied", "command_id": undo_id, "before": before,
-                           "after_revisions": changed, "evidence": evidence, "appraisal_id": appraisal_id}
-                conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)",
-                             (undo_id, self.scope.key(), payload_hash, dumps(inverse)))
-            result = {"state": action, "requested_action": route.action, "event_id": target["id"] if target else None,
-                      "undo_command_id": undo_id,
-                      "member_ids": [m["id"] for m in members], "evidence": evidence,
-                      "identity_judgement": route.identity.model_dump() if route.identity else None,
-                      "identity_evidence_versions": {r["record_id"]: r["revision"] for r in refs
-                          if route.identity and r["record_id"] in route.identity.prior_record_ids},
-                      "reason": route.reason, "at": self.mind.clock(), "appraisal_id": appraisal_id}
-            conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
-            results.append(result)
+                    self.graph.proof(conn, member.get("source_ids", []), allowed)
+                target = self.graph.get(conn, aliases.get(route.event_id, route.event_id), follow=True) if route.event_id else None
+                if target and (target["kind"] != "event" or target["revision"] != route.expected_revision):
+                    raise Conflict("Event route target changed", target=target["id"],
+                                   expected=route.expected_revision, actual=target["revision"])
+                before, changed = {}, {}
+                def remember(identifier, before=before):
+                    if identifier not in before:
+                        try:
+                            before[identifier] = self.graph.get(conn, identifier)
+                        except Missing:
+                            before[identifier] = None
+                def link(subject, predicate, object_id, remember=remember, evidence=evidence, route=route, changed=changed):
+                    identifier = self.graph.identifier("edge", [subject, predicate, object_id, "evidence", None])
+                    remember(identifier)
+                    value = self.graph.link(conn, subject, predicate, object_id, evidence,
+                                            reason=route.reason, basis="inferred", event_id=appraisal_id)
+                    changed[value["id"]] = value["revision"]
+                action = route.action
+                if action in {"append", "correct"} and (not target or not self._binding(conn, route, target, members, evidence, refs)):
+                    action = "defer"
+                if action == "create":
+                    if target or not route.title.strip():
+                        raise ValueError("A new event needs its own title and identity")
+                    identifier = self.graph.identifier("event", ["route", appraisal_id, route.key])
+                    remember(identifier)
+                    target = self.graph._put(conn, {"id": identifier, "kind": "event", "title": route.title,
+                        "text": "", "basis": "inferred", "source_ids": sorted({r["source_id"] for r in evidence}),
+                        "evidence": evidence, "occurred_at": min(m["occurred_at"] for m in members),
+                        "lifecycle": "open", "routing_command": command_id, "membership_authority": "graph"})
+                if action in {"create", "append", "correct"}:
+                    remember(target["id"])
+                    for member in members:
+                        if member["id"] == target["id"]:
+                            raise Conflict("An event cannot contain itself")
+                        if target["id"] in ancestors(conn, self.scope.key(), [member["id"]]):
+                            continue
+                        if member["id"] in ancestors(conn, self.scope.key(), [target["id"]]):
+                            raise Conflict("Event membership would create a cycle")
+                        link(member["id"], "part_of", target["id"])
+                        if action == "correct":
+                            link(member["id"], "corrects", target["id"])
+                    # Membership changes advance the event revision used by CAS readers.
+                    target = self.graph._put(conn, {**target, "membership_command": command_id})
+                    changed[target["id"]] = target["revision"]
+                    if route.thread_id:
+                        thread = self.graph.get(conn, aliases.get(route.thread_id, route.thread_id))
+                        if thread["kind"] != "thread" or thread["revision"] != route.expected_thread_revision:
+                            raise Conflict("Event thread changed", target=thread["id"],
+                                           expected=route.expected_thread_revision, actual=thread["revision"])
+                        link(target["id"], "part_of", thread["id"])
+                elif action == "link":
+                    if not target:
+                        raise ValueError("Related event required")
+                    for member in members:
+                        link(member["id"], "related", target["id"])
+                undo_id = "route-" + command_id if changed else None
+                if undo_id:
+                    inverse = {"state": "applied", "command_id": undo_id, "before": before,
+                               "after_revisions": changed, "evidence": evidence, "appraisal_id": appraisal_id}
+                    conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)",
+                                 (undo_id, self.scope.key(), payload_hash, dumps(inverse)))
+                result = {"state": action, "requested_action": route.action, "event_id": target["id"] if target else None,
+                          "undo_command_id": undo_id,
+                          "member_ids": [m["id"] for m in members], "evidence": evidence,
+                          "identity_judgement": route.identity.model_dump() if route.identity else None,
+                          "identity_evidence_versions": {r["record_id"]: r["revision"] for r in refs
+                              if route.identity and r["record_id"] in route.identity.prior_record_ids},
+                          "reason": route.reason, "at": self.mind.clock(), "appraisal_id": appraisal_id}
+                if supersedes:
+                    result["supersedes"] = supersedes
+                conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
+                record(conn, stamp, command_id, self.mind.clock())
+                results.append(result)
         return results
 
     def snapshot(self, conn, identifier):
@@ -436,7 +478,11 @@ class EventLifecycle:
              "correction_relations": [{k: e.get(k) for k in ("subject", "object", "reason", "basis", "occurred_at", "valid_from", "valid_until")}
                                       for e in snapshot["edges"].values() if e["predicate"] == "corrects"],
              "noncurrent_records": [{"id": r["id"], "status": r["status"]} for r in snapshot["all_records"].values() if r["id"] not in snapshot["records"]]},
-            max_tokens=65536)
+            max_tokens=65536,
+            judgment={"scope": self.scope.key(), "type": "event-digest", "goal": identifier,
+                      "completion": "every unit cites a supplied record id",
+                      "obligation_version": snapshot["input_hash"]},
+            depends_on=[identifier, *snapshot["all_records"]])
         result = summary.model_dump()
         unit_count = 0
         for section in ("narrative", "conclusions", "pending", "corrections"):
@@ -457,6 +503,10 @@ class EventLifecycle:
             row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?", (self.scope.key(), identifier)).fetchone()
             if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
                 raise Conflict("Event changed during digest generation")
+            # Second phase: the digest is servable only now that the event is still the
+            # one it was made from. The projection branch carries no token and is a no-op.
+            from .judgment_cache import accept
+            accept(self.engine, receipt, conn=conn)
             conn.execute("UPDATE mind_event_digests SET state='ready',revision=revision+1,input_hash=?,data=? WHERE scope=? AND event_id=?",
                          (snapshot["input_hash"], dumps(result), self.scope.key(), identifier))
             conn.execute("DELETE FROM mind_event_dependencies WHERE scope=? AND event_id=?", (self.scope.key(), identifier))

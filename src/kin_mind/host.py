@@ -13,6 +13,7 @@ from eventmem.core.models import Scope, SourceInput
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
+from .conflicts import classify
 from .context import Contexts
 from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
@@ -34,11 +35,20 @@ def load_config(path):
 
 
 def dispatch(config, action, request):
+    if action == "model-lease":
+        # The fallback of the lease routes. Answered before any engine opens, so a busy
+        # database costs the caller two seconds and never the engine's thirty.
+        from .model_lanes import lease_command
+        return lease_command(config["root"], request)
     registry = config.get("session_registry_file")
     if registry and Path(registry).exists():
         binding = json.loads(Path(registry).read_text())["binding"]
         config = {**config, "session_id": binding["threadId"]}
     engine = Engine(Path(config["root"]))
+    from .model_lanes import context_lane, declared, sync_capacity
+    # `recover` is the host's start-up call: there the configured capacity replaces what meta
+    # holds. Any other action only fills a missing value.
+    sync_capacity(engine, config, startup=action == "recover")
     mind = Mind(engine, Scope.model_validate(config["scope"]))
     if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
         from .plans import AutonomousPlans
@@ -101,6 +111,11 @@ def dispatch(config, action, request):
     if action == "recover-appraisals":
         from .recovery import recover_quarantined
         return recover_quarantined(mind, **request)
+    if action == "appraisal-attempts":
+        # Read-only accounting: outcomes, static codes, digests and usage. No private text.
+        from .attempts import read as read_attempts
+        return read_attempts(engine, mind.scope.key(), job_id=request.get("job_id"),
+                             limit=request.get("limit", 20))
     if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
         from .session_checkpoint import SessionCheckpoint
         checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])
@@ -115,7 +130,10 @@ def dispatch(config, action, request):
         if not request.get('shadow') and not memory.settings().get('manifest_restore'):
             snapshot.pop('manifestVersion', None)
             snapshot.pop('linked', None)
-        return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
+        # The checkpoint carries the user's session across a rotation, so somebody is waiting
+        # for it unless the host says this one is maintenance.
+        with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
     if action == "continuity-manifest":
         from .continuity_manifest import ContinuityManifest
         return ContinuityManifest(mind).read(**request)
@@ -150,12 +168,14 @@ def dispatch(config, action, request):
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
         if provider:
             provider.timeout = 120
-        return ReplyReviews(memory.sharing).preflight(request, provider)
+        with declared("foreground", action):
+            return ReplyReviews(memory.sharing).preflight(request, provider)
     if action == "share-preflight":
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
         if provider:
             provider.timeout = 120
-        return memory.sharing.preflight(request, provider)
+        with declared("foreground", action):
+            return memory.sharing.preflight(request, provider)
     if action == "share-cancel":
         return memory.sharing.cancel(request["draft_id"])
     if action == "reply-references":
@@ -388,7 +408,11 @@ def main():
         result = dispatch(load_config(args.config), args.action, json.load(sys.stdin))
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
-        result = {"error": type(error).__name__}
+        # Additive: the class stays the caller's contract, the taxonomy tells it
+        # whether waiting can help. Static codes only, never the failing payload.
+        found = classify(error)
+        result = {"error": type(error).__name__, "kind": found.kind,
+                  **({"code": found.code} if found.code else {})}
     print(json.dumps(result, ensure_ascii=False))
 
 

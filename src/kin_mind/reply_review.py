@@ -77,7 +77,10 @@ class ReplyReviews:
         with self.engine.db.connect() as conn:
             old = conn.execute('SELECT request_hash,data FROM mind_reply_reviews WHERE scope=? AND id=?', (self.scope,key)).fetchone()
             if old and old[0] != fingerprint:
-                raise Conflict('Frozen reply body changed')
+                # The same content freeze as sharing.register, and the same code: a changed
+                # frozen body is not a command whose payload moved.
+                raise Conflict('Frozen reply body changed', kind='runtime',
+                               code='reply-content-changed', target=key)
             old = json.loads(old[1]) if old else None
             if old and old['state'] == 'ready':
                 fresh = self.dependencies(conn, entries, [f[0] for f in old['dependencies']['findings']])

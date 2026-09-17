@@ -109,16 +109,25 @@ def tokenize(text: str) -> str:
 
 class Conflict(Exception):
     """Static host message plus optional structured facts. The message stays the
-    only positional argument, so str() and the HTTP 409 mapping never change."""
+    only positional argument, so str() and the HTTP 409 mapping never change.
 
-    def __init__(self, message="", *, code=None, target=None, expected=None, actual=None):
+    `kind` is the taxonomy of kin_mind.conflicts: what moved, not what to do
+    about it. A raise site that leaves it None is classified by the registry."""
+
+    def __init__(self, message="", *, kind=None, code=None, target=None, expected=None, actual=None):
         super().__init__(message)
-        self.code, self.target = code, target
+        self.kind, self.code, self.target = kind, code, target
         self.expected, self.actual = expected, actual
 
 
 class Missing(Exception):
-    pass
+    """A reference that is gone. It takes the same optional facts as Conflict and
+    stays a separate class, so every `except Conflict` keeps its current reach."""
+
+    def __init__(self, message="", *, kind=None, code=None, target=None, expected=None, actual=None):
+        super().__init__(message)
+        self.kind, self.code, self.target = kind, code, target
+        self.expected, self.actual = expected, actual
 
 
 class Deleted(Conflict):

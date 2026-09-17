@@ -8,8 +8,11 @@ from typing import Literal
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
+from eventmem.core.idempotency import record, unchanged
+from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
 
+from .autonomy_schema import optimized
 from .state import timestamp
 
 SCHEMA = """
@@ -269,55 +272,78 @@ class EventGraph:
             self.link(conn, identifier, "part_of", tid, refs, reason="Same host task identifier")
         return node
 
-    def apply(self, conn, proposal, refs, event_id, receipt, *, external_aliases=None):
+    def apply(self, conn, proposal, refs, event_id, receipt, *, external_aliases=None, items=None, keys=None):
+        """`items` (memory_items.Items): the memory section applies each node and edge whole or not at all,
+        under the `keys` it has in that proposal. Without it every fault raises, as it always did."""
+        from .memory_items import Items, positions
+        items = items or Items(conn, False)
+        node_keys, edge_keys = keys or (positions("graph.nodes", proposal.nodes), positions("graph.edges", proposal.edges))
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
         node_aliases = {n.key: n.id or self.identifier(n.kind, [event_id, n.key]) for n in proposal.nodes}
         if len(node_aliases) != len(proposal.nodes) or node_aliases.keys() & (external_aliases or {}).keys():
             raise Conflict("Graph keys must be unique")
         aliases = {**(external_aliases or {}), **node_aliases}
-        for item in proposal.nodes:
-            evidence = self.proof(conn, item.evidence_ids, allowed)
-            identifier = aliases[item.key]
-            try:
-                previous = self.get(conn, identifier)
-            except Missing:
-                previous = None
-            if previous and item.expected_revision != previous["revision"]:
-                raise Conflict("Graph node changed after evaluation")
-            if previous and previous["kind"] != item.kind:
-                raise Conflict("Graph kind is immutable")
-            if item.occurred_at:
-                timestamp(item.occurred_at)
-            basis = item.basis
-            if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
-                basis = "inferred"
-            if item.kind == "association":
-                basis = "internal_thought"
-            value = {**(previous or {}), **item.model_dump(exclude={"id", "key", "expected_revision", "evidence_ids"}), "id": identifier,
-                "basis": basis, "source_ids": sorted({r["source_id"] for r in evidence}), "evidence": evidence,
-                "occurred_at": item.occurred_at or (previous or {}).get("occurred_at") or self.mind.clock(),
-                "assessment_event": event_id, "configuration_version": receipt.get("configuration_version"),
-                "model": receipt.get("model"), "state": "active"}
-            if item.kind == "finding":
-                value["content_version"] = (previous or {}).get("content_version", 1) + int(bool(previous and previous.get("text") != item.text))
-            if value.get("owner_id"):
-                value["owner_id"] = aliases.get(value["owner_id"],value["owner_id"])
-            self._put(conn, value)
-        for item in proposal.nodes:
+        # A node this proposal creates introduces its key and the id that key stands for. One that updates a
+        # stored node introduces its key only: a reference by that id still names the stored node.
+        created = {n.key for n in proposal.nodes if items.enabled and not conn.execute(
+            "SELECT 1 FROM mind_graph_nodes WHERE scope=? AND id=?", (self.scope.key(), aliases[n.key])).fetchone()}
+        for key, item in zip(node_keys, proposal.nodes):
+            with items.item("graph-node", key, names=(item.key, aliases[item.key] if item.key in created else None),
+                            needs=(item.owner_id,), evidence=item.evidence_ids) as live:
+                if not live:
+                    continue
+                evidence = self.proof(conn, item.evidence_ids, allowed)
+                identifier = aliases[item.key]
+                try:
+                    previous = self.get(conn, identifier)
+                except Missing:
+                    previous = None
+                if previous and item.expected_revision != previous["revision"]:
+                    raise Conflict("Graph node changed after evaluation", target=identifier,
+                                   expected=item.expected_revision, actual=previous["revision"])
+                if previous and previous["kind"] != item.kind:
+                    raise Conflict("Graph kind is immutable")
+                if item.occurred_at:
+                    timestamp(item.occurred_at)
+                basis = item.basis
+                if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
+                    basis = "inferred"
+                if item.kind == "association":
+                    basis = "internal_thought"
+                value = {**(previous or {}), **item.model_dump(exclude={"id", "key", "expected_revision", "evidence_ids"}), "id": identifier,
+                    "basis": basis, "source_ids": sorted({r["source_id"] for r in evidence}), "evidence": evidence,
+                    "occurred_at": item.occurred_at or (previous or {}).get("occurred_at") or self.mind.clock(),
+                    "assessment_event": event_id, "configuration_version": receipt.get("configuration_version"),
+                    "model": receipt.get("model"), "state": "active"}
+                if item.kind == "finding":
+                    value["content_version"] = (previous or {}).get("content_version", 1) + int(bool(previous and previous.get("text") != item.text))
+                if value.get("owner_id"):
+                    value["owner_id"] = aliases.get(value["owner_id"],value["owner_id"])
+                self._put(conn, value)
+                items.carry(key, {r["source_id"] for r in evidence})
+        for key, item in zip(node_keys, proposal.nodes):
             if item.owner_id:
-                node = self.get(conn, aliases[item.key])
-                owner = self.ensure(conn, node["owner_id"])
-                if owner["id"] == node["id"]:
-                    raise Conflict("A graph node cannot own itself")
-                self.link(conn,node["id"],"part_of",owner["id"],node["evidence"],basis=node["basis"],reason="Content belongs to the referenced result",event_id=event_id)
-        for edge in proposal.edges:
-            evidence = self.proof(conn, edge.evidence_ids, allowed)
-            basis = edge.basis
-            if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
-                basis = "inferred"
-            self.link(conn, aliases.get(edge.subject, edge.subject), edge.relation, aliases.get(edge.object, edge.object), evidence,
-                basis=basis, reason=edge.reason, role=edge.role, confidence=edge.confidence, valid_from=edge.valid_from, valid_until=edge.valid_until, event_id=event_id)
-        return {"node_ids": list(node_aliases.values()), "edge_count": len(proposal.edges)}
+                # The second part of the same item: refused here, the node written above goes too.
+                with items.item("graph-node", key) as live:
+                    if not live:
+                        continue
+                    node = self.get(conn, aliases[item.key])
+                    owner = self.ensure(conn, node["owner_id"])
+                    if owner["id"] == node["id"]:
+                        raise Conflict("A graph node cannot own itself")
+                    self.link(conn,node["id"],"part_of",owner["id"],node["evidence"],basis=node["basis"],reason="Content belongs to the referenced result",event_id=event_id)
+        for key, edge in zip(edge_keys, proposal.edges):
+            with items.item("graph-edge", key, needs=(edge.subject, edge.object)) as live:
+                if not live:
+                    continue
+                evidence = self.proof(conn, edge.evidence_ids, allowed)
+                basis = edge.basis
+                if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
+                    basis = "inferred"
+                self.link(conn, aliases.get(edge.subject, edge.subject), edge.relation, aliases.get(edge.object, edge.object), evidence,
+                    basis=basis, reason=edge.reason, role=edge.role, confidence=edge.confidence, valid_from=edge.valid_from, valid_until=edge.valid_until, event_id=event_id)
+        return {"node_ids": [aliases[n.key] for key, n in zip(node_keys, proposal.nodes) if items.kept(key)],
+                "edge_count": sum(items.kept(key) for key in edge_keys)}
 
     def candidates(self, conn, query="", limit=40):
         limit = min(40, max(1, limit))
@@ -415,15 +441,21 @@ class EventGraph:
             raise ValueError("Graph revisions need command_id and reason")
         command_hash = digest(request)
         with self.engine.db.connect(write=True) as conn:
+            # The expected node and merge-target revisions gate this command; the action,
+            # the reason and the correction itself are what it is.
+            stamp = fingerprint("graph-revision", self.scope.key(), request,
+                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
             prior = conn.execute("SELECT digest,data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["command_id"])).fetchone()
             if prior:
-                if prior[0] != command_hash:
-                    raise Conflict("Graph command ID reused with other data")
+                if not unchanged(conn, stamp, request["command_id"], legacy=(prior[0], command_hash)):
+                    raise Conflict("Graph command ID reused with other data", kind="runtime",
+                                   code="payload-changed", target=request["command_id"])
                 return json.loads(prior[1])
             proof = self.proof(conn, request.get("evidence_ids", []))
             identifier = request["id"]; current = self.get(conn, identifier)
             if current["revision"] != request.get("expected_revision"):
-                raise Conflict("Graph revision changed")
+                raise Conflict("Graph revision changed", target=identifier,
+                               expected=request.get("expected_revision"), actual=current["revision"])
             before, changed = {identifier: current}, []
             action = request["action"]
             if action == "merge":
@@ -431,7 +463,8 @@ class EventGraph:
                 if target["kind"] != current["kind"] or target.get("merged_into") or current.get("merged_into") or target["id"] == identifier:
                     raise Conflict("Invalid graph merge")
                 if target["revision"] != request.get("target_revision"):
-                    raise Conflict("Merge target changed")
+                    raise Conflict("Merge target changed", target=target["id"],
+                                   expected=request.get("target_revision"), actual=target["revision"])
                 before[target["id"]] = target
                 current = {**current, "state": "merged", "merged_into": target["id"]}
                 target = self._put(conn, {**target, "aliases": list(dict.fromkeys([*target.get("aliases", []), current["title"], *current.get("aliases", [])])), "merge_sources": list(dict.fromkeys([*target.get("merge_sources", []), identifier]))})
@@ -478,7 +511,8 @@ class EventGraph:
                 old = json.loads(prior[0])
                 for nid, revision in old["after_revisions"].items():
                     if self.get(conn, nid)["revision"] != revision:
-                        raise Conflict("Affected graph objects changed since the command")
+                        raise Conflict("Affected graph objects changed since the command", target=nid,
+                                       expected=revision, actual=self.get(conn, nid)["revision"])
                 for nid, value in old["before"].items():
                     before[nid] = self.get(conn, nid)
                     restored = value if value is not None else {**before[nid], "state": "retracted"}
@@ -516,4 +550,5 @@ class EventGraph:
                 changed.append(self._put(conn, {**current, "revision_reason": request["reason"], "evidence": proof, "source_ids": sorted({r["source_id"] for r in proof})}, edge=current.get("kind") == "edge"))
             result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
             conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), command_hash, dumps(result)))
+            record(conn, stamp, request["command_id"], self.mind.clock())
             return result

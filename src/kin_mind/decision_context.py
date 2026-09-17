@@ -41,11 +41,12 @@ def expand(mind, context, proposal, receipt, provider, semantic_refs):
     """At most three dependent reads inside one 150-second expansion budget."""
     if not proposal.recall_needs:
         return proposal, receipt
+    from . import attempts
     from .adaptive_recall import AdaptiveRecall
     from .context import Contexts
     contexts = Contexts(mind)
     deadline = time.monotonic() + 150
-    rounds, receipts, seen = [], [], set()
+    rounds, receipts, retrievals, seen = [], [], [], set()
     for _ in range(3):
         needs = [n for n in proposal.recall_needs if n.query not in seen]
         if not needs or time.monotonic() >= deadline:
@@ -66,6 +67,9 @@ def expand(mind, context, proposal, receipt, provider, semantic_refs):
                             known.append(identifier)
                     except (Missing, Conflict):
                         pass
+        # Receipts and usage are accounting, not context: they cost tokens and made the
+        # rendered request differ on every attempt. They go to the receipt and calls[] only.
+        retrievals.append({k: info.pop(k) for k in ("model_receipts", "usage") if k in info})
         rounds.append({"query": need.query, "items": items[:8], "evidence_ids": known, "retrieval": info})
         context["requested_memory"] = rounds
         context["recall_budget"] = {"rounds_remaining": 3 - len(rounds), "seconds_remaining": max(0, int(deadline - time.monotonic()))}
@@ -75,13 +79,15 @@ def expand(mind, context, proposal, receipt, provider, semantic_refs):
         previous_timeout = provider.timeout
         try:
             provider.timeout = min(previous_timeout, remaining)
-            proposal, receipt = provider.appraise(context)
+            with attempts.appraise_purpose(provider, "expansion"):
+                proposal, receipt = provider.appraise(context)
             receipts.append(receipt)
         finally:
             provider.timeout = previous_timeout
         if not proposal.recall_needs:
             break
     receipt = {**receipt, "memory_expansion": {"rounds": len(rounds), "receipts": receipts,
+                "retrieval_receipts": retrievals,
                 "unresolved": [n.model_dump() for n in proposal.recall_needs]}}
     if proposal.recall_needs:
         # Missing model-requested evidence is not permission to improvise.

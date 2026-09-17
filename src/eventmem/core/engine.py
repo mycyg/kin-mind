@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .db import Conflict, Database, Deleted, Missing, digest, dumps, tokenize
 from .envelopes import current_message
+from .idempotency import record, unchanged
 from .models import RecordInput, RevisionInput, Scope, SourceInput, now
 
 
@@ -28,15 +29,22 @@ class Engine:
         self.cache_lock = threading.RLock()
         self.interactive_until = 0.0
 
-    def command(self, conn, key, payload, run):
+    def command(self, conn, key, payload, run, stamp=None):
+        """`stamp` is an optional idempotency.Stamp built by the caller, which owns the scope
+        and the host switch. Without one this compares the legacy digest of the whole payload,
+        exactly as before; with one the effective payload decides and the precondition does
+        not, so a retry that only refreshed its expected revision gets the original receipt."""
         hashed = digest(payload)
         row = conn.execute("SELECT * FROM commands WHERE id=?", (key,)).fetchone()
         if row:
-            if row["digest"] != hashed:
-                raise Conflict("Idempotency key reused with different content")
+            if not unchanged(conn, stamp, key, legacy=(row["digest"], hashed)):
+                # The key, not the payload: the digests stay out of the failure record.
+                raise Conflict("Idempotency key reused with different content",
+                               kind="runtime", code="payload-changed", target=key)
             return json.loads(row["result"])
         result = run()
         conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, hashed, dumps(result)))
+        record(conn, stamp, key, now())
         return result
 
     def receive(self, source: SourceInput, attachment: bytes | None = None) -> dict:
@@ -214,7 +222,7 @@ class Engine:
     def _insert(self, conn, record: RecordInput):
         rid = record.id or uid("mem")
         if conn.execute("SELECT 1 FROM tombstones WHERE key=?", (rid,)).fetchone():
-            raise Deleted(rid)
+            raise Deleted(rid, code="tombstoned")
         existing = conn.execute(
             "SELECT data FROM records WHERE id=?", (rid,)
         ).fetchone()
@@ -225,7 +233,7 @@ class Engine:
                 or stored["scope"] != record.scope.model_dump()
                 or stored["kind"] != record.kind
             ):
-                raise Conflict("Record id already belongs to different content")
+                raise Conflict("Record id already belongs to different content", target=rid)
             return stored
         for sid in set(record.source_ids):
             row = conn.execute(
@@ -303,6 +311,10 @@ class Engine:
         invalidate_source(self, conn, data)
         from kin_mind.lifecycle import record_changed
         record_changed(conn, data)
+        from kin_mind.judgment_cache import invalidate
+        # A revised source ends every judgment that rested on it. A request digest
+        # proves two requests are equal, not that the evidence behind them still holds.
+        invalidate(conn, [data["id"]])
         conn.execute(
             "INSERT INTO dirty VALUES(?,?) ON CONFLICT(record_id) DO UPDATE SET revision=excluded.revision",
             (data["id"], data["revision"]),
@@ -415,8 +427,12 @@ class Engine:
             def run():
                 data = self._get(conn, rid)
                 if data["revision"] != change.expected_revision:
+                    # A formatted message is never a static literal, so this one
+                    # carries its classification and its versions as keywords.
                     raise Conflict(
-                        f"Revision changed; current revision is {data['revision']}"
+                        f"Revision changed; current revision is {data['revision']}",
+                        kind="runtime", code="record-revision-changed", target=rid,
+                        expected=change.expected_revision, actual=data["revision"],
                     )
                 statuses = {
                     "confirm": "active",
