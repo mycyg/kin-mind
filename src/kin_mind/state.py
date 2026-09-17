@@ -915,6 +915,12 @@ class Mind(Continuity):
             k: dict(v, needs_review=not self._entry_fresh(conn, v))
             for k, v in state["traits"].items()
         }
+        # The ledger is the writer once it is switched on. It answers in the dict shape every
+        # older reader already knows, and carries its own projection beside it.
+        from .traits import ledger_view
+        ledger = ledger_view(conn, self, at)
+        if ledger:
+            traits = {**traits, **ledger["legacy"]}
         contact = deepcopy(state["profile"]["contact"])
         preference = state.get("contact_preference")
         if preference:
@@ -925,7 +931,7 @@ class Mind(Continuity):
                 "needs_review": not self._fresh(conn, preference["evidence"]),
                 "evidence_ids": [r["record_id"] for r in preference["evidence"]],
             }
-        return {
+        view = {
             "revision": state["revision"],
             "scope": self.scope.model_dump(),
             "as_of": at,
@@ -943,6 +949,10 @@ class Mind(Continuity):
             "action_events": [{**json.loads(r["data"]), "id": r["id"], "kind": r["kind"], "state": r["state"]}
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
         }
+        if ledger:
+            # Only while the switch is on: with it off this view is what it was, key for key.
+            view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
+        return view
 
     def read(self, *, as_of=None, history=0, query=""):
         if not 0 <= history <= 100:

@@ -327,6 +327,8 @@ class Engine:
     def _dirty(self, conn, data):
         from kin_mind.procedures import invalidate_source
         invalidate_source(self, conn, data)
+        from kin_mind.traits import invalidate_source as trait_source_changed
+        trait_source_changed(conn, data)
         from kin_mind.lifecycle import record_changed
         record_changed(conn, data)
         from kin_mind.judgment_cache import invalidate

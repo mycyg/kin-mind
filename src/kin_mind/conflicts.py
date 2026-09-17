@@ -30,7 +30,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
-    "kin_mind.evidence_classes",
+    "kin_mind.evidence_classes", "kin_mind.traits",
 )
 
 
@@ -238,6 +238,18 @@ REGISTRY = {
     "Replacement must be another active record in the same scope": ("semantic", "replacement-invalid", "block"),
     "Cross-scope relations are not allowed": ("semantic", "reference-cross-scope", "block"),
     "Job key reused with a different task": ("runtime", "payload-changed", "block"),
+    # --- traits.py: the ledger checks the material and the times, never the trait itself.
+    # All of them are raised inside an audited section, so each is refused on its own, recorded
+    # as a static code the next projection shows, and never asked again with a paid call. ---
+    "Trait is missing or outside this scope": ("semantic", "trait-unknown", "section"),
+    "Trait changed during evaluation": ("runtime", "trait-revision-changed", "section"),
+    "Cited material cannot stand for the evidence class it was given": ("semantic", "trait-evidence-class", "section"),
+    "A trait observation needs evidence of its own": ("semantic", "trait-evidence-missing", "section"),
+    "Establishing on inference needs separate episodes and support that is not Kin's own": ("semantic", "trait-single-episode", "section"),
+    "A trait decision names an observation the ledger does not hold": ("semantic", "trait-observation-unknown", "section"),
+    "An owner instruction or correction must quote the owner's own words": ("semantic", "trait-quote-unverified", "section"),
+    "A revoked trait needs an owner statement newer than its tombstone": ("semantic", "trait-revoked", "section"),
+    "A faded trait needs new support before it stands again": ("semantic", "trait-needs-support", "section"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),
