@@ -9,7 +9,9 @@ export async function submitPayload({media,uuid,upload,create,checkpoint}) {
   }
   checkpoint({stage:'message-submitting',submissionStarted:true});
   const result=await create({content,uuid});
-  if(result?.code!==0)throw Error('Platform rejected send: '+result?.code);
-  if(!result.data?.message_id)throw Error('Platform returned no message ID');
+  // A platform answer with an error code is a definitive refusal: the sender can
+  // record `rejected`. An answer without a message ID stays an unknown outcome.
+  if(result?.code!==0)throw Object.assign(Error('Platform rejected send: '+result?.code),{code:'PLATFORM_REJECTED',platformCode:result?.code});
+  if(!result.data?.message_id)throw Object.assign(Error('Platform returned no message ID'),{code:'PLATFORM_NO_MESSAGE_ID'});
   return result.data.message_id;
 }

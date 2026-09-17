@@ -22,3 +22,11 @@ test('file and text success both require platform IDs',async()=>{
     await assert.rejects(()=>submitPayload({uuid:'same',checkpoint:()=>{},create:async()=>({code:0,data:{}})}),/no message ID/);
   }
 });
+test('a platform refusal is told apart from an unknown outcome, so the sender can record rejected instead of unconfirmed',async()=>{
+  const refused=await submitPayload({uuid:'same',checkpoint:()=>{},create:async()=>({code:230099,msg:'refused'})}).catch(error=>error);
+  assert.deepEqual([refused.code,refused.platformCode,refused.message],['PLATFORM_REJECTED',230099,'Platform rejected send: 230099']);
+  const silent=await submitPayload({uuid:'same',checkpoint:()=>{},create:async()=>({code:0,data:{}})}).catch(error=>error);
+  assert.equal(silent.code,'PLATFORM_NO_MESSAGE_ID');
+  const lost=await submitPayload({uuid:'same',checkpoint:()=>{},create:async()=>{throw Error('socket hang up');}}).catch(error=>error);
+  assert.equal(lost.code,undefined,'a transport failure carries no verdict: the outcome stays unknown');
+});

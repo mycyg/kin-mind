@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
+import {TransportManifests,manifestView} from './transport-manifest.mjs';
 
 /** Outbox entries are local evidence, never an instruction or model identity. */
 export function outboxEvidence(directories) {
@@ -12,15 +13,30 @@ export function outboxEvidence(directories) {
         const value=JSON.parse(fs.readFileSync(path.join(directory,name),'utf8'));
         if(!value.id||!value.state)continue;
         values.push({id:value.id,text:value.text??'',state:value.state,references:value.references??[],
-          draft_id:value.draftId,message_id:value.messageId,at:value.acceptedAt??value.checkedAt??value.attemptedAt});
+          draft_id:value.draftId,message_id:value.messageId,at:value.acceptedAt??value.checkedAt??value.attemptedAt,
+          ...(typeof value.submissionStarted==='boolean'?{submission_started:value.submissionStarted}:{})});
       } catch { /* Incomplete atomic replacements are retried from the journal. */ }
     }
   }
   return values.sort((a,b)=>(b.at??'').localeCompare(a.at??''));
 }
 
+/** Review decisions plus durable delivery of reply groups. With
+ * `transportManifest` (the host's `transport_manifest` switch, on unless the
+ * caller injects false) groups live in the transport manifest: reviewed once,
+ * frozen, cut into fragments, reconciled by receipt. Switched off, every method
+ * below behaves exactly as it did before the manifest existed. */
 export class ReplyGuard {
-  constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),wholeReplyReview=false,onOutcome=()=>{}}) {Object.assign(this,{call,directory,outbox,clock,wholeReplyReview,onOutcome});this.active=new Map();}
+  constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),wholeReplyReview=false,onOutcome=()=>{},transportManifest=true,
+    manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry}) {
+    Object.assign(this,{call,directory,outbox,clock,wholeReplyReview,onOutcome,channel});this.active=new Map();
+    if(transportManifest)this.manifests=new TransportManifests({directory:manifestDirectory??path.join(directory,'reply-manifests'),clock,contracts,emit,lease,role,hooks,sleep,retry,
+      // The host may hand over a direct reader of `<outbox>/<transport id>.json`; outbox evidence is the fallback.
+      receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
+      cancelShare:draftId=>this.call('share-cancel',{draft_id:draftId}),
+      review:(requests,context)=>this.reviewGroup(requests,context),
+      onOutcome:detail=>this.onOutcome(detail)});
+  }
   check(request) {
     const key=createHash('sha256').update(JSON.stringify(request)).digest('hex');
     if(this.active.has(key))return this.active.get(key);
@@ -68,7 +84,35 @@ export class ReplyGuard {
       return result.state==='ready'?result:{...result,state:'pending',retryAt:this.clock()+60000};
     }catch{return {state:'pending',reason:'whole-reply-review-unavailable',retryAt:this.clock()+60000};}
   }
-  async deliverGroup(entries,ownerEpoch,review,{guard,send}) {
+  /** The review the manifest asks for. Whole-reply mode validates the entire
+   * group (`frozen` once a final review is stored); bubble-by-bubble mode only
+   * ever looks at bubbles that have not begun. */
+  async reviewGroup(requests,{frozen=false,pending=requests.map((_,i)=>i)}={}) {
+    if(this.wholeReplyReview)return this.checkGroup(requests,{frozen});
+    const result=await this.checkGroup(pending.map(i=>requests[i]));
+    if(result.state!=='ready')return result;
+    const checked=requests.map(()=>null);pending.forEach((index,position)=>{checked[index]=result.checked[position];});
+    return {...result,checked};
+  }
+  /** A second entrant gets `busy` and has changed nothing. */
+  report(result,groupId) {
+    if(result.busy||result.lost||!result.manifest)return {state:result.busy?'busy':result.lost?'lease-lost':'missing',groupId,entries:[]};
+    return manifestView(result.manifest);
+  }
+  /** Draft on disk first, then the whole-group review, then the final manifest,
+   * then the send: the order a complete reply needs. When nothing could be sent
+   * yet the result says why: `state` pending (with `reason`), silent or merged
+   * (with `choice`), exactly what `checkGroup` would have told the caller. */
+  async replyGroup(entries,ownerEpoch,{guard,send,channel=this.channel}={}) {
+    if(!this.manifests)return this.deliverGroup(entries,ownerEpoch,await this.checkGroup(entries.map(e=>e.request)),{guard,send});
+    const draft=this.manifests.createDraft({entries,ownerEpoch,channel});
+    return this.report(await this.manifests.run(draft.group_id,{guard,transport:send}),draft.group_id);
+  }
+  async deliverGroup(entries,ownerEpoch,review,{guard,send,channel=this.channel}) {
+    if(this.manifests) {
+      const draft=this.manifests.createDraft({entries,ownerEpoch,channel});
+      return this.report(await this.manifests.run(draft.group_id,{guard,transport:send,initialReview:review}),draft.group_id);
+    }
     const saved=this.deferGroup(entries,ownerEpoch);
     const file=path.join(this.directory,createHash('sha256').update(entries[0].delivery.id).digest('hex')+'.pending.json');
     if(saved.state==='accepted')return saved;
@@ -126,12 +170,18 @@ export class ReplyGuard {
   deferGroup(entries,ownerEpoch) {
     const first=entries[0];
     if(!first)return;
+    if(this.manifests)return this.park(entries,ownerEpoch,60000);
     const saved=this.defer(first.request,first.delivery,ownerEpoch);
     const file=path.join(this.directory,createHash('sha256').update(first.delivery.id).digest('hex')+'.pending.json');
     if(saved.entries)return saved;
     return this.save(file,{...saved,wholeReply:this.wholeReplyReview,entries:entries.map(e=>({...e,state:'unsent'})),retryAt:this.clock()+60000});
   }
+  /** Manifest mode: a deferred group is a `held` manifest; an existing one is returned as it is. */
+  park(entries,ownerEpoch,delay) {
+    return manifestView(this.manifests.createDraft({entries,ownerEpoch,channel:this.channel,hold:{reason:'share-review-pending',retryAt:this.clock()+delay}}));
+  }
   defer(request,delivery,ownerEpoch) {
+    if(this.manifests)return this.park([{request,delivery}],ownerEpoch,20*60000);
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
     const file=path.join(this.directory,createHash('sha256').update(delivery.id).digest('hex')+'.pending.json');
     let prior;try{prior=JSON.parse(fs.readFileSync(file,'utf8'));}catch{}
@@ -142,6 +192,11 @@ export class ReplyGuard {
     if(this.resuming||!fs.existsSync(this.directory))return {state:'idle'};
     this.resuming=true;let handled=0;
     try {
+      if(this.manifests) {
+        // Unfinished groups of the old journal come along once; finished ones never do.
+        const legacy=this.manifests.importLegacy(this.directory);
+        return {...await this.manifests.resumeDue({guard,transport:send,limit}),imported:legacy.imported.length};
+      }
       const files=fs.readdirSync(this.directory).filter(n=>n.endsWith('.pending.json'));
       for(const name of files) {
         const file=path.join(this.directory,name);let entry=JSON.parse(fs.readFileSync(file,'utf8'));
