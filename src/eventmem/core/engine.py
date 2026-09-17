@@ -394,14 +394,25 @@ class Engine:
 
     def history(self, rid, cursor=2147483647, limit=50):
         with self.db.connect() as conn:
-            self._get(conn, rid)
-            return [
+            current = self._get(conn, rid)
+            rows = [
                 dict(r) | {"data": json.loads(r["data"])}
                 for r in conn.execute(
                     "SELECT * FROM revisions WHERE record_id=? AND revision<? ORDER BY revision DESC LIMIT ?",
                     (rid, cursor, limit),
                 )
             ]
+            # Reading the versions of a record is an audit read: every revision is there, and
+            # what is not experience says so instead of showing the stored confirmation.
+            from .read_policy import ReadPolicy
+
+            policy = ReadPolicy.load(
+                self, Scope(**current["scope"]), "audit", conn=conn
+            )
+            if policy.enabled:
+                for row in rows:
+                    policy.present(row["data"], row["data"])
+        return rows
 
     def _save_revision(self, conn, data, action, reason):
         data["revision"] += 1

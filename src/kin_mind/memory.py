@@ -471,16 +471,20 @@ class MemoryContinuity:
         if not query:
             owner_messages = [e for e in recent if e.get("kind") == "owner-message"]
             query = " ".join(e.get("text", "") for e in owner_messages[-2:])
+        from eventmem.core.read_policy import ReadPolicy
         with self.engine.db.connect() as conn:
-            graph_context = self.graph.candidates(conn, query) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
+            # Everything an appraisal is shown is evidence of what happened, so it is selected
+            # and labelled by one experience read, families and identity evidence included.
+            policy = ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
+            graph_context = self.graph.candidates(conn, query, policy=policy) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
             for node in graph_context:
                 node["needs_review"] = not self.graph.fresh(conn, node)
                 if self.settings(conn)["event_lifecycle"] and node["kind"] == "event" and not node["needs_review"]:
                     from .lifecycle import EventLifecycle
                     from .adaptive_recall import evidence_excerpt
-                    members = EventLifecycle(self.mind, self.graph).snapshot(conn, node["id"])["records"]
+                    members = EventLifecycle(self.mind, self.graph).snapshot(conn, node["id"], policy=policy)["records"]
                     node["identity_evidence"] = [{"id": r["id"], "revision": r["revision"],
-                        "basis": r["confirmation"], "occurred_at": r["valid_from"],
+                        "basis": policy.basis(r), "occurred_at": r["valid_from"],
                         "text": evidence_excerpt(r["content"], query)[0], "excerpt_only": evidence_excerpt(r["content"], query)[1]}
                         for r in sorted(members.values(), key=lambda r: r["valid_from"], reverse=True)[:2]]
                 if node["kind"] in {"finding", "exploration", "work"}:
@@ -507,8 +511,10 @@ class MemoryContinuity:
                                 record = self.engine._get(conn, rid)
                             except (Conflict, Missing):
                                 continue
+                            if not policy.visible(record):
+                                continue
                             excerpt, partial = evidence_excerpt(record["content"], query, budget=250)
-                            members.append({"id": rid, "revision": record["revision"], "basis": record["confirmation"],
+                            members.append({"id": rid, "revision": record["revision"], "basis": policy.basis(record),
                                 "text": excerpt, "excerpt_only": partial, "occurred_at": record["valid_from"]})
                         if len(members) >= 2:
                             topic_candidates.append({"id": family["id"], "revision": family["revision"], "title": family["title"],

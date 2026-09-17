@@ -165,7 +165,7 @@ class AdaptiveRecall:
                 from .lifecycle import EventLifecycle
                 if EventLifecycle(self.mind, self.memory.graph).read(node["id"])["state"] != "ready":
                     return
-            item = self.contexts.graph_item(node, edges, compact=True)
+            item = self.contexts.graph_item(node, edges, compact=True, policy=policy)
             if host_envelope(item["text"]):
                 return
             if node.get("runtime_event_id") and len(node.get("record_ids", [])) == 1:
@@ -204,7 +204,7 @@ class AdaptiveRecall:
             channel_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="kin-recall") as executor:
                 lexical_future = executor.submit(candidates, self.engine, request, full_lexical=True, policy=policy)
-                graph_future = executor.submit(self.memory.graph.read, query=lookup, limit=40, hops=1)
+                graph_future = executor.submit(self.memory.graph.read, query=lookup, limit=40, hops=1, policy=policy)
                 vector_future = executor.submit(vector_candidates) if mode_used == "deep" and lookup else None
                 docs, _, _ = lexical_future.result()
                 graph = graph_future.result()
@@ -308,7 +308,9 @@ class AdaptiveRecall:
                         (self.mind.scope.key(), self.mind.scope.key(), rid, self.mind.scope.key(), rid)).fetchall()
                     for row in nodes:
                         node = json.loads(row[0])
-                        if self.memory.graph.fresh(conn, node):
+                        # This lane reaches nodes through the record index rather than through
+                        # a filtered graph read, so it asks the policy itself.
+                        if self.memory.graph.fresh(conn, node) and self.memory.graph.visible(conn, [node], policy):
                             node["needs_review"] = False
                             # Build outside this read transaction below.
                             node["_score"] = scores[rid] * 1.05
@@ -432,7 +434,7 @@ class AdaptiveRecall:
                     queries.insert(0, lookup + " ")
                     continue
                 break
-        selected = [pool[i] for i in ranked_ids[:40] if i in pool and self.contexts._current(pool[i])]
+        selected = [pool[i] for i in ranked_ids[:40] if i in pool and self.contexts._current(pool[i], policy)]
         info["expanded_ids"] = [i["id"] for i in selected[:8]]
         info["evidence_versions"] = {i["id"]: i["revision"] for i in selected}
         info["candidate_count"] = len(selected)

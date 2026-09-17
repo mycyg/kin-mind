@@ -1,4 +1,9 @@
-"""Additive storage for derived event views; original evidence is unchanged."""
+"""Additive storage for derived event views; original evidence is unchanged.
+
+`mind_isolation_archive` keeps the derived text a read policy change invalidates. A derived
+view is rebuilt, never corrected in place, and the version it replaces is kept here under the
+rules version that retired it, so nothing is lost when a summary is regenerated.
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_graph_record_refs(
@@ -35,6 +40,10 @@ CREATE TABLE IF NOT EXISTS mind_lifecycle_backfill(
 CREATE TABLE IF NOT EXISTS mind_foreground_leases(
  scope TEXT NOT NULL,session TEXT NOT NULL,expires_at REAL NOT NULL,
  PRIMARY KEY(scope,session));
+CREATE TABLE IF NOT EXISTS mind_isolation_archive(
+ scope TEXT NOT NULL,kind TEXT NOT NULL,identifier TEXT NOT NULL,revision INTEGER NOT NULL,
+ rules_version TEXT NOT NULL,archived_at TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(scope,kind,identifier,revision));
 """
 
 

@@ -316,7 +316,9 @@ def _bm25(docs: Sequence[Sequence[str]], query: Sequence[str]) -> list[float]:
         doc_freq.update(tf.keys())
 
     scores = [0.0] * n
-    for term in set(query):
+    # 按排序后的唯一词累加：浮点加法不满足结合律，`set` 的遍历顺序又随哈希种子变化，
+    # 同一次查询会因此给出不同的得分与排序。排序后结果只取决于输入。
+    for term in sorted(set(query)):
         df = doc_freq.get(term, 0)
         if df == 0:
             continue
