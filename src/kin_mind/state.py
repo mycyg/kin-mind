@@ -721,21 +721,39 @@ class Mind(Continuity):
         )
         if state["last_evolution_day"] == day:
             raise Conflict("Personality was already evaluated today")
-        interactions = {
-            r["hash"]
-            for r in refs
-            if r["authority"] == "explicit"
-            and r["metadata"].get("role") == "user"
-            and r["metadata"].get("host_event") == "message"
-        }
+        from .autonomy_schema import optimized
+        chain = optimized(conn, self.scope.key(), "behavior_chain")
+        if chain:
+            # An evening of ten messages counted as ten independent interactions while interactions
+            # were content hashes. One interaction window is one episode, which can only be stricter.
+            from .behavior_chain import owner_episodes
+            interactions = owner_episodes(self, conn, refs)
+        else:
+            interactions = {
+                r["hash"]
+                for r in refs
+                if r["authority"] == "explicit"
+                and r["metadata"].get("role") == "user"
+                and r["metadata"].get("host_event") == "message"
+            }
         if len(interactions) < spec["minimum_interactions"]:
             raise Conflict(
                 "Personality changes require three independent user interactions"
             )
-        sk, proposal = SelfKnowledge(self.engine, self.scope), request.evolution
+        sk, proposal = SelfKnowledge(self.engine, self.scope, clock=self.clock if chain else now), request.evolution
         claim = sk._get(conn, proposal.claim_id, "claim")
         assessment = sk._get(conn, proposal.assessment_id, "assessment")
         prediction = sk._get(conn, metadata(assessment)["prediction_id"], "prediction")
+        if chain:
+            # What decides how Kin behaves, not the version string that moves for every unrelated
+            # edit. An entry written before the stamp existed carries none and is not compatible.
+            from .compat import holds, stamp as compat_stamp
+            current = compat_stamp(self, conn, state)
+            def compatible(row):
+                return holds(metadata(row).get("compat"), current)
+        else:
+            def compatible(row):
+                return metadata(row).get("agent_version") == request.agent_version
         if (
             metadata(claim).get("basis") != "hypothesis"
             or metadata(prediction).get("claim_id") != claim["id"]
@@ -744,11 +762,15 @@ class Mind(Continuity):
             or metadata(prediction).get("claim_revision") != claim["revision"]
             or any(
                 r["status"] not in {"active", "unverified"}
-                or metadata(r).get("agent_version") != request.agent_version
+                or not compatible(r)
                 or not sk._fresh(conn, r)
                 for r in (claim, prediction, assessment)
             )
         ):
+            if chain:
+                raise Conflict(
+                    "A current, compatible prospective behavioral check is required"
+                )
             raise Conflict(
                 "A current, version-matched prospective behavioral check is required"
             )

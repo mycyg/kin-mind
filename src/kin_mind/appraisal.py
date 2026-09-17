@@ -342,8 +342,8 @@ SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continu
 # module that applies the section: it replaces its own paragraph here and nothing else.
 TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、内部事件都不能作证据。category 与 slug 决定这条证据归哪条特征，同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
 TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历、至少一条非自述的支持，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
-SELF_HYPOTHESIS_PROMPT = "self_hypothesis 暂不接收内容，留空。"
-PREDICTION_OUTCOMES_PROMPT = "prediction_outcomes 暂不接收内容，留空。"
+SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
+PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 暂不接收内容，留空。"
 NEXT_MOVE_PROMPT = "next_move 暂不接收内容，留空。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
@@ -1880,6 +1880,7 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
+                    from . import behavior_chain  # on the commit path, where it claims its own sections
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")
@@ -2181,6 +2182,15 @@ class Appraisals:
                                                value=value, proposal=proposal, receipt=receipt, sources=list(semantic_refs.values()),
                                                stimulus=data.get("stimulus"), version=effective_version, job_id=row["id"], settings=settings)
                         section(name, lambda name=name, commit=commit: AUDIT_HANDLERS[name](commit))
+                    if proposal.evolution and "self_hypothesis" in offered:
+                        # Not applied here: a proposal to move the slow parameters waits for the day's
+                        # merge, which checks the chain and the limits. Dropping it was how a valid
+                        # proposal disappeared without a refusal.
+                        proposed = SectionCommit(mind=self.mind, conn=conn, state=state, event_id=eid, section="evolution",
+                                                 value=proposal.evolution, proposal=proposal, receipt=receipt,
+                                                 sources=list(semantic_refs.values()), stimulus=data.get("stimulus"),
+                                                 version=effective_version, job_id=row["id"], settings=settings)
+                        section("evolution", lambda: behavior_chain.hold_evolution(proposed))
                     for entry in rejected:
                         if entry["section"] in AUDIT_SECTIONS:
                             # Why the host refused it, for the projection that owns the section to show
@@ -2385,7 +2395,8 @@ class Appraisals:
 
 
 class DailyReview:
-    """One model evaluation per local calendar day; proof limits stay in Mind."""
+    """One local calendar day, once. With the chain on it is a host merge of what an ordinary
+    appraisal already proposed and no model call at all; proof limits stay in Mind either way."""
 
     def __init__(self, mind):
         self.mind, self.engine = mind, mind.engine
@@ -2395,6 +2406,12 @@ class DailyReview:
             )
 
     def run(self, provider, agent_version):
+        with self.engine.db.connect() as conn:
+            chain = optimized(conn, self.mind.scope.key(), "behavior_chain")
+        if chain:
+            # No second full appraisal: the proposal, the check and the limits are all already here.
+            from .behavior_chain import merge_daily
+            return merge_daily(self.mind, agent_version)
         provider.background = True
         from zoneinfo import ZoneInfo
 
