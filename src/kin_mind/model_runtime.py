@@ -9,6 +9,10 @@ import httpx
 
 from eventmem.core.db import dumps
 
+class ModelAdmissionWait(RuntimeError):
+    """No request was admitted; waiting is not a failed model attempt."""
+
+
 _background = contextvars.ContextVar("kin_background_job", default=False)
 
 
@@ -38,10 +42,12 @@ def model_slot(provider, purpose):
             raise RuntimeError("deepseek-background-lease-unavailable")
         now = time.time()
         conn.execute("DELETE FROM mind_model_leases WHERE expires_at<=?", (now,))
-        if conn.execute("SELECT COUNT(*) FROM mind_model_leases WHERE lane='background'").fetchone()[0] >= 2:
-            raise RuntimeError("deepseek-background-capacity")
+        configured = conn.execute("SELECT value FROM meta WHERE key='kin_background_model_limit'").fetchone()
+        capacity = max(1, min(8, configured[0])) if configured else 2
+        if conn.execute("SELECT COUNT(*) FROM mind_model_leases WHERE lane='background'").fetchone()[0] >= capacity:
+            raise ModelAdmissionWait("deepseek-background-capacity")
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_foreground_leases'").fetchone() and conn.execute("SELECT 1 FROM mind_foreground_leases WHERE expires_at>? LIMIT 1", (now,)).fetchone():
-            raise RuntimeError("deepseek-foreground-priority")
+            raise ModelAdmissionWait("deepseek-foreground-priority")
         conn.execute("INSERT INTO mind_model_leases VALUES(?,?,?,?)", (key, "background", now + 90, dumps({"purpose": purpose})))
     def renew():
         while not stop.wait(20):
@@ -85,3 +91,12 @@ def close_client(provider):
     local = getattr(provider, "_http_clients", None)
     if local is not None and getattr(local, "client", None) is not None:
         local.client.close()
+
+
+def configure_capacity(engine, limit):
+    """One database-wide limit, shared by every process and scope."""
+    if type(limit) is not int or not 1 <= limit <= 8:
+        raise ValueError("Background model capacity must be between 1 and 8")
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO meta VALUES('kin_background_model_limit',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (limit,))
+    return {"background_model_limit": limit, "foreground_priority": True}

@@ -20,7 +20,7 @@ export function outboxEvidence(directories) {
 }
 
 export class ReplyGuard {
-  constructor({call,directory,outbox=()=>[],clock=()=>Date.now()}) {Object.assign(this,{call,directory,outbox,clock});this.active=new Map();}
+  constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),wholeReplyReview=false,onOutcome=()=>{}}) {Object.assign(this,{call,directory,outbox,clock,wholeReplyReview,onOutcome});this.active=new Map();}
   check(request) {
     const key=createHash('sha256').update(JSON.stringify(request)).digest('hex');
     if(this.active.has(key))return this.active.get(key);
@@ -42,7 +42,13 @@ export class ReplyGuard {
     return this.save(file,{...result,...(result.state==='pending'?{retryAfterMs:60000,retryAt:this.clock()+60000}:{})});
   }
   save(file,value){const temporary=file+'.'+process.pid+'.tmp';fs.writeFileSync(temporary,JSON.stringify(value),{mode:0o600});fs.renameSync(temporary,file);return value;}
-  async checkGroup(requests) {
+  async checkGroup(requests,{frozen=false}={}) {
+    if(this.wholeReplyReview){
+      const key='group-'+createHash('sha256').update(JSON.stringify([requests,frozen])).digest('hex');
+      if(this.active.has(key))return this.active.get(key);
+      const run=this.inspectGroup(requests,frozen).finally(()=>this.active.delete(key));
+      this.active.set(key,run);return run;
+    }
     const checked=[];
     for(const request of requests) {
       const result=await this.check({...request,batch_text:requests.map(r=>r.text).join('\n\n')});
@@ -51,13 +57,78 @@ export class ReplyGuard {
     }
     return {state:'ready',checked};
   }
+  async inspectGroup(entries,frozen) {
+    try {
+      for(const inputId of new Set(entries.filter(e=>!e.work&&e.reply_id).map(e=>e.reply_id))) {
+        const choice=await this.call('reply-status',{input_id:inputId});
+        if(['silent','merged'].includes(choice.action))return {state:choice.action,choice};
+      }
+      const result=await this.call('share-preflight-group',{entries,frozen,outbox:await this.outbox(),allow_model:!frozen});
+      // A semantic hold cannot stand in for a voluntary silence receipt.
+      return result.state==='ready'?result:{...result,state:'pending',retryAt:this.clock()+60000};
+    }catch{return {state:'pending',reason:'whole-reply-review-unavailable',retryAt:this.clock()+60000};}
+  }
+  async deliverGroup(entries,ownerEpoch,review,{guard,send}) {
+    const saved=this.deferGroup(entries,ownerEpoch);
+    const file=path.join(this.directory,createHash('sha256').update(entries[0].delivery.id).digest('hex')+'.pending.json');
+    if(saved.state==='accepted')return saved;
+    let value=saved;
+    if(!saved.review&&review?.state==='ready'){
+      if(review.checked?.length!==entries.length)throw Error('Whole reply review is incomplete');
+      value={...saved,wholeReply:true,state:'prepared',review,entries:saved.entries.map((entry,i)=>({...entry,
+        delivery:{...entry.delivery,text:review.checked[i].text??entry.request.text,references:review.checked[i].references??[]}}))};
+      this.save(file,value);
+    }
+    await this.resumeWholeGroup(file,value,{guard,send});
+    return JSON.parse(fs.readFileSync(file,'utf8'));
+  }
+  async resumeWholeGroup(file,entry,{guard,send}) {
+    if(entry.state==='accepted')return;
+    const save=value=>{entry=this.save(file,value);this.onOutcome({state:entry.state,inputId:entry.request.reply_id,reason:entry.reason});};
+    for(const item of entry.entries.filter(e=>e.state==='unconfirmed')) {
+      const receipt=(await this.outbox()).find(r=>r.id===item.delivery.id);
+      if(receipt?.state!=='accepted'||!receipt.message_id)return;
+      Object.assign(item,{state:'accepted',receipt});save({...entry,state:'prepared'});
+    }
+    if(entry.entries.every(item=>item.state==='accepted')){save({...entry,state:'accepted',reason:null});return;}
+    const permission=await guard(entry);
+    if(permission==='wait')return;
+    if(permission==='cancel'){
+      for(const item of entry.entries.filter(e=>e.state==='unsent'))await this.call('share-cancel',{draft_id:item.request.draft_id});
+      save({...entry,state:'canceled',reason:'input-or-session-superseded'});return;
+    }
+    // Once transport starts, keep the whole reviewed text immutable. Only
+    // validate source/configuration versions; never rewrite an unsent suffix.
+    const review=await this.checkGroup(entry.entries.map(e=>e.request),{frozen:!!entry.review});
+    if(['silent','merged'].includes(review.state)){
+      save({...entry,state:review.state,choice:review.choice});return;
+    }
+    if(review.state!=='ready'){
+      save({...entry,state:'pending',reason:review.reason,retryAt:this.clock()+60000});return;
+    }
+    if(!entry.review){
+      if(review.checked?.length!==entry.entries.length)throw Error('Whole reply review is incomplete');
+      entry.entries.forEach((item,i)=>{item.delivery={...item.delivery,text:review.checked[i].text??item.request.text,references:review.checked[i].references??[]};});
+      save({...entry,state:'prepared',review});
+    }
+    for(const item of entry.entries.filter(e=>e.state==='unsent')){
+      if(await guard(entry)!=='send')return;
+      item.state='unconfirmed';save({...entry,state:'unconfirmed'});
+      try{
+        const receipt=await send(item.delivery);item.receipt=receipt;
+        if(receipt.state!=='accepted'||!receipt.messageId){save({...entry,state:'unconfirmed'});return;}
+        item.state='accepted';save({...entry,state:'prepared'});
+      }catch{save({...entry,state:'unconfirmed'});return;}
+    }
+    save({...entry,state:'accepted',reason:null});
+  }
   deferGroup(entries,ownerEpoch) {
     const first=entries[0];
     if(!first)return;
     const saved=this.defer(first.request,first.delivery,ownerEpoch);
     const file=path.join(this.directory,createHash('sha256').update(first.delivery.id).digest('hex')+'.pending.json');
     if(saved.entries)return saved;
-    return this.save(file,{...saved,entries:entries.map(e=>({...e,state:'unsent'})),retryAt:this.clock()+60000});
+    return this.save(file,{...saved,wholeReply:this.wholeReplyReview,entries:entries.map(e=>({...e,state:'unsent'})),retryAt:this.clock()+60000});
   }
   defer(request,delivery,ownerEpoch) {
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
@@ -75,7 +146,7 @@ export class ReplyGuard {
         const file=path.join(this.directory,name);let entry=JSON.parse(fs.readFileSync(file,'utf8'));
         if(!['pending','prepared',...(entry.entries?['unconfirmed']:[])].includes(entry.state)||entry.retryAt>this.clock())continue;
         if(handled++>=limit)break;
-        if(entry.entries){await this.resumeGroup(file,entry,{guard,send});continue;}
+        if(entry.entries){await (entry.wholeReply?this.resumeWholeGroup(file,entry,{guard,send}):this.resumeGroup(file,entry,{guard,send}));continue;}
         let permission=await guard(entry);
         if(permission==='wait')continue;
         if(permission==='cancel'){await this.call('share-cancel',{draft_id:entry.request.draft_id});this.save(file,{...entry,state:'canceled'});continue;}

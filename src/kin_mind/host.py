@@ -136,6 +136,15 @@ def dispatch(config, action, request):
         return memory.habits.choose_reply(request)
     if action == "reply-status":
         return memory.habits.reply_status(request["input_id"])
+    if action == "configure-model-capacity":
+        from .model_runtime import configure_capacity
+        return configure_capacity(engine, request["limit"])
+    if action == "share-preflight-group":
+        from .reply_review import ReplyReviews
+        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
+        if provider:
+            provider.timeout = 120
+        return ReplyReviews(memory.sharing).preflight(request, provider)
     if action == "share-preflight":
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
         if provider:
@@ -266,7 +275,7 @@ def dispatch(config, action, request):
     if action == "review-enrichment":
         if config.get("review_paused") or not memory.settings()["operational_lanes"]:
             return {"state": "paused"}
-        return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment")
+        return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment", job_id=request.get("job_id"))
     if action == "review":
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}

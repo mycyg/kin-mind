@@ -71,3 +71,36 @@ test('pending replies survive restart, freeze a stable send and never replay unc
   await guard.resumeDue({...options,guard:async()=> 'cancel'});assert.equal(calls,1);
  }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
+
+test('whole reply freezes every body before transport, survives restart and never replays accepted or uncertain IDs',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-whole-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ const entries=['intro','complete body','tail'].map((text,i)=>({request:{draft_id:'d'+i,reply_id:'current',text},delivery:{id:'m'+i,text}}));
+ const sent=[],outbox=[];let reviews=0,now=0;
+ const args={directory,clock:()=>now,wholeReplyReview:true,outbox:()=>outbox,call:async(action,r)=>{
+  if(action==='reply-status')return {action:'reply'};
+  assert.equal(action,'share-preflight-group');assert.equal(r.entries.length,3);
+  if(!r.frozen)reviews++;
+  return {state:'ready',checked:r.entries.map(e=>({...e,state:'ready',references:[]}))};
+ }};
+ let guard=new ReplyGuard(args);
+ const review=await guard.checkGroup(entries.map(e=>e.request));
+ const options={guard:async()=> 'send',send:async d=>{sent.push(d);return d.id==='m1'?{state:'unconfirmed'}:{state:'accepted',messageId:'server-'+d.id};}};
+ assert.equal((await guard.deliverGroup(entries,'owner',review,options)).state,'unconfirmed');
+ now=60001;guard=new ReplyGuard(args);await guard.resumeDue(options);
+ assert.deepEqual(sent.map(s=>s.id),['m0','m1']);
+ outbox.push({id:'m1',state:'accepted',message_id:'server-m1'});await guard.resumeDue(options);
+ assert.deepEqual(sent.map(s=>s.id),['m0','m1','m2']);assert.equal(reviews,1);
+ await guard.resumeDue(options);assert.equal(sent.length,3);
+});
+
+test('semantic duplicate is durable pending; genuine input-specific silence bypasses review',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-hold-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ let silence=false,models=0;
+ const guard=new ReplyGuard({directory,wholeReplyReview:true,call:async(action)=>{
+  if(action==='reply-status')return {action:silence?'silent':'reply',input_id:'one'};
+  models++;return {state:'duplicate',reason:'Needs revision'};
+ }});
+ const request={draft_id:'d',reply_id:'one',text:'body'};
+ assert.equal((await guard.checkGroup([request])).state,'pending');
+ silence=true;assert.equal((await guard.checkGroup([request])).state,'silent');assert.equal(models,1);
+});
