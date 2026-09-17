@@ -1,33 +1,54 @@
 import {chatVoice} from './chat-bubbles.mjs';
+
+/** The decision is the one JSON object the concatenated output ends with, fence
+ * marks aside. It is found by trying each `{` from the last one backwards until
+ * a slice parses, so commentary in front of it — balanced or not — cannot
+ * swallow it. Concatenating first means a decision split across segments still
+ * arrives whole; requiring it to end the output means a stale earlier draft
+ * followed by unusable text is never revived. */
+function finalObject(text) {
+  const end=text.replace(/[\s`~]*$/,'').length;
+  if(text[end-1]!=='}')return null;
+  for(let start=text.lastIndexOf('{',end-1);start>=0;start=text.lastIndexOf('{',start-1)) {
+    try {
+      const value=JSON.parse(text.slice(start,end));
+      if(value&&typeof value==='object'&&!Array.isArray(value))return value;
+    } catch { /* Not where the decision begins; a wider one may still be there. */ }
+  }
+  return null;
+}
+
+/** A decision, or null when the output is not one. No body is ever shortened:
+ * content the channel cannot carry in one message is fragmented downstream. */
+function decide(result) {
+  if(result.action==='send'&&Array.isArray(result.bubbles)) {
+    if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {
+      const bubbles=result.bubbles.map(x=>x.text.trim());
+      return {action:'send',text:bubbles.join('\n\n'),bubbles,references:result.bubbles.map(x=>x.references??[])};
+    }
+    if(result.bubbles.length&&result.bubbles.every(x=>typeof x==='string'&&x.trim())) {
+      const bubbles=result.bubbles.map(x=>x.trim());
+      return {action:'send',text:bubbles.join('\n\n'),bubbles};
+    }
+    return null;
+  }
+  // Older hosts can finish an already-started draft during a rolling upgrade.
+  if(result.text===null&&!result.action)return {action:'wait',condition:'new_evidence',reason:'Legacy empty draft; a new related source is required'};
+  if((result.action==='send'||!result.action)&&typeof result.text==='string'&&result.text.trim())return {action:'send',text:result.text.trim()};
+  if(!['wait','abandon'].includes(result.action)||typeof result.reason!=='string'||!result.reason.trim()||result.reason.length>1200)return null;
+  if(result.action==='abandon')return {action:'abandon',reason:result.reason.trim()};
+  if(!['time','new_evidence','owner_reply'].includes(result.condition))return null;
+  const seconds=result.retry_after_seconds??1800;
+  if(result.condition==='time'&&(!Number.isSafeInteger(seconds)||seconds<300||seconds>21600))return null;
+  return {action:'wait',reason:result.reason.trim(),condition:result.condition,...(result.condition==='time'?{retry_after_seconds:seconds}:{})};
+}
+
 /** Public output only. A parse failure is an execution error, not a wish decision. */
 export function parseContactDraft(outputs) {
-  const last=outputs.filter(raw=>typeof raw==='string'&&raw.trim()).at(-1);
-  for (const raw of last?[last]:[]) {
-    let result;
-    try { result=JSON.parse(raw.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'')); }
-    catch { continue; }
-    if(!result||typeof result!=='object'||Array.isArray(result))continue;
-    if(result.action==='send'&&Array.isArray(result.bubbles)) {
-      if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {
-        const bubbles=result.bubbles.map(x=>x.text.trim());
-        if(bubbles.join('\n\n').length<=3000)return {action:'send',text:bubbles.join('\n\n'),bubbles,references:result.bubbles.map(x=>x.references??[])};
-      }
-      if(result.bubbles.length&&result.bubbles.every(x=>typeof x==='string'&&x.trim())&&result.bubbles.join('\n\n').length<=3000)
-        return {action:'send',text:result.bubbles.map(x=>x.trim()).join('\n\n'),bubbles:result.bubbles.map(x=>x.trim())};
-      continue;
-    }
-    // Older hosts can finish an already-started draft during a rolling upgrade.
-    if(result.text===null&&!result.action)return {action:'wait',condition:'new_evidence',reason:'Legacy empty draft; a new related source is required'};
-    if((result.action==='send'||!result.action)&&typeof result.text==='string'&&result.text.trim()&&result.text.length<=3000)
-      return {action:'send',text:result.text.trim()};
-    if(!['wait','abandon'].includes(result.action)||typeof result.reason!=='string'||!result.reason.trim()||result.reason.length>1200)continue;
-    if(result.action==='abandon')return {action:'abandon',reason:result.reason.trim()};
-    if(!['time','new_evidence','owner_reply'].includes(result.condition))continue;
-    const seconds=result.retry_after_seconds??1800;
-    if(result.condition==='time'&&(!Number.isSafeInteger(seconds)||seconds<300||seconds>21600))continue;
-    return {action:'wait',reason:result.reason.trim(),condition:result.condition,...(result.condition==='time'?{retry_after_seconds:seconds}:{})};
-  }
-  throw new Error('contact-draft-invalid-result');
+  const result=finalObject((Array.isArray(outputs)?outputs:[outputs]).filter(raw=>typeof raw==='string'&&raw.trim()).join(''));
+  const decision=result?decide(result):null;
+  if(!decision)throw new Error('contact-draft-invalid-result');
+  return decision;
 }
 
 export const contactDraftInstructions = `${chatVoice}\n内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
