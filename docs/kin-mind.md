@@ -47,9 +47,17 @@ HTTPS hostname. Embedding configuration remains independent.
 
 `Appraisals.enqueue` persists original evidence IDs. `run_one` leases one review per
 scope, makes one provider request, validates the response, and commits state and
-wish proposals in one transaction. A changed revision requires reappraisal. A lost
-queue acknowledgement after a committed mutation reuses the command receipt.
-Failures retain previous scores and use bounded retries with backoff. A timer checks
+wish proposals in one transaction. Eight optional sections of that commit are
+applied in savepoints of their own, so a section the host refuses is undone alone
+and the rest of the appraisal still commits; the refusal is recorded with static
+codes and host text only, and one bounded follow-up asks again for it and for
+whatever rested on it. A changed revision requires reappraisal. A lost queue
+acknowledgement after a committed mutation reuses the command receipt.
+Failures retain previous scores and use bounded retries with backoff: every lane
+shares one cap on charged attempts, and an exhausted budget or the same error
+signature twice in a row quarantines the row in the existing `needs-repair` state
+instead of paying for it again. A sourced host action resumes a quarantined row,
+which is then judged afresh with its failure history preserved. A timer checks
 queue readiness; no ready evidence means no model request. Source bodies and provider
 reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending. The request includes projected scores,

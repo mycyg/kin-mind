@@ -6,6 +6,8 @@ Historical enrichment creates memory notes and graph nodes before resolving thei
 
 The host-only `recover-history` command takes unique `job_ids`, a sourced `command_id`, confirmed worker termination and optional verified replacement proposals. It only resumes quarantined historical jobs, keeps original IDs, attempts and errors in recovery history, and reruns normal validators. It does not mark jobs complete, alter scores or replay messages. Reused results keep their original provider receipt. A rejected seed proceeds to a fresh historical review instead of repeatedly retrying the same proposal.
 
+Quarantine is no longer confined to this lane. `recover-appraisals` resumes a quarantined row of any lane, needs no worker shutdown and never replays a stored proposal as a seed; `recover-batched` settles the jobs an interrupted parent left batched. Both preserve the failure history and are covered by [mobile recovery and operational progress](mobile-recovery.md).
+
 ## Dialogue and clocks
 
 Owner input enters a durable journal before memory ingestion. It does not wait behind older artifact or delivery events. Failed journal entries keep their original identity and retry independently after five minutes, then fifteen minutes; later inputs and receipts continue. A split ZIP tail can contain a directory without its member bytes. Such a file retains its actual byte fingerprint and delivery receipt, while member coverage remains unavailable.
