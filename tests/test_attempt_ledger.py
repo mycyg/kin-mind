@@ -1,4 +1,4 @@
-"""The appraisal attempt ledger and honest usage accounting (WP2: A8, A9, A3 records).
+"""The appraisal attempt ledger and honest usage accounting.
 
 Synthetic replays only: an injected clock, scripted providers and httpx.MockTransport.
 No model call, no network. Every assertion about cost is about what the host records,

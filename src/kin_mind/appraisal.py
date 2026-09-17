@@ -664,7 +664,7 @@ class DeepSeek:
     def appraise(self, context):
         started = time.monotonic()
         self.failure_receipt = None
-        # An expansion round and (WP4) a revalidation are appraisal calls with a purpose
+        # An expansion round and a revalidation are appraisal calls with a purpose
         # of their own; every other call takes its purpose from its tool name.
         purpose = getattr(self, "call_purpose", None) or "appraise"
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None

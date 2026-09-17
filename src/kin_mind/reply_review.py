@@ -353,7 +353,7 @@ class ReplyReviews:
         state, reason = ('pending',semantic['reason']) if action=='hold' else ('ready',semantic['reason'])
         if sent and action == 'revise':
             # A frozen remainder is not rewritten in place: the host retires it and the tail
-            # decision (WP B2) starts a new group, which is reviewed on its own evidence.
+            # decision starts a new group, which is reviewed on its own evidence.
             state, reason = 'pending', 'frozen-remainder-needs-new-group'
         with self.engine.db.connect(write=True) as conn:
             if self.dependencies(conn,entries,nodes) != deps or not self.mind._fresh(conn,deps['evidence']):

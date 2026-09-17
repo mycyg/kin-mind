@@ -1,4 +1,4 @@
-"""Judgment cache v2 (WP7: A12).
+"""Judgment cache v2.
 
 Synthetic replays only: an injected clock, a scripted `httpx.MockTransport` and no
 network. Nothing here asserts what a provider charged, only what the host stores and
