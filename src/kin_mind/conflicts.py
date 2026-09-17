@@ -30,7 +30,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
-    "kin_mind.evidence_classes",
+    "kin_mind.evidence_classes", "kin_mind.behavior_chain", "kin_mind.compat",
 )
 
 
@@ -79,6 +79,7 @@ REGISTRY = {
     "Personality was already evaluated today": ("runtime", "evolution-already-today", "block"),
     "Personality changes require three independent user interactions": ("semantic", "evolution-needs-interactions", "block"),
     "A current, version-matched prospective behavioral check is required": ("semantic", "evolution-needs-behavioral-check", "block"),
+    "A current, compatible prospective behavioral check is required": ("semantic", "evolution-needs-behavioral-check", "block"),
     "A personality reversion requires explicit user correction evidence": ("semantic", "reversion-needs-owner-evidence", "block"),
     "Evolution event is outside this scope or missing": ("semantic", "reference-cross-scope", "block"),
     "Reversion evidence must follow the change": ("semantic", "reversion-evidence-too-early", "block"),
@@ -222,6 +223,17 @@ REGISTRY = {
     "Need independent result cases": ("semantic", "replay-needs-cases", "block"),
     "Procedure replay omitted or duplicated an outcome": ("semantic", "replay-incomplete", "block"),
     "Procedure changed during replay": ("runtime", "procedure-changed-during-replay", "block"),
+    # --- behavior_chain.py: a check is worth what its evidence is, so every one of these is
+    # refused alone and recorded; none of them costs a follow-up call ---
+    "The chain needs evidence this evaluation was shown": ("semantic", "chain-evidence-unknown", "section"),
+    "Chain evidence changed after it was supplied": ("runtime", "chain-evidence-changed", "section"),
+    "A hypothesis needs a prediction that could refute it": ("semantic", "hypothesis-without-prediction", "section"),
+    "This prediction was made under another configuration": ("runtime", "prediction-incompatible", "section"),
+    "An outcome needs evidence the host verified": ("semantic", "outcome-not-verifiable", "section"),
+    "Outcome evidence must be later than the prediction": ("semantic", "outcome-not-later", "section"),
+    "A result must name an execution of this scope": ("semantic", "result-unknown", "section"),
+    "This receipt does not show the behavior happened": ("semantic", "result-unverified", "section"),
+    "A reversion is a host action, not an appraisal proposal": ("semantic", "evolution-revert-not-proposed", "section"),
     # --- exploration_decisions.py ---
     "Sharing decision needs an exploration in this scope": ("semantic", "exploration-unknown", "block"),
     "A clock or delivery event cannot reopen a result decision": ("semantic", "decision-reopen-not-allowed", "block"),
