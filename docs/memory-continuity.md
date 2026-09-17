@@ -56,6 +56,8 @@ DeepSeek compression applies to *incoming* evidence; native compaction applies t
 
 Caches are bound to scope, input revisions, query purpose, budget and compression prompt version. Background overviews may be reused with an “overview” coverage label; explicit queries can still read the originals. Source correction, deletion or a mismatched revision invalidates dependent cached results. All model interfaces accept named structured results; reasoning blocks are excluded.
 
+Derived text is never rewritten to match a reader. A cached summary, a background overview or a stored window receipt is served only while every item it rendered is still something this read may see, so a dependency the [reading purpose](architecture.md#reading-purpose-and-evidence-classes) does not admit makes it a miss and the evidence is assembled again. A receipt replaced that way refunds the tokens it had charged to the automatic-background ledger, so a miss costs the window nothing. A receipt written before the classification existed names its own evidence, so it is checked against those records and nodes rather than against a stamp. While the [evidence isolation](operations.md#evidence-isolation) migration is unfinished, every cache, overview and receipt is a miss: stored text was compressed under rules that are still being applied.
+
 Background appraisal requests full evidence coverage with `require_all=True`.
 It processes every complete batch within its preparation deadline, retains
 completed batch receipts across retries, and reduces all batch summaries together.

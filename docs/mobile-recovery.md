@@ -40,6 +40,175 @@ Owner subscriptions to a switch notification survive internal completion
 requests and restarts. The notification follows actual provider/model/session
 verification, has one durable send ID and reconciles unknown receipts.
 
+## Complete phone replies
+
+A reply is a group of bubbles, and a bubble the channel cannot carry in one
+message is a group of fragments. `adapters/transport-manifest.mjs` is the only
+writer of one durable file per group, beside which it keeps the replaced revision
+as `.prev`, quarantined bytes in `quarantine/`, settled groups filed by month in
+`done/` and the group leases in `leases/`. Four rules hold over everything below:
+the final manifest is on disk before the first byte is sent, and a retry reads it
+back rather than deciding again; a fragment's state follows the transport's own
+receipt, which the transport writes before it submits; the lease decides who may
+write, never what was sent; and the memory host hears about whole bubbles only.
+
+The order is draft, review, manifest, send. `createDraft` persists the group
+before anything else happens to it — the text exists, nothing is reviewed or cut
+— and the same bubbles always give the same manifest back. The whole-group
+review then freezes each body, its references and its fragment identities, after
+which the group is final and later passes only read it. A group state is `draft`,
+`reviewed`, `sending`, `held`, `blocked-unknown`, `interrupted`, or one of the
+terminal `accepted`, `retired`, `partial` and `undeliverable`. A bubble is
+`unsent`, `sending`, `accepted`, `unconfirmed`, `rejected`, `undeliverable` or
+`canceled`, and its state is derived from its fragments rather than set: any
+fragment whose outcome is unknown makes the bubble unconfirmed, all accepted
+makes it accepted, a refusal makes it rejected, a failed file makes it
+undeliverable.
+
+Identity is stored once and never derived again. A fragment's transport ID comes
+from its bubble ID, its index and the hash of its own bytes, and it is written
+into the manifest at freeze time, so no later pass can renumber a fragment or
+compute a second ID for bytes that were already submitted. A group imported from
+the older pending journal keeps its bubble ID as its transport ID, because that
+is where its receipts are; groups that had already ended are never imported, so
+no old reply is replayed.
+
+Fragments are contiguous offset slices of the frozen text, so joining them
+returns it exactly, and the same text and limit always produce the same
+fragments. A code fence, a run of non-CJK characters — a word, a URL, a number —
+and a grapheme cluster are atoms and are never cut; the whitespace after an atom
+belongs to it, so a cut never falls inside or in front of a whitespace run. Among
+the cuts that cost no extra fragment the boundary is chosen by quality — a blank
+line, then a line break, a sentence end, a clause end, a space, and only then any
+other atom boundary — and within the best class the latest one. Size is measured
+in the unit the platform actually counts. Nothing is ever shortened to fit: when
+one atom alone exceeds the limit, or a cut would leave a fragment of nothing but
+whitespace, the complete bubble goes as a single file instead, named from its own
+content and with no words of the host's own. A body past the channel's file limit
+ends that bubble as undeliverable rather than being truncated.
+
+Receipts decide, in both directions. No receipt at all, or a receipt that proves
+nothing was submitted, means the send never began and the fragment returns to
+unsent. An acceptance must name a platform message; an acceptance without one is
+an unknown outcome. A refusal is final for that fragment. Anything else is
+unknown, and an unknown fragment moves its group to `blocked-unknown`, which
+stops that group and nothing else — every other group keeps sending. A transport
+that answers "this ID already has a receipt I cannot resolve" is never read as
+"nothing was sent". An unknown fragment is submitted again under its own
+transport ID at most once, only while the platform's own deduplication provably
+still covers the first attempt — a published window less a safety margin — and
+only when the contract the host injects for that channel says a repeated submit
+is safe. Neither published contract says so, so by default nothing is resent and
+the group waits for a receipt or an operator. Only an acceptance settles a
+resend: a refusal of a duplicate says nothing about the first attempt.
+
+Every write is taken under a lease with generation fencing. Each acquisition wins
+a new generation through an exclusive directory creation, so a generation has
+exactly one owner and works as a fencing token; a write is refused once the lease
+is lost, close enough to expiry that it could land after a takeover, or outranked
+by a higher generation already on disk. Expiry only frees the lease — it says
+nothing about what the previous holder already put on the network. The manifest
+that counts is the current file, unless it is unreadable or a lower-generation
+write landed over a higher one, in which case `.prev` is. A lease holder repairs
+the files and keeps the bad bytes; anyone else only reads. A second entrant to a
+group that is being worked on is told it is busy and has changed nothing at all.
+
+The memory host is told about bubbles, never about fragments. Once a bubble is
+accepted, left unconfirmed, or ended by a refusal, a failure or a withdrawal, its
+side effects run at least once and in order: a dead bubble's content reservation
+is released, then one bubble-level delivery event is emitted, carrying the
+message ID of every accepted fragment. Both are idempotent on the other side and
+each is tried a bounded number of times. A group is moved out of the live set —
+filed by month, so the live set stays small and old months can be pruned whole —
+only when it is terminal, owes no side effect and has no open question about its
+remainder.
+
+A review that is not ready holds the group with its reason visible and doubles
+the wait; after a bounded number of such holds the group is parked until there is
+a new reason to ask — new owner input, an explicit delivery, or an operator. A
+review that could not be reached at all judged nothing, so it keeps the growing
+wait but never parks the group, and chunk progress that was already paid for
+counts as progress rather than as another refusal. A bubble that has begun is
+always finished before anyone may stop the group. A transport that stays
+unavailable ends the group after a bounded number of failures instead of leaving
+it pending for ever.
+
+`node adapters/transport-manifest.mjs <command> --dir <manifests>` is the
+operator's entry point. It never sends and never prints message text.
+
+| Command | Effect |
+| --- | --- |
+| `status` | Group, bubble and fragment states, reasons, leases and tail facts, with no message text |
+| `reconcile` | Re-read receipts for one group or all of them; the exit from `blocked-unknown` once a receipt can tell |
+| `resolve` | State what really happened to one fragment nobody can tell about: `--outcome accepted --message-id <id>`, or `--outcome rejected` |
+| `retry` | A new reason to ask again: a group parked after its review tries ran out is offered to the service once more |
+| `continue` | Send an interrupted group on as written, for a remainder whose decision nobody will make |
+| `retire` | Withdraw the unsent remainder now; what was sent stays sent |
+
+`resolve` accepts only a fragment whose outcome is genuinely open, and an
+acceptance without a platform message ID is refused. What the operator settles is
+reported to memory, released and filed away by the service's next pass, because
+the tool has no memory host of its own. The switch is the host's
+`transport_manifest`; with it off every method behaves exactly as it did before
+the manifest existed. What becomes of a group's unsent remainder when the owner
+writes again is a separate decision; see
+[mobile routing](mobile-routing.md#the-unsent-rest-of-an-interrupted-reply).
+
+## Durable adapter state
+
+Every durable adapter state file is written through one writer and read through
+one loader. The writer gives each attempt a temporary name no other writer can
+share, fsyncs before the rename, and keeps the revision it replaces as
+`<file>.prev`. The loader takes the file, else that `.prev` copy; a revision it
+cannot read is moved into a `quarantine/` directory beside it, never deleted, and
+reported as a text-free fact that status can show. A file written under a schema
+this build does not know is reported to the caller and left where it is: another
+version's state is not damage.
+
+What a host does when nothing is left to restore depends on what the file was
+for. The router's state is a record of what it accepted, so it is rebuilt: the
+append-only event journal beside the file still names every input the router
+accepted, and those inputs come back as unconfirmed, which means a replayed input
+is refused until it is reconciled rather than submitted a second time, and the
+restart profile waits instead of switching the provider under lost work. The
+session registry refuses to open at all, because its binding is a fencing token:
+reopening at generation 1 would let an older fence pass again. The quarantined
+bytes stay on disk and restoring them is an operator step.
+
+Work-lock evidence larger than one review's limits is excerpted and split rather
+than refused, because an oversized task would otherwise hold the work lock for
+ever. An oversized body keeps its head and tail with its original length and
+digest stated beside it, so what is missing is said rather than dropped in
+silence; the evidence is then reviewed in at most eight chunks, each carrying the
+outline of the whole and the decisions taken before it. The verdicts are merged
+conservatively — the most cautious disposition wins, so one chunk that says keep
+keeps the lock, and a malformed chunk gets the same refusal an unchunked review
+would get. Evidence that does not fit even at the smallest excerpt waits under
+`review-context-needs-summary`. A request that was never oversized is byte for
+byte what it always was.
+
+A bubble the host retired never reached a transport and never will. That is a
+settled non-delivery rather than an uncertain one, and the work review treats it
+as such instead of holding the lock; delivery evidence is still required from the
+bubbles that were actually sent.
+
+The memory event journal keeps its retry notes in a bounded ledger of its own:
+one file per event that is still waiting, never more than a fixed number of them,
+carrying IDs, counts and times and never message text. Entries whose event is
+gone are removed, and only the most recently checked are kept, so losing one
+costs its event an earlier retry and nothing else. One unreadable queue file is
+moved aside rather than allowed to end ingestion, and an unreadable retry note
+only means its event is tried again sooner.
+
+A maintenance restart that puts the model back the way the owner already knows it
+changes nothing they can see. The host tracks the model the owner was last told
+about — the most recent runtime-status notice the platform accepted, which is the
+only durable record of what they heard, since a delivery carries a message ID and
+a time but not the model that wrote it. When a restart-initiated switch ends on
+that same model, its notice is settled as suppressed under
+`restart-restored-known-model` and is never sent. Real switches, status answers
+and watch subscriptions are unchanged.
+
 ## Independent appraisal progress
 
 The rollback flag is `operational_lanes`, enabled after a stopped-worker migration.

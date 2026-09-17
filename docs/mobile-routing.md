@@ -67,6 +67,65 @@ unrelated user task. An interrupted operation remains unconfirmed rather than
 being replayed. Native compaction completion follows the app server's
 [`contextCompaction` lifecycle](https://learn.chatgpt.com/docs/app-server).
 
+## The unsent rest of an interrupted reply
+
+A new owner message does not cancel the reply that is still going out. The
+group is interrupted at its next bubble boundary — a bubble that has begun is
+always finished first — and its unsent remainder waits for a decision about what
+should become of it: `continue` to deliver it exactly as written,
+`rewrite_remainder` when what it says still matters but belongs in the next
+reply, or `supersede` when the new message makes it obsolete.
+
+That decision is DeepSeek's, and it rides on a call the host makes anyway. The
+first carrier is the routing call for the new message: when the host has an
+interrupted reply to offer, it travels with that request and the decision comes
+back beside the route. Without one, every byte of the request is what it was
+before tails existed, and an unsolicited answer is never handed on. The route
+stands on its own — a tail the host cannot use is dropped and the remainder
+simply waits for its next carrier, which the classifier's own timeout, an
+attachment and a literal command all become, since those are never classified.
+The second carrier is the review of the next reply, which is given the older
+group's unsent items and reports which of them the new reply covers. Only when
+neither ran does the remainder get a bounded call of its own, and a literal owner
+stop needs no model at all. A group with a fragment whose outcome is unknown is
+offered to nobody: it blocks itself and nothing else.
+
+The intent is written to the group's manifest before anything is done about it,
+and recovery rolls it forward rather than starting again:
+
+1. **recorded** — the decision is on disk, with its carrier, its reason and the items it covers.
+2. **applied** — every named bubble is retired, its content reservation released and its canceled event emitted. A `continue` whose bubbles are all still unsent skips this: the group simply goes on, same bubbles, same transport IDs, and settles at once.
+3. **linked** — the group that answers for the remainder is named, and the old bubbles' supersession moves from the intent to that group. A `continue` whose bubbles can no longer go on in place becomes a group of its own carrying the same words, reviewed afresh.
+4. **settled** — by what that group really delivered.
+
+"Into the next reply" is an intention, not a delivery. What the next reply's
+receipts do not show as covered comes back and waits for a decision again, at
+most twice; after that the only answers left are continue and supersede. What
+DeepSeek superseded, and what the owner stopped, never comes back. A remainder
+that was withdrawn but not promised to a next reply does not wait indefinitely
+to be pointed at a successor either: after a bounded wait it settles as
+superseded.
+
+The owner's literal stop is made durable before anything else, so a restart
+cannot lose it, and it outranks whatever was decided before: a remainder promised
+to the next reply is no longer owed, and one that was to go on does not. It is
+dated when the owner said it rather than when the host got round to it, so the
+reply written after the stop is its successor. A dedicated call is asked only for
+a remainder that has waited without any carrier deciding, only while the owner's
+turn is not running, one group per pass and a bounded number of times with a
+growing wait; a new owner message is a new reason to ask. It declares the
+foreground lane under a purpose of its own, so the usage rows show every time
+ordinary chat paid for an extra call.
+
+The reply-tail port the router calls (offer, decided, missed, stopped) is
+optional and never decides routing: a port that is absent, slow to answer or
+failing changes nothing about the route. Tail facts reported for status carry
+states and identifiers only, never message text, and what was decided stays
+readable after later events that do not repeat it. The switch is the host's
+`reply_tail_decision`; with it off an interrupted group is handled exactly as the
+manifest alone handles it. The manifest, its fragments and the operator commands
+are described in [mobile recovery](mobile-recovery.md#complete-phone-replies).
+
 ## Provider compatibility
 
 `codex-models.mjs` changes the ACP provider and model, then verifies native thread
@@ -76,8 +135,10 @@ background terminals remain active. An unsupported adapter version fails closed.
 
 The mobile process uses its own combined model catalogue. Global desktop model
 configuration and account credentials are not rewritten. GPT-6 retains the host's
-configured Fast setting. DeepSeek conversation, classification and health review
-use `max` thinking; private reasoning never enters the channel output.
+configured Fast setting. DeepSeek conversation uses the reasoning effort the host
+configures for the gateway; classification, the tail decision, work review and
+health review enable thinking at high effort, and their receipts record it.
+Private reasoning never enters the channel output.
 
 `deepseek-gateway.mjs` binds an authenticated loopback endpoint and forwards only
 DeepSeek Flash Responses requests to the official HTTPS endpoint. It excludes
@@ -107,9 +168,9 @@ exploration wishes. It returns `keep`, `complete` or `not_a_task`. A held task i
 reviewed again after twenty minutes even if its inputs have not changed. Failed
 reviews use the same interval; busy native work only incurs a local check.
 
-Work review allows 65,536 output tokens and an eight-minute request deadline so
-`max` reasoning has room to finish its structured decision. This is within the
-provider's [documented output limit](https://api-docs.deepseek.com/quick_start/pricing/).
+[Mobile recovery](mobile-recovery.md#work-and-delivery) states the output ceiling
+and request deadline this review is given, which stay within the provider's
+[documented output limit](https://api-docs.deepseek.com/quick_start/pricing/).
 An output-limit stop is rejected even if a tool result appears syntactically
 complete. The receipt records stop reason and token usage without retaining
 reasoning text. A review-protocol version change invalidates the earlier review
@@ -152,16 +213,21 @@ uses the [Responses endpoint](https://api-docs.deepseek.com/guides/responses_api
 
 Every verified model change creates one durable owner notification, including
 automatic routing, work completion and restart reconciliation. A same-model
-profile refresh creates no switch notice. Explicit subscriptions share the
+profile refresh creates no switch notice, and neither does a maintenance restart
+that ends on the model the owner was last told about: that notice is settled as
+suppressed rather than sent, as [mobile recovery](mobile-recovery.md#durable-adapter-state)
+describes. Explicit subscriptions share the
 transition notice; uncertain sends reconcile the same outbox ID. Delayed notices
 distinguish the earlier transition from the current verified model. These control
 notices stay outside the recent public dialogue used for recall and appraisal.
 
-DeepSeek uses high reasoning throughout the gateway, classifier, work review,
-health review and memory evaluation. Output ceilings are 16K for routing, at
-least 64K for native chat and structured memory requests, and 128K for appraisal
-and work review. Output truncation remains a failed result. Latency limits are
-independent of token ceilings; classification retains its bounded fallback.
+The classifier, the tail decision, work review, health review and memory
+evaluation enable thinking at high effort; the gateway forwards the effort the
+host configures for conversation. Output ceilings are 16K for routing and for a
+tail decision asked on its own, at least 64K for native chat and structured
+memory requests, and 128K for appraisal and work review. Output truncation
+remains a failed result. Latency limits are independent of token ceilings;
+classification retains its bounded fallback.
 
 Run `node --test adapters/*.test.mjs` for synthetic routing, delivery, concurrency,
 gateway and cadence checks. Before enabling a host, additionally verify a live
