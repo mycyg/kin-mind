@@ -1871,8 +1871,12 @@ class Appraisals:
                         # Keep that share pending for the next batch; independent
                         # records and affect can commit without redoing the call.
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
-                        self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
+                        dropped = self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
                             memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots)
+                        if dropped:
+                            # Memory items the host dropped one by one (memory_items): recorded beside the refused sections.
+                            rejected.extend(dropped)
+                            data["rejected_sections"] = rejected
                     if proposal.habits and not isolation:
                         # The previous order, so that with the switch off two faults still surface as they did.
                         apply_habits()
@@ -1886,7 +1890,8 @@ class Appraisals:
                         conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
                             (review_id, self.mind.scope.key(), "pending", time.time(), dumps({"evidence_ids": data["evidence_ids"],
                                 "agent_version": effective_version, "origin": "reflection", "stimulus": FOLLOW_UP, "parent_id": row["id"],
-                                "section_review": {"rejected_sections": rejected, "held_sections": held}})))
+                                # A dropped memory item is only recorded: no follow-up is asked to restate it.
+                                "section_review": {"rejected_sections": [r for r in rejected if "item" not in r], "held_sections": held}})))
                     return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction),
                             **({"held_decisions": held_decisions} if held_decisions else {}),
                             **({"rejected_sections": rejected} if rejected else {}), **({"held_sections": held} if held else {}),

@@ -17,6 +17,8 @@ from pydantic import Field
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.models import Model, RecordInput, SourceInput
 
+from . import memory_items
+from .autonomy_schema import optimized
 from .computer import redact
 from .dialogue import recent_dialogue
 from .graph import EventGraph, GraphAssessment, query_terms
@@ -161,7 +163,7 @@ class MemoryContinuity:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(SCHEMA + memory_items.SCHEMA)
         self.graph = EventGraph(mind)
         self.sharing = ShareLedger(mind)
         self.habits = ConversationHabits(mind)
@@ -514,9 +516,61 @@ class MemoryContinuity:
                 "shares": [] if operational else self.history("share", query=query, limit=12)["items"],
                 "next_review": cursor["next_review"], "revision": cursor["revision"], "latest_owner_seq": latest_owner_seq}
 
+    def queue_unorganized(self, jobs, agent_version, limit=16):
+        """One more memory-only pass for the sources whose only carrier a commit had to drop.
+
+        It runs as history, so nothing is scored again and no wish is made; this is what organises
+        that experience later, in either lane mode. One job at a time. A source the pass withholds
+        again, or whose job ended without organising it, is left for an operator, never retried for ever."""
+        scope, at = self.scope.key(), self.mind.clock()
+        with self.engine.db.connect() as conn:
+            if not optimized(conn, scope, memory_items.SWITCH):
+                return {"state": "disabled"}
+            rows = memory_items.waiting(conn, scope)
+        if not rows:
+            return {"state": "idle"}
+        ended = {}
+        for job_id in dict.fromkeys(r["data"].get("job_id") for r in rows if r["state"] == "queued"):
+            status = jobs.status(job_id) if job_id else None
+            state = status["state"] if status else "missing"
+            if state in {"pending", "running", "batched"}:
+                return {"state": "pending", "job_id": job_id}
+            ended[job_id] = state
+        ready, unavailable = [], []
+        with self.engine.db.connect() as conn:
+            for row in [r for r in rows if r["state"] == "pending"][:limit]:
+                try:
+                    current = self.mind._fresh(conn, self.mind._evidence(conn, [row["source_id"]]))
+                except (Missing, Conflict):
+                    current = False
+                (ready if current else unavailable).append(row["source_id"])
+        receipt = None
+        if ready:
+            try:
+                receipt = jobs.enqueue(ready, agent_version, origin="reflection", stimulus="memory-backfill")
+            except (Missing, Conflict):
+                # A source moved between the check and the enqueue: the next review looks again.
+                ready = []
+        reasons = {}
+        with self.engine.db.connect(write=True) as conn:
+            for row in rows:
+                if row["state"] == "queued":
+                    reason = "job-" + ended[row["data"].get("job_id")]
+                    memory_items.mark(conn, scope, [row["source_id"]], "abandoned", at, reason=reason)
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            memory_items.mark(conn, scope, unavailable, "abandoned", at, reason="source-unavailable")
+            if receipt:
+                memory_items.mark(conn, scope, ready, "queued", at, job_id=receipt["id"])
+        if unavailable:
+            reasons["source-unavailable"] = len(unavailable)
+        if reasons:
+            self.engine.db.metric("memory_sources_abandoned", sum(reasons.values()), {"reasons": reasons})
+        return {"state": "queued", "job_id": receipt["id"], "sources": len(ready)} if receipt else {"state": "idle"}
+
     def queue_history(self, jobs, agent_version):
         """A resumable low-priority semantic pass. Old evidence cannot create a
         new emotion or wish; current user events always run first."""
+        self.queue_unorganized(jobs, agent_version)
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT * FROM mind_memory_migrations WHERE scope=? AND name='semantic'", (self.scope.key(),)).fetchone()
             cursor, data = (row["cursor"], json.loads(row["data"])) if row else (0, {})
@@ -571,7 +625,32 @@ class MemoryContinuity:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None):
-        """Called inside the same transaction as affect/concerns/wishes."""
+        """Called inside the same transaction as affect/concerns/wishes.
+
+        Returns what the host dropped item by item (memory_items), shaped like a refused section."""
+        items = memory_items.Items(conn, optimized(conn, self.scope.key(), memory_items.SWITCH))
+        items.run(lambda: self._apply_items(conn, items, assessment, refs, event_id, receipt))
+        processed = refs if processed_refs is None else processed_refs
+        # A source whose only carrier was dropped has not been organised: it stays out of the index
+        # and waits in the ledger for its memory-only pass (queue_unorganized).
+        withheld = items.withheld(conn, processed)
+        for ref in processed:
+            if ref["source_id"] not in withheld:
+                conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
+        abandoned = memory_items.settle(conn, self.scope.key(), [r["source_id"] for r in processed], withheld, event_id, self.mind.clock())
+        items.metric(conn, self.mind.clock(), event_id, withheld, abandoned)
+        if schedule:
+            # The cursor follows the events this evaluation was given and scored, withheld or not:
+            # held back, it would hand an already scored event to a full appraisal a second time.
+            config = self.settings(conn)
+            minutes = max(config["review_min_minutes"], min(config["review_max_minutes"], next_minutes))
+            next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
+            conn.execute("INSERT INTO mind_semantic_cursor(scope,seq,next_review,revision,data) VALUES(?,?,?,1,?) ON CONFLICT(scope) DO UPDATE SET seq=MAX(seq,excluded.seq),next_review=excluded.next_review,revision=revision+1,data=excluded.data",
+                         (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))
+        return items.records()
+
+    def _apply_items(self, conn, items, assessment, refs, event_id, receipt):
+        """One pass over every item of the section; memory_items repeats it when a cascade reaches back."""
         allowed_sources = {r["source_id"] for r in refs}
         allowed_records = {r["record_id"] for r in refs}
         def evidence(ids):
@@ -601,68 +680,81 @@ class MemoryContinuity:
             raise Conflict("Memory and graph keys must be unique in an assessment")
         aliases = {**note_aliases, **graph_aliases}
         resolve = lambda identifier: aliases.get(identifier, identifier)
-        for note in assessment.notes:
-            sources = evidence(note.evidence_ids)
-            node_id = aliases[note.key]
-            self.engine._insert(conn, RecordInput(id=node_id, scope=self.scope, kind=note.kind,
-                title=note.title, content=note.content, source_ids=sorted({r["source_id"] for r in sources}),
-                evidence_ids=sorted({r["record_id"] for r in sources}), generated=True, confirmation="inferred",
-                attributes={"semantic_event": event_id, "key": note.key, "model": receipt.get("model"), "about_ids": [resolve(i) for i in note.about_ids]}))
+        # Each item is applied whole or not at all (memory_items): its key is its place in the proposal, a note
+        # introduces its key and the id that key stands for, and whatever names a dropped key goes with it.
+        note_keys = memory_items.positions("notes", assessment.notes)
+        for key, note in zip(note_keys, assessment.notes):
+            with items.item("note", key, names=(note.key, aliases[note.key]), needs=note.about_ids, evidence=note.evidence_ids) as live:
+                if not live:
+                    continue
+                sources = evidence(note.evidence_ids)
+                node_id = aliases[note.key]
+                self.engine._insert(conn, RecordInput(id=node_id, scope=self.scope, kind=note.kind,
+                    title=note.title, content=note.content, source_ids=sorted({r["source_id"] for r in sources}),
+                    evidence_ids=sorted({r["record_id"] for r in sources}), generated=True, confirmation="inferred",
+                    attributes={"semantic_event": event_id, "key": note.key, "model": receipt.get("model"), "about_ids": [resolve(i) for i in note.about_ids]}))
+                items.carry(key, {r["source_id"] for r in sources})
         # Materialize both kinds of nodes before resolving cross-kind links.
         # This remains inside the caller's transaction: a bad edge rolls back
         # notes and graph nodes together, including their revision history.
         if config["graph"]:
-            self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases)
+            self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases, items=items,
+                             keys=(memory_items.positions("graph.nodes", assessment.graph.nodes, graph.nodes),
+                                   memory_items.positions("graph.edges", assessment.graph.edges, graph.edges)))
         if config["event_lifecycle"] and assessment.event_routes:
             from .lifecycle import EventLifecycle
             # The host issues these command ids itself, from the appraisal and the route key.
             # A later judgment that rewrites one of them is an explicit revision, not a client
             # reusing an id: it is validated again in full and keeps its before/after record.
-            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases, revise=True)
-        for note in assessment.notes:
-            for identifier in note.about_ids:
-                for root in self._record_ids(conn, resolve(identifier)):
-                    if aliases[note.key] != root:
-                        self.engine._relation(conn, aliases[note.key], "about", root, {"basis": "inferred", "event_id": event_id})
-        for link in assessment.links:
-            evidence(link.evidence_ids)
-            for left in self._record_ids(conn, resolve(link.subject)):
-                for right in self._record_ids(conn, resolve(link.object)):
-                    if left != right:
-                        self.engine._relation(conn, left, link.relation, right, {"basis": "inferred", "event_id": event_id, "evidence_ids": link.evidence_ids})
-        for proposal in assessment.disclosures:
-            proposal = proposal.model_copy(update={"about_ids": [resolve(i) for i in proposal.about_ids]})
-            share = self._get(conn, proposal.share_id)
-            if share["kind"] != "share" or not self._fresh(conn, share):
-                raise Conflict("Disclosure needs current delivery evidence")
-            for identifier in proposal.about_ids + proposal.previous_share_ids:
-                self._record_ids(conn, identifier)
-            topic_id = self._id("topic", proposal.topic.strip().casefold())
-            try:
-                topic = self._get(conn, topic_id)
-            except Missing:
-                topic = {"id": topic_id, "kind": "topic", "title": proposal.topic, "source_ids": [], "record_ids": []}
-            topic["source_ids"] = list(dict.fromkeys(topic["source_ids"] + share["source_ids"]))
-            topic["record_ids"] = list(dict.fromkeys(topic["record_ids"] + share["record_ids"]))
-            self._put(conn, topic)
-            share.update(semantic_state="assessed", topic=proposal.topic, topic_id=topic_id, summary=proposal.summary,
-                         mode=proposal.mode, previous_share_ids=proposal.previous_share_ids,
-                         about_ids=list(dict.fromkeys([*share.get("about_ids", []), *proposal.about_ids])),
-                         assessment_event=event_id, assessment_receipt=receipt)
-            self._put(conn, share)
+            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases, revise=True, items=items)
+        for key, note in zip(note_keys, assessment.notes):
+            # The second part of the same item: refused here, the note inserted above goes too.
+            with items.item("note", key) as live:
+                if not live:
+                    continue
+                for identifier in note.about_ids:
+                    for root in self._record_ids(conn, resolve(identifier)):
+                        if aliases[note.key] != root:
+                            self.engine._relation(conn, aliases[note.key], "about", root, {"basis": "inferred", "event_id": event_id})
+        for key, link in zip(memory_items.positions("links", assessment.links), assessment.links):
+            with items.item("link", key, needs=(link.subject, link.object)) as live:
+                if not live:
+                    continue
+                evidence(link.evidence_ids)
+                for left in self._record_ids(conn, resolve(link.subject)):
+                    for right in self._record_ids(conn, resolve(link.object)):
+                        if left != right:
+                            self.engine._relation(conn, left, link.relation, right, {"basis": "inferred", "event_id": event_id, "evidence_ids": link.evidence_ids})
+        for key, proposal in zip(memory_items.positions("disclosures", assessment.disclosures), assessment.disclosures):
+            with items.item("disclosure", key, needs=proposal.about_ids) as live:
+                if not live:
+                    continue
+                proposal = proposal.model_copy(update={"about_ids": [resolve(i) for i in proposal.about_ids]})
+                share = self._get(conn, proposal.share_id)
+                if share["kind"] != "share" or not self._fresh(conn, share):
+                    raise Conflict("Disclosure needs current delivery evidence")
+                for identifier in proposal.about_ids + proposal.previous_share_ids:
+                    self._record_ids(conn, identifier)
+                topic_id = self._id("topic", proposal.topic.strip().casefold())
+                try:
+                    topic = self._get(conn, topic_id)
+                except Missing:
+                    topic = {"id": topic_id, "kind": "topic", "title": proposal.topic, "source_ids": [], "record_ids": []}
+                topic["source_ids"] = list(dict.fromkeys(topic["source_ids"] + share["source_ids"]))
+                topic["record_ids"] = list(dict.fromkeys(topic["record_ids"] + share["record_ids"]))
+                self._put(conn, topic)
+                share.update(semantic_state="assessed", topic=proposal.topic, topic_id=topic_id, summary=proposal.summary,
+                             mode=proposal.mode, previous_share_ids=proposal.previous_share_ids,
+                             about_ids=list(dict.fromkeys([*share.get("about_ids", []), *proposal.about_ids])),
+                             assessment_event=event_id, assessment_receipt=receipt)
+                self._put(conn, share)
         if config["sharing"]:
-            allowed_shares = {m.share_id for m in assessment.coverage.mappings
-                if any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, self._get(conn, m.share_id)["source_ids"]))}
-            self.sharing.apply(conn, assessment.coverage, allowed_shares)
-        for ref in refs if processed_refs is None else processed_refs:
-            conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
-        if not schedule:
-            return
-        config = self.settings(conn)
-        minutes = max(config["review_min_minutes"], min(config["review_max_minutes"], next_minutes))
-        next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
-        conn.execute("INSERT INTO mind_semantic_cursor(scope,seq,next_review,revision,data) VALUES(?,?,?,1,?) ON CONFLICT(scope) DO UPDATE SET seq=MAX(seq,excluded.seq),next_review=excluded.next_review,revision=revision+1,data=excluded.data",
-                     (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))
+            def evaluated(share_id):
+                return any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, self._get(conn, share_id)["source_ids"]))
+            # Isolated, each mapping answers for its own share inside its savepoint; otherwise one
+            # lookup for all of them before any is applied, as before.
+            allowed_shares = evaluated if items.enabled else {m.share_id for m in assessment.coverage.mappings if evaluated(m.share_id)}
+            self.sharing.apply(conn, assessment.coverage, allowed_shares, items=items)
 
     def _record_ids(self, conn, identifier):
         if identifier.startswith(("graph_", "explore_")):
