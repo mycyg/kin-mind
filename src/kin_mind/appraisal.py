@@ -56,18 +56,18 @@ COMPRESSION_RETRY_SECONDS = 30
 REFERENCE_PATTERN = r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}"
 
 
-def static_text(text):
-    """A host sentence, not a payload: plain ASCII, bounded, nothing quoted."""
-    return bool(re.fullmatch(r"[ -~]{1,200}", text)) and not re.search(r"[\"'`]", text)
+def static_message(error):
+    """The exception's text only when it is a literal of the code object that raised it.
 
-
-def host_raised(error):
-    """Whether the raise site itself is host code, so its message is the host's."""
-    frame = error.__traceback__
-    while frame and frame.tb_next:
-        frame = frame.tb_next
-    origin = frame.tb_frame.f_globals.get("__name__", "") if frame else ""
-    return origin.split(".")[0] in {"kin_mind", "eventmem"}
+    An identifier the model cited, a parsed value or a formatted message is never such a literal, so
+    nothing of a proposal or its evidence can reach the queue row this way. One rule for every place a
+    failure is written down: a refused section, a failed attempt and what the next attempt is told.
+    """
+    trace = error.__traceback__
+    while trace is not None and trace.tb_next is not None:
+        trace = trace.tb_next
+    text = str(error)
+    return text if trace is not None and text in trace.tb_frame.f_code.co_consts else ""
 
 
 def error_detail(error, reported):
@@ -77,17 +77,18 @@ def error_detail(error, reported):
     if reported.startswith("deepseek-"):
         # The host's own provider codes; the caller already excluded free text.
         detail["code"] = reported
+    message = static_message(error)
     if isinstance(error, (Conflict, Missing)):
         text = str(error)
         if re.fullmatch(REFERENCE_PATTERN, text):
             # Deleted and Missing often carry an identifier instead of a sentence.
             detail["target"] = text
-        elif static_text(text):
-            detail["message"] = text
+        elif message:
+            detail["message"] = message
         elif text:
             detail["target"] = "unresolved-reference"
-    elif type(error) is ValueError and host_raised(error) and static_text(str(error)):
-        detail["message"] = str(error)
+    elif type(error) is ValueError and message:
+        detail["message"] = message
     if isinstance(error, Conflict):
         for key in ("code", "target", "expected", "actual"):
             value = getattr(error, key, None)
@@ -214,21 +215,14 @@ SECTION_UPSTREAM = {
 ISOLATED_SECTIONS = ("habits", "plan_changes", "action_decisions", "procedure_candidates", "concerns", "wishes", "wish_updates", "session_advice")
 # Refusing one of these leaves something to ask again even when nothing of this proposal rested on it.
 UPSTREAM_SECTIONS = {upstream for rests in SECTION_UPSTREAM.values() for upstream in rests}
-if set(SECTION_UPSTREAM) != set(Appraisal.model_fields) or not UPSTREAM_SECTIONS <= set(ISOLATED_SECTIONS):
+# The same, for a reason of their own. A plan review is edge-triggered: it consumes its wake-up reason
+# whether or not a decision applies, and a refused decision leaves next_review_at where it was, in the
+# past. Nothing would ask that plan again until an unrelated reason appeared, and the model would never
+# learn why the host refused it. So a refusal of either is asked again once, with the refusal in view.
+STRANDING_SECTIONS = {"plan_changes", "action_decisions"}
+ASK_AGAIN_SECTIONS = UPSTREAM_SECTIONS | STRANDING_SECTIONS
+if set(SECTION_UPSTREAM) != set(Appraisal.model_fields) or not ASK_AGAIN_SECTIONS <= set(ISOLATED_SECTIONS):
     raise RuntimeError("Register every Appraisal field and its upstream sections in SECTION_UPSTREAM")
-
-
-def static_message(error):
-    """The exception's text only when it is a literal of the code that raised it.
-
-    An identifier the model cited, a parsed value or a formatted message is never such a literal, so
-    nothing of a proposal or its evidence can reach the queue row this way.
-    """
-    trace = error.__traceback__
-    while trace is not None and trace.tb_next is not None:
-        trace = trace.tb_next
-    text = str(error)
-    return text if trace is not None and text in trace.tb_frame.f_code.co_consts else ""
 
 
 def refusal(section, error):
@@ -334,6 +328,7 @@ memory_context.recent_interaction 中提供且未标记 needs_review 的原始�
 SYSTEM += """
 held-sections 是宿主对上一轮评估的校验反馈，不是用户消息，也不是新经历。new_evidence 里 kind=held-sections 的内部记录列出 rejected_sections（被宿主拒绝的段，code 与 message 是宿主的静态拒绝原因）和 held_sections（依赖被拒段、因此搁置而尚未生效的段）；上一轮的其余内容已经提交。
 本轮只按拒绝原因修正并重新给出这些段，其余字段留空，不重复打分，也不因这条记录产生新的情绪、愿望或联系理由。habits 被拒时，先用用户明确发言的来源和 memory_context.conversation_habits.revision 重新给出 habits，再给出依赖它的探索愿望、对探索愿望的 resume、探索或联系步骤的 execute 决定、plan_changes 以及 curiosity 的 values 与 motivations；habits 没有重新给出时，这些依赖段继续搁置。依据不足就留空。
+plan_changes 或 action_decisions 本身被拒时，按拒绝原因重新给出这些计划变更与步骤决定：使用 autonomy_context 中当前的计划视图与 expected_revision，execute 逐项列出已满足的原有 preconditions；这是上一轮那个计划唯一的再问机会，不改正就没有下一次。没有把握时给 wait 并说明复核时间，不要为通过校验编造已满足的条件。
 """
 # The host's own feedback about the previous proposal of this same evaluation.
 PREVIOUS_ATTEMPT_PROMPT = """
@@ -1265,8 +1260,13 @@ class Appraisals:
                     from .procedures import Procedures
                     # A review answers for its plan's wake-up reasons, so that plan leads the window of 40
                     # however many others are due before it.
-                    target = AutonomousPlans(self.mind).review_target(row["id"]) if data.get("stimulus") == "plan-review" else None
-                    shown_plans = AutonomousPlans(self.mind).read(limit=40, manifest=True, first=target and target["plan_id"])
+                    plans_view = AutonomousPlans(self.mind)
+                    target = plans_view.review_target(row["id"]) if data.get("stimulus") == "plan-review" else None
+                    # A follow-up restates the decisions its parent's review had refused, so it leads with
+                    # the same plan. It answers for no wake-up reason of its own and registers no version.
+                    lead = target or (plans_view.review_target(data["parent_id"])
+                                      if data.get("stimulus") == FOLLOW_UP and data.get("parent_id") else None)
+                    shown_plans = plans_view.read(limit=40, manifest=True, first=lead and lead["plan_id"])
                     if target:
                         # Gone or no longer active: it cannot be shown as the plan under review. The commit
                         # then registers nothing for it and reopens the reasons this review had taken.
@@ -1712,7 +1712,7 @@ class Appraisals:
                     if proposal.session_advice and self.session_context and not historical:
                         section("session_advice", apply_advice)
                     review_id = None
-                    if (held or any(r["section"] in UPSTREAM_SECTIONS for r in rejected)) and not follow_up:
+                    if (held or any(r["section"] in ASK_AGAIN_SECTIONS for r in rejected)) and not follow_up:
                         # One follow-up restates what was refused and what rests on it, durable with this commit like
                         # the enrichment job. A follow-up never queues another: its own refusals are only recorded.
                         review_id = "review_" + digest([row["id"], FOLLOW_UP])[:32]
