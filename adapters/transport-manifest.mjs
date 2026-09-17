@@ -1,7 +1,8 @@
 /** The durable delivery record of one phone reply group: which bubbles it has,
  * how each frozen bubble is cut into transport fragments, and what is known
  * about every fragment. This module is the only writer of
- * `<directory>/<group_id>.json` (+ `.prev`, `quarantine/`, `done/`, `leases/`).
+ * `<directory>/<group_id>.json` (+ `.prev`, `quarantine/`, `done/`, `leases/`);
+ * `<directory>/tail/` beside them belongs to `reply-tail.mjs`.
  *
  * Rules that everything below follows:
  *  - the final manifest is on disk before the first byte is sent, and a retry
@@ -68,15 +69,28 @@ export function manifestView(manifest) {
   const entries=manifest.bubbles.map(b=>({request:b.request,state:b.state,delivery:{...shared,id:b.bubble_id,text:b.text,references:b.references,draftId:b.draft_id},
     fragments:b.fragments.map(f=>({transport_id:f.transport_id,kind:f.kind,state:f.state,messageId:f.receipt?.messageId}))}));
   return {state:legacyState(manifest),groupState:manifest.state,groupId:manifest.group_id,reason:manifest.reason??undefined,ownerEpoch:manifest.ownerEpoch,retryAt:manifest.retryAt,
+    createdAt:manifest.created_at,...(manifest.continued?{continuedAt:manifest.continued.at,continuedEpoch:manifest.continued.epoch}:{}),
     request:entries[0]?.request,delivery:entries[0]?.delivery,...(manifest.choice?{choice:manifest.choice}:{}),entries};
+}
+
+/** A group is kept in the live set while the fate of an unsent remainder is
+ * still open: its own intent, an obligation that came back, or an older group
+ * that is waiting for this one's outcome. `reply-tail.mjs` writes these fields. */
+export function tailOpen(manifest) {
+  return Boolean((manifest.tail_intent&&manifest.tail_intent.state!=='settled')||manifest.tail_owed?.items?.length||
+    (manifest.continues??[]).some(c=>!c.done)||(manifest.review?.covers_remainder?.length&&!manifest.review.coverage_applied));
 }
 
 /** Status without any message text: safe for health output and logs. */
 export function manifestSummary(manifest) {
+  const intent=manifest.tail_intent,owed=manifest.tail_owed;
   return {group_id:manifest.group_id,state:manifest.state,reason:manifest.reason??null,reply_id:manifest.reply_id,channel:manifest.channel,
     created_at:manifest.created_at,updated_at:manifest.updated_at,retryAt:manifest.retryAt,revision:manifest.revision,leaseGeneration:manifest.leaseGeneration,
-    ...(manifest.continues_reply_id?{continues_reply_id:manifest.continues_reply_id}:{}),...(manifest.tail_intent?{tail_intent:{id:manifest.tail_intent.id,state:manifest.tail_intent.state}}:{}),
-    bubbles:manifest.bubbles.map(b=>({bubble_id:b.bubble_id,draft_id:b.draft_id,state:b.state,reason:b.reason??null,
+    ...(manifest.continues_reply_id?{continues_reply_id:manifest.continues_reply_id}:{}),
+    ...(intent?{tail_intent:{id:intent.id,state:intent.state,...(intent.decision?{decision:intent.decision,carrier:intent.carrier??null,linked_group:intent.linked_group??null}:{})}}:{}),
+    ...(owed?.items?.length?{tail_owed:{items:owed.items.length,resurfaced:owed.resurfaced??0,forced:Boolean(owed.forced)}}:{}),
+    ...(manifest.holds?{holds:manifest.holds}:{}),...(manifest.parked?{parked:manifest.parked}:{}),
+    bubbles:manifest.bubbles.map(b=>({bubble_id:b.bubble_id,draft_id:b.draft_id,state:b.state,reason:b.reason??null,...(b.superseded_by?{superseded_by:b.superseded_by}:{}),
       fragments:b.fragments.map(f=>({transport_id:f.transport_id,index:f.index,kind:f.kind,state:f.state}))}))};
 }
 
@@ -85,7 +99,7 @@ export class TransportManifests {
     sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={}}) {
     Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep});
     this.lease={...LEASE_DEFAULTS,heartbeat:true,...lease};
-    this.retry={baseMs:60000,maxMs:15*60000,maxFailures:6,sideEffectAttempts:5,...retry};
+    this.retry={baseMs:60000,maxMs:15*60000,maxFailures:6,sideEffectAttempts:5,maxHolds:6,...retry};
     this.lastSubmitAt=null;this.notified=new Map();
   }
   file(id){return path.join(this.directory,id+'.json');}
@@ -158,8 +172,10 @@ export class TransportManifests {
 
   /** Persist the group before anything else happens to it (`draft`: the text
    * exists, nothing is reviewed or cut yet). The same entries give the same
-   * manifest back. */
-  createDraft({entries,ownerEpoch,channel='feishu',hold=null}) {
+   * manifest back. `continues` names the older groups whose unsent remainder
+   * this group answers for; it is part of the very first write, so the link
+   * exists from the moment the group does. */
+  createDraft({entries,ownerEpoch,channel='feishu',hold=null,continues=null,continuation=null}) {
     if(!Array.isArray(entries)||!entries.length||entries.some(e=>!e?.request||!e.delivery?.id))throw Error('A reply group needs bubbles with stable IDs');
     const ids=entries.map(e=>e.delivery.id),first=entries[0],now=this.clock();
     let id=groupIdFor(entries);
@@ -170,6 +186,8 @@ export class TransportManifests {
       kind:first.delivery.kind??'reply',work:Boolean(first.request.work),taskId:first.delivery.taskId,sessionFence:first.delivery.sessionFence,ownerEpoch,
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:hold?'held':'draft',reason:hold?.reason??null,leaseGeneration:0,revision:0,prevDigest:null,review:null,
       created_at:now,updated_at:now,retryAt:hold?.retryAt??0,failures:0,
+      ...(continues?.length?{continues_reply_id:continues[0].group_id,continues:continues.map(c=>({group_id:c.group_id,intent_id:c.intent_id??null}))}:{}),
+      ...(continuation?{continuation}:{}),
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
         return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,body_sha256:sha256(text),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
     return this.load(id)??(createJsonExclusive(this.file(id),manifest)?manifest:this.load(id));
@@ -195,22 +213,28 @@ export class TransportManifests {
         if(Buffer.byteLength(text,'utf8')>contract.file.maxBytes)Object.assign(bubble,{state:'undeliverable',reason:'file-exceeds-channel-limit'});
       }
     }
-    manifest.review={id:review.review_id??null,checked_hashes:manifest.bubbles.map(b=>b.body_sha256)};
-    Object.assign(manifest,{state:'reviewed',reason:null,retryAt:0});
+    // What this reply is reported to cover of an older group's remainder: IDs only.
+    // It is a claim; only this group's own receipts settle it.
+    const claims=Array.isArray(review.covers_remainder)?review.covers_remainder.filter(c=>c?.item_id&&c.covered_by).map(c=>({item_id:String(c.item_id),covered_by:String(c.covered_by)})):[];
+    manifest.review={id:review.review_id??null,checked_hashes:manifest.bubbles.map(b=>b.body_sha256),
+      ...(claims.length?{covers_remainder:claims}:{}),...(Array.isArray(review.remainder_owed)?{remainder_owed:review.remainder_owed.map(String)}:{})};
+    Object.assign(manifest,{state:'reviewed',reason:null,retryAt:0});this.unhold(manifest);
   }
+  /** A passed review, or a new reason to look again, gives the group a fresh, bounded set of tries. */
+  unhold(manifest){delete manifest.holds;delete manifest.parked;delete manifest.review_progress;}
 
   // ---- one pass over one group -----------------------------------------
 
   /** Reconcile, review if still needed, then send what the manifest says is
    * unsent. Returns `{manifest,worked}`, or `{busy:true}` when another entrant
    * owns the group: a second entrant changes nothing at all. */
-  async run(id,{guard=async()=>'send',transport=null,review=this.review,initialReview=null,operator=null}={}) {
+  async run(id,{guard=async()=>'send',transport=null,review=this.review,initialReview=null,operator=null,resume=false,operatorOnly=false}={}) {
     const seen=this.load(id);
     if(!seen)return {missing:true};
     if(!this.isLive(id))return {manifest:seen,worked:false};          // settled and filed away: nothing left to decide
     const lease=this.acquire(id,seen.leaseGeneration??0);
     if(!lease)return {busy:true,manifest:seen};
-    const context={lease,guard,review,transport:typeof transport==='function'?{send:transport}:transport,worked:false,failedEffects:new Set()};
+    const context={lease,guard,review,resume,transport:typeof transport==='function'?{send:transport}:transport,worked:false,failedEffects:new Set()};
     context.canSend=typeof context.transport?.send==='function';
     context.receipt=async fragmentId=>normalizeReceipt(await (context.transport?.receipt?.(fragmentId)??this.receipt?.(fragmentId)??null));
     let manifest=seen;
@@ -219,8 +243,9 @@ export class TransportManifests {
       if(!manifest)return {missing:true};
       if(!this.isLive(id)){removeLease({directory:path.join(this.directory,'leases'),id});return {manifest,worked:false};}
       if(operator)await operator(manifest,context);
-      await this.pass(manifest,context,initialReview);
-      await this.settle(manifest,context);
+      // `operatorOnly`: a change that must be quick and local (it may run on the
+      // owner's input path) touches neither receipts nor the memory host.
+      if(!operatorOnly){await this.pass(manifest,context,initialReview);await this.settle(manifest,context);}
       return {manifest,worked:context.worked};
     } catch(error) {
       if(error instanceof LeaseLost)return {lost:true,manifest:this.load(id)??manifest};
@@ -240,16 +265,17 @@ export class TransportManifests {
     for(const bubble of manifest.bubbles.filter(b=>open(b)&&started(b)))if(await this.sendBubble(manifest,bubble,context)!=='sent')return;
     if(!manifest.bubbles.some(open))return this.finish(manifest,context);
     if(!await this.permitted(manifest,context))return;
+    // A parked group is only ever stopped by the timer, never reviewed by it; anyone who asks for it by name is a new reason.
+    if(manifest.parked){if(context.resume)return;this.unhold(manifest);}
     const requests=manifest.bubbles.map(b=>b.request),pending=manifest.bubbles.flatMap((b,i)=>open(b)&&!started(b)?[i]:[]);
-    const verdict=context.review?await context.review(requests,{frozen:Boolean(manifest.review),pending,groupId:manifest.group_id}):{state:'ready',checked:requests.map(()=>({}))};
+    const verdict=context.review?await context.review(requests,{frozen:Boolean(manifest.review),pending,groupId:manifest.group_id,sent:this.sentEvidence(manifest)}):{state:'ready',checked:requests.map(()=>({}))};
     context.worked=true;
     if(['silent','merged'].includes(verdict.state)){manifest.choice=verdict.choice;return this.retire(manifest,context,{reason:verdict.state});}
-    if(verdict.state!=='ready') {
-      // Held, not lost: the next pass asks again.
-      Object.assign(manifest,{state:'held',reason:verdict.reason??'share-review-pending',retryAt:verdict.retryAt??this.clock()+this.retry.baseMs});
-      return this.save(manifest,context.lease);
-    }
+    if(verdict.state!=='ready')return this.refused(manifest,context,verdict);
     if(!manifest.review){this.finalize(manifest,verdict);await this.save(manifest,context.lease);}
+    else if(manifest.holds||manifest.parked)this.unhold(manifest);
+    // A review reads every request of the group. Whatever it reserved for a bubble that was withdrawn before is released once more.
+    for(const bubble of manifest.bubbles)if(bubble.state==='canceled'&&bubble.share_canceled)bubble.share_canceled=false;
     for(const bubble of manifest.bubbles.filter(open)) {
       if(!await this.permitted(manifest,context))return;
       if(await this.sendBubble(manifest,bubble,context)!=='sent')return;
@@ -258,12 +284,43 @@ export class TransportManifests {
   }
   async touch(manifest,context){context.worked=true;await this.save(manifest,context.lease);}
 
+  /** What this group already handed to a transport, in the shape the review reads an outbox row. */
+  sentEvidence(manifest) {
+    return manifest.bubbles.filter(b=>b.state==='accepted'||(open(b)&&started(b))).map(b=>{
+      const last=b.fragments.filter(f=>f.state==='accepted').at(-1)?.receipt;
+      return {id:b.bubble_id,draft_id:b.draft_id,text:b.text,state:b.state==='accepted'?'accepted':'unconfirmed',references:b.references??[],message_id:last?.messageId,at:last?.acceptedAt??b.state_at};
+    });
+  }
+
+  /** A review that is not ready. Held, not lost, and not a model call a minute
+   * for ever either: every refusal doubles the wait, and after `maxHolds` of
+   * them the group is parked until there is a new reason to ask (a new owner
+   * input, an explicit delivery, an operator). A review that could not be
+   * reached at all (`transient`) judged nothing: it keeps the growing wait but
+   * never parks the group. Two answers are no hold at all. */
+  async refused(manifest,context,verdict) {
+    const reason=verdict.reason??'share-review-pending',now=this.clock();
+    if(verdict.route==='interrupt') {       // the remainder cannot go out as written: a tail decision, not a wait
+      Object.assign(manifest,{state:'interrupted',reason,retryAt:0,interrupted:{at:now,by:null}});return this.save(manifest,context.lease);
+    }
+    if(verdict.route==='undeliverable') {   // asking again can never help: end it where status shows it
+      for(const bubble of manifest.bubbles.filter(b=>open(b)&&!started(b)))Object.assign(bubble,{state:'undeliverable',reason,state_at:iso(now)});
+      return this.finish(manifest,context);
+    }
+    const progressed=Number(verdict.chunks?.reviewed)>(manifest.review_progress??0);      // chunks already paid for are progress, not a refusal
+    const holds=(manifest.holds??0)+(progressed?0:1),parked=!verdict.transient&&holds>=this.retry.maxHolds;
+    Object.assign(manifest,{state:'held',reason,holds,retryAt:parked?0:Math.max(verdict.retryAt??0,now+Math.min(this.retry.maxMs,this.retry.baseMs*2**Math.max(0,holds-1)))});
+    if(progressed)manifest.review_progress=Number(verdict.chunks.reviewed);
+    if(parked)manifest.parked={at:now,reason:'review-hold-limit',holds};
+    return this.save(manifest,context.lease);
+  }
+
   /** The guard speaks at bubble boundaries only: send | wait | cancel | interrupt. */
   async permitted(manifest,context) {
     const answer=await context.guard(manifestView(manifest)),action=typeof answer==='string'?answer:answer?.action;
     if(action==='send')return true;
     if(action==='cancel')await this.retire(manifest,context,{reason:answer?.reason??'input-or-session-superseded'});
-    else if(action==='interrupt'){Object.assign(manifest,{state:'interrupted',reason:answer?.reason??'new-input',retryAt:0});await this.touch(manifest,context);}
+    else if(action==='interrupt'){Object.assign(manifest,{state:'interrupted',reason:answer?.reason??'new-input',retryAt:0,interrupted:{at:this.clock(),by:answer?.inputId??null}});await this.touch(manifest,context);}
     return false;
   }
 
@@ -373,9 +430,11 @@ export class TransportManifests {
     return 'sent';
   }
 
-  /** Retire every bubble that has not begun. What was sent stays sent. */
-  async retire(manifest,context,{reason,superseded_by}={}) {
-    for(const bubble of manifest.bubbles.filter(b=>open(b)&&!started(b)))
+  /** Retire every bubble that has not begun (or, with `only`, those of them
+   * named by draft ID). What was sent stays sent. */
+  async retire(manifest,context,{reason,superseded_by,only}={}) {
+    const named=only?new Set(only):null;
+    for(const bubble of manifest.bubbles.filter(b=>open(b)&&!started(b)&&(!named||named.has(b.draft_id??b.bubble_id))))
       Object.assign(bubble,{state:'canceled',reason,state_at:iso(this.clock()),...(superseded_by?{superseded_by}:{})});
     manifest.retired={reason,at:this.clock(),...(superseded_by?{superseded_by}:{})};
     context.worked=true;
@@ -428,7 +487,8 @@ export class TransportManifests {
   }
   /** Nothing more will happen to a settled terminal group: move it out of the live set. */
   async settle(manifest,context) {
-    if(!terminal(manifest)||(manifest.tail_intent&&manifest.tail_intent.state!=='settled')||this.owes(manifest))return;
+    // The operator's tool has no memory host: what it settles is reported, released and filed by the service's next pass.
+    if(this.role==='cli'||!terminal(manifest)||tailOpen(manifest)||this.owes(manifest))return;
     context.lease.assertHeld();
     const filed=this.doneFile(manifest.group_id);
     fs.mkdirSync(path.dirname(filed),{recursive:true,mode:0o700});
@@ -441,15 +501,24 @@ export class TransportManifests {
 
   /** Retire the unsent remainder now (owner stop, superseded, tail decision). */
   async retireRemainder(id,options){return this.run(id,{operator:(manifest,context)=>terminal(manifest)?null:this.retire(manifest,context,options)});}
-  /** An interrupted group goes on as written. */
-  async continueGroup(id) {
+  /** An interrupted group goes on as written: the same bubbles under the same
+   * transport IDs. `ownerEpoch` is the epoch the decision was made in, so the
+   * input that interrupted the group does not interrupt it a second time. */
+  resumeAsWritten(manifest,{ownerEpoch,by=null}={}) {
+    if(manifest.state==='interrupted')Object.assign(manifest,{state:manifest.review?'sending':'held',reason:null,retryAt:0});
+    const known=ownerEpoch!==undefined&&ownerEpoch!==null;
+    Object.assign(manifest,{continued:{at:this.clock(),by,...(known?{epoch:ownerEpoch}:{})},...(known?{ownerEpoch}:{})});this.unhold(manifest);
+  }
+  async continueGroup(id,options={}) {
     return this.run(id,{operator:async(manifest,context)=>{
       if(manifest.state!=='interrupted')return;
-      Object.assign(manifest,{state:manifest.review?'sending':'held',reason:null,retryAt:0});await this.touch(manifest,context);
+      this.resumeAsWritten(manifest,options);await this.touch(manifest,context);
     }});
   }
   /** Change manifest fields this module does not interpret (tail intents, links) under the lease. */
-  async mutate(id,change){return this.run(id,{operator:async(manifest,context)=>{if(await change(manifest)!==false)await this.touch(manifest,context);}});}
+  async mutate(id,change,{operatorOnly=false}={}){return this.run(id,{operatorOnly,operator:async(manifest,context)=>{if(await change(manifest,context)!==false)await this.touch(manifest,context);}});}
+  /** A new reason to ask again: a held or parked group gets a fresh, bounded set of review tries. */
+  async unpark(id){return this.mutate(id,manifest=>{if(!manifest.parked&&!manifest.holds)return false;this.unhold(manifest);manifest.retryAt=0;},{operatorOnly:true});}
   /** Re-read receipts only; never sends. The exit from `blocked-unknown` once the transport's receipt can tell. */
   async reconcileGroup(id,{receipt}={}){return this.run(id,{transport:receipt?{receipt}:null});}
   /** An operator states what really happened to one unknown fragment. */
@@ -472,14 +541,21 @@ export class TransportManifests {
     for(const manifest of due) {
       if(manifest.state==='interrupted'||manifest.retryAt>this.clock())continue;
       if(manifest.state==='blocked-unknown'&&await this.stillBlocked(manifest,transport))continue;
+      // A parked group costs nothing per tick: only a guard that wants it stopped gets it a pass.
+      if(manifest.parked&&!await this.guardStops(manifest,guard))continue;
       if(handled>=limit)break;
       try {
-        const result=await this.run(manifest.group_id,{guard,transport,review});
+        const result=await this.run(manifest.group_id,{guard,transport,review,resume:true});
         if(result.worked)handled++;
         groups.push({group_id:manifest.group_id,state:result.busy?'busy':result.lost?'lease-lost':result.manifest?.state??'missing'});
       } catch(error){groups.push({group_id:manifest.group_id,state:'failed',reason:error.name??'Error'});}
     }
     return {state:handled?'checked':'idle',checked:handled,groups};
+  }
+
+  async guardStops(manifest,guard) {
+    if(!guard)return false;
+    try{const answer=await guard(manifestView(manifest));return ['cancel','interrupt'].includes(typeof answer==='string'?answer:answer?.action);}catch{return false;}
   }
 
   /** True while no receipt of a blocked group says anything new and no resend is allowed. */
@@ -565,11 +641,16 @@ export class TransportManifests {
 export async function operatorMain(argv,{clock=()=>Date.now(),print=console.log}={}) {
   const [command,...rest]=argv,option=name=>{const index=rest.indexOf('--'+name);return index<0?undefined:rest[index+1];};
   const directory=option('dir');
-  if(!directory||!['status','reconcile','resolve'].includes(command))throw Error('Usage: status|reconcile|resolve --dir <reply-manifests> [--receipts <dir,dir>] [--group <id>] [--fragment <transport id> --outcome accepted|rejected --message-id <id>]');
+  if(!directory||!['status','reconcile','resolve','retry','continue','retire'].includes(command))throw Error('Usage: status|reconcile|resolve|retry|continue|retire --dir <reply-manifests> [--receipts <dir,dir>] [--group <id>] [--fragment <transport id> --outcome accepted|rejected --message-id <id>] [--reason <token>]');
   const receipts=option('receipts')?fileReceipts(option('receipts').split(',')):undefined;
   const manifests=new TransportManifests({directory,clock,role:'cli',receipt:receipts,lease:{heartbeat:false}});
   const show=result=>result.busy?{state:'busy'}:result.lost?{state:'lease-lost'}:result.missing?{state:'missing'}:manifestSummary(result.manifest);
   if(command==='status')return print(JSON.stringify(manifests.status(),null,2));
+  // The operator is a new reason: a group parked after its review tries ran out is asked about again by the service.
+  if(command==='retry')return print(JSON.stringify(show(await manifests.unpark(option('group'))),null,2));
+  // The operator's own exits for a group that waits for a tail decision nobody will make (the switch was turned off, the model stays away).
+  if(command==='continue')return print(JSON.stringify(show(await manifests.continueGroup(option('group'))),null,2));
+  if(command==='retire')return print(JSON.stringify(show(await manifests.retireRemainder(option('group'),{reason:/^[a-z0-9-]{1,64}$/.test(option('reason')??'')?option('reason'):'operator-retired'})),null,2));
   if(command==='resolve')return print(JSON.stringify(show(await manifests.resolve(option('group'),option('fragment'),{outcome:option('outcome'),messageId:option('message-id')})),null,2));
   const ids=option('group')?[option('group')]:manifests.live();
   const results={};

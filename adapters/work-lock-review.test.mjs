@@ -131,8 +131,11 @@ test('a completed step whose delivery is unconfirmed keeps the work lock, and no
   // and an owner-work verdict are three separate records, never one reused judgment.
   assert.equal(held.lane,REVIEWER_LANES.reviewWork);
   assert.equal(held.purpose,REVIEWER_PURPOSES.reviewWork);
-  assert.equal(new Set(Object.values(REVIEWER_PURPOSES)).size,3);
-  assert.equal(new Set(Object.values(REVIEWER_LANES)).size,3);
+  // Every entry point is accounted under a purpose of its own. The reply-tail decision is the routing
+  // call's own question asked alone, so it shares that call's lane and nothing else.
+  assert.equal(new Set(Object.values(REVIEWER_PURPOSES)).size,Object.keys(REVIEWER_PURPOSES).length);
+  assert.equal(new Set(['classify','reviewWork','audit'].map(entry=>REVIEWER_LANES[entry])).size,3);
+  assert.equal(REVIEWER_LANES.tail,REVIEWER_LANES.classify);
   // Confirmed delivery is judged by a new review, not by replaying the earlier one.
   f.evidence.receipts['reply-1']={state:'accepted',messageId:'receipt-1'};f.advance(20*60000);
   assert.equal((await f.review.tick()).state,'applied');

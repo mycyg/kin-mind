@@ -213,8 +213,24 @@ test('deferred groups are held manifests; bubble-by-bubble review only ever look
  now+=60000;reviewed.length=0;await guard.resumeDue(options);
  assert.deepEqual(reviewed,['reply-defer-d2'],'sent bubbles are never put through review again');
  assert.deepEqual(transport.platform.delivered.map(d=>d.body),['intro','body','tail']);
- now=20*60000;await guard.resumeDue({...options,guard:async entry=>entry.groupId==='reply-solo'?'cancel':'send'});
- assert.deepEqual(canceled,['solo-d']);assert.equal(transport.platform.delivered.length,3);
+ // A bare 'cancel' is how the host says "a newer message arrived". With tail decisions on (the default) that interrupts
+ // the group and releases nothing; a host that means a real cancel says so and gives its reason.
+ guard.defer({draft_id:'gone-d',reply_id:'current',text:'gone'},{id:'gone-m',text:'gone',kind:'reply',memoryBatchId:'reply-gone',expectedBubbles:1},'owner');
+ now=40*60000;await guard.resumeDue({...options,guard:async entry=>entry.groupId==='reply-solo'?'cancel':entry.groupId==='reply-gone'?{action:'cancel',reason:'session-superseded'}:'send'});
+ assert.deepEqual(canceled,['gone-d']);assert.equal(transport.platform.delivered.length,3);
+ assert.deepEqual(['reply-solo','reply-gone'].map(id=>{const m=guard.manifests.read(id);return [m.state,m.reason];}),[['interrupted','input-or-session-superseded'],['retired','session-superseded']]);
+});
+
+test('with reply_tail_decision switched off a bare cancel from the host guard retires the group, as it did before tails existed',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-manifest-cancel-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ let now=0;const canceled=[];
+ const guard=new ReplyGuard({directory,clock:()=>now,replyTailDecision:false,...quiet,call:async(action,r)=>{if(action==='share-cancel')canceled.push(r.draft_id);return action==='reply-status'?{action:'reply'}:{state:'ready',text:r.text};}});
+ assert.equal(guard.tail,null);
+ guard.defer({draft_id:'solo-d',reply_id:'current',text:'solo'},{id:'solo-m',text:'solo',kind:'reply',memoryBatchId:'reply-solo',expectedBubbles:1},'owner');
+ now=20*60000;
+ const result=await guard.resumeDue({guard:async()=>'cancel',send:()=>{throw Error('must not send');}});
+ assert.deepEqual(canceled,['solo-d']);assert.equal(result.tail,undefined);
+ assert.deepEqual([guard.manifests.read('reply-solo').state,guard.manifests.read('reply-solo').reason],['retired','input-or-session-superseded']);
 });
 
 test('resumeDue imports unfinished groups of the old journal once; finished ones and the switched-off guard are left alone',async t=>{
@@ -233,4 +249,22 @@ test('resumeDue imports unfinished groups of the old journal once; finished ones
  assert.deepEqual(transport.sends.map(d=>d.id),['reply-old-pending-m0','reply-old-pending-m1'],'imported bubbles go out under their old bubble IDs; the finished reply is never replayed');
  assert.equal((await new ReplyGuard(args).resumeDue({guard:async()=>'send',send:transport})).imported,0);
  assert.deepEqual(await new ReplyGuard({...args,transportManifest:false}).resumeDue({guard:async()=>'send',send:()=>{throw Error('must not send');}}),{state:'idle',checked:0},'the old resume filter ignores migrated files');
+});
+
+test('a review that cannot be reached judged nothing: the wait grows, the group is never parked, and it goes out once the review answers',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-manifest-outage-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ let now=0,down=true,reviews=0;
+ const guard=new ReplyGuard({directory,clock:()=>now,wholeReplyReview:true,retry:{maxHolds:2},...quiet,call:async(action,r)=>{
+  if(action==='reply-status')return {action:'reply'};
+  reviews++;if(down)throw Error('Mind worker failed');
+  return {state:'ready',review_id:'review',checked:r.entries.map(e=>({text:e.text,references:[]}))};
+ }});
+ const transport=createFakeTransport({directory:path.join(directory,'outbox'),clock:()=>now}),options={guard:async()=>'send',send:transport};
+ assert.equal((await guard.replyGroup(replyEntries('reply-outage',['one','two']),'owner',options)).groupState,'held');
+ for(let tick=0;tick<240;tick++){now+=60000;await guard.resumeDue(options);}
+ const held=guard.manifests.read('reply-outage');
+ assert.deepEqual([held.state,held.reason,held.parked,held.retryAt-held.updated_at],['held','whole-reply-review-unavailable',undefined,15*60000]);
+ assert.ok(reviews>2&&reviews<24,'asked again with a growing wait, a few times an hour at most: '+reviews);
+ down=false;now+=15*60000;await guard.resumeDue(options);
+ assert.equal(guard.manifests.read('reply-outage').state,'accepted');assert.deepEqual(transport.platform.delivered.map(d=>d.body),['one','two']);
 });
