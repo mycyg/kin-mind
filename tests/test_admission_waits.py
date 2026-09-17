@@ -83,3 +83,14 @@ def test_capacity_is_configurable_database_wide_and_foreground_still_has_priorit
         with model_slot(provider,'foreground-first'):pass
     with model_slot(SimpleNamespace(engine=mind.engine,background=False),'foreground'):pass
     with pytest.raises(ValueError):configure_capacity(mind.engine,99)
+
+
+def test_legacy_recovery_command_keeps_its_original_fingerprint(system):
+    from eventmem.core.db import digest
+    mind,memory,source,_=system
+    jobs=Appraisals(mind)
+    job=jobs.enqueue([source('history')], 'fixture-v1', stimulus='memory-enrichment')
+    assert jobs.run_one(Provider())['state']=='complete'
+    result=recover_history(mind,job_ids=[job['id']],command_id='legacy',source='original approval',workers_stopped=True)
+    assert result['fingerprint']==digest([[job['id']],'original approval',{}])
+    assert recover_history(mind,job_ids=[job['id']],command_id='legacy',source='original approval',workers_stopped=True)==result

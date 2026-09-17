@@ -54,7 +54,7 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
     if set(replacements) - set(job_ids):
         raise ValueError("Replacement outside the approved batch")
     name = "history-recovery:" + command_id
-    fingerprint = digest([job_ids, source, replacements, admission_only])
+    fingerprint = digest([job_ids, source, replacements, *([True] if admission_only else [])])
     with mind.engine.db.connect(write=True) as conn:
         previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
         if previous:
