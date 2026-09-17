@@ -642,7 +642,7 @@ class Contexts:
                 "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall"):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=()):
         started = time.monotonic()
         if mode not in {"auto", "light", "deep"}:
             raise ValueError("Unknown recall mode")
@@ -690,7 +690,7 @@ class Contexts:
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
             recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
-                allow_model=allow_model, deadline=started + 150, policy=policy)
+                allow_model=allow_model, deadline=started + 150, policy=policy, owner_words=owner_words)
             items.extend(recalled)
         elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
             graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),

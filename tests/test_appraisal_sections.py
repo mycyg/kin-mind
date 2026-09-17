@@ -52,9 +52,12 @@ pytest_plugins = ("test_memory_continuity",)
 # The request as it was before any of this existed, for one fixed context. A section that is not
 # offered leaves no trace: no property, no definition and no paragraph. Re-pin only together with a
 # deliberate change to the shared prompt, the shared schema or the context projection.
+# Re-pinned with the widened motivation half-life range, the stated procedure-candidate premise
+# and the owner named by role rather than by name: all three change the shared prompt or schema,
+# and none of them carries a switch.
 UNCHANGED_REQUEST = {
-    "interaction": "349ab11490e2c2eae3e3d1d8b2efa86867fafd0db499bb92840d3d54db356e44",
-    "action": "ae08dcffa488a80c6b4a21bc8031888dc9e738173279678c118b6254da2c79a4",
+    "interaction": "640b73348965838db21c5e1952503a09c2640af1a170ad72e4a4ffdc7bda8ccb",
+    "action": "6a84d6a7d181e164e5b5a6d248064d8903cc81dc8da9471ea910a0459a8c8d93",
     "history": "b374eb359aee4f49e3a38990e5454c3e6667c76dab6b5f793dbbe677d80783a3",
 }
 

@@ -104,13 +104,42 @@ _persona_cache: dict = {}
 _cache_lock = threading.Lock()
 
 
-def host_envelope(text):
+def host_envelope(text, prefixes=HOST_PREFIXES):
     """Legacy transport imports sometimes labelled host blocks as user turns.
 
     Recognize only known whole-message envelopes, never delete source records
     or reinterpret quoted phrases inside an actual conversation.
     """
-    return text.lstrip().startswith(HOST_PREFIXES)
+    return text.lstrip().startswith(prefixes)
+
+
+def envelope_prefixes(engine, conn=None):
+    """The envelope prefixes in force: the built-in ones, plus whatever a host added. The
+    built-ins are part of the read policy, so configuration only ever adds to them."""
+    if conn is None:
+        with engine.db.connect() as connection:
+            return envelope_prefixes(engine, connection)
+    row = conn.execute("SELECT data FROM settings WHERE key=?", (SETTINGS_KEY,)).fetchone()
+    private = ()
+    if row:
+        try:
+            private = json.loads(row[0]).get("envelope_prefixes") or ()
+        except (ValueError, AttributeError):
+            private = ()
+    extra = [p for p in private if isinstance(p, str) and p.strip()]
+    return tuple(dict.fromkeys([*HOST_PREFIXES, *extra]))
+
+
+def configure_envelopes(engine, prefixes):
+    """Host-only: the private envelope prefixes, replacing the previous private set. They are a
+    settings value, so a rolled back host ignores them, and the built-in list still stands."""
+    if not isinstance(prefixes, (list, tuple)) or len(prefixes) > 32 or any(
+            not isinstance(prefix, str) or not prefix.strip() or len(prefix) > 200 for prefix in prefixes):
+        raise ValueError("Envelope prefixes are up to 32 short whole-message openings")
+    stored = engine.settings(SETTINGS_KEY)
+    engine.settings(SETTINGS_KEY, {**(stored if isinstance(stored, dict) else {}),
+                                   "envelope_prefixes": list(prefixes), "rules_version": RULES_VERSION})
+    return envelope_prefixes(engine)
 
 
 class Found(NamedTuple):
@@ -158,7 +187,9 @@ def configure_registry(engine, namespaces):
             not isinstance(name, str) or not name.strip("*") or kind not in NON_EXPERIENCE
             for name, kind in namespaces.items()):
         raise ValueError("Namespace rules map a namespace to a non-experience class")
-    engine.settings(SETTINGS_KEY, {"namespaces": dict(namespaces), "rules_version": RULES_VERSION})
+    stored = engine.settings(SETTINGS_KEY)
+    engine.settings(SETTINGS_KEY, {**(stored if isinstance(stored, dict) else {}),
+                                   "namespaces": dict(namespaces), "rules_version": RULES_VERSION})
     return registry(engine)
 
 
@@ -172,7 +203,8 @@ def flagged(attributes):
     return None
 
 
-def source_rule(namespace, metadata, authority, *, source_id=None, approved=(), rules=NAMESPACE_REGISTRY, text=None):
+def source_rule(namespace, metadata, authority, *, source_id=None, approved=(), rules=NAMESPACE_REGISTRY, text=None,
+                prefixes=HOST_PREFIXES):
     """Classify one source from what is stored about it. None means plain experience.
 
     A declaration can only take a source out of experience, never vouch for it: metadata is
@@ -181,7 +213,7 @@ def source_rule(namespace, metadata, authority, *, source_id=None, approved=(), 
     only a host envelope — by text, by declaration or by namespace — is read before authorship.
     """
     metadata = metadata if isinstance(metadata, dict) else {}
-    if text and host_envelope(text):
+    if text and host_envelope(text, prefixes):
         return Found("host_envelope", None, RULE_ENVELOPE)
     declared = metadata.get(STAMP)
     declared = declared if isinstance(declared, str) and declared in NON_EXPERIENCE else None
@@ -247,10 +279,10 @@ def _shared(scope):
     return Scope(project="*", persona="*", collection="preferences", world=scope.world)
 
 
-def _source_found(row, approved, rules, text=None):
+def _source_found(row, approved, rules, text=None, prefixes=HOST_PREFIXES):
     data = json.loads(row["data"])
     return source_rule(row["namespace"], data.get("metadata"), data.get("authority"),
-                       source_id=row["id"], approved=approved, rules=rules, text=text)
+                       source_id=row["id"], approved=approved, rules=rules, text=text, prefixes=prefixes)
 
 
 class _Snapshot(NamedTuple):
@@ -258,6 +290,7 @@ class _Snapshot(NamedTuple):
     derived: dict  # source id -> Found, for registered or approved sources that have no row yet
     rules: tuple
     approved: frozenset
+    prefixes: tuple = HOST_PREFIXES  # the built-in envelope openings plus the host's own
 
 
 def _load_snapshot(engine, conn, scope, rules=None):
@@ -291,7 +324,7 @@ def _load_snapshot(engine, conn, scope, rules=None):
             found = _source_found(row, approved, rules)
             if found:
                 sources[row["id"]] = found
-    return _Snapshot(stored, sources, rules, approved)
+    return _Snapshot(stored, sources, rules, approved, envelope_prefixes(engine, conn))
 
 
 def _snapshot(engine, conn, scope):
@@ -371,6 +404,15 @@ class ReadPolicy:
         """A migration that started and has not finished: derived caches are not to be trusted."""
         return self.enabled and self.migration_state is not None and self.migration_state not in SETTLED
 
+    @property
+    def prefixes(self):
+        """The envelope openings this read filters by: the built-in ones plus the host's own."""
+        return self._snapshot.prefixes
+
+    def envelope(self, text):
+        """One reader for every lane that still filters by prefix rather than by class."""
+        return host_envelope(text or "", self._snapshot.prefixes)
+
     def admits(self, kind):
         return not self.enabled or kind in self._admitted or self.purpose == "audit"
 
@@ -416,7 +458,7 @@ class ReadPolicy:
             return reviewed
         # A host prompt is stored as an owner turn, so its text is read before the flags and
         # before who is recorded as having written it.
-        if host_envelope(record.get("content") or ""):
+        if self.envelope(record.get("content")):
             return Found("host_envelope", None, RULE_ENVELOPE)
         stamp = attributes.get(STAMP)
         stamp = stamp if isinstance(stamp, str) else None
@@ -538,7 +580,8 @@ def stamp_source(engine, conn, sid, source, text):
     for the root record's `origin_kind`, or None. A receipt never fails over its label."""
     try:
         found = source_rule(source.namespace, source.metadata, source.authority, source_id=sid,
-                            approved=approved_sources(engine, source.scope, conn), rules=registry(engine, conn), text=text)
+                            approved=approved_sources(engine, source.scope, conn), rules=registry(engine, conn), text=text,
+                            prefixes=envelope_prefixes(engine, conn))
         if not found:
             return None
         conn.execute("INSERT OR REPLACE INTO source_evidence_class VALUES(?,?,?,?,?)",
@@ -555,7 +598,7 @@ def proposed_policy(engine, conn, scope, rows, purpose="experience_recall", *, r
     stored = dict(live.rows)
     for row in rows:
         stored[row["source_id"]] = Found(row["class"], REQUEST_LABEL if row["rule"] == RULE_REQUEST else None, row["rule"])
-    return ReadPolicy(purpose, True, _Snapshot(stored, live.derived, live.rules, live.approved), state)
+    return ReadPolicy(purpose, True, _Snapshot(stored, live.derived, live.rules, live.approved, live.prefixes), state)
 
 
 def classify_scope(engine, conn, scope, *, rules=None):

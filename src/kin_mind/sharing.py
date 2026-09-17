@@ -261,16 +261,15 @@ class ShareLedger:
         with self.engine.db.connect() as conn:
             references = request.get("references") or self.references(conn, text, request.get("reply_id"))
             candidates = [n for n in self.graph.candidates(conn, text) if n["kind"] == "finding"]
-            # Exact quotations are an evidence-preserving fast path, including
-            # older callers that have not yet attached structured references.
-            if not references and provider is None:
-                value = normalized(text)
-                references = [{"unit_id": n["id"], "version": n.get("content_version", 1), "mode": "new"} for n in candidates if len(normalized(n.get("text", ""))) >= 16 and normalized(n["text"]) in value]
+            # An exact quotation nominates a unit; it does not settle what this bubble is doing
+            # with it. Naming the mode belongs to the review that reads the whole reply.
+            quoted = not references and provider is None and any(
+                len(normalized(n.get("text", ""))) >= 16 and normalized(n["text"]) in normalized(text) for n in candidates)
             context = [{"id": n["id"], "version": n.get("content_version", 1), "text": n.get("text", ""), "coverage": self.coverage(conn, n["id"])} for n in candidates[:12]]
         semantic = None
         # Semantic review is selected by the calling model/host and available
         # evidence, not a phrase list or a hand-tuned word-overlap threshold.
-        review_needed = bool(provider is not None or request.get("review_required"))
+        review_needed = bool(provider is not None or request.get("review_required") or quoted)
         if not references and review_needed:
             if provider is None:
                 return {"state": "pending", "reason": "share-semantic-review-required", "candidates": context}

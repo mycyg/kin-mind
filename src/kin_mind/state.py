@@ -66,7 +66,9 @@ class Evolution(Model):
 
 class Motivation(Model):
     target: StrictInt = Field(ge=0, le=100)
-    half_life_minutes: Literal[20, 60, 180]
+    # A short-term drive, in minutes: ten for a passing impulse, twelve hours for a slow one.
+    # Anything outside the range is refused by the schema, like every other bound here.
+    half_life_minutes: StrictInt = Field(ge=10, le=720)
     reason: str = Field(min_length=1, max_length=1200)
 
 
@@ -1076,11 +1078,11 @@ class Mind(Continuity):
 
             if self._action_review_pending(conn):
                 return {"eligible": False, "reason": "action-appraisal-pending"}
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
-            if not semantic and view["dimensions"]["initiative"]["needs_review"]:
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
+            if legacy and view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
-            if not semantic and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
+            if legacy and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
                 return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
@@ -1113,8 +1115,8 @@ class Mind(Continuity):
                 raise Conflict("Action appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
             ]
@@ -1122,7 +1124,7 @@ class Mind(Continuity):
                 not ready
                 or (view.get("action_policy") or {}).get("needs_review")
                 or view["contact"].get("preference", {}).get("needs_review")
-                or (not semantic and (view["dimensions"]["initiative"]["needs_review"]
+                or (legacy and (view["dimensions"]["initiative"]["needs_review"]
                 or view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]))
             ):
                 raise Conflict("The contact threshold or desire is no longer current")
@@ -1168,8 +1170,8 @@ class Mind(Continuity):
             desire = state["desires"].get(attempt["desire_id"])
             view = self._view(conn, state, self.clock())
             value = view["dimensions"]["initiative"]
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
             valid = (
                 attempt["state"] == "drafting"
                 and not (view.get("action_policy") or {}).get("needs_review")
@@ -1178,7 +1180,7 @@ class Mind(Continuity):
                 and desire
                 and desire["revision"] == attempt["desire_revision"]
                 and self._desire_ready(conn, desire, self.clock())
-                and (semantic or (not value["needs_review"]
+                and (not legacy or (not value["needs_review"]
                 and value["projected_value"] >= state["profile"]["contact"]["threshold"]))
             )
             return {
@@ -1259,9 +1261,13 @@ class Mind(Continuity):
                 if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
                     self._retarget(conn, current, self.clock())
                     eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
+                    stranded = False
                     if reason == "draft-failed":
                         failures = desire.get("contact_failures", 0) + 1
                         desire["contact_failures"] = failures
+                        # Past the third failure the wait needs evidence that may never come. Keep
+                        # the backoff, and let the model decide this wish's fate instead.
+                        stranded = failures >= 3
                         decision = ContactDecision(action="wait", reason="Draft generation or parsing failed",
                             condition="time" if failures < 3 else "new_evidence",
                             retry_after_seconds=300 * failures)
@@ -1280,6 +1286,14 @@ class Mind(Continuity):
                     current["updated_at"] = self.clock()
                     self._save(conn, current)
                     self._history(conn, eid, current, "contact-deferred", attempt)
+                    if stranded:
+                        from .actions import ActionEvents
+                        ActionEvents(self).emit(conn, "wish-review", [desire["id"], "draft-failed", failures], {
+                            "desire_id": desire["id"],
+                            "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                            "agent_version": current["agent_version"],
+                            "reason": "Drafting this wish failed three times",
+                        })
             if state == "accepted":
                 current = self._load(conn)
                 desire = current["desires"][attempt["desire_id"]]

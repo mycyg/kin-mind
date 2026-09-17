@@ -95,8 +95,14 @@ def test_accepted_bubble_immediately_blocks_rewording_across_channels(system):
     check = memory.sharing.preflight({"draft_id": "different-channel", "text": "Rephrased old finding", "references": [{"unit_id": units[0]["id"], "version": 1}]})
     assert check["state"] == "duplicate"
     assert check["coverage"][0]["deliveries"][0]["share_id"] == sent["share_id"]
-    assert memory.sharing.preflight({"draft_id": "new-finding", "text": units[1]["text"]})["state"] == "ready"
-    assert MemoryContinuity(mind).sharing.preflight({"draft_id": "after-restart", "text": units[0]["text"]})["state"] == "duplicate"
+    # A quotation nominates its finding and nothing more: neither an unshared nor an already
+    # shared one is settled without the review, and neither is released.
+    fresh = memory.sharing.preflight({"draft_id": "new-finding", "text": units[1]["text"]})
+    assert fresh["state"] == "pending" and fresh["reason"] == "share-semantic-review-required"
+    assert units[1]["id"] in [c["id"] for c in fresh["candidates"]]
+    again = MemoryContinuity(mind).sharing.preflight({"draft_id": "after-restart", "text": units[0]["text"]})
+    assert again["state"] == "pending" and again["reason"] == "share-semantic-review-required"
+    assert [c["coverage"]["state"] for c in again["candidates"] if c["id"] == units[0]["id"]] == ["shared"]
 
 
 def test_uncertain_send_reserves_original_identity(system):

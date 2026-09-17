@@ -26,6 +26,12 @@ def review(actions, jobs, proposal):
     return provider
 
 
+def legacy_gates(mind):
+    """The fixed 75-point gates. They are off unless an owner explicitly asks for them back."""
+    from kin_mind.memory import MemoryContinuity
+    MemoryContinuity(mind).configure({"legacy_drive_thresholds": True})
+
+
 def activate(mind, source):
     actions, jobs = ActionEvents(mind), Appraisals(mind)
     actions.configure(
@@ -58,6 +64,7 @@ def activate(mind, source):
 
 def test_clock_crossing_once_across_restart_and_no_idle_model_calls(setup):
     mind, source, clock = setup
+    legacy_gates(mind)
     actions, jobs = activate(mind, source)
     idle = FakeReviewer(error=AssertionError("No idle model calls"))
     for _ in range(19):
@@ -101,6 +108,7 @@ def test_clock_crossing_once_across_restart_and_no_idle_model_calls(setup):
 
 def test_concurrent_crossings_keep_one_internal_stimulus(setup):
     mind, source, clock = setup
+    legacy_gates(mind)
     actions, jobs = activate(mind, source)
     clock[0] += timedelta(minutes=21)
     with ThreadPoolExecutor(max_workers=3) as pool:
