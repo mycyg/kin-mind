@@ -91,6 +91,12 @@ def register_mind_tools(server, engine):
         return Mind(engine, scope).read(history=history, query=query)
 
     @server.tool()
+    def read_trait_ledger(scope: Scope, identifier: str | None = None, limit: int = 12, history: bool = False) -> dict:
+        """Read the slow-changing traits shared experience formed: the trait's own sentence, whether it is a candidate or established, and the host's counts of supporting and counter observations by evidence class, distinct episodes and days. Revoked traits keep a tombstone with the source that ended them. Counts are evidence, not a verdict, and reading grants no change; traits change only through an appraisal or an owner correction."""
+        from .traits import Traits
+        return Traits(Mind(engine, scope)).read(identifier, limit=limit, history=history)
+
+    @server.tool()
     def manage_concern(scope: Scope, request: ConcernChange) -> dict:
         """Manage a sourced concern: create/update/ease/resolve/reopen/archive. Concerns include care, anticipation, curiosity, distress and shared plans. Use current revision and agent_version; preserve explicit/inferred/internal_thought basis and confidence. A sent wish does not resolve its concern. New outcome evidence supports resolution; repeated source summaries cannot reinforce intensity. Returns a durable concern ID and revision. This tool never sends a message."""
         return Mind(engine, scope).manage_concern(request)

@@ -296,6 +296,17 @@ def dispatch(config, action, request):
             "exploration_cadence": cadence.status(),
             "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
         }
+    if action in {"traits", "trait-revoke", "traits-migrate"}:
+        from .traits import Traits
+        ledger = Traits(mind)
+        if action == "traits":
+            return ledger.read(request.get("identifier"), limit=request.get("limit", 12), history=request.get("history", False))
+        if action == "trait-revoke":
+            # An owner correction that must not wait for an appraisal. The cited source decides
+            # whether it is recorded as her own correction or as the operator's.
+            return ledger.revoke(request)
+        # Idempotent, and a dry run writes nothing.
+        return ledger.migrate(apply=bool(request.get("apply")))
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":

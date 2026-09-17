@@ -340,8 +340,8 @@ AUDIT_SECTION_SWITCH = {"trait_observations": "trait_ledger", "trait_decisions":
 SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continuity-bootstrap", "session-maintenance"}
 # One short paragraph per section, appended only where that section is offered. Each belongs to the
 # module that applies the section: it replaces its own paragraph here and nothing else.
-TRAIT_OBSERVATIONS_PROMPT = "trait_observations 暂不接收内容，留空。"
-TRAIT_DECISIONS_PROMPT = "trait_decisions 暂不接收内容，留空。"
+TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、内部事件都不能作证据。category 与 slug 决定这条证据归哪条特征，同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
+TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历、至少一条非自述的支持，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
 SELF_HYPOTHESIS_PROMPT = "self_hypothesis 暂不接收内容，留空。"
 PREDICTION_OUTCOMES_PROMPT = "prediction_outcomes 暂不接收内容，留空。"
 EXPRESSION_INTENT_PROMPT = "expression_intent 暂不接收内容，留空。"
@@ -717,6 +717,13 @@ def appraisal_context(context):
         state["action_policy"] = {k: v for k, v in original["action_policy"].items() if k in {
             "version", "trigger", "provider", "reasoning", "configured_at", "needs_review",
         }}
+    ledger = original.get("trait_ledger")
+    if ledger:
+        # The ledger, as the state projection built it: established and candidate traits apart,
+        # each with the host's counts, what an owner correction ended, and the open predictions.
+        # Structured state, so none of it is ever compressed. Absent while the switch is off.
+        state.update(traits=ledger["traits"], corrections=ledger["corrections"],
+                     open_predictions=ledger["open_predictions"])
     result["state"] = state
     # Several dimensions often carry the same complete appraisal account.
     # Reference it once without changing or shortening its meaning.
