@@ -584,7 +584,9 @@ class AutonomousPlans:
         with self.engine.db.connect(write=True) as conn:
             if foreground or not enabled(conn, self.scope, "autonomous_plans") or (actor == "create" and not enabled(conn, self.scope, "creative_execution")):
                 return {"state": "waiting", "reason": "foreground-or-feature-disabled"}
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_foreground_leases'").fetchone() and conn.execute("SELECT 1 FROM mind_foreground_leases WHERE scope=? AND expires_at>?", (self.scope, time.time())).fetchone():
+            from .model_lanes import foreground_active
+            # Machine-wide, like every other yield to the user: a scope isolates data, not attention.
+            if foreground_active(conn, self.scope):
                 return {"state": "waiting", "reason": "user-work-priority"}
             if actor == "create" and not enabled(conn, self.scope, "records"):
                 return {"state": "waiting", "reason": "result-memory-disabled"}

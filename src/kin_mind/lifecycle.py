@@ -156,6 +156,8 @@ def foreground_lease(engine, scope, session, *, active=True, seconds=180):
                          "DO UPDATE SET expires_at=excluded.expires_at", (scope, session, time.time() + seconds))
         else:
             conn.execute("DELETE FROM mind_foreground_leases WHERE scope=? AND session=?", (scope, session))
+        # A read lease is never handed back; whatever expired goes when the next one is written.
+        conn.execute("DELETE FROM mind_foreground_leases WHERE expires_at<=?", (time.time(),))
 
 
 class EventLifecycle:

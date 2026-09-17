@@ -1,69 +1,18 @@
 """Cross-process background capacity, client reuse and explicit unknown usage."""
-import contextvars
 import threading
-import time
-import uuid
 from contextlib import contextmanager
 
 import httpx
 
-from eventmem.core.db import dumps
-
-class ModelAdmissionWait(RuntimeError):
-    """No request was admitted; waiting is not a failed model attempt."""
-
-
-_background = contextvars.ContextVar("kin_background_job", default=False)
+# The ledger, the lanes and the context they travel in live in model_lanes. These names stay
+# importable from here, where their callers have always found them.
+from .model_lanes import ModelAdmissionWait, background_calls, configure, evaluation_slot, slot  # noqa: F401
 
 
-@contextmanager
-def background_calls():
-    token = _background.set(True)
-    try:
-        yield
-    finally:
-        _background.reset(token)
-
-
-_held = contextvars.ContextVar("kin_background_model_lease", default=None)
-
-
-@contextmanager
-def model_slot(provider, purpose):
-    engine = getattr(provider, "engine", None)
-    if not engine or not (getattr(provider, "background", False) or _background.get()) or _held.get():
-        yield
-        return
-    key, stop = str(uuid.uuid4()), threading.Event()
-    with engine.db.connect(write=True) as conn:
-        from .autonomy_schema import SCHEMA
-        # Schema normally exists through Mind; direct provider use is supported.
-        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_model_leases'").fetchone():
-            raise RuntimeError("deepseek-background-lease-unavailable")
-        now = time.time()
-        conn.execute("DELETE FROM mind_model_leases WHERE expires_at<=?", (now,))
-        configured = conn.execute("SELECT value FROM meta WHERE key='kin_background_model_limit'").fetchone()
-        capacity = max(1, min(8, configured[0])) if configured else 2
-        if conn.execute("SELECT COUNT(*) FROM mind_model_leases WHERE lane='background'").fetchone()[0] >= capacity:
-            raise ModelAdmissionWait("deepseek-background-capacity")
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_foreground_leases'").fetchone() and conn.execute("SELECT 1 FROM mind_foreground_leases WHERE expires_at>? LIMIT 1", (now,)).fetchone():
-            raise ModelAdmissionWait("deepseek-foreground-priority")
-        conn.execute("INSERT INTO mind_model_leases VALUES(?,?,?,?)", (key, "background", now + 90, dumps({"purpose": purpose})))
-    def renew():
-        while not stop.wait(20):
-            with engine.db.connect(write=True) as conn:
-                conn.execute("UPDATE mind_model_leases SET expires_at=? WHERE id=?", (time.time() + 90, key))
-    worker = threading.Thread(target=renew, name="kin-model-lease", daemon=True)
-    worker.start()
-    token = _held.set(key)
-    try:
-        yield
-    finally:
-        _held.reset(token)
-        stop.set()
-        worker.join(timeout=2)
-        with engine.db.connect(write=True) as conn:
-            conn.execute("DELETE FROM mind_model_leases WHERE id=?", (key,))
+def model_slot(provider, purpose, *, default=None):
+    """Delegates to the one admission implementation. `default` is the lane a call site
+    declares for itself when nothing above it declared one."""
+    return slot(provider, purpose, default=default)
 
 
 @contextmanager
@@ -95,8 +44,4 @@ def close_client(provider):
 
 def configure_capacity(engine, limit):
     """One database-wide limit, shared by every process and scope."""
-    if type(limit) is not int or not 1 <= limit <= 8:
-        raise ValueError("Background model capacity must be between 1 and 8")
-    with engine.db.connect(write=True) as conn:
-        conn.execute("INSERT INTO meta VALUES('kin_background_model_limit',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (limit,))
-    return {"background_model_limit": limit, "foreground_priority": True}
+    return configure(engine, limit)

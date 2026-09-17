@@ -29,7 +29,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.appraisal", "kin_mind.state", "kin_mind.graph", "kin_mind.memory",
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
-    "eventmem.core.engine",
+    "eventmem.core.engine", "kin_mind.model_lanes",
 )
 
 
@@ -232,6 +232,11 @@ REGISTRY = {
     "Replacement must be another active record in the same scope": ("semantic", "replacement-invalid", "block"),
     "Cross-scope relations are not allowed": ("semantic", "reference-cross-scope", "block"),
     "Job key reused with a different task": ("runtime", "payload-changed", "block"),
+    # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
+    "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
+    "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),
+    "Model lease was lost before commit": ("runtime", "model-lease-lost", "block"),
+    "Appraisal row was taken over during the evaluation": ("runtime", "lease-lost", "block"),
 }
 
 # Codes that have no static message to look up: either the caller substitutes them because

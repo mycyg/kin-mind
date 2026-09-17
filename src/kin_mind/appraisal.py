@@ -35,7 +35,7 @@ from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
 from .autonomy_schema import optimized
-from .model_runtime import request_client, model_slot, ModelAdmissionWait
+from .model_runtime import request_client, evaluation_slot, ModelAdmissionWait
 
 APPRAISAL_INPUT_BUDGET = 64000
 # Every lane is bounded: a charged attempt is a real appraisal call, and an
@@ -1195,7 +1195,7 @@ class Appraisals:
             else:
                 # Admit the entire evaluation before any compression/review call.
                 # Nested calls reuse this lease, so a wait never hides partial usage.
-                slots.enter_context(model_slot(provider, "appraisal:" + row["id"]))
+                slot = slots.enter_context(evaluation_slot(provider, self.engine, row["id"], data["attempt_token"]))
                 model_admitted = True
                 data.pop("waiting_reason", None)
                 if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
@@ -1490,6 +1490,7 @@ class Appraisals:
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")
+                    slot.verify(conn)
                     if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
                         stale = next((r["source_id"] for r in refs if not self.mind._fresh(conn, [r])), None)
                         raise Conflict("Evaluated sources changed before commit", target=stale)

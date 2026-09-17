@@ -1,6 +1,7 @@
 """Budgeted, versioned memory context. Compression never replaces evidence."""
 from __future__ import annotations
 
+import functools
 import json
 import re
 import sqlite3
@@ -46,6 +47,20 @@ def enabled(engine, scope):
         return bool(row and json.loads(row[0]).get("context"))
     except sqlite3.OperationalError:
         return False
+
+
+def _lane_from_purpose(purpose=None):
+    """A read declares its model lane from what it is for, never from which helper ends up
+    calling the model: compression serves a waiting user and an idle queue alike."""
+    def wrap(method):
+        @functools.wraps(method)
+        def declared_read(self, *args, **options):
+            from .model_lanes import context_lane, declared
+            lane = context_lane(purpose or options.get("purpose", "chat"), options.get("access_origin", "user_query"))
+            with declared(lane, "memory-context"):
+                return method(self, *args, **options)
+        return declared_read
+    return wrap
 
 
 class CompressedEntry(Model):
@@ -384,6 +399,7 @@ class Contexts:
                 "basis": node.get("basis", "inferred"), "graph_dependencies": deps, "coverage_dependency": coverage_dep,
                 **({"digest_dependency": digest_dep, "dependencies": record_deps} if digest_dep else {})}
 
+    @_lane_from_purpose("read")
     def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None):
         if detail not in {"index", "summary", "original"}:
             raise ValueError("Event detail must be index, summary or original")
@@ -515,6 +531,7 @@ class Contexts:
             packed["receipt"]["calls"] = packed.get('model_requests', 0 if packed.get('cache_hit') else sum(r.get('requests', 1) for r in receipts))
         return packed
 
+    @_lane_from_purpose("read")
     def read_history(self, kind, *, query="", identifier=None, cursor=0, budget=2000, provider=None):
         found = self.memory.history(kind, query=query, identifier=identifier, cursor=cursor, limit=8)
         items = [self.node_item(n) for n in found["items"] if not n["needs_review"]]
@@ -539,6 +556,7 @@ class Contexts:
         result.update(details=details["text"], omitted_ids=details["omitted_ids"], detail_tool="read_continuity_context", instruction_authority="data")
         return result
 
+    @_lane_from_purpose("read")
     def read_record(self, record, *, offset=0, length=12000, budget=2000, session=None, provider=None):
         if record["scope"] != self.mind.scope.model_dump() or offset < 0:
             raise Conflict("Invalid source read")
@@ -573,6 +591,7 @@ class Contexts:
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
                 "read_url": record["read_url"], "instruction_authority": "data"}
 
+    @_lane_from_purpose()
     def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None):
         started = time.monotonic()
         if mode not in {"auto", "light", "deep"}:

@@ -71,6 +71,89 @@ This does not block the chat session. Exhaustion remains a pending appraisal,
 never an empty successful decision. Output ceilings do not require that many tokens
 to be generated.
 
+### Model lanes and the lease interface
+
+Every DeepSeek call is admitted through one ledger, `mind_model_leases`, shared by the
+Python host, the API service and the Node adapters. The lane follows the purpose the
+caller declares, never the name of the function that ends up calling the model:
+compression serves a waiting reader and an idle queue alike.
+
+| Lane | Admission | Declared by |
+|---|---|---|
+| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; `share-preflight` and `share-preflight-group`; core recall; the Node classifier and chat turns |
+| `user-work` | one reserved slot, **exempt from the foreground yield** | the review that decides whether a held work task is finished |
+| `background` | `meta.kin_background_model_limit`, and only while no foreground session holds a lease anywhere on the machine | appraisals and everything nested in them, the daily review, event digests, procedure replay, completion review, prewarming, coverage backfill, core jobs, a context whose `access_origin` is `maintenance`, proactive drafts, the Node health audit |
+
+The exemption is what prevents a deadlock. A held work task keeps a foreground lease,
+every background caller waits on it with `deepseek-foreground-priority`, and the one
+call that can release the task is that review. The foreground yield is machine-wide:
+a scope isolates data, not the model's attention, and a plan executor's claim follows
+the same rule. A caller that declares nothing keeps the behaviour it had before lanes,
+no lease at all, and leaves a `model_lane_undeclared` metric with its purpose label.
+
+Capacity comes from configuration. The host's `mind-config.json` states
+`background_model_limit` (1–8); the `recover` action, which the host already runs at
+start-up, writes it to `meta`, and any other action fills it in only when `meta` has
+none. `configure-model-capacity` changes it while the host runs and holds until the
+next restart, so change the file as well. A missing limit is never a silent default:
+admission still uses 2, writes `model_capacity_unconfigured`, and `operational-status`
+reports `source: "default-unconfigured"`. `operational-status` lists each lane with its
+limit, the source of that limit and what is held, and every current holder by label,
+age and time to expiry. Purposes and holders are short labels, never text.
+
+A row lives for 90 seconds and Python renews it every 20. Expired rows, and expired
+`mind_foreground_leases` rows such as the `read:` leases nobody returns, are swept at
+every admission; that sweep is the whole of crash recovery. A renewal checks that it
+still updated a row. When it did not, the lease is lost: the late result is
+quarantined. A single call raises a `model-lease-lost` conflict instead of returning,
+and writes `model_lease_lost` with the usage its caller reported or `unknown`, never
+zero. An appraisal keeps the proposal and its receipt on the queue row and refuses
+the commit, so the judgment is auditable and never applied; once the lease is gone
+no further nested call is paid for. While an evaluation runs, a heartbeat extends the
+queue row's own lease in 180-second steps and never shortens it, so a long call cannot
+be reclaimed by another worker. No heartbeat outlives one hour: a worker that hangs
+without dying loses its row and its slot like one that crashed, only later. A thread started on a caller's behalf, such as the
+bounded rerank, is handed the caller's lease and declared lane and reuses them instead
+of taking a second slot; a thread abandoned at its deadline is no longer renewed, so
+it cannot keep a slot beyond the 90 seconds. The metrics are `model_capacity_unconfigured`,
+`model_capacity_invalid`, `model_lane_undeclared`, `model_lane_unrecorded` (a foreground
+or user-work call that went ahead while the ledger was busy), `model_lease_lost` and
+`model_call_abandoned`; each carries labels and counters only.
+
+Node never opens SQLite. The adapters use internal routes of the local API, which are
+deliberately absent from the published OpenAPI contract, with the same bearer
+credential as every `/v1` route:
+
+| Route | Request | Answers (HTTP 200) |
+|---|---|---|
+| `POST /v1/model-leases/acquire` | `{lane, purpose, holder?, id?, ttl_seconds?}` | `{state:"admitted", lease:{id, lane, purpose, expires_at, ttl_seconds, renew_after_seconds}, capacity}` · `{state:"wait", reason, retry_after_seconds, capacity}` · `{state:"disabled"}` |
+| `POST /v1/model-leases/renew` | `{id, ttl_seconds?}` | `{state:"renewed", lease}` · `{state:"lost", id}` |
+| `POST /v1/model-leases/release` | `{id}` | `{state:"released", id}` · `{state:"lost", id}` |
+| `GET /v1/model-leases` | — | the `model_lanes` block of `operational-status` |
+
+`purpose`, `holder` and a caller-chosen `id` match `[A-Za-z0-9][A-Za-z0-9:._-]*`;
+anything else is a 422. Choosing the `id` makes `acquire` repeatable after a lost
+answer and lets the caller release a lease it never saw confirmed. `ttl_seconds` is
+15–300 and defaults to 90; renew every `renew_after_seconds`. A lease is lost once its
+row is gone: the next admission of any lane deletes every row past its expiry before it
+counts, so a late renewal that still finds its row keeps it, and one that does not has
+lost a slot that may already be somebody else's. The wait reasons are
+`deepseek-background-capacity`, `deepseek-foreground-priority` and
+`deepseek-user-work-capacity`. Lease operations use a two-second `busy_timeout`: a busy
+or missing ledger answers 503 with `{state:"busy"|"unavailable", reason}` instead of
+queuing behind a writer. The fallback when the service is down is the host action
+`model-lease` with `{op:"acquire"|"renew"|"release"|"status", …}` and the same fields
+and answers; it is handled before any engine opens, and reports a busy ledger as
+`{state:"busy"}`. On `lost`, abort the request and record its usage as unknown. When
+neither path answers, foreground and user work go ahead and note it, and background
+work skips that run. `disabled` means `model_lanes` is off: carry on without a lease,
+as before. A rolled-back service answers 404, which is the same degraded mode.
+
+`model_lanes` is on by default in the memory settings and the ledger is shared, so the
+switch is machine-wide: set to `false` in any scope it restores the previous admission
+everywhere, with background capacity only, no quarantine, no heartbeat, and a plan
+claim that looks at its own scope.
+
 The one-minute host timer is a local queue/threshold check, not a periodic model
 request. Lengthening it to twenty minutes delays threshold detection without
 reducing idle provider requests, which are already zero. Exploration retains its

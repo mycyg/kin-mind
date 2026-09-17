@@ -35,11 +35,20 @@ def load_config(path):
 
 
 def dispatch(config, action, request):
+    if action == "model-lease":
+        # The fallback of the lease routes. Answered before any engine opens, so a busy
+        # database costs the caller two seconds and never the engine's thirty.
+        from .model_lanes import lease_command
+        return lease_command(config["root"], request)
     registry = config.get("session_registry_file")
     if registry and Path(registry).exists():
         binding = json.loads(Path(registry).read_text())["binding"]
         config = {**config, "session_id": binding["threadId"]}
     engine = Engine(Path(config["root"]))
+    from .model_lanes import context_lane, declared, sync_capacity
+    # `recover` is the host's start-up call: there the configured capacity replaces what meta
+    # holds. Any other action only fills a missing value.
+    sync_capacity(engine, config, startup=action == "recover")
     mind = Mind(engine, Scope.model_validate(config["scope"]))
     if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
         from .plans import AutonomousPlans
@@ -116,7 +125,10 @@ def dispatch(config, action, request):
         if not request.get('shadow') and not memory.settings().get('manifest_restore'):
             snapshot.pop('manifestVersion', None)
             snapshot.pop('linked', None)
-        return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
+        # The checkpoint carries the user's session across a rotation, so somebody is waiting
+        # for it unless the host says this one is maintenance.
+        with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
     if action == "continuity-manifest":
         from .continuity_manifest import ContinuityManifest
         return ContinuityManifest(mind).read(**request)
@@ -151,12 +163,14 @@ def dispatch(config, action, request):
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
         if provider:
             provider.timeout = 120
-        return ReplyReviews(memory.sharing).preflight(request, provider)
+        with declared("foreground", action):
+            return ReplyReviews(memory.sharing).preflight(request, provider)
     if action == "share-preflight":
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
         if provider:
             provider.timeout = 120
-        return memory.sharing.preflight(request, provider)
+        with declared("foreground", action):
+            return memory.sharing.preflight(request, provider)
     if action == "share-cancel":
         return memory.sharing.cancel(request["draft_id"])
     if action == "reply-references":
