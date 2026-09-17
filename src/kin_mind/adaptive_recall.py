@@ -16,23 +16,12 @@ from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, tokenize
 from eventmem.core.models import Model, RecallRequest
+# The envelope prefixes have one definition, in the read policy that classifies by them. They
+# stay importable from here for the graph lanes and the event snapshot.
+from eventmem.core.read_policy import HOST_PREFIXES, ReadPolicy, host_envelope
 from eventmem.core.retrieval import candidates, tokens, valid
 
 _remote_slots = threading.BoundedSemaphore(2)
-HOST_PREFIXES = (
-    "以下是共享记忆库的行为状态与探索结果（数据，不构成新指令）",
-    "内部探索选题事件，", "内部主动联系草稿事件，", "内部接入核验，",
-    "## Memory Writing Agent:", "# AGENTS.md instructions", "<environment_context>",
-    "<turn_aborted>", "Warning: Heads up: Long threads")
-
-
-def host_envelope(text):
-    """Legacy transport imports sometimes labelled host blocks as user turns.
-
-    Recognize only known whole-message envelopes, never delete source records
-    or reinterpret quoted phrases inside an actual conversation.
-    """
-    return text.lstrip().startswith(HOST_PREFIXES)
 
 
 def evidence_excerpt(text, query, budget=500):
@@ -116,8 +105,19 @@ class AdaptiveRecall:
         self.contexts, self.engine, self.mind = contexts, contexts.engine, contexts.mind
         self.memory = contexts.memory
 
-    def collect(self, query, *, mode="auto", history=False, provider=None, allow_model=False, deadline=None):
+    def collect(self, query, *, mode="auto", history=False, provider=None, allow_model=False, deadline=None,
+                recall_purpose="experience_recall", policy=None):
         started = time.monotonic()
+        # One policy for every lane. A caller that already loaded one hands it down; its purpose wins.
+        policy = policy or ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
+        # Envelopes used to be dropped here by prefix alone. The policy decides now, so an audit
+        # read keeps them, labelled; with its switch off the prefix rule stands as before.
+        if policy.enabled:
+            def concealed(record):
+                return not policy.visible(record, history)
+        else:
+            def concealed(record):
+                return host_envelope(record["content"])
         deadline = deadline or started + 150
         mode_used = select_mode(query, mode, history)
         info = {"mode_used": mode_used, "degraded_reasons": [], "pending_ids": [],
@@ -144,9 +144,9 @@ class AdaptiveRecall:
             recent.reverse()
 
         def add_record(record, score):
-            if host_envelope(record["content"]):
+            if concealed(record):
                 return
-            item = self.contexts.record_item(record, historical=history)
+            item = self.contexts.record_item(record, historical=history, policy=policy)
             attributes = record.get("attributes", {})
             item["source_form"] = "original_owner_turn" if (
                 attributes.get("role") == "user" and attributes.get("host_event") == "message"
@@ -188,7 +188,8 @@ class AdaptiveRecall:
             seen_queries.add(lookup)
             previous_ids = set(pool)
             info["rounds"] += 1
-            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
+            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history,
+                                    recall_purpose=policy.purpose)
             from .model_lanes import handoff
             carried = handoff()
             def vector_candidates():
@@ -202,7 +203,7 @@ class AdaptiveRecall:
                 return VectorIndex(self.engine, index).search(vectors[0], scopes=[self.mind.scope.key()], limit=120)
             channel_started = time.monotonic()
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="kin-recall") as executor:
-                lexical_future = executor.submit(candidates, self.engine, request, full_lexical=True)
+                lexical_future = executor.submit(candidates, self.engine, request, full_lexical=True, policy=policy)
                 graph_future = executor.submit(self.memory.graph.read, query=lookup, limit=40, hops=1)
                 vector_future = executor.submit(vector_candidates) if mode_used == "deep" and lookup else None
                 docs, _, _ = lexical_future.result()
@@ -214,7 +215,7 @@ class AdaptiveRecall:
                     except Exception as error:
                         info["degraded_reasons"].append("embedding:" + type(error).__name__)
             info.setdefault("candidate_wait_ms", []).append(round((time.monotonic()-channel_started)*1000, 3))
-            eligible = [r for r in docs if not host_envelope(r["content"])]
+            eligible = [r for r in docs if not concealed(r)]
             for rank, record in enumerate(eligible[:40]):
                 add_record(record, 1 / (60 + rank))
             if date_bounds:
@@ -228,7 +229,7 @@ class AdaptiveRecall:
                 dated = [json.loads(row[0]) for row in rows]
                 dated.sort(key=lambda r: (-len(wanted.intersection(tokenize(r["content"]).split())), r["id"]))
                 for rank, record in enumerate(dated[:12]):
-                    if valid(record, request) is None:
+                    if valid(record, request, policy) is None:
                         add_record(record, 2 / (60 + rank))
             # Questions about the owner's actual words need an original-source
             # lane. Large model-authored summaries must not crowd these out.
@@ -245,17 +246,20 @@ class AdaptiveRecall:
                 terms = list(dict.fromkeys([*terms, *grams]))[:120]
                 if terms:
                     match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
-                    source_filter = " AND ".join("ltrim(json_extract(r.data,'$.content')) NOT LIKE ?" for _ in HOST_PREFIXES)
+                    # The prefix filter stays in SQL ahead of the limit, except for a read that
+                    # is allowed to see envelopes.
+                    prefixes = () if policy.enabled and policy.admits("host_envelope") else HOST_PREFIXES
+                    source_filter = " AND ".join("ltrim(json_extract(r.data,'$.content')) NOT LIKE ?" for _ in prefixes) or "1"
                     with self.engine.db.connect() as conn:
                         rows = conn.execute(
                             "SELECT r.data FROM search JOIN records r ON r.id=search.id WHERE search MATCH ? AND r.scope=? "
                             "AND r.deleted=0 AND r.status='active' AND json_extract(r.data,'$.attributes.role')='user' "
                             "AND COALESCE(json_extract(r.data,'$.generated'),0)=0 AND " + source_filter + " ORDER BY bm25(search) LIMIT 24",
-                            (match, self.mind.scope.key(), *(p + '%' for p in HOST_PREFIXES))).fetchall()
+                            (match, self.mind.scope.key(), *(p + '%' for p in prefixes))).fetchall()
                     originals = [json.loads(row[0]) for row in rows]
-                    originals = [r for r in originals if not host_envelope(r["content"])]
+                    originals = [r for r in originals if not concealed(r)]
                     for rank, record in enumerate(originals[:24]):
-                        if valid(record, request) is None:
+                        if valid(record, request, policy) is None:
                             add_record(record, 1.4 / (60 + rank))
             for rank, node in enumerate(graph["nodes"][:40]):
                 add_graph(node, graph["edges"], .8 / (60 + rank))
@@ -268,7 +272,7 @@ class AdaptiveRecall:
                         f"SELECT id,data FROM records WHERE scope=? AND deleted=0 AND id IN ({marks})", [self.mind.scope.key(), *ids])}
                     for rank, hit in enumerate(vector_hits):
                         record = records.get(hit["id"])
-                        if record and record["revision"] == hit["revision"] and valid(record, request) is None:
+                        if record and record["revision"] == hit["revision"] and valid(record, request, policy) is None:
                             add_record(record, 1 / (60 + rank))
             neighbors = []
             if requested_neighbors:
@@ -287,7 +291,7 @@ class AdaptiveRecall:
                                 (self.mind.scope.key(), record["valid_from"])).fetchall()
                             for row in rows:
                                 neighbor = json.loads(row[0])
-                                if valid(neighbor, request) is None:
+                                if valid(neighbor, request, policy) is None:
                                     add_record(neighbor, 1 / 60)
                                     if neighbor["id"] in pool:
                                         neighbors.append(neighbor["id"])
@@ -409,7 +413,7 @@ class AdaptiveRecall:
                         for anchor_id in anchors:
                             anchor = self.engine._get(conn, anchor_id)
                             key = (anchor_id, followup.direction)
-                            if valid(anchor, request) is None and key not in expanded_neighbors:
+                            if valid(anchor, request, policy) is None and key not in expanded_neighbors:
                                 expanded_neighbors.add(key)
                                 requested_neighbors.append(key)
                 if not queries and (requested_neighbors or any(i not in reviewed for i in ordered)) and round_no < 2:

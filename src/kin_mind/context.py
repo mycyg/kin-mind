@@ -11,6 +11,7 @@ from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallRequest
+from eventmem.core.read_policy import ReadPolicy
 from eventmem.core.retrieval import candidates, tokens, valid
 
 from .computer import redact
@@ -462,9 +463,14 @@ class Contexts:
             "summary_state": summary_state, "stale_summary_revision": stale_revision,
             "index": [{k: n.get(k) for k in ("id", "kind", "revision", "needs_review")} for n in graph["nodes"]], "instruction_authority": "data"}
 
-    def record_item(self, record, *, historical=False):
-        return {"id": record["id"], "revision": record["revision"], "text": record["content"], "basis": record["confirmation"],
-                "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until")},
+    def record_item(self, record, *, historical=False, policy=None):
+        # What is not experience is shown under its class, never as `explicit`. A caller without a
+        # policy still gets the label: classification does not depend on what the read is for.
+        found = (policy or ReadPolicy.load(self.engine, self.mind.scope, "audit")).classify(record)
+        return {"id": record["id"], "revision": record["revision"], "text": record["content"],
+                "basis": record["confirmation"] if found.kind == "experience" else found.kind,
+                "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until"),
+                          **({"evidence_label": found.label} if found.kind == "experience" and found.label else {})},
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
     def _overview_key(self, item):
@@ -575,7 +581,9 @@ class Contexts:
             if selected and stop - offset > length:
                 break
             selected.append(paragraph); end = stop
-        item = self.record_item(record, historical=True)
+        # An explicit read by id is an audit read: the text is all there, labelled for what it is.
+        policy = ReadPolicy.load(self.engine, self.mind.scope, "audit")
+        item = self.record_item(record, historical=True, policy=policy)
         item["text"] = "\n\n".join(selected)
         item["id"] += ":segment:" + str(offset)
         overhead = self._read_overhead([item], {"source_ids": record["source_ids"], "read_url": record["read_url"]})
@@ -584,15 +592,15 @@ class Contexts:
         depth = "summary" if result["state"] == "compressed" else "original" if result["covered_ids"] else "index"
         if session:
             self.memory.access(session, record["id"], record["revision"], depth)
-        return {"id": record["id"], "revision": record["revision"], "confirmation": record["confirmation"],
+        return policy.present(record, {"id": record["id"], "revision": record["revision"], "confirmation": record["confirmation"],
                 "source_ids": record["source_ids"], "content": result.pop("text"), **result,
                 "content_length": len(content), "depth": depth,
                 "cursor": str(end) if result["covered_ids"] and end < len(content) else None,
                 "next_action": "read_source_or_increase_budget" if not result["covered_ids"] else None,
-                "read_url": record["read_url"], "instruction_authority": "data"}
+                "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall"):
         started = time.monotonic()
         if mode not in {"auto", "light", "deep"}:
             raise ValueError("Unknown recall mode")
@@ -633,11 +641,14 @@ class Contexts:
         habits = self.memory.habits.read()
         if habits["revision"]:
             items.append({"id": "conversation-habits", "revision": habits["revision"], "text": dumps(habits["preferences"]), "basis": "explicit"})
+        # `purpose` is the budget this context is built for; `recall_purpose` is what the recalled
+        # records may be. One policy for the whole build, handed to every record lane.
+        policy = ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
         recall_started = time.monotonic()
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
             recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
-                allow_model=allow_model, deadline=started + 150)
+                allow_model=allow_model, deadline=started + 150, policy=policy)
             items.extend(recalled)
         elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
             graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),
@@ -655,11 +666,12 @@ class Contexts:
             # question is retained for semantic compression and explicit reads.
             from eventmem.core.db import tokenize
             lookup = query if len(query) <= 4000 else " ".join(list(dict.fromkeys(tokenize(query).split()))[:80])
-            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history)
-            docs, _, _ = candidates(self.engine, request, full_lexical=True)
-            eligible = [r for r in docs if valid(r, request) is None and
-                        not (settings["adaptive_recall"] and host_envelope(r["content"]))]
-            items.extend(self.record_item(r, historical=history) for r in eligible[:24])
+            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history, recall_purpose=recall_purpose)
+            docs, _, _ = candidates(self.engine, request, full_lexical=True, policy=policy)
+            # The policy decides about host envelopes; the prefix rule stands only with its switch off.
+            eligible = [r for r in docs if valid(r, request, policy) is None and
+                        not (settings["adaptive_recall"] and not policy.enabled and host_envelope(r["content"]))]
+            items.extend(self.record_item(r, historical=history, policy=policy) for r in eligible[:24])
             local_recall_seconds += time.monotonic() - recall_started
         recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
@@ -712,7 +724,8 @@ class Contexts:
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index"} for i in selected],
-                      instruction_authority="data", purpose=purpose)
+                      instruction_authority="data", purpose=purpose,
+                      **({"recall_purpose": recall_purpose} if recall_purpose != "experience_recall" else {}))
         compression_requests = packed.get("model_requests", 0)
         packed.update(recall_info)
         packed["compression_model_requests"] = compression_requests

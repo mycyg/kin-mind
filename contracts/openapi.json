@@ -3847,6 +3847,17 @@
             "type": "boolean",
             "title": "Explain",
             "default": false
+          },
+          "recall_purpose": {
+            "type": "string",
+            "enum": [
+              "experience_recall",
+              "self_knowledge_view",
+              "audit"
+            ],
+            "title": "Recall Purpose",
+            "description": "What the read is for. Omit it for the default: a server that predates this field rejects it. experience_recall returns lived experience only. self_knowledge_view also returns role configuration, its examples and self-claims, each labelled with its class. audit returns everything, labelled. history only lifts the status and expiry checks.",
+            "default": "experience_recall"
           }
         },
         "additionalProperties": false,

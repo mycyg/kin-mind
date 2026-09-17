@@ -78,6 +78,9 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # remainder can be reviewed again, and an earlier tail settles through this call.
             # Off restores the stage-2 limits, which refuse such a group for ever.
             "chunked_reply_review": True,
+            # Stage 3: purpose-typed recall. Off restores `history` admitting self-knowledge, the
+            # prefix-only envelope filters, relation seeds taken before validation and bare labels.
+            "recall_purpose_policy": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -185,7 +188,7 @@ class MemoryContinuity:
         for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
-                    "chunked_reply_review"):
+                    "chunked_reply_review", "recall_purpose_policy"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

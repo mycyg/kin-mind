@@ -111,6 +111,7 @@ class RecallRequest(TypedDict, total=False):
     vector: list[float] | None
     index: str | None
     explain: bool
+    recall_purpose: Literal['experience_recall', 'self_knowledge_view', 'audit']
 
 class RecallResult(TypedDict, total=False):
     items: Required[list[RecallItem]]

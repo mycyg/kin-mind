@@ -126,10 +126,26 @@ def test_roles_and_hypotheses_keep_their_epistemic_status(memory):
     assert (
         hypothesis["id"] not in recalled["text"] and role["id"] not in recalled["text"]
     )
+    # `history` reaches earlier states of experience. It no longer admits self-knowledge:
+    # that takes the purpose of the read, and the line then carries its class.
     historical = memory.engine.recall(
         RecallRequest(scope=memory.scope, query="seek evidence", history=True)
     )
-    assert "hypothesis inferred config-1" in historical["text"]
+    assert (
+        hypothesis["id"] not in historical["text"]
+        and role["id"] not in historical["text"]
+    )
+    view = memory.engine.recall(
+        RecallRequest(
+            scope=memory.scope,
+            query="seek evidence",
+            history=True,
+            recall_purpose="self_knowledge_view",
+        )
+    )
+    assert "[self_knowledge hypothesis config-1]" in view["text"]
+    assert "[self_knowledge role config-1]" in view["text"]
+    assert "explicit" not in view["text"]
 
 
 @pytest.mark.parametrize("authority", ["model", "operation", "document"])

@@ -99,6 +99,11 @@ class Engine:
                     else "not_requested",
                 ),
             )
+            # What a source is gets decided once, as it arrives. Its row and the root record's
+            # stamp belong to the first revision, so no stored record is rewritten to mark it.
+            from .read_policy import STAMP, stamp_source
+
+            origin = stamp_source(self, conn, sid, source, record_text)
             # Deterministic text imports can be committed with the receipt.
             if attachment is None and source.text and len(source.text) <= 1_000_000:
                 confirmation = {
@@ -117,7 +122,9 @@ class Engine:
                     valid_from=source.occurred_at,
                     confirmation=confirmation,
                     generated=source.authority == "model",
-                    attributes=source.metadata,
+                    # The stamp is the engine's word: a caller cannot supply one it did not earn.
+                    attributes={k: v for k, v in source.metadata.items() if k != STAMP}
+                    | ({STAMP: origin} if origin else {}),
                 )
                 self._insert(conn, record)
                 if source.kind in {"knowledge", "checkpoint"}:
@@ -208,6 +215,17 @@ class Engine:
             if content:
                 return self.db.blobs / row["blob"]
             result = self._source(row)
+            # A provenance read says what kind of evidence this is, so a configuration is not
+            # taken for the owner's observed word. Only labelled sources gain keys.
+            from .read_policy import ReadPolicy
+
+            policy = ReadPolicy.load(self, Scope.model_validate_json(row["scope"]), "audit", conn=conn)
+            if policy.enabled:
+                root = conn.execute(
+                    "SELECT data FROM records WHERE id=? AND deleted=0",
+                    ("mem_" + digest([sid, "root"])[:32],),
+                ).fetchone()
+                policy.present_source(result, json.loads(root[0])["content"] if root else None)
             rows = [
                 r[0]
                 for r in conn.execute(
@@ -633,9 +651,15 @@ class Engine:
                 + " ORDER BY id LIMIT ?",
                 values + [limit + 1],
             ).fetchall()
+            from .read_policy import ReadPolicy
+
+            # A listing is an audit read: everything is there, and what is not experience says
+            # so. Classified before the attributes are blanked, because the rules read them.
+            policy = ReadPolicy.load(self, scope, "audit", conn=conn)
         items = []
         for row in rows[:limit]:
             data = json.loads(row["data"])
+            policy.present(data, data)
             data.update(content_length=len(data["content"]), preview=True)
             data["content"] = data["content"][:2000]
             data["attributes"] = {}
@@ -768,6 +792,9 @@ class Engine:
                         "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (sid, now())
                     )
                     conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+                    conn.execute(
+                        "DELETE FROM source_evidence_class WHERE source_id=?", (sid,)
+                    )
             # Stored command responses and session sets may contain deleted text.
             conn.execute("DELETE FROM commands")
             conn.execute("DELETE FROM sessions")
