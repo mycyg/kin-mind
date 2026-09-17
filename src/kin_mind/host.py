@@ -13,6 +13,7 @@ from eventmem.core.models import Scope, SourceInput
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
+from .conflicts import classify
 from .context import Contexts
 from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
@@ -388,7 +389,11 @@ def main():
         result = dispatch(load_config(args.config), args.action, json.load(sys.stdin))
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
-        result = {"error": type(error).__name__}
+        # Additive: the class stays the caller's contract, the taxonomy tells it
+        # whether waiting can help. Static codes only, never the failing payload.
+        found = classify(error)
+        result = {"error": type(error).__name__, "kind": found.kind,
+                  **({"code": found.code} if found.code else {})}
     print(json.dumps(result, ensure_ascii=False))
 
 

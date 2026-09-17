@@ -264,7 +264,13 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.exception_handler(Conflict)
     async def conflict(request, exc):
-        return JSONResponse({"detail": str(exc)}, status_code=409)
+        # Additive: `detail` is unchanged, the taxonomy says what moved and whether
+        # the caller may retry. Static classification only, never the payload.
+        from kin_mind.conflicts import classify
+
+        found = classify(exc)
+        return JSONResponse({"detail": str(exc), "kind": found.kind,
+                             **({"code": found.code} if found.code else {})}, status_code=409)
 
     @app.exception_handler(Missing)
     async def missing(request, exc):

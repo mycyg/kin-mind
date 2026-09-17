@@ -75,7 +75,8 @@ class Procedures:
             if previous["command_id"] == command:
                 return previous
             if p.expected_revision != previous["revision"]:
-                raise Conflict("Procedure changed during evaluation")
+                raise Conflict("Procedure changed during evaluation", target=identifier,
+                               expected=p.expected_revision, actual=previous["revision"])
         version = (json.loads(old[0])["revision"] + 1) if old else 1
         result = {**p.model_dump(), "id": identifier, "revision": version, "status": "candidate", "evidence": refs,
                   "command_id": command, "receipt": receipt, "outcomes": outcomes,
@@ -99,7 +100,7 @@ class Procedures:
             row = conn.execute("SELECT data FROM settings WHERE key='execution_environment'").fetchone()
             environment = json.loads(row[0]) if row else {}
         if any(environment.get(k) != v for k, v in p["environment"].items()):
-            raise Conflict("Procedure dependency version changed")
+            raise Conflict("Procedure dependency version changed", target=identifier)
         failures = conn.execute("SELECT data FROM mind_procedure_trials WHERE scope=? AND procedure_id=? AND revision=?", (self.scope, identifier, p["revision"])).fetchall()
         if any(not json.loads(r[0])["passed"] for r in failures):
             raise Conflict("Procedure has a failed counterexample")
@@ -116,7 +117,8 @@ class Procedures:
     def _record_trial(self, conn, *, identifier, revision, trial_id, result_id, passed, isolated, environment, verification):
         p = self.get(conn, identifier)
         if p["revision"] != revision:
-            raise Conflict("Trial ran a different method revision")
+            raise Conflict("Trial ran a different method revision", target=identifier,
+                           expected=revision, actual=p["revision"])
         outcome = self.outcome(conn, result_id)
         if outcome["external"] and not isolated:
             raise Conflict("External effects must use isolated validation and existing receipts")
@@ -180,7 +182,8 @@ def prepare_replay(engine, payload, provider=None):
             raise NotConfigured("Procedure learning is disabled")
         p = methods.get(conn, payload["id"])
         if p["revision"] != payload["revision"] or not mind._fresh(conn, p["evidence"]):
-            raise Conflict("Procedure evidence changed before replay")
+            raise Conflict("Procedure evidence changed before replay", target=payload["id"],
+                           expected=payload["revision"], actual=p["revision"])
         outcomes = {i: methods.outcome(conn, i) for i in p["result_ids"]}
         if len({o["case_id"] for o in outcomes.values()}) < 2:
             raise Conflict("Need independent result cases")
@@ -196,7 +199,8 @@ def prepare_replay(engine, payload, provider=None):
     def apply(conn):
         current = methods.get(conn, p["id"])
         if current["revision"] != p["revision"] or not mind._fresh(conn, p["evidence"]):
-            raise Conflict("Procedure changed during replay")
+            raise Conflict("Procedure changed during replay", target=p["id"],
+                           expected=p["revision"], actual=current["revision"])
         for c in verdict.cases:
             methods._record_trial(conn, identifier=p["id"], revision=p["revision"], trial_id=digest([p["id"], p["revision"], c.result_id]),
                 result_id=c.result_id, passed=c.passed, isolated=True, environment=p["environment"],

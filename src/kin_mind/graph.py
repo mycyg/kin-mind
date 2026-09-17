@@ -283,7 +283,8 @@ class EventGraph:
             except Missing:
                 previous = None
             if previous and item.expected_revision != previous["revision"]:
-                raise Conflict("Graph node changed after evaluation")
+                raise Conflict("Graph node changed after evaluation", target=identifier,
+                               expected=item.expected_revision, actual=previous["revision"])
             if previous and previous["kind"] != item.kind:
                 raise Conflict("Graph kind is immutable")
             if item.occurred_at:
@@ -423,7 +424,8 @@ class EventGraph:
             proof = self.proof(conn, request.get("evidence_ids", []))
             identifier = request["id"]; current = self.get(conn, identifier)
             if current["revision"] != request.get("expected_revision"):
-                raise Conflict("Graph revision changed")
+                raise Conflict("Graph revision changed", target=identifier,
+                               expected=request.get("expected_revision"), actual=current["revision"])
             before, changed = {identifier: current}, []
             action = request["action"]
             if action == "merge":
@@ -431,7 +433,8 @@ class EventGraph:
                 if target["kind"] != current["kind"] or target.get("merged_into") or current.get("merged_into") or target["id"] == identifier:
                     raise Conflict("Invalid graph merge")
                 if target["revision"] != request.get("target_revision"):
-                    raise Conflict("Merge target changed")
+                    raise Conflict("Merge target changed", target=target["id"],
+                                   expected=request.get("target_revision"), actual=target["revision"])
                 before[target["id"]] = target
                 current = {**current, "state": "merged", "merged_into": target["id"]}
                 target = self._put(conn, {**target, "aliases": list(dict.fromkeys([*target.get("aliases", []), current["title"], *current.get("aliases", [])])), "merge_sources": list(dict.fromkeys([*target.get("merge_sources", []), identifier]))})
@@ -478,7 +481,8 @@ class EventGraph:
                 old = json.loads(prior[0])
                 for nid, revision in old["after_revisions"].items():
                     if self.get(conn, nid)["revision"] != revision:
-                        raise Conflict("Affected graph objects changed since the command")
+                        raise Conflict("Affected graph objects changed since the command", target=nid,
+                                       expected=revision, actual=self.get(conn, nid)["revision"])
                 for nid, value in old["before"].items():
                     before[nid] = self.get(conn, nid)
                     restored = value if value is not None else {**before[nid], "state": "retracted"}

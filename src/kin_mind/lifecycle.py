@@ -234,7 +234,8 @@ class EventLifecycle:
                 self.graph.proof(conn, member.get("source_ids", []), allowed)
             target = self.graph.get(conn, aliases.get(route.event_id, route.event_id), follow=True) if route.event_id else None
             if target and (target["kind"] != "event" or target["revision"] != route.expected_revision):
-                raise Conflict("Event route target changed")
+                raise Conflict("Event route target changed", target=target["id"],
+                               expected=route.expected_revision, actual=target["revision"])
             before, changed = {}, {}
             def remember(identifier, before=before):
                 if identifier not in before:
@@ -278,7 +279,8 @@ class EventLifecycle:
                 if route.thread_id:
                     thread = self.graph.get(conn, aliases.get(route.thread_id, route.thread_id))
                     if thread["kind"] != "thread" or thread["revision"] != route.expected_thread_revision:
-                        raise Conflict("Event thread changed")
+                        raise Conflict("Event thread changed", target=thread["id"],
+                                       expected=route.expected_thread_revision, actual=thread["revision"])
                     link(target["id"], "part_of", thread["id"])
             elif action == "link":
                 if not target:

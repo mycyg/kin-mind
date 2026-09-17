@@ -325,7 +325,8 @@ def test_commit_conflict_is_reported_back_as_a_static_code(system):
     assert jobs.run_one(provider, lane="action")["state"] == "pending"
     stored = saved(mind, job["id"])
     assert stored["error"] == "Conflict"
-    assert stored["error_detail"] == {"class": "Conflict", "code": "mind-revision-changed",
+    # WP1 adds `kind`: what moved, so a second conflict with another `actual` counts as progress.
+    assert stored["error_detail"] == {"class": "Conflict", "code": "mind-revision-changed", "kind": "runtime",
                                       "message": "Mind revision changed; read current state before updating",
                                       "target": mind.scope.key(), "expected": 2, "actual": 3}
     assert "PRIVATE_FIXTURE" not in dumps(stored["error_detail"])
@@ -533,25 +534,31 @@ def test_error_detail_keeps_only_static_host_facts(system):
     def formatted(identifier):
         raise Conflict("Source " + identifier)
 
+    # WP1: every detail now also carries the taxonomy's `kind`; an unclassified failure
+    # says so instead of leaving the next attempt to guess what moved.
     host = raised(lambda: memory.configure({"max_charged_attempts": 0}))
-    assert error_detail(host, "ValueError") == {"class": "ValueError", "message": "Charged appraisal attempts must be between 1 and 20"}
+    assert error_detail(host, "ValueError") == {"class": "ValueError", "kind": "unknown",
+                                                "message": "Charged appraisal attempts must be between 1 and 20"}
     # A payload repr from outside the host is never kept, only its class.
-    assert error_detail(raised(lambda: int("主人说的原文")), "ValueError") == {"class": "ValueError"}
-    assert error_detail(raised(lambda: Appraisal.model_validate({"reason": ""})), "ValidationError") == {"class": "ValidationError"}
-    assert error_detail(raised(unavailable), "Missing") == {"class": "Missing", "message": "Evidence source is unavailable"}
-    assert error_detail(Deleted("mem_" + "a" * 32), "Deleted") == {"class": "Deleted", "target": "mem_" + "a" * 32}
+    assert error_detail(raised(lambda: int("主人说的原文")), "ValueError") == {"class": "ValueError", "kind": "unknown"}
+    assert error_detail(raised(lambda: Appraisal.model_validate({"reason": ""})), "ValidationError") == {"class": "ValidationError", "kind": "unknown"}
+    assert error_detail(raised(unavailable), "Missing") == {
+        "class": "Missing", "kind": "runtime", "code": "evidence-source-unavailable", "message": "Evidence source is unavailable"}
+    assert error_detail(Deleted("mem_" + "a" * 32), "Deleted") == {"class": "Deleted", "kind": "unknown", "target": "mem_" + "a" * 32}
     assert error_detail(raised(not_current), "Conflict") == {
-        "class": "Conflict", "message": "Evidence is not current", "code": "evidence-not-current", "target": "mem_x"}
+        "class": "Conflict", "kind": "runtime", "message": "Evidence is not current", "code": "evidence-not-current", "target": "mem_x"}
     assert error_detail(RuntimeError("deepseek-timeout"), "deepseek-timeout") == {
-        "class": "RuntimeError", "code": "deepseek-timeout"}
+        "class": "RuntimeError", "kind": "unknown", "code": "deepseek-timeout"}
     # One rule now, the stricter one: the text is kept only when it is a literal of the code object that
     # raised it, so an exception merely constructed vouches for nothing. Its static keywords still stand.
     # A sentence built around an identifier the model cited is no longer a host sentence either.
     assert error_detail(raised(lambda: formatted("src_" + "b" * 32)), "Conflict") == {
-        "class": "Conflict", "target": "unresolved-reference"}
-    assert error_detail(Missing("Evidence source is unavailable"), "Missing") == {"class": "Missing", "target": "unresolved-reference"}
+        "class": "Conflict", "kind": "unknown", "target": "unresolved-reference"}
+    # Constructed, never raised: no static message to look up, so the registry classifies nothing.
+    assert error_detail(Missing("Evidence source is unavailable"), "Missing") == {
+        "class": "Missing", "kind": "unknown", "target": "unresolved-reference"}
     assert error_detail(Conflict("Evidence is not current", code="evidence-not-current", target="mem_x"), "Conflict") == {
-        "class": "Conflict", "code": "evidence-not-current", "target": "mem_x"}
+        "class": "Conflict", "kind": "runtime", "code": "evidence-not-current", "target": "mem_x"}
 
 
 def test_conflict_keeps_its_message_and_the_api_still_maps_409(system):
@@ -567,4 +574,8 @@ def test_conflict_keeps_its_message_and_the_api_still_maps_409(system):
     app = create_app(engine=mind.engine, token="test-credential", workers=False, mcp_enabled=False)
     response = asyncio.run(app.exception_handlers[Conflict](None, detailed))
     assert response.status_code == 409
-    assert json.loads(response.body) == {"detail": "Evidence is not current"}
+    # WP1 adds `code` and `kind` beside the unchanged `detail`; the status is still 409.
+    assert json.loads(response.body) == {"detail": "Evidence is not current",
+                                         "code": "evidence-not-current", "kind": "runtime"}
+    plain_body = json.loads(asyncio.run(app.exception_handlers[Conflict](None, plain)).body)
+    assert plain_body == {"detail": "Evidence is not current", "kind": "unknown"}

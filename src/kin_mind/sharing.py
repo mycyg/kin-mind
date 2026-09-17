@@ -109,7 +109,8 @@ class ShareLedger:
         ref = ContentReference.model_validate(raw)
         unit = self.graph.get(conn, ref.unit_id)
         if unit["kind"] != "finding" or ref.version != unit.get("content_version", 1):
-            raise Conflict("Share reference version is unavailable")
+            raise Conflict("Share reference version is unavailable", target=ref.unit_id,
+                           expected=ref.version, actual=unit.get("content_version", 1))
         if not self.graph.fresh(conn, unit):
             raise Conflict("Share reference needs review")
         return ref, unit

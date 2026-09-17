@@ -72,7 +72,8 @@ class ConversationHabits:
             return json.loads(previous[1])
         current = self.read(conn)
         if current["revision"] != proposal.expected_revision:
-            raise Conflict("Conversation preferences changed")
+            raise Conflict("Conversation preferences changed", target=self.scope.key(),
+                           expected=proposal.expected_revision, actual=current["revision"])
         entries = current["entries"]
         for key, value in values.items():
             entries[key] = {"value": value, "evidence": proof, "reason": proposal.reason, "at": self.mind.clock(), "revision": current["revision"] + 1}

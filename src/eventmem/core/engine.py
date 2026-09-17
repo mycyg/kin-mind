@@ -33,7 +33,8 @@ class Engine:
         row = conn.execute("SELECT * FROM commands WHERE id=?", (key,)).fetchone()
         if row:
             if row["digest"] != hashed:
-                raise Conflict("Idempotency key reused with different content")
+                # The key, not the payload: the digests stay out of the failure record.
+                raise Conflict("Idempotency key reused with different content", target=key)
             return json.loads(row["result"])
         result = run()
         conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, hashed, dumps(result)))
@@ -214,7 +215,7 @@ class Engine:
     def _insert(self, conn, record: RecordInput):
         rid = record.id or uid("mem")
         if conn.execute("SELECT 1 FROM tombstones WHERE key=?", (rid,)).fetchone():
-            raise Deleted(rid)
+            raise Deleted(rid, code="tombstoned")
         existing = conn.execute(
             "SELECT data FROM records WHERE id=?", (rid,)
         ).fetchone()
@@ -225,7 +226,7 @@ class Engine:
                 or stored["scope"] != record.scope.model_dump()
                 or stored["kind"] != record.kind
             ):
-                raise Conflict("Record id already belongs to different content")
+                raise Conflict("Record id already belongs to different content", target=rid)
             return stored
         for sid in set(record.source_ids):
             row = conn.execute(
@@ -415,8 +416,12 @@ class Engine:
             def run():
                 data = self._get(conn, rid)
                 if data["revision"] != change.expected_revision:
+                    # A formatted message is never a static literal, so this one
+                    # carries its classification and its versions as keywords.
                     raise Conflict(
-                        f"Revision changed; current revision is {data['revision']}"
+                        f"Revision changed; current revision is {data['revision']}",
+                        kind="runtime", code="record-revision-changed", target=rid,
+                        expected=change.expected_revision, actual=data["revision"],
                     )
                 statuses = {
                     "confirm": "active",

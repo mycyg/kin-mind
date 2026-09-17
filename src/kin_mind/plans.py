@@ -112,9 +112,17 @@ class AutonomousPlans:
         if not refs or not self.mind._fresh(conn, refs):
             raise Conflict("Plan evidence needs review")
         if allowed is not None:
+            # Two different faults used to share one message: evidence this evaluation
+            # never saw is the proposal's own (the host decides it alone), while evidence
+            # that moved since it was supplied is a version the next attempt can read.
             manifest = {r["record_id"]: r["revision"] for r in allowed}
-            if any(manifest.get(r["record_id"]) != r["revision"] for r in refs):
-                raise Conflict("Plan uses evidence not supplied to this evaluation")
+            outside = next((r for r in refs if r["record_id"] not in manifest), None)
+            if outside:
+                raise Conflict("Plan uses evidence not supplied to this evaluation", target=outside["record_id"])
+            moved = next((r for r in refs if manifest[r["record_id"]] != r["revision"]), None)
+            if moved:
+                raise Conflict("Plan evidence changed after it was supplied", target=moved["record_id"],
+                               expected=manifest[moved["record_id"]], actual=moved["revision"])
         return refs
 
     def change(self, conn, proposal, command, *, allowed=None, receipt=None):
@@ -130,7 +138,8 @@ class AutonomousPlans:
         else:
             plan = self.get(conn, identifier)
             if plan["revision"] != p.expected_revision:
-                raise Conflict("Plan changed during evaluation")
+                raise Conflict("Plan changed during evaluation", target=identifier,
+                               expected=p.expected_revision, actual=plan["revision"])
             if plan["status"] in {"canceled", "completed"}:
                 raise Conflict("Terminal plans preserve their history; create a new goal")
             plan["revision"] += 1
@@ -201,7 +210,8 @@ class AutonomousPlans:
             raise Conflict("Autonomous action requires a verified DeepSeek high decision")
         plan = self._target(conn, d.plan_id)
         if plan["revision"] != d.expected_revision or plan["status"] != "active":
-            raise Conflict("Decision plan revision is no longer active")
+            raise Conflict("Decision plan revision is no longer active", target=plan["id"],
+                           expected=d.expected_revision, actual=plan["revision"])
         refs = self._refs(conn, d.evidence_ids, allowed)
         step = next((s for s in plan["steps"] if s["id"] == d.step_id), None)
         if not step or step["state"] in {"running", "completed", "unconfirmed", "abandoned"}:
@@ -304,7 +314,8 @@ class AutonomousPlans:
                 base = bases[plan["id"]] = {"expected": d.expected_revision, "revision": plan["revision"],
                                             "steps": self._entry(plan, self.owner_epoch(conn))["steps"]}
             elif d.expected_revision != base["expected"]:
-                raise Conflict("Inconsistent plan decision base revision")
+                raise Conflict("Inconsistent plan decision base revision", target=plan["id"],
+                               expected=base["expected"], actual=d.expected_revision)
             stale = base["expected"] != base["revision"]
             seen, actual = shown.get(plan["id"], {}).get("steps", {}).get(d.step_id), base["steps"].get(d.step_id)
             if plan["status"] != "active":
@@ -620,7 +631,8 @@ class AutonomousPlans:
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND id=?", (self.scope, run_id)).fetchone()
             if not row or row["owner"] != owner or row["fence"] != fence:
-                raise Conflict("Execution fence mismatch")
+                raise Conflict("Execution fence mismatch", target=run_id, expected=fence,
+                               actual=row["fence"] if row else None)
             run = json.loads(row["data"])
             if row["state"] != "running":
                 if run.get("result") == result and row["state"] == state:

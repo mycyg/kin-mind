@@ -97,8 +97,8 @@ the same on every lane: no further model call is paid for on that row until an
 operator resumes it, while its evidence, errors and receipts stay readable and
 subsequent batches continue. It records `repair_reason` with the count or code
 that ended the budget — `repeated-failure`, `charged-attempts-exhausted`,
-`compression-stalled`, `compression-passes-exhausted` or
-`transient-failures-exhausted` — rebuilds the frozen context and releases
+`compression-stalled`, `compression-passes-exhausted`,
+`transient-failures-exhausted` or `preparation-conflicts-exhausted` — rebuilds the frozen context and releases
 whatever the row had absorbed. A timeout is charged but never quarantines as a
 repeat, because a long context can time out deterministically.
 Transient provider failures — network errors, 5xx and 429 — produce no model
@@ -109,10 +109,26 @@ real progress, meaning newly cached parts, and by a total number of passes. The
 frozen context survives only while paid-for compression is tied to it; every
 charged failure and every quarantine rebuilds it.
 
+A conflict raised while the context is still being assembled, before any model
+call, is not a charged attempt either: it has a counter and a bound of its own
+and quarantines as `preparation-conflicts-exhausted`, rebuilding the frozen
+context each time because that snapshot is what went stale. A conflict no retry
+can resolve ends the row instead of spending the budget: the evidence it was
+enqueued for is gone or was already appraised, so the row finishes in the
+existing terminal `superseded` state with its code in `error_detail` and
+releases whatever it had absorbed. When another attempt has already committed
+the same judgment, the row completes from that durable receipt, with no second
+model call and nothing scored again.
+
 A failure keeps structured facts for the next attempt. `error_detail` holds the
-exception class, the host's own static code and message and the conflicting
-object — `Conflict` carries optional `code`, `target`, `expected` and `actual` —
-and never payload text or a validation repr. The next attempt is told as data,
+exception class, the host's own static code and message, the conflicting object
+and `kind` — what moved: `semantic` for a property of the proposal itself,
+`runtime` for a version that changed under it, `unknown` for a failure the host
+has not classified, which is always treated conservatively. `Conflict` and
+`Missing` carry optional `kind`, `code`, `target`, `expected` and `actual`; a
+runtime conflict whose `actual` moved is progress, not the same error twice.
+Host error output and the API's 409 body carry `code` and `kind` beside their
+existing fields. None of them ever holds payload text or a validation repr. The next attempt is told as data,
 in `previous_attempt`, why the host refused the previous proposal: that detail
 plus the refused sections, held sections, held decisions and dropped fields. An
 operator resume clears it, so a row judged afresh is not argued with about a
@@ -192,8 +208,8 @@ Queue counts are grouped by state and lane, so quarantined work is visible as
 `needs-repair` for the lane it belongs to. The `read` action returns the most
 recent appraisal rows, where a failed or partly refused attempt is legible
 without opening a proposal: `error`, `error_detail`, `repair_reason`,
-`waiting_reason`, `admission_waits`, `compression_waits`, `compression_stalls`
-and `transient_failures`, together with the committed `result` — which carries
+`waiting_reason`, `admission_waits`, `compression_waits`, `compression_stalls`,
+`transient_failures` and `preparation_conflicts`, together with the committed `result` — which carries
 `rejected_sections` as section, code and host message, `held_sections` as the
 section, the part held, how many items and the upstream refusal, `held_decisions`
 as plan, step and one of `plan-inactive`, `view-missing`, `step-touched` or

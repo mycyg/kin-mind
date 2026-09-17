@@ -67,6 +67,11 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             "plan_review_record_only": True,
             # Default-on: one refused proposal section no longer fails the whole appraisal.
             "appraisal_section_isolation": True,
+            # Stage 2, registered once here and read through autonomy_schema.optimized():
+            # each one off restores the stage-1 behavior of its work package.
+            "attempt_ledger": True, "idempotency_fingerprint": True, "manifest_rebase": True,
+            "appraisal_reuse": True, "appraisal_revalidation": True, "model_lanes": True,
+            "semantic_cache_v2": True, "memory_item_isolation": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -171,7 +176,9 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation"):
+        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
+                    "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
+                    "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
@@ -280,7 +287,8 @@ class MemoryContinuity:
         if artifact.get("path"):
             observed = fingerprint_file(artifact["path"])
             if artifact.get("sha256") and artifact["sha256"] != observed["sha256"]:
-                raise Conflict("Observed artifact version changed before ingestion")
+                raise Conflict("Observed artifact version changed before ingestion",
+                               expected=artifact["sha256"], actual=observed["sha256"])
             artifact = {**artifact, **observed, **({"name": artifact["name"]} if artifact.get("name") else {})}
         if artifact and not artifact.get("sha256"):
             raise ValueError("Artifacts require a host-observed fingerprint")
@@ -355,7 +363,8 @@ class MemoryContinuity:
                 prior = share["bubbles"].get(bubble, {})
                 content = event.get("text", "")
                 if prior.get("text", content) != content:
-                    raise Conflict("Bubble content changed under the same ID")
+                    # The bubble's identity only; the two bodies stay where they are.
+                    raise Conflict("Bubble content changed under the same ID", target=bubble)
                 state = event.get("state", "prepared")
                 if state not in {"prepared", "pending", "unconfirmed", "accepted", "canceled"}:
                     raise ValueError("Invalid delivery state")
@@ -566,10 +575,18 @@ class MemoryContinuity:
         allowed_sources = {r["source_id"] for r in refs}
         allowed_records = {r["record_id"] for r in refs}
         def evidence(ids):
+            # Two different faults used to share one message. Evidence this evaluation never
+            # saw is the proposal's own fault and is blocked; cited evidence that has since
+            # moved is a version, and the next attempt can be built on the current one.
             records = [record for identifier in ids for record in self._record_ids(conn, identifier)]
             selected = self.mind._evidence(conn, list(dict.fromkeys(records)))
-            if any(r["source_id"] not in allowed_sources and r["record_id"] not in allowed_records for r in selected) or not self.mind._fresh(conn, selected):
-                raise Conflict("Semantic evidence is outside the evaluated source set")
+            outside = next((r for r in selected if r["source_id"] not in allowed_sources and r["record_id"] not in allowed_records), None)
+            if outside:
+                raise Conflict("Semantic evidence is outside the evaluated source set", target=outside["record_id"])
+            stale = next((r for r in selected if not self.mind._fresh(conn, [r])), None)
+            if stale:
+                raise Conflict("Cited semantic evidence is no longer current",
+                               target=stale["record_id"], expected=stale["revision"])
             return selected
         note_aliases = {note.key: "mem_" + digest([self.scope.key(), event_id, note.key])[:32] for note in assessment.notes}
         if len(note_aliases) != len(assessment.notes):
