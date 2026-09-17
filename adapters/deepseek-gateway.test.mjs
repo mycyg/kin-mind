@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deepseekRequest, responseNormalizer, startDeepSeekGateway, replyContract} from './deepseek-gateway.mjs';
+import {deepseekRequest, responseNormalizer, startDeepSeekGateway, replyContract, nativeTurnPurpose} from './deepseek-gateway.mjs';
+import {createLeaseClient} from './model-lease.mjs';
 
 test('named native host events remain non-user data and do not corrupt ordinary tool receipts',()=>{
   const internal={type:'function_call_output',name:'kin_continuity_check',output:'Verify the current checkpoint'};
@@ -78,5 +79,53 @@ test('local gateway authenticates requests and enforces the configured effort at
     assert.equal((await response.json()).output.length,1);
     assert.equal(sent.url,'https://api.deepseek.com/responses');
     assert.equal(JSON.parse(sent.options.body).reasoning.effort,'high');
+  } finally {await gateway.close();}
+});
+
+const sse = frames => new Response(new ReadableStream({start(controller){
+  for(const frame of frames)controller.enqueue(new TextEncoder().encode(frame));controller.close();}}),
+  {headers:{'Content-Type':'text/event-stream'}});
+const turn = (gateway,body={model:'deepseek-flash',input:[]}) => fetch(gateway.baseUrl+'/responses',
+  {method:'POST',headers:{Authorization:'Bearer '+gateway.token},body:JSON.stringify(body)});
+
+test('native turns are attributed per session, and a background session yields a lane it cannot have',async()=>{
+  const usage=[];let kind='creation',upstream=0;
+  assert.deepEqual(nativeTurnPurpose('chat'),{lane:'foreground',purpose:'native-chat-turn'});
+  for(const background of ['contact-draft','creation','exploration'])
+    assert.equal(nativeTurnPurpose(background).lane,'background');
+  // One ledger answer for both turns: full for background, never a wait for foreground.
+  const lease=createLeaseClient({request:async()=>({state:'wait',reason:'deepseek-background-capacity',retry_after_seconds:30}),
+    setTimer:()=>0,clearTimer:()=>{}});
+  const gateway=await startDeepSeekGateway({key:'synthetic-secret',lease,onUsage:row=>usage.push(row),
+    purposeFor:()=>nativeTurnPurpose(kind),
+    fetchImpl:async()=>{upstream++;return new Response(JSON.stringify({id:'r',model:'deepseek-flash',usage:{input_tokens:7},output:[]}),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    assert.equal((await turn(gateway)).status,503);
+    assert.equal(upstream,0,'a yielded background turn never reaches the provider');
+    assert.deepEqual([usage[0].lane,usage[0].purpose,usage[0].usageStatus,usage[0].outcome],
+      ['background','native-creation','skipped','lane-skipped']);
+    assert.equal(usage[0].usage,null);
+    kind='chat';
+    assert.equal((await turn(gateway)).status,200);
+    assert.equal(upstream,1);
+    assert.deepEqual([usage[1].lane,usage[1].purpose,usage[1].usageStatus],['foreground','native-chat-turn','reported']);
+  } finally {await gateway.close();}
+});
+
+test('a provider error, a failed stream and a broken stream each leave one unknown usage row',async()=>{
+  const usage=[];let reply;
+  const gateway=await startDeepSeekGateway({key:'synthetic-secret',onUsage:row=>usage.push(row),fetchImpl:async()=>reply()});
+  try {
+    reply=()=>new Response('',{status:500});
+    assert.equal((await turn(gateway)).status,500);
+    reply=()=>sse(['data: '+JSON.stringify({type:'response.incomplete',response:{id:'r',model:'deepseek-flash',usage:{input_tokens:4}}})+'\n\n','data: [DONE]\n\n']);
+    assert.equal((await turn(gateway)).status,200);
+    reply=()=>sse(['data: '+JSON.stringify({type:'response.output_text.delta',delta:'x'})+'\n\n']);
+    const broken=await turn(gateway);await broken.text();
+    assert.deepEqual(usage.map(r=>[r.usageStatus,r.outcome]),
+      [['unknown','provider-http-500'],['reported','incomplete'],['unknown','transport-incomplete']]);
+    assert.equal(usage[0].usage,null);assert.equal(usage[2].usage,null);
+    assert.deepEqual(usage[1].usage,{input_tokens:4});
+    for(const row of usage)assert.ok(JSON.stringify(row).includes('"usage":'),'a usage key is always present');
   } finally {await gateway.close();}
 });

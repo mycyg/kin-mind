@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 import {atomicJson,ROUTER_MODELS} from './mobile-router.mjs';
+import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
@@ -9,8 +10,8 @@ const fingerprint=(router,task)=>hash({reviewPolicyVersion:4,task,inputs:task.in
 /** DeepSeek supplies the semantic judgment; the host owns execution and receipts.
  * Reviews run outside the router mutex and never take over a native user turn. */
 export class WorkLockReview {
-  constructor({router,file,collect,review,cancelDeferred=async()=>{throw Error('Deferred cancellation unavailable');},now=()=>Date.now(),retryMs=20*60000}) {
-    Object.assign(this,{router,file,collect,review,cancelDeferred,now,retryMs});
+  constructor({router,file,collect,review,cancelDeferred=async()=>{throw Error('Deferred cancellation unavailable');},now=()=>Date.now(),retryMs=20*60000,skipRetryMs=5*60000}) {
+    Object.assign(this,{router,file,collect,review,cancelDeferred,now,retryMs,skipRetryMs});
     router.workReviewerEnabled=true;
     this.running=false;this.closed=false;
     this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,attempts:{}};
@@ -53,7 +54,9 @@ export class WorkLockReview {
       if(this.closed)return {state:'closed'};
       // Never silently truncate a task into a misleading completion decision.
       if(JSON.stringify(evidence.input).length>64000||snapshot.inputs.length>128)return this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,state:'waiting',reason:'review-context-needs-summary',checkedAt:this.now()});
-      attempt=this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',checkedAt:this.now(),attempts:(previous?.attempts??0)+1});
+      // The reserved user-work lane is recorded with the attempt: this verdict is
+      // about the owner's own work and is never reused for any other question.
+      attempt=this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,lane:REVIEWER_LANES.reviewWork,purpose:REVIEWER_PURPOSES.reviewWork,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',checkedAt:this.now(),attempts:(previous?.attempts??0)+1});
       const result=await this.review(evidence.input),d=result.decision;
       const inputIds=new Set([...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])]),discardable=new Set((evidence.input.cancellableDeferred??[]).map(x=>x.id));
       // Retain the structured proposal even when its references fail validation.
@@ -106,6 +109,9 @@ export class WorkLockReview {
         return this.save({...attempt,state:'applied',appliedAt:this.now()});
       });
     } catch(error) {
+      // A refused lane is not a verdict and never resembles one: the work lock stays
+      // held and the review comes back, without spending a failure on it.
+      if(error?.leaseSkipped)return attempt?this.save({...attempt,state:'waiting',reason:'work-review-lane-unavailable',retryAt:this.now()+this.skipRetryMs}):{state:'waiting',reason:'work-review-lane-unavailable'};
       return attempt?this.save({...attempt,state:'failed',reason:error.message,receipt:error.receipt??attempt.receipt,retryAt:this.now()+this.retryMs}):{state:'waiting',reason:'work-evidence-unavailable'};
     } finally {this.running=false;}
   }
