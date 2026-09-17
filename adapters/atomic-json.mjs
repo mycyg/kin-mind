@@ -36,7 +36,9 @@ export function writeJsonAtomic(file,value,{previous=true,pretty=false,mode=0o60
     if(previous&&readJsonFile(file).state==='ok') {
       const link=file+'.'+unique()+'.prev.tmp';
       try{fs.linkSync(file,link);}catch{fs.copyFileSync(file,link);}
-      fs.renameSync(link,file+'.prev');
+      // Renaming a link onto the same inode is a no-op after an interrupted write,
+      // when `.prev` already names this revision: drop the link rather than leak it.
+      fs.renameSync(link,file+'.prev');fs.rmSync(link,{force:true});
     }
     fs.renameSync(temporary,file);
   } catch(error){fs.rmSync(temporary,{force:true});throw error;}

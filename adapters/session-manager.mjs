@@ -1,7 +1,7 @@
 import fs from 'node:fs';
-import path from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
-import {atomicJson} from './mobile-router.mjs';
+import {readJsonFile,createJsonExclusive} from './atomic-json.mjs';
+import {atomicJson,loadState} from './mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validateCheckpoint} from './session-policy.mjs';
 const hash=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const copy=v=>structuredClone(v);
@@ -13,8 +13,14 @@ export class SessionManager {
     Object.assign(this,{file,coordinator,inspect,collect,checkpoint,compact,ackCompact,createCandidate,injectCandidate,verifyCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence,reviewRequested,now});
     this.tail=Promise.resolve();this.closed=false;
     if(lease)this.acquireLease();
-    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,revision:0,binding:{conversationId:binding.conversationId??randomUUID(),generation:1,threadId:binding.threadId,nativeSessionId:binding.nativeSessionId},segments:[],config:{...SESSION_DEFAULTS,...config},compactions:[],evidence:{},events:{},requests:{},advice:null};
+    const loaded=loadState(file,{now,validate:value=>Boolean(value.binding?.threadId&&value.binding.nativeSessionId)&&Array.isArray(value.segments)});
+    // The binding is a fencing token. A registry with no readable revision left cannot
+    // be reopened at generation 1: an older fence, durable in a manifest, would pass it
+    // again. The quarantined bytes stay on disk, and restoring them is an operator step.
+    if(!loaded.value&&loaded.recovery)throw Error('KIN_SESSION_REGISTRY_UNREADABLE');
+    this.state=loaded.value??{schema:1,revision:0,binding:{conversationId:binding.conversationId??randomUUID(),generation:1,threadId:binding.threadId,nativeSessionId:binding.nativeSessionId},segments:[],config:{...SESSION_DEFAULTS,...config},compactions:[],evidence:{},events:{},requests:{},advice:null};
     if(this.state.schema!==1||!this.state.binding.threadId||!this.state.binding.nativeSessionId)throw Error('Invalid conversation registry');
+    if(loaded.recovery)this.state.recovery=loaded.recovery;
     this.state.config={...SESSION_DEFAULTS,...this.state.config};
     if(!this.state.segments.length)this.state.segments.push({...this.state.binding,state:'active',activatedAt:null});
     // A crash cannot turn an uncertain create, compact or promotion into retry.
@@ -23,26 +29,33 @@ export class SessionManager {
   }
   save(kind,details={}) {
     this.state.revision++;
-    atomicJson(this.file,this.state);
+    atomicJson(this.file,this.state,{previous:true});
     fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify({at:this.now(),revision:this.state.revision,kind,...details})+'\n',{mode:0o600});
   }
   view(){return copy(this.state);}
   fence(){return copy(this.state.binding);}
   assertFence(fence) {
-    const current=JSON.parse(fs.readFileSync(this.file,'utf8')).binding;
-    if(hash(current)!==hash(fence))throw Error('KIN_STALE_SESSION_GENERATION');
+    // The current file only: a fence is never checked against an older revision.
+    const current=readJsonFile(this.file);
+    if(current.state!=='ok'||!current.value?.binding)throw Error('KIN_SESSION_REGISTRY_UNREADABLE');
+    if(hash(current.value.binding)!==hash(fence))throw Error('KIN_STALE_SESSION_GENERATION');
     return true;
   }
   async locked(fn){return this.coordinator.locked(async()=>{this.assertFence(this.state.binding);return fn();});}
   acquireLease() {
     const file=this.file+'.lease';
-    fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
-    const write=()=>{const fd=fs.openSync(file,'wx',0o600);try{fs.writeFileSync(fd,JSON.stringify({pid:process.pid,nonce:this.leaseNonce}));fs.fsyncSync(fd);}finally{fs.closeSync(fd);}};
     this.leaseNonce=randomUUID();
-    try{write();}catch(error){if(error.code!=='EEXIST')throw error;const owner=JSON.parse(fs.readFileSync(file,'utf8'));let dead=false;try{process.kill(owner.pid,0);}catch(e){dead=e.code==='ESRCH';}if(!dead)throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');fs.unlinkSync(file);write();}
+    const write=()=>createJsonExclusive(file,{pid:process.pid,nonce:this.leaseNonce});
+    if(!write()) {
+      // An unreadable lease is treated as held: a second live host is the dangerous case.
+      const owner=readJsonFile(file).value;let dead=false;
+      if(Number.isInteger(owner?.pid)){try{process.kill(owner.pid,0);}catch(e){dead=e.code==='ESRCH';}}
+      if(!dead)throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');
+      fs.unlinkSync(file);if(!write())throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');
+    }
     this.leaseFile=file;
   }
-  close(){this.closed=true;if(this.leaseFile&&fs.existsSync(this.leaseFile)&&JSON.parse(fs.readFileSync(this.leaseFile,'utf8')).nonce===this.leaseNonce)fs.unlinkSync(this.leaseFile);}
+  close(){this.closed=true;if(this.leaseFile&&readJsonFile(this.leaseFile).value?.nonce===this.leaseNonce)fs.unlinkSync(this.leaseFile);}
   evidence(event) {
     if(!event.id||!event.sourceId||!event.revision||!Number.isFinite(event.at))throw Error('Session evidence needs a source and time');
     const old=this.state.evidence[event.id];
