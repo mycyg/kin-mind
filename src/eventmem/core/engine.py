@@ -311,6 +311,10 @@ class Engine:
         invalidate_source(self, conn, data)
         from kin_mind.lifecycle import record_changed
         record_changed(conn, data)
+        from kin_mind.judgment_cache import invalidate
+        # A revised source ends every judgment that rested on it. A request digest
+        # proves two requests are equal, not that the evidence behind them still holds.
+        invalidate(conn, [data["id"]])
         conn.execute(
             "INSERT INTO dirty VALUES(?,?) ON CONFLICT(record_id) DO UPDATE SET revision=excluded.revision",
             (data["id"], data["revision"]),

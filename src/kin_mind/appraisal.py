@@ -25,7 +25,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts
+from . import attempts, judgment_cache
 from .conflicts import classify, static_message
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .dialogue import clock_context, recent_dialogue
@@ -537,26 +537,75 @@ class DeepSeek:
         provider.engine = engine
         return provider
 
-    def structured(self, name, schema, system, context, *, max_tokens=65536):
-        """Share the verified Flash/high transport; accept only the named tool result."""
+    def _cache_hit(self, name, schema, value, token):
+        """A hit is an accounted call with no usage: `reused`, never a new request. It
+        saves the call and nothing else — the caller still validates before committing."""
+        attempts.record_call(self, name, outcome="cache-hit", model=value["receipt"].get("model"),
+                             request_id=value["receipt"].get("request_id"), elapsed_ms=0, usage_status="reused")
+        receipt = {**value["receipt"], "cache_hit": True, "usage": {}, "usage_status": "reused",
+                   "elapsed_ms": 0}
+        if token:
+            receipt["judgment_cache"] = token
+        return schema.model_validate(value["result"]), receipt
+
+    def _cache_get(self, name, schema, system, context, judgment):
+        """Look this exact rendered request up, and report what the write seam needs.
+
+        Judgment cache v2 when the caller declared a judgment and `semantic_cache_v2`
+        is on for its scope; otherwise the previous generation-keyed cache, unchanged.
+        """
+        if not hasattr(self, "engine"):
+            return None, None
+        if judgment is not None:
+            judgment_cache.identity(name, judgment)
+        request = digest([name, system, schema.model_json_schema(), context, self.endpoint, "deepseek-flash/high"])
+        with self.engine.db.connect() as conn:
+            if judgment is not None and judgment_cache.enabled(conn, judgment["scope"]):
+                found = judgment_cache.get(self.engine, conn, name, request, judgment, now=time.time())
+                state = {"request": request, "generation": None, "v2": True}
+                return state, (self._cache_hit(name, schema, found[1], found[0]) if found else None)
+            if name in judgment_cache.NEVER_CACHED:
+                return None, None
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_semantic_cache'").fetchone():
+                return None, None
+            generation = conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0]
+            cached = conn.execute("SELECT data FROM mind_semantic_cache WHERE id=? AND generation=? AND expires_at>?",
+                (request, generation, time.time())).fetchone()
+            state = {"request": request, "generation": generation, "v2": False}
+            return state, (self._cache_hit(name, schema, json.loads(cached[0]), None) if cached else None)
+
+    def _cache_put(self, state, name, context, judgment, depends_on, valid_for, result, receipt):
+        """Store the answer. Under v2 the row is **pending**: only the caller that
+        validated the result makes it servable, so a rejected result is never replayed."""
+        if not state or time.monotonic() > getattr(self, "absolute_deadline", float("inf")):
+            return None
+        value = {"result": result.model_dump(), "receipt": receipt}
+        if state["v2"]:
+            return judgment_cache.put(self.engine, name, state["request"], judgment, value,
+                                      now=time.time(), valid_for=valid_for,
+                                      depends_on=judgment_cache.dependencies(context, depends_on))
+        with self.engine.db.connect(write=True) as conn:
+            if conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0] == state["generation"]:
+                conn.execute("DELETE FROM mind_semantic_cache WHERE expires_at<=?", (time.time(),))
+                conn.execute("INSERT OR REPLACE INTO mind_semantic_cache VALUES(?,?,?,?)",
+                    (state["request"], state["generation"], time.time()+300, dumps(value)))
+        return None
+
+    def structured(self, name, schema, system, context, *, max_tokens=65536,
+                   judgment=None, depends_on=None, valid_for=None):
+        """Share the verified Flash/high transport; accept only the named tool result.
+
+        A caller that declares a `judgment` (type, goal, completion condition,
+        obligation version and scope) opts into the judgment cache, and confirms with
+        `judgment_cache.accept()` once its own validation passed.
+        """
         started = time.monotonic()
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
-        cache_key, generation = None, None
-        if hasattr(self, "engine"):
-            with self.engine.db.connect() as conn:
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_semantic_cache'").fetchone():
-                    generation = conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0]
-                    cache_key = digest([name, system, schema.model_json_schema(), context, self.endpoint, "deepseek-flash/high"])
-                    cached = conn.execute("SELECT data FROM mind_semantic_cache WHERE id=? AND generation=? AND expires_at>?",
-                        (cache_key, generation, time.time())).fetchone()
-                    if cached:
-                        value = json.loads(cached[0])
-                        attempts.record_call(self, name, outcome="cache-hit", model=value["receipt"].get("model"),
-                                             request_id=value["receipt"].get("request_id"), elapsed_ms=0, usage_status="reused")
-                        return schema.model_validate(value["result"]), {**value["receipt"], "cache_hit": True,
-                            "usage": {}, "usage_status": "reused", "elapsed_ms": 0}
+        cache_state, hit = self._cache_get(name, schema, system, context, judgment)
+        if hit is not None:
+            return hit
         body, request_digest = {}, digest([name, system, context])
         def elapsed():
             return round((time.monotonic() - started) * 1000)
@@ -599,12 +648,9 @@ class DeepSeek:
             receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
                        **attempts.usage_entry(body.get("usage")), "verified_at": datetime.now(timezone.utc).isoformat(),
                        "elapsed_ms": elapsed(), "cache_hit": False}
-            if cache_key and time.monotonic() <= getattr(self, "absolute_deadline", float("inf")):
-                with self.engine.db.connect(write=True) as conn:
-                    if conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0] == generation:
-                        conn.execute("DELETE FROM mind_semantic_cache WHERE expires_at<=?", (time.time(),))
-                        conn.execute("INSERT OR REPLACE INTO mind_semantic_cache VALUES(?,?,?,?)", (cache_key, generation, time.time()+300,
-                            dumps({"result": result.model_dump(), "receipt": receipt})))
+            token = self._cache_put(cache_state, name, context, judgment, depends_on, valid_for, result, receipt)
+            if token:
+                receipt["judgment_cache"] = token
             return result, receipt
         except httpx.TimeoutException:
             record("timeout")
