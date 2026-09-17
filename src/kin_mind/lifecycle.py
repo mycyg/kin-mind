@@ -108,6 +108,8 @@ def graph_changed(conn, scope, value, previous, at):
     for item in (value, previous or {}):
         identifiers.update(item[k] for k in ("subject", "object") if item.get(k))
     mark_dirty(conn, scope, identifiers, at, "graph-revision")
+    from .judgment_cache import invalidate
+    invalidate(conn, identifiers)
 
 
 def record_changed(conn, record):
@@ -131,6 +133,10 @@ def record_deleted(conn, record, at):
     conn.execute("UPDATE mind_event_digests SET data='{}' WHERE scope=? AND event_id IN "
                  "(SELECT event_id FROM mind_event_dependencies WHERE scope=? AND record_id=?)",
                  (scope, scope, record["id"]))
+    # Nor inside a cached judgment: an erasure purges the rows, it does not wait for a
+    # TTL. Callers cite raw sources as well as records, so both identities are purged.
+    from .judgment_cache import invalidate
+    invalidate(conn, [record["id"], *record.get("source_ids", [])])
 
 
 def record_usage(conn, scope, identifier, usage_id, origin, at, data=None):
@@ -464,7 +470,11 @@ class EventLifecycle:
              "correction_relations": [{k: e.get(k) for k in ("subject", "object", "reason", "basis", "occurred_at", "valid_from", "valid_until")}
                                       for e in snapshot["edges"].values() if e["predicate"] == "corrects"],
              "noncurrent_records": [{"id": r["id"], "status": r["status"]} for r in snapshot["all_records"].values() if r["id"] not in snapshot["records"]]},
-            max_tokens=65536)
+            max_tokens=65536,
+            judgment={"scope": self.scope.key(), "type": "event-digest", "goal": identifier,
+                      "completion": "every unit cites a supplied record id",
+                      "obligation_version": snapshot["input_hash"]},
+            depends_on=[identifier, *snapshot["all_records"]])
         result = summary.model_dump()
         unit_count = 0
         for section in ("narrative", "conclusions", "pending", "corrections"):
@@ -485,6 +495,10 @@ class EventLifecycle:
             row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?", (self.scope.key(), identifier)).fetchone()
             if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
                 raise Conflict("Event changed during digest generation")
+            # Second phase: the digest is servable only now that the event is still the
+            # one it was made from. The projection branch carries no token and is a no-op.
+            from .judgment_cache import accept
+            accept(self.engine, receipt, conn=conn)
             conn.execute("UPDATE mind_event_digests SET state='ready',revision=revision+1,input_hash=?,data=? WHERE scope=? AND event_id=?",
                          (snapshot["input_hash"], dumps(result), self.scope.key(), identifier))
             conn.execute("DELETE FROM mind_event_dependencies WHERE scope=? AND event_id=?", (self.scope.key(), identifier))

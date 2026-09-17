@@ -45,6 +45,28 @@ supports the official [Anthropic-compatible API](https://api-docs.deepseek.com/g
 with a typed `submit_appraisal` tool call. Credentials are sent only to the official
 HTTPS hostname. Embedding configuration remains independent.
 
+A structured tool call may be answered from the judgment cache (`mind_judgment_cache`)
+instead of the provider. Its key is the digest of the fully rendered request — tool
+name, system prompt, schema, context, endpoint, and model with its effort — and it no
+longer carries the database-wide generation, so an unrelated write elsewhere stops
+discarding a judgment that is still answerable. Four rules make dropping the
+generation safe. A caller states the judgment it is asking for — type, goal,
+completion condition and obligation version — and all four are matched alongside the
+request digest, so the verdict that a step is complete can never answer whether the
+owner's own work is complete. Acceptance has two phases: the answer is stored pending
+and becomes servable only once the caller reports that it passed the caller's own
+validation, so a result the host refused is never replayed. Each row keeps the
+identifiers its request rested on, and a revised, corrected or deleted source, or a
+graph change, purges it at once; a changed persona or scope configuration ends it as
+well. A row lives at most 300 seconds, and a caller may declare a shorter validity. A
+hit is recorded as a call with `usage_status: "reused"` and no usage, and it never
+skips the validation the caller runs before committing: an equal request proves the
+question is the same, not that the evidence behind it is still current.
+`submit_appraisal` is never served from this cache at all, because the host clock is
+part of that request; reuse on that path is the appraisal revalidation, not this.
+Setting `semantic_cache_v2` to false restores the previous generation-keyed cache in
+the older `mind_semantic_cache` table, which stage 2 otherwise leaves untouched.
+
 `Appraisals.enqueue` persists original evidence IDs. `run_one` leases one review per
 scope, makes one provider request, validates the response, and commits state and
 wish proposals in one transaction. Eight optional sections of that commit are
