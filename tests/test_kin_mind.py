@@ -707,3 +707,36 @@ def test_model_wait_ignores_maintenance_but_accepts_a_real_phone_source(setup):
             metadata={"host_event":"message", "role":"user", "channel":channel}))
         result = mind.reconsider_contacts(owner_epoch="unchanged")
         assert bool(result["resumed"]) == (channel == "feishu")
+
+
+@pytest.mark.parametrize("repair_valid", [True, False])
+def test_history_schema_repair_retains_both_call_receipts(monkeypatch, repair_valid):
+    monkeypatch.setenv("SYNTHETIC_KEY", "test-only-key")
+    calls = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        name = body["tools"][0]["name"]
+        calls.append(name)
+        fixed = name == "repair_appraisal" and repair_valid
+        return httpx.Response(200, json={
+            "model": "deepseek-flash", "id": name, "stop_reason": "tool_use",
+            "usage": {"input_tokens": 7, "output_tokens": 3 if name == "submit_appraisal" else 5},
+            "content": [{"type": "tool_use", "name": name,
+                         "input": {"reason": "Historical summary verified" if fixed else 123}}],
+        })
+
+    provider = DeepSeek("https://api.deepseek.com/anthropic", "deepseek-flash",
+                        "SYNTHETIC_KEY", transport=httpx.MockTransport(respond))
+    if repair_valid:
+        proposal, receipt = provider.appraise({"stimulus": "memory-enrichment"})
+        assert proposal.reason == "Historical summary verified"
+        assert receipt["usage"]["output_tokens"] == 3
+        assert receipt["schema_repair"]["usage"]["output_tokens"] == 5
+        assert receipt["request_id"] == "submit_appraisal"
+    else:
+        with pytest.raises(RuntimeError, match="deepseek-invalid-result"):
+            provider.appraise({"stimulus": "memory-enrichment"})
+        assert provider.failure_receipt["usage"]["output_tokens"] == 3
+        assert provider.failure_receipt["schema_repair"]["usage"]["output_tokens"] == 5
+    assert calls == ["submit_appraisal", "repair_appraisal"]
