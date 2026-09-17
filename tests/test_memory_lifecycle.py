@@ -796,6 +796,114 @@ def test_first_successful_ranking_can_expand_after_an_earlier_timeout(system, mo
     assert info["ranking_trace"][0]["followups"]
 
 
+CROWDED_QUERY = "9月16日星图蓝色主题后来改成什么了"
+CROWDED_ANSWER = "星图蓝色主题后来改成蓝紫色。"
+# The leading eight of the local ranking, and of a run whose second round was reranked.
+CROWDED_LOCAL_TOP = ["answer", "crowd-0", "crowd-1", "crowd-2", "crowd-3", "crowd-9", "crowd-4", "crowd-5"]
+CROWDED_RANKED_TOP = ["answer", "event", "crowd-21", "crowd-20", "crowd-19", "crowd-18", "crowd-17", "crowd-15"]
+
+
+class DeadRanker:
+    """Every rerank call hits the provider deadline."""
+    timeout = 30
+    def structured(self, name, schema, prompt, payload, **kwargs):
+        raise TimeoutError("recall-provider-deadline")
+
+
+def crowded_corpus(mind, memory, source, clock):
+    """More matching turns than the candidate cap, with one dated answer among them.
+
+    Only the answer falls inside the question's date window. The crowd arrives the next day as host
+    runtime events, so each round rescores the same pool even though the query never changes.
+    """
+    source("answer", CROWDED_ANSWER)
+    clock[0] += timedelta(days=1)
+    for index in range(70):
+        memory.ingest({"id": f"crowd-{index}", "kind": "owner-message", "at": mind.clock(),
+                       "text": f"星图蓝色主题的第{index}条讨论，后来改成什么还没定。"})
+        clock[0] += timedelta(minutes=1)
+    names = {}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE records SET data=json_set(data,'$.attributes.role','user')")
+        conn.execute("UPDATE records SET data=json_set(data,'$.attributes.host_event','message')")
+        for row in conn.execute("SELECT data FROM records"):
+            record = json.loads(row[0])
+            if record["content"] == CROWDED_ANSWER:
+                names[record["id"]] = "answer"
+            elif record["content"].startswith("星图蓝色主题的第"):
+                names[record["id"]] = "crowd-" + record["content"].split("第")[1].split("条")[0]
+    return names
+
+
+def test_a_rerank_that_never_answers_keeps_the_first_rounds_leading_evidence(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    names = crowded_corpus(mind, memory, source, clock)
+    recall = AdaptiveRecall(Contexts(mind))
+    local, local_info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=False)
+    degraded, info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=DeadRanker())
+    local_ids, degraded_ids = [i["id"] for i in local], [i["id"] for i in degraded]
+    # Without a model the local ranking answers the question by itself.
+    assert local_info["rounds"] == 1 and local_info["model_requests"] == 0
+    assert [names.get(i, "event") for i in local_ids[:8]] == CROWDED_LOCAL_TOP
+    assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
+    # A ranking nobody answered may not demote what the first round found without one.
+    assert degraded_ids[:8] == local_ids[:8]
+    # The extra rounds still order what follows it, and lose none of the first round's evidence.
+    assert set(local_ids) <= set(degraded_ids) and degraded_ids[8:] != local_ids[8:]
+
+
+def test_a_rerank_that_never_answers_returns_the_same_order_twice(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    crowded_corpus(mind, memory, source, clock)
+    recall = AdaptiveRecall(Contexts(mind))
+    first, first_info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=DeadRanker())
+    second, second_info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=DeadRanker())
+    assert [i["id"] for i in first] == [i["id"] for i in second]
+    assert first_info["rounds"] == second_info["rounds"] == 3
+
+
+def test_a_later_successful_rerank_still_decides_the_degraded_order(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    names = crowded_corpus(mind, memory, source, clock)
+    class Recovering:
+        timeout = 30
+        calls = 0
+        def structured(self, name, schema, prompt, payload, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("recall-provider-deadline")
+            # A distinctive order of its own: the answer, then the tail of the request backwards.
+            chosen = sorted(enumerate(payload["candidates"]), key=lambda c: ("蓝紫色" not in c[1]["text"], -c[0]))
+            return RecallRanking(ids=[c[1]["id"] for c in chosen[:8]]), {}
+    items, info = AdaptiveRecall(Contexts(mind)).collect(CROWDED_QUERY, mode="deep", allow_model=True,
+                                                        provider=Recovering())
+    assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
+    assert [names.get(i["id"], "event") for i in items[:8]] == CROWDED_RANKED_TOP
+
+
+def test_a_rerank_that_fails_outside_the_deadline_leaves_the_first_round_alone(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    crowded_corpus(mind, memory, source, clock)
+    class Broken:
+        timeout = 30
+        def structured(self, *a, **k):
+            raise RuntimeError("provider refused the request")
+    recall = AdaptiveRecall(Contexts(mind))
+    local, _ = recall.collect(CROWDED_QUERY, mode="deep", allow_model=False)
+    items, info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=Broken())
+    # Only a deadline buys another search round; anything else ends the loop where it failed.
+    assert info["rounds"] == 1 and "rerank:RuntimeError" in info["degraded_reasons"]
+    assert [i["id"] for i in items] == [i["id"] for i in local]
+
+
 def test_model_selects_followup_without_a_keyword_trigger(system, monkeypatch):
     import kin_mind.adaptive_recall as module
     from eventmem.core.providers import Providers
