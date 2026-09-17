@@ -460,6 +460,87 @@ def test_undo_is_a_dry_run_by_default_and_says_when_there_is_nothing_to_take_bac
     assert again["undo"]["claim_ids"] == [] and again["undo"]["node_ids"] == []
 
 
+def test_a_migration_taken_back_can_be_applied_again(world):
+    """An undo writes a new revision of every claim it restores, so the plan a second apply
+    makes is a different plan. Its commands have to say so, or the idempotency layer sees one
+    command id arriving with another payload and the chains can never be linked again."""
+    engine, ids = world["engine"], world["ids"]
+    run(world, apply=True)
+    migration(world).undo(apply=True)
+    again = run(world, apply=True)
+    assert again["state"] == "complete" and not strict(world)
+    assert again["steps"]["chains"] == {"linked": 2, "refused": []}
+    assert again["steps"]["invalidated"]["nodes"] == 2 and again["steps"]["invalidated"]["refused"] == []
+    assert [engine.get(ids[name])["status"] for name in ("voice-1", "voice-2", "voice-3")] == [
+        "superseded", "superseded", "active"]
+    with engine.db.connect() as conn:
+        node = world["graph"].get(conn, ids["mixed"])
+    assert node[MARK] == RULES_VERSION and CONFIGURATION_KEY in node
+    assert recalled(engine).isdisjoint({ids["installed"], ids["approved"]})
+
+
+def test_a_second_undo_restores_everything_and_skips_nothing(world):
+    engine, ids = world["engine"], world["ids"]
+    before = recalled(engine)
+    for _ in range(2):
+        run(world, apply=True)
+        result = migration(world).undo(apply=True)
+        # Every round leaves its own archive rows; only the newest one decides a restore, and
+        # the ones it superseded are never reported as work that could not be done.
+        assert result["summary"]["skipped"] == 0, result["undo"]["skipped"]
+        assert result["summary"]["claims"] == 2 and result["summary"]["nodes"] == 2
+        assert result["state"] == UNDONE and not strict(world)
+        assert recalled(engine) == before
+    with engine.db.connect() as conn:
+        kept = conn.execute("SELECT kind,COUNT(*) FROM mind_isolation_archive GROUP BY kind ORDER BY kind").fetchall()
+        node = world["graph"].get(conn, ids["mixed"])
+    # Nothing is deleted: both rounds are in the archive, the claims twice and the nodes twice.
+    assert dict(map(tuple, kept)) == {"evidence_class": 3, "graph_node": 4, "registry": 1, "self_claim": 4}
+    assert node["text"] == FINDING_TEXT and CONFIGURATION_KEY not in node and MARK not in node
+    assert engine.get(ids["voice-1"])["status"] == "active"
+
+
+def test_the_impact_list_reads_the_same_through_apply_undo_and_a_second_round(world):
+    seen = [sections(run(world))]
+    run(world, apply=True)
+    seen.append(sections(run(world)))
+    migration(world).undo(apply=True)
+    seen.append(sections(run(world)))
+    run(world, apply=True)
+    seen.append(sections(run(world)))
+    migration(world).undo(apply=True)
+    seen.append(sections(run(world)))
+    assert all(found == seen[0] for found in seen[1:])
+
+
+def test_a_claim_moved_by_another_writer_is_refused_with_its_code(world):
+    """A real concurrent change still stops the link, and the report says which code stopped
+    it, so an operator can tell a moved claim from a command id that was already used."""
+    engine, ids = world["engine"], world["ids"]
+    from eventmem.core.models import RevisionInput
+
+    original = IsolationMigration._step_chains
+
+    def meddle(self, plan):
+        engine.revise(ids["voice-1"], RevisionInput(command_id="outside-writer", expected_revision=1,
+                                                    action="correct", content="Amended by someone else.",
+                                                    reason="Synthetic concurrent correction"))
+        return original(self, plan)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IsolationMigration, "_step_chains", meddle)
+        result = run(world, apply=True)
+    refused = result["steps"]["chains"]["refused"]
+    assert [entry["code"] for entry in refused] == ["supersession-revision-changed"]
+    assert refused[0]["kind"] == "runtime" and refused[0]["old_id"] == ids["voice-1"]
+    assert result["state"] == "invalidated" and strict(world)
+    # The next apply plans against what is stored now and finishes.
+    finished = run(world, apply=True)
+    assert finished["state"] == "complete" and finished["steps"]["chains"]["refused"] == []
+    assert not strict(world)
+    assert [engine.get(ids[name])["status"] for name in ("voice-1", "voice-2")] == ["superseded", "superseded"]
+
+
 def test_link_supersession_mints_no_record_and_swaps_on_both_revisions(world):
     engine, ids = world["engine"], world["ids"]
     claims = SelfKnowledge(engine, SCOPE)
