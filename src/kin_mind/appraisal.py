@@ -15,7 +15,7 @@ import uuid
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -146,6 +146,89 @@ from .session_advice import (
     repair_input,
 )
 
+# --- The sections under audit -------------------------------------------------------------------
+# Shape only: identifiers, enumerations and bounds, so a request may carry a section before the
+# module that applies it exists. What a section means, and what it may commit, belong to that
+# module. Each is optional and empty by default; an empty one is left out of the stored proposal.
+
+Identifier = Annotated[str, Field(min_length=1, max_length=100)]
+ShortText = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class TraitObservation(Model):
+    key: str = Field(min_length=1, max_length=200)
+    category: str = Field(min_length=1, max_length=100)
+    slug: str = Field(min_length=1, max_length=100)
+    # `class` in the evidence vocabulary; a field cannot carry that name in Python.
+    evidence_class: Literal["owner_statement", "verified_behavior", "self_statement"]
+    polarity: Literal["support", "counter"]
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
+    result_ids: list[Identifier] = Field(default_factory=list, max_length=4)
+    note: str = Field(default="", max_length=300)
+
+
+class TraitEpisode(Model):
+    ref: ShortText
+    why_distinct: str = Field(min_length=1, max_length=200)
+
+
+class TraitDecision(Model):
+    action: Literal["propose", "establish", "revise", "fade", "restore", "revoke"]
+    trait_id: Identifier | None = None
+    expected_revision: StrictInt | None = Field(default=None, ge=0)
+    text: str = Field(min_length=1, max_length=300)
+    basis: Literal["inference", "owner_instruction", "owner_correction", "counter_evidence"]
+    observation_refs: list[Identifier] = Field(default_factory=list, max_length=8)
+    episodes: list[TraitEpisode] = Field(default_factory=list, max_length=4)
+    quote: str | None = Field(default=None, max_length=1000)
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=8)
+    reason: str = Field(min_length=1, max_length=400)
+
+
+class Prediction(Model):
+    statement: str = Field(min_length=1, max_length=300)
+    test_window_hours: StrictInt = Field(ge=1, le=168)
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
+
+
+class SelfHypothesis(Model):
+    statement: str = Field(min_length=1, max_length=300)
+    predictions: list[Prediction] = Field(default_factory=list, max_length=2)
+    trait_refs: list[Identifier] = Field(default_factory=list, max_length=4)
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
+    reason: str = Field(min_length=1, max_length=400)
+
+
+class PredictionOutcome(Model):
+    prediction_id: Identifier
+    outcome: Literal["confirmed", "refuted", "inconclusive"]
+    result_ids: list[Identifier] = Field(default_factory=list, max_length=4)
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
+    reason: str = Field(min_length=1, max_length=400)
+
+
+class IntentTopic(Model):
+    topic: ShortText
+    concern_id: Identifier | None = None
+
+
+class ExpressionIntent(Model):
+    stance: str = Field(min_length=1, max_length=300)
+    continue_topics: list[IntentTopic] = Field(default_factory=list, max_length=2)
+    avoid: list[ShortText] = Field(default_factory=list, max_length=2)
+    valid_minutes: StrictInt = Field(default=60, ge=10, le=720)
+    evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
+    trait_refs: list[Identifier] = Field(default_factory=list, max_length=6)
+
+
+class NextMove(Model):
+    move: Literal["reply", "quiet", "rest"]
+    wish_ref: Identifier | None = None
+    step_ref: Identifier | None = None
+    grounds: list[Identifier] = Field(default_factory=list, max_length=6)
+    alternative: str = Field(default="", max_length=300)
+    reason: str = Field(min_length=1, max_length=300)
+
 
 class Appraisal(Model):
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
@@ -166,6 +249,13 @@ class Appraisal(Model):
     plan_changes: list[PlanChange] = Field(default_factory=list, max_length=8)
     action_decisions: list[ActionDecision] = Field(default_factory=list, max_length=12)
     procedure_candidates: list[ProcedureCandidate] = Field(default_factory=list, max_length=4)
+    # Offered only where the switches and the lane allow, and applied by the module that owns each.
+    trait_observations: list[TraitObservation] = Field(default_factory=list, max_length=4)
+    trait_decisions: list[TraitDecision] = Field(default_factory=list, max_length=2)
+    self_hypothesis: SelfHypothesis | None = None
+    prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
+    expression_intent: ExpressionIntent | None = None
+    next_move: NextMove | None = None
 
     @field_validator("motivations")
     @classmethod
@@ -208,12 +298,27 @@ SECTION_UPSTREAM = {
     "reason": {}, "understanding": {}, "rhythm": {}, "sharing": {}, "memory": {}, "next_review_minutes": {},
     # Not applied by this commit: daily review only, and consumed before the commit.
     "evolution": {}, "recall_needs": {},
+    # Audited (AUDIT_SECTIONS below), and registered here like every other field so that what rests
+    # on what stays in one place.
+    "trait_observations": {},
+    "trait_decisions": {"trait_observations": None},
+    "self_hypothesis": {},
+    "prediction_outcomes": {},
+    "expression_intent": {"trait_decisions": None, "concerns": None},
+    "next_move": {"trait_decisions": None, "wishes": None, "action_decisions": None},
 }
+# Recorded and audited, never asked again: a refusal of one of these, and anything held behind one,
+# costs no model call. They are left out of the derivation below for exactly that reason. The order
+# is the order apply() commits them in: what is observed, then what was decided from it, then the
+# move, which is checked last because it may cite anything the same commit applied.
+AUDIT_SECTIONS = ("trait_observations", "trait_decisions", "self_hypothesis", "prediction_outcomes",
+                  "expression_intent", "next_move")
 # Applied inside a savepoint and a state snapshot, so each can be refused alone. A failure of any other
 # field fails the appraisal as before: without the event nothing is left to anchor the rest to.
-ISOLATED_SECTIONS = ("habits", "plan_changes", "action_decisions", "procedure_candidates", "concerns", "wishes", "wish_updates", "session_advice")
+ISOLATED_SECTIONS = ("habits", "plan_changes", "action_decisions", "procedure_candidates", "concerns", "wishes", "wish_updates", "session_advice", *AUDIT_SECTIONS)
 # Refusing one of these leaves something to ask again even when nothing of this proposal rested on it.
-UPSTREAM_SECTIONS = {upstream for rests in SECTION_UPSTREAM.values() for upstream in rests}
+UPSTREAM_SECTIONS = {upstream for name, rests in SECTION_UPSTREAM.items() if name not in AUDIT_SECTIONS
+                     for upstream in rests if upstream not in AUDIT_SECTIONS}
 # The same, for a reason of their own. A plan review is edge-triggered: it consumes its wake-up reason
 # whether or not a decision applies, and a refused decision leaves next_review_at where it was, in the
 # past. Nothing would ask that plan again until an unrelated reason appeared, and the model would never
@@ -222,6 +327,123 @@ STRANDING_SECTIONS = {"plan_changes", "action_decisions"}
 ASK_AGAIN_SECTIONS = UPSTREAM_SECTIONS | STRANDING_SECTIONS
 if set(SECTION_UPSTREAM) != set(Appraisal.model_fields) or not ASK_AGAIN_SECTIONS <= set(ISOLATED_SECTIONS):
     raise RuntimeError("Register every Appraisal field and its upstream sections in SECTION_UPSTREAM")
+if set(AUDIT_SECTIONS) & ASK_AGAIN_SECTIONS:
+    raise RuntimeError("An audited section is never asked again")
+
+# The switch each audited section is offered under. A switch that carries no section is not here.
+AUDIT_SECTION_SWITCH = {"trait_observations": "trait_ledger", "trait_decisions": "trait_ledger",
+                        "self_hypothesis": "behavior_chain", "prediction_outcomes": "behavior_chain",
+                        "expression_intent": "expression_intent", "next_move": "next_move_audit"}
+# Lanes that never carry an audited section: recorded history, the one follow-up, the migration and
+# session maintenance. The model is not even offered them there, and a proposal that reaches one of
+# these lanes from somewhere else is blanked before anything is validated against it.
+SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continuity-bootstrap", "session-maintenance"}
+# One short paragraph per section, appended only where that section is offered. Each belongs to the
+# module that applies the section: it replaces its own paragraph here and nothing else.
+TRAIT_OBSERVATIONS_PROMPT = "trait_observations 暂不接收内容，留空。"
+TRAIT_DECISIONS_PROMPT = "trait_decisions 暂不接收内容，留空。"
+SELF_HYPOTHESIS_PROMPT = "self_hypothesis 暂不接收内容，留空。"
+PREDICTION_OUTCOMES_PROMPT = "prediction_outcomes 暂不接收内容，留空。"
+EXPRESSION_INTENT_PROMPT = "expression_intent 暂不接收内容，留空。"
+NEXT_MOVE_PROMPT = "next_move 暂不接收内容，留空。"
+SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
+                   "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
+                   "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
+
+
+class SectionCommit:
+    """What a section handler is given. A handler needs something else: add it here, never at the
+    call site, so that one module's need does not reopen apply() for everybody."""
+
+    __slots__ = ("conn", "event_id", "job_id", "mind", "proposal", "receipt", "section",
+                 "settings", "sources", "state", "stimulus", "value", "version")
+
+    def __init__(self, **given):
+        for name in self.__slots__:
+            setattr(self, name, given.get(name))
+
+
+def unavailable_section(commit):
+    """What a section does until its own module claims it: accept nothing. An empty section passes,
+    so the switch may be on before the module lands; anything else is refused and recorded alone."""
+    if commit.value:
+        raise Conflict("No module has claimed this section yet", code="section-unavailable")
+
+
+# Section -> what applies it, run inside that section's savepoint in the order of AUDIT_SECTIONS.
+AUDIT_HANDLERS = {name: unavailable_section for name in AUDIT_SECTIONS}
+# Whether a section still commits when the owner wrote again while the appraisal ran. What was
+# observed did happen; a decision or an intent formed before that message waits for the next round.
+NEW_INTERACTION_COMMITS = {name: name == "trait_observations" for name in AUDIT_SECTIONS}
+
+
+def register_audit_section(name, handler, *, commits_on_new_interaction=False):
+    """The module that owns a section claims it here, at import time, and apply() stays as it is.
+    That module has to be imported on the commit path for the claim to be made; importing it where
+    its own tables or its context projection are set up is enough."""
+    if name not in AUDIT_SECTIONS:
+        raise RuntimeError("Unknown audited section")
+    AUDIT_HANDLERS[name] = handler
+    NEW_INTERACTION_COMMITS[name] = commits_on_new_interaction
+
+
+def audit_switches(conn, scope):
+    """The audited sections whose switch is on, read once per attempt like every other switch."""
+    return {name for name, switch in AUDIT_SECTION_SWITCH.items() if optimized(conn, scope, switch)}
+
+
+def offered_sections(stimulus, enabled):
+    """What one request may carry: the sections the switches allow, minus the lanes that carry none."""
+    if stimulus in SECTIONS_WITHHELD:
+        return ()
+    return tuple(name for name in AUDIT_SECTIONS if name in enabled)
+
+
+def blank_sections(proposal, offered):
+    """Force back to empty whatever this lane does not offer, before anything is validated against
+    it. The schema and the prompt already leave those sections out; a stored proposal may not."""
+    empty = Appraisal(reason=proposal.reason)
+    missing = {name: getattr(empty, name) for name in AUDIT_SECTIONS
+               if name not in offered and getattr(proposal, name)}
+    return proposal.model_copy(update=missing) if missing else proposal
+
+
+def proposal_record(proposal):
+    """What the queue row stores. An empty audited section is left out, so a reader that forbids
+    the fields it does not know still accepts a row this code wrote."""
+    return proposal.model_dump(exclude={name for name in AUDIT_SECTIONS if not getattr(proposal, name)})
+
+
+def asks_again(rejected, held):
+    """Whether these refusals leave anything one follow-up could restate. An audited section is
+    recorded and never asked again, and neither is anything held behind one."""
+    return (any(entry["section"] not in AUDIT_SECTIONS for entry in held)
+            or any(entry["section"] in ASK_AGAIN_SECTIONS for entry in rejected))
+
+
+REFUSAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mind_section_refusals(
+ scope TEXT NOT NULL, section TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL,
+ PRIMARY KEY(scope,section));
+"""
+
+
+def record_refusal(conn, scope, section, code, at):
+    """The last refusal of an audited section, so the projection that owns the section can show the
+    model why the host refused it. A static code and a time; never the proposal and never a text."""
+    conn.execute("INSERT OR REPLACE INTO mind_section_refusals VALUES(?,?,?,?)", (scope, section, code, at))
+
+
+def last_refusal(conn, scope, section=None):
+    """{section: {code, at}} for the audited sections that were refused, or one of them. A database
+    no appraisal queue has reached has refused nothing."""
+    try:
+        rows = conn.execute("SELECT section,code,at FROM mind_section_refusals WHERE scope=?"
+                            + (" AND section=?" if section else ""),
+                            (scope, section) if section else (scope,)).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {row["section"]: {"code": row["code"], "at": row["at"]} for row in rows}
 
 
 def refusal(section, error):
@@ -354,16 +576,24 @@ HISTORY_SYSTEM = """你是 Kin 的历史记忆整理器。只调用 submit_appra
 HISTORY_SYSTEM += PREVIOUS_ATTEMPT_PROMPT
 
 
-def appraisal_schema(operational=False, historical=False):
+def appraisal_schema(operational=False, historical=False, sections=()):
+    """`sections`: the audited sections this request offers. A section left out takes its property
+    and everything only it referenced with it, so a request offering none is the request as it was."""
     if historical:
         return HistoryAssessment.model_json_schema()
     schema = Appraisal.model_json_schema()
-    if not operational:
+    withheld = [name for name in AUDIT_SECTIONS if name not in sections]
+    for name in withheld:
+        schema["properties"].pop(name, None)
+    if not operational and not withheld:
         return schema
-    # The action lane has no graph-writing obligation. Do not ask a high
-    # reasoning model to plan fields which this transaction will not apply.
-    schema["properties"]["memory"] = {"type": "object", "properties": {}, "additionalProperties": False}
-    definitions = schema.pop("$defs", {})
+    if operational:
+        # The action lane has no graph-writing obligation. Do not ask a high
+        # reasoning model to plan fields which this transaction will not apply.
+        schema["properties"]["memory"] = {"type": "object", "properties": {}, "additionalProperties": False}
+    # `$defs` keeps the place it has: the action lane has always rebuilt it at the end, every other
+    # lane leaves the layout pydantic produced. A request's bytes do not move for a pruning.
+    definitions = schema.pop("$defs", {}) if operational else schema.get("$defs", {})
     used = set()
     def visit(value):
         if isinstance(value, dict):
@@ -377,7 +607,7 @@ def appraisal_schema(operational=False, historical=False):
         elif isinstance(value, list):
             for child in value:
                 visit(child)
-    visit(schema)
+    visit({key: value for key, value in schema.items() if key != "$defs"})
     schema["$defs"] = {key: definitions[key] for key in sorted(used)}
     return schema
 
@@ -756,7 +986,7 @@ class DeepSeek:
                             {
                                 "name": "submit_appraisal",
                                 "description": "Submit a validated state proposal",
-                                "input_schema": appraisal_schema(context.get("operational_only", False), context.get("stimulus") in {"memory-backfill", "memory-enrichment"}),
+                                "input_schema": appraisal_schema(context.get("operational_only", False), context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context)),
                             }
                         ],
                         "tool_choice": {"type": "auto"},
@@ -898,10 +1128,16 @@ class DeepSeek:
              "results": [s for s in context["new_evidence"] if s["id"] in target_ids], "recent_dialogue": context.get("recent_dialogue", [])}, max_tokens=65536)
         return fixed.sharing, receipt
 
+    def _sections(self, context):
+        """The audited sections this request offers. The host sets them for the attempt; a provider
+        that never set any offers none, which is the request as it was before they existed."""
+        return offered_sections(context.get("stimulus"), getattr(self, "audit_sections", ()) or ())
+
     def _system(self, context, policy):
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         return ((HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT) + persona_prompt(policy)
                 + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
+                + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。")
 
     def request_profile(self, context):
@@ -910,7 +1146,7 @@ class DeepSeek:
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         return {"system": digest(self._system(context, policy)),
-                "schema": digest(appraisal_schema(context.get("operational_only", False), historical)),
+                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context))),
                 "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": "high", "tool_choice": "auto"})}
 
 
@@ -929,7 +1165,7 @@ class Appraisals:
         self.session_context = session_context
         self.memory = MemoryContinuity(mind)
         with self.engine.db.connect() as conn:
-            conn.executescript(QUEUE_SCHEMA)
+            conn.executescript(QUEUE_SCHEMA + REFUSAL_SCHEMA)
 
     def exploration_targets(self, data, refs):
         if data.get("stimulus") != "exploration-result":
@@ -1469,6 +1705,9 @@ class Appraisals:
                 with self.engine.db.connect() as conn:
                     # One reading of the switch governs the whole attempt: the provider's validation, the advice repair and the commit.
                     isolation = optimized(conn, self.mind.scope.key(), SECTION_ISOLATION)
+                    # An audited section must never fail a whole appraisal, and without per-section
+                    # isolation there is nothing that could refuse one alone: then none is offered.
+                    audited = audit_switches(conn, self.mind.scope.key()) if isolation else set()
                     flags = manifests.switches(conn, self.mind.scope.key())
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
@@ -1504,6 +1743,9 @@ class Appraisals:
                         if not plan["needs_review"]:
                             semantic_refs.update({ref["record_id"]: ref for ref in plan["evidence"]})
                 provider.section_isolation = isolation
+                provider.audit_sections = audited
+                # What this lane may carry, for the request and for everything the commit applies.
+                offered = offered_sections(data.get("stimulus"), audited)
                 # The host's record of what this attempt is shown: the commit's rebase and the next
                 # attempt after a conflict both read it.
                 lane_name = "enrichment" if historical else "maintenance" if maintenance else "action"
@@ -1529,6 +1771,9 @@ class Appraisals:
                     if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
                         from .decision_context import expand
                         proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
+                # One place decides what an audited section may carry on this lane; a proposal that
+                # came back from storage is held to it exactly like one this attempt asked for.
+                proposal = blank_sections(proposal, offered)
                 # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
                 data.pop("dropped_fields", None)
                 if receipt.get("dropped_fields"):
@@ -1570,7 +1815,7 @@ class Appraisals:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": [], "recall_needs": []})
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
-                data.update(proposed_result=proposal.model_dump(), receipt=receipt,
+                data.update(proposed_result=proposal_record(proposal), receipt=receipt,
                             evaluated_sources=list(semantic_refs.values()))
                 if manifest:
                     # The manifest this proposal rests on: this attempt's, unless the proposal was reused
@@ -1582,19 +1827,19 @@ class Appraisals:
                 if missing_targets and self.exploration_capabilities.get("decisions"):
                     if hasattr(provider, "repair_sharing") and not data.get("sharing_repair_attempted"):
                         data["sharing_repair_attempted"] = True
-                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal.model_dump(), "receipt": receipt})
+                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt})
                         with self.engine.db.connect(write=True) as conn:
                             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
                         proposal = proposal.model_copy(update={"sharing": sharing})
                         receipt = {**receipt, "sharing_repair": repair_receipt}
-                        data.update(proposed_result=proposal.model_dump(), receipt=receipt)
+                        data.update(proposed_result=proposal_record(proposal), receipt=receipt)
                     if any(sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1 for t in targets):
                         raise RuntimeError("deepseek-missing-sharing-decision")
                 if data.get("stimulus") == FOLLOW_UP and isolation:
                     # The host, not the prompt, keeps a follow-up to what a commit can refuse or hold. The event
                     # itself was committed by the parent and is neither scored nor remembered a second time.
-                    blank, restated = Appraisal(reason=proposal.reason), {*ISOLATED_SECTIONS, "reason", "next_review_minutes", "values", "motivations"}
+                    blank, restated = Appraisal(reason=proposal.reason), {*ISOLATED_SECTIONS, "reason", "next_review_minutes", "values", "motivations"} - set(AUDIT_SECTIONS)
                     proposal = proposal.model_copy(update={name: getattr(blank, name) for name in SECTION_UPSTREAM if name not in restated})
                     proposal = proposal.model_copy(update={name: {k: v for k, v in getattr(proposal, name).items() if k == "curiosity"} for name in ("values", "motivations")})
                 migration = data.get("stimulus") == "continuity-bootstrap"
@@ -1613,7 +1858,7 @@ class Appraisals:
                 data["receipt"] = receipt
                 # Keep the structured judgment for auditing a failed atomic
                 # commit; model reasoning is never part of this record.
-                data["proposed_result"] = proposal.model_dump()
+                data["proposed_result"] = proposal_record(proposal)
                 event = AffectiveEvent(
                     command_id=row["id"],
                     agent_version=effective_version,
@@ -1914,17 +2159,38 @@ class Appraisals:
                         apply_habits()
                     if proposal.session_advice and self.session_context and not historical:
                         section("session_advice", apply_advice)
+                    # The audited sections, last and in one fixed order, each inside its own savepoint.
+                    # apply() knows none of them: a module claims its own through register_audit_section.
+                    for name in offered:
+                        value = getattr(proposal, name)
+                        if not NEW_INTERACTION_COMMITS[name] and new_interaction:
+                            # The owner wrote again while this ran: what was observed still holds, what
+                            # was decided or intended before that message waits for the next round.
+                            continue
+                        kept = hold(name, [value] if value else [])
+                        if not kept:
+                            continue
+                        commit = SectionCommit(mind=self.mind, conn=conn, state=state, event_id=eid, section=name,
+                                               value=value, proposal=proposal, receipt=receipt, sources=list(semantic_refs.values()),
+                                               stimulus=data.get("stimulus"), version=effective_version, job_id=row["id"], settings=settings)
+                        section(name, lambda name=name, commit=commit: AUDIT_HANDLERS[name](commit))
+                    for entry in rejected:
+                        if entry["section"] in AUDIT_SECTIONS:
+                            # Why the host refused it, for the projection that owns the section to show
+                            # next time. A static code and a time: no follow-up and no second call.
+                            record_refusal(conn, self.mind.scope.key(), entry["section"], entry["code"], self.mind.clock())
                     review_id = None
-                    if (held or any(r["section"] in ASK_AGAIN_SECTIONS for r in rejected)) and not follow_up:
+                    if asks_again(rejected, held) and not follow_up:
                         # One follow-up restates what was refused and what rests on it, durable with this commit like
                         # the enrichment job. A follow-up never queues another: its own refusals are only recorded.
                         review_id = "review_" + digest([row["id"], FOLLOW_UP])[:32]
                         conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
                             (review_id, self.mind.scope.key(), "pending", time.time(), dumps({"evidence_ids": data["evidence_ids"],
                                 "agent_version": effective_version, "origin": "reflection", "stimulus": FOLLOW_UP, "parent_id": row["id"],
-                                # A dropped memory item is only recorded: no follow-up is asked to restate it.
-                                "section_review": {"rejected_sections": [r for r in rejected if "item" not in r], "held_sections": held}})))
-                    return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction),
+                                # A dropped memory item, and an audited section, are only recorded: no follow-up restates them.
+                                "section_review": {"rejected_sections": [r for r in rejected if "item" not in r and r["section"] not in AUDIT_SECTIONS],
+                                                   "held_sections": [h for h in held if h["section"] not in AUDIT_SECTIONS]}})))
+                    return {"provider": receipt, "proposal": proposal_record(proposal), "new_interaction_pending": bool(new_interaction),
                             **({"held_decisions": held_decisions} if held_decisions else {}),
                             **({"rejected_sections": rejected} if rejected else {}), **({"held_sections": held} if held else {}),
                             **({"follow_up_id": review_id} if review_id else {})}

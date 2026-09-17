@@ -19,6 +19,7 @@ from eventmem.core.idempotency import (
     revision_id,
     stamp,
 )
+from eventmem.core.models import SourceInput
 from kin_mind.conflicts import classify
 from kin_mind.habits import ConversationHabits, HabitProposal
 from kin_mind.lifecycle import EventIdentityJudgement, EventRoute
@@ -339,8 +340,11 @@ def test_a_legacy_route_without_a_side_row_still_replays(system, appended):
 # --- habits: the preference revision gates the first effect and every revision -----------
 
 def habit_case(system, preferences, *, revision=0, reason="主人要求先问再探索"):
-    mind, _memory, _lifecycle, source, _clock = system
-    owner = source("owner-preference", "主人要求先问再探索")
+    mind, _memory, _lifecycle, _source, _clock = system
+    # A conversational preference rests on the owner's own turn, so the source is one.
+    owner = mind.engine.receive(SourceInput(namespace="synthetic", key="owner-preference", text="主人要求先问再探索",
+        scope=mind.scope, authority="explicit", occurred_at=mind.clock(), extract=False,
+        metadata={"role": "user", "host_event": "message"}))
     return HabitProposal(preferences=preferences, evidence_ids=[owner["id"]], reason=reason,
                          expected_revision=revision)
 

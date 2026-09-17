@@ -81,6 +81,11 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # Stage 3: purpose-typed recall. Off restores `history` admitting self-knowledge, the
             # prefix-only envelope filters, relation seeds taken before validation and bare labels.
             "recall_purpose_policy": True,
+            # Registered once here and read through autonomy_schema.optimized(). Each one off takes
+            # its sections out of the appraisal schema and prompt and blanks them before validation,
+            # which is the previous behavior exactly. The last two carry no appraisal section.
+            "trait_ledger": True, "behavior_chain": True, "expression_intent": True,
+            "next_move_audit": True, "wish_version_review": True, "rest_review_window": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -188,7 +193,9 @@ class MemoryContinuity:
         for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
-                    "chunked_reply_review", "recall_purpose_policy"):
+                    "chunked_reply_review", "recall_purpose_policy",
+                    "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
+                    "wish_version_review", "rest_review_window"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

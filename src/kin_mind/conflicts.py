@@ -30,6 +30,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
+    "kin_mind.evidence_classes",
 )
 
 
@@ -58,6 +59,8 @@ REGISTRY = {
     "Referenced graph identity changed during evaluation": ("runtime", "graph-node-changed", "reuse"),
     "Event identity evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
     "Topic candidate evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
+    # An audited section whose module is not installed: refused alone, recorded, never asked again.
+    "No module has claimed this section yet": ("semantic", "section-unavailable", "section"),
     # --- state.py: evidence, mind revision, policy authority, desires ---
     "Initialize the role profile before reading or changing state": ("semantic", "profile-uninitialized", "block"),
     "Evidence source is unavailable": ("runtime", "evidence-source-unavailable", "reuse"),
