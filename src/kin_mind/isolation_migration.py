@@ -69,6 +69,16 @@ IDENTIFIER = re.compile(r"\b[a-z]+_[0-9a-z_]{8,}\b")
 CHUNK = 200
 
 
+def _refusal(error):
+    """Why a step could not finish, in the words of the conflict taxonomy: the static code and
+    what moved. An operator has to be able to tell a claim another writer revised from a command
+    identity that was already spent, without reading a traceback."""
+    from .conflicts import classify
+
+    found = classify(error)
+    return {"code": found.code or "refused", "kind": found.kind, "handling": found.handling}
+
+
 def _load_registry(path):
     """The private namespace rules, which live in the operator's file and never in this code."""
     values = json.loads(Path(path).read_text())
@@ -126,9 +136,14 @@ class IsolationMigration:
                      (self.scope.key(), kind, identifier, revision, RULES_VERSION, self.mind.clock(), dumps(data)))
 
     def _archived(self, conn, kind):
+        """The newest archived version of each object of this kind. A migration applied, taken
+        back and applied again archives the same claim twice; only the last one says what the
+        object looked like before the change an undo has to reverse. Every row is kept, and the
+        ones a later round replaced are not work anybody still owes."""
         return [(row["identifier"], row["revision"], json.loads(row["data"])) for row in conn.execute(
-            "SELECT identifier,revision,data FROM mind_isolation_archive WHERE scope=? AND kind=? ORDER BY identifier,revision",
-            (self.scope.key(), kind))]
+            "SELECT identifier,revision,data FROM mind_isolation_archive a WHERE scope=? AND kind=? "
+            "AND revision=(SELECT MAX(revision) FROM mind_isolation_archive WHERE scope=a.scope AND kind=a.kind "
+            "AND identifier=a.identifier) ORDER BY identifier", (self.scope.key(), kind))]
 
     # --- what the migration would do --------------------------------------------------
 
@@ -371,6 +386,16 @@ class IsolationMigration:
             self._advance(conn, "classified", classified=plan["impact"]["classification"]["sources"])
         return written
 
+    @staticmethod
+    def _command_id(link):
+        """One supersession command names the two claims **and the revisions it was planned
+        against**. A plan made after an undo is a different plan, because the undo wrote a new
+        revision of the claim it restored; without the revisions that second plan would arrive
+        under the first plan's command id with another payload, and be refused for ever."""
+        return MIGRATION + ":" + digest([link["old_id"], link["new_id"],
+                                         link["expected_revisions"][link["old_id"]],
+                                         link["expected_revisions"][link["new_id"]]])[:32]
+
     def _step_chains(self, plan):
         linked, skipped = 0, []
         for chain in plan["chains"]:
@@ -384,11 +409,10 @@ class IsolationMigration:
                     self._archive(conn, CLAIM_ARCHIVE, link["old_id"], record["revision"], record)
                 try:
                     self.claims.link_supersession(link["old_id"], link["new_id"], link["expected_revisions"],
-                                                 MIGRATION + ":" + digest([link["old_id"], link["new_id"]])[:32])
+                                                  self._command_id(link))
                     linked += 1
                 except (Conflict, Missing) as error:
-                    skipped.append({"old_id": link["old_id"], "new_id": link["new_id"],
-                                    "reason": getattr(error, "code", None) or "refused"})
+                    skipped.append({"old_id": link["old_id"], "new_id": link["new_id"], **_refusal(error)})
         with self.engine.db.connect(write=True) as conn:
             self._advance(conn, "chains", supersessions=linked, supersessions_refused=skipped)
         return {"linked": linked, "refused": skipped}
@@ -426,7 +450,7 @@ class IsolationMigration:
                 try:
                     rewritten += bool(self._rewrite_node(conn, policy, node["id"], node["revision"]))
                 except (Conflict, Missing) as error:
-                    refused.append({"id": node["id"], "reason": getattr(error, "code", None) or "refused"})
+                    refused.append({"id": node["id"], **_refusal(error)})
         from .judgment_cache import invalidate
         dropped, targets = 0, [*plan["hidden"], *plan["superseded"], *[n["id"] for n in plan["nodes"]]]
         for start in range(0, len(targets), CHUNK):
