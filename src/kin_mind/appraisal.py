@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import ExitStack
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from urllib.parse import urlparse
@@ -20,7 +22,7 @@ import httpx
 from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.models import Model
+from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
@@ -31,6 +33,7 @@ from .memory import MemoryAssessment, MemoryContinuity
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
+from .autonomy_schema import optimized
 from .model_runtime import request_client, model_slot, ModelAdmissionWait
 
 APPRAISAL_INPUT_BUDGET = 64000
@@ -77,7 +80,14 @@ class WishUpdate(Model):
         return self
 
 
-from .session_advice import SESSION_ADVICE_PROMPT, SessionAdvice, advice_record
+from .session_advice import (
+    ADVICE_REPAIR_PROMPT,
+    SESSION_ADVICE_PROMPT,
+    AdviceRejected,
+    SessionAdvice,
+    advice_record,
+    repair_input,
+)
 
 
 class Appraisal(Model):
@@ -113,6 +123,85 @@ class Appraisal(Model):
         if set(v) - set(DIMENSIONS) or any(not 0 <= x <= 100 for x in v.values()):
             raise ValueError("Unknown dimension or score outside 0..100")
         return v
+
+
+# Default-on switch (mind_memory_config). An explicit false restores the previous behavior:
+# any refused section fails the whole appraisal, no unknown field is dropped, no extra repair call.
+SECTION_ISOLATION = "appraisal_section_isolation"
+# Stimulus of the one follow-up that restates what a commit refused or held.
+FOLLOW_UP = "held-sections"
+NOT_RESTATED = "A refused owner preference was not restated"
+
+# Every Appraisal field -> the sections it rests on. A refused section is undone alone. Whatever rests on
+# a refused or wholly held section is held: not applied, recorded with the refusal, and asked for again.
+# None: the whole field rests on that section; a text names the part that does (its test lives in apply()).
+# A new Appraisal field must be registered here, or this module does not import.
+SECTION_UPSTREAM = {
+    "habits": {},
+    "plan_changes": {"habits": None},
+    "action_decisions": {"plan_changes": "decisions on a plan this proposal changes", "habits": "execute on an explore or contact step"},
+    "procedure_candidates": {},
+    "concerns": {},
+    "wishes": {"habits": "explore wishes", "concerns": "wishes citing concern_ids"},
+    "wish_updates": {"habits": "resume of an explore wish", "concerns": "updates citing concern_ids"},
+    "session_advice": {},
+    "values": {"habits": "curiosity"},
+    "motivations": {"habits": "curiosity"},
+    # The event itself: affect, the sharing decision an exploration result requires, memory and the host's cursors.
+    "reason": {}, "understanding": {}, "rhythm": {}, "sharing": {}, "memory": {}, "next_review_minutes": {},
+    # Not applied by this commit: daily review only, and consumed before the commit.
+    "evolution": {}, "recall_needs": {},
+}
+# Applied inside a savepoint and a state snapshot, so each can be refused alone. A failure of any other
+# field fails the appraisal as before: without the event nothing is left to anchor the rest to.
+ISOLATED_SECTIONS = ("habits", "plan_changes", "action_decisions", "procedure_candidates", "concerns", "wishes", "wish_updates", "session_advice")
+# Refusing one of these leaves something to ask again even when nothing of this proposal rested on it.
+UPSTREAM_SECTIONS = {upstream for rests in SECTION_UPSTREAM.values() for upstream in rests}
+if set(SECTION_UPSTREAM) != set(Appraisal.model_fields) or not UPSTREAM_SECTIONS <= set(ISOLATED_SECTIONS):
+    raise RuntimeError("Register every Appraisal field and its upstream sections in SECTION_UPSTREAM")
+
+
+def static_message(error):
+    """The exception's text only when it is a literal of the code that raised it.
+
+    An identifier the model cited, a parsed value or a formatted message is never such a literal, so
+    nothing of a proposal or its evidence can reach the queue row this way.
+    """
+    trace = error.__traceback__
+    while trace is not None and trace.tb_next is not None:
+        trace = trace.tb_next
+    text = str(error)
+    return text if trace is not None and text in trace.tb_frame.f_code.co_consts else ""
+
+
+def refusal(section, error):
+    """What the queue row says about a refused section: a static code and static host text only."""
+    if isinstance(error, ValidationError):
+        # Locations and types, never the input.
+        issues = ",".join(".".join(map(str, e["loc"])) + "=" + e["type"] for e in error.errors(include_input=False))
+        return {"section": section, "code": "schema-invalid", "message": issues[:300]}
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9-]{1,60}", code):
+        code = next((name for kind, name in ((Conflict, "conflict"), (Missing, "missing-reference"), (ValueError, "invalid-value"))
+                     if isinstance(error, kind)), type(error).__name__)
+    return {"section": section, "code": code, "message": static_message(error)}
+
+
+def strip_unknown(raw, errors):
+    """Remove exactly the fields reported as extra. None when a location cannot be followed in the raw result."""
+    cleaned, dropped = deepcopy(raw), []
+    for error in errors:
+        parent = cleaned
+        for key in error["loc"][:-1]:
+            try:
+                parent = parent[key]
+            except (KeyError, IndexError, TypeError):
+                return None
+        if not isinstance(parent, dict) or error["loc"][-1] not in parent:
+            return None
+        del parent[error["loc"][-1]]
+        dropped.append([key if isinstance(key, int) else str(key)[:100] for key in error["loc"]])
+    return cleaned, dropped[:50]
 
 
 SYSTEM = """你是 Kin 的记忆与情绪评估器。根据提供的新经历提出可解释的状态变化。
@@ -183,6 +272,11 @@ memory_context.topic_candidates 是 Leiden 生成的主题候选，聚类本身�
 聊天中的明确偏好可以更新habits，expected_revision使用memory_context.conversation_habits.revision。preferences支持exploration_frequency（完整短句）、exploration_directions（方向列表）、exploration_min_interval_minutes（用户明确指定的最小间隔，默认0）、exploration_paused、reply_choice（always/autonomous）。evidence_ids只引用用户明确发言；自己的安排不成为用户要求。频率和方向影响后续选题及curiosity动力，按当前偏好调整本轮target和half_life。泛泛说少探索些可记录自然语言偏好，无需编造固定间隔。
 reply_choice=autonomous时，聊天模型可以自行决定回应、合并或安静；每次选择绑定当前真实输入编号。新的输入重新决定，不把一次安静变成永久不理会。
 memory_context.recent_interaction 中提供且未标记 needs_review 的原始来源，也可以用于事件理解、心事和节律判断。引用近期背景不会将那条原消息标记为本批已处理；处理游标仍由宿主依据本批新事件推进。
+"""
+
+SYSTEM += """
+held-sections 是宿主对上一轮评估的校验反馈，不是用户消息，也不是新经历。new_evidence 里 kind=held-sections 的内部记录列出 rejected_sections（被宿主拒绝的段，code 与 message 是宿主的静态拒绝原因）和 held_sections（依赖被拒段、因此搁置而尚未生效的段）；上一轮的其余内容已经提交。
+本轮只按拒绝原因修正并重新给出这些段，其余字段留空，不重复打分，也不因这条记录产生新的情绪、愿望或联系理由。habits 被拒时，先用用户明确发言的来源和 memory_context.conversation_habits.revision 重新给出 habits，再给出依赖它的探索愿望、对探索愿望的 resume、探索或联系步骤的 execute 决定、plan_changes 以及 curiosity 的 values 与 motivations；habits 没有重新给出时，这些依赖段继续搁置。依据不足就留空。
 """
 
 
@@ -557,11 +651,26 @@ class DeepSeek:
             raw_proposal = calls[0]["input"]
             if context.get("operational_only"):
                 raw_proposal = {**raw_proposal, "memory": {}}
+            # run_one and the daily review pass their reading of the switch; a bare provider isolates.
+            isolation = getattr(self, "section_isolation", True) is not False
+            historical = context.get("stimulus") in {"memory-enrichment", "memory-backfill"}
+            dropped = []
             try:
-                proposal = Appraisal.model_validate(raw_proposal)
+                try:
+                    proposal = Appraisal.model_validate(raw_proposal)
+                except ValidationError as error:
+                    # Fields the contract does not define carry nothing the host could apply. When they
+                    # are the only fault they are removed here: no model call and no retry.
+                    errors = error.errors(include_input=False)
+                    stripped = strip_unknown(raw_proposal, errors) if isolation and all(e["type"] == "extra_forbidden" for e in errors) else None
+                    if stripped is None:
+                        raise
+                    raw_proposal, dropped = stripped
+                    # Model-level checks only run once the fields fit; a fault they find is repaired below.
+                    proposal = Appraisal.model_validate(raw_proposal)
             except ValidationError as error:
-                # One bounded schema repair, using structured judgments only.
-                if context.get("stimulus") not in {"memory-enrichment", "memory-backfill"}:
+                # One bounded schema repair, using structured judgments only; on every lane while sections are isolated.
+                if not historical and not isolation:
                     raise
                 issues = [{"loc": list(e["loc"]), "type": e["type"]} for e in error.errors(include_input=False)]
                 # structured() owns its own failure receipt and clears it on
@@ -570,8 +679,9 @@ class DeepSeek:
                 appraisal_receipt = self.failure_receipt
                 self.failure_receipt = None
                 try:
-                    fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment,
-                        "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning.",
+                    fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment if historical else Appraisal,
+                        "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning."
+                        + ("" if historical else " Remove fields the schema does not define and leave every valid field as it is."),
                         {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
                 except Exception:
                     appraisal_receipt["schema_repair"] = self.failure_receipt or {
@@ -581,7 +691,7 @@ class DeepSeek:
                     raise
                 appraisal_receipt["schema_repair"] = repair_receipt
                 self.failure_receipt = appraisal_receipt
-                proposal = Appraisal.model_validate(fixed.model_dump())
+                proposal = Appraisal.model_validate({**fixed.model_dump(), **({"memory": {}} if context.get("operational_only") else {})})
             return proposal, {
                 "provider": "deepseek",
                 "model": body["model"],
@@ -592,6 +702,7 @@ class DeepSeek:
                 "persona_contract": persona_metadata(policy),
                 "context_projection": request_context.get("context_projection", "affect-decision-v3"),
                 "schema_repair": self.failure_receipt.get("schema_repair"),
+                **({"dropped_fields": dropped} if dropped else {}),
                 "context_characters": len(dumps(request_context)),
                 "max_output_tokens": 131072,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
@@ -608,6 +719,23 @@ class DeepSeek:
             raise RuntimeError("deepseek-invalid-result:" + fields[:150]) from None
         except (ValueError, KeyError, TypeError):
             raise RuntimeError("deepseek-invalid-result") from None
+
+    def repair_session_advice(self, advice, context, problem):
+        """One bounded correction of a refused session advice. The caller validates what comes back.
+
+        structured() clears the failure receipt on success; the appraisal call's own receipt is kept
+        beside the repair's, as the schema repair does, so neither cost is lost if the commit fails.
+        """
+        appraisal_receipt, self.failure_receipt = self.failure_receipt, None
+        try:
+            fixed, receipt = self.structured("repair_session_advice", SessionAdvice, ADVICE_REPAIR_PROMPT, repair_input(advice, context, problem))
+        except Exception:
+            failed = self.failure_receipt or {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+                                              "usage": None, "usage_status": "unknown", "outcome": "failed"}
+            self.failure_receipt = {**(appraisal_receipt or {}), "advice_repair": failed}
+            raise
+        self.failure_receipt = {**(appraisal_receipt or {}), "advice_repair": receipt}
+        return fixed, receipt
 
     def repair_sharing(self, proposal, context):
         target_ids = {t["source_id"] for t in context["exploration_targets"]}
@@ -767,6 +895,38 @@ class Appraisals:
             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(child_data), child_id))
         return members
 
+    def _review_evidence(self, job_id, data):
+        """A follow-up's own evidence: the refusal it answers, as for any internal stimulus.
+
+        The model reads why from it, and the parent's evidence, already appraised once, is not scored again
+        under another command. Static codes and host text only; the same key and text make it safe to repeat.
+        """
+        note = self.engine.receive(SourceInput(namespace="mind-internal-event", key=job_id, scope=self.mind.scope,
+            authority="model", kind="observation", session="internal-mind", occurred_at=self.mind.clock(), extract=False,
+            text=dumps({"kind": FOLLOW_UP, "appraisal_id": data.get("parent_id"), **data.get("section_review", {})}),
+            metadata={"host_event": "internal-" + FOLLOW_UP, "role": "assistant", "internal": True, "appraisal_id": data.get("parent_id")}))
+        return {"review_source_id": note["id"], "evidence_ids": list(dict.fromkeys([note["id"], *data["evidence_ids"]]))[:50]}
+
+    def _arm_follow_up(self, job_id):
+        """Right after the parent's commit: a source cannot be received inside that transaction.
+
+        With evidence of its own, whichever version of the host picks the follow-up up can commit it.
+        Best effort, and never a reason to fail the committed parent: the follow-up makes it itself if this is lost.
+        """
+        try:
+            with self.engine.db.connect() as conn:
+                queued = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND scope=? AND state='pending'", (job_id, self.mind.scope.key())).fetchone()
+            if not queued or json.loads(queued[0]).get("review_source_id"):
+                return
+            evidence = self._review_evidence(job_id, json.loads(queued[0]))
+            with self.engine.db.connect(write=True) as conn:
+                # Still unclaimed and unarmed: a worker that took it meanwhile arms its own attempt.
+                current = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND state='pending'", (job_id,)).fetchone()
+                if current and not json.loads(current[0]).get("review_source_id"):
+                    conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps({**json.loads(current[0]), **evidence}), job_id))
+        except Exception:  # noqa: BLE001
+            return
+
     def run_one(self, provider, *, lane=None, job_id=None):
         provider.background = True
         settings = self.memory.settings()
@@ -869,6 +1029,9 @@ class Appraisals:
                             self._settle_children(conn, row["id"], data, "complete")
                         return self.status(row["id"])
                     data["evidence_ids"] = remaining
+                if data.get("stimulus") == FOLLOW_UP and not data.get("review_source_id"):
+                    # Normally made right after the parent's commit; this covers a process that died in between.
+                    data.update(self._review_evidence(row["id"], data))
                 view = self.mind.read()
                 view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
@@ -890,6 +1053,11 @@ class Appraisals:
                             if node["kind"] in {"finding", "exploration", "work"}:
                                 node["share_coverage"] = self.memory.sharing.coverage(conn, node["id"])
                         memory_context["graph_candidates"] = graph
+                if memory_context and data.get("stimulus") == FOLLOW_UP and not data.get("frozen_memory_context"):
+                    # A follow-up restates refused sections only. Events still pending need a full appraisal,
+                    # so none is taken in here and the source cursor stays where it is.
+                    memory_context["through_seq"] = memory_context["cursor"]
+                    memory_context["pending_events"] = []
                 if memory_context and not data.get("frozen_memory_context"):
                     # The source cursor advances only across events actually given
                     # to this evaluation; out-of-window history remains pending.
@@ -943,10 +1111,19 @@ class Appraisals:
                 if memory_context:
                     model_context["memory_context"] = memory_context
                 data.pop("plan_view", None)
+                data.pop("plan_review_target", None)
                 if settings["semantic_actions"] and not historical and not maintenance:
                     from .plans import AutonomousPlans
                     from .procedures import Procedures
-                    shown_plans = AutonomousPlans(self.mind).read(limit=40, manifest=True)
+                    # A review answers for its plan's wake-up reasons, so that plan leads the window of 40
+                    # however many others are due before it.
+                    target = AutonomousPlans(self.mind).review_target(row["id"]) if data.get("stimulus") == "plan-review" else None
+                    shown_plans = AutonomousPlans(self.mind).read(limit=40, manifest=True, first=target and target["plan_id"])
+                    if target:
+                        # Gone or no longer active: it cannot be shown as the plan under review. The commit
+                        # then registers nothing for it and reopens the reasons this review had taken.
+                        lead = shown_plans["plans"][0] if shown_plans["plans"] else {}
+                        data["plan_review_target"] = {**target, "shown": lead.get("id") == target["plan_id"] and lead.get("status") == "active"}
                     # The host's own record of the plan view this attempt shows the model.
                     # Decisions are checked against it at commit, step by step.
                     data["plan_view"] = shown_plans.pop("manifest")
@@ -965,6 +1142,8 @@ class Appraisals:
                         model_context["effective_memory_use"] = strengths(conn, self.mind.scope.key(), identifiers, self.mind.clock())
                 memory_revisions = {n["id"]: n["revision"] for kind in ("works", "shares") for n in (memory_context or {}).get(kind, [])}
                 with self.engine.db.connect() as conn:
+                    # One reading of the switch governs the whole attempt: the provider's validation, the advice repair and the commit.
+                    isolation = optimized(conn, self.mind.scope.key(), SECTION_ISOLATION)
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
                     for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent]:
@@ -1006,6 +1185,7 @@ class Appraisals:
                             data["seed_rejected"] = True
                     if not data.get("seed_rejected"):
                         semantic_refs.update({ref["record_id"]: ref for ref in seed_refs})
+                provider.section_isolation = isolation
                 if historical and data.get("seed_memory") and not data.get("seed_rejected"):
                     try:
                         proposal = Appraisal(reason="Reuse verified semantic result", memory=MemoryAssessment.model_validate(data["seed_memory"]))
@@ -1018,11 +1198,40 @@ class Appraisals:
                 if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
                     from .decision_context import expand
                     proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
+                # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
+                data.pop("dropped_fields", None)
+                if receipt.get("dropped_fields"):
+                    data["dropped_fields"] = receipt["dropped_fields"]
                 deferred_memory = proposal.memory.model_dump() if operational else None
                 if operational:
                     proposal = proposal.model_copy(update={"memory": MemoryAssessment()})
                 if maintenance and proposal.session_advice is None:
                     raise RuntimeError("deepseek-missing-session-advice")
+                if maintenance and isolation and hasattr(provider, "repair_session_advice") and not data.get("advice_repair_attempted"):
+                    try:
+                        # Pure validation; the commit validates again whatever is applied.
+                        advice_record(proposal.session_advice, self.session_context, receipt, row["id"])
+                        problem = None
+                    except AdviceRejected as error:
+                        problem = error
+                    except Exception:  # noqa: BLE001 - not a fault the model can correct; the commit records it
+                        problem = None
+                    if problem:
+                        # One bounded repair for this job, marked before the call. A second refusal, or a
+                        # repair that fails, is recorded by the commit and the appraisal completes.
+                        data["advice_repair_attempted"] = True
+                        with self.engine.db.connect(write=True) as conn:
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                        try:
+                            advice, repair_receipt = provider.repair_session_advice(proposal.session_advice, self.session_context, problem)
+                            proposal = proposal.model_copy(update={"session_advice": advice})
+                        except ModelAdmissionWait:
+                            raise
+                        except Exception:  # noqa: BLE001 - the failed call keeps its actual or unknown usage
+                            repair_receipt = (getattr(provider, "failure_receipt", None) or {}).get("advice_repair") or {
+                                "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+                                "usage": None, "usage_status": "unknown", "outcome": "failed"}
+                        receipt = {**receipt, "advice_repair": repair_receipt}
                 if historical:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": [], "recall_needs": []})
                 # Save the structured result even when required-decision
@@ -1043,6 +1252,12 @@ class Appraisals:
                         data.update(proposed_result=proposal.model_dump(), receipt=receipt)
                     if any(sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1 for t in targets):
                         raise RuntimeError("deepseek-missing-sharing-decision")
+                if data.get("stimulus") == FOLLOW_UP and isolation:
+                    # The host, not the prompt, keeps a follow-up to what a commit can refuse or hold. The event
+                    # itself was committed by the parent and is neither scored nor remembered a second time.
+                    blank, restated = Appraisal(reason=proposal.reason), {*ISOLATED_SECTIONS, "reason", "next_review_minutes", "values", "motivations"}
+                    proposal = proposal.model_copy(update={name: getattr(blank, name) for name in SECTION_UPSTREAM if name not in restated})
+                    proposal = proposal.model_copy(update={name: {k: v for k, v in getattr(proposal, name).items() if k == "curiosity"} for name in ("values", "motivations")})
                 migration = data.get("stimulus") == "continuity-bootstrap"
                 if migration:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [u for u in proposal.wish_updates if u.action == "link"], "evolution": None})
@@ -1082,9 +1297,65 @@ class Appraisals:
                     used_evidence = {identifier for items in (proposal.memory.notes, proposal.memory.links, proposal.memory.graph.nodes, proposal.memory.graph.edges, proposal.memory.event_routes) for item in items for identifier in item.evidence_ids}
                     if any({ref["source_id"], ref["record_id"]} & used_evidence and not self.mind._fresh(conn, [ref]) for ref in semantic_refs.values()):
                         raise Conflict("Referenced semantic evidence changed before commit")
-                    if data.get("stimulus") == "session-maintenance":
+                    # What this commit attempt refuses or holds. It is written to the queue row as it happens, so
+                    # a commit that then fails as a whole still leaves the refusals as feedback for its retry.
+                    rejected, held, blocked = [], [], {}
+                    data.pop("rejected_sections", None)
+                    data.pop("held_sections", None)
+
+                    def section(name, run):
+                        """One section inside a savepoint and a state snapshot: refused alone, with everything it wrote undone."""
+                        if not isolation:
+                            run()
+                            return True
+                        snapshot = deepcopy(state)
+                        conn.execute("SAVEPOINT appraisal_section")
+                        try:
+                            run()
+                        except sqlite3.Error:
+                            # The database, not the proposal, failed: nothing about this transaction can be trusted.
+                            raise
+                        except Exception as error:  # noqa: BLE001 - recorded as a static code and host text, never the payload
+                            conn.execute("ROLLBACK TO appraisal_section")
+                            conn.execute("RELEASE appraisal_section")
+                            # The savepoint undid SQL only. _mutate() saves this very object: restore it in place.
+                            state.clear()
+                            state.update(snapshot)
+                            blocked[name] = refusal(name, error)
+                            rejected.append(blocked[name])
+                            data["rejected_sections"] = rejected
+                            return False
+                        conn.execute("RELEASE appraisal_section")
+                        return True
+
+                    def hold(name, items, tests=None):
+                        """(index, item) pairs of a field that may still be applied. Whatever rests on a refused or
+                        wholly held section is set aside with that refusal; the index keeps each command ID stable."""
+                        if any(part and upstream not in (tests or {}) for upstream, part in SECTION_UPSTREAM[name].items()):
+                            # Checked on every commit, not only when something is refused.
+                            raise RuntimeError("Every part named in SECTION_UPSTREAM needs its test")
+                        kept = list(enumerate(items))
+                        for upstream, part in SECTION_UPSTREAM[name].items():
+                            if upstream not in blocked or not kept:
+                                continue
+                            remaining = [pair for pair in kept if part and not tests[upstream](pair[1])]
+                            if len(remaining) < len(kept):
+                                cause = blocked[upstream]
+                                held.append({"section": name, **({"part": part} if part else {}), "items": len(kept) - len(remaining),
+                                             "upstream": upstream, "rejected": cause["section"], "code": cause["code"], "message": cause["message"]})
+                                data["held_sections"] = held
+                                if not part:
+                                    blocked[name] = cause
+                                kept = remaining
+                        return kept
+
+                    def apply_advice():
+                        # advice_record() validates before it builds anything; state changes only once it has returned.
                         state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
-                        return {"provider": receipt, "session_advice": state["session_advice"], "maintenance_only": True}
+                    if data.get("stimulus") == "session-maintenance":
+                        applied = section("session_advice", apply_advice)
+                        return {"provider": receipt, "session_advice": state["session_advice"] if applied else None, "maintenance_only": True,
+                                **({"rejected_sections": rejected} if rejected else {})}
                     referenced_graph = {v for n in proposal.memory.graph.nodes for v in (n.id,n.owner_id) if v}
                     referenced_graph.update(v for e in proposal.memory.graph.edges for v in (e.subject,e.object))
                     referenced_graph.update(v for r in proposal.memory.event_routes for v in [r.event_id, r.thread_id, *r.member_ids] if v)
@@ -1104,91 +1375,171 @@ class Appraisals:
                     allowed = self.mind._continuity_sources(conn, state, roots) + list(continuity_refs.values()) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
                     new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
+                    follow_up = data.get("stimulus") == FOLLOW_UP
+                    if isolation and follow_up and not proposal.habits and any(
+                            r["section"] == "habits" for r in (data.get("section_review") or {}).get("rejected_sections", [])):
+                        # A refused owner preference stays refused until it is restated. The follow-up that
+                        # leaves it out cannot free what rests on it: nothing acts on the stale preference.
+                        blocked["habits"] = {"section": "habits", "code": "not-restated", "message": NOT_RESTATED}
+                        rejected.append(blocked["habits"])
+                        data["rejected_sections"] = rejected
+
+                    def apply_habits():
+                        self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
+                    if isolation and proposal.habits:
+                        # Owner preferences are upstream of autonomous action, so they are settled first.
+                        section("habits", apply_habits)
                     held_decisions = []
                     if settings["autonomous_plans"] and not historical and not new_interaction:
                         from .plans import AutonomousPlans
                         plans = AutonomousPlans(self.mind)
                         shown = dict(data.get("plan_view") or {})
                         shown["plans"] = dict(shown.get("plans", {}))
-                        for index, change in enumerate(proposal.plan_changes):
-                            changed = plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
-                            plans.refresh_view(conn, shown, changed, eid + ":plan:" + str(index))
-                        # A decision is fenced by the step and basis the model was shown, not by its
-                        # expected_revision alone. One that lost that fence is held, not raised.
-                        held_decisions = plans.decide_batch(conn, proposal.action_decisions, eid + ":decision:", receipt, list(semantic_refs.values()),
-                            shown, version=effective_version, job_id=row["id"])
+
+                        def same_plan(value):
+                            try:
+                                return plans._target(conn, value)["id"]
+                            except Missing:
+                                return value
+
+                        def on_changed_plan(decision):
+                            named = {decision.plan_id, same_plan(decision.plan_id)}
+                            return any(named & ({c.id, c.key, "plan_" + digest([self.mind.scope.key(), c.desire_id or c.key])[:32]}
+                                                | ({same_plan(c.id)} if c.id else set())) for c in proposal.plan_changes)
+
+                        def autonomous_execute(decision):
+                            # A target that cannot be read is not known to be harmless.
+                            if decision.action != "execute":
+                                return False
+                            try:
+                                plan = plans._target(conn, decision.plan_id)
+                            except Missing:
+                                return True
+                            step = next((s for s in plan["steps"] if s["id"] == decision.step_id), None)
+                            return not step or step["actor"] in {"explore", "contact"}
+
+                        changes = hold("plan_changes", proposal.plan_changes)
+
+                        def apply_plan_changes():
+                            # The recorded view follows the changes only if all of them apply.
+                            view = {**shown, "plans": dict(shown["plans"])}
+                            for index, change in changes:
+                                changed = plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
+                                plans.refresh_view(conn, view, changed, eid + ":plan:" + str(index))
+                            shown["plans"] = view["plans"]
+                        if changes:
+                            section("plan_changes", apply_plan_changes)
+                        decisions = [d for _, d in hold("action_decisions", proposal.action_decisions, {"plan_changes": on_changed_plan, "habits": autonomous_execute})]
+
+                        def apply_action_decisions():
+                            # A decision is fenced by the step and basis the model was shown, not by its
+                            # expected_revision alone. One that lost that fence is held, not raised.
+                            held_decisions.extend(plans.decide_batch(conn, decisions, eid + ":decision:", receipt, list(semantic_refs.values()),
+                                shown, version=effective_version, job_id=row["id"]))
+                        if decisions:
+                            section("action_decisions", apply_action_decisions)
                         if data.get("stimulus") == "plan-review":
-                            plans.register_review(conn, list(shown["plans"]), eid + ":plan-view", receipt, effective_version)
+                            target = data.get("plan_review_target") or {}
+                            unshown = target.get("plan_id") if target and not target.get("shown") else None
+                            plans.register_review(conn, [i for i in shown["plans"] if i != unshown], eid + ":plan-view", receipt, effective_version)
+                            if unshown:
+                                # The plan this review was woken for could not be shown, so the review answered
+                                # for none of its reasons: the next tick finds them open.
+                                plans.reopen_wakeups(conn, target)
                     if settings["procedure_learning"] and not historical and not new_interaction:
                         from .procedures import Procedures
-                        for index, candidate in enumerate(proposal.procedure_candidates):
-                            Procedures(self.mind).propose(conn, candidate, eid + ":method:" + str(index), receipt, list(semantic_refs.values()))
+
+                        def apply_procedures():
+                            for index, candidate in enumerate(proposal.procedure_candidates):
+                                Procedures(self.mind).propose(conn, candidate, eid + ":method:" + str(index), receipt, list(semantic_refs.values()))
+                        if proposal.procedure_candidates:
+                            section("procedure_candidates", apply_procedures)
                     effective_event = event.model_copy(update={"motivations": {}, "values": {k: v for k, v in event.values.items() if k not in {"initiative", "curiosity"}}}) if new_interaction else event
+                    for name in ("values", "motivations"):
+                        kept = dict(item for _, item in hold(name, getattr(effective_event, name).items(), {"habits": lambda item: item[0] == "curiosity"}))
+                        if len(kept) != len(getattr(effective_event, name)):
+                            effective_event = effective_event.model_copy(update={name: kept})
                     if not historical:
                         self.mind._apply_event(conn, state, effective_event, eid, allowed)
                     if not new_interaction:
                         apply_decisions(self.mind, conn, state, proposal.sharing, event, receipt, data.get("stimulus"))
-                    if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery":
-                        for concern in proposal.concerns:
-                            self.mind._apply_concern(conn, state, concern, eid, effective_version, fallback=roots, allowed=allowed)
-                    for index, wish in enumerate([] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes):
-                        if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
-                            wish = wish.model_copy(update={"exploration_id": primary_result})
-                        if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
-                            and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
-                            for d in state["desires"].values()):
-                            continue
-                        if any(
-                            d["content"] == wish.content
-                            and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
-                            for d in state["desires"].values()
-                        ):
-                            continue
-                        changed = self.mind._apply_desire(
-                            conn,
-                            state,
-                            DesireChange(
-                                **event.model_dump(
-                                    exclude={
-                                        "values",
-                                        "motivations",
-                                        "origin",
-                                        "evolution",
-                                        "command_id",
-                                        "understanding", "rhythm",
-                                    }
+
+                    def apply_concerns():
+                        for change in proposal.concerns:
+                            self.mind._apply_concern(conn, state, change, eid, effective_version, fallback=roots, allowed=allowed)
+                    if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery" and proposal.concerns:
+                        section("concerns", apply_concerns)
+                    wishes = hold("wishes", [] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes,
+                                  {"habits": lambda wish: wish.kind == "explore", "concerns": lambda wish: bool(wish.concern_ids)})
+
+                    def apply_wishes():
+                        for index, wish in wishes:
+                            if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
+                                wish = wish.model_copy(update={"exploration_id": primary_result})
+                            if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
+                                and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
+                                for d in state["desires"].values()):
+                                continue
+                            if any(
+                                d["content"] == wish.content
+                                and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
+                                for d in state["desires"].values()
+                            ):
+                                continue
+                            changed = self.mind._apply_desire(
+                                conn,
+                                state,
+                                DesireChange(
+                                    **event.model_dump(
+                                        exclude={
+                                            "values",
+                                            "motivations",
+                                            "origin",
+                                            "evolution",
+                                            "command_id",
+                                            "understanding", "rhythm",
+                                        }
+                                    ),
+                                    command_id=row["id"] + ":wish:" + str(index),
+                                    action="create",
+                                    expires_at=(
+                                        timestamp(self.mind.clock())
+                                        + timedelta(hours=wish.ttl_hours)
+                                    ).isoformat(),
+                                    **wish.model_dump(exclude={"ttl_hours"}),
                                 ),
-                                command_id=row["id"] + ":wish:" + str(index),
-                                action="create",
-                                expires_at=(
-                                    timestamp(self.mind.clock())
-                                    + timedelta(hours=wish.ttl_hours)
-                                ).isoformat(),
-                                **wish.model_dump(exclude={"ttl_hours"}),
-                            ),
-                            eid,
-                        )
-                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
-                    for update in proposal.wish_updates:
-                        desire = state["desires"].get(update.desire_id)
-                        if not desire or desire["status"] in {"completed", "abandoned"} or timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()):
-                            continue
-                        # Ordinary conversation can supersede a wish without inventing
-                        # a proactive transport receipt. Retire it as abandoned.
-                        action = "update" if update.action == "link" else "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
-                        changed = self.mind._apply_desire(
-                            conn,
-                            state,
-                            DesireChange(
-                                **event.model_dump(
-                                    exclude={"values", "motivations", "origin", "evolution", "reason", "understanding", "rhythm"}
+                                eid,
+                            )
+                            state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
+                    if wishes:
+                        section("wishes", apply_wishes)
+                    updates = hold("wish_updates", proposal.wish_updates, {
+                        "habits": lambda update: update.action == "resume" and (state["desires"].get(update.desire_id) or {}).get("kind") == "explore",
+                        "concerns": lambda update: bool(update.concern_ids)})
+
+                    def apply_wish_updates():
+                        for _, update in updates:
+                            desire = state["desires"].get(update.desire_id)
+                            if not desire or desire["status"] in {"completed", "abandoned"} or timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()):
+                                continue
+                            # Ordinary conversation can supersede a wish without inventing
+                            # a proactive transport receipt. Retire it as abandoned.
+                            action = "update" if update.action == "link" else "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
+                            changed = self.mind._apply_desire(
+                                conn,
+                                state,
+                                DesireChange(
+                                    **event.model_dump(
+                                        exclude={"values", "motivations", "origin", "evolution", "reason", "understanding", "rhythm"}
+                                    ),
+                                    **{**update.model_dump(), "action": action,
+                                       "wait_condition": update.wait_condition if action == "wait" else None},
                                 ),
-                                **{**update.model_dump(), "action": action,
-                                   "wait_condition": update.wait_condition if action == "wait" else None},
-                            ),
-                            eid,
-                        )
-                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
+                                eid,
+                            )
+                            state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
+                    if updates:
+                        section("wish_updates", apply_wish_updates)
                     if operational:
                         self.memory.commit_action(conn, roots, eid, 20 if new_interaction else proposal.next_review_minutes, receipt)
                         # Enrichment uses the same original sources but a separate
@@ -1207,12 +1558,24 @@ class Appraisals:
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
                         self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
                             memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots)
-                    if proposal.habits:
-                        self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
+                    if proposal.habits and not isolation:
+                        # The previous order, so that with the switch off two faults still surface as they did.
+                        apply_habits()
                     if proposal.session_advice and self.session_context and not historical:
-                        state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        section("session_advice", apply_advice)
+                    review_id = None
+                    if (held or any(r["section"] in UPSTREAM_SECTIONS for r in rejected)) and not follow_up:
+                        # One follow-up restates what was refused and what rests on it, durable with this commit like
+                        # the enrichment job. A follow-up never queues another: its own refusals are only recorded.
+                        review_id = "review_" + digest([row["id"], FOLLOW_UP])[:32]
+                        conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                            (review_id, self.mind.scope.key(), "pending", time.time(), dumps({"evidence_ids": data["evidence_ids"],
+                                "agent_version": effective_version, "origin": "reflection", "stimulus": FOLLOW_UP, "parent_id": row["id"],
+                                "section_review": {"rejected_sections": rejected, "held_sections": held}})))
                     return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction),
-                            **({"held_decisions": held_decisions} if held_decisions else {})}
+                            **({"held_decisions": held_decisions} if held_decisions else {}),
+                            **({"rejected_sections": rejected} if rejected else {}), **({"held_sections": held} if held else {}),
+                            **({"follow_up_id": review_id} if review_id else {})}
 
                 def rebase(conn, state):
                     # Contact bookkeeping may advance the global revision during
@@ -1235,10 +1598,14 @@ class Appraisals:
                     return semantic_enabled
 
                 data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
-            # Only a committed result holds decisions; a replayed command receipt carries the same list.
-            data.pop("held_decisions", None)
-            if data["result"].get("held_decisions"):
-                data["held_decisions"] = data["result"]["held_decisions"]
+            if data["result"].get("follow_up_id"):
+                self._arm_follow_up(data["result"]["follow_up_id"])
+            # The committed result is the authority for these, and a replayed command receipt carries the same lists.
+            # (A commit that failed as a whole keeps the refusals apply() had recorded until then.)
+            for key in ("held_decisions", "rejected_sections", "held_sections"):
+                data.pop(key, None)
+                if data["result"].get(key):
+                    data[key] = data["result"][key]
             data.pop("error", None)
             state = "complete"
         except ModelAdmissionWait as error:
@@ -1319,6 +1686,7 @@ class DailyReview:
             .isoformat()
         )
         with self.engine.db.connect(write=True) as conn:
+            provider.section_isolation = optimized(conn, self.mind.scope.key(), SECTION_ISOLATION)
             if conn.execute(
                 "SELECT 1 FROM mind_daily_reviews WHERE scope=? AND day=?",
                 (self.mind.scope.key(), day),

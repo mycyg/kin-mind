@@ -50,12 +50,29 @@ def test_result_decision_survives_restart_without_auto_send(setup, tmp_path, dec
     assert jobs.run_one(reviewer)["state"] == "idle"
 
 
-def test_invalid_keep_plus_contact_rolls_back_everything(setup, tmp_path):
+@pytest.mark.parametrize("isolated", [False, True])
+def test_invalid_keep_plus_contact_rolls_back_everything(setup, tmp_path, isolated):
+    """Sections are isolated by default since stage 1 (A1): the wish that contradicts `keep` is refused alone and
+    the host-validated decision stands. With the switch off the previous contract holds: everything rolls back.
+    Either way the contact wish never leaks."""
+    from kin_mind.memory import MemoryContinuity
+
     mind, _, _, value, jobs = explored(setup, tmp_path)
+    if not isolated:
+        MemoryContinuity(mind).configure({"appraisal_section_isolation": False})
     before = mind.read()["revision"]
     reviewer = FakeReviewer(Appraisal(values={"initiative": 99}, reason="Invalid mixed result",
         sharing=[SharingDecision(exploration_id=value["id"], decision="keep", reason="Keep it")],
         wishes=[Wish(content="Must not leak", topic="draft", kind="contact", strength=99, ttl_hours=24, completion="send")]))
+    if isolated:
+        outcome = jobs.run_one(reviewer)
+        assert outcome["state"] == "complete" and outcome["result"]["rejected_sections"] == [
+            {"section": "wishes", "code": "conflict", "message": "This result has no current decision to communicate"}]
+        view = mind.read()
+        assert view["revision"] == before + 1 and view["exploration_decisions"][0]["decision"] == "keep"
+        assert [d for d in view["desires"] if d["kind"] == "contact"] == [] and "Must not leak" not in json.dumps(view["desires"])
+        assert not mind.contact_candidate()["eligible"]
+        return
     assert jobs.run_one(reviewer)["state"] == "pending"
     assert mind.read()["revision"] == before
     assert mind.read()["exploration_decisions"] == []

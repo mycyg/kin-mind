@@ -40,6 +40,8 @@ def fence(entry):
 # Why a ready step may no longer run as decided; each asks for a review, not for a retry.
 REVIEW_REASONS = {"configuration-changed", "new-owner-evidence", "source-needs-review", "missed-window-review-required",
                   "window-review-required", "procedure-needs-review"}
+# Ledger marker: the review that took this reason finished without being able to show the plan.
+UNSHOWN = "unshown:"
 
 
 class AutonomousPlans:
@@ -453,7 +455,26 @@ class AutonomousPlans:
                 return "procedure-needs-review"
         return None
 
-    def read(self, identifier=None, *, status=None, cursor=0, limit=24, history=False, manifest=False):
+    def review_target(self, job_id):
+        """The review event this appraisal answers and the plan it was woken for; None for any other appraisal."""
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT id,data FROM mind_action_events WHERE scope=? AND kind='plan-review' AND json_extract(data,'$.job_id')=? "
+                               "ORDER BY created_at,id LIMIT 1", (self.scope, job_id)).fetchone()
+        return {"event_id": row["id"], "plan_id": json.loads(row["data"]).get("plan_id")} if row else None
+
+    def reopen_wakeups(self, conn, target):
+        """A review that could not show its own plan answered for nothing: the reasons it took are open again.
+
+        Deleting them would not reopen anything. The same reasons give the same event key, and that
+        event exists and is complete. Kept under a marker no event carries, tick() finds them open and
+        takes them over, which is an event of its own.
+        """
+        if not conn.execute("SELECT 1 FROM mind_plans WHERE scope=? AND id=?", (self.scope, target["plan_id"])).fetchone():
+            return conn.execute("DELETE FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, target["plan_id"])).rowcount
+        return conn.execute("UPDATE mind_plan_wakeups SET event_id=? WHERE scope=? AND plan_id=? AND event_id=?",
+                            (UNSHOWN + target["event_id"], self.scope, target["plan_id"], target["event_id"])).rowcount
+
+    def read(self, identifier=None, *, status=None, cursor=0, limit=24, history=False, manifest=False, first=None):
         with self.engine.db.connect() as conn:
             if identifier:
                 plans = [self.get(conn, identifier)]
@@ -461,6 +482,14 @@ class AutonomousPlans:
                 rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? " + ("AND status=? " if status else "") +
                                     "ORDER BY next_review,id LIMIT ? OFFSET ?", (self.scope, *([status] if status else []), min(100, max(1, limit)), max(0, cursor))).fetchall()
                 plans = [json.loads(r[0]) for r in rows]
+            taken = len(plans)
+            lead = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, first)).fetchone() if first and not identifier else None
+            if lead:
+                # The plan a review was woken for leads its own view, however many plans are due before it.
+                # The window keeps its size, and the cursor counts only plans taken in their usual order.
+                usual = [p for p in plans if p["id"] != first]
+                rest = usual[:min(100, max(1, limit)) - 1]
+                taken, plans = len(rest) + (len(usual) < len(plans)), [json.loads(lead[0]), *rest]
             for plan in plans:
                 plan["needs_review"] = not self.mind._fresh(conn, plan["evidence"])
                 for step in plan["steps"]:
@@ -469,7 +498,7 @@ class AutonomousPlans:
                     plan["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plan_history WHERE id=? ORDER BY revision", (plan["id"],))]
             # Same snapshot as the plans themselves, so it describes exactly what is returned.
             shown = self.manifest(conn, plans) if manifest else None
-        result = {"plans": plans, "next_cursor": cursor + len(plans) if len(plans) == limit else None, "timezone": "Asia/Singapore"}
+        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == limit else None, "timezone": "Asia/Singapore"}
         return {**result, "manifest": shown} if manifest else result
 
     def _source_state(self, conn, ref):
@@ -521,7 +550,7 @@ class AutonomousPlans:
                     continue
                 answered = dict(conn.execute("SELECT key_digest,event_id FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, plan["id"])).fetchall())
                 dead = self._dead_reviews(conn, plan["id"])
-                new = [r for r in reasons if answered.get(digest(r)) is None or answered[digest(r)] in dead]
+                new = [r for r in reasons if answered.get(digest(r)) is None or answered[digest(r)] in dead or answered[digest(r)].startswith(UNSHOWN)]
                 review, unstarted = self._review_in_flight(conn, plan["id"], dead=dead)
                 if new and not review:
                     # Taking over from a review that never read the plan is an event of its own.

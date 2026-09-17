@@ -40,23 +40,50 @@ recent 中用户确实在指出错接话、遗忘任务或重复分享时，可�
 """
 
 
+class AdviceRejected(ValueError):
+    """The host refuses this advice. Code and message are static: neither quotes the advice or its sources."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+ADVICE_REPAIR_PROMPT = """你在修正一条被宿主拒绝的 session_advice。problem 是宿主的静态校验结论，不是用户消息。
+只引用 allowed_evidence 里的 id；prepare 或 rotate 必须引用 last_compaction.id，并至少引用一条 at 晚于 completedAt、未标记 needsReview 或 resolved 的观测。
+findings 的 sourceId 必须是用户原话的来源，quote 必须与原文逐字一致；无法保证时删除该条 finding。
+依据不足时改为 keep、recall、compact 或 defer，不要编造观测编号。只调用工具提交修正后的建议，不输出推理过程。"""
+
+
 def advice_record(proposal, context, receipt, event_id):
+    """Validates before anything is built: a refusal leaves no partial record behind."""
     if proposal is None or not context:
         return None
     known = {entry["id"] for entry in context.get("evidence", [])}
     if set(proposal.evidenceIds) - known:
-        raise ValueError("Session advice cites unknown observations")
+        raise AdviceRejected("unknown-observation", "Session advice cites unknown observations")
     recent = {entry["id"]: entry for entry in context.get("recent", [])}
     for finding in proposal.findings:
         source = recent.get(finding.sourceId)
         if not source or source.get("role") != "user" or finding.quote not in source.get("text", ""):
-            raise ValueError("Session finding needs an exact owner source")
+            raise AdviceRejected("finding-source-mismatch", "Session finding needs an exact owner source")
     if proposal.action in {"prepare", "rotate"}:
         compact = context.get("lastCompaction") or {}
         if not compact.get("id") or proposal.compactionId != compact["id"]:
-            raise ValueError("Session advice must prefer completed compaction")
+            raise AdviceRejected("compaction-not-cited", "Session advice must prefer completed compaction")
         evidence = [entry for entry in context.get("evidence", []) if entry["id"] in proposal.evidenceIds]
         if not any(entry.get("at", 0) > compact["completedAt"] and not entry.get("needsReview") and not entry.get("resolved") for entry in evidence):
-            raise ValueError("Session advice needs post-compaction evidence")
+            raise AdviceRejected("post-compaction-evidence-missing", "Session advice needs post-compaction evidence")
     return {"decision": proposal.model_dump(), "snapshotId": context["id"], "generation": context["binding"]["generation"],
             "receipt": receipt, "eventId": event_id}
+
+
+def repair_input(proposal, context, problem):
+    """What one bounded repair may see: the static refusal, what may be cited, and the advice itself.
+
+    Observation ids, times and flags are host bookkeeping; no observed text is repeated here.
+    """
+    compact = context.get("lastCompaction") or {}
+    return {"problem": {"code": problem.code, "message": str(problem)},
+            "allowed_evidence": [{k: entry[k] for k in ("id", "at", "needsReview", "resolved") if k in entry} for entry in context.get("evidence", [])],
+            "last_compaction": {k: compact[k] for k in ("id", "completedAt") if k in compact} or None,
+            "advice": proposal.model_dump()}
