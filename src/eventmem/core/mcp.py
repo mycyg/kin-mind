@@ -176,7 +176,7 @@ def create_mcp(engine):
         action: Literal["cancel", "pause", "resume", "snooze", "confirm"],
         due_at: str | None = None,
     ) -> dict:
-        """Change a scoped task using its current revision. snooze requires a timezone-aware due_at. Read again after a revision conflict. confirm approves a suggestion under the configured policy; it does not bypass delivery settings or confirm sending."""
+        """Change a scoped task using its current revision. snooze requires a timezone-aware due_at. Read again after a revision conflict. confirm approves a suggestion under the configured policy; it does not bypass delivery settings or confirm sending. cancel, pause, resume and snooze list the pending deliveries they stopped: canceled means nothing was sent, possibly_sent with reconciliation_required means the message may already have gone out and cannot be taken back."""
         return ContactTasks(engine, scope, policy_ids).manage(
             task_id, expected_revision, action, due_at
         )
