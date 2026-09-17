@@ -242,9 +242,14 @@ REGISTRY = {
     "Appraisal row was taken over during the evaluation": ("runtime", "lease-lost", "block"),
 }
 
-# Codes that have no static message to look up: either the caller substitutes them because
-# only it knows which meaning a shared message has, or the raise site formats its message.
+# Codes that have no static message to look up: the caller substitutes them because only it
+# knows which meaning a shared message has, the raise site formats its message, or the raise
+# site is outside the commit-path modules and carries its code as a keyword.
 CALLER_CODES = {
+    # core/self_knowledge.py: repairing a supersede chain is the host's own operation, so it
+    # is never sent back for review; the migration reports the refusal and retries by itself.
+    "supersession-invalid": ("semantic", "block"),
+    "supersession-revision-changed": ("runtime", "block"),
     # The evidence this evaluation exists to judge is gone: nothing is left to appraise.
     "root-evidence-unavailable": ("runtime", "terminal"),
     # `engine.command` refusing an appraisal's own key: another attempt already committed it.

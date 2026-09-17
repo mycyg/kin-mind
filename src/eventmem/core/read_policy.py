@@ -46,6 +46,8 @@ PRECEDENCE = ("synthetic_example", "role_configuration", "host_envelope", "self_
 RULES_VERSION = "evidence-classes-v1"
 # The row of `mind_memory_migrations` whose data.state says how far the isolation migration got.
 MIGRATION = "evidence-isolation-v1"
+# Migration states that are not half-done: the rules are fully applied, or fully taken back.
+SETTLED = ("complete", "undone")
 SWITCH = "recall_purpose_policy"
 SETTINGS_KEY = "evidence_classes"
 STAMP = "origin_kind"
@@ -116,9 +118,17 @@ def _matches(namespace, pattern):
     return namespace.startswith(pattern[:-1]) if pattern.endswith("*") else namespace == pattern
 
 
+def proposed_rules(namespaces):
+    """The public rules plus the private ones given here, most specific first: exact names,
+    then longer prefixes. A migration's dry run uses this to read as a registry file would."""
+    private = namespaces if isinstance(namespaces, dict) else {}
+    rules = dict(NAMESPACE_REGISTRY)
+    rules.update({str(name): kind for name, kind in private.items() if kind in NON_EXPERIENCE and str(name).strip("*")})
+    return tuple(sorted(rules.items(), key=lambda rule: (rule[0].endswith("*"), -len(rule[0]), rule[0])))
+
+
 def registry(engine, conn=None):
-    """The namespace rules in force: the public ones above plus the host's private additions.
-    Ordered so that the most specific rule is met first: exact names, then longer prefixes."""
+    """The namespace rules in force: the public ones above plus the host's private additions."""
     if conn is None:
         with engine.db.connect() as connection:
             return registry(engine, connection)
@@ -129,10 +139,7 @@ def registry(engine, conn=None):
             private = json.loads(row[0]).get("namespaces", {})
         except (ValueError, AttributeError):
             private = {}
-    private = private if isinstance(private, dict) else {}
-    rules = dict(NAMESPACE_REGISTRY)
-    rules.update({str(name): kind for name, kind in private.items() if kind in NON_EXPERIENCE and str(name).strip("*")})
-    return tuple(sorted(rules.items(), key=lambda rule: (rule[0].endswith("*"), -len(rule[0]), rule[0])))
+    return proposed_rules(private)
 
 
 def configure_registry(engine, namespaces):
@@ -243,7 +250,7 @@ class _Snapshot(NamedTuple):
     approved: frozenset
 
 
-def _load_snapshot(engine, conn, scope):
+def _load_snapshot(engine, conn, scope, rules=None):
     scopes = [scope.key(), _shared(scope).key()]
     stored = {}
     try:
@@ -252,7 +259,8 @@ def _load_snapshot(engine, conn, scope):
     except sqlite3.OperationalError:
         # A database this schema has not reached: every source is classified on the fly.
         pass
-    rules, approved = registry(engine, conn), approved_sources(engine, scope, conn)
+    rules = registry(engine, conn) if rules is None else rules
+    approved = approved_sources(engine, scope, conn)
     sources = {}
     # One lookup on the namespace index for the whole registry. `+scope` keeps the planner off
     # the scope index, which would walk every source of the scope for a handful of names.
@@ -351,7 +359,7 @@ class ReadPolicy:
     @property
     def strict(self):
         """A migration that started and has not finished: derived caches are not to be trusted."""
-        return self.enabled and self.migration_state not in (None, "complete")
+        return self.enabled and self.migration_state is not None and self.migration_state not in SETTLED
 
     def admits(self, kind):
         return not self.enabled or kind in self._admitted or self.purpose == "audit"
@@ -516,13 +524,24 @@ def stamp_source(engine, conn, sid, source, text):
         return None
 
 
-def classify_scope(engine, conn, scope):
+def proposed_policy(engine, conn, scope, rows, purpose="experience_recall", *, rules=None, state=None):
+    """A policy that reads as if `rows` were already stored, over the rules given or installed.
+    The migration's dry run needs both: it may not write its rows, nor install its registry."""
+    live = _load_snapshot(engine, conn, scope, rules)
+    stored = dict(live.rows)
+    for row in rows:
+        stored[row["source_id"]] = Found(row["class"], REQUEST_LABEL if row["rule"] == RULE_REQUEST else None, row["rule"])
+    return ReadPolicy(purpose, True, _Snapshot(stored, live.derived, live.rules, live.approved), state)
+
+
+def classify_scope(engine, conn, scope, *, rules=None):
     """Every source of a scope the rules take out of plain experience, for the migration that
     fills the table: [{source_id, namespace, class, rule, rules_version}]. Reads only. The root
     record supplies the text for the envelope rule; ids and static names, never content."""
     from .db import digest
 
-    rules, approved, proposed = registry(engine, conn), approved_sources(engine, scope, conn), []
+    rules = registry(engine, conn) if rules is None else rules
+    approved, proposed = approved_sources(engine, scope, conn), []
     for row in conn.execute("SELECT id,namespace,data FROM sources WHERE scope=? AND deleted=0 ORDER BY id", (scope.key(),)).fetchall():
         root = conn.execute("SELECT data FROM records WHERE id=? AND deleted=0", ("mem_" + digest([row["id"], "root"])[:32],)).fetchone()
         found = _source_found(row, approved, rules, text=json.loads(root[0])["content"] if root else None)
