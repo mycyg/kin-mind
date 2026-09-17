@@ -8,17 +8,20 @@ from zoneinfo import ZoneInfo
 import json
 
 from eventmem.core.db import Conflict, Missing
+# The envelope openings have one definition, in the read policy. This lane filtered by a copy
+# of one of them; it now asks that list, which is the built-in set plus the host's own.
+from eventmem.core.read_policy import HOST_PREFIXES, envelope_prefixes, host_envelope
 
 TIMEZONE = "Asia/Singapore"
 RECENT_EXCHANGES = 4
 
 
-def is_public_dialogue(event):
+def is_public_dialogue(event, prefixes=HOST_PREFIXES):
     return (event.get('kind') in {'owner-message', 'assistant-message', 'delivery'}
             and bool(event.get('text')) and not event.get('internal')
             and event.get('origin') not in {'runtime-notice', 'runtime-status', 'host-control'}
             and (event.get('kind') != 'delivery' or event.get('state') == 'accepted')
-            and not event['text'].startswith('Warning: Heads up: Long threads'))
+            and not host_envelope(event['text'], prefixes))
 
 
 def utc_time(value):
@@ -94,12 +97,13 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
     rows = dialogue_rows(mind, exchanges=exchanges)
     redundant = redundant_public_summaries([json.loads(r['data']) for r in rows])
     with mind.engine.db.connect() as conn:
+        prefixes = envelope_prefixes(mind.engine, conn)
         items, seen = [], {}
         for row in reversed(rows):
             event = json.loads(row["data"])
             if event['id'] in redundant:
                 continue
-            if not is_public_dialogue(event):
+            if not is_public_dialogue(event, prefixes):
                 continue
             try:
                 refs = mind._evidence(conn, [event["source_id"]])

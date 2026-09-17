@@ -14,6 +14,7 @@ from kin_mind.adaptive_recall import (
     RecallFollowup,
     RecallRanking,
     bounded,
+    fresh_leads,
 )
 from kin_mind.context import Contexts
 from kin_mind.lifecycle import (
@@ -177,7 +178,7 @@ def test_feature_disable_fences_a_prepared_job_commit(system, monkeypatch):
 def test_legacy_host_envelopes_do_not_impersonate_owner_sources(system):
     mind, _, _, source, _ = system
     source("genuine", "我要求探索时间给到二十分钟。")
-    source("old-envelope", "内部探索选题事件，不是小光的新消息，不发送消息。探索时间二十分钟。")
+    source("old-envelope", "内部探索选题事件，不是用户的新消息，不发送消息。探索时间二十分钟。")
     items, _ = AdaptiveRecall(Contexts(mind)).collect("我要求探索时间多少分钟？", mode="light")
     assert any("我要求探索时间" in i["text"] for i in items)
     assert not any(i["text"].startswith("内部探索选题事件，") for i in items)
@@ -791,16 +792,19 @@ def test_first_successful_ranking_can_expand_after_an_earlier_timeout(system, mo
             return RecallRanking(ids=[r["id"] for r in ordered[:8]],
                                  followups=[RecallFollowup(candidate_id=ordered[0]["id"], direction="after")]), {}
     _, info = AdaptiveRecall(Contexts(mind)).collect("星图后来怎样了？", mode="deep", allow_model=True, provider=Recovering())
-    assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
-    assert len(lookups) == 3
+    # The deadline is retried against the same candidates, so the first answer arrives inside
+    # round one and its follow-up drives the second round. Two searches, three requests.
+    assert info["rounds"] == 2 and "rerank:TimeoutError" in info["degraded_reasons"]
+    assert info["model_requests"] == 3
+    assert lookups == ["星图后来怎样了？", "星图后来怎样了？ "]
     assert info["ranking_trace"][0]["followups"]
 
 
 CROWDED_QUERY = "9月16日星图蓝色主题后来改成什么了"
 CROWDED_ANSWER = "星图蓝色主题后来改成蓝紫色。"
-# The leading eight of the local ranking, and of a run whose second round was reranked.
+# The leading eight of the local ranking, and of a run whose first round was reranked on retry.
 CROWDED_LOCAL_TOP = ["answer", "crowd-0", "crowd-1", "crowd-2", "crowd-3", "crowd-9", "crowd-4", "crowd-5"]
-CROWDED_RANKED_TOP = ["answer", "event", "crowd-21", "crowd-20", "crowd-19", "crowd-18", "crowd-17", "crowd-15"]
+CROWDED_RANKED_TOP = ["answer", "event", "crowd-26", "event", "crowd-25", "crowd-24", "event", "crowd-23"]
 
 
 class DeadRanker:
@@ -847,11 +851,14 @@ def test_a_rerank_that_never_answers_keeps_the_first_rounds_leading_evidence(sys
     # Without a model the local ranking answers the question by itself.
     assert local_info["rounds"] == 1 and local_info["model_requests"] == 0
     assert [names.get(i, "event") for i in local_ids[:8]] == CROWDED_LOCAL_TOP
-    assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
+    # Nothing answered and nothing new to look for: the candidates are asked about again, but
+    # the same string is not searched again.
+    assert info["rounds"] == 1 and info["model_requests"] == 3
+    assert "rerank:TimeoutError" in info["degraded_reasons"]
     # A ranking nobody answered may not demote what the first round found without one.
     assert degraded_ids[:8] == local_ids[:8]
-    # The extra rounds still order what follows it, and lose none of the first round's evidence.
-    assert set(local_ids) <= set(degraded_ids) and degraded_ids[8:] != local_ids[8:]
+    # And with no ranking at all, that first local order is the whole answer.
+    assert degraded_ids == local_ids
 
 
 def test_a_rerank_that_never_answers_returns_the_same_order_twice(system, monkeypatch):
@@ -863,7 +870,7 @@ def test_a_rerank_that_never_answers_returns_the_same_order_twice(system, monkey
     first, first_info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=DeadRanker())
     second, second_info = recall.collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=DeadRanker())
     assert [i["id"] for i in first] == [i["id"] for i in second]
-    assert first_info["rounds"] == second_info["rounds"] == 3
+    assert first_info["rounds"] == second_info["rounds"] == 1
 
 
 def test_a_later_successful_rerank_still_decides_the_degraded_order(system, monkeypatch):
@@ -883,7 +890,9 @@ def test_a_later_successful_rerank_still_decides_the_degraded_order(system, monk
             return RecallRanking(ids=[c[1]["id"] for c in chosen[:8]]), {}
     items, info = AdaptiveRecall(Contexts(mind)).collect(CROWDED_QUERY, mode="deep", allow_model=True,
                                                         provider=Recovering())
-    assert info["rounds"] == 3 and "rerank:TimeoutError" in info["degraded_reasons"]
+    # The ranking that did answer still decides, whether it answered a later round or a retry
+    # of the one that timed out.
+    assert info["rounds"] == 2 and "rerank:TimeoutError" in info["degraded_reasons"]
     assert [names.get(i["id"], "event") for i in items[:8]] == CROWDED_RANKED_TOP
 
 
@@ -947,13 +956,13 @@ def test_frozen_quote_matches_original_but_not_a_paraphrase(system, monkeypatch)
     replay = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(replay)
     mind, _, _, source, _ = system
-    source("note", "小光确认：颜色保持蓝色。")
+    source("note", "用户确认：颜色保持蓝色。")
     source("original", "颜色保持蓝色。")
     source("paraphrase", "她偏好蓝色。")
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE records SET data=json_set(data,'$.attributes.role','user')")
         records = {json.loads(r[0])["content"]: json.loads(r[0]) for r in conn.execute("SELECT data FROM records")}
-    expected = records["小光确认：颜色保持蓝色。"]["id"]
+    expected = records["用户确认：颜色保持蓝色。"]["id"]
     selected = records["颜色保持蓝色。"]["id"]
     monkeypatch.setattr(AdaptiveRecall, "collect", lambda *a, **k: ([{"id": selected}], {"degraded_reasons": []}))
     case = {"id": "source-equivalence", "query": "颜色？", "expected_ids": [expected], "evidence_quotes": {expected: "颜色保持蓝色。"},
@@ -961,3 +970,41 @@ def test_frozen_quote_matches_original_but_not_a_paraphrase(system, monkeypatch)
     assert replay.evaluate(mind.engine, mind.scope, [case])["critical_recall"] == 1
     selected = records["她偏好蓝色。"]["id"]
     assert replay.evaluate(mind.engine, mind.scope, [case])["critical_recall"] == 0
+
+
+class FadingRanker:
+    """One ranking of candidates nine to sixteen, and after that only deadlines."""
+    timeout = 30
+
+    def __init__(self, queries=()):
+        self.calls, self.selected, self.queries = 0, [], list(queries)
+
+    def structured(self, name, schema, prompt, payload, **kwargs):
+        self.calls += 1
+        if self.calls > 1:
+            raise TimeoutError("recall-provider-deadline")
+        self.selected = [c["id"] for c in payload["candidates"][8:16]]
+        return RecallRanking(ids=self.selected, queries=self.queries), {}
+
+
+def test_a_timeout_after_a_ranking_keeps_the_whole_selection_it_answered(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    crowded_corpus(mind, memory, source, clock)
+    provider = FadingRanker()
+    items, info = AdaptiveRecall(Contexts(mind)).collect(CROWDED_QUERY, mode="deep", allow_model=True, provider=provider)
+    chosen = info["ranking_trace"][0]["selected"]
+    assert len(chosen) == 8 and provider.calls > 1 and "rerank:TimeoutError" in info["degraded_reasons"]
+    # All eight, in the order it gave them: unreviewed leads follow the selection, never split it.
+    assert [i["id"] for i in items[:8]] == chosen
+
+
+def test_a_round_offers_only_the_leads_it_kept():
+    """A candidate the cap already dropped is not a lead, whatever it scores."""
+    scores = {"kept-new": 5.0, "kept-old": 4.0, "pruned-new": 9.0}
+    ordered = ["kept-old", "kept-new"]
+    assert fresh_leads(ordered, {"kept-old"}, scores) == ["kept-new"]
+    assert fresh_leads(ordered, set(), scores) == ["kept-new", "kept-old"]
+    assert fresh_leads(ordered, {"kept-old", "kept-new"}, scores) == []
+    assert fresh_leads(["a", "b", "c"], set(), {"a": 1.0, "b": 3.0, "c": 2.0}, limit=2) == ["b", "c"]

@@ -59,3 +59,13 @@ def enabled(conn, scope, flag="semantic_actions"):
 def optimized(conn, scope, flag):
     """Default-on optimization; only an explicit false restores the previous behavior."""
     return settings(conn, scope).get(flag) is not False
+
+
+LEGACY_THRESHOLDS = "legacy_drive_thresholds"
+
+
+def legacy_thresholds(conn, scope):
+    """Whether the fixed score gates still decide whether to speak or explore. Off by default,
+    and never on once decisions are semantic: a score is context, not a permission."""
+    config = settings(conn, scope)
+    return config.get("semantic_actions", False) is not True and config.get(LEGACY_THRESHOLDS, False) is True
