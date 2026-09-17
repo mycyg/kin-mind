@@ -731,6 +731,42 @@ class Appraisals:
         ]
         return clean[0] if job_id and clean else clean
 
+    def _batch_members(self, conn, identifiers):
+        """Flatten a batch: every nested absorbed job and its evidence, in order."""
+        members, evidence, queue = {}, {}, list(identifiers)
+        while queue:
+            identifier = queue.pop(0)
+            if identifier in members:
+                continue
+            members[identifier] = True
+            row = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND scope=?", (identifier, self.mind.scope.key())).fetchone()
+            if not row:
+                continue
+            child = json.loads(row[0])
+            evidence.update(dict.fromkeys(child.get("evidence_ids", [])))
+            queue.extend(child.get("batch_ids", []))
+        return list(members), list(evidence)
+
+    def _settle_children(self, conn, parent_id, data, state):
+        """No terminal parent leaves an absorbed job batched. A parent that goes
+        back to pending keeps carrying its children into the next attempt."""
+        if state == "pending":
+            return []
+        members, _ = self._batch_members(conn, data.get("batch_ids", []))
+        for child_id in members:
+            if state != "complete":
+                conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0 WHERE id=? AND state='batched'",
+                             (time.time(), child_id))
+                continue
+            child = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND state='batched'", (child_id,)).fetchone()
+            if not child:
+                continue
+            child_data = {**json.loads(child[0]), "result": {"batch_id": parent_id, "event_id": (data.get("result") or {}).get("event_id")}}
+            if data.get("receipt"):
+                child_data["receipt"] = data["receipt"]
+            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(child_data), child_id))
+        return members
+
     def run_one(self, provider, *, lane=None, job_id=None):
         provider.background = True
         settings = self.memory.settings()
@@ -763,7 +799,10 @@ class Appraisals:
                 (self.mind.scope.key(), time.time(), int(semantic_enabled), 1 if maintenance else 2 if enrichment else 0),
             ).fetchone():
                 return {"state": "busy"}
-            if semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}:
+            if (semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}
+                    # A judgment that already committed finishes from its durable
+                    # receipt; it must not absorb evidence that commit never saw.
+                    and not conn.execute("SELECT 1 FROM commands WHERE id=?", (self.mind._key(row["id"]),)).fetchone()):
                 batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND (json_extract(data,'$.stimulus') IS NULL OR json_extract(data,'$.stimulus') IN ('assistant-result','runtime-result','delivery')) ORDER BY available LIMIT 11",
                                      (self.mind.scope.key(), time.time(), row["id"])).fetchall()
                 ids = list(data["evidence_ids"])
@@ -780,15 +819,19 @@ class Appraisals:
                             total += tokens(self.engine._get(conn, identifier)["content"])
                     return total
                 for child in batch:
-                    combined = list(dict.fromkeys(ids + json.loads(child["data"])["evidence_ids"]))
+                    # A failed candidate still carries its own batched children.
+                    # Absorb that whole subtree, or it stays batched for ever.
+                    members, member_evidence = self._batch_members(conn, [child["id"]])
+                    combined = list(dict.fromkeys(ids + member_evidence))
                     if len(combined) > 40 or evidence_cost(combined) > 24000:
                         break
-                    ids = combined; batch_ids.append(child["id"])
+                    ids = combined
+                    batch_ids.extend(m for m in members if m not in batch_ids and m != row["id"])
                     stimuli.add(json.loads(child["data"]).get("stimulus"))
                 data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus="delivery" if stimuli == {"delivery"} else "interaction-batch")
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 for child_id in batch_ids:
-                    conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=?", (child_id,))
+                    conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
             data["attempt_started_at"] = self.mind.clock()
             data["attempt_token"] = uuid.uuid4().hex
             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
@@ -822,8 +865,8 @@ class Appraisals:
                     if not remaining:
                         data["result"] = {"already_integrated": True}
                         with self.engine.db.connect(write=True) as conn:
-                            for identifier in [row["id"], *data.get("batch_ids", [])]:
-                                conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), identifier))
+                            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
+                            self._settle_children(conn, row["id"], data, "complete")
                         return self.status(row["id"])
                     data["evidence_ids"] = remaining
                 view = self.mind.read()
@@ -1231,12 +1274,15 @@ class Appraisals:
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
                 (state, time.time() + delay, int(admission_wait), dumps(data), row["id"], data["attempt_token"]),
             ).rowcount
-            if changed and state == "complete":
-                for child_id in data.get("batch_ids", []):
-                    child = conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (child_id,)).fetchone()
-                    if child:
-                        child_data = {**json.loads(child[0]), "receipt": data.get("receipt"), "result": {"batch_id": row["id"], "event_id": data["result"].get("event_id")}}
-                        conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(child_data), child_id))
+            if changed:
+                self._settle_children(conn, row["id"], data, state)
+        if not changed:
+            # This worker lost its attempt token, so the receipt, proposal and
+            # error of this attempt are discarded. The holder settles children.
+            receipt = data.get("receipt") or data.get("failed_call_receipt") or {}
+            self.engine.db.metric("appraisal_attempt_discarded", 1, {
+                "appraisal": row["id"], "reason": "attempt-token-no-longer-owns-the-row", "attempted_state": state,
+                **({"usage": receipt["usage"]} if receipt.get("usage") else {"usage_status": receipt.get("usage_status", "unknown")})})
         return self.status(row["id"])
 
 
