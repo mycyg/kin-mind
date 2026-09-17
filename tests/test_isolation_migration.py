@@ -90,7 +90,7 @@ def world(tmp_path):
         "installed": receive(STORE, "installed", TITLES[2], ROLE_TEXT, authority="operation", role="host"),
         "approved": receive(STORE, "approved", TITLES[3], APPROVED_TEXT, role="host"),
         "request": receive(STORE, "request", TITLES[4], REQUEST_TEXT, role="user", host_event="message"),
-        "example": receive("chat", "example", TITLES[5], EXAMPLE_TEXT, role="user", examples_are_synthetic=True),
+        "example": receive("chat", "example", TITLES[5], EXAMPLE_TEXT, role="assistant", examples_are_synthetic=True),
     }
     mind.initialize(agent_version="synthetic-v1", evidence_ids=[ids["lived"]])
     memory = MemoryContinuity(mind)

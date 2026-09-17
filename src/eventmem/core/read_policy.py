@@ -8,12 +8,16 @@ something the owner was observed doing. `history` keeps one meaning only, status
 
 The unit of classification is the **source**. Evidence freshness is pinned to record revisions,
 so a stored record is never rewritten to mark it. Its class comes, in this order, from being a
-self-knowledge entry, from the rows its sources have in `source_evidence_class` (written with
-the source's text in hand, and the place where an operator's review is recorded), from the
-flags and the envelope text of the record as stored, from the namespace and approval rules
-applied on the fly to a source that has no row yet, and last from the stamp the record got
-when it was inserted. A half-migrated database therefore hides what a migrated one hides. The
-owner's own configuration requests stay experience and carry a label instead.
+self-knowledge entry, from a row an operator wrote (a rule named `operator-…` in
+`source_evidence_class`, the one place a person's review is recorded), from the envelope text a
+legacy host prompt starts with — such a prompt is stored as an owner turn, so only its text
+tells it apart — and then from who wrote it: **the owner's own words are always experience**,
+and no flag, namespace, row or stamp takes them out of it. What is not the owner's own words
+keeps the order it always had: the rows its sources have, the flags of the record as stored,
+the namespace and approval rules applied on the fly to a source that has no row yet, and last
+the stamp the record got when it was inserted. A half-migrated database therefore hides what a
+migrated one hides. A configuration signal on the owner's own words — a flag, a registered
+namespace, an approved source, a stamp — only labels them as a configuration request.
 """
 
 from __future__ import annotations
@@ -69,6 +73,10 @@ RULE_NAMESPACE = "namespace-registry"
 RULE_APPROVED = "persona-approved-source"
 RULE_REQUEST = "owner-configuration-request"
 RULE_STAMP = "insert-stamp"
+# A stored row whose rule starts with this was written by an operator with the text in hand. It
+# is the only thing that can hide the owner's own words; every rule above is automatic and the
+# classification and the migration never write one.
+RULE_OPERATOR = "operator-"
 
 # Namespace -> class for sources the host itself writes there. A trailing `*` is a prefix. The
 # owner's own words inside such a namespace stay experience, labelled as a configuration
@@ -156,7 +164,7 @@ def configure_registry(engine, namespaces):
 
 def flagged(attributes):
     """The ad-hoc marks a source's metadata, and so its root record's attributes, may carry.
-    They say what the content is, so they hold whoever wrote it."""
+    They say what the content is about, so they never hold against whoever wrote it."""
     if any(attributes.get(flag) for flag in EXAMPLE_FLAGS):
         return Found("synthetic_example", None, RULE_FLAG_EXAMPLE)
     if attributes.get("configuration_only"):
@@ -168,25 +176,27 @@ def source_rule(namespace, metadata, authority, *, source_id=None, approved=(), 
     """Classify one source from what is stored about it. None means plain experience.
 
     A declaration can only take a source out of experience, never vouch for it: metadata is
-    caller-supplied, so `origin_kind: experience` decides nothing.
+    caller-supplied, so `origin_kind: experience` decides nothing. The owner's own explicit turn
+    is an event that happened whatever it asked for: a configuration signal only labels it, and
+    only a host envelope — by text, by declaration or by namespace — is read before authorship.
     """
     metadata = metadata if isinstance(metadata, dict) else {}
-    declared = metadata.get(STAMP)
-    if isinstance(declared, str) and declared in NON_EXPERIENCE:
-        return Found(declared, None, RULE_DECLARED)
-    if flagged(metadata):
-        return flagged(metadata)
     if text and host_envelope(text):
         return Found("host_envelope", None, RULE_ENVELOPE)
+    declared = metadata.get(STAMP)
+    declared = declared if isinstance(declared, str) and declared in NON_EXPERIENCE else None
+    found = flagged(metadata)
     kind = next((value for pattern, value in rules if _matches(namespace, pattern)), None)
     rule = RULE_NAMESPACE
     if kind is None and source_id is not None and source_id in approved:
         kind, rule = "role_configuration", RULE_APPROVED
-    if kind is None:
-        return None
-    if kind != "host_envelope" and authority == "explicit" and metadata.get("role") == "user":
-        return Found("experience", REQUEST_LABEL, RULE_REQUEST)
-    return Found(kind, None, rule)
+    if "host_envelope" not in (declared, kind) and authority == "explicit" and metadata.get("role") == "user":
+        return Found("experience", REQUEST_LABEL, RULE_REQUEST) if declared or found or kind else None
+    if declared:
+        return Found(declared, None, RULE_DECLARED)
+    if found:
+        return found
+    return Found(kind, None, rule) if kind is not None else None
 
 
 def _persona_stamp(engine):
@@ -391,30 +401,44 @@ class ReadPolicy:
 
     def classify(self, record):
         """In the order of the module's first paragraph. A claim's own sources are the owner's
-        words, so being a self-knowledge entry is asked first; a stored row is asked next,
-        because it was written with everything known and records an operator's review."""
+        words, so being a self-knowledge entry is asked first; then an operator's row, the one
+        review a person wrote; then who said it, which nothing stored about a source outranks."""
         if not self.enabled:
             return PLAIN
         attributes = record.get("attributes") or {}
         if attributes.get("self_knowledge"):
             return Found("self_knowledge", None, RULE_SELF_KNOWLEDGE)
-        sources, rows, derived = record.get("source_ids") or (), self._rows, self._derived
-        if rows and any(sid in rows for sid in sources):
-            return self._combine([rows.get(sid) or derived.get(sid) or PLAIN for sid in sources])
+        sources = record.get("source_ids") or ()
+        rows = [self._rows.get(sid) for sid in sources]
+        behind = [row or self._derived.get(sid) for row, sid in zip(rows, sources)]
+        reviewed = next((f for f in behind if f and f.rule.startswith(RULE_OPERATOR)), None)
+        if reviewed:
+            return reviewed
+        # A host prompt is stored as an owner turn, so its text is read before the flags and
+        # before who is recorded as having written it.
+        if host_envelope(record.get("content") or ""):
+            return Found("host_envelope", None, RULE_ENVELOPE)
+        stamp = attributes.get(STAMP)
+        stamp = stamp if isinstance(stamp, str) else None
+        if attributes.get("role") == "user" and not record.get("generated"):
+            # An event that happened, whatever it asked for. Every signal here only labels it.
+            asked = (flagged(attributes) or stamp in NON_EXPERIENCE or stamp == REQUEST_LABEL
+                     or any(f and (f.kind != "experience" or f.label) for f in behind))
+            return Found("experience", REQUEST_LABEL, RULE_REQUEST) if asked else PLAIN
+        # Not the owner's own words: the order these rules have always had. A row saying only
+        # that the source's root record was an owner turn decides nothing about this record.
+        if any(f and f.rule != RULE_REQUEST for f in rows):
+            return self._combine([f or PLAIN for f in behind])
         found = flagged(attributes)
         if found:
             return found
-        if host_envelope(record.get("content") or ""):
-            return Found("host_envelope", None, RULE_ENVELOPE)
-        if derived and any(sid in derived for sid in sources):
-            return self._combine([derived.get(sid) or PLAIN for sid in sources])
-        stamp = attributes.get(STAMP)
-        if isinstance(stamp, str):
-            if stamp in NON_EXPERIENCE:
-                return Found(stamp, None, RULE_STAMP)
-            if stamp == REQUEST_LABEL:
-                return Found("experience", REQUEST_LABEL, RULE_STAMP)
-        return PLAIN
+        if any(f and f.rule != RULE_REQUEST for f in behind):
+            return self._combine([f or PLAIN for f in behind])
+        if stamp in NON_EXPERIENCE:
+            return Found(stamp, None, RULE_STAMP)
+        if stamp == REQUEST_LABEL:
+            return Found("experience", REQUEST_LABEL, RULE_STAMP)
+        return next((f for f in behind if f), PLAIN)
 
     def refusal(self, record, history=False):
         """Why this read may not return the record, or None. With the switch off this is the one

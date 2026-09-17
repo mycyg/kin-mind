@@ -79,7 +79,7 @@ def world(tmp_path):
                "configuration": receive("synthetic-persona-store", "installed", ROLE_TEXT,
                                         authority="operation", role="host", host_event="configuration-verified"),
                "example": receive("chat", "lantern-example", "Example dialogue: we watched lantern boats last winter.",
-                                  role="user", host_event="message", examples_are_synthetic=True),
+                                  role="assistant", host_event="message", examples_are_synthetic=True),
                "envelope": receive("chat", "lantern-envelope", ENVELOPE, role="user", host_event="message")}
     ids = {name: root(engine, source) for name, source in sources.items()}
     mind.initialize(agent_version="synthetic-v1", evidence_ids=[ids["lived"]])

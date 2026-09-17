@@ -24,7 +24,10 @@ ENVELOPE = "内部探索选题事件，宿主要求挑选灯笼集市选题，�
 EXAMPLE = "示例对话：去年冬天我们一起看过灯笼集市的灯船。"
 CONFIGURED = "角色设定原文：谈到灯笼集市时语气要温暖。"
 LIVED = "今天我们把灯笼集市的骨架修好了。"
-CLASS_OF = {ENVELOPE: "host_envelope", EXAMPLE: "synthetic_example", CONFIGURED: "role_configuration"}
+# The owner-word lanes only ever return owner-role turns, and the one thing that keeps such a
+# turn out of an experience read is the envelope text. A configuration flag only labels it.
+CLASS_OF = {ENVELOPE: "host_envelope"}
+LABELLED = (EXAMPLE, CONFIGURED)
 
 
 @pytest.fixture
@@ -49,7 +52,8 @@ def system(tmp_path):
 
 
 def owner_turns(source):
-    """Owner-role turns of one afternoon: one lived, three that only look like it."""
+    """Owner-role turns of one afternoon: one lived, one a host envelope stored as an owner
+    turn, and two the owner said about a configuration, which a flag only labels."""
     ids = {LIVED: source("lived", LIVED, role="user", host_event="message")}
     ids[ENVELOPE] = source("envelope", ENVELOPE, role="user", host_event="message")
     ids[EXAMPLE] = source("example", EXAMPLE, role="user", host_event="message", examples_are_synthetic=True)
@@ -71,6 +75,10 @@ def assert_lane(collect, ids):
         items = {i["id"]: i for i in collect(history=history)}
         assert ids[LIVED] in items and items[ids[LIVED]]["basis"] == "explicit"
         assert all(ids[text] not in items for text in CLASS_OF), history
+        # What the owner said about a configuration is still an owner turn, and says so.
+        for text in LABELLED:
+            assert items[ids[text]]["basis"] == "explicit", (text, history)
+            assert items[ids[text]]["facts"]["evidence_label"] == "configuration_request"
     audit = {i["id"]: i for i in collect(history=True, recall_purpose="audit")}
     for text, kind in CLASS_OF.items():
         assert audit[ids[text]]["basis"] == kind and audit[ids[text]]["text"] == text
@@ -130,7 +138,8 @@ def test_neighbour_lane_obeys_the_policy(system, monkeypatch):
     for history in (False, True):
         items = {i["id"] for i in collect(history=history)}
         assert LIVED not in rounds[0] and LIVED in rounds[1]
-        assert {anchor, ids[LIVED]} <= items and all(ids[text] not in items for text in CLASS_OF)
+        assert {anchor, ids[LIVED], *(ids[text] for text in LABELLED)} <= items
+        assert all(ids[text] not in items for text in CLASS_OF)
         # The ranking model is a reader too: it is never shown what is not experience.
         assert not any(text in shown for shown in rounds for text in CLASS_OF)
     audit = {i["id"]: i for i in collect(history=True, recall_purpose="audit")}
@@ -162,9 +171,10 @@ def test_light_context_path_obeys_the_policy(system):
     contexts = Contexts(mind)
     for history in (False, True):
         built = contexts.build("灯笼集市", purpose="read", mode="light", history=history, budget=8000)
-        lines = [json.loads(line) for line in built["text"].splitlines()]
-        assert LIVED in {line["text"] for line in lines}
-        assert not any(line["text"] in CLASS_OF for line in lines) and "recall_purpose" not in built
+        shown = {line["text"]: line for line in map(json.loads, built["text"].splitlines())}
+        assert LIVED in shown and "recall_purpose" not in built
+        assert not any(text in shown for text in CLASS_OF)
+        assert all(shown[text]["basis"] == "explicit" for text in LABELLED)
     audit = contexts.build("灯笼集市", purpose="read", mode="light", history=True, budget=8000, recall_purpose="audit")
     lines = {line["text"]: line for line in map(json.loads, audit["text"].splitlines())}
     assert all(lines[text]["basis"] == kind for text, kind in CLASS_OF.items())
@@ -256,6 +266,11 @@ async def test_read_memory_and_record_items_label_what_is_not_experience(system)
         assert json.loads(read["content"])["basis"] == kind and "explicit" not in read["content"]
     lived = json.loads((await server.call_tool("read_memory", {"record_id": ids[LIVED]}))[0].text)
     assert lived["confirmation"] == "explicit" and "evidence_class" not in lived
+    for text in LABELLED:
+        asked = json.loads((await server.call_tool("read_memory", {"record_id": ids[text]}))[0].text)
+        assert asked["confirmation"] == "explicit" and "evidence_class" not in asked
+        assert asked["evidence_label"] == "configuration_request"
+        assert contexts.record_item(mind.engine.get(ids[text]))["facts"]["evidence_label"] == "configuration_request"
 
 
 def test_configuration_request_keeps_its_basis_and_gains_a_label(system):
