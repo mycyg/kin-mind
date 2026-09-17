@@ -176,6 +176,7 @@ class AdaptiveRecall:
                 pinned.add(node["id"])
 
         ranked_ids, best_ids, reviewed = [], [], set()
+        first_ranked, first_pool = [], {}
         requested_neighbors, expanded_neighbors = [], set()
         for round_no in range(3 if mode_used == "deep" else 1):
             if not queries or time.monotonic() >= deadline:
@@ -347,6 +348,8 @@ class AdaptiveRecall:
             # available through explicit reads and returned continuation IDs.
             pool = {i: pool[i] for i in ordered}
             ranked_ids = ordered
+            if not first_ranked:
+                first_ranked, first_pool = ordered, dict(pool)
             if mode_used != "deep" or not allow_model or not ordered:
                 break
             selected, key_to_id = [], {}
@@ -434,6 +437,12 @@ class AdaptiveRecall:
                     queries.insert(0, lookup + " ")
                     continue
                 break
+        if first_ranked and not best_ids:
+            # No round's ranking ever answered. The later rounds reorder the same local evidence to
+            # feed one, so their reshuffling may not demote what the first round led with; whatever
+            # those rounds surfaced follows it.
+            pool = {**first_pool, **pool}
+            ranked_ids = list(dict.fromkeys([*first_ranked[:8], *ranked_ids]))
         selected = [pool[i] for i in ranked_ids[:40] if i in pool and self.contexts._current(pool[i], policy)]
         info["expanded_ids"] = [i["id"] for i in selected[:8]]
         info["evidence_versions"] = {i["id"]: i["revision"] for i in selected}
