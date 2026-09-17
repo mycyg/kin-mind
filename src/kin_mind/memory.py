@@ -72,6 +72,10 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             "attempt_ledger": True, "idempotency_fingerprint": True, "manifest_rebase": True,
             "appraisal_reuse": True, "appraisal_revalidation": True, "model_lanes": True,
             "semantic_cache_v2": True, "memory_item_isolation": True,
+            # Stage 3 WP B3: a long reply is reviewed in chunks, an interrupted group's unsent
+            # remainder can be reviewed again, and an earlier tail settles through this call.
+            # Off restores the stage-2 limits, which refuse such a group for ever.
+            "chunked_reply_review": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -178,7 +182,8 @@ class MemoryContinuity:
             raise ValueError("Unknown memory setting")
         for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
-                    "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation"):
+                    "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
+                    "chunked_reply_review"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
