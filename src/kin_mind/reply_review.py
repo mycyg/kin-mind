@@ -59,6 +59,13 @@ class ReplyReviews:
         return {'agent_version': self.mind._load(conn)['agent_version'], 'inputs': inputs, 'evidence': proof,
                 'findings': versions, 'latest_input': list(latest) if latest else None}
 
+    @staticmethod
+    def reused(value):
+        # The durable review retains its original accounting. A read/retry
+        # must not report that original model charge as a new request.
+        return {**value, 'reused': True, 'receipt': {**value['receipt'],
+            'cache_hit': True, 'usage': {}, 'usage_status': 'reused', 'elapsed_ms': 0}}
+
     def preflight(self, request, provider=None):
         entries = request.get('entries', [])
         if not 1 <= len(entries) <= 64 or any(not e.get('draft_id') or not isinstance(e.get('text'),str) or not e['text'].strip() for e in entries):
@@ -75,7 +82,7 @@ class ReplyReviews:
             if old and old['state'] == 'ready':
                 fresh = self.dependencies(conn, entries, [f[0] for f in old['dependencies']['findings']])
                 if fresh == old['dependencies'] and self.mind._fresh(conn, fresh['evidence']):
-                    return {**old, 'reused': True}
+                    return self.reused(old)
                 # A partially sent group must never be rewritten after its
                 # evidence changes. The original IDs stay in its journal.
                 if request.get('frozen'):
@@ -143,7 +150,7 @@ class ReplyReviews:
                 raise Conflict('Reply evidence changed during review')
             concurrent = conn.execute("SELECT data FROM mind_reply_reviews WHERE scope=? AND id=? AND state='ready'", (self.scope,key)).fetchone()
             if concurrent and json.loads(concurrent[0]).get('dependencies') == deps:
-                return {**json.loads(concurrent[0]), 'reused': True}
+                return self.reused(json.loads(concurrent[0]))
             reservations = {}
             for entry,bubble in zip(entries,decision.bubbles):
                 refs = [r.model_dump() for r in bubble.references]

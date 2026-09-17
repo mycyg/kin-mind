@@ -25,7 +25,9 @@ def test_one_whole_decision_includes_actual_input_and_reuses_frozen_evidence(sys
     assert first['state']=='ready' and len(provider.calls)==1
     assert provider.calls[0]['current_inputs'][0]['text']=='Please repeat the joke'
     assert [x['text'] for x in first['checked']]==[x['text'] for x in req['entries']]
-    assert api.preflight({**req,'frozen':True})['reused']
+    reused = api.preflight({**req,'frozen':True})
+    assert reused['reused'] and reused['receipt']['usage_status']=='reused'
+    assert reused['receipt']['usage']=={} and reused['receipt']['elapsed_ms']==0
     memory.ingest({'id':'new-input','kind':'owner-message','at':mind.clock(),'text':'Another question'})
     assert api.preflight({**req,'frozen':True})['state']=='pending'
     assert len(provider.calls)==1
