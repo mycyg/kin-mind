@@ -77,7 +77,8 @@ class Providers:
             self.engine.db.metric("model_ms", (time.perf_counter() - start) * 1000, {"role": role})
         for attempt in range(2 if local else 1):
             try:
-                with (model_slot(self, role) if has_shared_slots and config.model.startswith("deepseek") else nullcontext()), httpx.Client(
+                # Jobs mark themselves background; anything else reaching a model here is a recall somebody waits for.
+                with (model_slot(self, role, default="foreground") if has_shared_slots and config.model.startswith("deepseek") else nullcontext()), httpx.Client(
                     timeout=config.timeout_seconds,
                     follow_redirects=False,
                     trust_env=not local,

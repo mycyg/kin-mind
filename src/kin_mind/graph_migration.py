@@ -126,6 +126,8 @@ class GraphMigration:
     def match_shares(self, provider, owner_id, *, limit=24, force=False, max_batches=2, share_ids=None):
         """Checkpoint small, complete public-bubble batches; never send or rescore affect."""
         from eventmem.core.retrieval import tokens
+        # A backfill nobody waits for: it takes a background slot and yields to the user.
+        provider.background = True
         with self.engine.db.connect() as conn:
             previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (self.scope.key(), "coverage:"+owner_id)).fetchone()
             previous = json.loads(previous[0]) if previous else {}
