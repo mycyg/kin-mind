@@ -17,11 +17,33 @@ never establishes identity by itself.
 | `temperature_shadow` | Usage provenance and simulated thermal ordering |
 | `temperature_ranking` | Apply thermal ordering to optional automatic background |
 
-All switches default to false. Enable on a backed-up copy first. Automatic
+Those switches default to false. Enable on a backed-up copy first. Automatic
 volumes have `generated_by=kin-lifecycle`; manually maintained volumes retain
 ownership of their own members. Disabling a lifecycle feature fences both new
 job preparation and a pending result's commit. Disabled jobs park in
 `waiting_config` and can resume after re-enabling the feature.
+
+The same configuration, written through the host action `configure-memory`,
+carries the conflict-handling switches, which default to **on**:
+
+| Switch | Covers | Documented in |
+| --- | --- | --- |
+| `attempt_ledger` | `mind_appraisal_attempts`: one row per appraisal attempt with its model calls | [mobile recovery](mobile-recovery.md) |
+| `idempotency_fingerprint` | `mind_command_fingerprints`: command id, effective payload and precondition kept apart | [architecture](architecture.md) |
+| `manifest_rebase` | `mind_appraisal_manifests` and the commit rebase that reads one | [mobile recovery](mobile-recovery.md) |
+| `appraisal_reuse` | Tier A: committing a stored proposal with no model call | [mobile recovery](mobile-recovery.md) |
+| `appraisal_revalidation` | Tier B: one light `revalidate_appraisal` question | [mobile recovery](mobile-recovery.md) |
+| `model_lanes` | `mind_model_leases` admission with foreground, user-work and background lanes | [Kin Mind](kin-mind.md#model-lanes-and-the-lease-interface) |
+| `semantic_cache_v2` | `mind_judgment_cache` and its dependency index | [Kin Mind](kin-mind.md#deepseek-and-memory) |
+| `memory_item_isolation` | Item-level isolation in the memory section, and `mind_memory_unorganized` | [mobile recovery](mobile-recovery.md) |
+
+Each is independent, and an explicit `false` restores the previous behaviour of
+that part alone. Every table above is new, so code without these features
+ignores it and reads the columns it always read; a rollback leaves the tables
+in place, and a re-enabled switch finds its history. The conflict taxonomy that
+classifies a commit failure has no switch: it adds fields to records that
+already existed. `max_charged_attempts` is a number in the same configuration
+rather than a switch.
 
 Cooling additionally requires seven full elapsed days, seven consecutive completed
 daily observation receipts, and a fresh `temperature_validation` with critical
@@ -136,6 +158,9 @@ usage for writes `model_usage_unknown` and no token count at all: unreported usa
 is never a zero. That covers timeouts, network errors, HTTP failures, a missing
 tool call and an unverified model. A model role with no configured price reports
 `cost_status: "unpriced"` through `model_cost_unknown` instead of a cost of 0.0.
+The same rule governs the per-call records an appraisal attempt keeps in the
+[attempt ledger](mobile-recovery.md#operator-recovery), and the usage row a Node
+adapter reports for every call it makes.
 
 `read_event_thread` accepts `detail=index|summary|original` and optional
 `expected_revision`. Summary is the compatible default. Revision mismatch is an
@@ -200,7 +225,8 @@ cover source correction, concurrent arrival, invalid/truncated model output,
 leases, retries, split/undo, feature fences and access-origin semantics. Existing
 mobile completeness, model notices and shared-session tests remain release gates.
 
-Rollback disables the new switches and uses versioned graph undo where needed.
+Rollback disables the lifecycle switches and uses versioned graph undo where
+needed; a conflict-handling switch is set to `false` on its own, as above.
 Do not restore an old production database over new conversations or receipts.
 Retain the pre-rollout SQLite backup and original source/vector storage. Automatic
 volumes and summaries are derived views; source speech and delivery evidence
