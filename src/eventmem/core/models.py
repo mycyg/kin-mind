@@ -138,7 +138,10 @@ class RevisionInput(Model):
     attributes: dict[str, Any] | None = None
 
 
-class RecallRequest(Model):
+class RecallQuery(Model):
+    """Everything a recall may be asked, except what it is for. The chat model's tools take
+    this shape, so they cannot declare a purpose: what they recall is experience."""
+
     query: str = Field(default="", max_length=4000)
     scope: Scope = Field(default_factory=Scope)
     scenario: Literal[
@@ -169,6 +172,22 @@ class RecallRequest(Model):
     @classmethod
     def check_time(cls, value: str | None) -> str | None:
         return utc(value) if value else None
+
+
+RecallPurpose = Literal["experience_recall", "self_knowledge_view", "audit"]
+
+
+class RecallRequest(RecallQuery):
+    # Not `purpose`: that name belongs to the context budget (`Contexts.build`, the host's
+    # memory-context). `history` keeps its status and expiry meaning only.
+    recall_purpose: RecallPurpose = Field(
+        default="experience_recall",
+        description="What the read is for. Omit it for the default: a server that predates "
+        "this field rejects it. experience_recall returns lived experience only. "
+        "self_knowledge_view also returns role configuration, its examples and self-claims, "
+        "each labelled with its class. audit returns everything, labelled. history only "
+        "lifts the status and expiry checks.",
+    )
 
 
 class ContactPolicy(Model):

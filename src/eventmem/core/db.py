@@ -145,6 +145,8 @@ class Database:
             conn.executescript(SCHEMA)
             from kin_mind.lifecycle_schema import initialize
             initialize(conn)
+            from .read_policy import SCHEMA as READ_POLICY_SCHEMA
+            conn.executescript(READ_POLICY_SCHEMA)
         os.chmod(self.path, 0o600)
 
     @contextmanager

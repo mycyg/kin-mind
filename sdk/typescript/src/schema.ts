@@ -1115,6 +1115,13 @@ export interface components {
              * @default false
              */
             explain?: boolean;
+            /**
+             * Recall Purpose
+             * @description What the read is for. Omit it for the default: a server that predates this field rejects it. experience_recall returns lived experience only. self_knowledge_view also returns role configuration, its examples and self-claims, each labelled with its class. audit returns everything, labelled. history only lifts the status and expiry checks.
+             * @default experience_recall
+             * @enum {string}
+             */
+            recall_purpose?: "experience_recall" | "self_knowledge_view" | "audit";
         };
         /** RecallResult */
         RecallResult: {
