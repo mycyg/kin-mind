@@ -899,13 +899,18 @@ class Appraisals:
                                      "clock": clock_context(self.mind.clock()), "recent_dialogue": recent}
                 if memory_context:
                     model_context["memory_context"] = memory_context
+                data.pop("plan_view", None)
                 if settings["semantic_actions"] and not historical and not maintenance:
                     from .plans import AutonomousPlans
                     from .procedures import Procedures
+                    shown_plans = AutonomousPlans(self.mind).read(limit=40, manifest=True)
+                    # The host's own record of the plan view this attempt shows the model.
+                    # Decisions are checked against it at commit, step by step.
+                    data["plan_view"] = shown_plans.pop("manifest")
                     model_context["autonomy_context"] = {"semantic_actions": True,
                         "plans_enabled": settings["autonomous_plans"], "creation_enabled": settings["creative_execution"],
                         "procedure_learning": settings["procedure_learning"],
-                        "plans": AutonomousPlans(self.mind).read(limit=40),
+                        "plans": shown_plans,
                         "procedures": Procedures(self.mind).read(limit=12),
                         "execution_environment": self.engine.settings("execution_environment"),
                         "capabilities": self.exploration_capabilities,
@@ -1056,21 +1061,21 @@ class Appraisals:
                     allowed = self.mind._continuity_sources(conn, state, roots) + list(continuity_refs.values()) if proposal.concerns or proposal.understanding or proposal.rhythm else roots
                     latest_owner = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.mind.scope.key(),)).fetchone()[0] if memory_context else 0
                     new_interaction = memory_context and latest_owner > memory_context["latest_owner_seq"]
+                    held_decisions = []
                     if settings["autonomous_plans"] and not historical and not new_interaction:
                         from .plans import AutonomousPlans
                         plans = AutonomousPlans(self.mind)
+                        shown = dict(data.get("plan_view") or {})
+                        shown["plans"] = dict(shown.get("plans", {}))
                         for index, change in enumerate(proposal.plan_changes):
-                            plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
-                        decision_revisions = {}
-                        for index, decision in enumerate(proposal.action_decisions):
-                            original_revision = decision.expected_revision
-                            if decision.plan_id in decision_revisions:
-                                original, current_revision = decision_revisions[decision.plan_id]
-                                if original_revision != original:
-                                    raise Conflict("Inconsistent plan decision base revision")
-                                decision = decision.model_copy(update={"expected_revision": current_revision})
-                            updated = plans.decide(conn, decision, eid + ":decision:" + str(index), receipt, list(semantic_refs.values()))
-                            decision_revisions[decision.plan_id] = (original_revision, updated["revision"])
+                            changed = plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
+                            plans.refresh_view(conn, shown, changed, eid + ":plan:" + str(index))
+                        # A decision is fenced by the step and basis the model was shown, not by its
+                        # expected_revision alone. One that lost that fence is held, not raised.
+                        held_decisions = plans.decide_batch(conn, proposal.action_decisions, eid + ":decision:", receipt, list(semantic_refs.values()),
+                            shown, version=effective_version, job_id=row["id"])
+                        if data.get("stimulus") == "plan-review":
+                            plans.register_review(conn, list(shown["plans"]), eid + ":plan-view", receipt, effective_version)
                     if settings["procedure_learning"] and not historical and not new_interaction:
                         from .procedures import Procedures
                         for index, candidate in enumerate(proposal.procedure_candidates):
@@ -1163,7 +1168,8 @@ class Appraisals:
                         self.memory.habits.apply(conn, proposal.habits, eid+":habits", {v for r in semantic_refs.values() for v in (r["source_id"], r["record_id"])})
                     if proposal.session_advice and self.session_context and not historical:
                         state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
-                    return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction)}
+                    return {"provider": receipt, "proposal": proposal.model_dump(), "new_interaction_pending": bool(new_interaction),
+                            **({"held_decisions": held_decisions} if held_decisions else {})}
 
                 def rebase(conn, state):
                     # Contact bookkeeping may advance the global revision during
@@ -1186,6 +1192,10 @@ class Appraisals:
                     return semantic_enabled
 
                 data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+            # Only a committed result holds decisions; a replayed command receipt carries the same list.
+            data.pop("held_decisions", None)
+            if data["result"].get("held_decisions"):
+                data["held_decisions"] = data["result"]["held_decisions"]
             data.pop("error", None)
             state = "complete"
         except ModelAdmissionWait as error:
