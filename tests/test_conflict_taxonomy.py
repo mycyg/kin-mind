@@ -105,6 +105,9 @@ def test_a_stale_citation_is_not_an_out_of_bounds_one_in_plan_evidence(system):
 def test_a_stale_citation_is_not_an_out_of_bounds_one_in_memory_evidence(system):
     """The same split at memory.apply_assessment, the other conflated site."""
     mind, memory, source, _clock = system
+    # With item isolation on, a blocked note is dropped instead of raised (test_memory_item_isolation);
+    # this test classifies the raise site itself, which the switch leaves exactly as it was.
+    memory.configure({"memory_item_isolation": False})
     cited = source("memory-evidence")
     with mind.engine.db.connect() as conn:
         supplied = mind._evidence(conn, [cited])
