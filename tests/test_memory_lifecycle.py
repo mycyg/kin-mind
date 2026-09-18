@@ -1008,3 +1008,63 @@ def test_a_round_offers_only_the_leads_it_kept():
     assert fresh_leads(ordered, set(), scores) == ["kept-new", "kept-old"]
     assert fresh_leads(ordered, {"kept-old", "kept-new"}, scores) == []
     assert fresh_leads(["a", "b", "c"], set(), {"a": 1.0, "b": 3.0, "c": 2.0}, limit=2) == ["b", "c"]
+
+
+def chain_corpus(mind, memory, source, clock):
+    """Two owner turns of one correction chain; the question's words cover only the first.
+
+    The thread holding both turns matches no query term and is older than the graph
+    read's recency fill, so no query-driven lane can supply it: only the anchor's
+    container expansion can. A second thread over unrelated turns is the control.
+    """
+    from kin_mind.graph import GraphAssessment, GraphNode
+    anchor = memory.ingest({"id": "chain-anchor", "kind": "owner-message", "at": mind.clock(),
+                            "text": "星图封面不要再用深蓝色了"})
+    clock[0] += timedelta(minutes=1)
+    companion = memory.ingest({"id": "chain-companion", "kind": "owner-message", "at": mind.clock(),
+                               "text": "背景音换成雨声怎么样"})
+    clock[0] += timedelta(minutes=1)
+    unrelated = [memory.ingest({"id": f"unrelated-{index}", "kind": "owner-message", "at": mind.clock(),
+                                "text": f"客舱第{index}段的随手记录"}) for index in range(2)]
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE records SET data=json_set(data,'$.attributes.role','user')")
+        conn.execute("UPDATE records SET data=json_set(data,'$.attributes.host_event','message')")
+        refs = memory.graph.proof(conn, [anchor["record_id"], companion["record_id"]])
+        memory.graph.apply(conn, GraphAssessment(nodes=[GraphNode(key="chain", kind="thread",
+            title="晚间闲聊反馈线", text="当晚两条反馈的记录",
+            evidence_ids=[anchor["record_id"], companion["record_id"]])]), refs, "evaluation", {"model": "synthetic"})
+        thread = memory.graph.get(conn, memory.graph.identifier("thread", ["evaluation", "chain"]))
+        refs = memory.graph.proof(conn, [u["record_id"] for u in unrelated])
+        memory.graph.apply(conn, GraphAssessment(nodes=[GraphNode(key="control", kind="thread",
+            title="客舱随手记录线", text="与问题无关的若干记录",
+            evidence_ids=[u["record_id"] for u in unrelated])]), refs, "evaluation", {"model": "synthetic"})
+        control = memory.graph.get(conn, memory.graph.identifier("thread", ["evaluation", "control"]))
+    for index in range(45):
+        memory.ingest({"id": f"filler-{index}", "kind": "owner-message", "at": mind.clock(),
+                       "text": f"第{index}条无关的闲聊记录"})
+        clock[0] += timedelta(minutes=1)
+    return anchor, companion, thread, control
+
+
+def test_an_original_hit_recalls_the_thread_owning_its_evidence(system, monkeypatch):
+    from eventmem.core.providers import Providers
+    mind, memory, _, source, clock = system
+    monkeypatch.setattr(Providers, "embed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    anchor, companion, thread, control = chain_corpus(mind, memory, source, clock)
+    items, info = AdaptiveRecall(Contexts(mind)).collect("星图封面不要再用什么颜色？", mode="deep", allow_model=False)
+    assert info["model_requests"] == 0
+    assert anchor["record_id"] in info["candidate_ids"]
+    # The thread holding the same evidence enters the retained candidates only through
+    # container expansion: no query lane matches it and the recency fill is past it.
+    assert thread["id"] in info["candidate_ids"]
+    assert thread["id"] in [i["id"] for i in items[:8]]
+    # And through the thread the companion turn — lexically invisible to the question —
+    # is reachable evidence, the way the frozen replay's coverage set counts it.
+    with mind.engine.db.connect() as conn:
+        node = memory.graph.get(conn, thread["id"])
+    reached = set(node.get("record_ids") or []) | {r["record_id"] for r in node.get("evidence", [])}
+    assert companion["record_id"] in reached
+    # A thread whose evidence never entered the pool is not supplied: the lane recalls
+    # containers of pooled evidence, never threads at large.
+    assert control["id"] not in info["candidate_ids"]
+    assert info["degraded_reasons"] == ["embedding:RuntimeError"]

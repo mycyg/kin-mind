@@ -271,7 +271,8 @@ test('a classifier timeout falls back to the settlement carrier: the review of t
     switchModel:async()=>{throw Error('no switch in this test');},waitForIdle:async()=>{}});
   w.state.now+=1000;
   const record=await router.select({id:'input-2',text:'那第二点呢'});
-  assert.deepEqual([record.reason,record.tail],['classifier-unconfirmed',{carrier:'classify',state:'missed',groupId:'reply-a',reason:'classifier-unconfirmed'}]);
+  // KIN-ITER-20260918-02: the classification failure routes nothing; the tail still misses.
+  assert.deepEqual([record.state,record.reason,record.tail],['semantic-pending','classification-timeout',{carrier:'classify',state:'missed',groupId:'reply-a',reason:'classifier-unconfirmed'}]);
   assert.equal(w.guard.manifests.read('reply-a').tail_intent,undefined,'no decision was made up');
   // The next reply covers the second bubble and says nothing about the third.
   w.state.verdict=covering('reply-b',{'reply-a-d1':'reply-b-d0'});w.state.now+=1000;

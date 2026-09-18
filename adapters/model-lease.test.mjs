@@ -184,6 +184,104 @@ test('a lease answer nobody can read is a degraded ledger, not an admission',asy
   assert.deepEqual(LANES,['foreground','user-work','background']);
 });
 
+test('a lease that expires unconfirmed stops the call at the last confirmed deadline, not when the network comes back',async()=>{
+  const usage=[],notes=[],c=clock();
+  // Renewals fail while the network is unreachable; once the ttl has passed the ledger
+  // has given the slot to somebody else and answers lost.
+  const request=async(route,body)=>{
+    const op=route.split('/')[1];
+    if(op==='acquire')return {state:'admitted',lease:{id:body.id,lane:body.lane,purpose:body.purpose,expires_at:90,ttl_seconds:body.ttl_seconds,renew_after_seconds:30},capacity:{limit:4,source:'configured',held:1}};
+    if(op==='renew'){if(c.now()<=90000)throw Error('lease-service-unreachable');return {state:'lost',id:body.id};}
+    if(op==='release')return {state:'lost',id:body.id};
+    throw Error('unexpected-op');
+  };
+  const lease=createLeaseClient({request,note:n=>notes.push(n),...c});
+  const reviewer=createMobileReviewer({key:'synthetic',lease,onUsage:row=>usage.push(row),
+    fetchImpl:(url,options)=>new Promise((resolve,reject)=>{
+      options.signal.addEventListener('abort',()=>reject(options.signal.reason??Error('aborted')),{once:true});
+      // The provider's answer arrives at t=110 — twenty seconds past the last confirmed deadline.
+      c.setTimer(()=>resolve(answer('review_mobile_health',{input_tokens:7})),110000);
+    })});
+  const outcome=reviewer.audit({healthy:true}).then(()=>'answered',error=>error);
+  await settle();
+  await c.advance(60000);
+  // Unanswered renewals inside the confirmed window are not a loss: the call keeps running.
+  assert.equal(notes.filter(n=>n.event==='model-lease-expired-unconfirmed').length,0);
+  assert.equal(usage.length,0);
+  await c.advance(30000); // t=90: the ttl the ledger confirmed has passed without one confirmed renewal
+  await c.advance(110000); // t=200: the late answer and the network's return both arrive now
+  const error=await outcome;
+  assert.match(error?.message??'',/lease-expired-unconfirmed/);
+  // No late result was submitted after the deadline, and the spent call is recorded unknown.
+  assert.equal(usage.length,1);
+  assert.equal(usage[0].outcome,'lease-expired-unconfirmed');
+  assert.equal(usage[0].usageStatus,'unknown');
+  assert.equal(usage[0].usage,null);
+  assert.equal(usage[0].leaseExpiredUnconfirmed,true);
+  assert.equal(notes.filter(n=>n.event==='model-lease-expired-unconfirmed').length,1);
+  assert.equal(notes.filter(n=>n.event==='model-lease-lost').length,0);
+  // Renewal stopped once the lease was unconfirmable; nothing keeps retrying into somebody else's slot.
+  assert.equal(notes.filter(n=>n.event==='model-lease-renewal-unanswered').length,2);
+  assert.equal(c.pending(),0);
+});
+
+test('a renewal that never answers at all still costs the lease its deadline',async()=>{
+  const usage=[],notes=[],c=clock();
+  let renewals=0;
+  const request=async(route,body)=>{
+    const op=route.split('/')[1];
+    if(op==='acquire')return {state:'admitted',lease:{id:body.id,lane:body.lane,purpose:body.purpose,expires_at:90,ttl_seconds:body.ttl_seconds,renew_after_seconds:30},capacity:{limit:4,source:'configured',held:1}};
+    if(op==='renew'){renewals++;return new Promise(resolve=>c.setTimer(()=>resolve({state:'lost',id:body.id}),150000));}
+    if(op==='release')return {state:'lost',id:body.id};
+    throw Error('unexpected-op');
+  };
+  const lease=createLeaseClient({request,note:n=>notes.push(n),...c});
+  const reviewer=createMobileReviewer({key:'synthetic',lease,onUsage:row=>usage.push(row),
+    fetchImpl:(url,options)=>new Promise((resolve,reject)=>{
+      options.signal.addEventListener('abort',()=>reject(options.signal.reason??Error('aborted')),{once:true});
+      c.setTimer(()=>resolve(answer('review_mobile_health',{input_tokens:7})),110000);
+    })});
+  const outcome=reviewer.audit({healthy:true}).then(()=>'answered',error=>error);
+  await settle();
+  await c.advance(200000); // the one renewal hangs past the deadline and answers lost at t=180
+  const error=await outcome;
+  assert.match(error?.message??'',/lease-expired-unconfirmed/);
+  assert.equal(usage.length,1);
+  assert.equal(usage[0].outcome,'lease-expired-unconfirmed');
+  assert.equal(usage[0].usageStatus,'unknown');
+  assert.equal(usage[0].leaseExpiredUnconfirmed,true);
+  // The hanging renewal's late 'lost' is not a second verdict on top of the expiry.
+  assert.equal(renewals,1);
+  assert.equal(notes.filter(n=>n.event==='model-lease-expired-unconfirmed').length,1);
+  assert.equal(notes.filter(n=>n.event==='model-lease-lost').length,0);
+});
+
+test('an expired-unconfirmed foreground lease is only recorded: the owner keeps the answer already paid for',async()=>{
+  const usage=[],notes=[],c=clock();
+  const request=async(route,body)=>{
+    const op=route.split('/')[1];
+    if(op==='acquire')return {state:'admitted',lease:{id:body.id,lane:body.lane,purpose:body.purpose,expires_at:90,ttl_seconds:body.ttl_seconds,renew_after_seconds:30},capacity:{limit:4,source:'configured',held:1}};
+    if(op==='renew')throw Error('lease-service-unreachable');
+    if(op==='release')return {state:'lost',id:body.id};
+    throw Error('unexpected-op');
+  };
+  const lease=createLeaseClient({request,note:n=>notes.push(n),...c});
+  const reviewer=createMobileReviewer({key:'synthetic',lease,onUsage:row=>usage.push(row),
+    fetchImpl:(url,options)=>new Promise(resolve=>{
+      options.signal.addEventListener('abort',()=>resolve(answer('route_message',{input_tokens:3})),{once:true});
+      c.setTimer(()=>resolve(answer('route_message',{input_tokens:3})),110000);
+    })});
+  const pending=reviewer.classify({text:'hello',timeoutMs:1000});
+  await settle();
+  await c.advance(200000); // expiry passes at t=90, the answer lands at t=110
+  assert.equal((await pending).route,'chat');
+  assert.equal(usage.length,1);
+  assert.equal(usage[0].outcome,'answered');
+  assert.equal(usage[0].usageStatus,'reported');
+  assert.equal(usage[0].leaseExpiredUnconfirmed,true);
+  assert.equal(notes.filter(n=>n.event==='model-lease-expired-unconfirmed').length,1);
+});
+
 test('unknown usage is written as unknown and never survives as a dropped key or a zero',()=>{
   for(const value of [undefined,null,{}]) {
     const row=usageRow({purpose:'synthetic',usage:value});

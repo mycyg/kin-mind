@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION} from './mobile-router.mjs';
+import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,noticeReceiptClass} from './mobile-router.mjs';
 import {compactPrompt,publicMobileRuntime} from './mobile-controls.mjs';
 
 function fixture(t, options={}) {
@@ -48,8 +48,20 @@ test('casual and unknown follow-ups preserve completion while execution remains 
   await f.router.requestMode({commandId:'finish',mode:'auto',reason:'delivered',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   const completion=structuredClone(task.completion),version=task.inputVersion;
   await f.router.dispatch({id:'chat',text:'haha'},async()=> 'steered');
+  // The classifier goes down: the follow-up waits as itself — no submission, no
+  // task change, no model change (KIN-ITER-20260918-02).
   f.router.classify=async()=>{throw Error('classification timeout');};
-  await f.router.dispatch({id:'unknown',text:'How is the switch?'},async()=> 'new-turn');
+  await assert.rejects(f.router.dispatch({id:'unknown',text:'How is the switch?'},async()=>assert.fail('must not submit')),/waiting/);
+  assert.equal(task.inputVersion,version);assert.deepEqual(task.completion,completion);
+  assert.equal(f.runtime.model,'gpt-6-astra');assert.deepEqual(task.contextInputIds,['chat']);
+  assert.equal(f.router.state.inputs.unknown.state,'semantic-pending');
+  // The late answer says chat: it rides as context on the existing task, and the
+  // execution model stays GPT.
+  f.router.classify=async()=>({route:'chat',reason:'a question about the switch'});
+  f.router.state.semanticPending.unknown.nextAttemptAt=0;
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs.unknown.state,'selected');
+  await f.router.dispatch({id:'unknown',text:'How is the switch?'},async d=>{assert.equal(d.model,'gpt-6-astra');return'steered';});
   assert.equal(task.inputVersion,version);assert.deepEqual(task.completion,completion);
   assert.equal(f.runtime.model,'gpt-6-astra');assert.deepEqual(task.contextInputIds,['chat','unknown']);
 });
@@ -206,10 +218,122 @@ test('DeepSeek work escalation waits for its turn before changing provider',asyn
   assert.deepEqual(f.switched,['gpt-6-astra']);
 });
 
-test('classifier timeout fails over to work, without treating its output as chat',async t=>{
-  const f=fixture(t,{classify:async()=>{throw Error('timeout');}});
-  await f.router.dispatch({id:'question',text:'unclear'},async r=>{assert.equal(r.model,'gpt-6-astra');return'new-turn';});
-  assert.equal(f.router.currentTask().status,'running');
+test('a classification failure never manufactures work: the input waits as itself, bounded and visible',async t=>{
+  // KIN-ITER-20260918-02: this REVISES the old "classifier timeout fails over to
+  // work" semantics. A failed classification creates no task, no GPT switch and no
+  // execution grant; the input waits as itself and the failure class is recorded.
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{calls++;throw Error('classification-timeout');}});
+  await assert.rejects(f.router.dispatch({id:'question',text:'unclear'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(f.router.tasks().length,0,'no task is manufactured out of a failure');
+  assert.deepEqual(f.switched,[],'and no provider switch');
+  const record=f.router.state.inputs.question;
+  assert.equal(record.state,'semantic-pending');assert.equal(record.reason,'classification-timeout');
+  const entry=f.router.state.semanticPending.question;
+  assert.deepEqual([entry.failure.class,entry.attempts,entry.maxAttempts,entry.model],['timeout',2,4,'gpt-6-astra']);
+  assert.equal(calls,2,'the live dispatch drove the first bounded retry of the same input');
+  // The budget is visible and bounded; after it, an explicit failed state.
+  for(const _ of [1,2]){f.router.state.semanticPending.question.nextAttemptAt=0;await f.router.reviewSemanticPending();}
+  assert.equal(calls,4);
+  assert.equal(f.router.state.inputs.question.state,'semantic-failed');
+  assert.equal(f.router.state.inputs.question.reason,'classification-exhausted');
+  assert.equal(f.router.state.semanticPending.question.state,'failed');
+  assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
+  // A redrive never executes it and never asks again: it reports the explicit state.
+  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async()=>assert.fail('never submitted'));
+  assert.equal(outcome.route,'semantic-failed');
+  assert.equal(calls,4);
+});
+
+test('an idle chat whose classification failed is answered late as chat — never as work',async t=>{
+  let failures=2;
+  const f=fixture(t,{classify:async()=>{if(failures-->0)throw Error('classification-timeout');return{route:'chat',reason:'late answer'};}});
+  await assert.rejects(f.router.dispatch({id:'question',text:'unclear'},async()=>{throw Error('not yet');}),/waiting/);
+  assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
+  f.router.state.semanticPending.question.nextAttemptAt=0;
+  await f.router.reviewSemanticPending();
+  assert.deepEqual([f.router.state.inputs.question.state,f.router.state.inputs.question.route],['selected','chat']);
+  await f.router.dispatch({id:'question',text:'unclear'},async d=>{assert.equal(d.model,'deepseek-flash');return'new-turn';});
+  assert.deepEqual(f.switched,['deepseek-flash'],'chat goes to DeepSeek once known — GPT was never touched');
+  assert.equal(f.router.tasks().length,0);
+  assert.equal(f.router.state.semanticPending.question.state,'classified');
+});
+
+test('a restart with a pending classification keeps the wait durable, bounded and honest',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{calls++;throw Error('deepseek-http-503');}});
+  await assert.rejects(f.router.dispatch({id:'question',text:'unclear'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(f.router.state.semanticPending.question.failure.class,'http');
+  // An attempt in flight when the host dies is retried, never concluded.
+  f.router.state.semanticPending.question.state='classifying';f.router.save('synthetic-crash');
+  const restarted=new MobileRouter(f.args);
+  assert.equal(restarted.state.inputs.question.state,'semantic-pending','the wait survives the restart');
+  assert.equal(restarted.state.semanticPending.question.state,'retry');
+  assert.equal(restarted.tasks().length,0);assert.deepEqual(f.switched,[]);
+  // The pump-driven review resumes the SAME input; a late chat answer executes as chat.
+  restarted.classify=async()=>({route:'chat',reason:'answered after restart'});
+  restarted.state.semanticPending.question.nextAttemptAt=0;
+  await restarted.reviewSemanticPending();
+  assert.equal(restarted.state.inputs.question.state,'selected');
+  await restarted.dispatch({id:'question',text:'unclear'},async d=>{assert.equal(d.model,'deepseek-flash');return'new-turn';});
+  assert.equal(restarted.tasks().length,0);
+  assert.deepEqual(f.switched,['deepseek-flash']);
+});
+
+test('a late classification that arrives after a stop never resurrects work',async t=>{
+  const f=fixture(t);
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  f.router.classify=async()=>{throw Error('classification-timeout');};
+  await assert.rejects(f.router.dispatch({id:'more',text:'also add tests'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(f.router.state.inputs.more.state,'semantic-pending');
+  // The owner stops the task while the answer is in flight.
+  await f.router.dispatch({id:'stop',text:'停止任务'},async()=> 'steered');
+  await f.router.reconcile();
+  assert.equal(f.router.tasks().length,0);
+  // The late answer says "work": it creates nothing and extends nothing.
+  f.router.classify=async()=>({route:'work',reason:'late work answer'});
+  f.router.state.semanticPending.more.nextAttemptAt=0;
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs.more.state,'semantic-canceled');
+  assert.equal(f.router.state.inputs.more.reason,'superseded-by-cancel');
+  assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
+});
+
+test('a duplicate of a semantically pending input neither reclassifies nor double-executes',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{calls++;throw Error('classification-timeout');}});
+  await assert.rejects(f.router.dispatch({id:'same',text:'unclear'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(calls,2);
+  await assert.rejects(f.router.dispatch({id:'same',text:'unclear'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(calls,2,'a duplicate waits on the same entry; the input is not asked again');
+  assert.equal(Object.keys(f.router.state.semanticPending).length,1);
+  assert.equal(f.router.tasks().length,0);
+});
+
+test('explicit control commands keep their path while the classifier is down',async t=>{
+  const f=fixture(t,{classify:async()=>{throw Error('classification-timeout');}});
+  await f.router.dispatch({id:'enter',text:'/mode work'},async()=>{throw Error('host control');});
+  await f.router.applyPendingMode();
+  assert.equal(f.runtime.model,'gpt-6-astra');assert.equal(f.router.tasks().length,0);
+  assert.equal(Object.keys(f.router.state.semanticPending).length,0,'a command never waits on semantics');
+});
+
+test('a late-classified work follow-up joins the existing task without disturbing its lock',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const task=f.router.currentTask(),version=task.inputVersion;
+  f.router.classify=async()=>{throw Error('classification-timeout');};
+  await assert.rejects(f.router.dispatch({id:'followup',text:'also handle errors'},async()=>{throw Error('must not submit');}),/waiting/);
+  assert.equal(task.inputVersion,version,'while unclassified, the completion basis is untouched');
+  assert.equal(f.runtime.model,'gpt-6-astra');
+  f.router.classify=async()=>({route:'work',reason:'more work'});
+  f.router.state.semanticPending.followup.nextAttemptAt=0;
+  await f.router.reviewSemanticPending();
+  const record=f.router.state.inputs.followup;
+  assert.deepEqual([record.state,record.route],['selected','work']);
+  assert.equal(task.inputVersion,version+1,'a real follow-up invalidates the completion basis, as a fresh one would');
+  await f.router.dispatch({id:'followup',text:'also handle errors'},async d=>{assert.equal(d.model,'gpt-6-astra');return'steered';});
+  assert.equal(f.runtime.model,'gpt-6-astra');
+  assert.deepEqual(f.switched,[],'the existing work never loses its model');
 });
 
 test('switch and input acceptance share one mutex',async t=>{
@@ -377,6 +501,182 @@ test('concurrent notice drains do not send twice or mark an in-flight send retry
   while(!release)await new Promise(r=>setImmediate(r));
   await f.router.flushNotices({send,lookup:async()=>({state:'not-started'})});release();await first;
   assert.equal(sends,1);
+});
+
+// ---- KIN-ITER-20260918-03: proven-not-submitted vs submission-unknown ----
+
+test('the receipt vocabulary reads exactly three ways: accepted, rejected, not-submitted, else unknown',()=>{
+  assert.equal(noticeReceiptClass({state:'accepted',messageId:'om_1'}),'accepted');
+  assert.equal(noticeReceiptClass({state:'accepted'}),'unknown','accepted without a message id is not believed');
+  assert.equal(noticeReceiptClass({state:'rejected'}),'rejected');
+  assert.equal(noticeReceiptClass({state:'not-started'}),'not-submitted','no outbox record: the send never began');
+  assert.equal(noticeReceiptClass({state:'not-submitted'}),'not-submitted');
+  assert.equal(noticeReceiptClass({state:'pending',submissionStarted:false}),'not-submitted','a receipt written before the network proves nothing was submitted');
+  assert.equal(noticeReceiptClass({state:'pending',submissionStarted:true}),'unknown');
+  assert.equal(noticeReceiptClass({state:'unconfirmed'}),'unknown');
+  assert.equal(noticeReceiptClass({state:'failed'}),'unknown');
+  assert.equal(noticeReceiptClass(null),'unknown');
+  assert.equal(noticeReceiptClass({}),'unknown');
+});
+
+test('a crash mid-send leaves id and stage durable, and the restart only ever looks up the original id',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  let release;
+  const pending=f.router.flushNotices({send:async()=>{await new Promise(r=>{release=r;});return{state:'accepted',messageId:'m'};},lookup:async()=>null});
+  while(!release)await new Promise(r=>setImmediate(r));
+  const crashed=new MobileRouter(f.args);
+  const id=Object.keys(crashed.state.notices)[0];
+  assert.deepEqual([crashed.state.notices[id].state,crashed.state.notices[id].stage],['unconfirmed','sending'],
+    'a send in flight when the host died comes back as lookup-only, stage intact');
+  crashed.state.notices[id].nextAttemptAt=0;
+  let sends=0;
+  await crashed.flushNotices({send:async()=>{sends++;throw Error('must not resend the ambiguous one');},lookup:async()=>({state:'accepted',messageId:'om_late'})});
+  assert.equal(sends,0);
+  assert.deepEqual([crashed.state.notices[id].state,crashed.state.notices[id].messageId],['accepted','om_late']);
+  release();await pending;
+});
+
+test('a failed notice preparation leaves the notice resumable, with its stage recorded',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  f.router.inspect=async()=>{throw Error('inspect down');};
+  await assert.rejects(f.router.flushNotices({send:async()=>assert.fail('not reached'),lookup:async()=>null}),/inspect down/);
+  assert.deepEqual([f.router.state.notices[id].state,f.router.state.notices[id].stage],['pending','preparing']);
+  f.router.inspect=f.args.inspect;
+  const sent=[];
+  await f.router.flushNotices({send:async n=>{sent.push(n);return{state:'accepted',messageId:'m'};},lookup:async()=>null});
+  assert.equal(sent.length,1);assert.equal(f.router.state.notices[id].state,'accepted');
+});
+
+test('a notice proven not submitted is resent under its own id, beyond the old cap, bounded and visible',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  let sends=0;
+  const channel={send:async()=>{sends++;throw Error('network down before submit');},lookup:async()=>({state:'not-started'})};
+  for(let round=0;round<NOTICE_SEND_BUDGET;round++){await f.router.flushNotices(channel);f.router.state.notices[id].nextAttemptAt=0;}
+  assert.equal(sends,NOTICE_SEND_BUDGET,'the same id is retried while the ground truth is not-submitted');
+  const n=f.router.state.notices[id];
+  assert.equal(n.state,'failed','exhaustion is a visible state, not permanent polling');
+  assert.equal(n.waitingReason,'send-attempts-exhausted');assert.equal(n.nextAction,'none');
+  assert.equal(n.firstFailure.class,'send-not-submitted');
+  const before=f.router.state.history.length;
+  await f.router.flushNotices(channel);
+  assert.equal(sends,NOTICE_SEND_BUDGET,'terminal: no further sends');
+  assert.equal(f.router.state.history.length,before,'and nothing more is written');
+});
+
+test('a submission whose outcome is unknown is only ever looked up, then stops visibly',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  let sends=0;
+  const channel={send:async()=>{sends++;throw Error('timeout after submit');},lookup:async()=>({state:'unconfirmed',stage:'message-unconfirmed',submissionStarted:true})};
+  await f.router.flushNotices(channel);
+  assert.equal(sends,1);assert.equal(f.router.state.notices[id].state,'unconfirmed');
+  assert.equal(f.router.state.notices[id].nextAction,'lookup-only');
+  for(let n=0;n<NOTICE_LOOKUP_BUDGET;n++){f.router.state.notices[id].nextAttemptAt=0;await f.router.flushNotices(channel);}
+  assert.equal(sends,1,'an ambiguous submission is never resent');
+  assert.equal(f.router.state.notices[id].state,'unconfirmed');
+  f.router.state.notices[id].nextAttemptAt=0;await f.router.flushNotices(channel);
+  assert.equal(f.router.state.notices[id].state,'unresolved');
+  assert.equal(f.router.state.notices[id].waitingReason,'receipt-lookup-exhausted');
+  assert.equal(f.router.state.notices[id].nextAction,'none');
+});
+
+test('an accepted answer without a message id is not believed; the outbox decides',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  let sends=0;
+  await f.router.flushNotices({send:async()=>{sends++;return{state:'accepted'};},lookup:async()=>({state:'not-started'})});
+  assert.equal(f.router.state.notices[id].state,'retry','no message id, no acceptance — and the outbox proves nothing was submitted');
+  f.router.state.notices[id].nextAttemptAt=0;
+  await f.router.flushNotices({send:async n=>{sends++;assert.equal(n.id,id);return{state:'accepted',messageId:'om_ok'};},lookup:async()=>assert.fail('settled by the send')});
+  assert.equal(sends,2);assert.equal(f.router.state.notices[id].state,'accepted');
+});
+
+test('a rejected notice is terminal: never resent, never polled',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  let sends=0,lookups=0;
+  await f.router.flushNotices({send:async()=>{sends++;throw Error('platform refused');},lookup:async()=>{lookups++;return{state:'rejected',stage:'platform-rejected'};}});
+  assert.equal(f.router.state.notices[id].state,'rejected');
+  assert.equal(f.router.state.notices[id].waitingReason,'platform-rejected');
+  f.router.state.notices[id].nextAttemptAt=0;
+  await f.router.flushNotices({send:async()=>{sends++;},lookup:async()=>{lookups++;return null;}});
+  assert.deepEqual([sends,lookups],[1,1],'terminal: no resend, no re-check');
+});
+
+test('an unconfirmed notice whose record proves never-submitted is resumed under the same id',async t=>{
+  // The production stuck notices: unconfirmed, attempts past the old cap, outbox
+  // file missing. Ground truth wins: not-submitted, so the SAME id is sent again.
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  const id=Object.keys(f.router.state.notices)[0];
+  let sends=0;
+  await f.router.flushNotices({send:async()=>{sends++;throw Error('lost');},lookup:async()=>({state:'unconfirmed'})});
+  f.router.state.notices[id].attempts=3;f.router.state.notices[id].nextAttemptAt=0;
+  await f.router.flushNotices({send:async()=>{sends++;throw Error('must not resend while unknown');},lookup:async()=>({state:'not-started'})});
+  assert.equal(sends,1);assert.equal(f.router.state.notices[id].state,'retry','not-submitted ground truth resumes the send, past the old cap');
+  assert.equal(f.router.state.notices[id].nextAction,'resend-same-id');
+  f.router.state.notices[id].nextAttemptAt=0;
+  await f.router.flushNotices({send:async n=>{sends++;assert.equal(n.id,id);return{state:'accepted',messageId:'om_settled'};},lookup:async()=>null});
+  assert.deepEqual([f.router.state.notices[id].state,f.router.state.notices[id].messageId],['accepted','om_settled']);
+  assert.equal(sends,2);
+});
+
+test('a settle that changes nothing writes nothing',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{});
+  await f.router.flushNotices({send:async()=>({state:'accepted',messageId:'m'}),lookup:async()=>null});
+  const before=f.router.state.history.filter(e=>e.kind==='notice-settled').length;
+  await f.router.flushNotices({send:async()=>assert.fail('terminal'),lookup:async()=>assert.fail('terminal')});
+  assert.equal(f.router.state.history.filter(e=>e.kind==='notice-settled').length,before);
+});
+
+test('a stale mode confirmation is superseded and never sent',async t=>{
+  const f=fixture(t);f.runtime.model='deepseek-flash';
+  await f.router.requestMode({commandId:'exit',mode:'auto',reason:'owner wants chat',notify:true});
+  await f.router.applyPendingMode();
+  const stale=Object.values(f.router.state.notices).find(n=>n.kind==='mode-applied');
+  assert.ok(stale);assert.equal(stale.state,'pending');
+  // The model moved on before the confirmation was ever sent.
+  await f.router.requestMode({commandId:'back',mode:'work',reason:'owner wants work'});
+  await f.router.applyPendingMode();
+  assert.equal(f.runtime.model,'gpt-6-astra');
+  const sent=[];
+  await f.router.flushNotices({send:async n=>{sent.push(n);return{state:'accepted',messageId:'m-'+n.id};},lookup:async()=>null});
+  assert.equal(f.router.state.notices[stale.id].state,'superseded');
+  assert.equal(sent.some(n=>n.id===stale.id),false,'the stale confirmation was never sent');
+});
+
+// ---- KIN-ITER-20260918-03: what became of every transition's notification ----
+
+test('a rebind with no model change is recorded as such, and generates no notice',async t=>{
+  const f=fixture(t);
+  f.router.state.transition={state:'unconfirmed',from:'gpt-6-astra',to:'deepseek-flash'};
+  f.router.save('synthetic-crash');
+  const restored=new MobileRouter(f.args);
+  await restored.reconcile();
+  assert.equal(Object.keys(restored.state.notices).length,0);
+  assert.deepEqual(restored.state.transition.notification,{state:'not-generated',reason:'rebind-no-model-change'});
+});
+
+test('every real switch records what became of its owner notification',async t=>{
+  const f=fixture(t);f.runtime.model='deepseek-flash';
+  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
+  const notice=Object.values(f.router.state.notices).find(n=>n.kind==='model-switched');
+  assert.equal(notice.state,'pending');
+  assert.deepEqual(f.router.state.transition.notification,{state:'queued',noticeId:notice.id});
+});
+
+test('a suppressed restart notice is accounted as not sent, with its cause',async t=>{
+  const f=fixture(t);
+  await told(f,'deepseek-flash');
+  f.runtime.model='gpt-6-astra';                     // the native runtime came back on its own default
+  const restarted=new MobileRouter(f.args);
+  await restarted.restoreRoutingProfile();
+  const notice=Object.values(restarted.state.notices).find(n=>n.kind==='model-switched');
+  assert.equal(notice.state,'suppressed');
+  assert.deepEqual(restarted.state.transition.notification,{state:'suppressed',reason:'restart-restored-known-model',noticeId:notice.id});
+  assert.equal(restarted.lastToldModel(),'deepseek-flash','a suppressed notice never moves what the owner was told');
+  assert.equal(notice.acceptedAt,undefined);assert.equal(notice.messageId,undefined,'never delivered, never counted');
 });
 
 test('historical transitions are distinguished from current runtime and every host switch is recorded',async t=>{
@@ -555,7 +855,8 @@ test('a classifier that times out, or answers without a tail, leaves the remaind
   const timeout=tailPort({pending:offer,missed:detail=>({state:'missed',reason:detail.reason})});
   const f=fixture(t,{replyTail:timeout,classify:async()=>{throw Error('classification-timeout');}});
   const record=await f.router.select({id:'three',text:'unclear'});
-  assert.deepEqual([record.route,record.reason,record.tail],['work','classifier-unconfirmed',{carrier:'classify',state:'missed',reason:'classifier-unconfirmed'}]);
+  // KIN-ITER-20260918-02: a failed classification routes nothing; the input waits as itself.
+  assert.deepEqual([record.state,record.route,record.reason,record.tail],['semantic-pending',null,'classification-timeout',{carrier:'classify',state:'missed',reason:'classifier-unconfirmed'}]);
   assert.deepEqual(timeout.calls.at(-1),['missed',{inputId:'three',key:offer.key,reason:'classifier-unconfirmed'}]);
   const silent=tailPort({pending:offer});
   const g=fixture(t,{replyTail:silent,classify:async()=>({route:'chat',reason:'synthetic'})});
@@ -618,17 +919,24 @@ test('a natural-language stop is the literal command only for the owner with a t
 });
 
 test('a literal stop still needs no model, and an unavailable classifier cannot stop anything',async t=>{
-  const f=fixture(t,{classifyIntents:true,classify:async()=>{throw Error('the classifier is never asked for a literal stop');}});
+  const f=fixture(t,{classifyIntents:true,classify:async input=>{
+    if(input.text==='write code')return{route:'work',reason:'synthetic'};
+    throw Error('the classifier is never asked for a literal stop');}});
   await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
   const task=f.router.currentTask();
+  const before=f.classificationCalls();
   const stop=await f.router.select({id:'stop',text:'停止任务'});
-  assert.deepEqual([stop.reason,task.cancelRequested,f.classificationCalls()],['owner-stop-command',true,0]);
-  // The same words in ordinary language, with no classifier to read them: nothing happens.
-  const g=fixture(t,{classifyIntents:true,classify:async()=>{throw Error('classification-timeout');}});
+  assert.deepEqual([stop.reason,task.cancelRequested,f.classificationCalls()],['owner-stop-command',true,before]);
+  // The same words in ordinary language, with no classifier to read them: nothing
+  // happens — the input waits as itself and the running task keeps its model.
+  const g=fixture(t,{classifyIntents:true,classify:async input=>{
+    if(input.text==='write code')return{route:'work',reason:'synthetic'};
+    throw Error('classification-timeout');}});
   await g.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
   const unread=await g.router.select({id:'unread',text:'ok, that is enough for now'});
-  assert.deepEqual([unread.route,unread.reason,unread.stop],['work','work-lock: classifier-unconfirmed',undefined]);
+  assert.deepEqual([unread.state,unread.route,unread.reason,unread.stop],['semantic-pending',null,'classification-timeout',undefined]);
   assert.equal(g.router.currentTask().cancelRequested,undefined);
+  assert.equal(g.router.currentTask().status,'running');assert.equal(g.runtime.model,'gpt-6-astra');
 });
 
 test('a file the owner asked for is recorded as states and IDs; a malformed intent is dropped without failing the route',async t=>{
@@ -649,19 +957,28 @@ test('a file the owner asked for is recorded as states and IDs; a malformed inte
   assert.ok(!JSON.stringify(f.router.state.inputs.nonsense).includes('w'.repeat(30)));
 });
 
-test('the host can buy one message a second classification and a longer wait, and nothing more',async t=>{
+test('a failed classification is asked again of the same input, with a longer wait — and nothing more',async t=>{
+  // KIN-ITER-20260918-02: the retry is uniform and bounded; no trigger-word
+  // heuristic gates it, and a retry by itself never grants anything.
   const waits=[];let fail=true;
-  const f=fixture(t,{classifyIntents:true,classifyRetry:({text})=>/file/.test(text),
+  const f=fixture(t,{classifyIntents:true,
     classify:async input=>{waits.push(input.timeoutMs);if(fail){fail=false;throw Error('classification-timeout');}
       return {route:'chat',reason:'a file the owner asked for',recall:{mode:'light',query:'q',reason:'r'},file_send:{requested:true,channel:'wechat',file_ref:'report.pdf'}};}});
-  const asked=await f.router.select({id:'ask',text:'send me that file'});
-  assert.deepEqual([waits,asked.route,asked.fileSend.channel],[[15000,30000],'chat','wechat'],'twice, the second time with a longer wait');
-  assert.equal(f.router.state.history.some(e=>e.kind==='classification-retried'&&e.id==='ask'),true);
-  // A message the host says nothing about is asked exactly once, and fails closed as before.
-  fail=true;
-  const plain=await f.router.select({id:'plain',text:'hello there'});
-  assert.deepEqual([plain.route,plain.reason,waits],['work','classifier-unconfirmed',[15000,30000,15000]]);
-  assert.equal(plain.fileSend,undefined,'a retry the host asked for can never grant anything');
+  await f.router.dispatch({id:'ask',text:'send me that file'},async d=>{assert.equal(d.model,'deepseek-flash');return'new-turn';});
+  assert.deepEqual(waits,[15000,30000],'twice, the second time with a longer wait');
+  assert.equal(f.router.state.history.some(e=>e.kind==='semantic-retry'&&e.id==='ask'),true);
+  const asked=f.router.state.inputs.ask;
+  assert.deepEqual([asked.state,asked.route,asked.fileSend.channel],['accepted','chat','wechat']);
+  assert.equal(f.router.state.semanticPending.ask.state,'classified');
+  assert.equal(f.router.tasks().length,0,'a chat answer never invents work');
+  // A message that keeps failing is never routed by the failure itself.
+  f.router.classify=async input=>{waits.push(input.timeoutMs);throw Error('classification-timeout');};
+  await assert.rejects(f.router.dispatch({id:'plain',text:'hello there'},async()=>{throw Error('must not submit');}),/waiting/);
+  const plain=f.router.state.inputs.plain;
+  assert.deepEqual([plain.state,plain.route,plain.reason],['semantic-pending',null,'classification-timeout']);
+  assert.equal(plain.fileSend,undefined,'a retry can never grant anything');
+  assert.equal(f.router.tasks().length,0);
+  assert.equal(f.runtime.model,'deepseek-flash','and the settled chat model is not disturbed');
 });
 
 test('attachments and commands are never classified; a literal stop needs no model; other inputs never touch the tail port',async t=>{

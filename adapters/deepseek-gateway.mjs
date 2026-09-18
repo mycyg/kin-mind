@@ -158,7 +158,7 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
     } catch {
       // An abort, a timeout and a broken stream all spent a call whose usage nobody
       // ever reported. That is unknown, not zero, and not nothing.
-      if (attempted) report({usage: null, usageStatus: 'unknown', outcome: held?.lost ? 'lease-lost' : 'transport-incomplete'});
+      if (attempted) report({usage: null, usageStatus: 'unknown', outcome: held?.lost ? 'lease-lost' : held?.expired ? 'lease-expired-unconfirmed' : 'transport-incomplete'});
       // Never return provider bodies, credentials, or raw conversation data in errors.
       if (!res.headersSent) {
         res.writeHead(502, {'Content-Type': 'application/json'});

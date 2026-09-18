@@ -14,6 +14,36 @@ const LEDGER_TAIL_BYTES=1024*1024;
 /** The longest a second attempt at one classification may wait. */
 export const CLASSIFY_RETRY_MAX_MS=45000;
 export const NOTICE_SUPPRESSED='restart-restored-known-model';
+/** KIN-ITER-20260918-02: a failed classification is retried on the SAME input, and
+ * the budget — the first attempt plus this many asks in all — is durable. */
+export const SEMANTIC_RETRY_BUDGET=4;
+/** KIN-ITER-20260918-03: one notice id is sent at most this many times, and only
+ * while the ground truth says nothing was submitted; a notice whose submission is
+ * unknown is looked up at most this many times before it stops polling. */
+export const NOTICE_SEND_BUDGET=5;
+export const NOTICE_LOOKUP_BUDGET=10;
+/** Why a classification attempt failed. The class is recorded, never collapsed
+ * into one anonymous catch: timeout / http / parse / unavailable. */
+export function classificationFailure(error) {
+  const message=String(error?.message??error);
+  if(error?.name==='TimeoutError'||error?.name==='AbortError'||/timeout|timed out/i.test(message))return 'timeout';
+  if(/^deepseek-http-\d+/.test(message))return 'http';
+  if(error?.name==='SyntaxError'||/invalid|unreadable|budget-exhausted/i.test(message))return 'parse';
+  return 'unavailable';
+}
+/** How one receipt from the owner-bound sender reads for the notice pipeline.
+ * `not-submitted` is ground truth that nothing reached the platform (no outbox
+ * record, or one that proves no submission): the SAME notice id may be sent again,
+ * bounded. `unknown` means the network effect cannot be told: the original id is
+ * only ever looked up, never resent — a second message to the owner is worse. */
+export function noticeReceiptClass(receipt) {
+  if(!receipt||typeof receipt.state!=='string')return 'unknown';
+  if(receipt.state==='accepted')return receipt.messageId?'accepted':'unknown';
+  if(receipt.state==='rejected')return 'rejected';
+  if(receipt.state==='not-started'||receipt.state==='not-submitted')return 'not-submitted';
+  if(receipt.state==='pending'&&receipt.submissionStarted===false)return 'not-submitted';
+  return 'unknown';
+}
 export function recentConversation(items) {
   const counts={user:0,assistant:0};
   return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
@@ -67,8 +97,8 @@ export class MobileRouter {
    * whether to stop the running task, whether a file was asked for, what they call themselves
    * — and lets an owner message with attachments be classified instead of assumed to be work.
    * Left off, every request and every record is what it was before intents existed. */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,classifyRetry=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,classifyRetry});
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true});
     this.tail=Promise.resolve();this.inflight=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
@@ -81,9 +111,11 @@ export class MobileRouter {
       if(this.state.sessionId!==sessionId&&!this.state.conversationId)throw Error('Unmigrated router session mismatch');
       this.state.conversationId=binding.conversationId;this.state.generation=binding.generation;this.state.nativeSessionId=binding.nativeSessionId;this.state.sessionId=sessionId;
     }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
-    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};
+    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};
     for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
+    // A classification attempt interrupted mid-call is retried, never concluded.
+    for(const entry of Object.values(this.state.semanticPending))if(entry.state==='classifying')entry.state='retry';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
     for(const record of Object.values(this.state.inputs)){if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';}
     if(this.state.transition?.state==='switching')this.state.transition.state='unconfirmed';
@@ -184,10 +216,10 @@ export class MobileRouter {
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
+      let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
       // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
       const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
-      let tail=null,offered=null,classified=false;
+      let tail=null,offered=null,classified=false,semanticFailure=null;
       if(stop) {
         for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';
         // A literal stop needs no model: whatever is still unsent is retired by the host itself.
@@ -207,65 +239,93 @@ export class MobileRouter {
         offered=owner?await port('pending',{id:input.id,text:input.text}):null;
         if(!offered?.reply)offered=null;
         const files=intents?attachmentMetadata(input.attachments):[];
-        const ask=async wait=>{
-          let timer;
-          const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
-          try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
-          finally {clearTimeout(timer);}
-        };
         try {
-          let result;
-          const patience=this.state.config.classifierTimeoutMs;
-          try {result=await ask(patience);}
-          catch(error) {
-            // The host may say that this one message is worth asking twice, and waiting
-            // longer for the answer. That is all it may say: a second attempt is never a
-            // route, never an intent, and never granted more than once.
-            if(this.classifyRetry?.({text:input.text,attachments:files})!==true)throw error;
-            this.save('classification-retried',{id:input.id});
-            result=await ask(Math.min(patience*2,CLASSIFY_RETRY_MAX_MS));
-          }
-          if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
-          if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
-          decision=result.route;reason=result.reason?.slice(0,200)??'classification';
-          // Only the bounded reading of the intents is kept, and only when they were asked for.
-          const asked=intents?messageIntents(result):{};
-          if(['light','deep'].includes(result.recall?.mode)) {
-            const {owner_words:unbounded,...rest}=result.recall;
-            recall={...rest,...(asked.ownerWords?{owner_words:asked.ownerWords}:{}),decisionSource:CLASSIFIER_DECISION};
-          }
-          if(asked.fileSend)fileSend={...asked.fileSend,decisionSource:CLASSIFIER_DECISION,at:this.now()};
-          // A natural-language stop is the literal command's equal, and only that: the owner,
-          // an open task, and a classifier that actually answered. It is never inferred here.
-          if(asked.stop==='current_task'&&this.tasks().length) {
-            const taskIds=this.tasks().map(task=>task.id);
-            for(const task of this.tasks())task.cancelRequested=true;
-            stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
-          }
+          const result=await this.askClassification(input,{files,intents,offered,runtime,wait:this.state.config.classifierTimeoutMs});
+          ({decision,reason,command,recall,fileSend,stopIntent}=this.readClassification(result,{owner,intents,allowStop:true}));
           if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
             :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
-        } catch {
-          decision='work';reason='classifier-unconfirmed';classifierUnconfirmed=true;
+        } catch(error) {
+          // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
+          // anomaly always became work: the catch manufactured a provisional task and
+          // a GPT switch out of a chat nobody had read. A failure now decides
+          // nothing — no task, no provider switch, no execution grant — and the
+          // input waits as itself for the bounded review, failure class on record.
+          semanticFailure=classificationFailure(error);
           // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
           if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
         }
       }
       // Attachments and commands are never classified, so they cannot carry a tail decision either.
       if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
+      if(semanticFailure) {
+        const current=this.currentTask();
+        this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text.slice(0,4000),
+          attachments:intents?attachmentMetadata(input.attachments):[],occurredAt:input.occurredAt??null,receivedAt:input.receivedAt??null,
+          conversationId:this.state.conversationId??null,generation:this.state.generation??null,
+          taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])),
+          model:runtime.model??null,mode:this.state.mode,failure:{class:semanticFailure,at:this.now()},
+          attempts:1,maxAttempts:SEMANTIC_RETRY_BUDGET,nextAttemptAt:this.now(),state:'pending',createdAt:this.now(),updatedAt:this.now()};
+        const record={id:input.id,hash,kind:input.kind??'owner',state:'semantic-pending',route:null,intent:null,reason:'classification-'+semanticFailure,recall,command:null,taskId:null,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
+        this.state.inputs[input.id]=record;
+        if(!input.kind||input.kind==='owner')this.rememberOwner(input);
+        this.save('input-semantic-pending',{id:input.id,failure:semanticFailure});
+        return clone(record);
+      }
       const intent=decision;
-      // DeepSeek judges meaning; its answer never owns the execution lock.
-      if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
-      const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
-      if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
-      if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
+      const locked=this.applyRouteLock(input,{decision,reason,intent,command,runtime});
+      ({decision,reason}=locked);
+      const task=locked.task;
       const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{})};
       this.state.inputs[input.id]=record;
-      if(!input.kind||input.kind==='owner') {
-        this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
-        this.state.recent=this.state.recent.slice(-16);
-      }
+      if(!input.kind||input.kind==='owner')this.rememberOwner(input);
       this.save('input-selected',{id:input.id,route:decision,reason});return clone(record);
     });
+  }
+  /** One bounded ask of the classifier, with its own clock. The longest the call
+   * may wait is the caller's; the answer is never rerouted by trigger words. */
+  async askClassification(input,{files=[],intents=false,offered=null,runtime=null,wait}) {
+    let timer;
+    const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
+    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime?.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+    finally {clearTimeout(timer);}
+  }
+  /** A classification answer, validated and read within its bounds. Never owns the
+   * execution lock, and only ever exists when the classifier actually answered. */
+  readClassification(result,{owner,intents,allowStop=false}={}) {
+    if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
+    let command=null;
+    if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
+    const decision=result.route,reason=result.reason?.slice(0,200)??'classification';
+    let recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
+    // Only the bounded reading of the intents is kept, and only when they were asked for.
+    const asked=intents?messageIntents(result):{};
+    if(['light','deep'].includes(result.recall?.mode)) {
+      const {owner_words:unbounded,...rest}=result.recall;
+      recall={...rest,...(asked.ownerWords?{owner_words:asked.ownerWords}:{}),decisionSource:CLASSIFIER_DECISION};
+    }
+    if(asked.fileSend)fileSend={...asked.fileSend,decisionSource:CLASSIFIER_DECISION,at:this.now()};
+    // A natural-language stop is the literal command's equal, and only that: the owner,
+    // an open task, and a classifier that actually answered. It is never inferred here,
+    // and a late answer applies only against the task basis it was read from.
+    if(allowStop&&asked.stop==='current_task'&&this.tasks().length) {
+      const taskIds=this.tasks().map(task=>task.id);
+      for(const task of this.tasks())task.cancelRequested=true;
+      stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
+    }
+    return {decision,reason,command,recall,fileSend,stopIntent};
+  }
+  /** DeepSeek judges meaning; its answer never owns the execution lock. Real work
+   * keeps its model, tools and delivery lock; a chat that arrives while work is
+   * open rides as context on the existing task, never as a new one. */
+  applyRouteLock(input,{decision,reason,intent,command,runtime}) {
+    if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
+    const task=decision==='work'&&!command?(intent==='work'?this.addTask(input):this.currentTask()):command?null:this.currentTask();
+    if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
+    return {decision,reason,task};
+  }
+  rememberOwner(input) {
+    this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
+    this.state.recent=this.state.recent.slice(-16);
   }
   dispatch(input,submit) {
     if(this.inflight.has(input.id))return this.inflight.get(input.id);
@@ -276,9 +336,15 @@ export class MobileRouter {
     const selected=await this.select(input);
     if(selected.state==='deferred')return {route:'deferred',reason:selected.reason};
     if(selected.state==='accepted')return {route:'deduplicated',model:selected.model};
+    if(['semantic-failed','semantic-canceled'].includes(selected.state))return {route:selected.state,reason:selected.reason};
     for(;;) {
+      // A semantic wait is settled by its own bounded review — driven here while
+      // the caller is still alive, and by the host's pump when it is not.
+      if(this.state.inputs[input.id]?.state==='semantic-pending')await this.reviewSemanticPending();
       const outcome=await this.locked(async()=>{
         const record=this.state.inputs[input.id];
+        if(record.state==='semantic-pending')return null;
+        if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         const runtime=await this.reconcileTransition(await this.inspect());
         if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
@@ -327,6 +393,67 @@ export class MobileRouter {
       });
       if(outcome)return outcome;
       await this.waitForIdle();
+    }
+  }
+  /** KIN-ITER-20260918-02: the bounded review of inputs whose classification
+   * failed. The SAME input is asked of DeepSeek again — never rescored by trigger
+   * words — and a late answer routes only after its version basis, cancel state
+   * and the generation (lease) it was captured under have been checked. Whatever
+   * the budget cannot settle becomes an explicit failed state the ops and reply
+   * chains can see; the input is never silently swallowed. */
+  async reviewSemanticPending() {
+    for(const id of Object.keys(this.state.semanticPending)) {
+      const entry=await this.locked(async()=>{
+        const e=this.state.semanticPending[id];
+        if(!e||!['pending','retry'].includes(e.state)||e.nextAttemptAt>this.now())return null;
+        const record=this.state.inputs[id];
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash||(record.conversationId??null)!==e.conversationId||(record.generation??null)!==e.generation) {
+          e.state='superseded';e.updatedAt=this.now();this.save('semantic-review-superseded',{id});return null;
+        }
+        e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});
+        return clone(e);
+      });
+      if(!entry)continue;
+      let result=null,failure=null;
+      try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
+        {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
+      catch(error){failure=classificationFailure(error);}
+      await this.locked(async()=>{
+        const e=this.state.semanticPending[id];if(!e||e.state!=='classifying')return;
+        const record=this.state.inputs[id];e.updatedAt=this.now();
+        const fail=cls=>{
+          e.lastFailure={class:cls,at:this.now()};
+          if(e.attempts>=e.maxAttempts) {
+            e.state='failed';record.state='semantic-failed';record.reason='classification-exhausted';record.failureClass=e.failure.class;
+            this.save('input-semantic-failed',{id,failure:e.failure.class,attempts:e.attempts});
+          } else {e.state='retry';e.nextAttemptAt=this.now()+(e.attempts-1)*15000;this.save('semantic-retry-waiting',{id,attempt:e.attempts,failure:cls});}
+        };
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash){e.state='superseded';this.save('semantic-review-superseded',{id});return;}
+        if((this.state.conversationId??null)!==e.conversationId||(this.state.generation??null)!==e.generation) {
+          e.state='superseded';record.state='semantic-canceled';record.reason='generation-changed';
+          this.save('semantic-canceled',{id,reason:'generation-changed'});return;
+        }
+        if(failure)return fail(failure);
+        const owner=e.kind==='owner',intents=this.classifyIntents&&owner;
+        // A stop intent read late applies only to the exact task basis it was read from.
+        const basisSame=JSON.stringify(Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])))===JSON.stringify(e.taskVersions);
+        let read;
+        try{read=this.readClassification(result,{owner,intents,allowStop:basisSame});}catch(error){return fail(classificationFailure(error));}
+        // A stop that landed while the answer was in flight retires the input: a
+        // late work decision must never resurrect or extend what the owner canceled.
+        const canceled=Object.values(this.state.tasks).some(t=>t.cancelRequested||t.status==='canceled'&&(t.canceledAt??0)>=e.createdAt);
+        if(canceled&&read.decision==='work') {
+          e.state='superseded';record.state='semantic-canceled';record.reason='superseded-by-cancel';
+          this.save('semantic-canceled',{id,reason:'superseded-by-cancel'});return;
+        }
+        const runtime=await this.inspect();
+        const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,runtime});
+        Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
+          taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{})});
+        if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
+        e.state='classified';e.updatedAt=this.now();
+        this.save('input-classified-late',{id,route:locked.decision,reason:locked.reason,attempts:e.attempts});
+      });
     }
   }
   async requestMode(request) {
@@ -407,6 +534,15 @@ export class MobileRouter {
         target:actual.model,from:transition.from,runtime:view.actual,
         ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true})})});
       transition.noticeId=notice.id;
+      // KIN-ITER-20260918-03: every real change records what became of its owner
+      // notification. A suppressed notice is the record of a message deliberately
+      // NOT sent — the owner-visible state already matched — and it never counts
+      // as a delivered notification.
+      transition.notification=silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,noticeId:notice.id}:{state:'queued',noticeId:notice.id};
+    } else {
+      // A rebind that leaves the model where it was is not a change the owner can
+      // see: no notice is generated, and the transition says why.
+      transition.notification??={state:'not-generated',reason:transition.from===actual.model?'rebind-no-model-change':transition.from?'switch-unverified':'no-prior-model'};
     }
   }
   /** The model the owner was last told about: the most recent runtime-status notice
@@ -488,14 +624,28 @@ export class MobileRouter {
   async flushNotices({send,lookup}) {
     // The owner-bound sender has its own durable outbox. Never replay an
     // ambiguous send; reconcile the original ID, including after host restart.
+    // KIN-ITER-20260918-03: a receipt proves one of three things — accepted,
+    // rejected, or not-submitted (nothing reached the platform; the SAME id may be
+    // sent again, bounded by NOTICE_SEND_BUDGET, resumable across restarts).
+    // Anything else is submission-unknown: the original id is only ever looked up,
+    // never resent, and the re-checks are bounded by NOTICE_LOOKUP_BUDGET before
+    // the notice stops polling as a visible `unresolved`.
     for(const id of Object.keys(this.state.notices)) {
       const notice=await this.locked(async()=>{
         const n=this.state.notices[id];
         if(!['pending','retry','unconfirmed'].includes(n.state)||n.nextAttemptAt>this.now())return null;
-        if(n.state==='unconfirmed')return clone(n);
+        if(n.state==='unconfirmed') {
+          if((n.lookups??0)>=NOTICE_LOOKUP_BUDGET) {
+            n.state='unresolved';n.waitingReason='receipt-lookup-exhausted';n.nextAction='none';n.updatedAt=this.now();
+            this.save('notice-settled',{id,state:n.state,reason:n.waitingReason});return null;
+          }
+          return {...clone(n),lookupOnly:true};
+        }
+        // A reconcile-able id and stage are durable BEFORE any failable preparation.
+        n.stage='preparing';n.updatedAt=this.now();this.save('notice-preparing',{id});
         const runtime=await this.inspect();const view=publicMobileRuntime(this.state,runtime,this.sessionId);
         if(!view.actual.verified)return null;
-        if(n.kind==='mode-applied'&&runtime.model!==n.target){n.state='superseded';this.save('notice-superseded',{id});return null;}
+        if(n.kind==='mode-applied'&&runtime.model!==n.target){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
         if(n.kind==='model-switched'&&runtime.model!==n.target) {
           const past=runtimeReply({actual:n.runtime,tasks:[]},{switched:true}).replace('已经切到 ','此前已切到 ');
           n.text=past+' '+runtimeReply(view);
@@ -503,20 +653,36 @@ export class MobileRouter {
         if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
         n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
         // Whatever else the message recalls, this is the model it names as the current one.
-        n.runtime??=view.actual;n.toldModel=view.actual.model;n.state='sending';n.attempts=(n.attempts??0)+1;
+        n.runtime??=view.actual;n.toldModel=view.actual.model;n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
         this.save('notice-sending',{id});return {...clone(n),sendNow:true};
       });
       if(!notice)continue;
       let receipt;
-      try {receipt=notice.sendNow?await send({id,text:notice.text,kind:'runtime-status',sourceInputId:notice.sourceInputId,notificationSubscribers:notice.subscriberIds??[]}):await lookup(id);}
-      catch {receipt=await lookup(id).catch(()=>null);}
+      if(notice.sendNow) {
+        try {receipt=await send({id,text:notice.text,kind:'runtime-status',sourceInputId:notice.sourceInputId,notificationSubscribers:notice.subscriberIds??[]});}
+        catch {receipt=null;}
+        // Any non-accepted send outcome is settled from the outbox ground truth.
+        if(noticeReceiptClass(receipt)!=='accepted')receipt=await lookup(id).catch(()=>null)??receipt;
+      } else receipt=await lookup(id).catch(()=>null);
       await this.locked(async()=>{
         const n=this.state.notices[id];
-        if(receipt?.state==='accepted'&&receipt.messageId){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();
-          n.replyRecorded=true;}
-        else if(receipt?.state==='not-started'&&n.attempts<3){n.state='retry';n.nextAttemptAt=this.now()+2000*n.attempts;}
-        else {n.state='unconfirmed';n.nextAttemptAt=this.now()+30000;}
-        this.save('notice-settled',{id,state:n.state});
+        const before=JSON.stringify([n.state,n.waitingReason,n.nextAction,n.attempts,n.lookups,n.messageId,n.stage]);
+        const kind=noticeReceiptClass(receipt);
+        if(kind==='accepted'){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();n.replyRecorded=true;n.nextAction='none';n.stage='settled';}
+        else if(kind==='rejected'){n.firstFailure??={class:'receipt-rejected',at:this.now()};n.state='rejected';n.waitingReason='platform-rejected';n.nextAction='none';n.stage='settled';}
+        else if(kind==='not-submitted') {
+          n.firstFailure??={class:notice.sendNow?'send-not-submitted':'receipt-not-submitted',at:this.now()};
+          if((n.attempts??0)<NOTICE_SEND_BUDGET){n.state='retry';n.nextAttemptAt=this.now()+2000*(n.attempts??1);n.nextAction='resend-same-id';n.waitingReason='not-submitted-retry-scheduled';}
+          else{n.state='failed';n.waitingReason='send-attempts-exhausted';n.nextAction='none';n.stage='settled';}
+        } else {
+          n.firstFailure??={class:notice.sendNow?'send-outcome-unknown':'receipt-unknown',at:this.now()};
+          if(!notice.sendNow)n.lookups=(n.lookups??0)+1;
+          n.state='unconfirmed';n.nextAttemptAt=this.now()+30000;n.nextAction='lookup-only';n.waitingReason='submission-unknown';
+        }
+        n.updatedAt=this.now();
+        // A settle that changed nothing writes nothing.
+        if(JSON.stringify([n.state,n.waitingReason,n.nextAction,n.attempts,n.lookups,n.messageId,n.stage])!==before)
+          this.save('notice-settled',{id,state:n.state,...(n.waitingReason?{reason:n.waitingReason}:{})});
       });
     }
   }

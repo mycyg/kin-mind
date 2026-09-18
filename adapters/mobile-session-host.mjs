@@ -6,7 +6,7 @@ import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-wind
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
-import {safeBoundary,checkpointBudget} from './session-policy.mjs';
+import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
 import {switchCodexModel} from './codex-models.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
@@ -131,15 +131,19 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         }
         for(const event of events)if(!manager.state.compactions.some(c=>c.nativeEventId===event.id))await manager.nativeCompaction(event);
         const snapshot=await collect(),runtime=await inspect();
-        if(manager.state.restoreRequired&&!manager.state.restorePending&&safeBoundary({...snapshot,runtime}).safe){
+        // Read-only roster preparation may proceed on a versioned snapshot while
+        // owner notifications are unconfirmed; the prepared artifacts carry the
+        // annotation. Compaction, injection and promotion keep the strict boundary.
+        const preparation=safeReadOnlyPreparation({...snapshot,runtime});
+        if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe){
           const cp=await manager.checkpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
-          if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready');}
+          if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
         }
-        if(snapshot.manifestVersion&&safeBoundary({...snapshot,runtime}).safe){
+        if(snapshot.manifestVersion&&preparation.safe){
           const key=digest(snapshot.cursors);
           if(manager.state.rollingCursor!==key){
             const cp=await mindCall('session-checkpoint',{snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
-            manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared');
+            manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
           }
         }
         await manager.observe(runtime,snapshot);if(manager.state.observation)atomicJson(observationFile,manager.state.observation);
