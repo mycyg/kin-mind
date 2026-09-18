@@ -11,6 +11,7 @@ from eventmem.core import Engine
 from eventmem.core.db import digest
 from eventmem.core.integrity import enforce_source_root, warn_interpreter
 from eventmem.core.models import Scope, SourceInput
+from eventmem.paths import atomic_write
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
@@ -381,9 +382,12 @@ def dispatch(config, action, request):
         if cadence.status()["state"] == "ready":
             wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"
             if not wake.exists():
-                temporary = wake.with_suffix(".tmp")
-                temporary.write_text(json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
-                temporary.replace(wake)
+                # `mind-exploration-request.tmp` was one name two reviews shared, and
+                # the host reads this file the moment it appears: a second review
+                # renaming the first one's half-written temporary put a truncated
+                # request in front of it. A name of its own per write, and the bytes
+                # reach the disk before the rename rather than after it.
+                atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
         return result
     if action == "daily":
         return DailyReview(mind).run(
