@@ -98,7 +98,28 @@ MIXES = (
 )
 
 
-def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=None):
+# What a stated intent adds to the wording. It is never quoted: it says how to be present, and
+# the persona still decides the words. Without one the table below is the whole answer.
+INTENT_CONTINUE = "接着聊："
+INTENT_AVOID = "这段时间先不提："
+
+
+def intent_guidance(intent):
+    """The stance, what to stay with, what to leave alone — in the shape the table already uses."""
+    def hint(key, text):
+        return {"id": key, "text": text, "dimensions": [],
+                "evidence_ids": list(intent.get("evidence_ids", [])), "basis": "appraised_intent"}
+
+    items = [hint("intent-stance", intent["stance"])]
+    topics = [entry["topic"] for entry in intent.get("continue_topics", [])]
+    if topics:
+        items.append(hint("intent-continue", INTENT_CONTINUE + "、".join(topics)))
+    if intent.get("avoid"):
+        items.append(hint("intent-avoid", INTENT_AVOID + "、".join(intent["avoid"])))
+    return items
+
+
+def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=None, intent=None):
     valid = {k: v for k, v in dimensions.items() if not v.get("needs_review")}
     selected, consumed = [], set()
 
@@ -185,6 +206,12 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
                 "priority": 0,
             }
         ]
+    if intent:
+        # A fresh intent leads: what was just judged about this moment, then whatever the table
+        # still has room for. A rhythm cadence keeps the last of the three; it is the host's own
+        # projection of how this hour reads, and an intent does not overrule it.
+        cadence = [item for item in selected if item["basis"] == "runtime_inferred"]
+        selected = (intent_guidance(intent) + [i for i in selected if i not in cadence])[:3 - len(cadence)] + cadence
     for item in selected:
         item.pop("priority", None)
     result = {
@@ -193,5 +220,7 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
         "persona_contract": persona,
         "guidance": selected,
     }
+    if intent:
+        result["intent"] = {"id": intent["id"], "valid_until": intent["valid_until"]}
     result["fingerprint"] = digest(result)
     return result
