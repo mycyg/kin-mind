@@ -338,13 +338,21 @@ def test_a_revision_that_does_not_hash_fails_closed_without_taking_the_list_with
     after = mind.read(history=6)["history"]
     spoiled = {entry["revision"] for entry in after if entry["snapshot"] is None}
     intact = [entry for entry in after if entry["snapshot"] is not None]
-    assert broken_at in spoiled
     assert all(entry["history_error"] == history.REBUILD_FAILED
                for entry in after if entry["snapshot"] is None)
-    # A whole snapshot answers for itself, so the break stops at that one row. A patch row is
-    # answered for by the rows under it, so what rests on the break goes with it — and nothing
-    # older than the break does, in either shape.
-    assert spoiled == {broken_at} or packed
+    # A patch is answered for by the rows under it, so a break in one is found the moment it is
+    # walked, and everything resting on it goes with it. A whole snapshot answers for itself, and
+    # a list of a hundred of them is not where a hundred documents get hashed: that sweep is what
+    # `history-verify` is for, and not what a path a reply is waiting behind should be doing. So
+    # the break is still caught — by whatever rebuilds through it, a few lines below — but it is
+    # no longer caught by the listing merely mentioning the row.
+    with mind.engine.db.connect() as conn:
+        shape = history.shape_of(json.loads(conn.execute(
+            "SELECT data FROM mind_events WHERE scope=? AND revision=?",
+            (mind.scope.key(), broken_at)).fetchone()[0]))
+    assert (broken_at in spoiled) == (shape == "patch")
+    # And nothing older than the break goes with it, in either shape.
+    assert spoiled <= {broken_at} or packed
     assert all(revision >= broken_at for revision in spoiled)
     # What survived is unchanged, keys and all.
     assert intact and all(set(entry) == {"id", "kind", "revision", "occurred_at", "request", "snapshot"}

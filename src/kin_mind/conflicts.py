@@ -283,6 +283,11 @@ REGISTRY = {
     # do not hash to what the row claims. None of that is anything a proposal did or a retry mends,
     # so it stops here and is never sent back for review. ---
     "This revision cannot be rebuilt from the recorded history": ("runtime", "history-rebuild-failed", "block"),
+    # Compaction is rewriting every row of the history in place, against an archive of what they
+    # said before. A revision written in the middle of that is one the archive does not hold, so
+    # the writer stops instead. Nothing about the proposal is wrong and nothing about it will be
+    # right later either: the host waits for the operator, which is not a review.
+    "History is being compacted; no revision can be written until it finishes": ("runtime", "history-compaction-active", "block"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),

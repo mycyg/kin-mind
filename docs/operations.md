@@ -105,6 +105,25 @@ python -m kin_mind.host --config PRIVATE_CONFIG evidence-keys-verify
 
 The table is never the only reader. Before it is consulted, a catch-up reads the rows written past the cursor, which is how a period spent on the previous release, or an imported history, cannot leave a hole. Run the backfill once soon after deploying, because a cursor still at zero leaves that first reading to the catch-up, inside the write transaction of whichever appraisal reaches it first. While both `evidence_key_index` and `history_legacy_guard` are on, the guard refuses when either the table or the old scan says it has seen the key, and a disagreement between them is recorded as the `evidence_key_guard_mismatch` metric — with the key digest and which side said what, never any evidence text. Turning `evidence_key_index` off leaves the old scan alone, which is the previous behavior exactly. Turning `history_legacy_guard` off stops paying for that scan and belongs only to a store whose snapshots no longer carry the key, once the two have agreed for long enough to be believed.
 
+## Stored history
+
+Every revision of the mind's state used to be stored as a whole document. That is what makes the history inspectable and it is also why it grew into a third of the database: a document whose wishes are never pruned is written again on every change, however little of it moved. With `history_patches` on, a revision is stored as a keyed diff against the row before it — `["set", [key] or [key, key], value]` and `["del", path]`, with lists replaced whole — inside the same column, with no new table and no new column anywhere. On a synthetic history of 121 revisions over an 82 KB document that is 6.16 MB of rows against 432 KB, a saving of 93 %, for 0.3 ms added to the write.
+
+`history_patches` is **off by default**, and it is the only flag in this stage that is. The others choose how fast something runs, so leaving one on costs nothing worse than speed; this one chooses what a revision is written as, and from the first patch row committed, the release before this one can no longer rebuild the newest states. So it deploys off and is turned on as its own decision:
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG history-status
+python -m kin_mind.host --config PRIVATE_CONFIG history-verify
+```
+
+`history-status` says what the rows are: how many carry a whole state, how many carry a patch, how deep the chains have grown, what they cost, and `first_patch_revision` — which is empty until the format changes and is the **rollback boundary** once it is not. Before that revision the previous release reads every row as it always did. After it, rolling back means rolling back to the release that deployed this code with the flag off, not to the release before that one. Take a rollback drill on a copy before turning it on.
+
+`history-verify` rebuilds every revision in one forward pass and checks each document against the hash its row recorded. Both commands are read only and safe against a live store. Three outcomes, and the middle one is why there are three: `verified` means every row was checked and every one held; `incomplete` means something failed, and `failures` names the revisions; `partial` means nothing failed but some rows **could not be checked at all**. Those are the rows written before this release: they carry no hash, they are never rewritten, and nothing can be said about their contents beyond that they parse. They are counted as `unverifiable` and never added to the verified total, because a clean report about rows nobody looked at is the kind of thing that gets believed later.
+
+A row is kept whole rather than stored as a patch when its kind is `initialize` or a personality `evolution`, when the chain under it would reach fifty rows, when the patches standing on one whole state have cost as much as that state did, and when a single patch would cost more than half of it. It is also kept whole when the row before it is missing, will not parse, or does not hash to what it claims: the writer never builds on a chain it cannot read and never tries to repair one, so it writes a whole state, records `healed` in the row, and everything after that stands on the new ground. That covers the row before; a break further down is what `history-verify` finds. To repair one, turn `history_patches` off for a single revision — the next row is then a whole state again, which is a checkpoint by another name — and turn it back on.
+
+While compaction owns the rows, `meta.history_compaction_active` is set and no revision can be written at all: the commit is refused with `history-compaction-active` and nothing lands, because a row written in the middle of a rewrite is a row the archive does not hold.
+
 ## Contact callbacks
 
 MCP and Python hosts can create, inspect and change source-backed reminders using the [contact task tools](contact-tasks.md). Configure a scoped policy first. Keep `eventmem serve` running for the worker to process due schedules. Model-composed reminder text retains model provenance; revisions and callback receipts distinguish scheduled tasks from delivered messages.

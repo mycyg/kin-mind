@@ -179,6 +179,10 @@ class Mind(Continuity):
         # carried out of the write rather than written inside it, because such a disagreement is
         # always a refusal and a refusal takes its own transaction, and the note, back with it.
         self._guard_mismatches = []
+        # The exact text the state was last read from. The history layer takes it as a hint about
+        # what the row before this one holds and proves it against that row's own hash before
+        # believing a word of it, so a stale one costs a rebuild and can never cost correctness.
+        self._loaded = None
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         with self.engine.db.connect() as conn:
@@ -192,6 +196,7 @@ class Mind(Continuity):
             raise Missing(
                 "Initialize the role profile before reading or changing state"
             )
+        self._loaded = row["data"]
         return json.loads(row["data"])
 
     def _save(self, conn, state):
@@ -348,9 +353,11 @@ class Mind(Continuity):
         return "mind:" + digest([self.scope.key(), command_id])
 
     def _history(self, conn, event_id, state, kind, payload):
-        # The row's own shape belongs to the history layer, not here: this writes what a whole
-        # snapshot looks like, and a later reader asks that same layer what the row means.
-        from .history import snapshot_row
+        # The row's own shape belongs to the history layer, not here: it decides whether this
+        # revision is stored as a whole document or as what changed since the row before, and the
+        # same layer reads it back. Off by default, in which case the row is the one the previous
+        # release wrote, key for key. It also refuses outright while compaction owns the rows.
+        from .history import row_for
         conn.execute(
             "INSERT INTO mind_events VALUES(?,?,?,?,?,?)",
             (
@@ -359,7 +366,7 @@ class Mind(Continuity):
                 state["revision"],
                 kind,
                 self.clock(),
-                dumps(snapshot_row(payload, state)),
+                dumps(row_for(conn, self.scope.key(), state, kind, payload, loaded=self._loaded)),
             ),
         )
         # The one place history is written is the one place the evidence key index hears about it,
