@@ -156,8 +156,30 @@ class MemoryPaths:
             return p.as_posix()
 
 
-def atomic_write(path: Path, text: str) -> None:
-    """同目录临时文件 ＋ os.replace 写入，读方永远看不到半截文件。"""
+def _fsync_directory(directory: Path) -> bool:
+    """fsync 目录本身，让 rename 后的目录项落盘；平台/文件系统不支持时返回 False。"""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def atomic_write(path: Path, text: str) -> bool:
+    """同目录临时文件 ＋ os.replace 写入，读方永远看不到半截文件。
+
+    落盘口径与 adapters/atomic-json.mjs 的 syncDirectory 一致：文件内容 fsync 后才
+    rename，rename 后再 fsync 父目录，让目录项本身也 durable。返回 True 才表示两步
+    fsync 都成功；目录 fsync 在不支持的平台上会被拒绝（OSError，如 ENOTSUP/EINVAL），
+    此时写入照常完成、rename 依旧原子，但返回 False——调用方只有看到 True 才能宣称
+    完全落盘。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -169,3 +191,4 @@ def atomic_write(path: Path, text: str) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    return _fsync_directory(path.parent)
