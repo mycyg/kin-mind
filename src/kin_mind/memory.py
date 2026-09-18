@@ -100,6 +100,14 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # believing its caller's `workers_stopped`. Off restores that boolean as the only
             # check, which is the stage-4 behaviour of all four recovery commands exactly.
             "liveness_checks": True,
+            # Stage 5, and the one flag of it read through autonomy_schema.enabled(): off unless
+            # a store says otherwise. Every other flag here switches how something runs, so
+            # defaulting it on costs nothing but speed if it is wrong. This one switches what a
+            # revision is written as, and the release that deploys it has to stay a release the
+            # host can go back to — which it stops being the moment the first patch row is
+            # committed. So the code ships off, and turning it on is its own decision, taken once
+            # the history reads clean. Off, `_history` writes exactly the row it wrote before.
+            "history_patches": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -217,7 +225,8 @@ class MemoryContinuity:
                     "chunked_reply_review", "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
                     "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
-                    "evidence_key_index", "history_legacy_guard", "liveness_checks"):
+                    "evidence_key_index", "history_legacy_guard", "liveness_checks",
+                    "history_patches"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

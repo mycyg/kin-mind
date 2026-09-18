@@ -19,7 +19,7 @@ from importlib import import_module
 
 # Modules that register a command when they are imported. A package appends its own; the import is
 # deferred to the call so that a host which never runs a history command never pays for them.
-PROVIDERS: tuple[str, ...] = ()
+PROVIDERS: tuple[str, ...] = ("kin_mind.history_status",)
 
 COMMANDS: dict[str, object] = {}
 
