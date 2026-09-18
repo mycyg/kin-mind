@@ -208,6 +208,13 @@ def dispatch(config, action, request):
                   else migration.run(**options, registry_file=request.get("registry")))
         return {k: v for k, v in result.items()
                 if k in {"migration", "operation", "state", "applied", "rules_version", "summary", "steps", "output"}}
+    if action in {"evidence-keys-backfill", "evidence-keys-verify"}:
+        # Operator actions. The backfill writes nothing without `--apply`, resumes from its cursor
+        # and can be rerun; the verification is read only and compares both directions row by row.
+        from .evidence_keys import BATCH, SAMPLE, backfill, verify
+        if action == "evidence-keys-verify":
+            return verify(mind, limit=request.get("limit", SAMPLE))
+        return backfill(mind, apply=bool(request.get("apply")), batch=request.get("batch", BATCH))
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -445,13 +452,16 @@ def dispatch(config, action, request):
 
 
 MIGRATION_ACTION = "migrate-evidence-isolation"
+# The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
+# are told to write. Every one of them defaults to a dry run.
+APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    # Only `migrate-evidence-isolation` reads these; every other action takes its request on
-    # stdin as before. A dry run is the default, so nothing is written without `--apply`.
+    # Only the operator actions read these; every other action takes its request on stdin as
+    # before. A dry run is the default, so nothing is written without `--apply`.
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--undo", action="store_true")
@@ -462,13 +472,15 @@ def main():
     try:
         import sys
 
-        # An operator runs the migration from a terminal, with no request to pipe in.
+        # An operator runs these from a terminal, with no request to pipe in.
         raw = "" if sys.stdin.isatty() else sys.stdin.read()
         request = json.loads(raw) if raw.strip() else {}
-        if args.action == MIGRATION_ACTION:
+        if args.action in APPLY_ACTIONS:
             if args.apply and args.dry_run:
                 raise ValueError("Choose either a dry run or an apply")
-            request.update(apply=args.apply, undo=args.undo, output=args.output, registry=args.registry)
+            request["apply"] = args.apply
+        if args.action == MIGRATION_ACTION:
+            request.update(undo=args.undo, output=args.output, registry=args.registry)
         result = dispatch(load_config(args.config), args.action, request)
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
