@@ -2,7 +2,12 @@
 
 DeepSeek Flash/high chooses a question and its purpose in the existing appraisal.
 `exploration_target` is `knowledge` (the backward-compatible default) or
-`computer`. Kimi executes the question for at most 1,200 seconds. A computer
+`computer`. The exploration executor runs the question for at most 1,200
+seconds — currently codex-cli with model provider DeepSeek (deepseek-flash,
+reasoning high) behind a dedicated local gateway; the legacy kimi-cli executor
+remains the rollback path (`exploration_backend` unset or `"kimi"`, requiring
+`kimi_executable`). Receipts carry executor and model provider separately, so
+consumers must not filter on `provider == "kimi-cli"`. A computer
 question can concern the owner's authorized work or everyday activity. A high
 curiosity score alone does not authorize a scan: an actionable, sourced wish is
 required. There is no continuous screen recorder or new polling schedule.
@@ -21,8 +26,11 @@ The macOS adapter in `adapters/computer-context.swift` uses NSWorkspace,
 CGWindowList and accessibility reads. It never moves a pointer, types, requests
 system permissions or records continuously. An unavailable accessibility read
 is reported as such; file and page availability are separate facts. Office text
-is read locally; PDF text requires the optional `pdftotext` executable. Kimi's
-web tools remain available for public sources and do not inherit browser login.
+is read locally; PDF text requires the optional `pdftotext` executable. The codex
+executor exposes no web access: a web-dependent gap is recorded in
+`open_questions` as unknown, never answered from model memory. Under the kimi
+rollback executor, Kimi's web tools remain available for public sources and do
+not inherit browser login.
 
 All computer file reads pass through `ComputerReader`: configured roots and
 excluded runtime directories are checked after resolving symlinks. Credential
@@ -38,7 +46,7 @@ inferences and internal ideas. Source correction or deletion invalidates the
 associated decision and blocks its old contact intent pending reassessment.
 
 The optional `seen_database` preserves resource identities across workers and
-context-window trimming. Kimi receives a small window of previously read
+context-window trimming. The executor receives a small window of previously read
 resources and follows the current question from recent clues. An unchanged
 window is not a new owner interaction. Actual snapshots, paths and findings stay
 in the private store, not the public source repository.
@@ -62,16 +70,20 @@ These keys extend an existing private host configuration:
 ```
 
 Compile the native adapter with `swiftc adapters/computer-context.swift -o
-/private/bin/computer-context`. `kimi_home` is optional and otherwise follows
-`KIMI_CODE_HOME` or `~/.kimi-code`. Computer exploration creates a private Kimi
-home for that invocation, copies its model configuration and references the
-existing OAuth credential store. Only the three computer MCP tools are granted
-there. The custom agent profile exposes those tools and public web tools; it
-has no raw filesystem, shell, input-control or subagent tools. The ordinary
-knowledge profile is separate. Global Kimi configuration, workspace trust and
-desktop Codex settings are unchanged.
+/private/bin/computer-context`. Under the codex executor, the same three tools
+are served by the host's own `kin_computer` MCP server, injected into the run's
+configuration alone: user configuration and rules are ignored, other MCP servers,
+hooks, multi-agent, the generic shell and web search are disabled, and the
+sandbox is read-only. No global Kimi configuration, workspace trust or desktop
+Codex setting is read or changed. Under the kimi rollback executor, `kimi_home`
+is optional and otherwise follows `KIMI_CODE_HOME` or `~/.kimi-code`; computer
+exploration creates a private Kimi home for that invocation, copies its model
+configuration and references the existing OAuth credential store, and only the
+three computer MCP tools are granted there. The custom agent profile exposes
+those tools and public web tools; it has no raw filesystem, shell, input-control
+or subagent tools. The ordinary knowledge profile is separate.
 
-This uses Kimi's documented [MCP configuration](https://moonshotai.github.io/kimi-code/en/customization/mcp),
+The kimi rollback executor uses Kimi's documented [MCP configuration](https://moonshotai.github.io/kimi-code/en/customization/mcp),
 [custom agent tool allowlists](https://moonshotai.github.io/kimi-code/en/customization/agents)
 and [isolated configuration home](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html).
 In print mode, use `-p` with the configured rules; `--auto` cannot be combined
@@ -80,7 +92,7 @@ Validate actual tool execution, not just a successful CLI exit.
 
 ## A result need not become a message
 
-Kimi returns only a validated final object: findings, sources, open questions,
+The executor returns only a validated final object: findings, sources, open questions,
 optional `suggested_share` and optional `assistance_needed`. Thinking blocks and
 tool transcripts are excluded from the appraisal result. Tool names and status
 receipts may be retained for operational verification.
@@ -135,10 +147,10 @@ records the agreed participation; an unaccepted invitation remains a proposal.
 An owner being busy can move the request to waiting. Outcome evidence can resolve
 the concern and resume the related exploration; new wishes follow normal review.
 
-When Kimi reports `assistance_needed`, finishing its CLI run leaves the original
-exploration wish waiting for evidence. Supplying the condition can resume that
-same wish with a new execution receipt; a finished CLI process does not falsely
-mark the unanswered question complete.
+When the executor reports `assistance_needed`, finishing its run leaves the
+original exploration wish waiting for evidence. Supplying the condition can
+resume that same wish with a new execution receipt; a finished executor process
+does not falsely mark the unanswered question complete.
 
 This reuses concerns and wishes instead of creating a second task system. Work
 assigned by the owner still asks promptly for required inputs through its work
@@ -155,5 +167,5 @@ Synthetic tests cover share/defer/keep, restart and duplicate events, transactio
 rollback, source correction, request follow-up, resource identity, credential
 filtering, isolated tool profiles, timeout and work preemption. Enable the flags
 only after a real authorized read has returned an observed resource through the
-Kimi tool path. Disabling computer exploration keeps its records and prevents
+executor's tool path. Disabling computer exploration keeps its records and prevents
 new computer workers; existing knowledge wishes retain their meaning.

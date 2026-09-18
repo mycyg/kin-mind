@@ -35,7 +35,7 @@ Raw host events are durable before semantic evaluation. Actual operations and re
 
 The queue combines complete events under a 24,000-token input target and a 40-source ceiling. Oversized individual events use the existing source-preserving compression route. Historical graph interpretation has a persisted newest-first cursor, reuses the same appraisal worker, and evaluates old receipts against their matching findings. Live events take priority over historical backfill; failed jobs retain their cursors and retry timing. A backfill does not create feelings, reopen completed wishes or send old findings.
 
-Idle appraisals remain independently scheduled by DeepSeek within 20–120 minutes. Exploration remains curiosity-driven and Kimi executions have a twenty-minute ceiling. The work lock, shared conversation, current DS action decision and Singapore 00:00–09:00 quiet hours remain host responsibilities. With `semantic_actions` enabled, scores are dynamic context rather than an admission threshold.
+Idle appraisals remain independently scheduled by DeepSeek within 20–120 minutes. Exploration remains curiosity-driven and executor runs keep a twenty-minute ceiling. The work lock, shared conversation, current DS action decision and Singapore 00:00–09:00 quiet hours remain host responsibilities. With `semantic_actions` enabled, scores are dynamic context rather than an admission threshold.
 
 ## Recall and budgets
 
