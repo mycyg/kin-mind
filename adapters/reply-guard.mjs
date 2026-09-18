@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto';
 import {TransportManifests,manifestView} from './transport-manifest.mjs';
 import {ReplyTail} from './reply-tail.mjs';
 import {writeJsonAtomic} from './atomic-json.mjs';
+import {readThroughArchive} from './state-pruner.mjs';
 
 // Tail bookkeeping may have to wait for the memory host. A reply never waits for it longer than this; the work goes on behind it.
 const within=(work,ms)=>{let timer;return Promise.race([work,new Promise(resolve=>{timer=setTimeout(resolve,ms);timer.unref?.();})]).finally(()=>clearTimeout(timer));};
@@ -40,9 +41,9 @@ export function outboxEvidence(directories) {
  * Switched off, an interrupted group is handled as the manifest alone does. */
 export class ReplyGuard {
   constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),wholeReplyReview=false,onOutcome=()=>{},transportManifest=true,
-    manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry,
+    manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry,archivedState={},
     replyTailDecision=true,decideTail=null,ownerEpoch=null,onTail=null,onWake=()=>{},tailLimits,tailHooks,tailWaitMs=5000}) {
-    Object.assign(this,{call,directory,outbox,clock,wholeReplyReview,onOutcome,channel,tailWaitMs});this.active=new Map();
+    Object.assign(this,{call,directory,outbox,clock,wholeReplyReview,onOutcome,channel,tailWaitMs,archivedState});this.active=new Map();
     if(transportManifest)this.manifests=new TransportManifests({directory:manifestDirectory??path.join(directory,'reply-manifests'),clock,contracts,emit,lease,role,hooks,sleep,retry,
       // The host may hand over a direct reader of `<outbox>/<transport id>.json`; outbox evidence is the fallback.
       receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
@@ -57,9 +58,13 @@ export class ReplyGuard {
     if(this.active.has(key))return this.active.get(key);
     const run=this.inspect(request,key).finally(()=>this.active.delete(key));this.active.set(key,run);return run;
   }
+  /** A decision that was moved to the archive is still a decision. The lookup
+   * that misses looks there before concluding that nothing was ever decided —
+   * concluding that is how the owner hears the same thing a second time. */
+  prior(file){return readThroughArchive(file,this.archivedState).value;}
   async inspect(request,key) {
     const file=path.join(this.directory,key+'.json');fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
-    let old;try{old=JSON.parse(fs.readFileSync(file,'utf8'));}catch{}
+    const old=this.prior(file);
     if(old?.state==='silent'||old?.state==='merged')return old;
     if(old?.state==='pending'&&old.retryAt>this.clock())return old;
     let result;
@@ -226,7 +231,7 @@ export class ReplyGuard {
     if(this.manifests)return this.park([{request,delivery}],ownerEpoch,20*60000);
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
     const file=path.join(this.directory,createHash('sha256').update(delivery.id).digest('hex')+'.pending.json');
-    let prior;try{prior=JSON.parse(fs.readFileSync(file,'utf8'));}catch{}
+    const prior=this.prior(file);
     if(prior)return prior;
     return this.save(file,{state:'pending',request,delivery,ownerEpoch,at:this.clock(),retryAt:this.clock()+20*60000});
   }
