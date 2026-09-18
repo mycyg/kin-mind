@@ -56,7 +56,7 @@ class ConversationHabits:
         command id comes from a client, does not."""
         from .autonomy_schema import optimized
         proof = self.mind._evidence(conn, proposal.evidence_ids)
-        # `explicit` was never the same thing as "she said so": setup and persona texts carry it
+        # `explicit` was never the same thing as "the owner said so": setup and persona texts carry it
         # too. One shared predicate decides, so a configuration request cannot become a preference.
         policy = ReadPolicy.load(self.engine, self.scope, conn=conn)
         if not proof or not all(owner_statement(self.engine._get(conn, r["record_id"]), policy, sources=[r]) for r in proof) or not self.mind._fresh(conn, proof):

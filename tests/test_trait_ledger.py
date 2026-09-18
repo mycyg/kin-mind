@@ -452,7 +452,9 @@ def test_the_older_trait_record_is_carried_in_once_and_only_once(world):
 def test_with_the_ledger_off_the_view_and_the_projection_are_what_they_were(world):
     first_round(world)
     assert "trait_ledger" in world.mind.read()
-    world.memory.configure({"trait_ledger": False})
+    # The behaviour chain projects its own open predictions beside the ledger, on its own switch:
+    # both off is what "what they were" means.
+    world.memory.configure({"trait_ledger": False, "behavior_chain": False})
     view = world.mind.read()
     assert "trait_ledger" not in view and view["traits"] == {}
     projected = appraisal_context({"state": view, "stimulus": None})

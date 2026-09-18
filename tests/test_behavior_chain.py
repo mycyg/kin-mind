@@ -5,12 +5,15 @@ scripted provider that must not be called fails the test if it is.
 """
 import hashlib
 import json
+import subprocess
+import sys
 from datetime import timedelta
 
 import pytest
 from test_appraisal_sections import CONTEXT, Recorded
 from test_plan_review_loop import Env, Reviewer
 from test_section_isolation import children, run
+from test_trait_ledger import World, first_round, world  # noqa: F401 - `world` is a fixture
 
 from eventmem.core.db import Conflict, digest
 from eventmem.core.models import ModelRole, SourceInput
@@ -19,10 +22,13 @@ from eventmem.core.self_knowledge import (
     ClaimInput,
     PredictionInput,
     SelfKnowledge,
+    metadata,
 )
+from kin_mind import appraisal as appraisal_module
 from kin_mind import compat
 from kin_mind.appraisal import (
     ASK_AGAIN_SECTIONS,
+    AUDIT_SECTION_SWITCH,
     SECTIONS_WITHHELD,
     Appraisal,
     Appraisals,
@@ -30,6 +36,7 @@ from kin_mind.appraisal import (
     Prediction,
     PredictionOutcome,
     SelfHypothesis,
+    appraisal_context,
     last_refusal,
     offered_sections,
 )
@@ -41,10 +48,15 @@ pytest_plugins = ("test_memory_continuity",)
 # What the chain's switch adds to one fixed request: two properties and two paragraphs, and nothing
 # else. Re-pin only together with a deliberate change to those.
 CHAIN_REQUEST = "907a33d6f729519b1ba46d2b943ab95455aa1e023efd42ac9fcbd5371314a32c"
-# What a behavior-relevant instruction is, digested. A paragraph that moves fails this test, and its
-# author chooses: a new BEHAVIOR_CONTRACT, because the checks made under the old one no longer
-# describe this agent, or a new pin here, because they still do.
-PINNED_PROMPTS = {"behavior-1": "bcc89f06f5220d2161e7b982e4d7747af47502096399bcb838b4b8e2e3f5724b"}
+# Every behavior-relevant instruction, digested (compat.behavior_prompts: the shared appraisal
+# prompt and the paragraph of each audited section). A paragraph that moves fails the test below,
+# and its author chooses one of two things — see the message there.
+#
+# behavior-1 covers: the seams' placeholders replaced by the trait ledger's two real paragraphs.
+PINNED_PROMPTS = {"behavior-1": "078abd5881aad060ff5738888af6a37662835f210735692c3787e3635deca6ab"}
+# How to read the digest a change produced, in one command from the repository root:
+REPIN_COMMAND = ("uv run --extra dev python -c "
+                 "'from kin_mind.compat import prompt_digest; print(prompt_digest())'")
 
 
 @pytest.fixture
@@ -298,7 +310,7 @@ def test_a_changed_contract_or_persona_voids_the_chain(env, monkeypatch):
     assert openings(env)[0]["stale_reason"] == "compat-changed:persona"
 
 
-def test_the_key_moves_for_what_decides_behavior_and_for_nothing_else(env):
+def test_the_key_moves_for_what_decides_behavior_and_for_nothing_else(env, monkeypatch):
     first = stamp(env)
     env.mind.record(AffectiveEvent(command_id="an-ordinary-event", agent_version=env.version,
                                    expected_revision=env.mind.read()["revision"], evidence_ids=[env.initial],
@@ -313,9 +325,47 @@ def test_the_key_moves_for_what_decides_behavior_and_for_nothing_else(env):
         evolved = env.mind._load(conn)
         evolved["profile"]["dimensions"]["curiosity"].update(baseline=90, half_life_hours=99)
         assert compat.stamp(env.mind, conn, evolved)["key"] == first["key"]
+    # The memory model roles are not what answers the owner, and moving one is not a configuration
+    # change of the agent under test.
     env.mind.engine.settings("models", {"summary": ModelRole(endpoint="https://api.deepseek.com",
                                                              model="another-model").model_dump()})
+    assert stamp(env)["key"] == first["key"]
+    # An execution fact nothing of this rests on is not one either; the ones named are.
+    env.mind.engine.settings("execution_environment", {"jq": "1.7"})
+    assert stamp(env)["key"] == first["key"]
+    env.mind.engine.settings("execution_environment", {"jq": "1.7", "python": "3.13"})
+    assert compat.stale_reason(first, stamp(env)) == "compat-changed:environment"
+    env.mind.engine.settings("execution_environment", {})
+    assert stamp(env)["key"] == first["key"], "an environment nobody registered is not a change"
+    # The model this evaluator pins itself is: it decides what every structured answer was.
+    monkeypatch.setattr(appraisal_module, "APPRAISAL_MODEL", "another-appraiser")
     assert compat.stale_reason(first, stamp(env)) == "compat-changed:models"
+
+
+def host_action(env, action, **request):
+    from kin_mind.host import dispatch
+    return dispatch({"root": str(env.mind.engine.db.root), "scope": env.mind.scope.model_dump(),
+                     "agent_version": env.version, "session_id": "synthetic-session"}, action, request)
+
+
+def test_the_chat_model_is_registered_by_the_host_and_moves_the_key_once(env, monkeypatch):
+    """Nothing goes stale for never having registered one; the first registration moves it once."""
+    unregistered = stamp(env)
+    assert stamp(env)["key"] == unregistered["key"]
+    registered = host_action(env, "configure-behavior-models", chat=" a-chat-model ", chat_effort="high")
+    assert registered["state"] == "registered" and registered["behavior_models"] == {
+        "chat": "a-chat-model", "chat_effort": "high"}
+    once = stamp(env)
+    assert compat.stale_reason(unregistered, once) == "compat-changed:models"
+    assert stamp(env)["key"] == once["key"], "reading it again is not a change"
+    # The same registration again is the same configuration; a different effort is not.
+    host_action(env, "configure-behavior-models", chat="a-chat-model", chat_effort="high")
+    assert stamp(env)["key"] == once["key"]
+    host_action(env, "configure-behavior-models", chat="a-chat-model", chat_effort="low")
+    assert compat.stale_reason(once, stamp(env)) == "compat-changed:models"
+    for invalid in ({"chat": "", "chat_effort": "high"}, {"chat": "a-chat-model"}, {"chat": 3, "chat_effort": "high"}):
+        with pytest.raises(ValueError, match="Behavior models need"):
+            host_action(env, "configure-behavior-models", **invalid)
 
 
 def approve_persona(env, voice="Use complete sentences.", version="persona-v1"):
@@ -492,9 +542,151 @@ def test_the_switch_off_keeps_the_daily_review_as_it_was(env):
     assert len(events(env)) == 1
 
 
+# --- what the model is shown, end to end -----------------------------------------------------------
+
+def projected(world):
+    """The state an appraisal would really be handed, through the projection that builds it."""
+    return appraisal_context({"state": world.mind.read(), "stimulus": None})["state"]
+
+
+def test_the_model_is_shown_an_open_prediction_and_settles_it(world):
+    """One appraisal makes a check; the next is shown it, and settles it with what the host can see."""
+    promise = world.owner("owner-asks-for-a-source", "Will you bring me a source next time?")
+    result, data, _ = world.appraise([promise], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[promise])))
+    assert result["state"] == "complete" and "rejected_sections" not in data
+    world.clock[0] += timedelta(hours=2)
+    later = world.owner("owner-confirms", "You did bring the source this time.")
+    seen = {}
+
+    def script(state, shown):
+        seen["open"] = state.get("open_predictions")
+        return Appraisal(reason="A real owner message", prediction_outcomes=[PredictionOutcome(
+            prediction_id=state["open_predictions"][0]["id"], outcome="confirmed",
+            evidence_ids=[later], reason="What the owner reported, which the host holds")])
+
+    result, data, _ = world.appraise([later], script)
+    assert result["state"] == "complete" and "rejected_sections" not in data
+    shown = seen["open"][0]
+    # Everything the chain knows about an open check except the revision, which is the manifest's.
+    assert set(shown) == {"id", "statement", "claim_id", "made_at", "test_window_hours",
+                          "window_ends_at", "expired", "compat", "stale_reason"}
+    assert shown["compat"] == "current" and not shown["expired"]
+    assert assessment_of(world, shown["id"]) and projected(world)["open_predictions"] == []
+
+
+def test_each_projection_answers_to_its_own_switch(world):
+    first_round(world)
+    promise = world.owner("owner-asks-for-a-source", "Will you bring me a source next time?")
+    world.appraise([promise], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[promise])))
+    open_one = openings(world)[0]["id"]
+    assert [p["id"] for p in projected(world)["open_predictions"]] == [open_one]
+    # The ledger on, the chain off: the ledger's own projection, and nothing left open to settle.
+    world.memory.configure({"behavior_chain": False})
+    state = projected(world)
+    assert state["open_predictions"] == [] and state["traits"]["candidate"]
+    # The chain on, the ledger off: its own projection, and nothing of the ledger's.
+    world.memory.configure({"behavior_chain": True, "trait_ledger": False})
+    state = projected(world)
+    assert [p["id"] for p in state["open_predictions"]] == [open_one]
+    assert not {"traits", "corrections"} & set(state)
+
+
+# --- one writer for a trait ---------------------------------------------------------------------
+
+def test_the_ledger_is_the_only_writer_of_traits(world):
+    """With the ledger on, a trait in an evolution is refused where it is proposed and where it
+    would be applied. With it off, the older snapshot still works."""
+    claim, _prediction, assessment = confirmed_chain(world)
+    request = evolution(world, claim, assessment, evidence=separate_windows(world),
+                        traits={"interests": "Lantern light"})
+    with pytest.raises(Conflict, match="only writer of traits"):
+        world.mind.record(request)
+    job = world.enqueue("owner-chat")
+    run(world, lambda shown, context: Appraisal(reason="A synthetic proposal", evolution=Evolution(
+        claim_id=claim["id"], assessment_id=assessment["id"], traits={"interests": "Lantern light"})), job_id=job)
+    assert [r["code"] for r in world.job(job)["rejected_sections"]] == ["traits-owned-by-ledger"]
+    assert proposals(world) == []
+    world.memory.configure({"trait_ledger": False})
+    world.mind.record(request.model_copy(update={"expected_revision": world.mind.read()["revision"]}))
+    assert world.mind.read()["traits"]["interests"]["text"] == "Lantern light"
+
+
+# --- what a hypothesis rests on ------------------------------------------------------------------
+
+def claim_of(world, prediction_id):
+    return world.mind.engine.get([p for p in openings(world) if p["id"] == prediction_id][0]["claim_id"])
+
+
+def test_a_hypothesis_records_the_traits_it_rests_on(world):
+    first_round(world)
+    trait = world.mind.read()["trait_ledger"]["traits"]["candidate"][0]
+    source = world.owner("owner-asks-about-it", "Is that a habit of yours now?")
+    result, data, _ = world.appraise([source], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[source], trait_refs=[trait["id"]])))
+    assert result["state"] == "complete" and "rejected_sections" not in data
+    prediction = openings(world)[0]
+    assert metadata(claim_of(world, prediction["id"]))["rests_on"] == [trait["id"]]
+    # A trait that is not there, and one an owner correction ended, are both refused.
+    invented = world.owner("owner-asks-again", "And this one?")
+    _result, data, _ = world.appraise([invented], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[invented], trait_refs=["trait_invented"])))
+    assert [r["code"] for r in data["rejected_sections"]] == ["trait-unknown"]
+    world.ledger().revoke({"trait_id": trait["id"], "reason": "An owner correction",
+                           "source_id": world.owner("owner-corrects", "That is not me at all.")})
+    ended = world.owner("owner-asks-once-more", "And now?")
+    _result, data, _ = world.appraise([ended], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[ended], trait_refs=[trait["id"]])))
+    assert [r["code"] for r in data["rejected_sections"]] == ["trait-not-effective"]
+
+
+def test_with_the_ledger_off_a_trait_reference_is_accepted_and_ignored(world):
+    world.memory.configure({"trait_ledger": False})
+    source = world.owner("owner-asks", "Is that a habit of yours?")
+    result, data, _ = world.appraise([source], lambda state, shown: Appraisal(
+        reason="A real owner message", self_hypothesis=hypothesis(evidence_ids=[source], trait_refs=["trait_invented"])))
+    assert result["state"] == "complete" and "rejected_sections" not in data
+    assert "rests_on" not in metadata(claim_of(world, openings(world)[0]["id"]))
+
+
+# --- every section claimed, whatever a path read first --------------------------------------------
+
+def test_building_the_queue_is_enough_to_claim_every_section(tmp_path):
+    """A fresh process that only builds the queue: no projection has been read, and no audited
+    section is still the no-op that refuses whatever it is given."""
+    code = """import json,sys
+from eventmem.core import Engine
+from eventmem.core.models import Scope
+from kin_mind.appraisal import AUDIT_HANDLERS, Appraisals, unavailable_section
+from kin_mind.state import Mind
+Appraisals(Mind(Engine(sys.argv[1]), Scope(persona='synthetic-claims')))
+print(json.dumps([n for n, h in AUDIT_HANDLERS.items() if h is not unavailable_section]))
+"""
+    answer = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, check=True)
+    assert json.loads(answer.stdout.splitlines()[-1]) == [
+        "trait_observations", "trait_decisions", "self_hypothesis", "prediction_outcomes"]
+
+
+def test_a_section_owner_that_has_not_landed_is_simply_not_there(monkeypatch):
+    """A release without one of the owning modules claims the others and says nothing about it."""
+    monkeypatch.setattr(appraisal_module, "SECTION_OWNERS",
+                        (*appraisal_module.SECTION_OWNERS, "a_module_that_has_not_landed"))
+    appraisal_module.claim_audit_sections()
+    appraisal_module.claim_audit_sections()  # importing is idempotent, so calling this is too
+    assert appraisal_module.AUDIT_HANDLERS["self_hypothesis"] is not appraisal_module.unavailable_section
+
+
 def test_a_behavior_relevant_paragraph_forces_a_decision(env):
     assert compat.prompt_digest() == PINNED_PROMPTS[compat.BEHAVIOR_CONTRACT], (
-        "A behavior-relevant paragraph moved: bump BEHAVIOR_CONTRACT, or re-pin it here.")
+        "A behavior-relevant paragraph moved, so this is a decision, not a failure.\n"
+        "Read the new digest with:\n  " + REPIN_COMMAND + "\n"
+        "Then either (a) it says something different about how the agent behaves, so bump "
+        "compat.BEHAVIOR_CONTRACT and add the new digest under the new name in PINNED_PROMPTS "
+        "(tests/test_behavior_chain.py) — every open prediction and pending proposal made under "
+        "the old contract then reads as stale, which is what you want; or (b) it is a rewording "
+        "that leaves what an already-made check meant intact, so replace the digest of the current "
+        "contract in PINNED_PROMPTS and note what you changed in the comment above it.")
     # The key is these five ingredients, and a stamp holds no text of any of them.
     current = stamp(env)
     assert set(current["parts"]) == {"persona", "contract", "definitions", "models", "environment"}

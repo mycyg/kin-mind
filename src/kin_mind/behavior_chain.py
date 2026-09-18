@@ -110,6 +110,23 @@ def _receipts(conn, mind, ids):
     return refs
 
 
+def _traits(conn, mind, refs):
+    """The traits a hypothesis says it rests on, while the ledger is the authority on them. A trait
+    that is not in effect cannot be what a behavior is predicted from, so it is refused here rather
+    than followed later into an invalidation that has nothing to invalidate."""
+    from .autonomy_schema import optimized
+    from .traits import EFFECTIVE, Traits
+    if not refs or not optimized(conn, mind.scope.key(), "trait_ledger"):
+        return []
+    ledger = Traits(mind)
+    for identifier in refs:
+        # Missing carries `trait-unknown` from the ledger itself; an ended trait is this refusal.
+        if ledger.get(conn, identifier)["status"] not in EFFECTIVE:
+            raise Conflict("A hypothesis rests only on a trait that is in effect",
+                           code="trait-not-effective", target=identifier)
+    return sorted(set(refs))
+
+
 def commit_hypothesis(commit):
     """`self_hypothesis`: one claim and the predictions that could refute it, in this transaction."""
     mind, conn, value = commit.mind, commit.conn, commit.value
@@ -122,7 +139,8 @@ def commit_hypothesis(commit):
     claim = knowledge.claim_in(conn, ClaimInput(
         command_id=commit.event_id + ":hypothesis", aspect=value.statement[:200], context=CLAIM_CONTEXT,
         agent_version=commit.version, claim=value.statement, basis="hypothesis",
-        evidence_ids=sorted({ref["record_id"] for ref in refs})), compat=current)
+        evidence_ids=sorted({ref["record_id"] for ref in refs})), compat=current,
+        rests_on=_traits(conn, mind, value.trait_refs))
     for index, prediction in enumerate(value.predictions):
         if prediction.evidence_ids:
             _refs(conn, mind, prediction.evidence_ids, commit.sources)
@@ -165,10 +183,14 @@ def hold_evolution(commit):
 
     The day's merge checks the chain and the limits. Dropping this silently, as the previous
     release did, is what kept the whole chain out of production."""
+    from .autonomy_schema import optimized
     mind, conn, value = commit.mind, commit.conn, commit.value
     if value.revert_event_id:
         raise Conflict("A reversion is a host action, not an appraisal proposal",
                        code="evolution-revert-not-proposed")
+    if value.traits and optimized(conn, mind.scope.key(), "trait_ledger"):
+        # Refused where it was proposed, so a proposal the merge could only refuse is never stored.
+        raise Conflict("The trait ledger is the only writer of traits", code="traits-owned-by-ledger")
     _ensure(conn)
     current = compat.stamp(mind, conn, commit.state)
     identifier = "evolution_" + digest([commit.event_id, "proposal"])[:32]

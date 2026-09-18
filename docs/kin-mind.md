@@ -209,9 +209,11 @@ the daily action merges it host side. It requires three independent original
 interactions — one interaction window counts once, however many messages it holds — a
 pending proposal, and a prediction of the same configuration confirmed by host-verified
 evidence. "The same configuration" is a compatibility key over the approved persona, a
-declared behavior contract, the dimension definition texts, the appraisal and answer
-model identifiers and the relevant execution environment, so an unrelated agent version
-bump no longer voids a check while a real change does. What a change voids stays
+declared behavior contract, the dimension definition texts, the appraisal model this
+evaluator pins for itself, the chat model the host registers with
+`configure-behavior-models` (unregistered until it does, which is stable rather than
+stale), and the relevant execution environment. An unrelated agent version bump no
+longer voids a check while a real change does. What a change voids stays
 readable, marked with the ingredient that moved. `Mind` enforces parameter limits and
 preserves the claim's hypothesis status. A later explicit correction can revert the
 latest personality revision while retaining history; intervening personality revisions

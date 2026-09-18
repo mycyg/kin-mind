@@ -234,6 +234,10 @@ REGISTRY = {
     "A result must name an execution of this scope": ("semantic", "result-unknown", "section"),
     "This receipt does not show the behavior happened": ("semantic", "result-unverified", "section"),
     "A reversion is a host action, not an appraisal proposal": ("semantic", "evolution-revert-not-proposed", "section"),
+    "A hypothesis rests only on a trait that is in effect": ("semantic", "trait-not-effective", "section"),
+    # Raised where it is proposed (a section, refused alone) and again where it would be applied
+    # (state.py, outside one, so the whole commit stops): one message, the stricter handling.
+    "The trait ledger is the only writer of traits": ("semantic", "traits-owned-by-ledger", "block"),
     # --- exploration_decisions.py ---
     "Sharing decision needs an exploration in this scope": ("semantic", "exploration-unknown", "block"),
     "A clock or delivery event cannot reopen a result decision": ("semantic", "decision-reopen-not-allowed", "block"),
