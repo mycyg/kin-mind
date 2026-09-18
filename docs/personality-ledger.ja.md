@@ -68,7 +68,7 @@
 | `trait_ledger` | `trait_observations`、`trait_decisions`、台帳の表と経路、そして評価の投影とチャット文脈における特性と訂正の項目。 |
 | `expression_intent` | `expression_intent`、および姿勢・話題・回避が対応表だけでなく言葉づかいに届くこと。 |
 | `next_move_audit` | `next_move` と追記のみの `mind_next_moves`。 |
-| `behavior_chain` | `self_hypothesis`、`prediction_outcomes`、互換の刻印、保留中の進化提案、モデルを呼ばない日次統合。無効にすると、一日一回のモデル要求と「同じ agent_version の評定」に戻ります。 |
+| `behavior_chain` | `self_hypothesis`、`prediction_outcomes`、互換の刻印、保留中の進化提案、モデルを呼ばない日次統合。無効にすると、一日一回のモデル要求と「同じ agent_version の評定」に戻り、同時にこの段階が終わらせようとした沈黙も戻ります——通常の評価が出した `evolution` は届いた場所で捨てられ、適用も保存も拒否理由の記録もされません。 |
 | `wish_version_review` | 判断が以前のエージェント版で下された願いについて、願いと版ごとに `wish-review` を一度だけ出します。未準備のまま誰も二度と見に来ない状態に置き去りにしません。 |
 | `rest_review_window` | 次の静かな見直しの上限 `review_rest_max_minutes`＝480 を、律動が休んでいるあいだ、または相手の非通知時間帯のあいだだけ適用します。それ以外では引き続き `review_max_minutes` が決め、どちらの上限なのかは要求に書かれます。 |
 

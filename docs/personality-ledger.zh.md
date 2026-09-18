@@ -68,7 +68,7 @@
 | `trait_ledger` | `trait_observations`、`trait_decisions`、账本的表与路由，以及评估投影和聊天上下文里的特征与更正条目。 |
 | `expression_intent` | `expression_intent`，以及姿态、话题与回避进入措辞，而不再只有查表。 |
 | `next_move_audit` | `next_move` 与只追加的 `mind_next_moves`。 |
-| `behavior_chain` | `self_hypothesis`、`prediction_outcomes`、兼容印记、待定的演化提案，以及不调模型的每日合并。关闭后恢复为每天一次模型请求与"同一 agent_version 的评定"。 |
+| `behavior_chain` | `self_hypothesis`、`prediction_outcomes`、兼容印记、待定的演化提案，以及不调模型的每日合并。关闭后恢复为每天一次模型请求与"同一 agent_version 的评定"——同时也恢复了这一阶段要终结的那种沉默：普通评估给出的 `evolution` 在到达处被丢弃，既不应用、也不留存为提案、也不给出拒绝理由。 |
 | `wish_version_review` | 对决策作于更早智能体版本的愿望，按愿望与版本各发一次 `wish-review`，而不是让它停在未就绪、再也没有人过问。 |
 | `rest_review_window` | 下一次安静复核的上限 `review_rest_max_minutes`＝480，仅在节律处于休息相位或用户免打扰时段时适用。其余场合仍由 `review_max_minutes` 决定，请求里会写明本次适用哪个上限。 |
 

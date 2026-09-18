@@ -619,6 +619,32 @@ def test_the_ledger_is_the_only_writer_of_traits(world):
     assert world.mind.read()["traits"]["interests"]["text"] == "Lantern light"
 
 
+def test_turning_the_chain_off_costs_the_evolution_itself(world):
+    """What an operator gives up by turning this switch off, pinned so that nobody has to find out
+    during a rollback. With the chain off an `evolution` from an ordinary appraisal is dropped where
+    it arrives: not applied, not stored as a proposal, and not refused either. That silence is the
+    behaviour this stage was built to end, and it is exactly what a rollback restores -- so it may
+    not be discovered by surprise. The ledger stays the only writer of a trait either way."""
+    claim, _prediction, assessment = confirmed_chain(world)
+    world.memory.configure({"behavior_chain": False})
+
+    # A trait offered through an evolution: still not written, and the appraisal is not harmed.
+    job = world.enqueue("owner-chat")
+    result, _ = run(world, lambda shown, context: Appraisal(reason="A synthetic proposal", evolution=Evolution(
+        claim_id=claim["id"], assessment_id=assessment["id"], traits={"interests": "Lantern light"})), job_id=job)
+    assert result["state"] == "complete" and world.job(job).get("rejected_sections") is None
+    assert world.mind.read()["traits"] == {}
+
+    # And the part that is only the chain's: a baseline change goes nowhere at all.
+    before = world.mind.read()["dimensions"]["mood"]["baseline"]
+    job2 = world.enqueue("owner-chat-again")
+    run(world, lambda shown, context: Appraisal(reason="A synthetic proposal", evolution=Evolution(
+        claim_id=claim["id"], assessment_id=assessment["id"], baseline_changes={"mood": before + 1})), job_id=job2)
+    assert world.mind.read()["dimensions"]["mood"]["baseline"] == before
+    assert events(world) == [] and proposals(world) == []
+    assert world.job(job2).get("rejected_sections") is None
+
+
 # --- what a hypothesis rests on ------------------------------------------------------------------
 
 def claim_of(world, prediction_id):

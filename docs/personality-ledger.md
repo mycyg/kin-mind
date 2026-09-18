@@ -68,7 +68,7 @@ Switches are registered in `memory.DEFAULTS`, are read through `autonomy_schema.
 | `trait_ledger` | `trait_observations`, `trait_decisions`, the ledger tables and its routes, and the trait and correction items in both the appraisal projection and the chat context. |
 | `expression_intent` | `expression_intent`, and the stance, topics and avoidances reaching the wording instead of the lookup table alone. |
 | `next_move_audit` | `next_move` and the append-only `mind_next_moves`. |
-| `behavior_chain` | `self_hypothesis`, `prediction_outcomes`, the compatibility stamp, the pending evolution proposal and the daily merge with no model call. Off restores one model request a day and an assessment in the same agent version. |
+| `behavior_chain` | `self_hypothesis`, `prediction_outcomes`, the compatibility stamp, the pending evolution proposal and the daily merge with no model call. Off restores one model request a day and an assessment in the same agent version — and, with it, the silence this stage was built to end: an `evolution` from an ordinary appraisal is dropped where it arrives, neither applied nor stored nor refused. |
 | `wish_version_review` | One `wish-review` per wish and version for a wish whose decision was made under an earlier agent version, instead of leaving it not-ready with nothing ever looking at it again. |
 | `rest_review_window` | The `review_rest_max_minutes` ceiling of 480 for the next quiet review, applied only while the rhythm rests or the owner's quiet hours run. Everywhere else `review_max_minutes` still decides, and the request says which ceiling holds. |
 
