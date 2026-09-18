@@ -175,9 +175,20 @@ def project(entry, at):
 class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
+        # What the dedupe guard found while its two records of scored evidence disagreed. It is
+        # carried out of the write rather than written inside it, because such a disagreement is
+        # always a refusal and a refusal takes its own transaction, and the note, back with it.
+        self._guard_mismatches = []
+        # The exact text the state was last read from. The history layer takes it as a hint about
+        # what the row before this one holds and proves it against that row's own hash before
+        # believing a word of it, so a stale one costs a rebuild and can never cost correctness.
+        self._loaded = None
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
+        from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
+        from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA)
+            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
+                               + DESIRE_ARCHIVE_SCHEMA)
 
     def _load(self, conn):
         row = conn.execute(
@@ -187,6 +198,7 @@ class Mind(Continuity):
             raise Missing(
                 "Initialize the role profile before reading or changing state"
             )
+        self._loaded = row["data"]
         return json.loads(row["data"])
 
     def _save(self, conn, state):
@@ -343,6 +355,11 @@ class Mind(Continuity):
         return "mind:" + digest([self.scope.key(), command_id])
 
     def _history(self, conn, event_id, state, kind, payload):
+        # The row's own shape belongs to the history layer, not here: it decides whether this
+        # revision is stored as a whole document or as what changed since the row before, and the
+        # same layer reads it back. Off by default, in which case the row is the one the previous
+        # release wrote, key for key. It also refuses outright while compaction owns the rows.
+        from .history import row_for
         conn.execute(
             "INSERT INTO mind_events VALUES(?,?,?,?,?,?)",
             (
@@ -351,12 +368,25 @@ class Mind(Continuity):
                 state["revision"],
                 kind,
                 self.clock(),
-                dumps({"request": payload, "snapshot": state}),
+                dumps(row_for(conn, self.scope.key(), state, kind, payload, loaded=self._loaded)),
             ),
         )
+        # The one place history is written is the one place the evidence key index hears about it,
+        # so no commit can leave the index behind the row that introduced a key.
+        from .evidence_keys import record as record_evidence_key
+        record_evidence_key(conn, self.scope.key(), state, kind, event_id)
 
     def _mutate(self, request, kind, fn, *, rebase=None):
         payload = request.model_dump() if hasattr(request, "model_dump") else request
+        try:
+            return self._transact(payload, kind, fn, rebase)
+        finally:
+            # Outside the transaction, so a refusal that rolled the write back still leaves the
+            # sign of what the guard disagreed with itself about.
+            from .evidence_keys import flush_mismatches
+            flush_mismatches(self.engine, self._guard_mismatches)
+
+    def _transact(self, payload, kind, fn, rebase):
         with self.engine.db.connect(write=True) as conn:
             from .autonomy_schema import optimized
             # The expected revision is this command's precondition, checked inside run(); it
@@ -572,13 +602,14 @@ class Mind(Continuity):
         unknown = set(request.values) - set(state["dimensions"])
         if unknown:
             raise ValueError("Unknown affective dimension")
-        # A single underlying event cannot be scored again under another command.
+        # A single underlying event cannot be scored again under another command. What has been
+        # scored is kept in its own table now, because the snapshots this used to scan are about to
+        # become patches; until that is finished the old scan still answers beside it, and either
+        # one saying yes is enough to refuse.
+        from .evidence_keys import already_scored
         evidence_key = digest(sorted({(r["source_id"], r["hash"]) for r in refs}))
-        duplicate = conn.execute(
-            "SELECT 1 FROM mind_events WHERE scope=? AND kind='affect' AND json_extract(data,'$.snapshot.last_evidence_key')=? LIMIT 1",
-            (self.scope.key(), evidence_key),
-        ).fetchone()
-        if duplicate:
+        if already_scored(conn, self.scope.key(), evidence_key, at=self.clock(),
+                          deferred=self._guard_mismatches):
             raise Conflict(
                 "This evidence was already appraised; use a source correction or new evidence"
             )
@@ -612,6 +643,23 @@ class Mind(Continuity):
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
 
+    def _desire(self, conn, state, identifier):
+        """The wish this identifier names, wherever it now lives.
+
+        A finished wish may have been moved to the archive to keep it out of a document that is
+        written again on every revision. It is still that wish: the same identifier, the same plan
+        links, the same evidence and the same receipt. Every reader that asks for a wish by its
+        identifier asks here, so a move can never turn a wish that exists into one that does not —
+        which would cost a dedupe, and a duplicate message after it.
+
+        What comes back from the archive is a copy of a finished wish, so writing to it writes
+        nowhere. Every path that changes a wish refuses a finished one before it reaches this."""
+        desire = state["desires"].get(identifier)
+        if desire is not None:
+            return desire
+        from .desire_archive import archived
+        return archived(conn, self.scope.key(), identifier)
+
     def manage_desire(self, request: DesireChange):
         return self._mutate(
             request,
@@ -620,13 +668,19 @@ class Mind(Continuity):
         )
 
     def _apply_desire(self, conn, state, request, event_id):
+        from .desire_archive import intent as archived_intent
         refs = self._evidence(conn, request.evidence_ids)
         if request.exploration_id:
             from .exploration_decisions import require_share
             decision = require_share(self, conn, state, request.exploration_id)
-            if request.action == "create" and any(d.get("exploration_id") == request.exploration_id
-                                                  and d.get("sharing_revision") == decision["revision"]
-                                                  for d in state["desires"].values()):
+            # Whatever their status, including the finished ones that have moved: one sharing
+            # decision has one contact intent, and an intent that left the document did not stop
+            # being the intent this decision already has.
+            if request.action == "create" and (any(d.get("exploration_id") == request.exploration_id
+                                                   and d.get("sharing_revision") == decision["revision"]
+                                                   for d in state["desires"].values())
+                                               or archived_intent(conn, self.scope.key(),
+                                                                  request.exploration_id, decision["revision"])):
                 raise Conflict("This sharing decision already has a contact intent")
         link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
         at = self.clock()
@@ -635,6 +689,11 @@ class Mind(Continuity):
             if timestamp(request.expires_at) <= timestamp(at):
                 raise ValueError("A new desire must have a future expiry")
             did = "desire_" + digest([self.scope.key(), request.command_id])[:32]
+            if self._desire(conn, state, did) is not None:
+                # The identifier is derived from the command, so a command that ran once before
+                # would land on a wish that has since moved. One identifier, one wish, in one
+                # place: a second copy in the document is the state the archive may never reach.
+                raise Conflict("A finished desire stays in history; create a new desire")
             state["desires"][did] = dict(
                 id=did,
                 status="wanted",
@@ -657,6 +716,10 @@ class Mind(Continuity):
         else:
             did = request.desire_id
             if did not in state["desires"]:
+                if self._desire(conn, state, did) is not None:
+                    # An archived wish is a finished wish that has moved, so it earns the refusal
+                    # a finished wish earns — not the one for a wish that was never here.
+                    raise Conflict("A finished desire stays in history; create a new desire")
                 raise Missing("Desire is outside this scope or missing")
             desire = state["desires"][did]
             if request.exploration_target and desire["kind"] != "explore":
@@ -667,8 +730,10 @@ class Mind(Continuity):
                 from .exploration_decisions import require_share
                 linked_result = request.exploration_id or desire["exploration_id"]
                 decision = require_share(self, conn, state, linked_result)
-                if any(d["id"] != did and d.get("exploration_id") == linked_result
-                       and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values()):
+                if (any(d["id"] != did and d.get("exploration_id") == linked_result
+                        and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values())
+                        or archived_intent(conn, self.scope.key(), linked_result,
+                                           decision["revision"], exclude=did)):
                     raise Conflict("This sharing decision already has another contact intent")
             if desire["status"] in {"completed", "abandoned"}:
                 raise Conflict(
@@ -873,11 +938,12 @@ class Mind(Continuity):
             raise Conflict(
                 "A later personality revision exists; review it before reverting"
             )
-        before = conn.execute(
-            "SELECT data FROM mind_events WHERE scope=? AND revision=?",
-            (self.scope.key(), row["revision"] - 1),
-        ).fetchone()
-        previous = json.loads(before[0])["snapshot"]
+        # What the profile was before that evolution, read through the history layer: the row
+        # before it rather than the revision before it, and verified against its own hash. A
+        # reversion that cannot show the state it is restoring restores nothing — the layer
+        # raises `history-rebuild-failed` here and the whole commit goes back.
+        from .history import before
+        previous = before(conn, self.scope.key(), row["revision"])
         for key, old in state["dimensions"].items():
             spec = previous["profile"]["dimensions"][key]
             old.update(
@@ -994,6 +1060,13 @@ class Mind(Continuity):
         if ledger:
             # Only what a switch that is on produced: with both off this view is what it was, key for key.
             view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
+        from .desire_archive import STATE_KEY as DESIRE_ARCHIVE
+        moved = (state.get(DESIRE_ARCHIVE) or {}).get("count") or 0
+        if moved:
+            # How many finished wishes are held outside the document, so a reader counting what is
+            # here does not read the move as a hundred wishes having ceased to exist. Present only
+            # once something has moved, so a store that never archives sees the view it always did.
+            view[DESIRE_ARCHIVE] = {"count": moved}
         return view
 
     def read(self, *, as_of=None, history=0, query=""):
@@ -1038,19 +1111,10 @@ class Mind(Continuity):
                 result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
             self._continuity_view(conn, state, result, at, query)
             if history:
-                result["history"] = [
-                    dict(
-                        id=r["id"],
-                        kind=r["kind"],
-                        revision=r["revision"],
-                        occurred_at=r["occurred_at"],
-                        **json.loads(r["data"]),
-                    )
-                    for r in conn.execute(
-                        "SELECT * FROM mind_events WHERE scope=? ORDER BY revision DESC LIMIT ?",
-                        (self.scope.key(), history),
-                    )
-                ]
+                # The same six keys as before. How a revision is stored is the layer's business,
+                # and one revision it cannot rebuild costs that entry its snapshot, not the list.
+                from .history import entries
+                result["history"] = entries(conn, self.scope.key(), history)
             return result
 
     @staticmethod

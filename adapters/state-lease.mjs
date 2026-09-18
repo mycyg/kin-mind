@@ -59,7 +59,7 @@ export function acquireLease({directory,id,role='service',clock=Date.now,floor=0
   const generation=Math.max(seen.generation,floor)+1,marker=markerPath(directory,id,generation);
   try{fs.mkdirSync(marker,{mode:0o700});}catch(error){if(error.code==='EEXIST')return null;throw error;}
   const owner={pid,nonce:randomBytes(12).toString('hex'),role},now=clock();
-  try{fs.writeFileSync(path.join(marker,'claim.json'),JSON.stringify({owner,at:now}),{mode:0o600});}catch{/* The marker's mtime stands in. */}
+  try{writeJsonAtomic(path.join(marker,'claim.json'),{owner,at:now},{previous:false});}catch{/* The marker's mtime stands in. */}
   // A contender that slept since its first read may have won a generation that
   // is already history. It must notice that before it writes anything.
   if((readLease(directory,id)?.generation??0)>=generation||highest(directory,id)>generation) {

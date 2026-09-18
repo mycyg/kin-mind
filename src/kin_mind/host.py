@@ -9,7 +9,9 @@ from pathlib import Path
 
 from eventmem.core import Engine
 from eventmem.core.db import digest
+from eventmem.core.integrity import enforce_source_root, warn_interpreter
 from eventmem.core.models import Scope, SourceInput
+from eventmem.paths import atomic_write
 
 from .actions import ActionEvents
 from .appraisal import Appraisals, DailyReview, DeepSeek
@@ -18,6 +20,7 @@ from .context import Contexts
 from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
 from .exploration_cadence import ExplorationCadence
+from .liveness import checks_enabled, record_alive
 from .memory import MemoryContinuity
 from .state import Mind
 
@@ -98,7 +101,7 @@ def dispatch(config, action, request):
     memory = MemoryContinuity(mind)
     if action == "operational-status":
         from .operational_status import operational_status
-        return operational_status(mind)
+        return operational_status(mind, config)
     if action == "recover-operational":
         from .recovery import migrate_operational
         return migrate_operational(mind, workers_stopped=request.get("workers_stopped"))
@@ -111,6 +114,15 @@ def dispatch(config, action, request):
     if action == "recover-appraisals":
         from .recovery import recover_quarantined
         return recover_quarantined(mind, **request)
+    if action.startswith("history-"):
+        # Operator actions on the stored history itself. Each one registers with the history
+        # registry instead of adding a branch here, so a package that ships a new command does
+        # not have to touch this dispatch to be reachable.
+        # The configuration travels with them because compaction has to prove nothing is running,
+        # and where the host keeps its pid files and its status file is not something the store
+        # knows. Commands that do not need it are not given it.
+        from .history_admin import dispatch as history_command
+        return history_command(mind, action, request, config)
     if action == "appraisal-attempts":
         # Read-only accounting: outcomes, static codes, digests and usage. No private text.
         from .attempts import read as read_attempts
@@ -202,6 +214,36 @@ def dispatch(config, action, request):
                   else migration.run(**options, registry_file=request.get("registry")))
         return {k: v for k, v in result.items()
                 if k in {"migration", "operation", "state", "applied", "rules_version", "summary", "steps", "output"}}
+    if action in {"maintenance-tick", "vector-optimize"}:
+        # Housekeeping for derived data only. Both write nothing without `--apply`, and both
+        # report what they would have done so the decision can be taken on the numbers: the
+        # tick's is the one hard delete in the programme, of compressed context that costs a
+        # model call to rebuild, and the Lance command removes superseded manifests of the
+        # vectors while leaving every current row where it is.
+        from .maintenance import VECTOR_KEEP_DAYS, tick, vector_optimize
+        if action == "vector-optimize":
+            days = request.get("older_than_days", VECTOR_KEEP_DAYS)
+            if type(days) is not int or days < 0:
+                raise ValueError("A version age is a whole number of days")
+            return vector_optimize(mind, config, apply=bool(request.get("apply")), older_than_days=days)
+        return tick(mind, config, apply=bool(request.get("apply")))
+    if action in {"evidence-keys-backfill", "evidence-keys-verify"}:
+        # Operator actions. The backfill writes nothing without `--apply`, resumes from its cursor
+        # and can be rerun; the verification is read only and compares both directions row by row.
+        from .evidence_keys import BATCH, SAMPLE, backfill, verify
+        if action == "evidence-keys-verify":
+            return verify(mind, limit=request.get("limit", SAMPLE))
+        return backfill(mind, apply=bool(request.get("apply")), batch=request.get("batch", BATCH))
+    if action in {"desire-archive", "desire-unarchive"}:
+        # Operator actions. Neither writes without `--apply`, and the dry run asks for no flag at
+        # all: it reads what would move and what holds everything else, which is what makes it
+        # safe against a copy of a live store. The restore is never gated by the flag, because it
+        # is what runs before a rollback to a release that cannot see the archive.
+        from .desire_archive import DAYS, archive, restore
+        if action == "desire-unarchive":
+            return restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
+        return archive(mind, apply=bool(request.get("apply")), days=request.get("days", DAYS),
+                       limit=request.get("limit"))
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -366,9 +408,12 @@ def dispatch(config, action, request):
         if cadence.status()["state"] == "ready":
             wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"
             if not wake.exists():
-                temporary = wake.with_suffix(".tmp")
-                temporary.write_text(json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
-                temporary.replace(wake)
+                # `mind-exploration-request.tmp` was one name two reviews shared, and
+                # the host reads this file the moment it appears: a second review
+                # renaming the first one's half-written temporary put a truncated
+                # request in front of it. A name of its own per write, and the bytes
+                # reach the disk before the rename rather than after it.
+                atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
         return result
     if action == "daily":
         return DailyReview(mind).run(
@@ -406,12 +451,22 @@ def dispatch(config, action, request):
     if action == "settle":
         return mind.settle_contact(**request)
     if action == "recover":
-        # Startup must follow verified termination of the previous service/owned worker.
+        # A start-up used to assume the previous service was gone and interrupt every
+        # running exploration. It asks now: a row is interrupted only when its worker
+        # is provably gone — the pid is dead, the pid became some other process, or
+        # the budget it recorded has run out. Anything it cannot establish is left
+        # running, because a start-up that races a live exploration must lose.
         with engine.db.connect(write=True) as conn:
-            interrupted = conn.execute("SELECT data FROM mind_explorations WHERE scope=? AND state='running'", (mind.scope.key(),)).fetchall()
+            evidence = checks_enabled(conn, mind.scope.key())
+            running = conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state='running'", (mind.scope.key(),)).fetchall()
             current = mind._load(conn)
-            for row in interrupted:
+            interrupted, retained = [], []
+            for row in running:
                 data = json.loads(row["data"])
+                if evidence and record_alive(data.get("liveness")):
+                    retained.append(row["id"])
+                    continue
+                interrupted.append(row["id"])
                 desire = current["desires"].get(data.get("desire_id"))
                 if desire and desire["status"] == "in_progress":
                     desire.update(status="wanted", revision=desire["revision"]+1, updated_at=mind.clock())
@@ -420,10 +475,11 @@ def dispatch(config, action, request):
                 current["updated_at"] = mind.clock()
                 mind._save(conn, current)
                 mind._history(conn, "mind_" + digest([mind.scope.key(), current["revision"]])[:32], current, "exploration-recovery", {"interrupted": len(interrupted)})
-            conn.execute(
-                "UPDATE mind_explorations SET state='interrupted' WHERE scope=? AND state='running'",
-                (mind.scope.key(),),
-            )
+            for identifier in interrupted:
+                conn.execute(
+                    "UPDATE mind_explorations SET state='interrupted' WHERE id=? AND scope=? AND state='running'",
+                    (identifier, mind.scope.key()),
+                )
             attempts = conn.execute(
                 "SELECT id FROM mind_contacts WHERE scope=? AND state='drafting'",
                 (mind.scope.key(),),
@@ -434,18 +490,23 @@ def dispatch(config, action, request):
                 state="canceled",
                 reason="Host restarted before sending",
             )
-        return {"state": "recovered", "canceled_drafts": len(attempts)}
+        return {"state": "recovered", "canceled_drafts": len(attempts),
+                "interrupted_explorations": interrupted, "live_explorations": retained}
     raise ValueError("Unknown host action")
 
 
 MIGRATION_ACTION = "migrate-evidence-isolation"
+# The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
+# are told to write. Every one of them defaults to a dry run.
+APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
+                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    # Only `migrate-evidence-isolation` reads these; every other action takes its request on
-    # stdin as before. A dry run is the default, so nothing is written without `--apply`.
+    # Only the operator actions read these; every other action takes its request on stdin as
+    # before. A dry run is the default, so nothing is written without `--apply`.
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--undo", action="store_true")
@@ -456,14 +517,27 @@ def main():
     try:
         import sys
 
-        # An operator runs the migration from a terminal, with no request to pipe in.
+        config = load_config(args.config)
+        # Before the store opens and before the request is even read: the code this process
+        # would run has to be the code the deployment points at. A refusal is a SystemExit,
+        # which the handler below cannot turn into a result -- an ordinary exception here
+        # would be printed as one more failed action and the host would keep running the
+        # wrong copy, which is the exact failure this check exists for.
+        enforce_source_root(config.get("source_root"))
+        # And whether the next worker will have anything to start with. Only said,
+        # never acted on: this process is running, so a broken interpreter cannot
+        # hurt it, and refusing would remove the one path still able to report it.
+        warn_interpreter(config.get("python"))
+        # An operator runs these from a terminal, with no request to pipe in.
         raw = "" if sys.stdin.isatty() else sys.stdin.read()
         request = json.loads(raw) if raw.strip() else {}
-        if args.action == MIGRATION_ACTION:
+        if args.action in APPLY_ACTIONS:
             if args.apply and args.dry_run:
                 raise ValueError("Choose either a dry run or an apply")
-            request.update(apply=args.apply, undo=args.undo, output=args.output, registry=args.registry)
-        result = dispatch(load_config(args.config), args.action, request)
+            request["apply"] = args.apply
+        if args.action == MIGRATION_ACTION:
+            request.update(undo=args.undo, output=args.output, registry=args.registry)
+        result = dispatch(config, args.action, request)
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
         # Additive: the class stays the caller's contract, the taxonomy tells it

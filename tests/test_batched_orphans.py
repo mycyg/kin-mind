@@ -233,9 +233,8 @@ def test_recovery_completes_a_provably_committed_orphan_once(system):
     mind, _memory, source, _clock = system
     jobs, provider = Appraisals(mind), Provider(fail_times=1)
     child, parent, grand = nested(mind, jobs, source, provider)
-    with pytest.raises(ValueError, match="termination"):
-        recover_batched(mind, command_id="wp4-orphans", workers_stopped=False)
-    result = recover_batched(mind, command_id="wp4-orphans", workers_stopped=True)
+    # Nothing holds a lease here, so the boolean settles nothing either way.
+    result = recover_batched(mind, command_id="wp4-orphans", workers_stopped=False)
     assert result["completed"] == [child] and result["requeued"] == []
     assert result["rows"] == [{"id": child, "state": "complete", "reason": "settled-by-committed-ancestor",
                                "ancestor": grand, "event_id": jobs.status(grand)["result"]["event_id"]}]
@@ -253,9 +252,7 @@ def test_host_action_runs_the_batched_recovery_once(system):
     child, _parent, _grand = nested(mind, jobs, source, provider)
     config = {"root": str(mind.engine.db.root), "scope": mind.scope.model_dump(),
               "agent_version": "fixture-v1", "session_id": "fixture"}
-    with pytest.raises(ValueError, match="termination"):
-        dispatch(config, "recover-batched", {"command_id": "wp4-host", "workers_stopped": False})
-    result = dispatch(config, "recover-batched", {"command_id": "wp4-host", "workers_stopped": True})
+    result = dispatch(config, "recover-batched", {"command_id": "wp4-host", "workers_stopped": False})
     assert result["completed"] == [child]
     assert dispatch(config, "recover-batched", {"command_id": "wp4-host", "workers_stopped": True}) == result
 

@@ -3,8 +3,8 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {atomicJson} from './mobile-router.mjs';
 import {FINAL_NON_DELIVERY} from './work-lock-review.mjs';
+import {readThroughArchive} from './state-pruner.mjs';
 
-const read=file=>{try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return null;}};
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 /** Owner-bound evidence readers are injected by the private host. No model
@@ -13,7 +13,13 @@ const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('h
  * because the router starts before the reply guard does): a deferred reply is
  * a held manifest there, and the old `.pending.json` journal stays readable
  * for a host that runs with the manifest switched off. */
-export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null}) {
+export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null,archivedState={}}) {
+  // Every lookup here asks for one record by name, so each of them can afford to
+  // look in the archive after missing. The directory scan below deliberately does
+  // not: walking the archive as well would undo the reason anything was moved
+  // there. What that scan needs is protected by the reference set instead —
+  // a delivery this task still holds is a record the pruner never moves.
+  const read=file=>readThroughArchive(file,archivedState).value??null;
   const deferredFile=id=>path.join(deferredDirectory,createHash('sha256').update(id).digest('hex')+'.pending.json');
   const outbox=id=>read(path.join(outboxDirectory,id+'.json'));
   const deferredView=entry=>entry?{state:entry.state,request:entry.request,delivery:entry.delivery,ownerEpoch:entry.ownerEpoch}:null;

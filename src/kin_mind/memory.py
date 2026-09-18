@@ -90,6 +90,42 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # which is the previous behavior exactly. The last two carry no appraisal section.
             "trait_ledger": True, "behavior_chain": True, "expression_intent": True,
             "next_move_audit": True, "wish_version_review": True, "rest_review_window": True,
+            # Stage 5, read through autonomy_schema.optimized(). `evidence_key_index` off takes the
+            # evidence key table out of the dedupe guard and leaves only the scan of the snapshots,
+            # which is the previous behavior exactly. `history_legacy_guard` off stops paying for
+            # that scan, and belongs only to a store whose snapshots no longer carry the key: while
+            # both are on the guard refuses on either answer and records any disagreement.
+            "evidence_key_index": True, "history_legacy_guard": True,
+            # Stage 5: a recovery command asks the lease ledger and the process table instead of
+            # believing its caller's `workers_stopped`. Off restores that boolean as the only
+            # check, which is the stage-4 behaviour of all four recovery commands exactly.
+            "liveness_checks": True,
+            # Stage 5, and the one flag of it read through autonomy_schema.enabled(): off unless
+            # a store says otherwise. Every other flag here switches how something runs, so
+            # defaulting it on costs nothing but speed if it is wrong. This one switches what a
+            # revision is written as, and the release that deploys it has to stay a release the
+            # host can go back to — which it stops being the moment the first patch row is
+            # committed. So the code ships off, and turning it on is its own decision, taken once
+            # the history reads clean. Off, `_history` writes exactly the row it wrote before.
+            "history_patches": False,
+            # Stage 5, the other flag read through autonomy_schema.enabled(): off unless a store
+            # says otherwise, and even on it moves nothing without the explicit command. It
+            # decides what the document the model is shown contains, and the release before it
+            # cannot see an archived wish at all — so it deploys off, a dry run is read first, and
+            # `desire-unarchive` puts everything back before any rollback. Off, a finished wish
+            # stays in the document exactly as it does today.
+            "desire_archive": False,
+            # Stage 5 housekeeping, all three off and all three read through
+            # autonomy_schema.enabled(). `context_cache_sweep` is the only hard delete in the
+            # programme: it removes rows of `mind_context_cache`, which hold compressed context
+            # and nothing else, and a removed row costs one model call to build again. It stays
+            # off until an owner has been told exactly that and has agreed to it, and off the
+            # cache keeps every row and an erase leaves the compressed copies behind, as today.
+            # `metrics_name_ring` gives the telemetry table a ring per name instead of one
+            # shared ring; off is the shared ring, unchanged. `vector_optimize` only unlocks a
+            # command, which still refuses unless the store is provably quiet and still writes
+            # nothing without `--apply`.
+            "context_cache_sweep": False, "metrics_name_ring": False, "vector_optimize": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -206,7 +242,10 @@ class MemoryContinuity:
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
                     "chunked_reply_review", "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
-                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds"):
+                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
+                    "evidence_key_index", "history_legacy_guard", "liveness_checks",
+                    "history_patches", "desire_archive",
+                    "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

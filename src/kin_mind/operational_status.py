@@ -1,8 +1,10 @@
 """Read progress separately from liveness, without loading private messages."""
 import json
 
+from eventmem.core.integrity import verify_interpreter, verify_source_root
 
-def operational_status(mind):
+
+def operational_status(mind, config=None):
     with mind.engine.db.connect() as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         scope = mind.scope.key()
@@ -30,7 +32,18 @@ def operational_status(mind):
             autonomy["strength_observation_days"] = {r[0]: r[1] for r in conn.execute("SELECT version,COUNT(*) FROM mind_strength_observations WHERE scope=? GROUP BY version", (scope,))}
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
+    # Which copy of the source answered this call, and which other copies are still
+    # reachable on the path. The start-up check already refused a foreign one, so a
+    # `verified` verdict here is the boring case; what an operator comes for is
+    # `shadows`, which names a stale editable install before it ever wins a race.
+    source = verify_source_root((config or {}).get("source_root"))
+    # And whether the configuration still names an interpreter that exists. This one
+    # is about the next spawn, not about this process, and it says so itself: a host
+    # whose configured Python has been deleted keeps answering here while every
+    # worker it tries to start fails, which is exactly how that goes unnoticed.
+    source["interpreter"] = verify_interpreter((config or {}).get("python"))
     return {"checked_at": mind.clock(), "autonomy": autonomy, "model_lanes": lanes, "queues": [dict(r) for r in rows],
+            "source": source,
             "timing_contract": "oldest_available_unix is queue age, not current execution start; a missing attempt_started_at is unknown. Use lease_expires_unix for running-worker deadline.",
             "action": {"last_success": action.get("last_success"), "next_review": schedule["next_review"] if schedule else None,
                        "revision": schedule["revision"] if schedule else None, "model": action.get("receipt", {}).get("model")},

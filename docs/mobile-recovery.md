@@ -490,8 +490,8 @@ parent still carries the evidence of the children its quarantine released, so
 each of those children finds that evidence already integrated and completes
 without a model call of its own.
 
-`recover-batched` takes a `command_id` and `workers_stopped`, and is one-shot
-and idempotent for that command. It settles the jobs an interrupted parent left
+`recover-batched` takes a `command_id` and the legacy `workers_stopped`, and is
+one-shot and idempotent for that command. It settles the jobs an interrupted parent left
 batched. A child is completed only when a really committed ancestor evaluated
 its exact current source version: that ancestor's commit receipt and event must
 exist, and every source must still be current, lie inside the ancestor's
@@ -501,6 +501,51 @@ returns to the queue for a new judgment, with its reason recorded per row —
 `outside-ancestor-manifest` or `commit-receipt-missing`. The separate
 [`recover-history`](exploration-recovery-continuity.md) path remains the one
 that may carry verified replacement proposals for historical enrichment.
+
+## What proves the workers stopped
+
+A recovery command used to accept the caller's `workers_stopped` as the whole
+proof. The parameter is still taken, so no caller breaks, but it decides nothing:
+the lease ledger and the process table answer instead.
+
+`recover-operational` and `recover-batched` both release every `running`
+appraisal, so both refuse — `worker-lease-fresh` — while one of those rows still
+holds an unexpired lease. `plan-recover` returns only the executions whose
+`lease_until` has passed and reports the rest under `still_leased` instead of
+interrupting them. `recover-history` and `recover-appraisals` touch quarantined
+rows that no worker can hold, and so ask for nothing at all.
+
+A start-up `recover` no longer interrupts every running exploration. Each one
+records the pid that claimed it, that process's start time and a deadline of its
+own budget plus an hour of settlement, inside the row's existing `data`. The
+restart interrupts a row only when that pid is gone, when the number now belongs
+to a process that started at another time, or when the deadline has passed;
+anything it cannot establish — no `ps` to ask, a row written before this existed
+— stays running and is reported under `live_explorations`. Every check fails
+closed in that same direction: unreadable evidence means the work is alive.
+
+Compaction and other whole-store operations ask for more than that. Quiescence
+means all of: both pid files name a process that is gone or is not what it
+claimed; `status.json` is `stopped` or its heartbeat is over 45 s old; no
+unexpired lease in any of the five lease tables (`mind_appraisals`,
+`mind_plan_runs`, `mind_model_leases`, `mind_foreground_leases`, `jobs`); no live
+exploration; and a `BEGIN EXCLUSIVE` probe that succeeds. The probe is attempted
+only once every other clause is quiet, so a running host is recognised without
+ever reaching for the write lock. The pid and status files belong to the host, so
+their paths come from its configuration:
+
+```json
+"liveness": {
+  "processes": [{"name": "bridge", "pid_file": "PRIVATE_STATE/bridge.pid", "command": "service.mjs"},
+                {"name": "memory-service", "pid_file": "PRIVATE_ROOT/service.pid", "command": "memory_service.py"}],
+  "status_file": "PRIVATE_STATE/status.json"
+}
+```
+
+A path that is not configured is missing evidence, and missing evidence is never
+quiet. Setting `liveness_checks` to false restores the previous behaviour of all
+four commands exactly: the boolean alone decides, and every running exploration
+is interrupted at start-up.
 
 ## Visibility and deployment
 

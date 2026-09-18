@@ -38,7 +38,10 @@ from kin_mind.expression_intent import stale_reason, stored
 # Re-pinned once when every package landed together: WP6's three switch-less changes to the
 # shared prompt (the widened half-life range, the stated procedure premise, the owner named by
 # role) move every request that offers anything, this one included.
-INTENT_REQUEST = "5a44ca34576573cf7b29f920ab4ed2d9b1e3f6960fd77dfe008310f0968a40b1"
+# Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
+# already told it, that a host internal event is not evidence: production refused both
+# sections on two of its first four appraisals for citing exactly that.
+INTENT_REQUEST = "b07ac17a53e770ad41248938d0d6e1029c38012c5beab7742407fc9e6d682a34"
 # Every sentence the lookup table can say, and the whole compiled answer for a grid of states.
 # Re-pin only together with a deliberate change to the table itself.
 TABLE_ANSWERS = "80cee70dd5970f835d843603df5717ac226f84fcfedca89f72256d204fab23c3"

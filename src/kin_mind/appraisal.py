@@ -351,8 +351,8 @@ TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某�
 TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历、至少一条非自述的支持，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
 SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
-EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据，trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
-NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
+EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
+NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
                    "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
                    "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
@@ -744,7 +744,14 @@ def appraisal_context(context):
             projected["reason"] = desire.get("reason", "")
             projected["evidence_ids"] = [r["record_id"] for r in desire.get("evidence", [])]
         state["desires"].append(projected)
-    state["desire_window"] = {"included": len(chosen_desires), "total": len(all_desires), "remaining_in_storage": len(all_desires) - len(chosen_desires)}
+    # What has been moved out of the document is still stored and still this mind's: counted here
+    # so the window says how many wishes exist rather than how many are left in the document. The
+    # key is absent until something moves, so a store that never archives is projected as before.
+    moved = (original.get("desire_archive") or {}).get("count") or 0
+    state["desire_window"] = {"included": len(chosen_desires), "total": len(all_desires) + moved,
+                              "remaining_in_storage": len(all_desires) - len(chosen_desires) + moved}
+    if moved:
+        state["desire_window"]["archived"] = moved
     # Keep the decision window bounded; evidence dedup and revision history do
     # not depend on which concerns happen to fit this request.
     concerns = original.get("concerns", [])
@@ -2139,18 +2146,31 @@ class Appraisals:
                                   {"habits": lambda wish: wish.kind == "explore", "concerns": lambda wish: bool(wish.concern_ids)})
 
                     def apply_wishes():
+                        from .desire_archive import contents as archived_contents
+                        from .desire_archive import intent as archived_intent
+                        # Read once, and only where it is read at all: the content check reaches
+                        # finished wishes on a bootstrap and nowhere else.
+                        made = (archived_contents(conn, self.mind.scope.key())
+                                if data.get("stimulus") == "bootstrap" else set())
                         for index, wish in wishes:
                             if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
                                 wish = wish.model_copy(update={"exploration_id": primary_result})
-                            if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
+                            # Both of these read the finished wishes as well as the live ones, so
+                            # both ask the archive: an intent that moved is still this decision's
+                            # intent, and a wish a bootstrap already made is still made.
+                            if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
                                 and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
-                                for d in state["desires"].values()):
+                                for d in state["desires"].values())
+                                or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
+                                                   (state.get("exploration_decisions", {}).get(wish.exploration_id) or {}).get("revision"))):
                                 continue
                             if any(
                                 d["content"] == wish.content
                                 and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
                                 for d in state["desires"].values()
                             ):
+                                continue
+                            if wish.content in made:
                                 continue
                             changed = self.mind._apply_desire(
                                 conn,

@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {writeJsonAtomic,createJsonExclusive,readJsonFile,quarantineFile} from './atomic-json.mjs';
+import {writeJsonAtomic,createJsonExclusive,createFileExclusive,readJsonFile,quarantineFile} from './atomic-json.mjs';
+import {readThroughArchive} from './state-pruner.mjs';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 /** The retry ledger keeps one file per event that is still waiting, and never more
  * than this many. It carries IDs, counts and times only — never message text. */
@@ -14,15 +15,19 @@ function canonical(value) {
   return value;
 }
 export class MemoryEventJournal {
-  constructor({directory,call,clock=Date.now}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;}
+  constructor({directory,call,clock=Date.now,archivedState={}}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;this.archivedState=archivedState;}
   append(event) {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
     const file=path.join(this.directory,hash(event.id)+'.json'),body=JSON.stringify(canonical(event));
     const receipt=path.join(this.directory,'receipts',hash(event.id)+'.json');
-    if(fs.existsSync(receipt)) {
+    // A receipt that was archived still says this event was ingested. Missing it
+    // would ingest the same delivery a second time, which is the one thing the
+    // receipt exists to stop, so the miss looks in the archive before giving up.
+    const recorded=readThroughArchive(receipt,this.archivedState);
+    if(recorded.state!=='missing') {
       // An unreadable receipt is a conflict, never a reason to ingest the event twice.
-      if(readJsonFile(receipt).value?.digest!==hash(body))throw Error('Memory event ID conflicts with committed contents');
+      if(recorded.value?.digest!==hash(body))throw Error('Memory event ID conflicts with committed contents');
       return {state:'recorded',id:event.id};
     }
     if(fs.existsSync(file)) {
@@ -65,7 +70,11 @@ export class MemoryEventJournal {
     const file=path.join(this.directory,hash(event.id)+'.json'),directory=path.join(this.directory,'receipts');
     const body=JSON.stringify(canonical(event));
     if(fs.existsSync(file)&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event changed before acknowledgement');
-    writeJsonAtomic(path.join(directory,path.basename(file)),{id:event.id,digest:hash(body)},{previous:false});
+    // When this was settled, so that the receipt can later be told how old it is
+    // without anyone reading the file's own timestamps — those are rewritten by
+    // reconciliation and say nothing true about the record. Earlier code reads
+    // only `digest` here, so the extra key costs a rollback nothing.
+    writeJsonAtomic(path.join(directory,path.basename(file)),{id:event.id,digest:hash(body),at:new Date(this.clock()).toISOString()},{previous:false});
     fs.rmSync(file,{force:true});
     for(const suffix of ['','.prev'])fs.rmSync(this.errorFile(path.basename(file))+suffix,{force:true});
   }
@@ -124,7 +133,9 @@ export function snapshotArtifact(file,directory) {
   const bytes=fs.readFileSync(file),sha256=hash(bytes);
   fs.mkdirSync(directory,{recursive:true,mode:0o700});
   const target=path.join(directory,sha256);
-  try{fs.writeFileSync(target,bytes,{flag:'wx',mode:0o600});}catch(error){if(error.code!=='EEXIST')throw error;}
+  // The snapshot is the proof that these were the bytes. It is written whole or
+  // not at all, because a half-written one keeps a name that promises the rest.
+  createFileExclusive(target,bytes);
   return {path:target,observed_path:file,sha256,name:path.basename(file),bytes:bytes.length};
 }
 /** Reconcile the local outbox/journal gap; never call a transport API here. */

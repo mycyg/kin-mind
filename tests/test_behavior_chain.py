@@ -59,7 +59,10 @@ CHAIN_REQUEST = "f377b871ebc42c040b2927a9ca86a3fdcc937af44e52b434ac3dd0bb322562b
 # of each audited section — the trait ledger's two, the chain's two, the expression intent and the
 # next move. Nothing in production was ever asked a placeholder, so no check made under this
 # contract meant anything different before these paragraphs arrived: a re-pin, not a new contract.
-PINNED_PROMPTS = {"behavior-1": "754302428177e17e723fbb53ce5e345ccdb909b0ff43900f28c5476561e2228e"}
+# Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
+# already told it, that a host internal event is not evidence: production refused both
+# sections on two of its first four appraisals for citing exactly that.
+PINNED_PROMPTS = {"behavior-1": "fd57ba63347ee125dacb770a3a2fad0577174d037977794da5d90491fa6e9e9d"}
 # How to read the digest a change produced, in one command from the repository root:
 REPIN_COMMAND = ("uv run --extra dev python -c "
                  "'from kin_mind.compat import prompt_digest; print(prompt_digest())'")

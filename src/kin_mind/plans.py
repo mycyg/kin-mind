@@ -14,6 +14,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 
+from . import liveness
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled, optimized
 from .state import project, timestamp
@@ -681,11 +682,23 @@ class AutonomousPlans:
             return run
 
     def recover(self, *, workers_stopped=False):
-        if not workers_stopped:
+        """Return the executions a stopped host left running, and only those.
+
+        The caller's `workers_stopped` is kept for the hosts that still send it and
+        is no longer what decides: an execution whose lease has not expired is held
+        by an executor that is still working, and interrupting it here would take a
+        step away from a run that is about to settle it. Such a row is reported
+        instead, so the operator sees why it stayed."""
+        with self.engine.db.connect() as conn:
+            evidence = liveness.checks_enabled(conn, self.scope)
+        if not evidence and not workers_stopped:
             raise Conflict("Recovery requires verified termination of previous executors")
-        recovered = []
+        recovered, held = [], []
         with self.engine.db.connect(write=True) as conn:
             for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND state='running'", (self.scope,)).fetchall():
+                if evidence and row["lease_until"] > time.time():
+                    held.append({"id": row["id"], "lease_until": row["lease_until"]})
+                    continue
                 run = json.loads(row["data"])
                 # Contact delivery may have happened before the crash. Preserve
                 # uncertainty until the existing transport reconciles receipts.
@@ -699,7 +712,7 @@ class AutonomousPlans:
                 plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
                 self._save(conn, plan, "recover:" + row["id"])
                 recovered.append(row["id"])
-        return {"recovered": recovered}
+        return {"recovered": recovered, "still_leased": held}
 
     def migrate_desires(self):
         """Preserve existing identities; migration grants no execution decision."""
@@ -742,7 +755,11 @@ class AutonomousPlans:
                             or not self.mind._fresh(conn, plan["evidence"] + decision["evidence"])):
                             continue
                     did = step.get("desire_id") or (plan.get("desire_id") if len(plan["steps"]) == 1 else None)
-                    desire = state["desires"].get(did)
+                    # Wherever that wish now lives. A finished one may have been moved out of the
+                    # document, and a miss here would not skip it — the identifier is derived from
+                    # this decision, so this would make the same wish over again, with the contact
+                    # it already had still to come.
+                    desire = self.mind._desire(conn, state, did) if did else None
                     if not ready and not desire:
                         continue
                     if desire and desire.get("plan_decision_id") == step["decision"]["id"]:
@@ -776,6 +793,12 @@ class AutonomousPlans:
                 self.mind._retarget(conn, state, self.mind.clock())
                 state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
                 self.mind._save(conn, state)
+                # A revision with no row of its own is a hole in the history: whoever later asks
+                # what the state was just before some event has to read across it and guess, and
+                # the reversion path used to fail on the guess rather than on the gap. This bump
+                # is the host's own, so it gets the host's own event, named after what it did.
+                self.mind._history(conn, "mind_" + digest([self.scope, "plan-wish-sync", state["revision"]])[:32],
+                                   state, "plan-wish-sync", {"desire_ids": created})
         return created
 
     def linked_ready(self, conn, desire):

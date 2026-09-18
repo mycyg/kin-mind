@@ -339,7 +339,9 @@ def test_section_failing_after_it_changed_state_leaves_no_half_applied_wish(env,
     assert env.job(job)["rejected_sections"] == [{"section": "wishes", "code": "conflict", "message": "This result has no current decision to communicate"}]
     state = saved_state(env)
     assert state["desires"] == {} and env.mind.read()["desires"] == [] and state["dimensions"]["mood"]["score"] == 64
-    snapshot = json.loads(env.rows("SELECT data FROM mind_events ORDER BY revision DESC LIMIT 1")[0]["data"])["snapshot"]
+    # Through the history layer, not the column: what a row stores is the layer's business now,
+    # and the audit record this asserts about is the same one either way.
+    snapshot = env.mind.read(history=1)["history"][0]["snapshot"]
     assert snapshot["desires"] == {} and snapshot["revision"] == state["revision"]
     # Nothing rests on wishes, so nothing is asked again.
     assert children(env, job) == []
