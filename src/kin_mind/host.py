@@ -118,8 +118,11 @@ def dispatch(config, action, request):
         # Operator actions on the stored history itself. Each one registers with the history
         # registry instead of adding a branch here, so a package that ships a new command does
         # not have to touch this dispatch to be reachable.
+        # The configuration travels with them because compaction has to prove nothing is running,
+        # and where the host keeps its pid files and its status file is not something the store
+        # knows. Commands that do not need it are not given it.
         from .history_admin import dispatch as history_command
-        return history_command(mind, action, request)
+        return history_command(mind, action, request, config)
     if action == "appraisal-attempts":
         # Read-only accounting: outcomes, static codes, digests and usage. No private text.
         from .attempts import read as read_attempts
@@ -495,8 +498,8 @@ def dispatch(config, action, request):
 MIGRATION_ACTION = "migrate-evidence-isolation"
 # The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
 # are told to write. Every one of them defaults to a dry run.
-APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive")
-APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "maintenance-tick", "vector-optimize")
+APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
+                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore")
 
 
 def main():

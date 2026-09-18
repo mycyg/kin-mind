@@ -124,6 +124,30 @@ A row is kept whole rather than stored as a patch when its kind is `initialize` 
 
 While compaction owns the rows, `meta.history_compaction_active` is set and no revision can be written at all: the commit is refused with `history-compaction-active` and nothing lands, because a row written in the middle of a rewrite is a row the archive does not hold.
 
+## Compacting the history already written
+
+Turning the flag on changes what the next revision is stored as. It does nothing to the rows already there, and in a store that has been running a while those are nearly all of them. `history-compact` rewrites them: the `data` column becomes what changed since the row before instead of a whole document, and nothing else about the row moves. Every row stays, every column stays, and `id`, `scope`, `revision`, `kind` and `occurred_at` are not written at all — four of the readers of this table want the columns and never look inside `data`.
+
+This is the only command in the stage that touches data the store already holds, so the archive comes first. Before a row is rewritten its bytes are copied verbatim into a separate database, `archive/mind-events-v1-<date>.sqlite3` beside the store at mode 0600, fsynced, then read back on a fresh connection and compared column by column with what is still in the store. Only then is the row touched, and the rewrite, the rebuild that checks it and the cursor that records it are one transaction. **Nothing here ever deletes the archive**, on success or on failure.
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG history-compact
+python -m kin_mind.host --config PRIVATE_CONFIG history-compact '{"apply":true}'
+python -m kin_mind.host --config PRIVATE_CONFIG history-compact-verify
+```
+
+Without `apply` it writes nothing at all: it checks every precondition and reports each verdict rather than stopping at the first, plans what each row would become, and computes one batch of real patches to say what the saving would be. With `apply` a failed precondition is a refusal that has written nothing.
+
+Four preconditions, every run, none of them skippable. The store must be **quiet** by the whole proof in the liveness section — both pid files naming processes that are gone or are something else, a host status that is stopped or has not beaten for forty-five seconds, no fresh lease in any of the five lease tables, no live exploration, and an exclusive lock available. There must be a **backup** of the database that can be shown to hold the same history rows between the same first and last revision as the store; one is taken beside the store, named for the history it is a copy of, unless a matching one is already there or the operator names a file, and a named file that is of something else is refused rather than replaced. There must be free **disk** for that backup, the archive and working room. And `meta.history_compaction_active` is set before the first batch, so the writer refuses revisions while this owns the rows.
+
+That marker is **not self-clearing**. A run that stops part way leaves it set and the store closed to new revisions until someone decides: run `history-compact` again, which carries on from the cursor, or `history-restore`, which puts the archived rows back and opens the store again. The cost of that is a host that stays stopped; the cost of clearing it would be a revision written into a half-rewritten history.
+
+Rows that keep their whole document are the first row, every fiftieth row, every `evolution` row and the row before it, and the row under any row that was already a patch — the last of those is what keeps the depth recorded in an existing patch true, since it recorded the chain under it as nothing. Two more are the command's own and can only keep more rows whole: a patch that would not be smaller than the document it replaces, and a chain that would reach the writer's own bound. The report counts each reason separately.
+
+`history-compact-verify` is the check the rewrite is allowed to have happened for, and it is the one to read. `history-verify` asks whether a row still hashes to what it claims; after a compaction that is two halves of the same pass agreeing with each other, which is why its report now carries `compacted_through` and says so. `history-compact-verify` rebuilds each revision from the store and compares it with the **archived original bytes**, which were copied out before the first row moved. `deep` rebuilds each revision from its own nearest whole document instead of carrying the state forward: the same answer reached independently, much slower, and worth one run on a copy before a release.
+
+`history-restore` writes the archived originals back row by row. It needs the same quiet, it compares the columns beside `data` and refuses if one of them has moved, it leaves the archive exactly where it is, and it opens the store again.
+
 ## Wish archive
 
 The state document carries every wish that was ever made, and it is written again on every
