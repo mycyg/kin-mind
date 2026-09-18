@@ -41,12 +41,15 @@ TTL_SECONDS = 300
 MAX_VALIDITY_SECONDS = 86400
 # Bounded so one wide context cannot grow the dependency index without limit.
 MAX_DEPENDENCIES = 500
-# Keys whose values are identifiers of what a request rested on, never payload text.
+# Keys whose values are identifiers of what a request rested on, never payload text. A trait is one
+# of them: a verdict reached while the shared history carried a trait rested on that trait, and one
+# owner sentence can end it.
 DEPENDENCY_KEYS = frozenset({"source_id", "source_ids", "record_id", "record_ids",
-                             "evidence_ids", "node_id", "node_ids", "dependency_ids"})
+                             "evidence_ids", "node_id", "node_ids", "dependency_ids",
+                             "trait_id", "trait_ids"})
 # Containers whose items carry their own `id`, in the rendered appraisal/review contexts.
 DEPENDENCY_ITEMS = frozenset({"new_evidence", "sources", "graph_candidates", "records",
-                              "verified_artifacts", "items"})
+                              "verified_artifacts", "items", "established", "candidate"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_judgment_cache(

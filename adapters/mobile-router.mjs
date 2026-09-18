@@ -4,16 +4,33 @@ import {createHash} from 'node:crypto';
 import {writeJsonAtomic,readJsonFile,loadJson} from './atomic-json.mjs';
 import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
+import {messageIntents} from './mobile-reviewer.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
 export const ROUTER_MODELS = Object.freeze({chat:'deepseek-flash',work:'gpt-6-astra'});
 const LEDGER_TAIL_BYTES=1024*1024;
+/** The longest a second attempt at one classification may wait. */
+export const CLASSIFY_RETRY_MAX_MS=45000;
 export const NOTICE_SUPPRESSED='restart-restored-known-model';
 export function recentConversation(items) {
   const counts={user:0,assistant:0};
   return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
+}
+/** The classifier's own answer, told apart from the host's literal commands. */
+export const CLASSIFIER_DECISION='deepseek-input-classification';
+export const ATTACHMENT_KINDS=Object.freeze(['file','image','video','voice','other']);
+const label=(value,max)=>typeof value==='string'&&value.trim().length>0&&!/[\p{Cc}]/u.test(value)?value.trim().slice(0,max):null;
+/** What a classifier may learn about an attachment: kind, type, name, size. Whatever else
+ * the host carries about it — a path, a URL, a key, the bytes themselves — is built out of
+ * the request here, so no caller can widen it by passing a richer object. */
+export function attachmentMetadata(list) {
+  return (Array.isArray(list)?list:[]).slice(0,24).map(item=>({
+    kind:ATTACHMENT_KINDS.includes(item?.kind)?item.kind:'other',
+    ...(label(item?.mimeType,100)?{mimeType:label(item.mimeType,100)}:{}),
+    ...(label(item?.name,120)?{name:label(item.name,120)}:{}),
+    ...(Number.isSafeInteger(item?.bytes)&&item.bytes>=0?{bytes:item.bytes}:{})}));
 }
 export function modeCommand(text) {
   const value=text.trim().replace(/[~～!！。\s]+$/u,'');
@@ -45,9 +62,13 @@ export function loadState(file,{schema=1,validate=()=>true,now=()=>Date.now()}={
 export class MobileRouter {
   /** `replyTail` is the host's reply-tail port (`pending`, `decided`, `missed`, `stopped`), all
    * optional. It lets the unsent rest of an interrupted reply ride on the routing call this
-   * router makes anyway; without it nothing here changes. */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail});
+   * router makes anyway; without it nothing here changes.
+   * `classifyIntents` lets that same call carry what the owner wants done with the message —
+   * whether to stop the running task, whether a file was asked for, what they call themselves
+   * — and lets an owner message with attachments be classified instead of assumed to be work.
+   * Left off, every request and every record is what it was before intents existed. */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,classifyRetry=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,classifyRetry});
     this.tail=Promise.resolve();this.inflight=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
@@ -156,12 +177,14 @@ export class MobileRouter {
         if(previous.state==='failed-before-submit'){previous.state='selected';this.save('input-preparation-retry',{id:input.id});}
         return clone(previous);
       }
+      // The literal stop is read before any model is asked, and answers on its own when none can be.
       const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
       const owner=!input.kind||input.kind==='owner';
+      const intents=this.classifyIntents&&owner;
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'};
+      let decision,reason,classifierUnconfirmed=false,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
       // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
       const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
       let tail=null,offered=null,classified=false;
@@ -172,7 +195,9 @@ export class MobileRouter {
       }
       else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
-      } else if(input.attachments?.length||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
+      // An owner message with attachments used to be work without anyone reading it. With
+      // intents on it is classified like any other, with the attachment metadata in view.
+      } else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
         decision='work';reason='work-input';
       } else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
       else {
@@ -181,16 +206,42 @@ export class MobileRouter {
         classified=true;
         offered=owner?await port('pending',{id:input.id,text:input.text}):null;
         if(!offered?.reply)offered=null;
-        try {
+        const files=intents?attachmentMetadata(input.attachments):[];
+        const ask=async wait=>{
           let timer;
-          const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),this.state.config.classifierTimeoutMs);});
-          let result;
-          try {result=await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:this.state.config.classifierTimeoutMs,...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+          const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
+          try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
           finally {clearTimeout(timer);}
+        };
+        try {
+          let result;
+          const patience=this.state.config.classifierTimeoutMs;
+          try {result=await ask(patience);}
+          catch(error) {
+            // The host may say that this one message is worth asking twice, and waiting
+            // longer for the answer. That is all it may say: a second attempt is never a
+            // route, never an intent, and never granted more than once.
+            if(this.classifyRetry?.({text:input.text,attachments:files})!==true)throw error;
+            this.save('classification-retried',{id:input.id});
+            result=await ask(Math.min(patience*2,CLASSIFY_RETRY_MAX_MS));
+          }
           if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
           if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
           decision=result.route;reason=result.reason?.slice(0,200)??'classification';
-          if(['light','deep'].includes(result.recall?.mode))recall={...result.recall,decisionSource:'deepseek-input-classification'};
+          // Only the bounded reading of the intents is kept, and only when they were asked for.
+          const asked=intents?messageIntents(result):{};
+          if(['light','deep'].includes(result.recall?.mode)) {
+            const {owner_words:unbounded,...rest}=result.recall;
+            recall={...rest,...(asked.ownerWords?{owner_words:asked.ownerWords}:{}),decisionSource:CLASSIFIER_DECISION};
+          }
+          if(asked.fileSend)fileSend={...asked.fileSend,decisionSource:CLASSIFIER_DECISION,at:this.now()};
+          // A natural-language stop is the literal command's equal, and only that: the owner,
+          // an open task, and a classifier that actually answered. It is never inferred here.
+          if(asked.stop==='current_task'&&this.tasks().length) {
+            const taskIds=this.tasks().map(task=>task.id);
+            for(const task of this.tasks())task.cancelRequested=true;
+            stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
+          }
           if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
             :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
         } catch {
@@ -207,7 +258,7 @@ export class MobileRouter {
       const task=decision==='work'&&!command&&(intent==='work'&&!classifierUnconfirmed||!this.currentTask()&&intent==='work')?this.addTask(input):command?null:this.currentTask();
       if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
       if(task&&classifierUnconfirmed&&task.inputIds.includes(input.id))task.provisional=true;
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{})};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner') {
         this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});

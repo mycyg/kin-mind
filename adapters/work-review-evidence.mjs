@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {atomicJson} from './mobile-router.mjs';
+import {FINAL_NON_DELIVERY} from './work-lock-review.mjs';
 
 const read=file=>{try{return JSON.parse(fs.readFileSync(file,'utf8'));}catch{return null;}};
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -23,6 +24,8 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
   // Changes when anything about the group's bodies or what was sent of it changes; bookkeeping (retry times, revisions) does not count.
   const manifestProof=manifest=>digest({group:manifest.group_id,ownerEpoch:manifest.ownerEpoch,bubbles:manifest.bubbles.map(b=>[b.bubble_id,b.draft_id,b.body_sha256,b.state,b.fragments.map(f=>f.state)])});
   const accepted=bubble=>bubble.fragments.filter(f=>f.state==='accepted'&&f.receipt?.messageId).map(f=>String(f.receipt.messageId));
+  /** A transport's own reason travels as a static code, never as a message. */
+  const code=(value,fallback)=>/^[a-z0-9-]{1,64}$/.test(value??'')?value:fallback;
   async function collect(snapshot) {
     const ids=[...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])];
     const allMessages=fs.existsSync(outboxDirectory)?fs.readdirSync(outboxDirectory).filter(f=>f.endsWith('.json')).map(f=>read(path.join(outboxDirectory,f))).filter(Boolean):[];
@@ -77,6 +80,8 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
         // "unconfirmed" for ever and the work lock is never released on its merits.
         const filed=!message&&!found&&entry?.state!=='pending'?store()?.findBubble(id,{settled:true})??null:null;
         const gone=[found,filed].find(m=>m?.bubble.state==='canceled');
+        // Refused by the platform, or given up on by the transport: a final non-delivery.
+        const refused=[found,filed].find(m=>FINAL_NON_DELIVERY.includes(m?.bubble.state));
         const request=found?found.bubble.request:entry?.request,inputIndex=ids.indexOf(request?.reply_id);
         const ordinary=found?deferred(found.manifest)&&found.manifest.kind==='reply'&&found.manifest.taskId===snapshot.task.id      // a manifest bubble is text by construction
           :entry?.state==='pending'&&entry.delivery?.id===id&&entry.delivery?.taskId===snapshot.task.id&&entry.delivery.kind==='reply'&&!entry.delivery.media&&!entry.delivery.artifact;
@@ -88,9 +93,15 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
           outputs.push({id,text:found.bubble.text,file:null,receivedByServer:true});
         } else if(gone&&!cancellable) {
           // Retired before it began: settled, and never an obligation to deliver again.
-          const reason=/^[a-z0-9-]{1,64}$/.test(gone.bubble.reason??gone.manifest.retired?.reason??'')?gone.bubble.reason??gone.manifest.retired.reason:'retired';
+          const reason=code(gone.bubble.reason??gone.manifest.retired?.reason,'retired');
           receipts[id]={state:'retired',reason,source:'transport-manifest'};
           outputs.push({id,retired:true,reason,receivedByServer:false});
+        } else if(refused&&!cancellable) {
+          // This bubble will never arrive. The review is told so, and told why, instead of
+          // seeing an unconfirmed delivery it can only answer by keeping the lock.
+          const reason=code(refused.bubble.reason,'transport-'+refused.bubble.state);
+          receipts[id]={state:refused.bubble.state,reason,source:'transport-manifest'};
+          outputs.push({id,undelivered:true,reason,receivedByServer:false});
         } else receipts[id]={state:cancellable?'not-submitted':message?.state??'unconfirmed',messageId:message?.messageId};
         if(cancellable) {
           const value={id,replyId:request.reply_id,text:request.text,reason:'A later authenticated input superseded this unsent ordinary reply candidate; classify its actual content before discarding.'};

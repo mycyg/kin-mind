@@ -511,8 +511,8 @@ def test_a_dropped_memory_item_is_recorded_beside_a_refused_section_and_asked_fo
     sid, outside = system.source("owner-asks-to-pause-exploring"), system.source("never-shown")
     jobs = Appraisals(system.mind)
     job_id = jobs.enqueue([sid], "fixture-v1")["id"]
-    proposal = Appraisal(reason="She wants fewer explorations", values={"mood": 70},
-        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[sid], reason="She asked to pause", expected_revision=7),
+    proposal = Appraisal(reason="The owner wants fewer explorations", values={"mood": 70},
+        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[sid], reason="The owner asked to pause", expected_revision=7),
         memory=MemoryAssessment(notes=[note("kept", [sid]), note("blocked", [sid, outside])]))
     result = jobs.run_one(Scripted(interaction_batch=proposal), job_id=job_id)
     assert result["state"] == "complete"

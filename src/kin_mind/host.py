@@ -296,6 +296,37 @@ def dispatch(config, action, request):
             "exploration_cadence": cadence.status(),
             "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
         }
+    if action in {"traits", "trait-revoke", "traits-migrate", "trait-wish-review"}:
+        from .traits import Traits
+        ledger = Traits(mind)
+        if action == "traits":
+            return ledger.read(request.get("identifier"), limit=request.get("limit", 12), history=request.get("history", False))
+        if action == "trait-revoke":
+            # An owner correction that must not wait for an appraisal. The cited source decides
+            # whether it is recorded as the owner's own correction or as the operator's.
+            return ledger.revoke(request)
+        if action == "trait-wish-review":
+            # What a moved trait left not ready, and then what was done about it: read first, so the
+            # answer says what it found as well as what it moved. Without `apply` it writes nothing;
+            # with it those wishes go to the existing `waiting` state — which is what an older
+            # release has to see before a rollback, because to it they would still look ready.
+            from .trait_refs import review_view, settle_wishes
+            return {**review_view(mind), **settle_wishes(mind, apply=bool(request.get("apply")))}
+        # Idempotent, and a dry run writes nothing.
+        return ledger.migrate(apply=bool(request.get("apply")))
+    if action == "configure-behavior-models":
+        # The operator's own route, for the release step: the model this host answers with is the
+        # one thing about a behavioral check that the store cannot read for itself.
+        from .compat import BEHAVIOR_MODELS, CHAT_FIELDS
+        values = {field: request.get(field) for field in CHAT_FIELDS}
+        if any(not isinstance(v, str) or not v.strip() or len(v) > 200 for v in values.values()):
+            raise ValueError("Behavior models need a chat model id and an effort, as short strings")
+        return {"state": "registered", BEHAVIOR_MODELS: engine.settings(
+            BEHAVIOR_MODELS, {field: value.strip() for field, value in values.items()})}
+    if action == "next-moves":
+        # Read only: what each appraisal said it was doing, and what the host found behind it.
+        from .next_move import recent
+        return recent(mind, limit=request.get("limit", 20))
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":

@@ -368,10 +368,19 @@ def test_personality_prospective_limits_history_and_reversion(setup):
         PredictionInput,
         SelfKnowledge,
     )
+    from kin_mind.compat import stamp as compatibility
+    from kin_mind.memory import MemoryContinuity
     from kin_mind.state import Evolution
 
     mind, source, clock = setup
+    # The trait snapshot this event writes is the older writer: while the ledger's switch is on the
+    # ledger is the only one, and an evolution carrying traits is refused.
+    MemoryContinuity(mind).configure({"trait_ledger": False})
     sk = SelfKnowledge(mind.engine, mind.scope)
+    # An evolution no longer asks the chain for an equal agent_version: each entry carries what the
+    # host says decides behavior, and the commit compares that.
+    with mind.engine.db.connect() as conn:
+        compat = compatibility(mind, conn)
 
     # The self-knowledge layer has an independent wall clock; evidence must precede calls.
     def src(key):
@@ -388,7 +397,8 @@ def test_personality_prospective_limits_history_and_reversion(setup):
             agent_version="synthetic-v1",
             claim="I prefer checking a primary source",
             evidence_ids=refs,
-        )
+        ),
+        compat=compat,
     )
     prediction = sk.predict(
         PredictionInput(
@@ -399,7 +409,8 @@ def test_personality_prospective_limits_history_and_reversion(setup):
             behavior="Check a primary source",
             information="The next query has not been answered",
             probability=0.8,
-        )
+        ),
+        compat=compat,
     )
     outcome = src("later-observed-behavior")
     assessment = sk.assess(
@@ -410,7 +421,8 @@ def test_personality_prospective_limits_history_and_reversion(setup):
             outcome=True,
             evidence_ids=[outcome],
             note="Observed source check",
-        )
+        ),
+        compat=compat,
     )
     clock[0] = datetime.now(timezone.utc)
     proposal = Evolution(

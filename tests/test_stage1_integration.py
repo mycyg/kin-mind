@@ -171,7 +171,7 @@ def test_a_retry_after_a_whole_commit_failure_tells_the_model_what_was_refused(e
     owner = env.source("owner-asks-to-pause-exploring")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
     stale = HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner],
-                          reason="She asked", expected_revision=7)
+                          reason="The owner asked", expected_revision=7)
     result, _ = run(env, lambda shown, context: Appraisal(reason="A refused preference, then a fault in the event",
         values={"mood": 99}, habits=stale,
         sharing=[SharingDecision(exploration_id="explore_missing", decision="keep", reason="Keep")]), job_id=job)

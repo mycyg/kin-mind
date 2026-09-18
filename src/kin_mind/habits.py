@@ -9,6 +9,9 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.idempotency import record, revision_id, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
+from eventmem.core.read_policy import ReadPolicy
+
+from .evidence_classes import owner_statement
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_conversation_habits(scope TEXT PRIMARY KEY,revision INTEGER NOT NULL,data TEXT NOT NULL);
@@ -53,7 +56,10 @@ class ConversationHabits:
         command id comes from a client, does not."""
         from .autonomy_schema import optimized
         proof = self.mind._evidence(conn, proposal.evidence_ids)
-        if not proof or not all(r["authority"] == "explicit" for r in proof) or not self.mind._fresh(conn, proof):
+        # `explicit` was never the same thing as "the owner said so": setup and persona texts carry it
+        # too. One shared predicate decides, so a configuration request cannot become a preference.
+        policy = ReadPolicy.load(self.engine, self.scope, conn=conn)
+        if not proof or not all(owner_statement(self.engine._get(conn, r["record_id"]), policy, sources=[r]) for r in proof) or not self.mind._fresh(conn, proof):
             raise Conflict("Habit changes require current explicit owner evidence")
         if allowed is not None and any(r["source_id"] not in allowed and r["record_id"] not in allowed for r in proof):
             raise Conflict("Habit change cites evidence outside this evaluation")

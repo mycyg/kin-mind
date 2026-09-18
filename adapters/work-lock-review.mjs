@@ -8,6 +8,9 @@ const copy=value=>structuredClone(value);
 const fingerprint=(router,task)=>hash({reviewPolicyVersion:4,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
 
 export const REVIEW_LIMITS=Object.freeze({bytes:64000,items:128,chunkItems:48,maxChunks:8,excerpt:4000,minExcerpt:250});
+/** Transport outcomes that will never become a delivery. They are reported to the review
+ * as what they are, instead of holding the work lock open for a receipt that cannot come. */
+export const FINAL_NON_DELIVERY=Object.freeze(['rejected','undeliverable']);
 const DISPOSITIONS=['keep','complete','not_a_task'];
 const EXCERPT_GAP='\n[…]\n';
 const malformed=d=>!DISPOSITIONS.includes(d?.disposition)||!d.reason?.trim()||!Array.isArray(d.evidenceIds)||!d.evidenceIds.length||!Array.isArray(d.remaining)||!Array.isArray(d.discardDraftIds);
@@ -70,8 +73,8 @@ export function mergeDecisions(list) {
 /** DeepSeek supplies the semantic judgment; the host owns execution and receipts.
  * Reviews run outside the router mutex and never take over a native user turn. */
 export class WorkLockReview {
-  constructor({router,file,collect,review,cancelDeferred=async()=>{throw Error('Deferred cancellation unavailable');},now=()=>Date.now(),retryMs=20*60000,skipRetryMs=5*60000,reviewLimits={}}) {
-    Object.assign(this,{router,file,collect,review,cancelDeferred,now,retryMs,skipRetryMs});
+  constructor({router,file,collect,review,cancelDeferred=async()=>{throw Error('Deferred cancellation unavailable');},now=()=>Date.now(),retryMs=20*60000,retryMaxMs=8*3600000,skipRetryMs=5*60000,reviewLimits={}}) {
+    Object.assign(this,{router,file,collect,review,cancelDeferred,now,retryMs,retryMaxMs,skipRetryMs});
     this.reviewLimits={...REVIEW_LIMITS,...reviewLimits};
     router.workReviewerEnabled=true;
     this.running=false;this.closed=false;
@@ -82,6 +85,11 @@ export class WorkLockReview {
     for(const attempt of Object.values(this.state.attempts))if(attempt.state==='reviewing'){attempt.state='interrupted';attempt.retryAt=now();}
   }
   close(){this.closed=true;}
+  /** The same question, on a task that has not changed, is not worth paying for again as
+   * soon: each repeat of an unchanged verdict waits twice as long, up to the cap. The
+   * attempt is keyed by the task fingerprint, so any change to the task starts at zero
+   * again. When the lock is released is not touched by this — only when it is asked. */
+  keptRetryAt(repeats){return this.now()+Math.min(this.retryMaxMs,this.retryMs*2**Math.min(repeats,32));}
   save(attempt){this.state.attempts[attempt.id]=attempt;this.state.latest=attempt.id;atomicJson(this.file,this.state,{previous:true});fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify(attempt)+'\n',{mode:0o600});return attempt;}
   view(){const a=this.state.attempts[this.state.latest];return a?{state:a.state,taskId:a.taskId,inputVersion:a.inputVersion,disposition:a.decision?.disposition,reason:a.reason??a.decision?.reason,model:a.receipt?.model,reasoning:a.receipt?.reasoning,verifiedAt:a.receipt?.verifiedAt,checkedAt:a.checkedAt,lastCheckAt:this.state.lastCheckAt??a.checkedAt,retryAt:a.retryAt??(a.checkedAt+this.retryMs),...(a.chunks?{chunks:a.chunks}:{}),...(this.state.recovery?{recovery:this.state.recovery.reason}:{})}: {state:'not-needed',...(this.state.recovery?{recovery:this.state.recovery.reason}:{})};}
   /** One review for the ordinary case, with exactly the request it always sent.
@@ -152,7 +160,10 @@ export class WorkLockReview {
         if(!task||task.id!==snapshot.task.id||fingerprint(this.router,task)!==snapshot.key)return this.save({...attempt,state:'superseded',reason:'task-changed-during-review'});
         const blocked=this.blocked(task,runtime);
         if(blocked)return this.save({...attempt,state:'waiting',reason:blocked,retryAt:this.now()+this.retryMs});
-        if(d.disposition==='keep')return this.save({...attempt,state:'kept',retryAt:this.now()+this.retryMs});
+        if(d.disposition==='keep') {
+          const repeats=previous?.state==='kept'&&previous.decision?.disposition==='keep'?(previous.repeats??0)+1:0;
+          return this.save({...attempt,state:'kept',repeats,retryAt:this.keptRetryAt(repeats)});
+        }
         if(d.remaining.length||!d.evidenceIds.includes(task.inputIds[0])||!d.evidenceIds.includes(task.inputIds.at(-1)))throw Error('Work review does not cover original and current inputs');
         // Re-read evidence under the input/switch mutex. Changed receipts or
         // sources cannot be accepted using the earlier model decision.
@@ -160,10 +171,15 @@ export class WorkLockReview {
         if(hash(fresh)!==attempt.evidenceHash)return this.save({...attempt,state:'superseded',reason:'evidence-changed-during-review',retryAt:this.now()});
         const changedRuntime=this.blocked(task,await this.router.inspect());
         if(changedRuntime)return this.save({...attempt,state:'waiting',reason:changedRuntime,retryAt:this.now()+this.retryMs});
-        const canceled=[],replacements=[],retired=[];
+        const canceled=[],replacements=[],retired=[],undelivered=[];
         for(const [deliveryId,delivery] of Object.entries(task.deliveries??{})) {
           const proof=fresh.receipts?.[deliveryId];
           if(delivery.state==='accepted'&&delivery.messageId&&proof?.state==='accepted'&&proof.messageId===delivery.messageId)continue;
+          // Refused by the platform, or past every attempt the transport will make: this
+          // bubble will never arrive, and waiting for its receipt would hold the work lock
+          // for ever. It is recorded as the non-delivery it is; the rule that some bubble
+          // must actually have been delivered is enforced below, unchanged.
+          if(FINAL_NON_DELIVERY.includes(proof?.state)){undelivered.push(deliveryId);continue;}
           // A bubble the host retired never reached a transport and never will. That is a
           // settled non-delivery, not an unconfirmed one, and it cannot hold the lock for
           // ever. Delivery evidence is still required from the bubbles that were sent.
@@ -176,7 +192,10 @@ export class WorkLockReview {
           if(d.disposition!=='not_a_task'||!d.discardDraftIds.includes(deliveryId)||proof?.state!=='not-submitted')return this.save({...attempt,state:'waiting',reason:'delivery-unconfirmed',retryAt:this.now()+this.retryMs});
           canceled.push(deliveryId);
         }
-        if(!Object.values(task.deliveries??{}).some(x=>x.state==='accepted'&&x.messageId))return this.save({...attempt,state:'waiting',reason:'no-delivery-evidence',retryAt:this.now()+this.retryMs});
+        // At least one bubble must really have arrived. A router record that says accepted
+        // while the transport's own evidence says the bubble was refused is not that proof.
+        const settled=new Set(undelivered);
+        if(!Object.entries(task.deliveries??{}).some(([deliveryId,x])=>x.state==='accepted'&&x.messageId&&!settled.has(deliveryId)))return this.save({...attempt,state:'waiting',reason:'no-delivery-evidence',retryAt:this.now()+this.retryMs});
         for(const deliveryId of canceled) {
           const proof=await this.cancelDeferred(deliveryId,{reviewId:id,evidence:fresh});
           if(proof?.state!=='canceled-before-send')throw Error('Deferred draft was not canceled');
@@ -186,8 +205,9 @@ export class WorkLockReview {
         if(finalBlock){this.router.save('work-review-held',{taskId:task.id,reason:finalBlock});return this.save({...attempt,state:'waiting',reason:finalBlock,retryAt:this.now()+this.retryMs});}
         for(const [deliveryId,fulfilledBy] of replacements)Object.assign(task.deliveries[deliveryId],{state:'not-submitted',fulfilledBy,workReviewId:id});
         for(const deliveryId of retired)Object.assign(task.deliveries[deliveryId],{state:'retired',reason:fresh.receipts[deliveryId].reason,workReviewId:id});
+        for(const deliveryId of undelivered)Object.assign(task.deliveries[deliveryId],{state:fresh.receipts[deliveryId].state,reason:fresh.receipts[deliveryId].reason,workReviewId:id});
         task.status=d.disposition==='not_a_task'?'canceled':'completed';
-        task.completedAt=this.now();task.workReview={id,disposition:d.disposition,reason:d.reason,evidenceIds:d.evidenceIds,receipt:result.receipt,inputVersion:task.inputVersion,canceledDraftIds:canceled,...(retired.length?{retiredDeliveryIds:retired}:{})};
+        task.completedAt=this.now();task.workReview={id,disposition:d.disposition,reason:d.reason,evidenceIds:d.evidenceIds,receipt:result.receipt,inputVersion:task.inputVersion,canceledDraftIds:canceled,...(retired.length?{retiredDeliveryIds:retired}:{}),...(undelivered.length?{undeliveredDeliveryIds:undelivered}:{})};
         this.router.save('work-reviewed',{taskId:task.id,reviewId:id,disposition:d.disposition});
         if(!this.router.tasks().length)this.router.recordModeRequest({mode:'auto',commandId:id,reason:'DeepSeek verified the work lifecycle: '+d.reason,notify:false,sourceInputId:'host:'+id});
         return this.save({...attempt,state:'applied',appliedAt:this.now()});

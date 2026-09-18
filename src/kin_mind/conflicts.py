@@ -30,6 +30,9 @@ COMMIT_PATH_MODULES = (
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
+    "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
+    "kin_mind.expression_intent",
+    "kin_mind.next_move", "kin_mind.trait_refs",
 )
 
 
@@ -58,6 +61,8 @@ REGISTRY = {
     "Referenced graph identity changed during evaluation": ("runtime", "graph-node-changed", "reuse"),
     "Event identity evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
     "Topic candidate evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
+    # An audited section whose module is not installed: refused alone, recorded, never asked again.
+    "No module has claimed this section yet": ("semantic", "section-unavailable", "section"),
     # --- state.py: evidence, mind revision, policy authority, desires ---
     "Initialize the role profile before reading or changing state": ("semantic", "profile-uninitialized", "block"),
     "Evidence source is unavailable": ("runtime", "evidence-source-unavailable", "reuse"),
@@ -76,6 +81,7 @@ REGISTRY = {
     "Personality was already evaluated today": ("runtime", "evolution-already-today", "block"),
     "Personality changes require three independent user interactions": ("semantic", "evolution-needs-interactions", "block"),
     "A current, version-matched prospective behavioral check is required": ("semantic", "evolution-needs-behavioral-check", "block"),
+    "A current, compatible prospective behavioral check is required": ("semantic", "evolution-needs-behavioral-check", "block"),
     "A personality reversion requires explicit user correction evidence": ("semantic", "reversion-needs-owner-evidence", "block"),
     "Evolution event is outside this scope or missing": ("semantic", "reference-cross-scope", "block"),
     "Reversion evidence must follow the change": ("semantic", "reversion-evidence-too-early", "block"),
@@ -219,6 +225,21 @@ REGISTRY = {
     "Need independent result cases": ("semantic", "replay-needs-cases", "block"),
     "Procedure replay omitted or duplicated an outcome": ("semantic", "replay-incomplete", "block"),
     "Procedure changed during replay": ("runtime", "procedure-changed-during-replay", "block"),
+    # --- behavior_chain.py: a check is worth what its evidence is, so every one of these is
+    # refused alone and recorded; none of them costs a follow-up call ---
+    "The chain needs evidence this evaluation was shown": ("semantic", "chain-evidence-unknown", "section"),
+    "Chain evidence changed after it was supplied": ("runtime", "chain-evidence-changed", "section"),
+    "A hypothesis needs a prediction that could refute it": ("semantic", "hypothesis-without-prediction", "section"),
+    "This prediction was made under another configuration": ("runtime", "prediction-incompatible", "section"),
+    "An outcome needs evidence the host verified": ("semantic", "outcome-not-verifiable", "section"),
+    "Outcome evidence must be later than the prediction": ("semantic", "outcome-not-later", "section"),
+    "A result must name an execution of this scope": ("semantic", "result-unknown", "section"),
+    "This receipt does not show the behavior happened": ("semantic", "result-unverified", "section"),
+    "A reversion is a host action, not an appraisal proposal": ("semantic", "evolution-revert-not-proposed", "section"),
+    "A hypothesis rests only on a trait that is in effect": ("semantic", "trait-not-effective", "section"),
+    # Raised where it is proposed (a section, refused alone) and again where it would be applied
+    # (state.py, outside one, so the whole commit stops): one message, the stricter handling.
+    "The trait ledger is the only writer of traits": ("semantic", "traits-owned-by-ledger", "block"),
     # --- exploration_decisions.py ---
     "Sharing decision needs an exploration in this scope": ("semantic", "exploration-unknown", "block"),
     "A clock or delivery event cannot reopen a result decision": ("semantic", "decision-reopen-not-allowed", "block"),
@@ -235,6 +256,28 @@ REGISTRY = {
     "Replacement must be another active record in the same scope": ("semantic", "replacement-invalid", "block"),
     "Cross-scope relations are not allowed": ("semantic", "reference-cross-scope", "block"),
     "Job key reused with a different task": ("runtime", "payload-changed", "block"),
+    # --- traits.py: the ledger checks the material and the times, never the trait itself.
+    # All of them are raised inside an audited section, so each is refused on its own, recorded
+    # as a static code the next projection shows, and never asked again with a paid call. ---
+    "Trait is missing or outside this scope": ("semantic", "trait-unknown", "section"),
+    "Trait changed during evaluation": ("runtime", "trait-revision-changed", "section"),
+    "Cited material cannot stand for the evidence class it was given": ("semantic", "trait-evidence-class", "section"),
+    "A trait observation needs evidence of its own": ("semantic", "trait-evidence-missing", "section"),
+    "Establishing on inference needs separate episodes and support that is not Kin's own": ("semantic", "trait-single-episode", "section"),
+    "A trait decision names an observation the ledger does not hold": ("semantic", "trait-observation-unknown", "section"),
+    "An owner instruction or correction must quote the owner's own words": ("semantic", "trait-quote-unverified", "section"),
+    "A revoked trait needs an owner statement newer than its tombstone": ("semantic", "trait-revoked", "section"),
+    "A faded trait needs new support before it stands again": ("semantic", "trait-needs-support", "section"),
+    # --- expression_intent.py: an intent is worth what it rests on. Each of these refuses that one
+    # section, is recorded as a static code the next projection shows, and costs no second call ---
+    "An intent cites evidence this evaluation was not shown": ("semantic", "intent-evidence-unknown", "section"),
+    "Intent evidence changed after it was supplied": ("runtime", "intent-evidence-changed", "section"),
+    "An intent names a trait the ledger no longer carries": ("runtime", "intent-trait-not-current", "section"),
+    "An intent topic names a concern this scope does not carry": ("semantic", "intent-concern-unknown", "section"),
+    # --- next_move.py: an audit of the move the same appraisal says it is making. Both are raised
+    # inside that section, so each drops the move alone and nothing else of the proposal. ---
+    "This move does not match what this appraisal committed": ("semantic", "next-move-inconsistent", "section"),
+    "This move rests on something the host cannot find": ("semantic", "next-move-forged-grounds", "section"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),

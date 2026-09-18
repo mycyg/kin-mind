@@ -81,8 +81,8 @@ class ActionEvents:
         queued = []
         with self.mind.engine.db.connect(write=True) as conn:
             state = self.mind._load(conn)
-            from .autonomy_schema import enabled
-            if enabled(conn, self.mind.scope.key()):
+            from .autonomy_schema import legacy_thresholds
+            if not legacy_thresholds(conn, self.mind.scope.key()):
                 # Scores are context. Only due reviews and new evidence wake DS.
                 return queued
             if not state.get("action_policy") or not self.mind._fresh(
@@ -182,24 +182,23 @@ class ActionEvents:
 
     def review_unselected(self):
         view = self.mind.read()
-        from .autonomy_schema import enabled
+        from .autonomy_schema import enabled, legacy_thresholds, optimized
         with self.mind.engine.db.connect() as conn:
             semantic = enabled(conn, self.mind.scope.key())
+            legacy = legacy_thresholds(conn, self.mind.scope.key())
+            versions = optimized(conn, self.mind.scope.key(), "wish_version_review")
         if (
             not view.get("action_policy")
             or view["action_policy"]["needs_review"]
-            or (not semantic and view["dimensions"]["curiosity"]["value"] < 75)
+            or (legacy and view["dimensions"]["curiosity"]["value"] < 75)
         ):
             return
         with self.mind.engine.db.connect(write=True) as conn:
             for d in view["desires"]:
-                if (
-                    d["kind"] == "explore"
-                    and d["status"] == "wanted"
-                    and not d["expired"]
-                    and not d["needs_review"]
-                    and d.get("decision_receipt", {}).get("provider") != "deepseek"
-                ):
+                if d["status"] != "wanted" or d["expired"] or d["needs_review"]:
+                    continue
+                receipt = d.get("decision_receipt", {})
+                if d["kind"] == "explore" and receipt.get("provider") != "deepseek":
                     self.emit(
                         conn,
                         "wish-review",
@@ -208,6 +207,26 @@ class ActionEvents:
                             "desire_id": d["id"],
                             "evidence_ids": [r["record_id"] for r in d["evidence"]],
                             "agent_version": view["agent_version"],
+                        },
+                    )
+                elif (
+                    versions
+                    and semantic
+                    and receipt.get("provider") == "deepseek"
+                    and receipt.get("agent_version") != view["agent_version"]
+                ):
+                    # A wish decided under an earlier version is not ready any more, and nothing
+                    # would ever look at it again. Ask once what to do with it, per wish and
+                    # version, so it is confirmed or dropped rather than silently stranded.
+                    self.emit(
+                        conn,
+                        "wish-review",
+                        [d["id"], "agent-version", view["agent_version"]],
+                        {
+                            "desire_id": d["id"],
+                            "evidence_ids": [r["record_id"] for r in d["evidence"]],
+                            "agent_version": view["agent_version"],
+                            "reason": "The decision behind this wish was made under an earlier version",
                         },
                     )
 
@@ -230,10 +249,11 @@ class ActionEvents:
         if (view.get("action_policy") or {}).get("needs_review"):
             return {"state": "waiting", "reason": "action-policy-needs-review"}
         score = view["dimensions"]["curiosity"]
-        from .autonomy_schema import enabled
+        from .autonomy_schema import enabled, legacy_thresholds
         with self.mind.engine.db.connect() as conn:
             semantic = enabled(conn, self.mind.scope.key())
-        if not semantic and (score["needs_review"] or score["projected_value"] < (view["exploration"].get("threshold") or 75)):
+            legacy = legacy_thresholds(conn, self.mind.scope.key())
+        if legacy and (score["needs_review"] or score["projected_value"] < (view["exploration"].get("threshold") or 75)):
             return {
                 "state": "waiting",
                 "reason": "curiosity-below-threshold-or-stale",

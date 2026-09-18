@@ -203,11 +203,22 @@ The optional [mobile routing host](mobile-routing.md) keeps conversation and wor
 models in one native thread, protects ongoing tasks during model changes, and
 separates four-hour mobile health reviews from the daily desktop check.
 
-A daily personality review is separate from short-term scoring. It requires three
-independent original interactions and an existing prospective behavioral assessment
-in the same agent version. `Mind` enforces parameter limits and preserves the claim's
-hypothesis status. A later explicit correction can revert the latest personality
-revision while retaining history; intervening personality revisions require review.
+A daily personality review is separate from short-term scoring. With `behavior_chain`
+enabled it makes no model request at all: an ordinary appraisal proposes the change and
+the daily action merges it host side. It requires three independent original
+interactions — one interaction window counts once, however many messages it holds — a
+pending proposal, and a prediction of the same configuration confirmed by host-verified
+evidence. "The same configuration" is a compatibility key over the approved persona, a
+declared behavior contract, the dimension definition texts, the appraisal model this
+evaluator pins for itself, the chat model the host registers with
+`configure-behavior-models` (unregistered until it does, which is stable rather than
+stale), and the relevant execution environment. An unrelated agent version bump no
+longer voids a check while a real change does. What a change voids stays
+readable, marked with the ingredient that moved. `Mind` enforces parameter limits and
+preserves the claim's hypothesis status. A later explicit correction can revert the
+latest personality revision while retaining history; intervening personality revisions
+require review. With the switch off the previous behaviour returns: one model request a
+day, and an assessment in the same agent version.
 
 ## Exploration
 

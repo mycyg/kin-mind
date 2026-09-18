@@ -87,8 +87,10 @@ def metadata(record):
 
 
 class SelfKnowledge:
-    def __init__(self, engine, scope: Scope):
-        self.engine, self.scope = engine, scope
+    def __init__(self, engine, scope: Scope, clock=now):
+        # The clock is injectable because ordering is the whole point of a prospective check: a
+        # host that replays a chain must be able to say which moment came first.
+        self.engine, self.scope, self.clock = engine, scope, clock
 
     def _get(self, conn, rid, entry=None):
         row = self.engine._get(conn, rid)
@@ -100,7 +102,7 @@ class SelfKnowledge:
 
     def _evidence(self, conn, ids, *, authorities=None, after=None):
         sources, snapshots, hashes = set(), {}, set()
-        stamp = now()
+        stamp = self.clock()
         for rid in sorted(set(ids)):
             row = self._get(conn, rid)
             if row["status"] != "active" or not self._current(row, stamp):
@@ -125,23 +127,38 @@ class SelfKnowledge:
                     raise Conflict(
                         "Evidence does not have the required source authority"
                     )
-                if after and source["occurred_at"] < after:
-                    raise Conflict("Outcome evidence predates the prediction")
+                if after and source["occurred_at"] <= after:
+                    # The same moment is not later: evidence recorded with the prediction was
+                    # available to whoever made it, and tests nothing.
+                    raise Conflict("Outcome evidence must be later than the prediction")
                 if source["occurred_at"] > stamp:
                     raise Conflict("Evidence has not occurred yet")
                 sources.add(sid)
                 hashes.add(source["hash"])
         return sorted(sources), snapshots, sorted(hashes)
 
-    def _command(self, name, request, run):
+    def _within(self, conn, name, request, run):
+        """The command, in a transaction the caller owns, so one appraisal can record a hypothesis
+        and its predictions beside everything else it commits, and refuse them together."""
         payload = {"scope": self.scope.model_dump(), "request": request.model_dump()}
         key = "self:" + name + ":" + digest([self.scope.key(), request.command_id])
-        with self.engine.db.connect(write=True) as conn:
-            result = self.engine.command(conn, key, payload, lambda: run(conn))
-            # A receipt replay reports current state and cannot resurrect deletion.
-            return self._get(conn, result["id"])
+        result = self.engine.command(conn, key, payload, lambda: run(conn))
+        # A receipt replay reports current state and cannot resurrect deletion.
+        return self._get(conn, result["id"])
 
-    def claim(self, request: ClaimInput):
+    def _command(self, name, request, run):
+        with self.engine.db.connect(write=True) as conn:
+            return self._within(conn, name, request, run)
+
+    def claim(self, request: ClaimInput, *, compat=None, rests_on=None):
+        return self._command("claim", request, self._claiming(request, compat, rests_on))
+
+    def claim_in(self, conn, request: ClaimInput, *, compat=None, rests_on=None):
+        """`claim()` inside the caller's transaction. `rests_on` are host identifiers this claim was
+        made from; the host that supplies them decides what they mean and has already checked them."""
+        return self._within(conn, "claim", request, self._claiming(request, compat, rests_on))
+
+    def _claiming(self, request, compat, rests_on=None):
         def run(conn):
             sources, snapshots, _ = self._evidence(
                 conn,
@@ -171,6 +188,11 @@ class SelfKnowledge:
                 "agent_version": request.agent_version,
                 "evidence_revisions": snapshots,
                 "supersedes": request.supersedes,
+                # The host's stamp of the configuration this was made under, when it keeps one, and
+                # what it says this claim rests on. Absent on everything written before they existed,
+                # and on everything written through the tools.
+                **({"compat": compat} if compat else {}),
+                **({"rests_on": sorted(set(rests_on))} if rests_on else {}),
             }
             row = self.engine._insert(
                 conn,
@@ -179,6 +201,9 @@ class SelfKnowledge:
                     title=request.aspect,
                     content=request.claim,
                     scope=self.scope,
+                    # The host's clock decides when an entry of this chain became true, so a replay
+                    # orders a claim, its predictions and their evidence the way they happened.
+                    valid_from=self.clock(),
                     source_ids=sources,
                     evidence_ids=request.evidence_ids,
                     generated=request.basis == "hypothesis",
@@ -200,7 +225,7 @@ class SelfKnowledge:
             self.engine.db.bump(conn)
             return row
 
-        return self._command("claim", request, run)
+        return run
 
     def link_supersession(self, old_id, new_id, expected_revisions, command_id):
         """Repeat what `claim()` does to the claim it replaces, without inserting a record.
@@ -246,7 +271,15 @@ class SelfKnowledge:
         with self.engine.db.connect(write=True) as conn:
             return self.engine.command(conn, key, payload, lambda: run(conn))
 
-    def predict(self, request: PredictionInput):
+    def predict(self, request: PredictionInput, *, compat=None, window_hours=None):
+        return self._command("prediction", request, self._predicting(request, compat, window_hours))
+
+    def predict_in(self, conn, request: PredictionInput, *, compat=None, window_hours=None):
+        """`predict()` inside the caller's transaction. `window_hours` is the host's own note of
+        when the behavior was expected to show; the caller, not the model, decides what it means."""
+        return self._within(conn, "prediction", request, self._predicting(request, compat, window_hours))
+
+    def _predicting(self, request, compat, window_hours):
         def run(conn):
             claim = self._get(conn, request.claim_id, "claim")
             info = metadata(claim)
@@ -256,12 +289,15 @@ class SelfKnowledge:
                 raise Conflict("A prediction requires a current claim")
             if not self._fresh(conn, claim):
                 raise Conflict("Self-claim evidence changed")
+            # One forecast per case per configuration. With a stamp the configuration is what the
+            # host says decides behavior; without one it stays the agent version, as it was.
+            field, value = ("compat.key", compat["key"]) if compat else ("agent_version", info["agent_version"])
             duplicate = conn.execute(
                 "SELECT 1 FROM records WHERE scope=? AND deleted=0 "
                 "AND json_extract(data,'$.attributes.self_knowledge.entry')='prediction' "
                 "AND json_extract(data,'$.attributes.self_knowledge.case_id')=? "
-                "AND json_extract(data,'$.attributes.self_knowledge.agent_version')=?",
-                (self.scope.key(), request.case_id, info["agent_version"]),
+                f"AND json_extract(data,'$.attributes.self_knowledge.{field}')=?",
+                (self.scope.key(), request.case_id, value),
             ).fetchone()
             if duplicate:
                 raise Conflict(
@@ -274,6 +310,7 @@ class SelfKnowledge:
                     title=request.behavior[:1000],
                     content=request.behavior,
                     scope=self.scope,
+                    valid_from=self.clock(),
                     source_ids=claim["source_ids"],
                     evidence_ids=[claim["id"]],
                     generated=True,
@@ -290,6 +327,8 @@ class SelfKnowledge:
                             "information": request.information,
                             "probability": request.probability,
                             "generic_probability": request.generic_probability,
+                            **({"compat": compat} if compat else {}),
+                            **({"test_window_hours": window_hours} if window_hours else {}),
                         }
                     },
                 ),
@@ -297,9 +336,16 @@ class SelfKnowledge:
             self.engine.db.bump(conn)
             return row
 
-        return self._command("prediction", request, run)
+        return run
 
-    def assess(self, request: AssessmentInput):
+    def assess(self, request: AssessmentInput, *, compat=None):
+        return self._command("assessment", request, self._assessing(request, compat))
+
+    def assess_in(self, conn, request: AssessmentInput, *, compat=None):
+        """`assess()` inside the caller's transaction."""
+        return self._within(conn, "assessment", request, self._assessing(request, compat))
+
+    def _assessing(self, request, compat):
         def run(conn):
             prediction = self._get(conn, request.prediction_id, "prediction")
             if (
@@ -315,7 +361,8 @@ class SelfKnowledge:
                 conn,
                 request.evidence_ids,
                 authorities={"explicit", "operation"},
-                after=prediction["received_at"],
+                # When the forecast was made, by the clock that made it, not by storage time.
+                after=prediction["valid_from"],
             )
             existing = conn.execute(
                 "SELECT 1 FROM records WHERE scope=? AND deleted=0 "
@@ -335,6 +382,7 @@ class SelfKnowledge:
                     title=prediction["title"],
                     content=request.note,
                     scope=self.scope,
+                    valid_from=self.clock(),
                     source_ids=sources,
                     evidence_ids=[prediction["id"], *request.evidence_ids],
                     # Recording a reported outcome is not independent validation.
@@ -352,6 +400,7 @@ class SelfKnowledge:
                             "outcome": request.outcome,
                             "evidence_revisions": snapshots,
                             "source_hashes": hashes,
+                            **({"compat": compat} if compat else {}),
                         }
                     },
                 ),
@@ -359,7 +408,7 @@ class SelfKnowledge:
             self.engine.db.bump(conn)
             return row
 
-        return self._command("assessment", request, run)
+        return run
 
     @staticmethod
     def _current(row, stamp):
@@ -371,7 +420,7 @@ class SelfKnowledge:
         )
 
     def _fresh(self, conn, row):
-        stamp = now()
+        stamp = self.clock()
         for rid, revision in metadata(row).get("evidence_revisions", {}).items():
             try:
                 evidence = self._get(conn, rid)

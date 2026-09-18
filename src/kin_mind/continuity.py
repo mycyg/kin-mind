@@ -141,7 +141,7 @@ def concern_projection(entry, at):
     return result
 
 
-def select_concerns(concerns, query="", limit=3):
+def select_concerns(concerns, query="", limit=3, intent=None):
     def tokens(text):
         text = text.lower()
         return set(re.findall(r"[a-z0-9_]+", text)) | {
@@ -165,6 +165,19 @@ def select_concerns(concerns, query="", limit=3):
         ),
         reverse=True,
     )
+    if intent:
+        # A fresh intent chooses first: the concern it named, or else the one its topic really
+        # overlaps. The overlap ranking above stays, and fills whatever is left of the three.
+        picked = []
+        for entry in intent.get("continue_topics", []):
+            found = next((c for c in active if c["id"] == entry.get("concern_id")), None)
+            if found is None:
+                asked = tokens(entry.get("topic") or "")
+                found = next((c for c in active if asked & tokens(c["topic"] + " " + c["content"])), None)
+            if found is not None and found["id"] not in picked:
+                picked.append(found["id"])
+        order = {identifier: index for index, identifier in enumerate(picked)}
+        active.sort(key=lambda c: order.get(c["id"], len(order)))
     return [
         {
             k: c.get(k)
@@ -519,7 +532,17 @@ class Continuity:
         topic = query or ((assessment or {}).get("understanding") or {}).get(
             "topic", ""
         )
-        result["selected_concerns"] = select_concerns(result["concerns"], topic)
+        # The intent the last appraisal stated, while it is still fresh. Everything below falls
+        # back to what it always did when it is not, and nothing here reads it while its switch
+        # is off. A new owner message does not end an intent: see expression_intent.
+        from .expression_intent import view as intent_view
+        speaking = flags["expression"] and config.get("activation", "active") == "active"
+        intent = intent_view(conn, self, at, continuity_active=speaking,
+                             persona=result.get("persona_contract"))
+        if intent and intent["status"]:
+            result["continuity"]["expression_intent"] = intent["status"]
+        stated = (intent or {}).get("use")
+        result["selected_concerns"] = select_concerns(result["concerns"], topic, intent=stated)
         if flags["rhythm"]:
             interactions = interaction_windows(conn, self.scope.key(), at)
             entry = state.get("rhythm")
@@ -531,12 +554,13 @@ class Continuity:
             )
         else:
             result["rhythm"] = {"status": "disabled", "mode": "interaction-led"}
-        if flags["expression"] and config.get("activation", "active") == "active":
+        if speaking:
             result["expression"] = compile_expression(
                 result["dimensions"],
                 rhythm=result["rhythm"],
                 config_version=config.get("version"),
                 persona=result.get("persona_contract"),
+                intent=stated,
             )
             result["expression"]["concern_ids"] = [
                 c["id"] for c in result["selected_concerns"]

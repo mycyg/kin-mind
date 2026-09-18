@@ -28,10 +28,10 @@ pytest_plugins = ("test_memory_continuity",)
 
 SWITCHES = ("manifest_rebase", "appraisal_reuse", "appraisal_revalidation")
 MOOD = {"reason": "A synthetic current judgment", "values": {"mood": 61}, "next_review_minutes": 25}
-NEW_WISH = {"content": "Tell her what the sundial showed", "topic": "sundial", "kind": "contact",
-            "strength": 60, "ttl_hours": 24, "completion": "She has heard it"}
-OTHER_WISH = {"content": "Ask her which clock face she prefers", "topic": "clock", "kind": "contact",
-              "strength": 55, "ttl_hours": 24, "completion": "She has answered"}
+NEW_WISH = {"content": "Tell the owner what the sundial showed", "topic": "sundial", "kind": "contact",
+            "strength": 60, "ttl_hours": 24, "completion": "The owner has heard it"}
+OTHER_WISH = {"content": "Ask the owner which clock face they prefer", "topic": "clock", "kind": "contact",
+              "strength": 55, "ttl_hours": 24, "completion": "The owner has answered"}
 
 
 def keep_all(request):
@@ -222,7 +222,7 @@ def later_of(mind, **delta):
 def delivering(mind, source):
     """A contact wish the model is shown as `wanted`, already handed to the transport."""
     wish = mind.manage_desire(DesireChange(command_id="older-wish", agent_version="fixture-v1", expected_revision=mind.read()["revision"],
-        evidence_ids=[source("older-wish-evidence")], action="create", content="Tell her what the sundial showed", topic="sundial",
+        evidence_ids=[source("older-wish-evidence")], action="create", content="Tell the owner what the sundial showed", topic="sundial",
         kind="contact", strength=80, expires_at=later_of(mind, days=2), completion="The platform accepts it", reason="A finding to share"))
     mind.record(AffectiveEvent(command_id="drive", agent_version="fixture-v1", expected_revision=mind.read()["revision"],
                                evidence_ids=[source("drive-evidence")], values={"initiative": 90}, reason="A synthetic drive"))
@@ -547,12 +547,12 @@ def test_keep_resets_only_the_conflicting_expectation_and_commits_through_the_sa
     owner = env.source("owner-asks-to-pause-exploring")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
     change = lambda plan: {"action": "pause", "id": plan["id"], "expected_revision": plan["revision"], "reason": "Pause it", "evidence_ids": [owner]}
-    proposal = dict(MOOD, habits={"preferences": {"exploration_paused": True}, "evidence_ids": [owner], "reason": "She asked", "expected_revision": 0},
+    proposal = dict(MOOD, habits={"preferences": {"exploration_paused": True}, "evidence_ids": [owner], "reason": "The owner asked", "expected_revision": 0},
                     plan_changes=[change(paused), change(untouched)])
     def others_write():
         # Someone else moves both compare-and-swap targets of this proposal while the model thinks.
         env.memory.habits.update({"command_id": "another-preference", "preferences": {"reply_choice": "autonomous"},
-                                  "evidence_ids": [env.source("owner-allows-silence")], "reason": "She said so", "expected_revision": 0})
+                                  "evidence_ids": [env.source("owner-allows-silence")], "reason": "The owner said so", "expected_revision": 0})
         env.decide(paused, "wait", next_review_at=later(env, days=3))
     api = Model(monkeypatch, [proposal, answer({"habits:": "keep", "plans:": "wait"})], env.mind.engine, during={"submit_appraisal": [others_write]})
     first = run(env.mind, api.provider, job)
@@ -579,7 +579,7 @@ def test_stale_evidence_inside_a_patch_is_refused_by_the_same_apply(env, monkeyp
     plan = waiting_plan(env)
     corrected = env.source("an-older-remark")
     job = env.enqueue("owner-chat")
-    understanding = {"meaning": "She asked about the clock", "topic": "clock", "importance": 50, "confidence": 0.9, "basis": "inferred"}
+    understanding = {"meaning": "The owner asked about the clock", "topic": "clock", "importance": 50, "confidence": 0.9, "basis": "inferred"}
     def others_write():
         bookkeeping(env, plan)()
         env.owner_message("owner-says-something-new")
@@ -888,8 +888,8 @@ def test_evidence_the_first_attempt_recalled_stays_in_bounds_when_its_proposal_i
     plan = waiting_plan(env)
     older = last_week(env)
     job = env.enqueue("owner-chat")
-    recall = {"query": "what she said about exploring", "reason": "Needed", "mode": "light", "identifiers": [older]}
-    habits = {"preferences": {"exploration_paused": True}, "evidence_ids": [older], "reason": "She asked last week", "expected_revision": 0}
+    recall = {"query": "what the owner said about exploring", "reason": "Needed", "mode": "light", "identifiers": [older]}
+    habits = {"preferences": {"exploration_paused": True}, "evidence_ids": [older], "reason": "The owner asked last week", "expected_revision": 0}
     api = Model(monkeypatch, [dict(MOOD, recall_needs=[recall]), dict(MOOD, habits=habits)], env.mind.engine,
                 during={"submit_appraisal": [lambda: None, bookkeeping(env, plan)]})
     first = run(env.mind, api.provider, job)
@@ -908,12 +908,12 @@ def test_recalled_evidence_that_has_moved_since_is_not_merged_back(env, monkeypa
     plan = waiting_plan(env)
     older = last_week(env)
     job = env.enqueue("owner-chat")
-    recall = {"query": "what she said about exploring", "reason": "Needed", "mode": "light", "identifiers": [older]}
-    habits = {"preferences": {"exploration_paused": True}, "evidence_ids": [older], "reason": "She asked last week", "expected_revision": 0}
+    recall = {"query": "what the owner said about exploring", "reason": "Needed", "mode": "light", "identifiers": [older]}
+    habits = {"preferences": {"exploration_paused": True}, "evidence_ids": [older], "reason": "The owner asked last week", "expected_revision": 0}
     def corrected():
         bookkeeping(env, plan)()
         env.mind.engine.receive(SourceInput(namespace="plan-review-test", key="owner-asked-to-pause-exploring-last-week", version="2",
-            text="She corrected it", scope=env.mind.scope, authority="explicit", occurred_at=env.mind.clock(),
+            text="The owner corrected it", scope=env.mind.scope, authority="explicit", occurred_at=env.mind.clock(),
             metadata={"role": "user", "host_event": "message"}))
     api = Model(monkeypatch, [dict(MOOD, recall_needs=[recall]), dict(MOOD, habits=habits), keep_all, dict(MOOD, values={"mood": 50})],
                 env.mind.engine, during={"submit_appraisal": [lambda: None, corrected]})
@@ -924,7 +924,7 @@ def test_recalled_evidence_that_has_moved_since_is_not_merged_back(env, monkeypa
     request, = api.sent("revalidate_appraisal")
     cited, = request["conflicts"]
     assert cited["object"].startswith("sources:mem_") and [f["path"] for f in cited["relevant_fragment"]] == [["habits"]]
-    assert (cited["before"]["content"], cited["after"]["content"]) == ("owner-asked-to-pause-exploring-last-week", "She corrected it")
+    assert (cited["before"]["content"], cited["after"]["content"]) == ("owner-asked-to-pause-exploring-last-week", "The owner corrected it")
     assert second["error_detail"]["code"] == "insufficient-authority" and "reuse" not in env.job(job)
     assert env.memory.habits.read()["revision"] == 0
     assert run(env.mind, api.provider, job)["state"] == "complete" and api.tools[-1] == "submit_appraisal"
@@ -1001,7 +1001,7 @@ def test_a_receipt_settlement_does_not_rest_on_concerns_or_rhythm(env):
     def a_concern_appears():
         env.mind.manage_concern(ConcernChange(command_id="a-new-concern", agent_version=env.version, expected_revision=env.mind.read()["revision"],
             evidence_ids=[env.source("owner-mentions-an-interview")], action="create", key="interview", kind="care", content="An interview tomorrow",
-            topic="interview", intensity=60, basis="explicit", confidence=0.9, reason="She mentioned it"))
+            topic="interview", intensity=60, basis="explicit", confidence=0.9, reason="The owner mentioned it"))
     provider = Scripted(dict(MOOD, values={"sharing": 30}), during=[a_concern_appears])
     assert run(env.mind, provider, job)["state"] == "pending"
     second = run(env.mind, provider, job)
@@ -1011,7 +1011,7 @@ def test_a_receipt_settlement_does_not_rest_on_concerns_or_rhythm(env):
     def another_concern():
         env.mind.manage_concern(ConcernChange(command_id="another-concern", agent_version=env.version, expected_revision=env.mind.read()["revision"],
             evidence_ids=[env.source("owner-mentions-a-trip")], action="create", key="trip", kind="anticipation", content="A trip next week",
-            topic="trip", intensity=40, basis="explicit", confidence=0.9, reason="She mentioned it"))
+            topic="trip", intensity=40, basis="explicit", confidence=0.9, reason="The owner mentioned it"))
     provider = Scripted(MOOD, during=[another_concern])
     assert run(env.mind, provider, other)["state"] == "pending"
     assert run(env.mind, provider, other)["state"] == "complete" and len(provider.calls) == 2

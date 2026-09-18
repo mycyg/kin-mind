@@ -65,6 +65,10 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             "temperature_shadow": False, "temperature_ranking": False,
             "temperature_shadow_started_at": None, "temperature_validation": None,
             "semantic_actions": False, "autonomous_plans": False, "creative_execution": False,
+            # Off by default: the fixed score gates that used to decide whether to speak or explore.
+            # A score is context, so only an explicit opt-in brings them back. The stored thresholds
+            # are left as they are, so switching this on restores the previous behaviour exactly.
+            "legacy_drive_thresholds": False,
             # Default-on optimization: an unchanged wait is recorded without a plan revision.
             "plan_review_record_only": True,
             # Default-on: one refused proposal section no longer fails the whole appraisal.
@@ -81,10 +85,22 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # Stage 3: purpose-typed recall. Off restores `history` admitting self-knowledge, the
             # prefix-only envelope filters, relation seeds taken before validation and bare labels.
             "recall_purpose_policy": True,
+            # Registered once here and read through autonomy_schema.optimized(). Each one off takes
+            # its sections out of the appraisal schema and prompt and blanks them before validation,
+            # which is the previous behavior exactly. The last two carry no appraisal section.
+            "trait_ledger": True, "behavior_chain": True, "expression_intent": True,
+            "next_move_audit": True, "wish_version_review": True, "rest_review_window": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20,
+            # The ceiling while the rhythm rests or the owner's quiet hours run, so a night costs
+            # one appraisal instead of one every two hours. Applied only there, and only with
+            # `rest_review_window` on; everywhere else `review_max_minutes` still decides.
+            "review_rest_max_minutes": 480,
+            # What the owner is called, for the recall lane that looks for their own words. Empty
+            # by default: with none configured that lane uses generic first/second-person words.
+            "recall_owner_aliases": [],
             # Charged appraisal attempts before a job is quarantined for repair.
             "max_charged_attempts": 5}
 
@@ -188,7 +204,9 @@ class MemoryContinuity:
         for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
-                    "chunked_reply_review", "recall_purpose_policy"):
+                    "chunked_reply_review", "recall_purpose_policy",
+                    "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
+                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:
@@ -216,6 +234,13 @@ class MemoryContinuity:
                     raise Conflict("Cooling needs a current successful replay validation")
             if not 20 <= config["review_min_minutes"] <= config["first_review_minutes"] <= config["review_max_minutes"] <= 120:
                 raise ValueError("Review range must be within 20..120 minutes")
+            if (type(config["review_rest_max_minutes"]) is not int
+                    or not config["review_max_minutes"] <= config["review_rest_max_minutes"] <= 720):
+                raise ValueError("The resting review ceiling must be between the ordinary one and 720 minutes")
+            aliases = config["recall_owner_aliases"]
+            if (type(aliases) is not list or len(aliases) > 8
+                    or any(type(a) is not str or not a.strip() or len(a) > 40 for a in aliases)):
+                raise ValueError("Owner aliases are up to eight short names")
             if type(config["max_charged_attempts"]) is not int or not 1 <= config["max_charged_attempts"] <= 20:
                 raise ValueError("Charged appraisal attempts must be between 1 and 20")
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
@@ -628,17 +653,20 @@ class MemoryContinuity:
                 "evidence_ids": [r["record_id"] for r in refs], "agent_version": state["agent_version"],
                 "reason": "Reconsider current interests and motives without inventing an owner message", "due_at": due["next_review"]})
 
-    def commit_action(self, conn, refs, event_id, next_minutes, receipt):
-        """The action clock progresses even when historical enrichment cannot."""
+    def commit_action(self, conn, refs, event_id, next_minutes, receipt, *, max_minutes=None):
+        """The action clock progresses even when historical enrichment cannot.
+
+        `max_minutes`: the ceiling the request allowed, which is the resting one while the owner
+        is asleep. Unset means the ordinary ceiling, exactly as before."""
         config = self.settings(conn)
-        minutes = max(config["review_min_minutes"], min(config["review_max_minutes"], next_minutes))
+        minutes = max(config["review_min_minutes"], min(max_minutes or config["review_max_minutes"], next_minutes))
         next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
         conn.execute("INSERT INTO mind_action_schedule VALUES(?,?,1,?) ON CONFLICT(scope) DO UPDATE SET next_review=excluded.next_review,revision=revision+1,data=excluded.data",
                      (self.scope.key(), next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes, "last_success": self.mind.clock()})))
         for ref in refs:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
 
-    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None):
+    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None):
         """Called inside the same transaction as affect/concerns/wishes.
 
         Returns what the host dropped item by item (memory_items), shaped like a refused section."""
@@ -657,7 +685,7 @@ class MemoryContinuity:
             # The cursor follows the events this evaluation was given and scored, withheld or not:
             # held back, it would hand an already scored event to a full appraisal a second time.
             config = self.settings(conn)
-            minutes = max(config["review_min_minutes"], min(config["review_max_minutes"], next_minutes))
+            minutes = max(config["review_min_minutes"], min(max_minutes or config["review_max_minutes"], next_minutes))
             next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
             conn.execute("INSERT INTO mind_semantic_cursor(scope,seq,next_review,revision,data) VALUES(?,?,?,1,?) ON CONFLICT(scope) DO UPDATE SET seq=MAX(seq,excluded.seq),next_review=excluded.next_review,revision=revision+1,data=excluded.data",
                          (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))

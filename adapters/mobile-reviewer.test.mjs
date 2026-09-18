@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {createMobileReviewer,REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
+import {createMobileReviewer,REVIEWER_LANES,REVIEWER_PURPOSES,messageIntents} from './mobile-reviewer.mjs';
 import {createLeaseClient} from './model-lease.mjs';
 
 test('classifier uses max thinking without exposing reasoning or adding context',async()=>{
@@ -147,4 +147,64 @@ test('the tail decision on its own: its own tool and purpose label, the routing 
   assert.deepEqual(usage.map(row=>[row.purpose,row.lane,row.outcome,row.leaseState]),[['mobile-reply-tail','foreground','answered','admitted']],'every call of its own shows up in the usage rows under its own label');
   answer={decision:'rewrite_remainder',reason:'not allowed any more'};
   await assert.rejects(reviewer.tail({interruptedReply:{...interruptedReply,decisions:['continue','supersede']}}),/deepseek-invalid-tail-decision/);
+});
+
+// ---- intents: what else the one routing call is asked about the same message ----
+const intentAnswer=(extra={})=>Response.json({id:'request-2',model:'deepseek-flash',usage:{input_tokens:1},stop_reason:'tool_use',
+  content:[{type:'tool_use',name:'route_message',input:{route:'chat',reason:'casual',stop:'none',recall:{mode:'light',query:'q',reason:'r'},...extra}}]});
+const plainInput={text:'hello',clock:{now:'2026-01-01T00:00:00.000Z'},recent:[{role:'user',text:'earlier'}],task:null,mode:'auto',workHeld:false,timeoutMs:1000};
+
+test('with intents on the added prompt and schema are one bounded block, and the request is pinned too',async()=>{
+  const bodies=[];
+  const reviewer=createMobileReviewer({key:'synthetic',fetchImpl:async(url,options)=>{bodies.push(options.body);return intentAnswer();}});
+  await reviewer.classify(plainInput);
+  await reviewer.classify({...plainInput,intents:true});
+  await reviewer.classify({...plainInput,intents:true,attachments:[{kind:'image',mimeType:'image/jpeg',name:'photo.jpg',bytes:12345}]});
+  const [off,on]=bodies;
+  // The request as it stands with intents on and nothing sent with the message. Length and
+  // SHA-256, so that every later change to these rules has to be pinned again on purpose.
+  assert.equal(on.length,3845);
+  assert.equal(createHash('sha256').update(on).digest('hex'),'e8e509a25b1e35d9fa0b980f16b92fc49260c0bfb41189e68a9e11d52f0569e6');
+  assert.equal(on.length-off.length,885,'the whole cost of the intents on an ordinary message');
+  const [before,after,carried]=bodies.map(body=>JSON.parse(body));
+  assert.equal(after.system.length-before.system.length,434);
+  assert.equal(JSON.stringify(after.tools[0].input_schema).length-JSON.stringify(before.tools[0].input_schema).length,451);
+  assert.ok(after.system.startsWith(before.system),'the routing rules are untouched; the intent rules are appended');
+  assert.deepEqual(Object.keys(after.tools[0].input_schema.properties),['route','control','reason','recall','stop','file_send']);
+  assert.deepEqual(after.tools[0].input_schema.properties.stop.enum,['none','current_task']);
+  assert.deepEqual(after.tools[0].input_schema.required,['route','reason','recall','stop'],'only the one enum token is required of every answer');
+  assert.deepEqual(after.tools[0].input_schema.properties.recall.properties.owner_words,{type:'array',maxItems:8,items:{type:'string',maxLength:24}});
+  assert.deepEqual(JSON.parse(after.messages[0].content),{text:'hello',clock:{now:'2026-01-01T00:00:00.000Z'},recent:[{role:'user',text:'earlier'}],task:null,mode:'auto',workHeld:false},'the switch itself never travels');
+  // The attachment rules are paid for only by a message that actually carried something.
+  assert.ok(!after.system.includes('attachments is the metadata'));
+  assert.equal(carried.system.length-after.system.length,179);
+  assert.deepEqual(JSON.parse(carried.messages[0].content).attachments,[{kind:'image',mimeType:'image/jpeg',name:'photo.jpg',bytes:12345}]);
+});
+
+test('intents nobody asked for are never handed on, and the route never fails over one',async()=>{
+  let answer={stop:'current_task',file_send:{requested:true,channel:'wechat',file_ref:'report.pdf'},recall:{mode:'light',query:'q',reason:'r',owner_words:['captain']}};
+  const reviewer=createMobileReviewer({key:'synthetic',fetchImpl:async()=>intentAnswer(answer)});
+  const unasked=await reviewer.classify(plainInput);
+  assert.deepEqual([unasked.route,unasked.stop,unasked.file_send,unasked.recall.owner_words],['chat',undefined,undefined,undefined]);
+  const asked=await reviewer.classify({...plainInput,intents:true});
+  assert.deepEqual(messageIntents(asked),{stop:'current_task',fileSend:{requested:true,channel:'wechat',fileRef:'report.pdf'},ownerWords:['captain']});
+  // Nothing about the intents can fail a classification: the route is answered either way.
+  answer={stop:'delete_everything',file_send:{requested:true,channel:'sms',file_ref:'x'},recall:{mode:'light',query:'q',reason:'r',owner_words:'not a list'}};
+  const kept=await reviewer.classify({...plainInput,intents:true});
+  assert.deepEqual([kept.route,messageIntents(kept)],['chat',{}]);
+});
+
+test('the bounded reading of an intent drops what is malformed, oversized or unknown',()=>{
+  const sha='a'.repeat(64);
+  assert.deepEqual(messageIntents({stop:'none'}),{stop:'none'});
+  assert.deepEqual(messageIntents({file_send:{requested:true,channel:'wechat',file_ref:' report.pdf ',candidate_sha256:sha.toUpperCase()}}),
+    {fileSend:{requested:true,channel:'wechat',fileRef:'report.pdf',candidateSha256:sha}});
+  for(const send of [{requested:false,channel:'wechat',file_ref:'x'},{requested:true,channel:'sms',file_ref:'x'},{requested:true,channel:'wechat',file_ref:'y'.repeat(121)},
+    {requested:true,channel:'wechat',file_ref:'a'+String.fromCharCode(1)+'b'},{requested:true,channel:'wechat'}])assert.deepEqual(messageIntents({file_send:send}),{});
+  // A digest that is not one is dropped on its own; what is left is still a usable request.
+  assert.deepEqual(messageIntents({file_send:{requested:true,channel:'wechat',file_ref:'r',candidate_sha256:'not-a-digest'}}),{fileSend:{requested:true,channel:'wechat',fileRef:'r'}});
+  assert.deepEqual(messageIntents({recall:{owner_words:['captain','captain','  ','x'.repeat(25),'kin',...Array.from({length:12},(_,i)=>'w'+i)]}}).ownerWords,
+    ['captain','kin','w0','w1','w2','w3','w4','w5']);
+  assert.deepEqual(messageIntents({recall:{owner_words:[]}}),{});
+  assert.deepEqual(messageIntents(null),{});
 });

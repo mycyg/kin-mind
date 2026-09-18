@@ -91,7 +91,7 @@ def test_invalid_session_advice_no_longer_blocks_mood_understanding_or_plan_deci
     job = env.enqueue("owner-chat")
     def script(shown, context):
         return Appraisal(reason="A real owner message", values={"mood": 72},
-            understanding=Understanding(meaning="She asked about the clock", topic="clock", importance=60, confidence=0.9, basis="explicit"),
+            understanding=Understanding(meaning="The owner asked about the clock", topic="clock", importance=60, confidence=0.9, basis="explicit"),
             action_decisions=[env.decision(shown[plan["id"]], "wait", strength=35, next_review_at=later(env, hours=3))],
             session_advice=SessionAdvice(action="recall", reason="Context looks thin", evidenceIds=["invented-observation"]))
     result, provider = run(env, script, job_id=job, session=SESSION)
@@ -120,11 +120,11 @@ def habits_case(env):
     owner = env.source("owner-asks-to-pause-exploring")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
     def proposal(shown, context, *, revision):
-        return Appraisal(reason="She wants fewer explorations", values={"mood": 70, "curiosity": 88},
+        return Appraisal(reason="The owner wants fewer explorations", values={"mood": 70, "curiosity": 88},
             motivations={"curiosity": Motivation(target=90, half_life_minutes=60, reason="A new question"),
                          "initiative": Motivation(target=55, half_life_minutes=60, reason="Wants to talk")},
-            habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked to pause", expected_revision=revision),
-            wishes=[wish("Find out how escapements work", kind="explore"), wish("Tell her about the clock")],
+            habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked to pause", expected_revision=revision),
+            wishes=[wish("Find out how escapements work", kind="explore"), wish("Tell the owner about the clock")],
             wish_updates=[WishUpdate(desire_id=wanted["desire_id"], action="resume", reason="Curious again")],
             plan_changes=[PlanChange(action="create", key="sundial", goal="Draw a sundial", motivation="A whim", reason="Own idea", evidence_ids=[owner],
                 steps=[PlanStep(id="draw", actor="create", goal="Draw it", completion="A saved drawing")])],
@@ -142,7 +142,7 @@ def test_refused_habits_hold_what_rests_on_them_and_one_follow_up_restates_it(en
     view, data = env.mind.read(), env.job(job)
     # Independent sections committed.
     assert view["dimensions"]["mood"]["value"] == 70 and view["dimensions"]["initiative"]["motivation"]["target"] == 55
-    assert [d["content"] for d in view["desires"] if d["kind"] == "contact"] == ["Tell her about the clock"]
+    assert [d["content"] for d in view["desires"] if d["kind"] == "contact"] == ["Tell the owner about the clock"]
     assert env.step(clock)["state"] == "ready"
     # Nothing that rests on the refused preference was applied.
     assert env.memory.habits.read()["revision"] == 0 and env.memory.habits.read()["preferences"]["exploration_paused"] is False
@@ -213,23 +213,23 @@ def test_refused_preference_is_asked_again_even_when_nothing_of_the_proposal_res
     """Beyond the letter of the spec: without this the owner's requirement would be lost with no second chance."""
     owner = env.source("owner-asks-to-pause-exploring")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
-    result, _ = run(env, lambda shown, context: Appraisal(reason="She asked to pause", values={"mood": 60},
-        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=7)), job_id=job)
+    result, _ = run(env, lambda shown, context: Appraisal(reason="The owner asked to pause", values={"mood": 60},
+        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=7)), job_id=job)
     assert result["state"] == "complete" and env.mind.read()["dimensions"]["mood"]["value"] == 60
     data = env.job(job)
     assert data["rejected_sections"] == [STALE_HABITS] and "held_sections" not in data
     [follow] = children(env, job)
     assert follow["stimulus"] == FOLLOW_UP and follow["section_review"] == {"rejected_sections": [STALE_HABITS], "held_sections": []}
     result, _ = run(env, lambda shown, context: Appraisal(reason="Restated",
-        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=0)), job_id=follow["id"])
+        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=0)), job_id=follow["id"])
     assert result["state"] == "complete" and env.memory.habits.read()["preferences"]["exploration_paused"] is True
 
 
 def test_follow_up_makes_its_own_evidence_when_the_host_died_right_after_the_commit(env):
     owner = env.source("owner-asks-to-pause-exploring")
     job = Appraisals(env.mind).enqueue([owner], env.version)["id"]
-    habit = lambda revision: HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=revision)
-    run(env, lambda shown, context: Appraisal(reason="She asked to pause", values={"mood": 60}, habits=habit(7)), job_id=job)
+    habit = lambda revision: HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=revision)
+    run(env, lambda shown, context: Appraisal(reason="The owner asked to pause", values={"mood": 60}, habits=habit(7)), job_id=job)
     [follow] = children(env, job)
     with env.mind.engine.db.connect(write=True) as conn:
         # As the commit itself left it: the parent's evidence only.
@@ -266,8 +266,8 @@ def test_follow_up_runs_on_the_action_lane_beside_the_enrichment_job(tmp_path):
             self.revision, self.contexts = revision, []
         def appraise(self, context):
             self.contexts.append(context)
-            return Appraisal(reason="She asked to pause", values={"mood": 70} if self.revision else {},
-                habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=self.revision),
+            return Appraisal(reason="The owner asked to pause", values={"mood": 70} if self.revision else {},
+                habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=self.revision),
                 wishes=[wish("Find out how escapements work", kind="explore")]), dict(RECEIPT)
     assert jobs.run_one(Scripted(7), lane="action")["state"] == "complete"
     with mind.engine.db.connect() as conn:
@@ -297,11 +297,11 @@ def test_follow_up_takes_in_no_pending_event_and_never_applies_the_event_itself_
             self.fields, self.contexts = fields, []
         def appraise(self, context):
             self.contexts.append(context)
-            return Appraisal(reason="She asked to pause", wishes=[wish("Find out how escapements work", kind="explore")], **self.fields), dict(RECEIPT)
-    pause = lambda revision: HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[first["source_id"]], reason="She asked", expected_revision=revision)
+            return Appraisal(reason="The owner asked to pause", wishes=[wish("Find out how escapements work", kind="explore")], **self.fields), dict(RECEIPT)
+    pause = lambda revision: HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[first["source_id"]], reason="The owner asked", expected_revision=revision)
     assert jobs.run_one(Scripted(values={"mood": 70}, habits=pause(7)))["state"] == "complete"
     cursor = memory.semantic_context()["cursor"]
-    # She writes again before the follow-up runs.
+    # The owner writes again before the follow-up runs.
     clock[0] += timedelta(minutes=1)
     second = memory.ingest({"id": "owner-2", "kind": "owner-message", "at": mind.clock(), "text": "And tell me about your day"})
     restating = Scripted(values={"mood": 5, "curiosity": 80}, habits=pause(0),
@@ -332,7 +332,7 @@ def test_section_failing_after_it_changed_state_leaves_no_half_applied_wish(env,
     monkeypatch.setattr(env.mind, "_apply_desire", spy)
     # The second wish links a result that has no sharing decision: refused only after the first was applied.
     result, _ = run(env, lambda shown, context: Appraisal(reason="Two wishes", values={"mood": 64},
-        wishes=[wish("Make her a paper clock", kind="create"), wish("Share the finding", exploration_id="explore_without_a_decision")]), job_id=job)
+        wishes=[wish("Make the owner a paper clock", kind="create"), wish("Share the finding", exploration_id="explore_without_a_decision")]), job_id=job)
     assert result["state"] == "complete"
     # The first wish really was in the in-memory state when the second one failed.
     assert sizes == [1]
@@ -348,7 +348,7 @@ def test_section_failing_after_it_changed_state_leaves_no_half_applied_wish(env,
 def test_refused_section_undoes_its_sql_and_its_state_together(env):
     enable_continuity(env)
     older = env.mind.manage_desire(DesireChange(command_id="older-wish", agent_version=env.version, expected_revision=env.mind.read()["revision"],
-        evidence_ids=[env.initial], action="create", content="Send her the drawing", topic="drawing", kind="contact", strength=50,
+        evidence_ids=[env.initial], action="create", content="Send the owner the drawing", topic="drawing", kind="contact", strength=50,
         expires_at=later(env, days=2), completion="Accepted", reason="An older idea"))["desire_id"]
     job = env.enqueue("owner-chat")
     concern = lambda **values: ConcernProposal(reason="A thought", **values)
@@ -366,7 +366,7 @@ def test_refused_section_undoes_its_sql_and_its_state_together(env):
     # What cites a concern is held, what does not is applied, and the refused upstream section is asked again.
     assert [(h["section"], h["part"], h["items"]) for h in data["held_sections"]] == [
         ("wishes", "wishes citing concern_ids", 1), ("wish_updates", "updates citing concern_ids", 1)]
-    assert sorted(d["content"] for d in state["desires"].values()) == ["Make a paper clock", "Send her the drawing"]
+    assert sorted(d["content"] for d in state["desires"].values()) == ["Make a paper clock", "Send the owner the drawing"]
     assert state["desires"][older]["status"] == "waiting" and not state["desires"][older].get("concern_ids")
     assert state["dimensions"]["mood"]["score"] == 61 and [c["stimulus"] for c in children(env, job)] == [FOLLOW_UP]
 
@@ -433,7 +433,7 @@ def test_commit_that_fails_as_a_whole_keeps_its_refusals_as_feedback_and_commits
     before = env.mind.read()
     def script(shown, context):
         return Appraisal(reason="Refused preference, then a fault in the event itself", values={"mood": 99},
-            habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=7),
+            habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=7),
             wishes=[wish("Look it up", kind="explore")], sharing=[SharingDecision(exploration_id="explore_missing", decision="keep", reason="Keep")])
     result, _ = run(env, script, job_id=job)
     # The sharing decision belongs to the event itself: as before, its failure fails the appraisal.
@@ -455,8 +455,8 @@ def test_database_error_inside_a_section_is_never_mistaken_for_a_refusal(env, mo
     def broken(self, conn, proposal, command_id, allowed=None, **_options):
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(ConversationHabits, "apply", broken)
-    result, _ = run(env, lambda shown, context: Appraisal(reason="She asked", values={"mood": 99},
-        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="She asked", expected_revision=0)), job_id=job)
+    result, _ = run(env, lambda shown, context: Appraisal(reason="The owner asked", values={"mood": 99},
+        habits=HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[owner], reason="The owner asked", expected_revision=0)), job_id=job)
     assert result["state"] == "pending" and result["error"] == "OperationalError"
     assert env.mind.read()["dimensions"] == before["dimensions"] and "rejected_sections" not in env.job(job)
 
@@ -585,7 +585,7 @@ def maintenance(env):
 
 
 INVENTED = {"reason": "Rotate", "session_advice": {"action": "recall", "reason": "Thin context", "evidenceIds": ["invented-observation"],
-            "findings": [{"sourceId": "turn-1", "kind": "task-omission", "quote": "about the clock", "reason": "She repeated it"}]}}
+            "findings": [{"sourceId": "turn-1", "kind": "task-omission", "quote": "about the clock", "reason": "The owner repeated it"}]}}
 
 
 def test_session_maintenance_with_refused_advice_is_repaired_once_and_committed(env, monkeypatch):
@@ -653,7 +653,7 @@ def test_session_maintenance_is_not_repaired_with_the_switch_off(env, monkeypatc
 
 def test_refused_finding_names_no_owner_words(env):
     job = maintenance(env)
-    advice = SessionAdvice(action="keep", reason="Fine", findings=[SessionFinding(sourceId="turn-1", kind="repeat-share", quote="words she never said", reason="Guess")])
+    advice = SessionAdvice(action="keep", reason="Fine", findings=[SessionFinding(sourceId="turn-1", kind="repeat-share", quote="words the owner never said", reason="Guess")])
     result, _ = run(env, None, job_id=job, session=SESSION, provider=type("Scripted", (), {"appraise": lambda self, context: (Appraisal(reason="Keep", session_advice=advice), dict(RECEIPT))})())
     assert result["state"] == "complete"
     assert env.job(job)["rejected_sections"] == [{"section": "session_advice", "code": "finding-source-mismatch", "message": "Session finding needs an exact owner source"}]
@@ -711,7 +711,7 @@ def test_review_that_cannot_show_its_plan_registers_no_version_and_reopens_its_r
         # It is listed, as any plan is, but not as the active plan under review; it becomes active again while the model thinks.
         assert shown[plan["id"]]["status"] == "paused"
         env.plans.manage({"command_id": "resume", "action": "resume", "id": plan["id"], "expected_revision": paused["revision"],
-                          "reason": "She is done", "evidence_ids": [env.initial], "next_review_at": later(env, days=30)})
+                          "reason": "The owner is done", "evidence_ids": [env.initial], "next_review_at": later(env, days=30)})
         with env.mind.engine.db.connect(write=True) as conn:
             resumed = {**env.plans.get(conn, plan["id"]), "agent_version": "planning-v1"}
             conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (json.dumps(resumed), plan["id"]))

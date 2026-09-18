@@ -48,7 +48,10 @@ class Procedures:
             if data.get("result", {}).get("verified"):
                 return {"case_id": data["plan_id"], "source_id": data["result"]["source_id"], "external": data["actor"] == "contact"}
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_runtime_events'").fetchone():
-            row = conn.execute("SELECT data FROM mind_runtime_events WHERE scope=? AND id=? AND kind IN ('task-result','artifact-created','delivery')", (self.scope, identifier)).fetchone()
+            # The model is shown each event's own host id; the table is keyed by the hashed one.
+            # Both resolve to the same row, so citing what was shown is not a forged result.
+            scoped = "runtime_" + digest([self.scope, identifier])[:32]
+            row = conn.execute("SELECT data FROM mind_runtime_events WHERE scope=? AND id IN (?,?) AND kind IN ('task-result','artifact-created','delivery')", (self.scope, identifier, scoped)).fetchone()
             if row:
                 data = json.loads(row[0])
                 if data.get("kind") == "artifact-created":

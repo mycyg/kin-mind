@@ -66,7 +66,9 @@ class Evolution(Model):
 
 class Motivation(Model):
     target: StrictInt = Field(ge=0, le=100)
-    half_life_minutes: Literal[20, 60, 180]
+    # A short-term drive, in minutes: ten for a passing impulse, twelve hours for a slow one.
+    # Anything outside the range is refused by the schema, like every other bound here.
+    half_life_minutes: StrictInt = Field(ge=10, le=720)
     reason: str = Field(min_length=1, max_length=1200)
 
 
@@ -479,6 +481,12 @@ class Mind(Continuity):
                     return False
             except Conflict:
                 return False
+        if desire.get("trait_revisions"):
+            # A wish committed on a trait rests on the revision that trait had. One owner sentence
+            # can end it, and a wish standing on what the ledger no longer carries is not ready.
+            from .trait_refs import links_fresh
+            if not links_fresh(conn, self, desire):
+                return False
         return (
             desire["kind"] == "contact"
             and desire["status"] == "wanted"
@@ -709,9 +717,14 @@ class Mind(Continuity):
         return {"desire_id": did, "desire_revision": desire["revision"]}
 
     def _evolve(self, conn, state, request, refs, event_id):
+        from .autonomy_schema import optimized
         validate_trait_changes(load_persona(self.engine, self.scope), request.evolution.traits)
         if request.evolution.revert_event_id:
             return self._revert(conn, state, request, refs, event_id)
+        if request.evolution.traits and optimized(conn, self.scope.key(), "trait_ledger"):
+            # One writer for a trait. The ledger records what it rests on, per observation and per
+            # episode, and can revoke one trait alone; a snapshot written here can do neither.
+            raise Conflict("The trait ledger is the only writer of traits", code="traits-owned-by-ledger")
         spec = state["profile"]["evolution"]
         day = (
             timestamp(self.clock())
@@ -721,21 +734,39 @@ class Mind(Continuity):
         )
         if state["last_evolution_day"] == day:
             raise Conflict("Personality was already evaluated today")
-        interactions = {
-            r["hash"]
-            for r in refs
-            if r["authority"] == "explicit"
-            and r["metadata"].get("role") == "user"
-            and r["metadata"].get("host_event") == "message"
-        }
+        from .autonomy_schema import optimized
+        chain = optimized(conn, self.scope.key(), "behavior_chain")
+        if chain:
+            # An evening of ten messages counted as ten independent interactions while interactions
+            # were content hashes. One interaction window is one episode, which can only be stricter.
+            from .behavior_chain import owner_episodes
+            interactions = owner_episodes(self, conn, refs)
+        else:
+            interactions = {
+                r["hash"]
+                for r in refs
+                if r["authority"] == "explicit"
+                and r["metadata"].get("role") == "user"
+                and r["metadata"].get("host_event") == "message"
+            }
         if len(interactions) < spec["minimum_interactions"]:
             raise Conflict(
                 "Personality changes require three independent user interactions"
             )
-        sk, proposal = SelfKnowledge(self.engine, self.scope), request.evolution
+        sk, proposal = SelfKnowledge(self.engine, self.scope, clock=self.clock if chain else now), request.evolution
         claim = sk._get(conn, proposal.claim_id, "claim")
         assessment = sk._get(conn, proposal.assessment_id, "assessment")
         prediction = sk._get(conn, metadata(assessment)["prediction_id"], "prediction")
+        if chain:
+            # What decides how Kin behaves, not the version string that moves for every unrelated
+            # edit. An entry written before the stamp existed carries none and is not compatible.
+            from .compat import holds, stamp as compat_stamp
+            current = compat_stamp(self, conn, state)
+            def compatible(row):
+                return holds(metadata(row).get("compat"), current)
+        else:
+            def compatible(row):
+                return metadata(row).get("agent_version") == request.agent_version
         if (
             metadata(claim).get("basis") != "hypothesis"
             or metadata(prediction).get("claim_id") != claim["id"]
@@ -744,11 +775,15 @@ class Mind(Continuity):
             or metadata(prediction).get("claim_revision") != claim["revision"]
             or any(
                 r["status"] not in {"active", "unverified"}
-                or metadata(r).get("agent_version") != request.agent_version
+                or not compatible(r)
                 or not sk._fresh(conn, r)
                 for r in (claim, prediction, assessment)
             )
         ):
+            if chain:
+                raise Conflict(
+                    "A current, compatible prospective behavioral check is required"
+                )
             raise Conflict(
                 "A current, version-matched prospective behavioral check is required"
             )
@@ -885,6 +920,12 @@ class Mind(Continuity):
             d = deepcopy(desire)
             d["needs_review"] = not self._fresh(conn, d["evidence"])
             d["expired"] = timestamp(d["expires_at"]) <= timestamp(at)
+            if d.get("trait_revisions"):
+                # Only where a wish really was committed on a trait, so a view without the ledger
+                # is the view it was. It is not dropped and it does not quietly stay ready: this is
+                # the reason a reader is given, and `trait-wish-review` moves it to `waiting`.
+                from .trait_refs import links_fresh
+                d["trait_needs_review"] = not links_fresh(conn, self, d)
             desires.append(d)
         values = {}
         for key, entry in state["dimensions"].items():
@@ -915,6 +956,13 @@ class Mind(Continuity):
             k: dict(v, needs_review=not self._entry_fresh(conn, v))
             for k, v in state["traits"].items()
         }
+        # The ledger is the writer once it is switched on. It answers in the dict shape every
+        # older reader already knows, and carries its own projection beside it.
+        from .traits import ledger_view
+        ledger = ledger_view(conn, self, at)
+        if ledger:
+            # Only the ledger's own switch produces `legacy`; the chain's projection travels beside it.
+            traits = {**traits, **ledger.get("legacy", {})}
         contact = deepcopy(state["profile"]["contact"])
         preference = state.get("contact_preference")
         if preference:
@@ -925,7 +973,7 @@ class Mind(Continuity):
                 "needs_review": not self._fresh(conn, preference["evidence"]),
                 "evidence_ids": [r["record_id"] for r in preference["evidence"]],
             }
-        return {
+        view = {
             "revision": state["revision"],
             "scope": self.scope.model_dump(),
             "as_of": at,
@@ -943,6 +991,10 @@ class Mind(Continuity):
             "action_events": [{**json.loads(r["data"]), "id": r["id"], "kind": r["kind"], "state": r["state"]}
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
         }
+        if ledger:
+            # Only what a switch that is on produced: with both off this view is what it was, key for key.
+            view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
+        return view
 
     def read(self, *, as_of=None, history=0, query=""):
         if not 0 <= history <= 100:
@@ -1076,11 +1128,11 @@ class Mind(Continuity):
 
             if self._action_review_pending(conn):
                 return {"eligible": False, "reason": "action-appraisal-pending"}
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
-            if not semantic and view["dimensions"]["initiative"]["needs_review"]:
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
+            if legacy and view["dimensions"]["initiative"]["needs_review"]:
                 return {"eligible": False, "reason": "state-needs-review"}
-            if not semantic and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
+            if legacy and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
                 return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
@@ -1113,8 +1165,8 @@ class Mind(Continuity):
                 raise Conflict("Action appraisal is pending")
             state = self._load(conn)
             view = self._view(conn, state, self.clock())
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
             ready = [
                 d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
             ]
@@ -1122,7 +1174,7 @@ class Mind(Continuity):
                 not ready
                 or (view.get("action_policy") or {}).get("needs_review")
                 or view["contact"].get("preference", {}).get("needs_review")
-                or (not semantic and (view["dimensions"]["initiative"]["needs_review"]
+                or (legacy and (view["dimensions"]["initiative"]["needs_review"]
                 or view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]))
             ):
                 raise Conflict("The contact threshold or desire is no longer current")
@@ -1168,8 +1220,8 @@ class Mind(Continuity):
             desire = state["desires"].get(attempt["desire_id"])
             view = self._view(conn, state, self.clock())
             value = view["dimensions"]["initiative"]
-            from .autonomy_schema import enabled
-            semantic = enabled(conn, self.scope.key())
+            from .autonomy_schema import legacy_thresholds
+            legacy = legacy_thresholds(conn, self.scope.key())
             valid = (
                 attempt["state"] == "drafting"
                 and not (view.get("action_policy") or {}).get("needs_review")
@@ -1178,7 +1230,7 @@ class Mind(Continuity):
                 and desire
                 and desire["revision"] == attempt["desire_revision"]
                 and self._desire_ready(conn, desire, self.clock())
-                and (semantic or (not value["needs_review"]
+                and (not legacy or (not value["needs_review"]
                 and value["projected_value"] >= state["profile"]["contact"]["threshold"]))
             )
             return {
@@ -1259,9 +1311,13 @@ class Mind(Continuity):
                 if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
                     self._retarget(conn, current, self.clock())
                     eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
+                    stranded = False
                     if reason == "draft-failed":
                         failures = desire.get("contact_failures", 0) + 1
                         desire["contact_failures"] = failures
+                        # Past the third failure the wait needs evidence that may never come. Keep
+                        # the backoff, and let the model decide this wish's fate instead.
+                        stranded = failures >= 3
                         decision = ContactDecision(action="wait", reason="Draft generation or parsing failed",
                             condition="time" if failures < 3 else "new_evidence",
                             retry_after_seconds=300 * failures)
@@ -1280,6 +1336,14 @@ class Mind(Continuity):
                     current["updated_at"] = self.clock()
                     self._save(conn, current)
                     self._history(conn, eid, current, "contact-deferred", attempt)
+                    if stranded:
+                        from .actions import ActionEvents
+                        ActionEvents(self).emit(conn, "wish-review", [desire["id"], "draft-failed", failures], {
+                            "desire_id": desire["id"],
+                            "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                            "agent_version": current["agent_version"],
+                            "reason": "Drafting this wish failed three times",
+                        })
             if state == "accepted":
                 current = self._load(conn)
                 desire = current["desires"][attempt["desire_id"]]

@@ -124,3 +124,16 @@ test('a group that is merely held is still unconfirmed, never mistaken for retir
   const evidence=await f.adapter.collect(f.snapshot);
   assert.deepEqual(['bubble-0','bubble-1','bubble-2'].map(id=>evidence.receipts[id].state),['unconfirmed','unconfirmed','unconfirmed']);
 });
+
+test('a bubble the transport will never deliver is reported as that, not as an unconfirmed delivery',async t=>{
+  for(const [state,reason,reported] of [['rejected','platform-rejected','platform-rejected'],['undeliverable','file-exceeds-channel-limit','file-exceeds-channel-limit'],
+    ['undeliverable','A sentence the platform wrote','transport-undeliverable']]) {
+    const f=manifestFixture(t);
+    await f.manifests.mutate('reply-deferred',m=>{Object.assign(m.bubbles[0],{state,reason});},{operatorOnly:true});
+    const evidence=await f.adapter.collect(f.snapshot);
+    assert.deepEqual(evidence.receipts['bubble-0'],{state,reason:reported,source:'transport-manifest'},'the state and a static reason, never the platform’s own words');
+    assert.deepEqual(evidence.input.outputs.find(o=>o.id==='bubble-0'),{id:'bubble-0',undelivered:true,reason:reported,receivedByServer:false});
+    assert.equal(evidence.receipts.reply.state,'accepted','what was delivered is unchanged');
+    assert.deepEqual(evidence.input.cancellableDeferred,[],'a group one of whose bubbles is settled is no longer a deferred draft');
+  }
+});

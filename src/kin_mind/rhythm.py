@@ -20,6 +20,25 @@ def stamp(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
+# The one phase that means the role is not up. `drowsy` is still on its way there.
+REST_PHASE = "resting"
+
+
+def quiet_hours(contact, at):
+    """Whether `at` falls inside the owner's do-not-disturb window, in their own timezone."""
+    start, end = contact.get("quiet_start"), contact.get("quiet_end")
+    if type(start) is not int or type(end) is not int or start == end:
+        return False
+    hour = stamp(at).astimezone(ZoneInfo(contact.get("timezone") or "Asia/Singapore")).hour
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def at_rest(view, at):
+    """The owner's night as the host sees it: the rhythm resting, or their quiet hours."""
+    return ((view.get("rhythm") or {}).get("phase") == REST_PHASE
+            or quiet_hours(view.get("contact") or {}, at))
+
+
 def interaction_windows(conn, scope, at, timezone="Asia/Singapore"):
     cutoff = (stamp(at) - timedelta(days=14)).isoformat()
     rows = conn.execute(
