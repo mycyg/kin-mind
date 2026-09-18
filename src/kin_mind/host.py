@@ -111,6 +111,12 @@ def dispatch(config, action, request):
     if action == "recover-appraisals":
         from .recovery import recover_quarantined
         return recover_quarantined(mind, **request)
+    if action.startswith("history-"):
+        # Operator actions on the stored history itself. Each one registers with the history
+        # registry instead of adding a branch here, so a package that ships a new command does
+        # not have to touch this dispatch to be reachable.
+        from .history_admin import dispatch as history_command
+        return history_command(mind, action, request)
     if action == "appraisal-attempts":
         # Read-only accounting: outcomes, static codes, digests and usage. No private text.
         from .attempts import read as read_attempts

@@ -343,6 +343,9 @@ class Mind(Continuity):
         return "mind:" + digest([self.scope.key(), command_id])
 
     def _history(self, conn, event_id, state, kind, payload):
+        # The row's own shape belongs to the history layer, not here: this writes what a whole
+        # snapshot looks like, and a later reader asks that same layer what the row means.
+        from .history import snapshot_row
         conn.execute(
             "INSERT INTO mind_events VALUES(?,?,?,?,?,?)",
             (
@@ -351,7 +354,7 @@ class Mind(Continuity):
                 state["revision"],
                 kind,
                 self.clock(),
-                dumps({"request": payload, "snapshot": state}),
+                dumps(snapshot_row(payload, state)),
             ),
         )
 
@@ -873,11 +876,12 @@ class Mind(Continuity):
             raise Conflict(
                 "A later personality revision exists; review it before reverting"
             )
-        before = conn.execute(
-            "SELECT data FROM mind_events WHERE scope=? AND revision=?",
-            (self.scope.key(), row["revision"] - 1),
-        ).fetchone()
-        previous = json.loads(before[0])["snapshot"]
+        # What the profile was before that evolution, read through the history layer: the row
+        # before it rather than the revision before it, and verified against its own hash. A
+        # reversion that cannot show the state it is restoring restores nothing — the layer
+        # raises `history-rebuild-failed` here and the whole commit goes back.
+        from .history import before
+        previous = before(conn, self.scope.key(), row["revision"])
         for key, old in state["dimensions"].items():
             spec = previous["profile"]["dimensions"][key]
             old.update(
@@ -1038,19 +1042,10 @@ class Mind(Continuity):
                 result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
             self._continuity_view(conn, state, result, at, query)
             if history:
-                result["history"] = [
-                    dict(
-                        id=r["id"],
-                        kind=r["kind"],
-                        revision=r["revision"],
-                        occurred_at=r["occurred_at"],
-                        **json.loads(r["data"]),
-                    )
-                    for r in conn.execute(
-                        "SELECT * FROM mind_events WHERE scope=? ORDER BY revision DESC LIMIT ?",
-                        (self.scope.key(), history),
-                    )
-                ]
+                # The same six keys as before. How a revision is stored is the layer's business,
+                # and one revision it cannot rebuild costs that entry its snapshot, not the list.
+                from .history import entries
+                result["history"] = entries(conn, self.scope.key(), history)
             return result
 
     @staticmethod
