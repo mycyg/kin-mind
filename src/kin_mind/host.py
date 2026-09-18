@@ -252,8 +252,8 @@ def dispatch(config, action, request):
             result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
         return result
     if action == "memory-context":
-        from .dialogue import clock_context
         from .adaptive_recall import select_mode
+        from .dialogue import clock_context
         requested_mode = request.get("mode", "auto")
         if request.get("purpose") == "read" and requested_mode == "auto":
             requested_mode = "deep"
@@ -429,6 +429,30 @@ def dispatch(config, action, request):
                 "autonomy": view.get("autonomy", {})}
     if action == "explore":
         stop = Path(config["exploration_stop_file"])
+        backend = config.get("exploration_backend") or "kimi"
+        if backend == "codex":
+            # The backend switch is explicit config. An executor that cannot start
+            # pauses the exploration with a recorded reason; there is no fallback.
+            from .codex_executor import prepare_codex_exploration
+            prepared = prepare_codex_exploration(config)
+            if prepared["state"] != "ready":
+                return prepared
+            budget = min(int(request.get("budget_seconds") or prepared["budget_seconds"]),
+                         prepared["budget_seconds"])
+            return explorer.run(
+                prepared["executable"],
+                config["exploration_directory"],
+                config["agent_version"],
+                canceled=stop.exists,
+                model=prepared["model"],
+                runner=prepared["runner"],
+                brief=request.get("brief"),
+                desire_id=request.get("desire_id"),
+                budget_seconds=budget,
+                computer=config.get("computer_exploration"),
+            )
+        if backend != "kimi":
+            raise ValueError("Unknown exploration_backend: " + str(backend))
         return explorer.run(
             config["kimi_executable"],
             config["exploration_directory"],
