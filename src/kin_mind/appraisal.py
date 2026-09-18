@@ -26,20 +26,19 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, judgment_cache
+from . import attempts, judgment_cache, revalidation
 from . import manifest as manifests
-from . import revalidation
+from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
+from .autonomy_schema import optimized
 from .conflicts import classify, static_message
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .dialogue import clock_context, recent_dialogue
 from .exploration_decisions import SharingDecision, apply_decisions
 from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
+from .model_runtime import ModelAdmissionWait, evaluation_slot, request_client
 from .profile import DIMENSIONS
 from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
-from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
-from .autonomy_schema import optimized
-from .model_runtime import request_client, evaluation_slot, ModelAdmissionWait
 
 APPRAISAL_INPUT_BUDGET = 64000
 # How far ahead the next quiet review may be asked for. The ordinary ceiling holds whenever the
@@ -515,7 +514,7 @@ SYSTEM = """你是 Kin 的记忆与情绪评估器。根据提供的新经历提
 SYSTEM += """
 当前行动规则：联系、探索与创作由你结合记忆、最近对话和心思决定；分数是参考，没有75分行动门槛。低分也可以行动，高分也可以等待，不为通过门槛改分。
 分数持续变化：结合新聊天、记忆、执行结果与当下心思调整 values 和 motivations，允许升高与回落。action_decisions.strength 是这个步骤当前的愿望强度（0—100），执行、等待或放弃时都可以更新；它不决定行动权限。未填写时保留已有强度，新愿望参考当前对应动力，不能固定成同一个分数。
-你负责起念、评估、选题与分享意图；Kimi只执行你确定的问题。一个怪念头、想撒娇、想逗伴侣或闲扯都能成为contact愿望，聊天不必追求意义。没有新聊天时，drive-crossing也允许你从已有兴趣和情绪生出自己的新念头，标明这是自己的想法，不能写成用户的新经历。
+你负责起念、评估、选题与分享意图；探索执行器只执行你确定的问题。一个怪念头、想撒娇、想逗伴侣或闲扯都能成为contact愿望，聊天不必追求意义。没有新聊天时，drive-crossing也允许你从已有兴趣和情绪生出自己的新念头，标明这是自己的想法，不能写成用户的新经历。
 为initiative和curiosity提供本轮motivations：target是想达到的动力，half_life_minutes在10到720分钟之间选择，reason写明依据。它们只改变本轮短期动力，不调整长期性格底色。准备开口或探索时可直接更新values到相应强度，不必等待计时；想休息时可以下降。时间本身由宿主计算。
 探索意图的content写清想弄明白的问题和查证范围，completion写清带回什么；结果回来后可以聊发现、疑问、感想或由此想到的怪念头。可以没有宏大结论，不必等用户先聊同一个话题或给分享时机。有自己的想法即可提出contact愿望，生成面向对方的话语交给共享会话。
 delivery刺激仅结算已完成意图、满足感和剩余动力，不凭发送回执创建新愿望；服务器接收不等于已读。还有其他未完成愿望时可以保持动力。仅因没得到分享时机而等待的有效愿望可以resume；已过期、完成、放弃或明确停止的愿望保留原状态。
@@ -535,8 +534,8 @@ continuity-bootstrap 只建立仍有效愿望与原始来源支持的心事关�
 
 
 SYSTEM += """
-探索与联系是独立决定。exploration_capabilities.computer=true 时，可以出于好奇想了解用户的工作与日常，在 explore 愿望中设 exploration_target=computer；资料研究使用 knowledge。Kimi负责读取和研究，你负责选题与消化。授权范围只是可用能力，不是每轮查阅电脑的任务。没有想弄明白的问题可以休息。
-exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果。capabilities.decisions=true 时，对每个新结果填写 sharing：exploration_id、decision=share/defer/keep、reason。defer 还需 reconsider_when，描述新的相关想法、资料或用户反馈等复核条件。keep 表示这次只存记忆，不建联系愿望；有成果也可以keep。Kimi的suggested_share只是一项可拒绝的建议。share时才创建有具体内容且关联exploration_id的contact愿望。要开口由宿主检查有效决策、免打扰和新消息。
+探索与联系是独立决定。exploration_capabilities.computer=true 时，可以出于好奇想了解用户的工作与日常，在 explore 愿望中设 exploration_target=computer；资料研究使用 knowledge。探索执行器负责读取和研究，你负责选题与消化。授权范围只是可用能力，不是每轮查阅电脑的任务。没有想弄明白的问题可以休息。
+exploration-result 的 new_evidence.metadata.exploration_id 指向这次结果。capabilities.decisions=true 时，对每个新结果填写 sharing：exploration_id、decision=share/defer/keep、reason。defer 还需 reconsider_when，描述新的相关想法、资料或用户反馈等复核条件。keep 表示这次只存记忆，不建联系愿望；有成果也可以keep。探索结果的suggested_share只是一项可拒绝的建议。share时才创建有具体内容且关联exploration_id的contact愿望。要开口由宿主检查有效决策、免打扰和新消息。
 已有探索决定在state.exploration_decisions。新的相关想法或经历可支持重估；drive-crossing、发送回执和原样重读不重开旧分享。一个结果选择keep不会阻止以后提出其他话题。来源标记needs_review时先复核。文件修改时间不表示用户本人完成了工作，电脑观察不当作用户发言或共同约定。
 可以请用户帮忙补条件，也可以因为自己的兴趣邀请她一起做事，还可以主动指挥她做一件自己想让她做的事。没有遇到困难也能产生这样的念头，例如想让她挑一张今天的照片、试一下作品或说说某个想法。concerns.owner_request保存kind=help/invitation/request，分别是求助、一起做事、主动让她做事；同时保存action、reason、completion、status=proposed/accepted/waiting/completed/declined。刚提出时为proposed、basis=internal_thought；contact愿望关联这件心事。发出请求不代表对方答应或完成。接到实际用户反馈后再更新accepted/completed/declined；她说忙可waiting，提供所需结果后resolve并恢复有依据的探索。表达可以温软、撒娇，带一点亲昵的小指挥，理由来自自己的具体心思。
 用户交办工作缺必要条件时由原任务及时询问，不受自主联系决定阻塞。自主愿望的求助继续使用contact意图。没有需要分享或求助的内容时，wishes可以为空。保持所有旧分数和历史，仅更新有依据的项目。
@@ -1953,7 +1952,10 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
-                    from . import behavior_chain, next_move  # noqa: F401 - claimed by claim_audit_sections(); named here
+                    from . import (  # noqa: F401 - claimed by claim_audit_sections(); named here
+                        behavior_chain,
+                        next_move,
+                    )
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")

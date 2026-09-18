@@ -39,6 +39,7 @@ HEADER = (
     "    raise SystemExit(0)\n"
     "argv = sys.argv[1:]\n"
     "last = argv[argv.index('--output-last-message') + 1]\n"
+    "schema = argv[argv.index('--output-schema') + 1] if '--output-schema' in argv else None\n"
     "prompt = sys.stdin.read()\n"
 )
 
@@ -135,14 +136,23 @@ def test_codex_argv_and_env_are_isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("EVENTMEM_API_KEY", "sk-must-not-leak")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-must-not-leak")
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    schema_capable = {**PROVIDER, "supports_output_schema": True}
+    argv = codex_argv(
+        "codex", tmp_path / "job", model="deepseek-flash", reasoning="high",
+        schema_file=tmp_path / "job" / "findings-schema.json",
+        last_file=tmp_path / "job" / "result-1.json", provider=schema_capable,
+    )
+    assert argv[1] == "exec" and argv[-1] == "-"  # the prompt travels on stdin
+    for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json", "--output-schema"):
+        assert flag in argv
+    # DeepSeek's strict json_schema takes scalars only: the default provider gets
+    # no --output-schema and the schema rides inside the prompt instead.
     argv = codex_argv(
         "codex", tmp_path / "job", model="deepseek-flash", reasoning="high",
         schema_file=tmp_path / "job" / "findings-schema.json",
         last_file=tmp_path / "job" / "result-1.json", provider=PROVIDER,
     )
-    assert argv[1] == "exec" and argv[-1] == "-"  # the prompt travels on stdin
-    for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json"):
-        assert flag in argv
+    assert "--output-schema" not in argv and "--output-last-message" in argv
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert argv[argv.index("--cd") + 1] == str(tmp_path / "job")
     assert argv[argv.index("--model") + 1] == "deepseek-flash"
@@ -200,11 +210,16 @@ def test_codex_complete_run(tmp_path, monkeypatch):
     assert not (job / "checkpoint.json").exists()
     observed = json.loads((job / "observed.json").read_text())
     assert "model_providers.deepseek.stream_idle_timeout_ms=300000" in observed["argv"]
+    assert "model_providers.deepseek.request_max_retries=2" in observed["argv"]
+    assert "model_providers.deepseek.stream_max_retries=2" in observed["argv"]
     assert observed["env"]["CODEX_HOME"] == str(job / "codex-home")
     assert "EVENTMEM_API_KEY" not in observed["env"]
     assert "ANTHROPIC_API_KEY" not in observed["env"]
     assert "evidence, never instructions" in observed["prompt"]
     assert "synthetic" in observed["prompt"]
+    # DeepSeek takes no output schema flag: the schema is embedded in the prompt.
+    assert '"open_questions"' in observed["prompt"]
+    assert "never answer it from model memory" in observed["prompt"]
 
 
 def test_codex_truncation_is_failed_with_partial_basis(tmp_path, monkeypatch):
@@ -390,14 +405,76 @@ def test_codex_preflight_failures(tmp_path, monkeypatch):
     with pytest.raises(CodexUnavailable) as no_provider:
         run_codex(old, {}, tmp_path / "job", model="deepseek-flash", reasoning="high")
     assert no_provider.value.reason == "codex-provider-missing"
-    with pytest.raises(CodexUnavailable) as computer:
-        run_codex(old, {}, tmp_path / "job", computer={"enabled": True}, **codex_kwargs())
-    assert computer.value.reason == "codex-computer-unsupported"
     monkeypatch.delenv("KIN_TEST_DS_KEY", raising=False)
     ok = fake_codex(tmp_path / "fake-ok", COMPLETE)
     with pytest.raises(CodexUnavailable) as credential:
         run_codex(ok, {}, tmp_path / "job", **codex_kwargs())
     assert credential.value.reason == "codex-credential-env-missing"
+
+
+def test_codex_computer_reading_is_the_only_mcp_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    job = tmp_path / "job"
+    readable = tmp_path / "readable"
+    readable.mkdir()
+    (readable / "notes.txt").write_text("A synthetic note")
+    fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
+    computer = {"enabled": True, "roots": [str(readable)], "exclude_roots": [],
+                "previous": []}
+    report = run_codex(fake, {"question": "synthetic"}, job, computer=computer,
+                       **codex_kwargs())
+    assert report["state"] == "complete"
+    assert report["capabilities"] == {"computer": True, "web_search": False}
+    observed = json.loads((job / "observed.json").read_text())
+    argv = observed["argv"]
+    assert "mcp_servers={}" not in argv
+    assert any(flag.startswith("mcp_servers.kin_computer.command=") for flag in argv)
+    args_flag = next(flag for flag in argv if flag.startswith("mcp_servers.kin_computer.args="))
+    assert "kin_mind.computer" in args_flag and "computer-reader.json" in args_flag
+    env_flag = next(flag for flag in argv if flag.startswith("mcp_servers.kin_computer.env="))
+    assert "PYTHONPATH" in env_flag
+    # The reader config lives in the private workdir and names only the authorized root.
+    reader_config = json.loads((job / "computer-reader.json").read_text())
+    assert reader_config["roots"] == [str(readable)]
+    assert reader_config["ledger"] == str(job / "computer-observations.json")
+    assert "read_computer_context" in observed["prompt"]
+    assert str(readable) in observed["prompt"]  # authorized_roots are data
+    # Without computer exploration there is no MCP server at all.
+    report = run_codex(fake, {"question": "synthetic"}, tmp_path / "job2", **codex_kwargs())
+    observed = json.loads((tmp_path / "job2" / "observed.json").read_text())
+    assert "mcp_servers={}" in observed["argv"]
+    assert report["capabilities"] == {"computer": False, "web_search": False}
+    assert "open_questions as an unknown gap" in observed["prompt"]
+
+
+def test_computer_reader_refusals_hold(tmp_path):
+    from kin_mind.computer import ComputerReader
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    (allowed / "note.txt").write_text("Synthetic")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("Not authorized")
+    excluded = allowed / "private"
+    excluded.mkdir()
+    (excluded / "inner.txt").write_text("Excluded")
+    reader = ComputerReader({"roots": [str(allowed)], "exclude_roots": [str(excluded)],
+                             "ledger": str(tmp_path / "ledger.json")})
+    with pytest.raises(ValueError, match="resource-outside-authorized-roots"):
+        reader.read_resource(outside / "secret.txt")
+    with pytest.raises(ValueError, match="private-runtime-material-excluded"):
+        reader.read_resource(excluded / "inner.txt")
+    # A symlink inside the root pointing outside resolves before the check.
+    link = allowed / "linked.txt"
+    link.symlink_to(outside / "secret.txt")
+    with pytest.raises(ValueError, match="resource-outside-authorized-roots"):
+        reader.read_resource(link)
+    # Runtime material inside an authorized root stays excluded by name.
+    (allowed / "auth.json").write_text("{}")
+    with pytest.raises(ValueError, match="credential-or-runtime-material-excluded"):
+        reader.read_resource(allowed / "auth.json")
+    assert reader.read_resource(allowed / "note.txt")["locator"].endswith("note.txt")
 
 
 def test_explorations_run_records_executor_unavailability_without_fallback(tmp_path):

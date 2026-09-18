@@ -32,7 +32,7 @@ from kin_mind.traits import Traits
 # Re-pinned once when every package landed together: WP6's three switch-less changes to the
 # shared prompt (the widened half-life range, the stated procedure premise, the owner named by
 # role) move every request that offers anything, this one included.
-LEDGER_REQUEST = "21996e6ec09bb3da03f59d86b9f0f0c946c696c76bffd6eab92a28feb9874c87"
+LEDGER_REQUEST = "8347251d91f092a096e5249204d97198bf86f8bf70c4a9dc20bedabd2efa47c6"
 LEDGER_SECTIONS = ("trait_observations", "trait_decisions")
 
 

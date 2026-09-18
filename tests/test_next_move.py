@@ -46,7 +46,7 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
 # already told it, that a host internal event is not evidence: production refused both
 # sections on two of its first four appraisals for citing exactly that.
-MOVE_REQUEST = "95aa8ca745cab34c08c1cf91eb887faf0ea86ab2cd7ec81dd4ec5d22440abbe4"
+MOVE_REQUEST = "520bce80a6c33347e937a16030aaed663a478ba5ec5477caedafd524a8bd4af7"
 MOVE_SECTIONS = ("next_move",)
 
 
