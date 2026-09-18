@@ -19,27 +19,39 @@ from importlib import import_module
 
 # Modules that register a command when they are imported. A package appends its own; the import is
 # deferred to the call so that a host which never runs a history command never pays for them.
-PROVIDERS: tuple[str, ...] = ("kin_mind.history_status",)
+PROVIDERS: tuple[str, ...] = ("kin_mind.history_status", "kin_mind.history_compaction")
 
 COMMANDS: dict[str, object] = {}
+# The commands that are handed the host's own configuration as well as the mind. Only the ones that
+# have to look outside the database for their answer: where the host keeps its pid files and its
+# status file is not something the store knows, and a command that proves nothing is running cannot
+# be told to trust the request for it.
+NEEDS_CONFIG: set[str] = set()
 
 
-def command(name):
+def command(name, *, config=False):
     """Register a handler as the `history-*` action of that name."""
     if not name.startswith("history-"):
         raise RuntimeError("A history command's name starts with history-")
 
     def register(handler):
         COMMANDS[name] = handler
+        if config:
+            NEEDS_CONFIG.add(name)
         return handler
 
     return register
 
 
-def dispatch(mind, action, request):
+def dispatch(mind, action, request, config=None):
     for module in PROVIDERS:
         import_module(module)
     handler = COMMANDS.get(action)
     if handler is None:
         raise ValueError("Unknown history operation")
+    if action in NEEDS_CONFIG:
+        # Positionally, so a request can never supply it: what the host is running is the host's own
+        # account of itself, and a caller that could pass its own would be back to asserting that
+        # the workers are stopped.
+        return handler(mind, config, **(request or {}))
     return handler(mind, **(request or {}))
