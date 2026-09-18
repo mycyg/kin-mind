@@ -59,7 +59,7 @@ export function createMobileReviewer({key,fetchImpl=fetch,onUsage=()=>{},lease=n
             messages:[{role:'user',content:JSON.stringify(input)}],thinking:{type:'enabled'},output_config:{effort:'high'},
             tools:[{name,description:'Submit the structured result. Call this tool exactly once to finish the review.',input_schema:schema}],tool_choice:{type:'auto'}}),
         });
-      } catch(error) {report({usageStatus:'unknown',outcome:slot?.lost?'lease-lost':'transport-failed'});throw error;}
+      } catch(error) {report({usageStatus:'unknown',outcome:slot?.lost?'lease-lost':slot?.expired?'lease-expired-unconfirmed':'transport-failed'});throw error;}
       if(!response.ok){report({usageStatus:'unknown',outcome:'provider-http-'+response.status});throw Error('deepseek-http-'+response.status);}
       let body;
       try {body=await response.json();}

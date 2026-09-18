@@ -18,6 +18,19 @@ requests do not create work or invalidate a completion proposal. Literal native
 commands have their own protocol path; natural phrasing is not matched by a
 collection of regular expressions.
 
+A classification that fails decides nothing (KIN-ITER-20260918-02, revising the
+old "classification anomaly becomes work" tradeoff): no task is manufactured, no
+provider switch happens and no execution grant is made. The input waits in the
+durable `semantic-pending` state — input id and version basis, the real tasks and
+actual model at capture, the failure class (`timeout`, `http`, `parse` or
+`unavailable`) and the next bounded review condition — and the same input is asked
+of DeepSeek again under a bounded, persistent budget. A late answer is applied to
+the state of now: it checks the task's input version, cancel state and generation
+before routing, and a work answer that arrives after a stop is retired rather than
+resurrected. When the budget is exhausted the input becomes `semantic-failed`,
+visible to the ops and reply chains — never silently swallowed, never routed by
+the failure itself.
+
 Entering work mode takes effect at an idle boundary. An exit request remains
 pending until the task is delivered. A completion proposal alone does not release
 work: the host requires `completedTaskId` and `completedInputVersion`, then checks native turn completion, tool states,
@@ -47,10 +60,16 @@ task. A mixed message that also requests code, a document or a repair remains wo
 A mode request can set `notify: true`. After native model verification, the host
 creates a durable notification with a stable output ID. The owner-bound sender
 and its durable outbox are injected through `flushNotices({send, lookup})`.
-Successful delivery requires a platform message ID. A missing ID or timeout is
-reconciled against that same outbox record; it does not trigger another model
-turn or a fresh send. Only a confirmed pre-send failure (`not-started`) retries,
-with the same ID. Notification receipts are separate from task delivery receipts.
+Successful delivery requires a platform message ID; an `accepted` answer without
+one is not believed. Every receipt reads exactly one of three ways
+(KIN-ITER-20260918-03): `accepted`; `rejected`, which is terminal; or
+proven-not-submitted — no outbox record, or one that proves nothing reached the
+platform — which retries the SAME ID under a visible bounded budget, resumable
+across restarts. Anything else means the submission is unknown: the original ID
+is only ever looked up, never resent, and the re-checks are themselves bounded
+before the notice stops polling as a visible `unresolved`. Retry exhaustion is a
+state with a reason, never permanent polling. A settle that would change nothing
+writes nothing. Notification receipts are separate from task delivery receipts.
 Host integrations must guard provider changes for the duration of the send and
 must bypass task-delivery accounting for these non-task messages.
 
@@ -212,7 +231,10 @@ uses the [Responses endpoint](https://api-docs.deepseek.com/guides/responses_api
 ## Validation
 
 Every verified model change creates one durable owner notification, including
-automatic routing, work completion and restart reconciliation. A same-model
+automatic routing, work completion and restart reconciliation. Every transition
+records what became of it — `queued`, `suppressed` with its cause, or
+`not-generated` (a rebind with no owner-visible change) — and a suppressed notice
+is never counted as delivered. A same-model
 profile refresh creates no switch notice, and neither does a maintenance restart
 that ends on the model the owner was last told about: that notice is settled as
 suppressed rather than sent, as [mobile recovery](mobile-recovery.md#durable-adapter-state)
@@ -227,7 +249,8 @@ host configures for conversation. Output ceilings are 16K for routing and for a
 tail decision asked on its own, at least 64K for native chat and structured
 memory requests, and 128K for appraisal and work review. Output truncation
 remains a failed result. Latency limits are independent of token ceilings;
-classification retains its bounded fallback.
+a classification that cannot be obtained waits as itself, bounded, as described
+above.
 
 Run `node --test adapters/*.test.mjs` for synthetic routing, delivery, concurrency,
 gateway and cadence checks. Before enabling a host, additionally verify a live

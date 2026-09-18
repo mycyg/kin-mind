@@ -39,6 +39,21 @@ export function safeBoundary({runtime,tasks=[],inputs=[],notices=[],contactRunni
   return {safe:true};
 }
 
+/** KIN-ITER-20260918-03: read-only roster preparation (computing a checkpoint or
+ * rolling manifest from a versioned snapshot) is split from the safety check that
+ * compaction, injection and segment swaps must still pass. Preparation never
+ * touches the native session, so unconfirmed owner notifications do not block it —
+ * but every delivery the owner never confirmed receiving is annotated on the
+ * result, and the prepared artifact carries them. Everything else safeBoundary
+ * checks still applies. The strict path stays the default. */
+export function safeReadOnlyPreparation({runtime,tasks=[],inputs=[],notices=[],contactRunning=false}) {
+  const strict=safeBoundary({runtime,tasks,inputs,notices:[],contactRunning});
+  if(!strict.safe)return strict;
+  const unconfirmedDeliveries=notices.filter(n=>!['accepted','superseded','suppressed'].includes(n.state))
+    .map(n=>({id:n.id,kind:n.kind,state:n.state}));
+  return {safe:true,readOnly:true,...(unconfirmedDeliveries.length?{unconfirmedDeliveries}:{})};
+}
+
 export function checkpointBudget(checkpoint,budget) {
   const plan=checkpoint?.budgetPlan;
   if(plan?.reason==='recent-dialogue'&&plan.requested===budget&&Number.isInteger(plan.effective)&&plan.effective>=budget&&plan.effective<=8000&&plan.limit===8000)return plan.effective;

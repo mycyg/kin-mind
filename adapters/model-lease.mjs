@@ -62,20 +62,39 @@ export function createLeaseClient({request, now = () => Date.now(), setTimer = s
     const proceed = state === 'admitted' || state === 'disabled'
       || (state === 'degraded' && PROCEEDS_WHILE_DEGRADED.has(lane)) || (state === 'wait' && lane === 'foreground');
     const controller = state === 'admitted' && ABORTS_WHEN_LOST.has(lane) ? new AbortController() : null;
-    let timer = null, lost = false, done = state !== 'admitted';
+    let timer = null, watchdog = null, confirmedUntil = null, lost = false, expired = false, done = state !== 'admitted';
 
     const schedule = seconds => {
       timer = setTimer(renew, Math.max(1000, (Number(seconds) > 0 ? Number(seconds) : ttl / 3) * 1000));
       timer?.unref?.();
     };
+    // The last deadline the ledger confirmed. An unanswered renewal is not a loss — but
+    // it is not a renewal either: once this instant passes, the server may hand the slot
+    // to somebody else, and a call still running would spend resources nobody is counting.
+    const arm = () => {
+      if (watchdog !== null) clearTimer(watchdog);
+      watchdog = setTimer(expire, Math.max(0, confirmedUntil - now()));
+      watchdog?.unref?.();
+    };
+    const expire = () => {
+      watchdog = null;
+      if (done || expired) return;
+      if (now() < confirmedUntil) {arm(); return;} // the clock moved backwards; keep waiting
+      expired = true;
+      note({event: 'model-lease-expired-unconfirmed', lane, purpose, id});
+      // Foreground holds no controller: there the expiry is only recorded, as with a loss.
+      controller?.abort(Error('model-lease-expired-unconfirmed'));
+    };
+    const confirm = () => {confirmedUntil = now() + ttl * 1000; arm();};
     const renew = async () => {
       timer = null;
-      if (done) return;
+      if (done || expired) return;
       const result = await call('renew', {id, ttl_seconds: ttl});
-      if (done) return;
+      if (done || expired) return;
       if (result.state === 'lost') {
         lost = true;
         note({event: 'model-lease-lost', lane, purpose, id});
+        if (watchdog !== null) {clearTimer(watchdog); watchdog = null;}
         controller?.abort(Error('model-lease-lost'));
         return;
       }
@@ -83,23 +102,27 @@ export function createLeaseClient({request, now = () => Date.now(), setTimer = s
       // given away; aborting a call that is already paid for on a transport hiccup
       // would spend the money and keep nothing.
       if (result.state !== 'renewed') note({event: 'model-lease-renewal-unanswered', lane, purpose, id});
+      else confirm();
       schedule(result.lease?.renew_after_seconds);
     };
-    if (state === 'admitted') schedule(answer.lease?.renew_after_seconds);
+    if (state === 'admitted') {schedule(answer.lease?.renew_after_seconds); confirm();}
 
     return {
       lane, purpose, id, state, reason, proceed,
       get lost() {return lost;},
+      get expired() {return expired;},
       signal: controller?.signal ?? null,
       capacity: answer.capacity ?? null,
       retryAfterSeconds: state === 'wait' ? (Number(answer.retry_after_seconds) || DEFAULT_RETRY_SECONDS) : null,
       detail() {
-        return {lane, purpose, leaseState: state, ...(reason ? {leaseReason: reason} : {}), ...(lost ? {leaseLost: true} : {})};
+        return {lane, purpose, leaseState: state, ...(reason ? {leaseReason: reason} : {}), ...(lost ? {leaseLost: true} : {}),
+          ...(expired ? {leaseExpiredUnconfirmed: true} : {})};
       },
       async release() {
         if (done) {done = true; return {state};}
         done = true;
         if (timer !== null) {clearTimer(timer); timer = null;}
+        if (watchdog !== null) {clearTimer(watchdog); watchdog = null;}
         return call('release', {id});
       },
     };
