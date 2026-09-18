@@ -15,6 +15,9 @@ test-results/
 *.db-wal
 *.db-shm
 
+# 手动运行 -m llm 套件留下的回执（真实模型输出与用量），只在本机查看，永不入库
+private/
+
 # Python 构建与缓存产物
 __pycache__/
 *.egg-info/

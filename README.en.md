@@ -108,6 +108,8 @@ An experience leads to a growth hypothesis. I register a behavioral prediction, 
 
 Summaries and repeated references to the same event are not new growth evidence. Hypotheses, old configurations, predictions, assessments and counterexamples remain available for review. Corrected sources mark related judgments for reassessment, and reversions preserve revision history.
 
+These judgements now have a ledger of their own. Evidence about me is counted under the one episode it came from rather than the number of times it was mentioned, and what a piece of evidence may stand for is decided by where it came from: words actually spoken, an execution receipt the host itself verified, and something I said about myself are three different things. A trait has to rest on two separate episodes and at least one piece of support that is not my own word; a plain correction ends it, and the tombstone and the history stay. I also say how I mean to be present for the next few replies, and what choice I am making now and which records it rests on. The host checks only that the material is real — never whether the sentence about me is true. [Traits, expression intent and behaviour checks](docs/personality-ledger.md)
+
 ## Running and integrating
 
 ```bash

@@ -1,0 +1,81 @@
+# Traits, expression intent and behaviour checks
+
+A personality used to be a field nothing ever wrote. `traits` stayed empty, no caller created a claim or a prediction, and a personality proposal returned by an ordinary appraisal was dropped without a word. The appraisal that already happens now carries six optional sections, each behind its own switch, under one rule: **the host checks that the material a section cites is real, that it may stand for the class it was given, and that it comes from separate times. It never judges the sentence itself.** What Kin is said to be is Kin's own, and the host vouches only for what is behind it.
+
+Every section is optional and empty by default. With its switch off, its property, its definitions and its prompt paragraph are taken out of the request, a value that arrives anyway is blanked before anything reads it, and the stored proposal omits it, so a row stays readable by the previous release. A refused section is refused alone: the mood, the wishes and the plan decisions of the same appraisal commit as usual, the refusal is recorded in `mind_section_refusals`, and **no second, paid model call is queued** — the next evaluation is shown the refusal through the projection that owns it. History lanes, the follow-up call, the continuity bootstrap and session maintenance carry none of these sections. If the owner writes again while an appraisal is running, only `trait_observations` still commits; the decisions and the intent wait for the next round.
+
+## The trait ledger
+
+`trait_ledger` turns on `trait_observations` (up to four per appraisal) and `trait_decisions` (up to two), and the tables `mind_traits`, `mind_trait_history`, `mind_trait_observations` and `mind_trait_dependents`.
+
+An **observation** is one piece of evidence for or against one trait, from one episode. The table is append-only and identity is the evidence rather than the telling of it, so one trait takes one observation per episode and polarity: ten messages inside one interaction window are one time something happened, not ten. An episode is the host's, taken in order of preference from an execution id, the interaction window that already joins owner turns no more than thirty minutes apart, or the root of the utterance; one utterance ingested under two namespaces has one root and one episode. A caller may merge episodes and may never split one.
+
+What may stand for what is decided by evidence class, not by who wrote the text. `owner_statement` is the owner's own words: explicit authority, the role of a user, a message event, an owner namespace, not generated, and not a configuration or self-knowledge record — a setup or persona source carries explicit authority too and is refused here. `verified_behavior` is something Kin actually did, cited through `result_ids` as an execution the host itself resolved: a plan run that is completed and verified, a verified task result, an accepted delivery with a platform message id, or a completed exploration. An exploration's own report is `self_statement`, because Kin wrote it; its receipt is behaviour. A `mind-internal-event` source is evidence of nothing in any class. Every cited evidence id must lie inside the evaluated set of this appraisal.
+
+A trait acts from the moment it is proposed. `establish` says the shared history carries it, and on `inference` that costs at least two distinct episodes, at least one supporting observation that is not Kin's own words, and a statement naming at least two observations with different episodes and why they are distinct. Anything less is refused as `trait-single-episode` and the candidate goes on acting. An `owner_instruction` or `owner_correction` needs every cited item to pass the owner predicate and needs the `quote` to be a literal substring of the record it cites; a revoke may not rest on evidence older than the trait. A revoked trait leaves a tombstone — the reason, the source that ended it, and a history that stays readable — and proposing the same key again needs an owner statement newer than the tombstone. Support decays on the thirty-day half-life effective use already uses: a trait with none left reads as fading before anything is written, and the next write of the ledger records it. A source that moved under an observation leaves the trait `needs_review`, and a trait under review is neither established nor offered to build on.
+
+Which categories may grow at all is the approved persona contract's decision and nobody else's; a Chinese category name reaches the contract as the one key it names. The appraising model is shown up to twelve traits, established and candidate apart, with counts rather than evidence text — observations and episodes per class, non-self support, counter-examples, the days spanned, whether it is all one window — up to six corrections with the source that ended each, and the last refusal this projection owns. The chat model is shown the same ledger as two items of its own, `self-traits` and `trait-corrections`, each with the basis `self_knowledge`, because none of it is the owner speaking. With the switch off both disappear and the context is what it was.
+
+## Expression intent
+
+`expression_intent` lets the same appraisal state how it means to be present for the next few replies: a stance, at most two topics worth staying with, at most two things to leave alone, and how long that is meant to hold (ten to seven hundred and twenty minutes). Before this, the chat model learned how Kin felt from a lookup table of fixed sentences chosen by where a number fell, and nothing that was actually judged about the moment reached the wording.
+
+The host checks only that the material is real: evidence of this same evaluation, traits the ledger carries now at the revision it showed, concerns this scope holds. A citation it cannot resolve refuses the intent alone, as `trait-unknown`, `intent-concern-unknown` or `intent-evidence-unknown`. The stance is never quoted and is not a script: it says how to be present, and the persona still decides the words. A named concern leads the ones the reply stays with; a topic without an id still finds the concern it overlaps.
+
+An intent is used while it is fresh and never after. It ends when its own minutes run out, when the evidence under it moved, when a trait it cited was revised or revoked, when continuity is not active, or when the persona changed. **A new owner message is deliberately not one of those**: the reply to a message is written before the appraisal of that message, so an intent that expired on arrival could never be used at all. In every case where it does not hold, the wording falls back to the lookup table byte for byte.
+
+## The move an appraisal accounts for
+
+`next_move_audit` lets an appraisal say what it is doing and what that rests on, and records it in the append-only table `mind_next_moves`. It is an audit and nothing else: **it orders nothing and readies nothing.** Every wish and every plan step is chosen exactly as it was before any move was ever recorded, and no code that reads wishes or schedules action knows the table exists.
+
+The model declares one of three words — `reply`, `quiet` or `rest` — and the fuller word is the host's. The host reads what this same appraisal really committed, not what it proposed: a step it set running, a wish it left wanting, a request it made of the owner, and derives `explore`, `create`, `invite` or `ask` from that. A move is inconsistent when it says nothing is happening while this commit started something that leaves for the owner now, or when it points at a wish or a step this appraisal neither committed nor left standing. A ground is forged when the host cannot find what it names; it may name evidence of this evaluation, a trait the ledger still carries, a concern that is still current, or a correction the ledger recorded. Either fault drops this section alone, and the model's own two sentences — the alternative it weighed and its reason — are kept as written.
+
+## Behaviour checks
+
+`behavior_chain` turns on `self_hypothesis` (one, with up to two predictions, each given a test window of one to one hundred and sixty-eight hours) and `prediction_outcomes` (up to three). The host records the hypothesis and its predictions inside the appraisal's own transaction, stamped with the configuration they were made under, and shows up to four open predictions to later evaluations.
+
+An outcome is accepted only from what the host itself resolved — a verified execution receipt, or evidence of this same evaluation with explicit or operation authority — and only when the prediction came first; the same moment is not first, because it was available to whoever made the prediction. Kin's own report that a prediction came true settles nothing.
+
+"Made under the same configuration" used to mean an equal `agent_version`, which moved for every unrelated edit, so no check ever survived long enough to be used. It is now a compatibility key over the approved persona and the hashes of its three texts, a declared `BEHAVIOR_CONTRACT` constant, the text of the dimension definitions (never their baselines and half-lives, which are what an evolution moves), the model that appraises and the model that answers, and the part of the execution environment a behaviour can depend on. An unrelated version bump keeps a prediction testable; a real change makes it stale, visibly, and names the ingredient that moved. Nothing is deleted by going stale. A pinned digest of the behaviour-relevant prompt paragraphs fails until whoever edited them chooses: bump the contract, because the earlier checks no longer describe this agent, or re-pin, because they still do.
+
+A non-empty `evolution` from an ordinary appraisal is kept as a pending proposal. The existing `daily` action becomes a host-side merge with **no model call**: it commits the change as its own evolution event only under a confirmed prediction of the same configuration and the configured floor of independent interactions, counted as interaction windows rather than messages. The once-a-day rule, the baseline and half-life limits, `separate_evolution` and reversion are untouched. The ledger is the only writer of a trait: a trait snapshot offered through an evolution is refused where it is proposed and again where it would be applied.
+
+## What the host will not vouch for
+
+- **That a trait is true.** It vouches that the cited material exists, that it may stand for the class it was given, that it came from separate times, and that an owner's words were quoted literally. The sentence about Kin is Kin's own.
+- **That an authority label is honest.** The predicates read what the store recorded. Operational evidence has to be ingested by a trusted host; a timestamp check cannot prove that nobody already knew the answer.
+- **That an episode count matches lived experience.** The thirty-minute window is the interaction window that already existed, reused as it stands. It can only under-count independent times, which delays a promotion and never grants one; a candidate acts meanwhile.
+- **That a stated move was carried out.** `mind_next_moves` records what an appraisal said and what the host found behind it. It changes no order and no readiness.
+- **That an intent was obeyed.** It is a stance handed to the wording, never a script, and it is dropped the moment it stops being fresh.
+- **That a confirmed prediction makes a personality change right.** It makes it eligible for the daily merge, under the limits that were already there.
+
+## Storage, interfaces and switches
+
+New tables are created by the module that owns them, on demand, and are read by nobody else, so an older host ignores them and a rollback leaves them in place. All new data goes into existing `data` JSON otherwise.
+
+| Interface | Contract |
+| --- | --- |
+| `traits` host action / `read_trait_ledger` MCP tool | Read the ledger: each trait's own sentence, its counts and its status, plus corrections and open predictions. Read only — the chat model has no way to write to it. |
+| `trait-revoke` host action | An owner correction that must not wait for an appraisal. The cited source decides whether it is recorded as the owner's own correction or as the operator's. |
+| `traits-migrate` host action | Carries an older `state.traits` record into the ledger. Idempotent, and a dry run writes nothing. |
+| `next-moves` host action | Read only: what each appraisal said it was doing, and what the host derived behind it. |
+| `configure-behavior-models` host action | Registers the model this host answers with — the one ingredient of a behavioural check the store cannot read for itself. Unregistered until it does, which is stable rather than stale. |
+
+Switches are registered in `memory.DEFAULTS`, are read through `autonomy_schema.optimized()`, and are set with `configure-memory`. All six default on. Every one of them off is the behaviour that was there before, byte for byte.
+
+| Switch | What it turns on |
+| --- | --- |
+| `trait_ledger` | `trait_observations`, `trait_decisions`, the ledger tables and its routes, and the trait and correction items in both the appraisal projection and the chat context. |
+| `expression_intent` | `expression_intent`, and the stance, topics and avoidances reaching the wording instead of the lookup table alone. |
+| `next_move_audit` | `next_move` and the append-only `mind_next_moves`. |
+| `behavior_chain` | `self_hypothesis`, `prediction_outcomes`, the compatibility stamp, the pending evolution proposal and the daily merge with no model call. Off restores one model request a day and an assessment in the same agent version. |
+| `wish_version_review` | One `wish-review` per wish and version for a wish whose decision was made under an earlier agent version, instead of leaving it not-ready with nothing ever looking at it again. |
+| `rest_review_window` | The `review_rest_max_minutes` ceiling of 480 for the next quiet review, applied only while the rhythm rests or the owner's quiet hours run. Everywhere else `review_max_minutes` still decides, and the request says which ceiling holds. |
+
+A separate `legacy_drive_thresholds` switch, off by default, restores the fixed 75-point contact and exploration gates, and applies only while `semantic_actions` is not on. Stored thresholds stay numbers whether it is on or off.
+
+## What is tested, and what is only recorded
+
+`tests/test_stage4_contrast.py` puts the same question to two engines that lived through different evenings and checks that each answers from what only its own history can account for: the two projections and the two chat contexts differ in the way the histories do, each recorded move rests on a trait and an evidence item that resolve in that engine, and a ground borrowed from the other history is refused as forged while the rest of that appraisal commits. It also runs one history twice with every switch off, once answered with all six sections filled in and once with the proposal as it was before they existed, and compares the state, the chat context, the stored row and the tables the store even has, byte for byte.
+
+`tests/llm/test_personality_contrast.py` is the same shape against the real appraiser. It is marked `llm`, deselected by every ordinary run, and run by hand. It asserts only what the host can verify — the commit went through, every ground and trait reference still resolves inside the engine that answered, nothing was refused as unresolvable, and the history whose interest the owner ended never rests on it as something it still carries. Whether the two answers differ, what each decided and what it cost are written to a receipt under `private/llm-receipts/` and never asserted: two histories are not required to choose differently, and a run where they agree is not a failure.
