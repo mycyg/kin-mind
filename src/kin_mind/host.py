@@ -296,7 +296,7 @@ def dispatch(config, action, request):
             "exploration_cadence": cadence.status(),
             "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
         }
-    if action in {"traits", "trait-revoke", "traits-migrate"}:
+    if action in {"traits", "trait-revoke", "traits-migrate", "trait-wish-review"}:
         from .traits import Traits
         ledger = Traits(mind)
         if action == "traits":
@@ -305,6 +305,13 @@ def dispatch(config, action, request):
             # An owner correction that must not wait for an appraisal. The cited source decides
             # whether it is recorded as the owner's own correction or as the operator's.
             return ledger.revoke(request)
+        if action == "trait-wish-review":
+            # What a moved trait left not ready, and then what was done about it: read first, so the
+            # answer says what it found as well as what it moved. Without `apply` it writes nothing;
+            # with it those wishes go to the existing `waiting` state — which is what an older
+            # release has to see before a rollback, because to it they would still look ready.
+            from .trait_refs import review_view, settle_wishes
+            return {**review_view(mind), **settle_wishes(mind, apply=bool(request.get("apply")))}
         # Idempotent, and a dry run writes nothing.
         return ledger.migrate(apply=bool(request.get("apply")))
     if action == "configure-behavior-models":

@@ -733,7 +733,9 @@ def appraisal_context(context):
     chosen_desires = sorted(active_desires, key=lambda d: (d.get("updated_at", ""), d["id"]), reverse=True)[:16] + completed_desires[-8:]
     for desire in chosen_desires:
         active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
-        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review", "exploration_target", "exploration_id"}
+        # `trait_needs_review` is only ever there when this wish really was committed on a trait, so
+        # a projection built without the ledger is the projection it was, key for key.
+        keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review", "trait_needs_review", "exploration_target", "exploration_id"}
         if active:
             keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
         projected = {k: v for k, v in desire.items() if k in keys}

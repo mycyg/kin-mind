@@ -213,10 +213,24 @@ def _fragments(proposal, name, key, aliases=()):
              lambda d: key in (d.get("share_id"), *(d.get("about_ids") or []), *(d.get("previous_share_ids") or [])), inside)
         each("notes", memory.get("notes"), lambda n: key in (n.get("about_ids") or []), inside)
         each("links", memory.get("links"), lambda link: key in (link.get("subject"), link.get("object")), inside)
+    elif name in {"traits", "corrections"}:
+        # A decision names the trait it is about; a hypothesis, an intent and a move name the traits
+        # they rest on. An observation names none: it says which trait its evidence belongs to by
+        # category and slug, and the ledger resolves that itself.
+        each("trait_decisions", proposal.get("trait_decisions"), lambda d: d.get("trait_id") == key)
+        for section in ("self_hypothesis", "expression_intent"):
+            paths.extend([[section]] if key in ((proposal.get(section) or {}).get("trait_refs") or []) else [])
+        paths.extend([["next_move"]] if key in ((proposal.get("next_move") or {}).get("grounds") or []) else [])
+    elif name == "predictions":
+        each("prediction_outcomes", proposal.get("prediction_outcomes"), lambda o: o.get("prediction_id") == key)
+    elif name == "intent":
+        # The intent in force is what the wording was going to be built on; a new one replaces it.
+        paths.extend([["expression_intent"]] if proposal.get("expression_intent") else [])
     elif name == "sources":
-        for section in ("understanding", "rhythm", "habits"):
+        for section in ("understanding", "rhythm", "habits", "self_hypothesis", "expression_intent"):
             paths.extend([[section]] if proposal.get(section) and _cites(proposal[section], identifiers) else [])
-        for section in ("concerns", "plan_changes", "action_decisions", "procedure_candidates"):
+        for section in ("concerns", "plan_changes", "action_decisions", "procedure_candidates",
+                        "trait_observations", "trait_decisions", "prediction_outcomes"):
             each(section, proposal.get(section), lambda item: _cites(item, identifiers))
         for section in ("notes", "links", "event_routes"):
             each(section, memory.get(section), lambda item: _cites(item, identifiers), ("memory",))
@@ -233,10 +247,19 @@ RESTING = {
     "plans": ("plan_changes", "action_decisions"), "procedures": ("procedure_candidates", "action_decisions"),
     "graph": ("memory",), "topics": ("memory",), "works": ("memory",), "shares": ("memory",), "pending": ("memory",),
     "session": ("session_advice",),
+    # What a moved trait, a settled prediction or a replaced intent is allowed to reach. Each of
+    # these sections is refused on its own at commit anyway; this is so a light question can say
+    # what moved instead of spending a full rerun on it.
+    "traits": ("trait_decisions", "self_hypothesis", "expression_intent", "next_move"),
+    "corrections": ("trait_decisions", "next_move"),
+    "predictions": ("prediction_outcomes",), "intent": ("expression_intent",),
 }
 # Everything a proposal may withdraw or restate when time, the owner or the dialogue moved.
 ANY_SECTION = ("values", "motivations", "wishes", "wish_updates", "understanding", "concerns", "rhythm", "sharing",
-               "habits", "session_advice", "plan_changes", "action_decisions", "procedure_candidates", "memory")
+               "habits", "session_advice", "plan_changes", "action_decisions", "procedure_candidates", "memory",
+               # Empty in every request that does not offer them, so this is exactly what it was.
+               "trait_observations", "trait_decisions", "self_hypothesis", "prediction_outcomes",
+               "expression_intent", "next_move")
 
 
 def _present(proposal, sections, blank):
@@ -272,8 +295,21 @@ def _history(conn, table, identifier, revision, column="id"):
 
 GRAPH_SHOWN = ("id", "kind", "title", "text", "revision", "content_version", "owner_id", "source_ids", "record_ids",
                "basis", "occurred_at", "created_by", "state")
+# What a trait is, said the way the ledger says it: its own sentence, what it rests on and where it
+# stands. No host verdict in words, and no observation text.
+TRAIT_SHOWN = ("id", "category", "slug", "text", "revision", "status", "basis", "reason")
 # Accounting is not evidence about what was delivered; everything else of a work or share is shown as the appraisal shows it.
 MEMORY_HIDDEN = {"assessment_receipt"}
+
+
+def _trait(trait):
+    """One revision of a trait as a history row holds it, in the shape the projection shows."""
+    if not trait:
+        return None
+    return {**{k: trait.get(k) for k in TRAIT_SHOWN},
+            "evidence_ids": [ref["record_id"] for ref in trait.get("evidence") or [] if ref.get("record_id")],
+            **({"tombstone": {k: (trait["tombstone"] or {}).get(k) for k in ("at", "reason", "basis", "quote", "actor")}}
+               if trait.get("tombstone") else {})}
 
 
 def _before(jobs, conn, change, old):
@@ -307,6 +343,17 @@ def _before(jobs, conn, change, old):
             # Revision 0 was never written: the owner had stated no preference yet.
             habits = {"entries": {}}
         return {**entry, "content": {k: v.get("value") for k, v in habits.get("entries", {}).items()}} if habits else entry
+    if name in {"traits", "corrections"}:
+        trait = _trait(_history(conn, "mind_trait_history", key, entry.get("revision")))
+        return {**entry, "content": trait} if trait else entry
+    if name == "predictions":
+        record = _history(conn, "revisions", key, entry.get("revision"), "record_id")
+        return {**entry, "content": {"statement": record.get("content"), "made_at": record.get("valid_from")}} if record else entry
+    if name == "intent":
+        row = conn.execute("SELECT data FROM mind_expression_intent_log WHERE id=?", (key,)).fetchone() \
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_expression_intent_log'").fetchone() else None
+        from .expression_intent import shown as intent_shown
+        return {**entry, "content": intent_shown(json.loads(row[0]))} if row else entry
     return entry
 
 
@@ -342,6 +389,24 @@ def _after(jobs, conn, change, shown):
     if name in {"works", "shares"}:
         node = next((n for n in memory.get(name, []) if n["id"] == key), None)
         return {**entry, "content": {k: v for k, v in node.items() if k not in MEMORY_HIDDEN}} if node else entry
+    if name == "traits":
+        # The ledger as the rebuilt context shows it. A trait the projection no longer lists is
+        # exactly that: gone from what may be built on, whatever the tables still hold.
+        shown_traits = (state.get("traits") or {})
+        trait = next((t for side in ("established", "candidate") for t in shown_traits.get(side, []) if t["id"] == key), None)
+        return {**entry, "content": {k: trait.get(k) for k in (*TRAIT_SHOWN, "facts")}} if trait else entry
+    if name == "corrections":
+        found = next((c for c in state.get("corrections") or [] if c.get("trait_id") == key), None)
+        return {**entry, "content": found} if found else entry
+    if name == "predictions":
+        found = next((p for p in state.get("open_predictions") or [] if p.get("id") == key), None)
+        # Absent from the open list means it has an outcome now, which is what `after: null` says.
+        return {**entry, "content": found} if found else entry
+    if name == "intent":
+        from .expression_intent import shown as intent_shown
+        from .expression_intent import stored as intent_stored
+        current = intent_stored(conn, jobs.mind.scope.key())
+        return {**entry, "content": intent_shown(current)} if current and current["id"] == key else entry
     return entry
 
 
@@ -400,6 +465,10 @@ def _resets(proposal, name, key, paths, revision, plan_revision=None):
             # attempt only reaches once every moved step it decides on was answered for.
             found.append(([*path, "expected_revision"], plan_revision))
         elif (name == "procedures" and holder == "procedure_candidates") or (name == "graph" and holder == "nodes" and item.get("id") == key):
+            found.append(([*path, "expected_revision"], revision))
+        elif name == "traits" and holder == "trait_decisions" and item.get("trait_id") == key:
+            # The ledger's own compare-and-swap, reset like every other one: only for the entry the
+            # model said still stands, and the commit checks the material again regardless.
             found.append(([*path, "expected_revision"], revision))
         elif name == "graph" and holder == "event_routes":
             route = route or key in (item.get("event_id"), item.get("thread_id"))

@@ -51,14 +51,19 @@ PART = "#part"
 
 HISTORY, MAINTENANCE, DELIVERY = "memory-history", "session-maintenance", "delivery"
 MIND_STATE = ("dimensions", "desires", "concerns", "decisions", "rhythm", "assessment", "timing", "style")
+# What a shared history formed, and what rests on it: the ledger's traits and the corrections that
+# ended some of them, the behavior checks still open, and the intent in force. They are classes of
+# their own rather than part of `profile_version`, so a trait that moved costs a reread of what
+# rested on it and not of every stored proposal there is (decision 10).
+LEDGER = ("traits", "corrections", "predictions", "intent")
 # Every class a manifest of this version can carry. `time` stands for the validity check, and
 # `sources` for a citable source that moved without the stored proposal citing it.
-CLASSES = (*MIND_STATE, "plans", "procedures", "habits", "graph", "topics", "works", "shares",
+CLASSES = (*MIND_STATE, *LEDGER, "plans", "procedures", "habits", "graph", "topics", "works", "shares",
            "pending", "dialogue", "session", "sources", "time")
 # Judgment type -> classes it does not rest on. History is shown no mood, wishes, plans, methods,
-# timing or session; a receipt settlement cannot touch concerns or rhythm.
+# timing, session or ledger; a receipt settlement cannot touch concerns or rhythm.
 IRRELEVANT = {
-    HISTORY: frozenset({*MIND_STATE, "plans", "procedures", "time", "session"}),
+    HISTORY: frozenset({*MIND_STATE, *LEDGER, "plans", "procedures", "time", "session"}),
     DELIVERY: frozenset({"concerns", "rhythm"}),
 }
 # Judgment type -> the only known classes it rests on (its root evidence is always compared).
@@ -206,6 +211,37 @@ def _mind_state(view, shown):
     return classes, values
 
 
+def _ledger(conn, mind, view, clock):
+    """The four stage-4 classes, each from the switch that produced it.
+
+    `traits` and `corrections` are read off the projection the model was really shown; `predictions`
+    and `intent` come from the modules that own them, because what a manifest needs of those — the
+    revision, and whether the thing still holds — is deliberately not in the projection. With every
+    switch off nothing here is produced at all, and the manifest is the one it was.
+    """
+    from .autonomy_schema import optimized
+    from .traits import manifest_entries as ledger_entries
+    found, scope = {}, mind.scope.key()
+    traits, corrections = ledger_entries(view)
+    if traits:
+        found["traits"] = traits
+    if corrections:
+        found["corrections"] = corrections
+    if optimized(conn, scope, "behavior_chain"):
+        from .behavior_chain import manifest_entries as chain_entries
+        found["predictions"] = chain_entries(conn, mind)
+    if optimized(conn, scope, "expression_intent"):
+        from .expression_intent import manifest_entries as intent_entries
+        continuity = view.get("continuity") or {}
+        # The same two facts `_continuity_view` reads before it decides whether an intent may shape
+        # the wording at all. Two attempts derive it the same way, which is what a comparison needs.
+        found["intent"] = intent_entries(
+            conn, mind, clock, persona=view.get("persona_contract"),
+            continuity_active=bool((continuity.get("features") or {}).get("expression"))
+            and continuity.get("activation", "active") == "active")
+    return {name: entry for name, entry in found.items() if entry}
+
+
 def _boundaries(view, shown_state, context, clock):
     """Every future time boundary the model was shown: desire expiries and retries, step windows,
     review times and the next edges of the quiet hours."""
@@ -283,6 +319,7 @@ def build(jobs, provider, data, context, *, refs, targets, sources, view, lane, 
             "recent": [e.get("id") for e in session.get("recent", [])]}}
     with mind.engine.db.connect() as conn:
         epoch = _owner(conn, scope)
+        classes.update(_ledger(conn, mind, view, clock))
     bound = attempt_bound(provider)
     boundaries = _boundaries(view, shown_state, context, clock)
     limit = timestamp(clock) + timedelta(seconds=bound)
@@ -440,6 +477,9 @@ def write_set(proposal):
     written |= {("plans", d["plan_id"] + "/" + d["step_id"]) for d in proposal.get("action_decisions") or []
                 if d["plan_id"] not in created}
     written |= {("procedures", c["id"]) for c in proposal.get("procedure_candidates") or [] if c.get("id")}
+    # A trait decision fences itself on the revision it was taken against, exactly as a plan change
+    # does. One that names no trait is a first proposal: nobody else has a version of it yet.
+    written |= {("traits", d["trait_id"]) for d in proposal.get("trait_decisions") or [] if d.get("trait_id")}
     written |= {("graph", n["id"]) for n in graph.get("nodes") or [] if n.get("id")}
     for route in memory.get("event_routes") or []:
         written |= {("graph", identifier) for identifier in (route.get("event_id"), route.get("thread_id")) if identifier}

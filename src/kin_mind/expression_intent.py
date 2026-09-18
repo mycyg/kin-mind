@@ -25,7 +25,7 @@ from datetime import timedelta
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.persona import load_persona, persona_metadata
 
-from . import appraisal
+from . import appraisal, trait_refs
 from .autonomy_schema import optimized
 from .evidence_classes import never_evidence
 from .state import timestamp
@@ -129,6 +129,13 @@ def commit_intent(commit):
                  (mind.scope.key(), identifier, at, intent["valid_until"], dumps(intent)))
     conn.execute("INSERT OR REPLACE INTO mind_expression_intent_log VALUES(?,?,?,?)",
                  (identifier, mind.scope.key(), at, dumps(intent)))
+    # The intent already re-reads the ledger for itself before every reply; this is so that one
+    # place answers the other question — what did this trait hold up, once it moves. One intent is
+    # in force at a time, so the one this replaces leaves no row behind.
+    trait_refs.clear_kind(conn, mind.scope.key(), "intent")
+    trait_refs.record(conn, mind.scope.key(), "intent", identifier,
+                      {ref["trait_id"]: ref["revision"] for ref in traits},
+                      dependent_revision=intent["valid_until"], at=at)
     return intent
 
 

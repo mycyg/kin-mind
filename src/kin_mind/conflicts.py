@@ -32,7 +32,7 @@ COMMIT_PATH_MODULES = (
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
     "kin_mind.expression_intent",
-    "kin_mind.next_move",
+    "kin_mind.next_move", "kin_mind.trait_refs",
 )
 
 

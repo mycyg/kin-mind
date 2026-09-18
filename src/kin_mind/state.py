@@ -481,6 +481,12 @@ class Mind(Continuity):
                     return False
             except Conflict:
                 return False
+        if desire.get("trait_revisions"):
+            # A wish committed on a trait rests on the revision that trait had. One owner sentence
+            # can end it, and a wish standing on what the ledger no longer carries is not ready.
+            from .trait_refs import links_fresh
+            if not links_fresh(conn, self, desire):
+                return False
         return (
             desire["kind"] == "contact"
             and desire["status"] == "wanted"
@@ -914,6 +920,12 @@ class Mind(Continuity):
             d = deepcopy(desire)
             d["needs_review"] = not self._fresh(conn, d["evidence"])
             d["expired"] = timestamp(d["expires_at"]) <= timestamp(at)
+            if d.get("trait_revisions"):
+                # Only where a wish really was committed on a trait, so a view without the ledger
+                # is the view it was. It is not dropped and it does not quietly stay ready: this is
+                # the reason a reader is given, and `trait-wish-review` moves it to `waiting`.
+                from .trait_refs import links_fresh
+                d["trait_needs_review"] = not links_fresh(conn, self, d)
             desires.append(d)
         values = {}
         for key, entry in state["dimensions"].items():

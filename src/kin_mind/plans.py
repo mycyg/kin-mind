@@ -41,7 +41,7 @@ def fence(entry):
 
 # Why a ready step may no longer run as decided; each asks for a review, not for a retry.
 REVIEW_REASONS = {"configuration-changed", "new-owner-evidence", "source-needs-review", "missed-window-review-required",
-                  "window-review-required", "procedure-needs-review"}
+                  "window-review-required", "procedure-needs-review", "trait-needs-review"}
 # Ledger marker: the review that took this reason finished without being able to show the plan.
 UNSHOWN = "unshown:"
 
@@ -454,6 +454,12 @@ class AutonomousPlans:
             return "new-owner-evidence"
         if not self.mind._fresh(conn, plan["evidence"]) or not self.mind._fresh(conn, decision["evidence"]):
             return "source-needs-review"
+        from .trait_refs import decision_needs_review
+        if decision_needs_review(conn, self.scope, plan["id"], step, decision):
+            # A trait this decision was taken on has moved. Like a moved source, that asks for one
+            # review and not for a retry: the wake-up key names the step and its revision, so the
+            # review that answers it consumes it, and a fact that merely stays true wakes nothing.
+            return "trait-needs-review"
         now = timestamp(self.mind.clock())
         if timestamp(plan["next_review_at"]) <= now:
             return "review-due"

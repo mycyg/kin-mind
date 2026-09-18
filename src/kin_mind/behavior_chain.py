@@ -31,7 +31,7 @@ from eventmem.core.self_knowledge import (
     metadata,
 )
 
-from . import appraisal, compat
+from . import appraisal, compat, trait_refs
 from .evidence_classes import episode_key, never_evidence, verified_behavior, window_of
 from .rhythm import interaction_windows, stamp as moment
 from .state import AffectiveEvent, Evolution
@@ -111,20 +111,23 @@ def _receipts(conn, mind, ids):
 
 
 def _traits(conn, mind, refs):
-    """The traits a hypothesis says it rests on, while the ledger is the authority on them. A trait
-    that is not in effect cannot be what a behavior is predicted from, so it is refused here rather
-    than followed later into an invalidation that has nothing to invalidate."""
+    """The traits a hypothesis says it rests on, with the revision each had, while the ledger is the
+    authority on them. A trait that is not in effect cannot be what a behavior is predicted from, so
+    it is refused here rather than followed later into an invalidation that has nothing to
+    invalidate. The revisions are what a later correction finds this claim by."""
     from .autonomy_schema import optimized
     from .traits import EFFECTIVE, Traits
     if not refs or not optimized(conn, mind.scope.key(), "trait_ledger"):
-        return []
-    ledger = Traits(mind)
+        return {}
+    ledger, found = Traits(mind), {}
     for identifier in refs:
         # Missing carries `trait-unknown` from the ledger itself; an ended trait is this refusal.
-        if ledger.get(conn, identifier)["status"] not in EFFECTIVE:
+        trait = ledger.get(conn, identifier)
+        if trait["status"] not in EFFECTIVE:
             raise Conflict("A hypothesis rests only on a trait that is in effect",
                            code="trait-not-effective", target=identifier)
-    return sorted(set(refs))
+        found[identifier] = trait["revision"]
+    return found
 
 
 def commit_hypothesis(commit):
@@ -136,11 +139,16 @@ def commit_hypothesis(commit):
     refs = _refs(conn, mind, value.evidence_ids, commit.sources)
     current = compat.stamp(mind, conn, commit.state)
     knowledge = SelfKnowledge(mind.engine, mind.scope, clock=mind.clock)
+    rests_on = _traits(conn, mind, value.trait_refs)
     claim = knowledge.claim_in(conn, ClaimInput(
         command_id=commit.event_id + ":hypothesis", aspect=value.statement[:200], context=CLAIM_CONTEXT,
         agent_version=commit.version, claim=value.statement, basis="hypothesis",
         evidence_ids=sorted({ref["record_id"] for ref in refs})), compat=current,
-        rests_on=_traits(conn, mind, value.trait_refs))
+        rests_on=sorted(rests_on))
+    # The claim keeps the ids; the ledger keeps the line back, with the revisions they had, so a
+    # correction can find the check that rested on the trait it just ended.
+    trait_refs.record(conn, mind.scope.key(), "hypothesis", claim["id"], rests_on,
+                      dependent_revision=claim["revision"], at=mind.clock())
     for index, prediction in enumerate(value.predictions):
         if prediction.evidence_ids:
             _refs(conn, mind, prediction.evidence_ids, commit.sources)
