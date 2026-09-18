@@ -357,12 +357,14 @@ class AdaptiveRecall:
                                         neighbors.append(neighbor["id"])
                 requested_neighbors = []
             # An original hit also recalls the stable events owning that evidence.
+            # Threads are the same kind of container one level up: a turn that belongs to a
+            # correction chain recalls the chain, not only the single event holding it.
             with self.engine.db.connect() as conn:
                 for rid in sorted(pool, key=lambda i: -scores[i])[:24]:
                     if not rid.startswith("mem_"):
                         continue
                     nodes = conn.execute(
-                        "SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND kind='event' AND "
+                        "SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND kind IN ('event','thread') AND "
                         "(id IN (SELECT node_id FROM mind_graph_record_refs WHERE scope=? AND record_id=?) OR "
                         "id IN (SELECT object FROM mind_graph_edges WHERE scope=? AND subject=? AND predicate='part_of' AND state='active')) LIMIT 4",
                         (self.mind.scope.key(), self.mind.scope.key(), rid, self.mind.scope.key(), rid)).fetchall()
