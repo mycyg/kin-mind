@@ -350,6 +350,35 @@ def test_stale_vector_revision_is_filtered(tmp_path):
     )
 
 
+def test_purge_after_an_erase_needs_nothing_the_vector_extra_omits(tmp_path, monkeypatch):
+    pytest.importorskip("lancedb")
+    import sys
+
+    from eventmem.core.vectors import VectorIndex
+
+    e = Engine(tmp_path)
+    source = e.receive(
+        SourceInput(namespace="vector-purge", key="1", text="A sentence to be erased")
+    )
+    rid = e.source(source["id"])["record_ids"][0]
+    index_id = VectorIndex.register(e, "test-purge-model", 4, "test-v1")
+    index = VectorIndex(e, index_id)
+    index.upsert(
+        [{"id": rid, "scope": Scope().key(), "revision": 1, "vector": [1.0, 0.0, 0.0, 0.0]}]
+    )
+    e.delete(rid)
+    with e.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM tombstones WHERE key=?", (rid,)).fetchone()
+    # The `vector` extra installs lancedb, numpy and pyarrow — never pylance. A
+    # machine that happens to have pylance would hide a purge that reaches for it,
+    # so the absence is built here rather than read off whatever runs this: a None
+    # in `sys.modules` makes `import lance` fail the way a missing install does.
+    monkeypatch.setitem(sys.modules, "lance", None)
+    # Nothing to return and nothing to raise: the purge job calls this for effect.
+    assert index.purge() is None
+    assert index.table().count_rows() == 0
+
+
 def test_process_death_after_remote_effect_leaves_uncertain_delivery(tmp_path):
     import subprocess, sys
 
