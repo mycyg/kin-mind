@@ -32,7 +32,7 @@ COMMIT_PATH_MODULES = (
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
     "kin_mind.expression_intent",
-    "kin_mind.next_move", "kin_mind.trait_refs",
+    "kin_mind.next_move", "kin_mind.trait_refs", "kin_mind.history",
 )
 
 
@@ -278,6 +278,11 @@ REGISTRY = {
     # inside that section, so each drops the move alone and nothing else of the proposal. ---
     "This move does not match what this appraisal committed": ("semantic", "next-move-inconsistent", "section"),
     "This move rests on something the host cannot find": ("semantic", "next-move-forged-grounds", "section"),
+    # --- history.py: the one reader of the state history. A revision that will not rebuild is the
+    # host's own material to investigate — a missing parent, a patch that does not fit, bytes that
+    # do not hash to what the row claims. None of that is anything a proposal did or a retry mends,
+    # so it stops here and is never sent back for review. ---
+    "This revision cannot be rebuilt from the recorded history": ("runtime", "history-rebuild-failed", "block"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),

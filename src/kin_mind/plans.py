@@ -776,6 +776,12 @@ class AutonomousPlans:
                 self.mind._retarget(conn, state, self.mind.clock())
                 state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
                 self.mind._save(conn, state)
+                # A revision with no row of its own is a hole in the history: whoever later asks
+                # what the state was just before some event has to read across it and guess, and
+                # the reversion path used to fail on the guess rather than on the gap. This bump
+                # is the host's own, so it gets the host's own event, named after what it did.
+                self.mind._history(conn, "mind_" + digest([self.scope, "plan-wish-sync", state["revision"]])[:32],
+                                   state, "plan-wish-sync", {"desire_ids": created})
         return created
 
     def linked_ready(self, conn, desire):
