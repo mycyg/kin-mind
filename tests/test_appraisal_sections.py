@@ -56,9 +56,12 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned with the widened motivation half-life range, the stated procedure-candidate premise
 # and the owner named by role rather than by name: all three change the shared prompt or schema,
 # and none of them carries a switch.
+# Re-pinned for the executor-agnostic exploration wording: the shared prompt no longer names
+# Kimi as the exploration executor (the codex-cli backend reads and researches now). A
+# rewording only — what a check made under the old text meant is unchanged.
 UNCHANGED_REQUEST = {
-    "interaction": "640b73348965838db21c5e1952503a09c2640af1a170ad72e4a4ffdc7bda8ccb",
-    "action": "6a84d6a7d181e164e5b5a6d248064d8903cc81dc8da9471ea910a0459a8c8d93",
+    "interaction": "84b8f29db399ad062151b6496c48608bd1f34e91312b5a21352c87208c9e865f",
+    "action": "89083464792ade3bcbb01cfcfa03d90eec2d3159dd40aaf4e4a35f3e99b49800",
     "history": "b374eb359aee4f49e3a38990e5454c3e6667c76dab6b5f793dbbe677d80783a3",
 }
 

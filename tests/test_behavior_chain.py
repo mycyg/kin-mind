@@ -50,7 +50,7 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned once when every package landed together: WP6's three switch-less changes to the
 # shared prompt (the widened half-life range, the stated procedure premise, the owner named by
 # role) move every request that offers anything, this one included.
-CHAIN_REQUEST = "f377b871ebc42c040b2927a9ca86a3fdcc937af44e52b434ac3dd0bb322562bc"
+CHAIN_REQUEST = "d295f4c79bff822ecd263b3dd485be597becc1041ff4f9d77ee672d1f26e5210"
 # Every behavior-relevant instruction, digested (compat.behavior_prompts: the shared appraisal
 # prompt and the paragraph of each audited section). A paragraph that moves fails the test below,
 # and its author chooses one of two things — see the message there.
@@ -62,7 +62,9 @@ CHAIN_REQUEST = "f377b871ebc42c040b2927a9ca86a3fdcc937af44e52b434ac3dd0bb322562b
 # Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
 # already told it, that a host internal event is not evidence: production refused both
 # sections on two of its first four appraisals for citing exactly that.
-PINNED_PROMPTS = {"behavior-1": "fd57ba63347ee125dacb770a3a2fad0577174d037977794da5d90491fa6e9e9d"}
+# Re-pinned for the executor-agnostic exploration wording: the prompt no longer names Kimi as
+# the exploration executor. A rewording; the contract's meaning is unchanged.
+PINNED_PROMPTS = {"behavior-1": "1127108a01ae7243306da857ecc41602b97dfb8d00426b6bb6f585764529c204"}
 # How to read the digest a change produced, in one command from the repository root:
 REPIN_COMMAND = ("uv run --extra dev python -c "
                  "'from kin_mind.compat import prompt_digest; print(prompt_digest())'")

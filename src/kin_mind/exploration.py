@@ -1,4 +1,28 @@
-"""Bounded Kimi CLI exploration. Only validated final results enter memory."""
+"""Bounded CLI exploration. Only validated final results enter memory.
+
+Executor protocol. `Explorations.run` calls its runner as
+
+    runner(executable, payload, workdir, *, budget_seconds, canceled, model=None, **options)
+
+- executable: the configured CLI path for the selected backend; a runner never
+  resolves or falls back to another one.
+- payload: the reviewed input (question, evidence with ids and versions, previous
+  explorations). It is data, never instructions.
+- workdir: a private directory the executor creates (mode 0700) and owns.
+- budget_seconds: the TOTAL ceiling — waiting, tool calls and bounded format repair
+  included; any per-request timeout is bounded by the remaining budget.
+- canceled: returns True when the run must stop (owner task, lease loss, stop file).
+- options: backend extras (`profile`/`computer` for kimi, `reasoning`/`provider`/
+  `continuation` for codex).
+
+The runner returns a dict matching `ExecutionReport`: a terminal state
+(complete / failed / timed-out / preempted), a validated `Findings` dump or None,
+usage separated into not_dispatched / reported / unknown, the native execution id,
+the exit code, start/finish stamps and the backend identity (executor vs model
+provider). An interrupted run also leaves a `checkpoint` a later attempt can
+continue from. `normalize_execution_report` fills contract defaults around the
+minimal dicts of older runners.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +37,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Literal
 from urllib.parse import unquote, urlparse
 
 from pydantic import Field, field_validator
@@ -23,6 +48,65 @@ from eventmem.core.models import Model, SourceInput
 from . import liveness
 from .memory import MemoryContinuity
 from .state import DesireChange
+
+EXECUTION_STATES = ("complete", "failed", "timed-out", "preempted")
+USAGE_STATUSES = ("not_dispatched", "reported", "unknown")
+
+
+class UsageReport(Model):
+    """What the backend said about model usage. A run that never reached the model
+    is `not_dispatched`; one that ran but reported nothing is `unknown`. A missing
+    count is never a zero."""
+
+    status: Literal["not_dispatched", "reported", "unknown"] = "unknown"
+    per_request: list[dict] = Field(default_factory=list)
+    total: dict | None = None
+
+
+class ExecutionReport(Model):
+    """The executor contract; see the module docstring. `result` is a validated
+    `Findings` dump and only a `complete` state may carry one."""
+
+    state: Literal["complete", "failed", "timed-out", "preempted"]
+    result: dict | None = None
+    partial: bool = True
+    reason: str | None = None
+    executor: str = "kimi-cli"
+    provider: str | None = None
+    model: str | None = None
+    reasoning: str | None = None
+    executor_version: str | None = None
+    config_digest: str | None = None
+    native_execution_id: str | None = None
+    exit_code: int | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    seconds: float | None = None
+    attempt: int = 1
+    workdir: str | None = None
+    input_sources: list[dict] = Field(default_factory=list)
+    usage: UsageReport = Field(default_factory=UsageReport)
+    checkpoint: dict | None = None
+
+
+class CodexUnavailable(RuntimeError):
+    """The codex executor cannot start: CLI missing, too old, or a configured
+    credential absent. The exploration pauses with the recorded reason; there is
+    never a silent fallback to another backend or to a default model."""
+
+    def __init__(self, reason, detail=None, *, executor="codex-cli", provider=None):
+        super().__init__(reason if detail is None else reason + ": " + str(detail))
+        self.reason, self.executor, self.provider = reason, executor, provider
+
+
+def normalize_execution_report(raw):
+    """Contract defaults around what a runner returned, keeping its extra keys."""
+    known = {key: raw[key] for key in ExecutionReport.model_fields if key in raw}
+    report = ExecutionReport.model_validate(known)
+    normalized = {**raw, **report.model_dump()}
+    if normalized["provider"] is None and normalized["executor"] == "kimi-cli":
+        normalized["provider"] = "kimi-cli"  # the historical default
+    return normalized
 
 
 class Citation(Model):
@@ -102,6 +186,7 @@ def run_kimi(
     if not 1 <= budget_seconds <= 1200:
         raise ValueError("Exploration budget must be between 1 and 1200 seconds")
     started = time.monotonic()
+    started_at = time.time()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     skills = directory / "empty-skills"
@@ -254,8 +339,14 @@ def run_kimi(
             "error_tags": error_tags,
             "state": state,
             "seconds": round(time.monotonic() - started, 2),
+            "executor": "kimi-cli",
             "provider": "kimi-cli",
             "model": model or "configured-default",
+            "native_execution_id": None,
+            "started_at": started_at,
+            "finished_at": time.time(),
+            # Kimi stream-json frames carry no usage the host can verify.
+            "usage": {"status": "unknown", "per_request": [], "total": None},
             **({"observations": list(json.loads(ledger.read_text()).values())} if ledger and ledger.exists() else {}),
             "result": result.model_dump() if result else None,
             "partial": state != "complete",
@@ -352,13 +443,27 @@ class Explorations:
                 previous = [v for item in self.recent(8) for v in item.get("observations", [])][-60:]
                 options["computer"] = {**computer, "previous": [
                     {k: v[k] for k in ("id", "locator", "version", "title", "observed_at")} for v in previous]}
+            if getattr(runner, "wants_continuation", False):
+                # Explicit checkpoint continuation: a new attempt reads the previous
+                # one's recorded sources, gaps and partial findings. There is no
+                # native session resume to claim.
+                for prior in self.recent(8):
+                    if prior.get("desire_id") == desire["id"] and isinstance(prior.get("checkpoint"), dict):
+                        options["continuation"] = prior["checkpoint"]
+                        break
             from .decision_context import execution_brief
             reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"])
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=canceled, model=model, **options)
+            output = normalize_execution_report(output)
             data.update(output)
             state = output["state"]
+        except CodexUnavailable as error:
+            # Pause with the reason recorded; never a silent fallback to kimi or a default model.
+            state = "failed"
+            data.update(error="exploration-executor-unavailable", waiting_reason=error.reason,
+                        executor=error.executor, provider=error.provider, partial=True, result=None)
         except Exception as error:  # noqa: BLE001 - owned helper boundary; retain a redacted failure receipt
             state = "failed"
             data.update(error=type(error).__name__, partial=True, result=None)
@@ -373,11 +478,17 @@ class Explorations:
                 metadata={"host_event": "computer-observation", "actor": observation["actor"],
                           "locator": observation["locator"], "resource_version": observation["version"]}))
             observation_ids.append(observed["id"])
+        executor = data.get("executor") or "kimi-cli"
         source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
             scope=self.mind.scope, authority="model", kind="observation", session=eid,
             text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
             occurred_at=self.mind.clock(), extract=not MemoryContinuity(self.mind).settings()['semantic'],
-            metadata={"host_event": "exploration-result", "provider": "kimi-cli", "exploration_id": eid,
+            # Executor (the CLI that ran) and provider (the model behind it) are
+            # distinct facts; legacy rows come from kimi-cli running kimi.
+            metadata={"host_event": "exploration-result", "executor": executor,
+                      "provider": data.get("provider") or ("kimi-cli" if executor == "kimi-cli" else None),
+                      "model": data.get("model"), "reasoning": data.get("reasoning"),
+                      "exploration_id": eid,
                       "exploration_target": target, "observation_ids": observation_ids,
                       "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])}))
         data["source_id"] = source["id"]

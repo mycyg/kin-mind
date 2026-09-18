@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deepseekRequest, responseNormalizer, startDeepSeekGateway, replyContract, nativeTurnPurpose} from './deepseek-gateway.mjs';
+import {deepseekRequest, responseNormalizer, startDeepSeekGateway, startExplorationGateway, replyContract, continuityContract, explorationContract, nativeTurnPurpose, GATEWAY_PROFILES} from './deepseek-gateway.mjs';
 import {createLeaseClient} from './model-lease.mjs';
 
 test('named native host events remain non-user data and do not corrupt ordinary tool receipts',()=>{
@@ -128,4 +128,118 @@ test('a provider error, a failed stream and a broken stream each leave one unkno
     assert.deepEqual(usage[1].usage,{input_tokens:4});
     for(const row of usage)assert.ok(JSON.stringify(row).includes('"usage":'),'a usage key is always present');
   } finally {await gateway.close();}
+});
+
+test('purpose profiles are host-bound contracts, never request-declared', () => {
+  const body = {model:'deepseek-flash',input:[{type:'message',role:'user',content:'Research this'}]};
+  const exploration = deepseekRequest(body, 'high', 'exploration');
+  assert.equal(exploration.instructions, explorationContract);
+  assert.ok(!exploration.instructions.includes(replyContract),
+    'an exploration turn must not inherit the user-reply contract');
+  // Even a trailing continuity host event cannot move a profiled instance off
+  // its contract; the legacy unprofiled path still swaps as before.
+  const event = {type:'function_call_output',name:'kin_continuity_check',output:'Verify'};
+  assert.equal(deepseekRequest({model:'deepseek-flash',input:[event]}, 'high', 'exploration').instructions, explorationContract);
+  assert.equal(deepseekRequest({model:'deepseek-flash',input:[event]}).instructions, continuityContract);
+  assert.equal(deepseekRequest(body, 'high', 'chat').instructions, replyContract);
+  assert.equal(deepseekRequest(body, 'high', 'contact-draft').instructions, replyContract);
+  assert.equal(deepseekRequest(body, 'high', 'continuity-check').instructions, continuityContract);
+  assert.throws(() => deepseekRequest(body, 'high', 'owner-asserted'), /unknown-gateway-profile/);
+  assert.deepEqual(GATEWAY_PROFILES.exploration, {lane:'background', purpose:'native-exploration', contract:explorationContract});
+});
+
+test('a profiled gateway fixes lane and purpose for every request and never consults purposeFor', async () => {
+  const usage = [];
+  const gateway = await startExplorationGateway({key:'synthetic-secret', onUsage:row=>usage.push(row),
+    fetchImpl:async()=>new Response(JSON.stringify({id:'r',model:'deepseek-flash',usage:{input_tokens:3},output:[]}),{headers:{'Content-Type':'application/json'}})});
+  try {
+    assert.equal(gateway.profile, 'exploration');
+    const response = await turn(gateway);
+    assert.equal(response.status, 200);
+    assert.equal(usage[0].lane, 'background');
+    assert.equal(usage[0].purpose, 'native-exploration');
+  } finally {await gateway.close();}
+  // purposeFor is not even reachable on a profiled instance.
+  const profiled = await startDeepSeekGateway({key:'synthetic-secret', profile:'chat',
+    purposeFor:()=>{throw Error('must-not-be-called');},
+    fetchImpl:async()=>new Response(JSON.stringify({id:'r',model:'deepseek-flash',output:[]}),{headers:{'Content-Type':'application/json'}})});
+  try {
+    assert.equal((await turn(profiled)).status, 200);
+  } finally {await profiled.close();}
+});
+
+test('the fifth concurrent background request waits; a foreground request is never queued behind exploration', async () => {
+  // One shared ledger, capacity four for background. Foreground is never queued.
+  const held = new Map(); let maxConcurrentBackground = 0;
+  const ledger = async (operation, body) => {
+    const op = operation.replace('model-leases/', '');
+    if (op === 'acquire') {
+      const background = [...held.values()].filter(h => h.lane === 'background').length;
+      if (body.lane === 'background' && background >= 4)
+        return {state:'wait', reason:'deepseek-background-capacity', retry_after_seconds:0.01};
+      held.set(body.id, {lane:body.lane});
+      if (body.lane === 'background') maxConcurrentBackground = Math.max(maxConcurrentBackground, background + 1);
+      return {state:'admitted', lease:{renew_after_seconds:600}};
+    }
+    if (op === 'renew') return held.has(body.id) ? {state:'renewed', lease:{renew_after_seconds:600}} : {state:'lost'};
+    if (op === 'release') {held.delete(body.id); return {state:'released'};}
+    return {state:'unavailable'};
+  };
+  const usage = [];
+  const lease = () => createLeaseClient({request:ledger, waitBudgetMs:4000});
+  let upstreamCalls = 0; const pending = [];
+  const slowUpstream = async () => {
+    upstreamCalls++;
+    return new Promise(resolve => pending.push(() =>
+      resolve(new Response(JSON.stringify({id:'r'+upstreamCalls,model:'deepseek-flash',usage:{input_tokens:1},output:[]}),
+        {headers:{'Content-Type':'application/json'}}))));
+  };
+  const exploration = await startExplorationGateway({key:'synthetic-secret', lease:lease(), onUsage:row=>usage.push(row), fetchImpl:slowUpstream});
+  const chat = await startDeepSeekGateway({key:'synthetic-secret', profile:'chat', lease:lease(), onUsage:row=>usage.push(row), fetchImpl:slowUpstream});
+  const until = async (condition, label) => {
+    for (let i = 0; i < 200 && !condition(); i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(condition(), label);
+  };
+  try {
+    // Four explorations hold all four background slots without finishing.
+    const turns = [0, 1, 2, 3].map(() => turn(exploration));
+    await until(() => upstreamCalls === 4, 'four explorations reach the provider');
+    const fifth = turn(exploration);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(upstreamCalls, 4, 'the fifth background request is still waiting for a slot');
+    // The owner's chat turn shares the ledger but no background slot: it answers now.
+    const chatTurn = turn(chat);
+    await until(() => upstreamCalls === 5, 'foreground is not queued behind exploration');
+    pending.at(-1)();  // answer the chat turn
+    assert.equal((await chatTurn).status, 200);
+    // One exploration completes; the waiting fifth may now take its slot.
+    pending[0]();
+    await until(() => upstreamCalls === 6, 'the fifth request took the released slot');
+    pending.at(-1)();  // answer the fifth
+    assert.equal((await fifth).status, 200);
+    for (const answer of pending) answer();
+    await Promise.all(turns);
+    assert.equal(maxConcurrentBackground, 4, 'background occupancy never exceeded the shared four');
+    await until(() => held.size === 0, 'every lease was released on exit');
+    const explorationRows = usage.filter(row => row.purpose === 'native-exploration');
+    assert.equal(explorationRows.length, 5);
+    assert.ok(explorationRows.every(row => row.lane === 'background'));
+    assert.ok(explorationRows.every(row => row.leaseState === 'admitted'));
+    const chatRow = usage.find(row => row.purpose === 'native-chat-turn');
+    assert.equal(chatRow.lane, 'foreground');
+    assert.equal(chatRow.leaseState, 'admitted');
+  } finally {await exploration.close(); await chat.close();}
+});
+
+test('exploration and creation identities never share a purpose, and only deepseek-flash crosses', () => {
+  // C7-16: distinct background purposes on the same lane.
+  assert.equal(GATEWAY_PROFILES.exploration.purpose, 'native-exploration');
+  assert.equal(nativeTurnPurpose('creation').purpose, 'native-creation');
+  assert.equal(nativeTurnPurpose('contact-draft').purpose, 'native-contact-draft');
+  assert.notEqual(GATEWAY_PROFILES.exploration.purpose, nativeTurnPurpose('creation').purpose);
+  assert.equal(GATEWAY_PROFILES.exploration.lane, nativeTurnPurpose('creation').lane);
+  // C7-2: a non-DeepSeek model never crosses the gateway, whatever the request claims.
+  assert.throws(() => deepseekRequest({model:'gpt-6-astra', input:[]}), /unsupported-request/);
+  assert.throws(() => deepseekRequest({model:'deepseek-v4-pro', input:[],}), /unsupported-request/);
+  assert.throws(() => deepseekRequest({model:'deepseek-flash', input:[]}, 'extreme'), /unsupported-reasoning-effort/);
 });
