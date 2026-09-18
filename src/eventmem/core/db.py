@@ -200,6 +200,8 @@ class Database:
         return key
 
     def metric(self, name, value, data=None):
+        from kin_mind.maintenance import trim_metrics
+
         from .models import now
 
         with self.connect(write=True) as conn:
@@ -207,7 +209,9 @@ class Database:
                 "INSERT INTO metrics(name,value,created_at,data) VALUES(?,?,?,?)",
                 (name, value, now(), dumps(data or {})),
             )
-            # Bound telemetry independently of user memories.
-            conn.execute(
-                "DELETE FROM metrics WHERE id < (SELECT MAX(id)-20000 FROM metrics)"
-            )
+            # Bound telemetry independently of user memories. One ring shared by every
+            # name is the same bound applied in the wrong place: it lets a name that
+            # fires on every model call evict a name that fires when something rare
+            # goes wrong, which is the one an operator came to read. The ring is per
+            # name behind a flag, and the flag off is this line as it always was.
+            trim_metrics(conn, name)

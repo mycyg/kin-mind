@@ -108,6 +108,17 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # committed. So the code ships off, and turning it on is its own decision, taken once
             # the history reads clean. Off, `_history` writes exactly the row it wrote before.
             "history_patches": False,
+            # Stage 5 housekeeping, all three off and all three read through
+            # autonomy_schema.enabled(). `context_cache_sweep` is the only hard delete in the
+            # programme: it removes rows of `mind_context_cache`, which hold compressed context
+            # and nothing else, and a removed row costs one model call to build again. It stays
+            # off until an owner has been told exactly that and has agreed to it, and off the
+            # cache keeps every row and an erase leaves the compressed copies behind, as today.
+            # `metrics_name_ring` gives the telemetry table a ring per name instead of one
+            # shared ring; off is the shared ring, unchanged. `vector_optimize` only unlocks a
+            # command, which still refuses unless the store is provably quiet and still writes
+            # nothing without `--apply`.
+            "context_cache_sweep": False, "metrics_name_ring": False, "vector_optimize": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -226,7 +237,7 @@ class MemoryContinuity:
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
                     "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
-                    "history_patches"):
+                    "history_patches", "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

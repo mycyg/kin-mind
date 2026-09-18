@@ -136,8 +136,12 @@ def foreground_active(conn, scope=None):
 
 def _metric(conn, name, data):
     from eventmem.core.models import now
+
+    from .maintenance import trim_metrics
     conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES(?,?,?,?)", (name, 1, now(), dumps(data)))
-    conn.execute("DELETE FROM metrics WHERE id < (SELECT MAX(id)-20000 FROM metrics)")
+    # The ledger writes into the same telemetry table as the engine, so it bounds it
+    # the same way: one ring per name with the flag on, the shared ring without it.
+    trim_metrics(conn, name)
 
 
 def _busy(error):

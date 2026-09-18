@@ -813,6 +813,14 @@ class Engine:
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM prefetch")
             conn.execute("DELETE FROM metrics")
+            # And so does the compressed context built out of it, which is the same
+            # text in a model's words. It goes only for a scope whose configuration
+            # asked for that sweep: erasing text nobody can read any more is one
+            # decision, hard-deleting a derived cache is another, and the second one
+            # is the flag. Without it the gap stays what it is today and is written
+            # down as such in the operator documentation.
+            from kin_mind.maintenance import purge_context_cache_on_erase
+            purge_context_cache_on_erase(conn)
             for job in conn.execute("SELECT id,payload FROM jobs").fetchall():
                 payload = json.loads(job["payload"])
                 if (
@@ -962,9 +970,27 @@ class Engine:
                 json.loads(r[0])
                 for r in conn.execute("SELECT data FROM vector_indexes")
             ]
-            metrics = conn.execute(
-                "SELECT name,value,data FROM metrics ORDER BY id DESC LIMIT 2000"
-            ).fetchall()
+            from kin_mind.maintenance import STATS_NAMES, STATS_WINDOW, ring_enabled
+
+            if ring_enabled(conn):
+                # The window was the newest 2,000 rows of the whole table, so a name
+                # that fires rarely left this answer long before it left the table:
+                # with a model call writing three rows, a store that had been busy for
+                # a day could not say what its own recall latency was. Each of the
+                # three names this reads now brings its own newest 2,000 samples,
+                # which is the same window applied where the ring now is.
+                metrics = [
+                    row
+                    for name in STATS_NAMES
+                    for row in conn.execute(
+                        "SELECT name,value,data FROM metrics WHERE name=? ORDER BY id DESC LIMIT ?",
+                        (name, STATS_WINDOW),
+                    )
+                ]
+            else:
+                metrics = conn.execute(
+                    "SELECT name,value,data FROM metrics ORDER BY id DESC LIMIT 2000"
+                ).fetchall()
         times = sorted(r["value"] for r in metrics if r["name"] == "recall_ms")
         counts["latency"] = {
             "samples": len(times),
