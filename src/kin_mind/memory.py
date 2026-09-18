@@ -96,6 +96,10 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # that scan, and belongs only to a store whose snapshots no longer carry the key: while
             # both are on the guard refuses on either answer and records any disagreement.
             "evidence_key_index": True, "history_legacy_guard": True,
+            # Stage 5: a recovery command asks the lease ledger and the process table instead of
+            # believing its caller's `workers_stopped`. Off restores that boolean as the only
+            # check, which is the stage-4 behaviour of all four recovery commands exactly.
+            "liveness_checks": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -213,7 +217,7 @@ class MemoryContinuity:
                     "chunked_reply_review", "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
                     "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
-                    "evidence_key_index", "history_legacy_guard"):
+                    "evidence_key_index", "history_legacy_guard", "liveness_checks"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

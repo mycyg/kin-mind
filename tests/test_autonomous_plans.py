@@ -126,8 +126,13 @@ def test_concurrent_claim_restart_and_late_result(env):
     run = claimed["run"]
     with pytest.raises(Conflict):
         plans.settle(run["id"], run["owner"], run["fence"], state="completed", result={"verified": True})
-    with pytest.raises(Conflict):
-        plans.recover()
+    # The winner's lease has not expired: a restart recovery reports that row and
+    # leaves it alone, however confidently the caller declares the workers stopped.
+    held = plans.recover()
+    assert held["recovered"] == [] and [r["id"] for r in held["still_leased"]] == [run["id"]]
+    assert plans.recover(workers_stopped=True)["recovered"] == []
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=0 WHERE id=?", (run["id"],))
     assert plans.recover(workers_stopped=True)["recovered"] == [run["id"]]
     assert plans.read(plan["id"])["plans"][0]["steps"][0]["state"] == "waiting"
     with pytest.raises(Conflict):

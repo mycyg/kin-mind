@@ -20,6 +20,7 @@ from pydantic import Field, field_validator
 from eventmem.core.db import Conflict, digest, dumps
 from eventmem.core.models import Model, SourceInput
 
+from . import liveness
 from .memory import MemoryContinuity
 from .state import DesireChange
 
@@ -310,7 +311,12 @@ class Explorations:
         eid = "explore_" + digest([self.mind.scope.key(), desire["id"], desire["revision"]])[:32]
         data = {"desire_id": desire["id"], "selected_brief": desire["content"], "exploration_target": target,
                 "topic_selected_by": "deepseek-appraisal", "agent_version": agent_version,
-                "evidence_ids": [r["record_id"] for r in desire["evidence"]]}
+                "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                # Who is running this, so that a later start can tell an exploration
+                # that is still working from one whose process died with the host.
+                # The row is the only place there is: `mind_explorations` gains no
+                # column for it, and `data` is already ours to shape.
+                "liveness": liveness.self_record(deadline=time.time() + budget_seconds + liveness.EXPLORATION_MARGIN_SECONDS)}
         request = DesireChange(command_id=eid+":start", agent_version=agent_version,
             expected_revision=candidate["revision"], evidence_ids=data["evidence_ids"],
             action="start", desire_id=desire["id"], reason="Host claimed the reviewed exploration intent")

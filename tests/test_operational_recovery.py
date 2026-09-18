@@ -53,12 +53,12 @@ def test_recovery_coalesces_clock_wakeups_once_and_preserves_state(system):
     from kin_mind.recovery import migrate_operational
     mind, memory, _source, clock = system
     before = mind.read()["dimensions"]
-    with pytest.raises(ValueError, match="termination"):
-        migrate_operational(mind, workers_stopped=False)
     clock[0] += timedelta(hours=1)
     actions = ActionEvents(mind)
     memory.queue_idle(actions)
-    receipt = migrate_operational(mind, workers_stopped=True)
+    # The caller's word for a stopped worker is no longer the check; an unheld
+    # lane migrates whatever the boolean says (stage 5: liveness_checks).
+    receipt = migrate_operational(mind, workers_stopped=False)
     assert receipt["superseded_idle_events"]
     assert migrate_operational(mind, workers_stopped=True) == receipt
     assert mind.read()["dimensions"] == before
