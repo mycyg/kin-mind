@@ -957,3 +957,117 @@ def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path,
     result = dispatch(config, "explore", {})
     assert result["state"] == "complete"
     assert registry.read_bytes() == before
+
+
+# --- C2 dispatch indirection: the bridge-published exploration gateway ---------
+
+def test_exploration_gateway_state_file_lifecycle(tmp_path):
+    """C2: the published baseUrl is honored only while its writer is alive."""
+    from kin_mind.codex_executor import exploration_gateway_base_url
+
+    state = tmp_path / "exploration-gateway.json"
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:45678/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid()}))
+    assert exploration_gateway_base_url(state) == "http://127.0.0.1:45678/v1"
+
+    missing = tmp_path / "never-written.json"
+    with pytest.raises(CodexUnavailable) as gone:
+        exploration_gateway_base_url(missing)
+    assert gone.value.reason == "exploration-gateway-missing"
+
+    # A dead writer's file is stale and not honored.
+    import subprocess
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:45678/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": dead.pid}))
+    with pytest.raises(CodexUnavailable) as stale:
+        exploration_gateway_base_url(state)
+    assert stale.value.reason == "exploration-gateway-stale"
+
+    # Only the bridge's loopback gateway is ever a valid target.
+    state.write_text(json.dumps({"baseUrl": "https://api.deepseek.com/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid()}))
+    with pytest.raises(CodexUnavailable) as invalid:
+        exploration_gateway_base_url(state)
+    assert invalid.value.reason == "exploration-gateway-invalid"
+
+
+def test_prepare_reads_the_gateway_state_file_only_without_static_base_url(tmp_path, monkeypatch):
+    """C2: config wins over the state file; missing both pauses without claiming."""
+    from kin_mind.codex_executor import prepare_codex_exploration
+
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setenv("KIN_EXPLORATION_GATEWAY_TOKEN", "synthetic-bridge-token")
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)
+    state = tmp_path / "exploration-gateway.json"
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:41001/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid()}))
+    base = {"exploration_backend": "codex", "exploration_command": str(fake)}
+
+    # The state file supplies the address; the token env var name defaults.
+    prepared = prepare_codex_exploration({**base, "exploration_gateway_state_file": str(state)})
+    assert prepared["state"] == "ready"
+    report = prepared["runner"](str(fake), {"question": "synthetic https://example.com"},
+                                tmp_path / "job", budget_seconds=60, canceled=lambda: False,
+                                model="deepseek-flash")
+    assert report["state"] == "complete"
+    assert report["provider"] == "deepseek"
+
+    # An explicit static base_url wins over the state file.
+    prepared = prepare_codex_exploration({**base, "exploration_gateway_state_file": str(state),
+                                        "exploration_model_provider": PROVIDER})
+    assert prepared["state"] == "ready"
+    report = prepared["runner"](str(fake), {"question": "synthetic https://example.com"},
+                                tmp_path / "job2", budget_seconds=60, canceled=lambda: False,
+                                model="deepseek-flash")
+    assert report["state"] == "complete"
+
+    # Missing both: the exploration waits, nothing is claimed and nothing runs kimi.
+    unprepared = prepare_codex_exploration(base)
+    assert unprepared["state"] == "waiting"
+    assert unprepared["reason"] == "exploration-gateway-unconfigured"
+
+    # A stale state file pauses the same way.
+    import subprocess
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:41001/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": dead.pid}))
+    stale = prepare_codex_exploration({**base, "exploration_gateway_state_file": str(state)})
+    assert stale["state"] == "waiting" and stale["detail"] == "exploration-gateway-stale"
+
+
+def test_host_explore_codex_dispatch_reads_the_state_file(tmp_path, monkeypatch):
+    """C2: end to end — dispatch with no static provider base_url reads the bridge file."""
+    from kin_mind.exploration import Explorations
+    from kin_mind.host import dispatch
+
+    _, mind, _ = exploration_world(tmp_path)
+    fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setenv("KIN_EXPLORATION_GATEWAY_TOKEN", "synthetic-bridge-token")
+    state = tmp_path / "state" / "exploration-gateway.json"
+    state.parent.mkdir(0o700, parents=True)
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:41002/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid()}))
+    config = host_config(tmp_path, mind, exploration_backend="codex",
+                         exploration_command=str(fake),
+                         exploration_gateway_state_file=str(state))
+    result = dispatch(config, "explore", {})
+    assert result["state"] == "complete"
+    assert result["executor"] == "codex-cli" and result["provider"] == "deepseek"
+    observed = json.loads((Path(config["exploration_directory"]) / result["id"] / "observed.json").read_text())
+    argv = observed["argv"]
+    assert 'model_providers.deepseek.base_url="http://127.0.0.1:41002/v1"' in argv
+    assert 'model_providers.deepseek.env_key="KIN_EXPLORATION_GATEWAY_TOKEN"' in argv
+    assert observed["env"]["KIN_EXPLORATION_GATEWAY_TOKEN"] == "synthetic-bridge-token"
+
+    # Without the file the same dispatch waits and claims nothing.
+    state.unlink()
+    waiting = dispatch(config, "explore", {})
+    assert waiting["state"] == "waiting"
+    assert waiting["detail"] == "exploration-gateway-missing"
+    assert len(Explorations(mind).recent()) == 1  # only the completed one exists
