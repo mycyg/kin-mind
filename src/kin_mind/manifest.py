@@ -510,8 +510,12 @@ def _written(shown, state):
                          + [motive(state["dimensions"].get(k))] for k in shown["dimensions"]}))
     if "desires" in shown:
         seen = {k: [e.get("revision"), e.get("status")] for k, e in shown["desires"].items() if k != "#window"}
+        # The total the model was shown counts the finished wishes that have been moved out of the
+        # document as well as the ones still in it, so this side counts them the same way. Read
+        # from the state's own count rather than from the archive, because this runs inside the
+        # commit transaction and the number has to be the one this revision carries.
         rows.append(("desires", {"#total": shown["desires"]["#window"]["total"], **seen},
-                     {"#total": len(state.get("desires", {})),
+                     {"#total": len(state.get("desires", {})) + ((state.get("desire_archive") or {}).get("count") or 0),
                       **{k: [(state["desires"].get(k) or {}).get(f) for f in ("revision", "status")] for k in seen}}))
     if "concerns" in shown and shown["concerns"]["#window"].get("enabled"):
         seen = {k: e.get("revision") for k, e in shown["concerns"].items() if k != "#window"}

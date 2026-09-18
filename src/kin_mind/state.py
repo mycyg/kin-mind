@@ -184,9 +184,11 @@ class Mind(Continuity):
         # believing a word of it, so a stale one costs a rebuild and can never cost correctness.
         self._loaded = None
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
+        from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA)
+            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
+                               + DESIRE_ARCHIVE_SCHEMA)
 
     def _load(self, conn):
         row = conn.execute(
@@ -641,6 +643,23 @@ class Mind(Continuity):
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
 
+    def _desire(self, conn, state, identifier):
+        """The wish this identifier names, wherever it now lives.
+
+        A finished wish may have been moved to the archive to keep it out of a document that is
+        written again on every revision. It is still that wish: the same identifier, the same plan
+        links, the same evidence and the same receipt. Every reader that asks for a wish by its
+        identifier asks here, so a move can never turn a wish that exists into one that does not —
+        which would cost a dedupe, and a duplicate message after it.
+
+        What comes back from the archive is a copy of a finished wish, so writing to it writes
+        nowhere. Every path that changes a wish refuses a finished one before it reaches this."""
+        desire = state["desires"].get(identifier)
+        if desire is not None:
+            return desire
+        from .desire_archive import archived
+        return archived(conn, self.scope.key(), identifier)
+
     def manage_desire(self, request: DesireChange):
         return self._mutate(
             request,
@@ -649,13 +668,19 @@ class Mind(Continuity):
         )
 
     def _apply_desire(self, conn, state, request, event_id):
+        from .desire_archive import intent as archived_intent
         refs = self._evidence(conn, request.evidence_ids)
         if request.exploration_id:
             from .exploration_decisions import require_share
             decision = require_share(self, conn, state, request.exploration_id)
-            if request.action == "create" and any(d.get("exploration_id") == request.exploration_id
-                                                  and d.get("sharing_revision") == decision["revision"]
-                                                  for d in state["desires"].values()):
+            # Whatever their status, including the finished ones that have moved: one sharing
+            # decision has one contact intent, and an intent that left the document did not stop
+            # being the intent this decision already has.
+            if request.action == "create" and (any(d.get("exploration_id") == request.exploration_id
+                                                   and d.get("sharing_revision") == decision["revision"]
+                                                   for d in state["desires"].values())
+                                               or archived_intent(conn, self.scope.key(),
+                                                                  request.exploration_id, decision["revision"])):
                 raise Conflict("This sharing decision already has a contact intent")
         link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
         at = self.clock()
@@ -664,6 +689,11 @@ class Mind(Continuity):
             if timestamp(request.expires_at) <= timestamp(at):
                 raise ValueError("A new desire must have a future expiry")
             did = "desire_" + digest([self.scope.key(), request.command_id])[:32]
+            if self._desire(conn, state, did) is not None:
+                # The identifier is derived from the command, so a command that ran once before
+                # would land on a wish that has since moved. One identifier, one wish, in one
+                # place: a second copy in the document is the state the archive may never reach.
+                raise Conflict("A finished desire stays in history; create a new desire")
             state["desires"][did] = dict(
                 id=did,
                 status="wanted",
@@ -686,6 +716,10 @@ class Mind(Continuity):
         else:
             did = request.desire_id
             if did not in state["desires"]:
+                if self._desire(conn, state, did) is not None:
+                    # An archived wish is a finished wish that has moved, so it earns the refusal
+                    # a finished wish earns — not the one for a wish that was never here.
+                    raise Conflict("A finished desire stays in history; create a new desire")
                 raise Missing("Desire is outside this scope or missing")
             desire = state["desires"][did]
             if request.exploration_target and desire["kind"] != "explore":
@@ -696,8 +730,10 @@ class Mind(Continuity):
                 from .exploration_decisions import require_share
                 linked_result = request.exploration_id or desire["exploration_id"]
                 decision = require_share(self, conn, state, linked_result)
-                if any(d["id"] != did and d.get("exploration_id") == linked_result
-                       and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values()):
+                if (any(d["id"] != did and d.get("exploration_id") == linked_result
+                        and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values())
+                        or archived_intent(conn, self.scope.key(), linked_result,
+                                           decision["revision"], exclude=did)):
                     raise Conflict("This sharing decision already has another contact intent")
             if desire["status"] in {"completed", "abandoned"}:
                 raise Conflict(
@@ -1024,6 +1060,13 @@ class Mind(Continuity):
         if ledger:
             # Only what a switch that is on produced: with both off this view is what it was, key for key.
             view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
+        from .desire_archive import STATE_KEY as DESIRE_ARCHIVE
+        moved = (state.get(DESIRE_ARCHIVE) or {}).get("count") or 0
+        if moved:
+            # How many finished wishes are held outside the document, so a reader counting what is
+            # here does not read the move as a hundred wishes having ceased to exist. Present only
+            # once something has moved, so a store that never archives sees the view it always did.
+            view[DESIRE_ARCHIVE] = {"count": moved}
         return view
 
     def read(self, *, as_of=None, history=0, query=""):

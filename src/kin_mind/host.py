@@ -217,6 +217,16 @@ def dispatch(config, action, request):
         if action == "evidence-keys-verify":
             return verify(mind, limit=request.get("limit", SAMPLE))
         return backfill(mind, apply=bool(request.get("apply")), batch=request.get("batch", BATCH))
+    if action in {"desire-archive", "desire-unarchive"}:
+        # Operator actions. Neither writes without `--apply`, and the dry run asks for no flag at
+        # all: it reads what would move and what holds everything else, which is what makes it
+        # safe against a copy of a live store. The restore is never gated by the flag, because it
+        # is what runs before a rollback to a release that cannot see the archive.
+        from .desire_archive import DAYS, archive, restore
+        if action == "desire-unarchive":
+            return restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
+        return archive(mind, apply=bool(request.get("apply")), days=request.get("days", DAYS),
+                       limit=request.get("limit"))
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -468,7 +478,7 @@ def dispatch(config, action, request):
 MIGRATION_ACTION = "migrate-evidence-isolation"
 # The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
 # are told to write. Every one of them defaults to a dry run.
-APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill")
+APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive")
 
 
 def main():

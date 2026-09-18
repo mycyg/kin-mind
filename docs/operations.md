@@ -124,6 +124,53 @@ A row is kept whole rather than stored as a patch when its kind is `initialize` 
 
 While compaction owns the rows, `meta.history_compaction_active` is set and no revision can be written at all: the commit is refused with `history-compaction-active` and nothing lands, because a row written in the middle of a rewrite is a row the archive does not hold.
 
+## Wish archive
+
+The state document carries every wish that was ever made, and it is written again on every
+revision. Most of them are finished: a hundred and twenty wishes, over half the document by bytes,
+all but a few already completed or abandoned. `mind_desire_archive` holds the finished ones that
+nothing is still waiting on, whole — the same identifier, the same plan links, the same evidence
+references, the same decision receipt — and the document carries only what is still live plus the
+tail of finished wishes the appraisal projection shows.
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG desire-archive
+echo '{"days": 14}' | python -m kin_mind.host --config PRIVATE_CONFIG desire-archive
+python -m kin_mind.host --config PRIVATE_CONFIG desire-archive --apply
+python -m kin_mind.host --config PRIVATE_CONFIG desire-unarchive --apply
+```
+
+The dry run is the default, writes nothing at all, and asks for no flag: run it against a copy
+first and read what it says. `would_archive` names every wish that would move; `holding` names
+every wish that would stay and **why**, by identifier, with a sentence for each reason under
+`reasons` and totals under `holding_reasons`. `days` is the floor under a settled wish and is the
+only number worth trying at several values — the rest of the decision does not change with it.
+
+**Time is never a reason.** Only a wish the model has already settled as `completed` or
+`abandoned` can move. A long-running plan is not finished because it is old; an expired `wanted`
+or `waiting` wish is not touched at all, because expiry is not a verdict and the wish is still the
+model's to settle. Nor does a wish move while anything is still open on it: a contact attempt
+drafting, pending or unconfirmed; a plan run running or unconfirmed; an active plan or step; an
+action event that has not settled, including one left for review; a running exploration; or a
+delivery recorded as partial. Each of those appears by name in `holding`.
+
+A wish that moved is still this mind's. Every reader that asks for a wish by its identifier looks
+in the archive when the document misses, so an update of an archived wish is refused exactly as a
+finished wish is refused, a sharing decision whose contact intent has moved still refuses a second
+one, and the plan synchronisation skips it instead of making it again. The count of what has moved
+is kept in the state document, so the projection's `desire_window.total` still says how many
+wishes this mind has rather than how many are left in the document.
+
+`desire_archive` is **off by default** and the move needs the explicit command as well as the
+flag. `desire-unarchive` is never gated by it: with no identifiers it puts everything back, and it
+is what runs **before a rollback**, because the release before this one cannot see the archive at
+all and would read those wishes as gone. Nothing is ever deleted — an unarchived wish leaves the
+table only in the same transaction that puts it back into the document, and the document sorts its
+keys, so a full round trip gives back the document it had.
+
+Both the move and the restore are ordinary revisions with their own history rows, `desire-archive`
+and `desire-unarchive`, whose request names the wishes that moved.
+
 ## Which copy of the source runs
 
 A deployment says where the code lives; until the start-up self-check, nothing asked the interpreter whether it agreed. An editable install left behind in the virtual environment puts a second, older copy of `eventmem` or `kin_mind` on `sys.path`, and the current working directory comes before everything a deployment controls. Either is enough for a host to import code that was replaced days ago, and the only symptom is that a fix which was deployed appears not to have been.
