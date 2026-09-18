@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {writeJsonAtomic,createJsonExclusive,readJsonFile,quarantineFile} from './atomic-json.mjs';
+import {writeJsonAtomic,createJsonExclusive,createFileExclusive,readJsonFile,quarantineFile} from './atomic-json.mjs';
 const hash=value=>createHash('sha256').update(value).digest('hex');
 /** The retry ledger keeps one file per event that is still waiting, and never more
  * than this many. It carries IDs, counts and times only — never message text. */
@@ -124,7 +124,9 @@ export function snapshotArtifact(file,directory) {
   const bytes=fs.readFileSync(file),sha256=hash(bytes);
   fs.mkdirSync(directory,{recursive:true,mode:0o700});
   const target=path.join(directory,sha256);
-  try{fs.writeFileSync(target,bytes,{flag:'wx',mode:0o600});}catch(error){if(error.code!=='EEXIST')throw error;}
+  // The snapshot is the proof that these were the bytes. It is written whole or
+  // not at all, because a half-written one keeps a name that promises the rest.
+  createFileExclusive(target,bytes);
   return {path:target,observed_path:file,sha256,name:path.basename(file),bytes:bytes.length};
 }
 /** Reconcile the local outbox/journal gap; never call a transport API here. */

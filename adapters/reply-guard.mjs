@@ -3,6 +3,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {TransportManifests,manifestView} from './transport-manifest.mjs';
 import {ReplyTail} from './reply-tail.mjs';
+import {writeJsonAtomic} from './atomic-json.mjs';
 
 // Tail bookkeeping may have to wait for the memory host. A reply never waits for it longer than this; the work goes on behind it.
 const within=(work,ms)=>{let timer;return Promise.race([work,new Promise(resolve=>{timer=setTimeout(resolve,ms);timer.unref?.();})]).finally(()=>clearTimeout(timer));};
@@ -71,7 +72,10 @@ export class ReplyGuard {
     } catch {result={state:'pending',reason:'share-review-unavailable',transient:true};}
     return this.save(file,{...result,...(result.state==='pending'?{retryAfterMs:60000,retryAt:this.clock()+60000}:{})});
   }
-  save(file,value){const temporary=file+'.'+process.pid+'.tmp';fs.writeFileSync(temporary,JSON.stringify(value),{mode:0o600});fs.renameSync(temporary,file);return value;}
+  // A share decision is what stops the same thing being said to the owner twice.
+  // It is written through the shared writer: a unique temporary name, so two
+  // checks at once never share one, and the bytes on the disk before the rename.
+  save(file,value){writeJsonAtomic(file,value,{previous:false});return value;}
   async checkGroup(requests,{frozen=false,remainder=null,sent=[]}={}) {
     if(this.wholeReplyReview){
       const key='group-'+createHash('sha256').update(JSON.stringify(remainder?[requests,frozen,remainder.items.map(item=>item.id)]:[requests,frozen])).digest('hex');

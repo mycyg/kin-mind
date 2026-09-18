@@ -3,6 +3,7 @@ import {createInterface} from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
+import {writeJsonAtomic} from './atomic-json.mjs';
 
 const schema={type:'object',properties:{summary:{type:'string'},artifacts:{type:'array',minItems:1,maxItems:24,items:{type:'string'}},verification:{type:'array',items:{type:'string'}},remaining:{type:'array',items:{type:'string'}}},required:['summary','artifacts','verification','remaining'],additionalProperties:false};
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
@@ -38,7 +39,7 @@ export class AutonomousCreator {
     const directory=path.join(this.root,hash(Buffer.from(plan.id)).slice(0,24),hash(Buffer.from(step.id)).slice(0,24));
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
     const schemaFile=path.join(directory,'.result-schema.json'),lastFile=path.join(directory,'.result-'+run.id+'.json');
-    fs.writeFileSync(schemaFile,JSON.stringify(schema),{mode:0o600});
+    writeJsonAtomic(schemaFile,schema,{previous:false});
     const args=['exec','--ignore-user-config','--ignore-rules','--ephemeral','--skip-git-repo-check','--json','--color','never',
       '--sandbox','workspace-write','--cd',directory,'--model',this.model,'--output-schema',schemaFile,'--output-last-message',lastFile,
       '-c','approval_policy="never"','-c','mcp_servers={}','-c','features.apps=false','-c','features.hooks=false','-c','features.multi_agent=false',
