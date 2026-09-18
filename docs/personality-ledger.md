@@ -45,7 +45,7 @@ A non-empty `evolution` from an ordinary appraisal is kept as a pending proposal
 - **That a trait is true.** It vouches that the cited material exists, that it may stand for the class it was given, that it came from separate times, and that an owner's words were quoted literally. The sentence about Kin is Kin's own.
 - **That an authority label is honest.** The predicates read what the store recorded. Operational evidence has to be ingested by a trusted host; a timestamp check cannot prove that nobody already knew the answer.
 - **That an episode count matches lived experience.** The thirty-minute window is the interaction window that already existed, reused as it stands. It can only under-count independent times, which delays a promotion and never grants one; a candidate acts meanwhile.
-- **That a stated move was carried out.** `mind_next_moves` records what an appraisal said and what the host found behind it. It changes no order and no readiness.
+- **That a stated move was carried out.** `mind_next_moves` records what an appraisal said and what the host found behind it. It changes no order, and the only readiness it can change is to withdraw it: a wish whose trait the owner has since ended stops looking ready. Nothing here ever makes something ready.
 - **That an intent was obeyed.** It is a stance handed to the wording, never a script, and it is dropped the moment it stops being fresh.
 - **That a confirmed prediction makes a personality change right.** It makes it eligible for the daily merge, under the limits that were already there.
 
@@ -67,7 +67,7 @@ Switches are registered in `memory.DEFAULTS`, are read through `autonomy_schema.
 | --- | --- |
 | `trait_ledger` | `trait_observations`, `trait_decisions`, the ledger tables and its routes, and the trait and correction items in both the appraisal projection and the chat context. |
 | `expression_intent` | `expression_intent`, and the stance, topics and avoidances reaching the wording instead of the lookup table alone. |
-| `next_move_audit` | `next_move` and the append-only `mind_next_moves`. |
+| `next_move_audit` | `next_move`, the append-only `mind_next_moves`, and — because the move's grounds are the one place the model says in band *why* it is pursuing a wish or a step — the record of which trait that wish or step rests on. It still readies nothing: what it records can only make something stop being ready, never make it ready. Off, new wishes stop acquiring that record; the ones that already have it keep it. |
 | `behavior_chain` | `self_hypothesis`, `prediction_outcomes`, the compatibility stamp, the pending evolution proposal and the daily merge with no model call. Off restores one model request a day and an assessment in the same agent version — and, with it, the silence this stage was built to end: an `evolution` from an ordinary appraisal is dropped where it arrives, neither applied nor stored nor refused. |
 | `wish_version_review` | One `wish-review` per wish and version for a wish whose decision was made under an earlier agent version, instead of leaving it not-ready with nothing ever looking at it again. |
 | `rest_review_window` | The `review_rest_max_minutes` ceiling of 480 for the next quiet review, applied only while the rhythm rests or the owner's quiet hours run. Everywhere else `review_max_minutes` still decides, and the request says which ceiling holds. |
