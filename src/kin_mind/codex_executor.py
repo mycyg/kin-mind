@@ -616,22 +616,53 @@ def codex_runner(*, reasoning, provider, cli_version, model_catalog=None):
     return run
 
 
+def exploration_gateway_base_url(state_file, *, probe=None):
+    """The bridge-published exploration gateway address, honored only while the
+    publishing process is alive. A missing, unreadable, non-loopback or stale
+    file pauses the exploration; nothing falls back to another backend."""
+    from .liveness import probe_process
+    try:
+        data = json.loads(Path(state_file).read_text())
+        base_url = str(data["baseUrl"])
+        pid = int(data["pid"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise CodexUnavailable("exploration-gateway-missing", error) from error
+    seen = (probe or probe_process)(pid)
+    if seen.get("alive") is False:
+        raise CodexUnavailable("exploration-gateway-stale", "pid " + str(pid))
+    parsed = urlparse(base_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+        raise CodexUnavailable("exploration-gateway-invalid")
+    return base_url
+
+
 def prepare_codex_exploration(config, *, environ=None):
     """Host config -> a ready runner, or a recorded waiting reason.
 
     A configuration problem is a loud error (the operator must fix it); an
     environment that cannot start codex pauses the exploration. Neither path ever
-    falls back to kimi or to a default model.
-    """
+    falls back to kimi or to a default model. The provider address is an explicit
+    `exploration_model_provider.base_url` when configured, else the bridge's
+    published exploration-gateway state file, read fresh at each dispatch."""
     environ = os.environ if environ is None else environ
     command = config.get("exploration_command")
     if not command:
         raise ValueError('exploration_backend "codex" requires exploration_command')
-    if config.get("exploration_model_provider") is None:
-        raise ValueError('exploration_backend "codex" requires exploration_model_provider '
-                         "(id, base_url, optional env_key/wire_api); without it codex would "
-                         "use its built-in default model")
-    provider = validated_provider(config["exploration_model_provider"])
+    provider_config = dict(config.get("exploration_model_provider") or {})
+    if not provider_config.get("base_url"):
+        state_file = config.get("exploration_gateway_state_file")
+        if not state_file and not provider_config:
+            return {"state": "waiting", "reason": "exploration-gateway-unconfigured",
+                    "backend": "codex"}
+        try:
+            provider_config["base_url"] = exploration_gateway_base_url(state_file)
+        except CodexUnavailable as error:
+            return {"state": "waiting", "reason": "exploration-executor-unavailable",
+                    "detail": error.reason, "backend": "codex"}
+    provider_config.setdefault("id", "deepseek")
+    provider_config.setdefault("wire_api", "responses")
+    provider_config.setdefault("env_key", "KIN_EXPLORATION_GATEWAY_TOKEN")
+    provider = validated_provider(provider_config)
     max_running = int(config.get("exploration_max_running") or 1)
     if max_running != 1:
         raise ValueError("exploration_max_running > 1 is not supported: the exploration "
