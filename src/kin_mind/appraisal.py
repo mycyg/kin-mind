@@ -744,7 +744,14 @@ def appraisal_context(context):
             projected["reason"] = desire.get("reason", "")
             projected["evidence_ids"] = [r["record_id"] for r in desire.get("evidence", [])]
         state["desires"].append(projected)
-    state["desire_window"] = {"included": len(chosen_desires), "total": len(all_desires), "remaining_in_storage": len(all_desires) - len(chosen_desires)}
+    # What has been moved out of the document is still stored and still this mind's: counted here
+    # so the window says how many wishes exist rather than how many are left in the document. The
+    # key is absent until something moves, so a store that never archives is projected as before.
+    moved = (original.get("desire_archive") or {}).get("count") or 0
+    state["desire_window"] = {"included": len(chosen_desires), "total": len(all_desires) + moved,
+                              "remaining_in_storage": len(all_desires) - len(chosen_desires) + moved}
+    if moved:
+        state["desire_window"]["archived"] = moved
     # Keep the decision window bounded; evidence dedup and revision history do
     # not depend on which concerns happen to fit this request.
     concerns = original.get("concerns", [])
@@ -2139,18 +2146,31 @@ class Appraisals:
                                   {"habits": lambda wish: wish.kind == "explore", "concerns": lambda wish: bool(wish.concern_ids)})
 
                     def apply_wishes():
+                        from .desire_archive import contents as archived_contents
+                        from .desire_archive import intent as archived_intent
+                        # Read once, and only where it is read at all: the content check reaches
+                        # finished wishes on a bootstrap and nowhere else.
+                        made = (archived_contents(conn, self.mind.scope.key())
+                                if data.get("stimulus") == "bootstrap" else set())
                         for index, wish in wishes:
                             if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
                                 wish = wish.model_copy(update={"exploration_id": primary_result})
-                            if wish.exploration_id and any(d.get("exploration_id") == wish.exploration_id
+                            # Both of these read the finished wishes as well as the live ones, so
+                            # both ask the archive: an intent that moved is still this decision's
+                            # intent, and a wish a bootstrap already made is still made.
+                            if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
                                 and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
-                                for d in state["desires"].values()):
+                                for d in state["desires"].values())
+                                or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
+                                                   (state.get("exploration_decisions", {}).get(wish.exploration_id) or {}).get("revision"))):
                                 continue
                             if any(
                                 d["content"] == wish.content
                                 and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
                                 for d in state["desires"].values()
                             ):
+                                continue
+                            if wish.content in made:
                                 continue
                             changed = self.mind._apply_desire(
                                 conn,

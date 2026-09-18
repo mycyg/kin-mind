@@ -108,6 +108,13 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # committed. So the code ships off, and turning it on is its own decision, taken once
             # the history reads clean. Off, `_history` writes exactly the row it wrote before.
             "history_patches": False,
+            # Stage 5, the other flag read through autonomy_schema.enabled(): off unless a store
+            # says otherwise, and even on it moves nothing without the explicit command. It
+            # decides what the document the model is shown contains, and the release before it
+            # cannot see an archived wish at all — so it deploys off, a dry run is read first, and
+            # `desire-unarchive` puts everything back before any rollback. Off, a finished wish
+            # stays in the document exactly as it does today.
+            "desire_archive": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -226,7 +233,7 @@ class MemoryContinuity:
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
                     "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
-                    "history_patches"):
+                    "history_patches", "desire_archive"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

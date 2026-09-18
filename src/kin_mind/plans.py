@@ -755,7 +755,11 @@ class AutonomousPlans:
                             or not self.mind._fresh(conn, plan["evidence"] + decision["evidence"])):
                             continue
                     did = step.get("desire_id") or (plan.get("desire_id") if len(plan["steps"]) == 1 else None)
-                    desire = state["desires"].get(did)
+                    # Wherever that wish now lives. A finished one may have been moved out of the
+                    # document, and a miss here would not skip it — the identifier is derived from
+                    # this decision, so this would make the same wish over again, with the contact
+                    # it already had still to come.
+                    desire = self.mind._desire(conn, state, did) if did else None
                     if not ready and not desire:
                         continue
                     if desire and desire.get("plan_decision_id") == step["decision"]["id"]:
