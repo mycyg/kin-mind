@@ -44,7 +44,7 @@ CHAIN_REQUEST = "907a33d6f729519b1ba46d2b943ab95455aa1e023efd42ac9fcbd5371314a32
 # What a behavior-relevant instruction is, digested. A paragraph that moves fails this test, and its
 # author chooses: a new BEHAVIOR_CONTRACT, because the checks made under the old one no longer
 # describe this agent, or a new pin here, because they still do.
-PINNED_PROMPTS = {"behavior-1": "bcc89f06f5220d2161e7b982e4d7747af47502096399bcb838b4b8e2e3f5724b"}
+PINNED_PROMPTS = {"behavior-1": "b0028afcbfb5b28daa4af53ea024e0e5edbd004ced10dfdf989c673d769e76d7"}
 
 
 @pytest.fixture

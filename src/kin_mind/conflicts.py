@@ -31,6 +31,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
+    "kin_mind.expression_intent",
 )
 
 
@@ -262,6 +263,12 @@ REGISTRY = {
     "An owner instruction or correction must quote the owner's own words": ("semantic", "trait-quote-unverified", "section"),
     "A revoked trait needs an owner statement newer than its tombstone": ("semantic", "trait-revoked", "section"),
     "A faded trait needs new support before it stands again": ("semantic", "trait-needs-support", "section"),
+    # --- expression_intent.py: an intent is worth what it rests on. Each of these refuses that one
+    # section, is recorded as a static code the next projection shows, and costs no second call ---
+    "An intent cites evidence this evaluation was not shown": ("semantic", "intent-evidence-unknown", "section"),
+    "Intent evidence changed after it was supplied": ("runtime", "intent-evidence-changed", "section"),
+    "An intent names a trait the ledger no longer carries": ("runtime", "intent-trait-not-current", "section"),
+    "An intent topic names a concern this scope does not carry": ("semantic", "intent-concern-unknown", "section"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),
