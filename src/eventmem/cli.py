@@ -880,6 +880,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     from eventmem.core.cli import COMMANDS, main as core_main
+    from eventmem.core.integrity import enforce_source_root
+
+    # A command line is pointed at whatever checkout its operator meant to use, so a
+    # foreign source is said out loud here and never acted on: refusing would turn a
+    # deliberate `--root` against another tree into a tool that cannot be run. The
+    # services that must not start on the wrong code refuse for themselves. With no
+    # KIN_SOURCE_ROOT in the environment there is nothing to compare against and this
+    # costs nothing at all.
+    enforce_source_root(warn_only=True)
     actual = argv if argv is not None else sys.argv[1:]
     if actual and actual[0] in COMMANDS:
         return core_main(actual)

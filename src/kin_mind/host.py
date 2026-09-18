@@ -9,6 +9,7 @@ from pathlib import Path
 
 from eventmem.core import Engine
 from eventmem.core.db import digest
+from eventmem.core.integrity import enforce_source_root, warn_interpreter
 from eventmem.core.models import Scope, SourceInput
 
 from .actions import ActionEvents
@@ -99,7 +100,7 @@ def dispatch(config, action, request):
     memory = MemoryContinuity(mind)
     if action == "operational-status":
         from .operational_status import operational_status
-        return operational_status(mind)
+        return operational_status(mind, config)
     if action == "recover-operational":
         from .recovery import migrate_operational
         return migrate_operational(mind, workers_stopped=request.get("workers_stopped"))
@@ -485,6 +486,17 @@ def main():
     try:
         import sys
 
+        config = load_config(args.config)
+        # Before the store opens and before the request is even read: the code this process
+        # would run has to be the code the deployment points at. A refusal is a SystemExit,
+        # which the handler below cannot turn into a result -- an ordinary exception here
+        # would be printed as one more failed action and the host would keep running the
+        # wrong copy, which is the exact failure this check exists for.
+        enforce_source_root(config.get("source_root"))
+        # And whether the next worker will have anything to start with. Only said,
+        # never acted on: this process is running, so a broken interpreter cannot
+        # hurt it, and refusing would remove the one path still able to report it.
+        warn_interpreter(config.get("python"))
         # An operator runs these from a terminal, with no request to pipe in.
         raw = "" if sys.stdin.isatty() else sys.stdin.read()
         request = json.loads(raw) if raw.strip() else {}
@@ -494,7 +506,7 @@ def main():
             request["apply"] = args.apply
         if args.action == MIGRATION_ACTION:
             request.update(undo=args.undo, output=args.output, registry=args.registry)
-        result = dispatch(load_config(args.config), args.action, request)
+        result = dispatch(config, args.action, request)
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.
         # Additive: the class stays the caller's contract, the taxonomy tells it

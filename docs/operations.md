@@ -124,6 +124,26 @@ A row is kept whole rather than stored as a patch when its kind is `initialize` 
 
 While compaction owns the rows, `meta.history_compaction_active` is set and no revision can be written at all: the commit is refused with `history-compaction-active` and nothing lands, because a row written in the middle of a rewrite is a row the archive does not hold.
 
+## Which copy of the source runs
+
+A deployment says where the code lives; until the start-up self-check, nothing asked the interpreter whether it agreed. An editable install left behind in the virtual environment puts a second, older copy of `eventmem` or `kin_mind` on `sys.path`, and the current working directory comes before everything a deployment controls. Either is enough for a host to import code that was replaced days ago, and the only symptom is that a fix which was deployed appears not to have been.
+
+Set `source_root` in the host configuration — the same directory the host already puts on `PYTHONPATH` — and every private entry point checks it before opening the store. `eventmem` and `kin_mind` must both resolve to a file under that root; otherwise the process prints where each one actually came from, next to the root it was told to use, and exits 78 without reading the request. The refusal is deliberately a process exit rather than an error result: an error result is one more line in a log, and the host would carry on running the wrong code.
+
+Both paths are resolved, and a root that resolves to a different string is still compared with `samefile`, so a symlinked deployment, a case-insensitive volume or a tree reachable through two mounts is not mistaken for a foreign install. Everything it cannot establish refuses: a module that resolves nowhere, a root that is not on disk, a namespace package with no file. A root that was never configured is the one skip, because there is then nothing to compare against.
+
+`KIN_ALLOW_FOREIGN_SOURCE=1` — that exact value, not `true` and not any other — starts anyway, for an operator deliberately running from somewhere else. `KIN_SOURCE_ROOT` supplies the root to a process that has no host configuration. The `eventmem` command line only warns and always continues: it is pointed at whatever checkout its operator meant to use, and the services that must not start on the wrong code refuse for themselves.
+
+The interpreter is the other half of the same question, and the half that is easier to lose. A configuration naming a `python` that has been deleted fails every spawn, once per attempt, with nothing written down: the host keeps the process it already has, so it never notices it has stopped being able to start any others. So `python`, where the configuration names one, is checked too — the path exists, is a file, and is executable.
+
+That one is only reported, never refused. Whatever finds it is by definition still running, and stopping it would take down the one path still able to say so. A host action prints a static warning line to stderr and carries on; note that a host spawned by the Node bridge has its stderr discarded, so `operational-status` is the channel that actually reaches an operator.
+
+`operational-status` carries all of it under `source`: the verdict, and `shadows` — every other copy of either package still reachable on `sys.path`, listed even when the verdict is clean, because a shadow only wins when it comes first and that list is the warning that arrives before the fault. Uninstalling a stale editable install (`uv pip uninstall`, or removing its `.pth` from the environment's `site-packages`) is what empties it.
+
+`source.interpreter` states its own subject, because a clean answer there would otherwise read as a remark about the process doing the asking — which is worthless, since that process demonstrably started. It is about the interpreter the **next** spawn will use. It reports `configured` (what the configuration says), `resolved` (what that path actually leads to), `state` (`usable`, `missing`, `not-a-file`, `not-executable`, `unreadable`, or `not-configured`) and `running` (the interpreter answering right now).
+
+When `state` is `usable` but `running_is_configured` is false, the two disagree: something started this process from a path the configuration does not name, which is how a corrected configuration leaves a caller still spawning the old environment from a path hardcoded of its own. That comparison is on the paths, not on `samefile`: a virtual environment's `bin/python` is usually a link to a shared base build, so two entirely different environments — different packages, different installed code — are one file and two interpreters. `shares_base_interpreter` reports that separately, which distinguishes the ordinary shape of the fault (two environments over one Python) from the stranger one (two unrelated installations).
+
 ## Contact callbacks
 
 MCP and Python hosts can create, inspect and change source-backed reminders using the [contact task tools](contact-tasks.md). Configure a scoped policy first. Keep `eventmem serve` running for the worker to process due schedules. Model-composed reminder text retains model provenance; revisions and callback receipts distinguish scheduled tasks from delivered messages.
