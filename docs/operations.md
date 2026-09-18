@@ -170,6 +170,33 @@ keys, so a full round trip gives back the document it had.
 
 Both the move and the restore are ordinary revisions with their own history rows, `desire-archive`
 and `desire-unarchive`, whose request names the wishes that moved.
+## Derived caches and telemetry
+
+Two tables grow without an end and neither of them holds a memory. `mind_context_cache` holds **compressed context**: the summary a model produced of records that are all still there, keyed by a digest of the inputs that produced it. `metrics` holds telemetry and is already a ring. The maintenance tick bounds both, and reports what it would do before it is allowed to do anything:
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG maintenance-tick
+python -m kin_mind.host --config PRIVATE_CONFIG maintenance-tick --apply
+```
+
+**The cache sweep is the one hard delete in this stage, and it deletes a derived cache and nothing else.** Everywhere else a bounded table is bounded by moving rows into an archive that is never deleted, because those rows are the owner's. These rows are the model's working copy of rows that stay where they are: drop one and the next reader misses, pays one model call, and writes the same summary again — which is not an argument about the design but something this store has already lived through, when the evidence-isolation migration took 80 of these rows out of service and the whole consequence was that they were compressed again. So `context_cache_sweep` is **off** until someone has been told exactly that and has agreed to it, and off the tick only counts.
+
+Two rules decide what goes: an age of 14 days on the row's own `created_at`, and a cap of 2,000 newest rows per scope on whatever survives the age. Two guards decide when: the sweep **never deletes the newest row**, because `Appraisals._cache_mark` takes `MAX(rowid)` of this table before an appraisal pass and counts the rows written after it — deleting the highest row would let SQLite hand the same number out again and a pass that did make progress would look stalled, which ends in a quarantine; and it **refuses while a running appraisal still holds a fresh lease** (`worker-lease-fresh`), because those are the rows that pass is caching right now. A sweep that held a row back says so with `retained_newest`.
+
+Nothing else is reachable from there. The two statements that can remove a cached summary spell `mind_context_cache` out in full, and no table name in that module is ever built or passed in; each row goes by its own identifier, out of a plan that can be printed first; and `mind_context_windows` — what was actually delivered and read — is touched by none of it. Nothing runs the tick on its own either: like the backfill above, it is an operator action, so a sweep happens when somebody runs one.
+
+An erase is the other half. Erasing a record already clears the stored command responses, session sets and prefetch rows that may hold the same text; with `context_cache_sweep` on it clears the compressed context of that scope as well, and only of scopes whose own configuration asked for the sweep. **With the flag off, that gap stays open**: text erased from the records can still be sitting in a summary in this table, which is worth knowing before deciding the flag is not urgent.
+
+`metrics_name_ring` gives the telemetry table a ring per name. One shared ring of 20,000 rows is the same bound applied in the wrong place: `model_ms`, `model_cost` and `model_tokens` are written on every model call, so a day of work pushes `recall_ms`, `appraisal_quarantined` and `structured_rejected` out of the window entirely — and the store then cannot report its own recall latency, because `Engine.overview` reads the newest 2,000 rows of the table and none of them are that name. With the ring on, a name keeps its own newest 2,000 rows, a name can only ever evict itself, and that reader asks per name as well. Turning it on trims each name that is already over the ring on its next write; the tick with `--apply` does the same for every name at once. The tick's report lists the distribution, what the ring would remove, and which names are already `crowded_out` of the read window.
+
+Lance keeps one manifest per write, and a store that writes all day accumulates thousands of them against a much smaller amount of data. `vector-optimize` removes them, and it is a command with three locks: the `vector_optimize` flag off refuses it, a store that is not provably quiet refuses it (an old version can be the version a running read is holding — the quiescence proof is the same one compaction uses), and without `--apply` it only reports.
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG vector-optimize
+python -m kin_mind.host --config PRIVATE_CONFIG vector-optimize --apply
+```
+
+It reports `versions_before`/`versions_after`, `rows_before`/`rows_after` and the bytes on both sides. Unchanged row counts are the half of the condition the code can check; the other half is the operator's, because `optimize` also merges small files and folds new rows into the existing index, and nothing here can prove an approximate search still returns what it returned. **Compare recall over the same queries before and after, and do not enable this in a release until that comparison has been made.**
 
 ## Which copy of the source runs
 

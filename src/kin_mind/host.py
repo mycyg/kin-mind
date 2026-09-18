@@ -211,6 +211,19 @@ def dispatch(config, action, request):
                   else migration.run(**options, registry_file=request.get("registry")))
         return {k: v for k, v in result.items()
                 if k in {"migration", "operation", "state", "applied", "rules_version", "summary", "steps", "output"}}
+    if action in {"maintenance-tick", "vector-optimize"}:
+        # Housekeeping for derived data only. Both write nothing without `--apply`, and both
+        # report what they would have done so the decision can be taken on the numbers: the
+        # tick's is the one hard delete in the programme, of compressed context that costs a
+        # model call to rebuild, and the Lance command removes superseded manifests of the
+        # vectors while leaving every current row where it is.
+        from .maintenance import VECTOR_KEEP_DAYS, tick, vector_optimize
+        if action == "vector-optimize":
+            days = request.get("older_than_days", VECTOR_KEEP_DAYS)
+            if type(days) is not int or days < 0:
+                raise ValueError("A version age is a whole number of days")
+            return vector_optimize(mind, config, apply=bool(request.get("apply")), older_than_days=days)
+        return tick(mind, config, apply=bool(request.get("apply")))
     if action in {"evidence-keys-backfill", "evidence-keys-verify"}:
         # Operator actions. The backfill writes nothing without `--apply`, resumes from its cursor
         # and can be rerun; the verification is read only and compares both directions row by row.
@@ -483,6 +496,7 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 # The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
 # are told to write. Every one of them defaults to a dry run.
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive")
+APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "maintenance-tick", "vector-optimize")
 
 
 def main():
