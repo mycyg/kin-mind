@@ -132,6 +132,25 @@ class VectorIndex:
             if ids:
                 from datetime import timedelta
 
-                table.cleanup_old_versions(
-                    older_than=timedelta(seconds=0), delete_unverified=True
+                # The erased rows are gone from the current version above, but an
+                # old version still holds their vectors, so the versions have to go
+                # too. `optimize` is the call that does it: `cleanup_old_versions`
+                # has been deprecated since lancedb 0.21 and routes through
+                # `to_lance()`, which needs `pylance` — a package the `vector` extra
+                # does not install, so the old call raised ImportError on the first
+                # erase that left a tombstone. Same idiom as
+                # `kin_mind.maintenance.vector_optimize`. It also merges small files
+                # and folds new rows into the index; neither of those removes a row,
+                # and the only rows this drops are the ones deleted just above.
+                #
+                # `delete_unverified` stays false. It used to be true, and this runs
+                # from a background job on a live store, where lancedb says to set it
+                # only if no other process can be working on the dataset -- which a
+                # background job cannot promise. It is not needed for the erasure
+                # either: dropping the old versions is what takes the erased vectors
+                # with them, and what the flag would additionally remove is files no
+                # manifest references at all, left behind by an interrupted write.
+                # Those cost space until a later pass; the flag costs the store.
+                table.optimize(
+                    cleanup_older_than=timedelta(seconds=0), delete_unverified=False
                 )
