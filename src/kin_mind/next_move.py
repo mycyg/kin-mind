@@ -28,7 +28,7 @@ import sqlite3
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
-from . import appraisal, traits
+from . import appraisal, trait_refs, traits
 from .autonomy_schema import optimized
 from .evidence_classes import never_evidence
 from .state import timestamp
@@ -231,6 +231,9 @@ def commit_move(commit):
                          # The agent's own words, stored as they were written.
                          "alternative": value.alternative, "reason": value.reason,
                          "receipt": commit.receipt, "agent_version": commit.version})))
+    # This row is a record and nothing else. What it says about a wish or a step resting on a trait
+    # does outlive it, because a correction has to be able to find what stood on that trait.
+    trait_refs.attach(commit, bound, grounds)
 
 
 def recent(mind, *, limit=SHOWN_MOVES):

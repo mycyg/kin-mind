@@ -135,6 +135,14 @@ class Traits:
                      (trait["id"], self.scope, trait["category"], trait["status"], trait["revision"], at, dumps(trait)))
         conn.execute("INSERT OR REPLACE INTO mind_trait_history VALUES(?,?,?,?,?)",
                      (trait["id"], trait["revision"], command, at, dumps(trait)))
+        # The one place a trait is written, so it is the one place that has to tell what rested on
+        # it. A revision it no longer has is not this trait any more; a cached judgment that rested
+        # on it proves two requests were equal, never that the trait behind them still holds.
+        from . import trait_refs
+        from .judgment_cache import invalidate
+        trait_refs.trait_moved(conn, self.scope, trait["id"], trait["revision"], at,
+                               ended=trait["status"] not in EFFECTIVE)
+        invalidate(conn, [trait["id"]])
         return trait
 
     def observations(self, conn, trait_id=None, *, state="valid"):
@@ -413,9 +421,9 @@ class Traits:
                      tombstone={"at": at, "reason": reason, "basis": basis, "quote": quote, "actor": actor,
                                 "source_ids": [r["source_id"] for r in (owner or evidence)],
                                 "owner_statement": bool(owner), "revoked_revision": trait["revision"]})
+        # Everything that rested on this trait is left for review by the write itself: a revoked
+        # trait has no revision anyone may still be standing on.
         self._save(conn, trait, command, at)
-        conn.execute("UPDATE mind_trait_dependents SET state='needs_review',at=? WHERE scope=? AND trait_id=?",
-                     (at, self.scope, trait["id"]))
         return self.get(conn, trait["id"])
 
     # --- the facts the host counts -----------------------------------------------------------------
@@ -614,21 +622,46 @@ def ledger_view(conn, mind, at):
     return view or None
 
 
+def manifest_entries(view):
+    """The ids this ledger contributes to the input-manifest classes `traits` and `corrections`.
+
+    Read off the projection the model was really shown, not the table: the manifest records what
+    one attempt was given, and a trait the window left out is not something it rested on. Decision
+    10 puts them here rather than in `profile_version`, so a trait that moved costs a reread of
+    what rested on it and not of every stored proposal there is."""
+    ledger = (view or {}).get("trait_ledger") or {}
+    traits, shown = ledger.get("traits") or {}, {}
+    for side in ("established", "candidate"):
+        for trait in traits.get(side, []):
+            shown[trait["id"]] = {"revision": trait["revision"], "status": trait["status"],
+                                  "stored_status": trait["stored_status"], "needs_review": trait["needs_review"]}
+    corrections = {entry["trait_id"]: {"revision": entry["revision"], "at": entry["at"]}
+                   for entry in ledger.get("corrections") or []}
+    return shown, corrections
+
+
 def invalidate_source(conn, record):
     """A source moved under a trait. Its text and its history stay; what rested on it is reviewed."""
     if not installed(conn):
         return
+    from . import trait_refs
+    from .judgment_cache import invalidate
     changed = conn.execute(
         "UPDATE mind_trait_observations SET state='needs_review',data=json_set(data,'$.state','needs_review') "
         "WHERE state='valid' AND EXISTS(SELECT 1 FROM json_each(mind_trait_observations.data,'$.evidence') e "
         "WHERE json_extract(e.value,'$.record_id')=? AND json_extract(e.value,'$.revision')<>?) RETURNING trait_id",
         (record["id"], record["revision"])).fetchall()
-    conn.execute(
+    reviewed = conn.execute(
         "UPDATE mind_traits SET status='needs_review',data=json_set(data,'$.status','needs_review',"
         "'$.invalidation','source-version-changed') WHERE status IN ('candidate','established') AND ("
         "id IN (SELECT value FROM json_each(?)) OR EXISTS(SELECT 1 FROM json_each(mind_traits.data,'$.evidence') e "
-        "WHERE json_extract(e.value,'$.record_id')=? AND json_extract(e.value,'$.revision')<>?))",
-        (dumps([r[0] for r in changed]), record["id"], record["revision"]))
+        "WHERE json_extract(e.value,'$.record_id')=? AND json_extract(e.value,'$.revision')<>?)) RETURNING id,scope",
+        (dumps([r[0] for r in changed]), record["id"], record["revision"])).fetchall()
+    # The revision does not move here — it is the same sentence — but the trait is no longer in
+    # force, so what rested on it stands exactly where a revoke leaves it.
+    for row in reviewed:
+        trait_refs.trait_moved(conn, row["scope"], row["id"], None, record["updated_at"], ended=True)
+    invalidate(conn, [row["id"] for row in reviewed])
 
 
 def commit_observations(commit):
