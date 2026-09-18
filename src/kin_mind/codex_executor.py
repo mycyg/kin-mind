@@ -128,11 +128,17 @@ def findings_schema():
 
 
 def codex_argv(executable, directory, *, model, reasoning, schema_file, last_file, provider,
-               computer_mcp=None):
+               computer_mcp=None, model_catalog=None):
     """One non-interactive run: user config, rules, MCP, hooks, multi-agent, web
     search and approvals all off; read-only sandbox; prompt arrives on stdin.
     The only MCP server allowed is the host's own computer reader, injected per
     exploration (never the user's global MCP configuration).
+
+    Follows DeepSeek's official codex integration doc where this CLI version
+    accepts it: wire_api responses, model_reasoning_effort, web_search disabled,
+    forced_login_method api. `preferred_auth_method` from that doc is rejected by
+    codex-cli 0.155.0 strict config, and its inline `experimental_bearer_token`
+    violates the credential rule — the credential stays an env var NAME here.
 
     --output-schema goes only to providers that accept a strict JSON schema
     (DeepSeek's json_schema supports scalar types only — verified 2026-09-18);
@@ -147,6 +153,7 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
         "--model", model,
         "--output-last-message", str(last_file),
         "-c", 'approval_policy="never"',
+        "-c", 'forced_login_method="api"',
         "-c", "features.apps=false",
         "-c", "features.hooks=false",
         "-c", "features.multi_agent=false",
@@ -154,6 +161,8 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
         "-c", "model_reasoning_effort=" + dumps(reasoning),
         "-c", 'shell_environment_policy.inherit="none"',
     ]
+    if model_catalog:
+        argv += ["-c", "model_catalog_json=" + dumps(str(model_catalog))]
     if output_schema:
         argv += ["--output-schema", str(schema_file)]
     if computer_mcp:
@@ -288,6 +297,7 @@ def run_codex(
     cli_version=None,
     continuation=None,
     computer=None,
+    model_catalog=None,
 ):
     """One bounded codex attempt. Returns the ExecutionReport-shaped receipt.
 
@@ -352,11 +362,12 @@ def run_codex(
     last_file = directory / f"result-{attempt}.json"
     argv = codex_argv(executable, directory, model=model, reasoning=reasoning,
                       schema_file=schema_file, last_file=last_file, provider=provider,
-                      computer_mcp=computer_mcp)
+                      computer_mcp=computer_mcp, model_catalog=model_catalog)
     child_env = codex_env(codex_home, env_key=provider.get("env_key"))
     identity = {"executor": "codex-cli", "executor_version": cli_version, "model": model,
                 "reasoning": reasoning, "sandbox": "read-only",
                 "capabilities": {"computer": bool(computer_mcp), "web_search": False},
+                "model_catalog": str(model_catalog) if model_catalog else None,
                 "provider": {key: value for key, value in provider.items() if key != "env_key"}}
     input_sources = _input_sources(topic)
     prompt = codex_prompt(topic, budget_seconds=budget_seconds, continuation=continuation,
@@ -558,12 +569,13 @@ def run_codex(
         return receipt
 
 
-def codex_runner(*, reasoning, provider, cli_version):
+def codex_runner(*, reasoning, provider, cli_version, model_catalog=None):
     """Bind the injected model configuration into an `Explorations.run` runner."""
 
     def run(executable, topic, directory, **kwargs):
         return run_codex(executable, topic, directory, reasoning=reasoning,
-                         provider=provider, cli_version=cli_version, **kwargs)
+                         provider=provider, cli_version=cli_version,
+                         model_catalog=model_catalog, **kwargs)
 
     run.wants_continuation = True
     return run
@@ -604,6 +616,10 @@ def prepare_codex_exploration(config, *, environ=None):
         "reasoning": config.get("exploration_reasoning") or "high",
         "budget_seconds": int(config.get("exploration_budget_seconds") or 1200),
         "cli_version": version,
+        # Optional operator-managed model catalog (DeepSeek's doc ships one as
+        # models.json); without it codex warns and uses fallback metadata, which
+        # the real probes proved workable.
         "runner": codex_runner(reasoning=config.get("exploration_reasoning") or "high",
-                               provider=provider, cli_version=version),
+                               provider=provider, cli_version=version,
+                               model_catalog=config.get("exploration_model_catalog")),
     }

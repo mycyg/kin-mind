@@ -145,6 +145,19 @@ def test_codex_argv_and_env_are_isolated(tmp_path, monkeypatch):
     assert argv[1] == "exec" and argv[-1] == "-"  # the prompt travels on stdin
     for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--json", "--output-schema"):
         assert flag in argv
+    # DeepSeek's official codex doc prescribes API-key login; this CLI version
+    # rejects preferred_auth_method, so the api login method alone is pinned.
+    assert 'forced_login_method="api"' in argv
+    assert not any(flag.startswith("preferred_auth_method") for flag in argv)
+    # An operator-managed model catalog is injected only when configured.
+    assert not any(flag.startswith("model_catalog_json") for flag in argv)
+    with_catalog = codex_argv(
+        "codex", tmp_path / "job", model="deepseek-flash", reasoning="high",
+        schema_file=tmp_path / "job" / "findings-schema.json",
+        last_file=tmp_path / "job" / "result-1.json", provider=schema_capable,
+        model_catalog=tmp_path / "models.json",
+    )
+    assert f'model_catalog_json="{tmp_path}/models.json"' in with_catalog
     # DeepSeek's strict json_schema takes scalars only: the default provider gets
     # no --output-schema and the schema rides inside the prompt instead.
     argv = codex_argv(
@@ -651,11 +664,13 @@ def test_host_explore_codex_end_to_end(tmp_path, monkeypatch):
     fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
     monkeypatch.setenv("EVENTMEM_API_KEY", "sk-must-not-leak")
+    catalog = tmp_path / "models.json"
+    catalog.write_text(json.dumps({"models": []}))
     config = host_config(
         tmp_path, mind, exploration_backend="codex", exploration_command=str(fake),
         exploration_model="deepseek-flash", exploration_reasoning="high",
         exploration_budget_seconds=1200, exploration_max_running=1,
-        exploration_model_provider=PROVIDER,
+        exploration_model_provider=PROVIDER, exploration_model_catalog=str(catalog),
     )
     result = dispatch(config, "explore", {})
     assert result["state"] == "complete"
@@ -675,3 +690,5 @@ def test_host_explore_codex_end_to_end(tmp_path, monkeypatch):
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert argv[argv.index("--cd") + 1] == str(job)
     assert 'model_provider="deepseek"' in argv
+    assert 'forced_login_method="api"' in argv
+    assert f'model_catalog_json="{catalog}"' in argv

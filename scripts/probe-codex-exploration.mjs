@@ -73,7 +73,7 @@ function codexArgv({workdir, schemaFile, lastFile, baseUrl, envKey, webSearch = 
   const argv = ['exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--skip-git-repo-check',
     '--json', '--color', 'never', '--sandbox', 'read-only', '--cd', workdir,
     '--model', 'deepseek-flash', '--output-schema', schemaFile, '--output-last-message', lastFile,
-    '-c', 'approval_policy="never"', '-c', 'features.apps=false', '-c', 'features.hooks=false',
+    '-c', 'approval_policy="never"', '-c', 'forced_login_method="api"', '-c', 'features.apps=false', '-c', 'features.hooks=false',
     '-c', 'features.multi_agent=false', '-c', `web_search="${webSearch}"`,
     '-c', 'model_reasoning_effort="high"', '-c', 'shell_environment_policy.inherit="none"',
     '-c', 'model_provider="kin_probe"', '-c', 'model_providers.kin_probe.name="Kin probe"',
