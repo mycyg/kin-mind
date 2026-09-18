@@ -29,7 +29,10 @@ from kin_mind.traits import Traits
 
 # The request with the ledger offered, so a change to its paragraph or its schema is deliberate.
 # The all-off pins live with the seams and are not touched here.
-LEDGER_REQUEST = "06a5afcc1e4359d57abb47b6e5619d983802e78b6d11eff391c42f496b82e8cf"
+# Re-pinned once when every package landed together: WP6's three switch-less changes to the
+# shared prompt (the widened half-life range, the stated procedure premise, the owner named by
+# role) move every request that offers anything, this one included.
+LEDGER_REQUEST = "21996e6ec09bb3da03f59d86b9f0f0c946c696c76bffd6eab92a28feb9874c87"
 LEDGER_SECTIONS = ("trait_observations", "trait_decisions")
 
 

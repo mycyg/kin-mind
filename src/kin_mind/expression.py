@@ -211,7 +211,7 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
         # still has room for. A rhythm cadence keeps the last of the three; it is the host's own
         # projection of how this hour reads, and an intent does not overrule it.
         cadence = [item for item in selected if item["basis"] == "runtime_inferred"]
-        selected = (intent_guidance(intent) + [i for i in selected if i not in cadence])[:3 - len(cadence)] + cadence
+        selected = (intent_guidance(intent) + [i for i in selected if i not in cadence])[:max(0, 3 - len(cadence))] + cadence
     for item in selected:
         item.pop("priority", None)
     result = {

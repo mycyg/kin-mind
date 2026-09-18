@@ -35,7 +35,10 @@ from kin_mind.expression_intent import stale_reason, stored
 
 # The request with the intent offered, so a change to its paragraph or its schema is deliberate.
 # The all-off pins live with the seams and are not touched here.
-INTENT_REQUEST = "23e9a2b2d142d33352b86d6643e02adb8e6a83d3b1cadde3752df80fc350bd76"
+# Re-pinned once when every package landed together: WP6's three switch-less changes to the
+# shared prompt (the widened half-life range, the stated procedure premise, the owner named by
+# role) move every request that offers anything, this one included.
+INTENT_REQUEST = "5a44ca34576573cf7b29f920ab4ed2d9b1e3f6960fd77dfe008310f0968a40b1"
 # Every sentence the lookup table can say, and the whole compiled answer for a grid of states.
 # Re-pin only together with a deliberate change to the table itself.
 TABLE_ANSWERS = "80cee70dd5970f835d843603df5717ac226f84fcfedca89f72256d204fab23c3"

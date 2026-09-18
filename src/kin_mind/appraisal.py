@@ -352,7 +352,7 @@ TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 
 SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据，trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
-NEXT_MOVE_PROMPT = "next_move 暂不接收内容，留空。"
+NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
                    "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
                    "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
@@ -396,7 +396,7 @@ def register_audit_section(name, handler, *, commits_on_new_interaction=False):
 
 # The module of this package that owns each audited section. A module that has not landed yet is
 # simply not there; one that is there is imported, and an error inside it is not hidden.
-SECTION_OWNERS = ("traits", "behavior_chain", "expression", "next_move")
+SECTION_OWNERS = ("traits", "behavior_chain", "expression_intent", "next_move")
 
 
 def claim_audit_sections():
@@ -1944,7 +1944,7 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
-                    from . import behavior_chain  # already imported by claim_audit_sections(); named here
+                    from . import behavior_chain, next_move  # noqa: F401 - claimed by claim_audit_sections(); named here
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")

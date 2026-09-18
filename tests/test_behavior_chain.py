@@ -47,13 +47,19 @@ pytest_plugins = ("test_memory_continuity",)
 
 # What the chain's switch adds to one fixed request: two properties and two paragraphs, and nothing
 # else. Re-pin only together with a deliberate change to those.
-CHAIN_REQUEST = "907a33d6f729519b1ba46d2b943ab95455aa1e023efd42ac9fcbd5371314a32c"
+# Re-pinned once when every package landed together: WP6's three switch-less changes to the
+# shared prompt (the widened half-life range, the stated procedure premise, the owner named by
+# role) move every request that offers anything, this one included.
+CHAIN_REQUEST = "f377b871ebc42c040b2927a9ca86a3fdcc937af44e52b434ac3dd0bb322562bc"
 # Every behavior-relevant instruction, digested (compat.behavior_prompts: the shared appraisal
 # prompt and the paragraph of each audited section). A paragraph that moves fails the test below,
 # and its author chooses one of two things — see the message there.
 #
-# behavior-1 covers: the seams' placeholders replaced by the trait ledger's two real paragraphs.
-PINNED_PROMPTS = {"behavior-1": "078abd5881aad060ff5738888af6a37662835f210735692c3787e3635deca6ab"}
+# behavior-1 covers: the seams' placeholders replaced, one package at a time, by the real paragraph
+# of each audited section — the trait ledger's two, the chain's two, the expression intent and the
+# next move. Nothing in production was ever asked a placeholder, so no check made under this
+# contract meant anything different before these paragraphs arrived: a re-pin, not a new contract.
+PINNED_PROMPTS = {"behavior-1": "754302428177e17e723fbb53ce5e345ccdb909b0ff43900f28c5476561e2228e"}
 # How to read the digest a change produced, in one command from the repository root:
 REPIN_COMMAND = ("uv run --extra dev python -c "
                  "'from kin_mind.compat import prompt_digest; print(prompt_digest())'")
@@ -664,8 +670,10 @@ Appraisals(Mind(Engine(sys.argv[1]), Scope(persona='synthetic-claims')))
 print(json.dumps([n for n, h in AUDIT_HANDLERS.items() if h is not unavailable_section]))
 """
     answer = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, check=True)
-    assert json.loads(answer.stdout.splitlines()[-1]) == [
-        "trait_observations", "trait_decisions", "self_hypothesis", "prediction_outcomes"]
+    # Every declared section, not a list kept by hand: a section whose owner in SECTION_OWNERS is
+    # misspelled, or missing, is claimed by nothing and would otherwise refuse everything it is
+    # given in production while every test that imports its module directly still passed.
+    assert json.loads(answer.stdout.splitlines()[-1]) == list(appraisal_module.AUDIT_SECTIONS)
 
 
 def test_a_section_owner_that_has_not_landed_is_simply_not_there(monkeypatch):

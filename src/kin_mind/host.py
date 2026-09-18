@@ -316,6 +316,10 @@ def dispatch(config, action, request):
             raise ValueError("Behavior models need a chat model id and an effort, as short strings")
         return {"state": "registered", BEHAVIOR_MODELS: engine.settings(
             BEHAVIOR_MODELS, {field: value.strip() for field, value in values.items()})}
+    if action == "next-moves":
+        # Read only: what each appraisal said it was doing, and what the host found behind it.
+        from .next_move import recent
+        return recent(mind, limit=request.get("limit", 20))
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":

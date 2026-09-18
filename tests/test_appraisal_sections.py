@@ -45,6 +45,7 @@ from kin_mind.appraisal import (
     offered_sections,
     proposal_record,
     register_audit_section,
+    unavailable_section,
 )
 
 pytest_plugins = ("test_memory_continuity",)
@@ -199,7 +200,10 @@ def test_a_lane_that_offers_nothing_blanks_what_a_proposal_carries(env, monkeypa
 
 # --- the commit seam ------------------------------------------------------------------------------
 
-def test_a_section_no_module_claims_is_refused_alone_and_recorded(env):
+def test_a_section_no_module_claims_is_refused_alone_and_recorded(env, monkeypatch):
+    # The seam as it is before any module lands: whichever sections are claimed by now, this one
+    # is put back to the default handler, which is what the switch being on ahead of the code means.
+    monkeypatch.setitem(AUDIT_HANDLERS, "next_move", unavailable_section)
     job = env.enqueue("owner-chat")
     result, _ = run(env, lambda shown, context: Appraisal(reason="A real owner message", values={"mood": 72},
                                                           next_move=move()), job_id=job)

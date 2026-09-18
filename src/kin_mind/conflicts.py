@@ -32,6 +32,7 @@ COMMIT_PATH_MODULES = (
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
     "kin_mind.expression_intent",
+    "kin_mind.next_move",
 )
 
 
@@ -273,6 +274,10 @@ REGISTRY = {
     "Intent evidence changed after it was supplied": ("runtime", "intent-evidence-changed", "section"),
     "An intent names a trait the ledger no longer carries": ("runtime", "intent-trait-not-current", "section"),
     "An intent topic names a concern this scope does not carry": ("semantic", "intent-concern-unknown", "section"),
+    # --- next_move.py: an audit of the move the same appraisal says it is making. Both are raised
+    # inside that section, so each drops the move alone and nothing else of the proposal. ---
+    "This move does not match what this appraisal committed": ("semantic", "next-move-inconsistent", "section"),
+    "This move rests on something the host cannot find": ("semantic", "next-move-forged-grounds", "section"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),
