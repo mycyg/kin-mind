@@ -150,14 +150,15 @@ class SelfKnowledge:
         with self.engine.db.connect(write=True) as conn:
             return self._within(conn, name, request, run)
 
-    def claim(self, request: ClaimInput, *, compat=None):
-        return self._command("claim", request, self._claiming(request, compat))
+    def claim(self, request: ClaimInput, *, compat=None, rests_on=None):
+        return self._command("claim", request, self._claiming(request, compat, rests_on))
 
-    def claim_in(self, conn, request: ClaimInput, *, compat=None):
-        """`claim()` inside the caller's transaction."""
-        return self._within(conn, "claim", request, self._claiming(request, compat))
+    def claim_in(self, conn, request: ClaimInput, *, compat=None, rests_on=None):
+        """`claim()` inside the caller's transaction. `rests_on` are host identifiers this claim was
+        made from; the host that supplies them decides what they mean and has already checked them."""
+        return self._within(conn, "claim", request, self._claiming(request, compat, rests_on))
 
-    def _claiming(self, request, compat):
+    def _claiming(self, request, compat, rests_on=None):
         def run(conn):
             sources, snapshots, _ = self._evidence(
                 conn,
@@ -187,9 +188,11 @@ class SelfKnowledge:
                 "agent_version": request.agent_version,
                 "evidence_revisions": snapshots,
                 "supersedes": request.supersedes,
-                # The host's stamp of the configuration this was made under, when it keeps one.
-                # Absent on everything written before the stamp existed, and through the tools.
+                # The host's stamp of the configuration this was made under, when it keeps one, and
+                # what it says this claim rests on. Absent on everything written before they existed,
+                # and on everything written through the tools.
                 **({"compat": compat} if compat else {}),
+                **({"rests_on": sorted(set(rests_on))} if rests_on else {}),
             }
             row = self.engine._insert(
                 conn,

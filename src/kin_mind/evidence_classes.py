@@ -43,7 +43,7 @@ def never_evidence(source):
 
 
 def owner_statement(record, policy=None, *, sources=()):
-    """Did the owner herself say this? `sources` are the cited source rows when the caller has
+    """Did the owner say this, in person? `sources` are the cited source rows when the caller has
     them. Without a policy (the classification is switched off) the local checks still hold."""
     if not isinstance(record, dict) or any(never_evidence(s) for s in sources):
         return False

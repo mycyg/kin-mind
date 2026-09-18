@@ -303,10 +303,19 @@ def dispatch(config, action, request):
             return ledger.read(request.get("identifier"), limit=request.get("limit", 12), history=request.get("history", False))
         if action == "trait-revoke":
             # An owner correction that must not wait for an appraisal. The cited source decides
-            # whether it is recorded as her own correction or as the operator's.
+            # whether it is recorded as the owner's own correction or as the operator's.
             return ledger.revoke(request)
         # Idempotent, and a dry run writes nothing.
         return ledger.migrate(apply=bool(request.get("apply")))
+    if action == "configure-behavior-models":
+        # The operator's own route, for the release step: the model this host answers with is the
+        # one thing about a behavioral check that the store cannot read for itself.
+        from .compat import BEHAVIOR_MODELS, CHAT_FIELDS
+        values = {field: request.get(field) for field in CHAT_FIELDS}
+        if any(not isinstance(v, str) or not v.strip() or len(v) > 200 for v in values.values()):
+            raise ValueError("Behavior models need a chat model id and an effort, as short strings")
+        return {"state": "registered", BEHAVIOR_MODELS: engine.settings(
+            BEHAVIOR_MODELS, {field: value.strip() for field, value in values.items()})}
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":

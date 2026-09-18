@@ -709,9 +709,14 @@ class Mind(Continuity):
         return {"desire_id": did, "desire_revision": desire["revision"]}
 
     def _evolve(self, conn, state, request, refs, event_id):
+        from .autonomy_schema import optimized
         validate_trait_changes(load_persona(self.engine, self.scope), request.evolution.traits)
         if request.evolution.revert_event_id:
             return self._revert(conn, state, request, refs, event_id)
+        if request.evolution.traits and optimized(conn, self.scope.key(), "trait_ledger"):
+            # One writer for a trait. The ledger records what it rests on, per observation and per
+            # episode, and can revoke one trait alone; a snapshot written here can do neither.
+            raise Conflict("The trait ledger is the only writer of traits", code="traits-owned-by-ledger")
         spec = state["profile"]["evolution"]
         day = (
             timestamp(self.clock())
@@ -942,7 +947,8 @@ class Mind(Continuity):
         from .traits import ledger_view
         ledger = ledger_view(conn, self, at)
         if ledger:
-            traits = {**traits, **ledger["legacy"]}
+            # Only the ledger's own switch produces `legacy`; the chain's projection travels beside it.
+            traits = {**traits, **ledger.get("legacy", {})}
         contact = deepcopy(state["profile"]["contact"])
         preference = state.get("contact_preference")
         if preference:
@@ -972,7 +978,7 @@ class Mind(Continuity):
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
         }
         if ledger:
-            # Only while the switch is on: with it off this view is what it was, key for key.
+            # Only what a switch that is on produced: with both off this view is what it was, key for key.
             view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
         return view
 

@@ -6,6 +6,7 @@ source authority. Queue errors contain categories, not private response bodies.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -379,12 +380,28 @@ NEW_INTERACTION_COMMITS = {name: name == "trait_observations" for name in AUDIT_
 
 def register_audit_section(name, handler, *, commits_on_new_interaction=False):
     """The module that owns a section claims it here, at import time, and apply() stays as it is.
-    That module has to be imported on the commit path for the claim to be made; importing it where
-    its own tables or its context projection are set up is enough."""
+    Which module owns what is declared in SECTION_OWNERS, and claim_audit_sections() imports them
+    all where the queue is built, so a claim never depends on what a path happened to read first."""
     if name not in AUDIT_SECTIONS:
         raise RuntimeError("Unknown audited section")
     AUDIT_HANDLERS[name] = handler
     NEW_INTERACTION_COMMITS[name] = commits_on_new_interaction
+
+
+# The module of this package that owns each audited section. A module that has not landed yet is
+# simply not there; one that is there is imported, and an error inside it is not hidden.
+SECTION_OWNERS = ("traits", "behavior_chain", "expression", "next_move")
+
+
+def claim_audit_sections():
+    """Import every module that owns an audited section, once, on the commit path.
+
+    A handler is claimed by importing the module that owns it, so the claim used to depend on which
+    projection a path had already read: one that reached apply() without reading the state found a
+    section still unclaimed and refused it as unavailable. This is the one place that settles it."""
+    for name in SECTION_OWNERS:
+        if importlib.util.find_spec("." + name, __package__):
+            importlib.import_module("." + name, __package__)
 
 
 def audit_switches(conn, scope):
@@ -720,10 +737,10 @@ def appraisal_context(context):
     ledger = original.get("trait_ledger")
     if ledger:
         # The ledger, as the state projection built it: established and candidate traits apart,
-        # each with the host's counts, what an owner correction ended, and the open predictions.
-        # Structured state, so none of it is ever compressed. Absent while the switch is off.
-        state.update(traits=ledger["traits"], corrections=ledger["corrections"],
-                     open_predictions=ledger["open_predictions"])
+        # each with the host's counts, what an owner correction ended, and the predictions still
+        # open. Structured state, so none of it is ever compressed. Each part follows its own
+        # switch, so what a switched-off projection did not build is absent here too.
+        state.update({key: ledger[key] for key in ("traits", "corrections", "open_predictions") if key in ledger})
     result["state"] = state
     # Several dimensions often carry the same complete appraisal account.
     # Reference it once without changing or shortening its meaning.
@@ -749,6 +766,12 @@ def appraisal_context(context):
     return result
 
 
+# The model every structured response of this evaluator is verified against, and the effort it is
+# asked for. One name for both the request and the check, because what a behavioral check meant
+# depends on them: `compat` reads them from here.
+APPRAISAL_MODEL, APPRAISAL_EFFORT = "deepseek-flash", "high"
+
+
 class DeepSeek:
     def __init__(
         self, endpoint, model, key_env="EVENTMEM_API_KEY", timeout=60, transport=None
@@ -769,7 +792,7 @@ class DeepSeek:
         cfg = json.loads(row[0])["summary"]
         provider = cls(
             cfg["endpoint"],
-            "deepseek-flash",
+            APPRAISAL_MODEL,
             cfg.get("api_key_env", "EVENTMEM_API_KEY"),
             600,
         )
@@ -797,7 +820,7 @@ class DeepSeek:
             return None, None
         if judgment is not None:
             judgment_cache.identity(name, judgment)
-        request = digest([name, system, schema.model_json_schema(), context, self.endpoint, "deepseek-flash/high"])
+        request = digest([name, system, schema.model_json_schema(), context, self.endpoint, APPRAISAL_MODEL + "/" + APPRAISAL_EFFORT])
         with self.engine.db.connect() as conn:
             if judgment is not None and judgment_cache.enabled(conn, judgment["scope"]):
                 found = judgment_cache.get(self.engine, conn, name, request, judgment, now=time.time())
@@ -856,10 +879,10 @@ class DeepSeek:
             with request_client(self, self.timeout, name) as client:
                 response = client.post(self.endpoint + "/v1/messages",
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                    json={"model": "deepseek-flash", "max_tokens": max_tokens, "system": system,
+                    json={"model": APPRAISAL_MODEL, "max_tokens": max_tokens, "system": system,
                           "messages": [{"role": "user", "content": dumps(context)}],
                           "tools": [{"name": name, "description": "Submit sourced structured results", "input_schema": schema.model_json_schema()}],
-                          "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": "high"}})
+                          "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": APPRAISAL_EFFORT}})
             if response.status_code != 200:
                 # A refused request still made one: it leaves a record with unknown usage.
                 record("http-" + str(response.status_code))
@@ -867,8 +890,8 @@ class DeepSeek:
             body = response.json()
             if hasattr(self, "engine"):
                 self.engine.db.metric("structured_model_usage", 1, {"tool": name, "model": body.get("model"),
-                    "reasoning": "high", "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
-            if body.get("model") != "deepseek-flash" or body.get("stop_reason") == "max_tokens":
+                    "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
+            if body.get("model") != APPRAISAL_MODEL or body.get("stop_reason") == "max_tokens":
                 if hasattr(self,"engine"):
                     self.engine.db.metric("structured_rejected", 1, {"tool":name,"reported_model":body.get("model"),"stop_reason":body.get("stop_reason"),"max_tokens":max_tokens, **attempts.usage_entry(body.get("usage"))})
                 record("max-tokens" if body.get("stop_reason") == "max_tokens" else "model-unverified")
@@ -884,7 +907,7 @@ class DeepSeek:
                 raise
             record("ok")
             self.failure_receipt = None
-            receipt = {"provider": "deepseek", "model": body["model"], "reasoning": "high", "request_id": body.get("id"),
+            receipt = {"provider": "deepseek", "model": body["model"], "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"),
                        **attempts.usage_entry(body.get("usage")), "verified_at": datetime.now(timezone.utc).isoformat(),
                        "elapsed_ms": elapsed(), "cache_hit": False}
             token = self._cache_put(cache_state, name, context, judgment, depends_on, valid_for, result, receipt)
@@ -998,7 +1021,7 @@ class DeepSeek:
                         ],
                         "tool_choice": {"type": "auto"},
                         "thinking": {"type": "enabled"},
-                        "output_config": {"effort": "high"},
+                        "output_config": {"effort": APPRAISAL_EFFORT},
                     },
                 )
                 if response.status_code != 200:
@@ -1008,7 +1031,7 @@ class DeepSeek:
             if hasattr(self, "engine"):
                 # The main call was the only one that reached no metric at all.
                 self.engine.db.metric("structured_model_usage", 1, {"tool": "submit_appraisal", "model": body.get("model"),
-                    "reasoning": "high", "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
+                    "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
             self.failure_receipt = {"provider": "deepseek", "model": body.get("model"), "request_id": body.get("id"),
                 "stop_reason": body.get("stop_reason"), **attempts.usage_entry(body.get("usage")),
                 "block_types": [b.get("type") for b in body.get("content", [])],
@@ -1016,7 +1039,7 @@ class DeepSeek:
             if body.get("stop_reason") == "max_tokens":
                 record("max-tokens")
                 raise RuntimeError("deepseek-output-budget-exhausted")
-            if body.get("model") != "deepseek-flash":
+            if body.get("model") != APPRAISAL_MODEL:
                 record("model-unverified")
                 raise RuntimeError("deepseek-model-unverified")
             tool_calls = [
@@ -1066,7 +1089,7 @@ class DeepSeek:
                         {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
                 except Exception:
                     appraisal_receipt["schema_repair"] = self.failure_receipt or {
-                        "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+                        "provider": "deepseek", "model": APPRAISAL_MODEL, "reasoning": APPRAISAL_EFFORT,
                         "usage": None, "usage_status": "unknown", "outcome": "failed"}
                     self.failure_receipt = appraisal_receipt
                     raise
@@ -1078,7 +1101,7 @@ class DeepSeek:
                 "model": body["model"],
                 **attempts.usage_entry(body.get("usage")),
                 "request_id": body.get("id"),
-                "reasoning": "high",
+                "reasoning": APPRAISAL_EFFORT,
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
                 "context_projection": request_context.get("context_projection", "affect-decision-v3"),
@@ -1120,7 +1143,7 @@ class DeepSeek:
         try:
             fixed, receipt = self.structured("repair_session_advice", SessionAdvice, ADVICE_REPAIR_PROMPT, repair_input(advice, context, problem))
         except Exception:
-            failed = self.failure_receipt or {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+            failed = self.failure_receipt or {"provider": "deepseek", "model": APPRAISAL_MODEL, "reasoning": APPRAISAL_EFFORT,
                                               "usage": None, "usage_status": "unknown", "outcome": "failed"}
             self.failure_receipt = {**(appraisal_receipt or {}), "advice_repair": failed}
             raise
@@ -1154,7 +1177,7 @@ class DeepSeek:
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         return {"system": digest(self._system(context, policy)),
                 "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context))),
-                "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": "high", "tool_choice": "auto"})}
+                "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"})}
 
 
 QUEUE_SCHEMA = """
@@ -1171,6 +1194,8 @@ class Appraisals:
         self.exploration_capabilities = exploration_capabilities or {}
         self.session_context = session_context
         self.memory = MemoryContinuity(mind)
+        # Whatever else this process has read, every audited section has its own handler from here on.
+        claim_audit_sections()
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA + REFUSAL_SCHEMA)
 
@@ -1815,7 +1840,7 @@ class Appraisals:
                             raise
                         except Exception:  # noqa: BLE001 - the failed call keeps its actual or unknown usage
                             repair_receipt = (getattr(provider, "failure_receipt", None) or {}).get("advice_repair") or {
-                                "provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+                                "provider": "deepseek", "model": APPRAISAL_MODEL, "reasoning": APPRAISAL_EFFORT,
                                 "usage": None, "usage_status": "unknown", "outcome": "failed"}
                         receipt = {**receipt, "advice_repair": repair_receipt}
                 if historical:
@@ -1880,7 +1905,7 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
-                    from . import behavior_chain  # on the commit path, where it claims its own sections
+                    from . import behavior_chain  # already imported by claim_audit_sections(); named here
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")

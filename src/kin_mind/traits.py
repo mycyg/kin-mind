@@ -535,7 +535,7 @@ class Traits:
                         (trait["id"],)).fetchall()]
                 found.append(shown)
             return {"traits": found, "corrections": self.corrections(conn),
-                    "open_predictions": open_predictions(conn, self.scope),
+                    "open_predictions": open_predictions(conn, self.mind),
                     "enabled": optimized(conn, self.scope, "trait_ledger")}
 
     def revoke(self, request):
@@ -588,20 +588,30 @@ class Traits:
                     "carried": carried, "already_present": present, "total": len(state.get("traits") or {})}
 
 
-def open_predictions(conn, scope):
-    """The seam the behaviour chain fills. Until it lands there is nothing open to show."""
-    return []
+def open_predictions(conn, mind):
+    """What the behavior chain still has open, on the chain's own switch, without the revision the
+    manifest needs. Empty while that switch is off, whatever the ledger's switch says."""
+    if not optimized(conn, mind.scope.key(), "behavior_chain"):
+        return []
+    from .behavior_chain import open_predictions as chain
+    return [{key: value for key, value in item.items() if key != "revision"}
+            for item in chain(conn, mind, limit=4)]
 
 
 def ledger_view(conn, mind, at):
-    """What the state projection adds while the ledger is on: the dict shape older readers know,
-    and the structured view an appraisal is shown. Nothing at all while the switch is off."""
-    scope = mind.scope.key()
-    if not optimized(conn, scope, "trait_ledger") or not installed(conn):
-        return None
-    ledger = Traits(mind)
-    return {"legacy": ledger.legacy(conn), "traits": ledger.projection(conn, at),
-            "corrections": ledger.corrections(conn), "open_predictions": open_predictions(conn, scope)}
+    """What the state projection adds: the dict shape older readers know and the structured view an
+    appraisal is shown, while the ledger is on; the predictions still open, while the chain is on.
+    Each part answers to its own switch, and with both off there is nothing to add at all."""
+    scope, view = mind.scope.key(), {}
+    if optimized(conn, scope, "trait_ledger") and installed(conn):
+        ledger = Traits(mind)
+        view = {"legacy": ledger.legacy(conn), "traits": ledger.projection(conn, at),
+                "corrections": ledger.corrections(conn), "open_predictions": []}
+    if optimized(conn, scope, "behavior_chain"):
+        # On its own switch, whatever the ledger's says: the paragraph that asks the model to settle
+        # a prediction promises this key, so it is there to be empty rather than missing.
+        view["open_predictions"] = open_predictions(conn, mind)
+    return view or None
 
 
 def invalidate_source(conn, record):

@@ -3,10 +3,10 @@
 `agent_version` moves for every unrelated edit, so requiring it to be equal meant no check ever
 survived long enough to be used. This key names what actually decides how Kin behaves: the approved
 persona, a declared behavior contract, the text of the dimension definitions (never their baselines
-and half-lives, which the evolution this chain feeds is what moves), the models that appraise and
-that answer, and the part of the execution environment a behavior can depend on. An unrelated
-version bump keeps a prediction testable; a real change makes it stale, visibly, and the reason
-names the ingredient that moved.
+and half-lives, which the evolution this chain feeds is what moves), the model that appraises and
+the model that answers, and the part of the execution environment a behavior can depend on. An
+unrelated version bump keeps a prediction testable; a real change makes it stale, visibly, and the
+reason names the ingredient that moved.
 
 `BEHAVIOR_CONTRACT` is declared, never derived: changing a behavior-relevant instruction is a
 decision, not a side effect of editing prose. `tests/test_behavior_chain.py` pins the digest of
@@ -29,8 +29,13 @@ PERSONA_FIELDS = ("version", "core_sha256", "voice_sha256", "maintenance_sha256"
 # What a dimension entry holds that an evolution may move. A definition change asks a different
 # question; a baseline change is the answer this chain exists to produce.
 EVOLVING = ("baseline", "half_life_hours")
-# The configured roles a behavioral check rests on: the model that appraises, the model that answers.
-MODEL_ROLES = ("summary", "answer")
+# The models a behavioral check rests on. The one that appraises is pinned by the evaluator itself
+# and read from there. The one that answers is known only to the host, which registers it here.
+BEHAVIOR_MODELS = "behavior_models"
+CHAT_FIELDS = ("chat", "chat_effort")
+# What an ingredient nothing has written yet digests to. It is a literal rather than an empty value
+# so that a store which never registered one is stable: the first registration moves the key once.
+UNREGISTERED = "unregistered"
 # The execution facts a behavior can depend on. The rest of the environment is noise for this key.
 ENVIRONMENT_KEYS = ("python", "node", "os", "platform", "shell")
 
@@ -42,16 +47,19 @@ def _setting(conn, key):
 
 def parts(mind, conn, state=None):
     """The ingredients, each already a digest, so a stored stamp names what moved and holds no text."""
+    from . import appraisal
     profile = (state or mind._load(conn))["profile"]
     policy = load_persona(mind.engine, mind.scope)
-    models, environment = _setting(conn, "models"), _setting(conn, "execution_environment")
+    chat, environment = _setting(conn, BEHAVIOR_MODELS), _setting(conn, "execution_environment")
+    running = {key: environment[key] for key in ENVIRONMENT_KEYS if key in environment}
     return {
         "persona": digest([policy[field] for field in PERSONA_FIELDS]) if policy else "none",
         "contract": BEHAVIOR_CONTRACT,
         "definitions": digest({key: {name: value for name, value in entry.items() if name not in EVOLVING}
                                for key, entry in profile["dimensions"].items()}),
-        "models": digest([(models.get(role) or {}).get("model") for role in MODEL_ROLES]),
-        "environment": digest({key: environment[key] for key in ENVIRONMENT_KEYS if key in environment}),
+        "models": digest([appraisal.APPRAISAL_MODEL, appraisal.APPRAISAL_EFFORT,
+                          *[chat.get(field) or UNREGISTERED for field in CHAT_FIELDS]]),
+        "environment": digest(running or UNREGISTERED),
     }
 
 
