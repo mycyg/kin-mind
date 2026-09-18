@@ -571,6 +571,201 @@ def test_a_rebuild_that_does_not_come_back_out_right_takes_the_batch_with_it(set
     unchanged(mind, before)
 
 
+# --- the two phases, in order ------------------------------------------------------------------
+#
+# The commitment this module makes is stronger than per-batch archiving: the whole target set of a
+# run is archived and read-back-verified before the first row is rewritten. These tests instrument
+# the seam between the phases — the archive of the last row, the gap between the phases, a copy
+# that is not of this store, a row that escapes the archive — and each asserts the same thing from
+# a different side: no rewrite without a verified archive copy of what the row held.
+
+
+def archive_name(mind):
+    """The file the next run of this store will archive into, named for today as the run names it."""
+    return f"{history_compaction.ARCHIVE_STEM}-{history_compaction._day(mind.clock())}.sqlite3"
+
+
+def test_not_one_row_is_rewritten_before_the_whole_set_is_archived(setup, quiet, monkeypatch):
+    """The phase order, proven at its worst point: the archive of the LAST target row fails.
+
+    Every chunk before it is already committed and verified in the archive, and still nothing may
+    have been rewritten — the rewrite loop has not run yet, by construction."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=6)
+    before = stored_rows(mind)
+    last = max(texts)
+    real = history_compaction._archive_batch
+
+    def fail_on_the_last_row(path, scope, rows_, **kwargs):
+        if rows_[-1]["revision"] == last:
+            raise KeyboardInterrupt("the archive of the last target row never happened")
+        return real(path, scope, rows_, **kwargs)
+
+    monkeypatch.setattr(history_compaction, "_archive_batch", fail_on_the_last_row)
+    with pytest.raises(KeyboardInterrupt):
+        run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    # Zero rewrites, byte for byte, even though most of the set is already safely archived.
+    unchanged(mind, before)
+    with mind.engine.db.connect() as conn:
+        assert history_compaction.progress(conn, mind.scope.key())["through"] == 0
+    assert marker(mind)
+    held = archive_of(mind, archive_name(mind))
+    assert last not in held and 0 < len(held) < len(texts)
+    missing = set(texts) - set(held)
+    # The resume re-walks the archive phase, keeps the copies already there, and finishes.
+    monkeypatch.setattr(history_compaction, "_archive_batch", real)
+    done = run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    assert done["state"] == "complete" and done["archived"] == len(missing)
+    assert done["archive_confirmed"] == len(texts)
+    rebuilds(mind, texts)
+    assert run(mind, "history-compact-verify")["state"] == "verified"
+
+
+def test_interrupted_between_the_phases_resumes_safely(setup, quiet, monkeypatch):
+    """The widest window an interruption can land in: the whole set is archived and verified, and
+    not one row of it has been rewritten yet. The resume re-verifies every copy it already holds
+    and copies in nothing twice."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=5)
+    before = stored_rows(mind)
+    real = history_compaction._archive_target_set
+
+    def archive_everything_then_fall_over(*args, **kwargs):
+        real(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted between the archive and the rewrite phases")
+
+    monkeypatch.setattr(history_compaction, "_archive_target_set", archive_everything_then_fall_over)
+    with pytest.raises(KeyboardInterrupt):
+        run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    unchanged(mind, before)
+    assert marker(mind)
+    # Phase one really had finished: the archive holds every original, verified.
+    assert set(archive_of(mind, archive_name(mind))) == set(before)
+    monkeypatch.setattr(history_compaction, "_archive_target_set", real)
+    done = run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    assert done["state"] == "complete"
+    assert done["archived"] == 0 and done["archive_confirmed"] == len(before)
+    rebuilds(mind, texts)
+    assert run(mind, "history-compact-verify")["state"] == "verified"
+
+
+def test_an_archive_row_that_disagrees_with_the_store_stops_the_run(setup, quiet):
+    """`OR IGNORE` keeps the copy the archive already holds. When that copy is not the row in the
+    store, the read-back comparison refuses — and because the comparison is phase one, it refuses
+    before the first rewrite, with the store still closed to the writer."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=4)
+    before = stored_rows(mind)
+    path = history_compaction.archive_dir(mind.engine.db) / archive_name(mind)
+    # A row that is not of this store, planted where the run will trust nothing but its own
+    # read-back comparison to find it.
+    row = before[sorted(texts)[1]]
+    conn = history_compaction._archive_connection(path, create=True)
+    try:
+        conn.execute("INSERT INTO mind_events_v1 VALUES(?,?,?,?,?,?,?,?)",
+                     (row["scope"], row["revision"], row["id"], row["kind"], row["occurred_at"],
+                      '{"request":null,"snapshot":{"planted":true}}', "0" * 64, mind.clock()))
+    finally:
+        conn.close()
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True}, quiet)
+    assert refusal.value.target == "archive-row-differs"
+    assert refusal.value.actual["revision"] == row["revision"]
+    # The rewrite never started, and the marker stays set: the store is closed until someone has
+    # looked. A write attempted meanwhile is refused.
+    unchanged(mind, before)
+    assert marker(mind)
+    clock[0] += timedelta(minutes=9)
+    with pytest.raises(Conflict) as refused:
+        mind.record(AffectiveEvent(
+            command_id="during-compaction", agent_version="synthetic-v1",
+            expected_revision=mind.read()["revision"], evidence_ids=[source("observed-later")],
+            values={"mood": 44}, reason="A sourced synthetic observation"))
+    assert refused.value.code == history.COMPACTING
+    # The operator's way out: the archive's bad copy is removed, and the next run archives the one
+    # row it was missing, re-verifies the rest, and completes.
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DELETE FROM mind_events_v1 WHERE revision=?", (row["revision"],))
+        conn.commit()
+    finally:
+        conn.close()
+    done = run(mind, "history-compact", {"apply": True}, quiet)
+    assert done["state"] == "complete" and done["archived"] == 1
+    assert done["archive_confirmed"] == len(texts)
+    rebuilds(mind, texts)
+
+
+def test_a_row_that_escapes_the_archive_is_never_rewritten(setup, quiet, monkeypatch):
+    """The loop's own proof, fault-injected: phase one is made to skip one row, and the rewrite
+    must stop at that row rather than touch it — however a row came to be uncovered."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=5)
+    before = stored_rows(mind)
+    escaped = sorted(texts)[3]
+    real = history_compaction._archive_batch
+
+    def skip_one_row(path, scope, rows_, **kwargs):
+        kept = [row for row in rows_ if row["revision"] != escaped]
+        return real(path, scope, kept, **kwargs) if kept else 0
+
+    monkeypatch.setattr(history_compaction, "_archive_batch", skip_one_row)
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True, "batch": 2}, quiet)
+    assert refusal.value.target == "row-not-in-verified-archive"
+    assert refusal.value.actual["revision"] == escaped
+    # The batches before it committed; it, the row batched with it, and everything after are
+    # exactly as they were.
+    with mind.engine.db.connect() as conn:
+        through = history_compaction.progress(conn, mind.scope.key())["through"]
+    assert 0 < through < escaped
+    current = stored_rows(mind)
+    for revision, row in before.items():
+        if revision > through:
+            assert current[revision] == row, revision
+    assert marker(mind)
+    # With the fault removed the resume archives the row it missed — that one row, no other — and
+    # finishes.
+    monkeypatch.setattr(history_compaction, "_archive_batch", real)
+    done = run(mind, "history-compact", {"apply": True, "batch": 2}, quiet)
+    assert done["state"] == "complete" and done["archived"] == 1
+    rebuilds(mind, texts)
+    assert run(mind, "history-compact-verify")["state"] == "verified"
+
+
+def test_a_bad_rewrite_in_a_later_batch_is_still_caught(setup, quiet, monkeypatch):
+    """The per-batch landed verification, unchanged by the phase split: batches have committed
+    before this one, the patch it writes does not rebuild its row, and the batch goes down with
+    nothing of it committed."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=5)
+    before = stored_rows(mind)
+    target = sorted(texts)[7]
+    real = history.patch_row
+
+    def a_patch_that_loses_a_key(payload, state, **kw):
+        row = real(payload, state, **kw)
+        if state.get("revision") == target:
+            row["patch"] = [op for op in row["patch"] if op[1][:1] != ["updated_at"]] or row["patch"]
+        return row
+
+    monkeypatch.setattr(history_compaction.history, "patch_row", a_patch_that_loses_a_key)
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True, "batch": 2}, quiet)
+    assert refusal.value.target in {"patch-does-not-rebuild-the-row",
+                                    "rebuilt-row-differs-from-the-original"}
+    # Earlier batches are committed work; the batch holding the bad rewrite is rolled back whole.
+    with mind.engine.db.connect() as conn:
+        through = history_compaction.progress(conn, mind.scope.key())["through"]
+    assert 0 < through < target
+    current = stored_rows(mind)
+    assert current[sorted(texts)[1]] != before[sorted(texts)[1]]
+    for revision, row in before.items():
+        if revision > through:
+            assert current[revision] == row, revision
+    assert marker(mind)
+
+
 # --- rows this will not touch ----------------------------------------------------------------------------
 
 

@@ -9,13 +9,15 @@ held at each revision. So it is built the other way round from the rest: the que
 every step is not "may this proceed" but "is there anything at all to stop for", and every answer
 that is not a plain no stops it.
 
-**The archive comes first.** Before a single row is rewritten, its bytes — every column, verbatim —
-are copied into a separate database file, fsynced, then read back on a fresh connection and compared
-byte for byte with what is still in the store. Only then is that row touched, and only inside a
-transaction that also moves the cursor and rebuilds what it just wrote, so there is no committed
-state in which a row was rewritten and either nobody wrote down that it had been or nobody checked
-that it came out right. The archive is never deleted by any code here, at any point, for any reason;
-`history-restore` reads from it and leaves it exactly where it is.
+**The archive comes first — all of it.** A run is two phases, in the only order they may happen in.
+Phase one copies every row the run will touch — every column, verbatim — into a separate database
+file, fsyncs it, then reads each row back on a fresh connection and compares it byte for byte with
+what is still in the store. Only when the whole target set is archived and verified does the rewrite
+loop run, and the loop refuses any row that phase one did not cover, however that happened. Each
+batch is then rewritten inside a transaction that also moves the cursor and rebuilds what it just
+wrote, so there is no committed state in which a row was rewritten and either nobody wrote down that
+it had been or nobody checked that it came out right. The archive is never deleted by any code here,
+at any point, for any reason; `history-restore` reads from it and leaves it exactly where it is.
 
 What a rewrite does, precisely: `data` becomes what changed since the row before instead of the
 whole document, and **nothing else moves**. Every row stays, every column stays, and `id`, `scope`,
@@ -86,11 +88,13 @@ ARCHIVE_STEM = "mind-events-v1"
 # for the same reason, and 0600 like everything else here.
 BACKUP_STEM = "memory-precompaction"
 # Progress, in the table every other resumable migration in this package uses. `cursor` is the
-# revision through which the history is archived and rewritten; those two facts and the rewrite
-# itself are one commit.
+# revision through which the history is rewritten — and therefore archived, because no row is
+# rewritten that the archive does not already hold verified. Cursor and rewrite are one commit.
 MIGRATION = "history-compaction-v1"
-# Rows per batch. Small on purpose: the batch is the unit an interruption can cost, and twenty-five
-# rows of half a megabyte is a write transaction measured in hundreds of milliseconds.
+# Rows per batch. Small on purpose: in the rewrite loop the batch is the unit an interruption can
+# cost, and twenty-five rows of half a megabyte is a write transaction measured in hundreds of
+# milliseconds. The archive phase reads in chunks of the same size, so the copy of the store it
+# holds in memory is never bigger than one batch either.
 BATCH = 25
 # Every n-th row keeps its whole document. Counted in rows, not revisions: the mind's revision has
 # always been allowed to move without a row here, so counting revisions would leave a store with
@@ -247,7 +251,7 @@ def archive_counts(path: Path, scope):
         conn.close()
 
 
-def _archive_batch(path, scope, rows, *, at, started_at, source):
+def _archive_batch(path, scope, rows, *, at, started_at, source, verified=None):
     """Copy originals into the archive verbatim, fsync, and read them back to compare.
 
     `OR IGNORE`, so a row the archive already holds keeps the copy it already has: the first copy
@@ -258,7 +262,10 @@ def _archive_batch(path, scope, rows, *, at, started_at, source):
     page cache can answer for the file, and it is every column, byte for byte. A row that differs is
     either an archive that did not receive what it was handed, or a store whose row has moved since
     the copy was taken — which would mean something other than this has been rewriting history — and
-    neither is a thing to write past."""
+    neither is a thing to write past.
+
+    `verified`, when given, collects the proof per row: its revision to the hash of the bytes the
+    archive was just shown to hold. The rewrite loop accepts no row without one."""
     written = 0
     conn = _archive_connection(path, create=True)
     try:
@@ -290,9 +297,65 @@ def _archive_batch(path, scope, rows, *, at, started_at, source):
                     _refuse("archive-row-differs", revision=row["revision"], column=column)
             if kept["data_sha256"] != digest(kept["data"].encode()):
                 _refuse("archive-digest-differs", revision=row["revision"])
+            if verified is not None:
+                verified[row["revision"]] = kept["data_sha256"]
     finally:
         check.close()
     return written
+
+
+def _archive_target_set(db, path, scope, through, settled, *, at, batch, limit):
+    """Phase one of the two: the whole target set of this run, archived and read-back-verified
+    before the first row is rewritten.
+
+    The target set is every row above the cursor, bounded by `limit` where the operator gave one —
+    exactly the rows this invocation may touch. It is taken in chunks so the copy held in memory is
+    never bigger than one batch; every chunk is committed, fsynced and read back before the next is
+    fetched, and the phase does not return until every target row has been compared.
+
+    What comes back is the coverage proof the rewrite loop checks every row against: revision to
+    the hash of the bytes the archive was verified to hold. A resumed run walks the same phase
+    again: `OR IGNORE` keeps the copies already there and the read-back compares them with the
+    store a second time, so an interruption here costs nothing but the walk.
+
+    `archived` counts rows this invocation copied in; `confirmed` counts the rows it read back out
+    and compared, which on a resumed or repeated run includes the ones that were already there. A
+    run that archived nothing and confirmed everything is a run over a history the archive already
+    holds, and saying so takes both numbers."""
+    covered, archived, confirmed = {}, 0, 0
+    last = through
+    remaining = None if limit is None else int(limit)
+    while remaining is None or remaining > 0:
+        take = batch if remaining is None else min(batch, remaining)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,scope,revision,kind,occurred_at,data FROM mind_events"
+                " WHERE scope=? AND revision>? ORDER BY revision LIMIT ?",
+                (scope, last, take)).fetchall()
+        if not rows:
+            break
+        archived += _archive_batch(path, scope, rows, at=at, started_at=settled["started_at"],
+                                   source=Path(db.path).name, verified=covered)
+        confirmed += len(rows)
+        last = rows[-1]["revision"]
+        if remaining is not None:
+            remaining -= len(rows)
+    return covered, archived, confirmed
+
+
+def _covered(covered, row):
+    """The proof the rewrite loop requires of phase one: this row is in the archive, verified, and
+    its bytes have not moved since.
+
+    A row with no verified archive copy is never rewritten, whatever the reason it is missing —
+    holding the whole set back until every row is covered is the point of running the archive as a
+    phase of its own. A row whose bytes moved since its copy was verified is the same refusal the
+    write guard below would give, found one read earlier."""
+    kept = covered.get(row["revision"])
+    if kept is None:
+        _refuse("row-not-in-verified-archive", revision=row["revision"])
+    if kept != digest(row["data"].encode()):
+        _refuse("row-changed-under-the-rewrite", revision=row["revision"])
 
 
 # --- the backup -----------------------------------------------------------------------------------
@@ -661,14 +724,18 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
     the saving on one batch's worth of real patches — so what an operator reads before deciding is
     the decision the run will make and not a description of it.
 
-    With `apply`, a failed precondition is a refusal that has written nothing. Past that the work is
-    one batch at a time: archive, fsync, compare byte for byte, then one transaction that rewrites
-    the rows, rebuilds what it wrote, compares each rebuild with the original text and moves the
-    cursor. `limit` stops after that many rows, for an operator who wants to watch the first batch
-    before committing to the rest; the cursor makes the next invocation carry on from there.
+    With `apply`, a failed precondition is a refusal that has written nothing. Past that the run is
+    two phases: first the whole target set — every row above the cursor, bounded by `limit` where
+    one was given — is archived, fsynced and read back byte for byte, and only once every one of
+    those rows is verified in the archive does the rewrite loop run, one batch at a time: one
+    transaction that rewrites the rows, rebuilds what it wrote, compares each rebuild with the
+    original text and moves the cursor. `limit` stops after that many rows, for an operator who
+    wants to watch the first batch before committing to the rest; the cursor makes the next
+    invocation carry on from there.
 
-    Resumable and idempotent. The cursor and the rewrite commit together, so an interrupted run has
-    either done a batch or not done it, and a row already in the new format is passed over."""
+    Resumable and idempotent. The archive phase repeats without harm — existing copies are kept and
+    compared again — the cursor and the rewrite commit together, so an interrupted run has either
+    done a batch or not done it, and a row already in the new format is passed over."""
     scope, at = mind.scope.key(), mind.clock()
     db, batch = mind.engine.db, max(1, min(200, int(batch)))
     with db.connect() as conn:
@@ -760,10 +827,20 @@ def _counted(whole):
 
 
 def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
+    """The two phases, in the only order they may happen in.
+
+    Phase one archives and read-back-verifies the whole target set before anything moves. Phase two
+    is the batch rewrite loop, which accepts no row phase one did not cover: every row it reads is
+    checked against the coverage proof before it is prepared, so there is no committed state in
+    which a row was rewritten without a verified archive copy of what it held."""
     db = mind.engine.db
     done = {"rewritten": 0, "checkpoints": 0, "patched": 0, "passed_over": 0, "archived": 0,
             "archive_confirmed": 0, "bytes_before": 0, "bytes_after": 0}
     reasons, stopped = {}, None
+    with db.connect() as conn:
+        through = progress(conn, scope)["through"]
+    covered, done["archived"], done["archive_confirmed"] = _archive_target_set(
+        db, path, scope, through, settled, at=at, batch=batch, limit=limit)
     while True:
         # `limit` bounds the rows an invocation touches, not only the batches it runs, so an
         # operator who asked to see three rows before committing to the rest sees three.
@@ -782,6 +859,7 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
             carried = _carry(conn, scope, through) if through else None
             prepared, landed = [], []
             for row in rows:
+                _covered(covered, row)
                 data = _parse(row["data"])
                 if data is not None and _new_format(data):
                     # Already the shape this produces. It is archived like every other row and then
@@ -797,15 +875,8 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
                 for reason in fired:
                     reasons[reason] = reasons.get(reason, 0) + 1
 
-        # `archived` counts rows this invocation copied in; `archive_confirmed` counts the rows it
-        # read back out and compared, which on a resumed or repeated run includes the ones that
-        # were already there. A run that archived nothing and confirmed everything is a run over a
-        # history the archive already holds, and saying so takes both numbers.
-        done["archived"] += _archive_batch(path, scope, rows, at=at,
-                                           started_at=settled["started_at"],
-                                           source=Path(db.path).name)
-        done["archive_confirmed"] += len(rows)
-
+        # No per-batch archive here: phase one already holds every row this loop may touch, and
+        # `_covered` has just proved it of each row in this batch.
         with db.connect(write=True) as conn:
             for row, text, shape in prepared:
                 if text is None:
