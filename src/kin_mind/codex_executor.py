@@ -157,6 +157,11 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
         "-c", "features.apps=false",
         "-c", "features.hooks=false",
         "-c", "features.multi_agent=false",
+        # No generic shell and no image viewer: the file filter would otherwise be
+        # bypassable, since a read-only sandbox still reads anywhere (C7 case 10).
+        # The prompt carries the payload; the computer MCP covers authorized reads.
+        "-c", "features.shell_tool=false",
+        "-c", "features.view_image=false",
         "-c", 'web_search="disabled"',
         "-c", "model_reasoning_effort=" + dumps(reasoning),
         "-c", 'shell_environment_policy.inherit="none"',
@@ -282,6 +287,22 @@ def _input_sources(topic):
         if isinstance(item, dict)
     ]
     return evidence or [{"id": identifier} for identifier in topic.get("source_ids", [])]
+
+
+def _unbacked_citations(findings, topic, observations, directory):
+    """Citations that rest on nothing this run supplied or observed.
+
+    Web access is absent, so a URL or local path is legitimate only when it appears
+    in the input payload (evidence text, prior explorations, source ids), in the
+    computer observation ledger (locators), or names this run's host-written input
+    file. Anything else the model invented."""
+    input_file = directory / "input.json"
+    haystack = dumps(topic) + dumps(observations) + str(input_file) + str(input_file.resolve())
+    return [
+        citation.url
+        for citation in findings.sources
+        if citation.url not in haystack
+    ]
 
 
 def run_codex(
@@ -476,11 +497,15 @@ def run_codex(
         elapsed = round(time.monotonic() - started, 2)
         # A result is final only on a clean native completion. Anything written by
         # an interrupted or truncated run is a partial basis, never a result.
+        observations = []
+        if computer_ledger and computer_ledger.exists():
+            observations = list(json.loads(computer_ledger.read_text()).values())
         final_text = None
         if last_file.exists():
             final_text = last_file.read_text(encoding="utf-8", errors="replace")[:1_000_000]
         result = None
         partial_findings = None
+        extra_gaps = []
         if state == "failed":
             if child.returncode == 0 and turn_completed:
                 if final_text is None:
@@ -490,8 +515,19 @@ def run_codex(
                     if result is None:
                         reason = "invalid-result-shape" if _json_candidates(final_text) else "invalid-final-result"
                 if result is not None:
-                    state = "complete"
-                    reason = None
+                    # Every citation must rest on this run's supplied evidence or its
+                    # observation ledger. With web access absent, a URL or path that
+                    # appears from nowhere is invented: the run is not complete.
+                    unbacked = _unbacked_citations(result, topic, observations, directory)
+                    if unbacked:
+                        state = "failed"
+                        reason = "unbacked-citation"
+                        extra_gaps = ["rejected unbacked citation: " + citation for citation in unbacked[:10]]
+                        partial_findings = None
+                        result = None
+                    else:
+                        state = "complete"
+                        reason = None
             else:
                 reason = "native-run-incomplete"
                 if final_text is not None:
@@ -511,7 +547,7 @@ def run_codex(
         else:
             usage = {"status": "unknown", "per_request": reported, "total": None}
         checkpoint = None
-        if state != "complete" and (state in {"preempted", "timed-out"} or partial_findings is not None):
+        if state != "complete" and (state in {"preempted", "timed-out"} or partial_findings is not None or extra_gaps):
             checkpoint = {
                 "exploration_id": directory.name,
                 "attempt": attempt,
@@ -521,7 +557,7 @@ def run_codex(
                 "reasoning": reasoning,
                 "input_sources": input_sources,
                 "sources_used": [source.model_dump() for source in partial_findings.sources] if partial_findings else [],
-                "gaps": list(partial_findings.open_questions) if partial_findings else [],
+                "gaps": (list(partial_findings.open_questions) if partial_findings else []) + extra_gaps,
                 "partial_findings": partial_findings.model_dump() if partial_findings else None,
                 "native_execution_id": thread_id,
                 "seconds": elapsed,
@@ -560,8 +596,7 @@ def run_codex(
             "tool_results": tool_results,
             "errors": errors[-10:],
             "error_tags": [tag for tag in ERROR_TAGS if tag in diagnostic_text.lower()],
-            **({"observations": list(json.loads(computer_ledger.read_text()).values())}
-               if computer_ledger and computer_ledger.exists() else {}),
+            **({"observations": observations} if observations else {}),
             **({"checkpoint": checkpoint} if checkpoint else {}),
         }
         atomic_write(directory / "receipt.json", dumps(receipt))

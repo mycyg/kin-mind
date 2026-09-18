@@ -74,7 +74,7 @@ function codexArgv({workdir, schemaFile, lastFile, baseUrl, envKey, webSearch = 
     '--json', '--color', 'never', '--sandbox', 'read-only', '--cd', workdir,
     '--model', 'deepseek-flash', '--output-schema', schemaFile, '--output-last-message', lastFile,
     '-c', 'approval_policy="never"', '-c', 'forced_login_method="api"', '-c', 'features.apps=false', '-c', 'features.hooks=false',
-    '-c', 'features.multi_agent=false', '-c', `web_search="${webSearch}"`,
+    '-c', 'features.multi_agent=false', '-c', 'features.shell_tool=false', '-c', 'features.view_image=false', '-c', `web_search="${webSearch}"`,
     '-c', 'model_reasoning_effort="high"', '-c', 'shell_environment_policy.inherit="none"',
     '-c', 'model_provider="kin_probe"', '-c', 'model_providers.kin_probe.name="Kin probe"',
     '-c', `model_providers.kin_probe.base_url="${baseUrl}"`,
@@ -264,6 +264,7 @@ async function stubMode() {
 }
 
 async function realMode() {
+  const only = arg('--only', 'both');
   const credentialsFile = arg('--credentials');
   if (!credentialsFile) throw Error('--credentials <file.env> required for real probes');
   const lines = fs.readFileSync(credentialsFile, 'utf8').split('\n');
@@ -301,8 +302,11 @@ async function realMode() {
       known_evidence: [{id: 'src_probe_1', source_id: 'src_probe_1', revision: 1, authority: 'document',
         occurred_at: new Date().toISOString(), text: 'Probe fixture: the ledger is green.', instruction_authority: 'data'}],
       source_ids: ['src_probe_1']};
-    const basic = await driver({executable: 'codex', topic, workdir: path.join(scratch, 'basic'),
+    let basic = null;
+    if (only !== 'tool') {
+    basic = await driver({executable: 'codex', topic, workdir: path.join(scratch, 'basic'),
       model: 'deepseek-flash', reasoning: 'high', provider, budget_seconds: 600});
+    if (only !== 'tool')
     save('probe-b-basic-roundtrip.json', {
       probe: 'B-real-roundtrip', at: new Date().toISOString(), scratch,
       executor: basic.executor, cli_version: basic.executor_version, provider: basic.provider,
@@ -316,6 +320,8 @@ async function realMode() {
         instructions_has_reply_contract: (r.body.instructions ?? '').includes('Write only messages addressed to the user'),
         instructions_has_exploration_contract: (r.body.instructions ?? '').includes('source-backed exploration')})),
     });
+    }
+    if (only === 'basic') return;
     // Tool round trip: the computer MCP reader against a probe fixture.
     const fixture = path.join(scratch, 'fixture');
     fs.mkdirSync(fixture, {recursive: true, mode: 0o700});

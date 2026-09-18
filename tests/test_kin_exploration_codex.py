@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -29,6 +30,17 @@ FINDINGS = {
     "sources": [{"url": "https://example.com", "title": "Synthetic source"}],
     "open_questions": ["What remains open?"],
     "suggested_share": None,
+}
+
+# The citation validator rejects sources the run never supplied: the evidence
+# text carries the URL the findings cite.
+TOPIC = {
+    "question": "synthetic",
+    "known_evidence": [{"id": "s1", "source_id": "s1", "revision": 3, "authority": "document",
+                        "occurred_at": "2026-01-01T00:00:00+00:00",
+                        "text": "Background material referencing https://example.com",
+                        "instruction_authority": "data"}],
+    "source_ids": ["s1"],
 }
 
 HEADER = (
@@ -89,7 +101,7 @@ def exploration_world(tmp_path):
             namespace="synthetic",
             key="question",
             scope=scope,
-            text="Explore a source-backed question",
+            text="Explore a source-backed question; background https://example.com",
         )
     )["id"]
     mind.initialize(agent_version="test-v1", evidence_ids=[source])
@@ -149,6 +161,10 @@ def test_codex_argv_and_env_are_isolated(tmp_path, monkeypatch):
     # rejects preferred_auth_method, so the api login method alone is pinned.
     assert 'forced_login_method="api"' in argv
     assert not any(flag.startswith("preferred_auth_method") for flag in argv)
+    # C7-10: no generic shell or image viewer — the read-only sandbox would
+    # otherwise let them read anywhere, bypassing the computer file filter.
+    assert "features.shell_tool=false" in argv and "features.view_image=false" in argv
+    assert "features.multi_agent=false" in argv and "mcp_servers={}" in argv
     # An operator-managed model catalog is injected only when configured.
     assert not any(flag.startswith("model_catalog_json") for flag in argv)
     with_catalog = codex_argv(
@@ -199,8 +215,7 @@ def test_codex_complete_run(tmp_path, monkeypatch):
     monkeypatch.setenv("EVENTMEM_API_KEY", "sk-must-not-leak")
     job = tmp_path / "job"
     fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
-    report = run_codex(fake, {"question": "synthetic", "source_ids": ["s1"]}, job,
-                       **codex_kwargs())
+    report = run_codex(fake, TOPIC, job, **codex_kwargs())
     assert report["state"] == "complete" and report["reason"] is None
     assert report["result"]["summary"] == "A sourced finding"
     assert report["partial"] is False
@@ -214,7 +229,7 @@ def test_codex_complete_run(tmp_path, monkeypatch):
         "per_request": [{"input_tokens": 120, "output_tokens": 30}],
         "total": {"input_tokens": 120, "output_tokens": 30},
     }
-    assert report["input_sources"] == [{"id": "s1"}]
+    assert report["input_sources"] == [{"id": "s1", "source_id": "s1", "revision": 3}]
     assert report["config_digest"] and report["workdir"] == str(job)
     assert report["started_at"] and report["finished_at"] and report["seconds"] >= 0
     receipt = json.loads((job / "receipt.json").read_text())
@@ -385,13 +400,13 @@ def test_codex_continuation_reads_the_prior_checkpoint(tmp_path, monkeypatch):
         + "import time\ntime.sleep(30)\n",
     )
     began = time.monotonic()
-    first = run_codex(interrupted, {"question": "synthetic", "source_ids": ["s1", "s2"]},
+    first = run_codex(interrupted, {"question": "synthetic https://example.com", "source_ids": ["s1", "s2"]},
                       tmp_path / "job-1",
                       canceled=lambda: time.monotonic() - began > 0.5, **codex_kwargs())
     assert first["state"] == "preempted" and first["checkpoint"]["attempt"] == 1
     assert first["checkpoint"]["input_sources"] == [{"id": "s1"}, {"id": "s2"}]
     resumed = fake_codex(tmp_path / "fake-resumed", OBSERVE + COMPLETE)
-    second = run_codex(resumed, {"question": "synthetic", "source_ids": ["s1", "s2"]},
+    second = run_codex(resumed, {"question": "synthetic https://example.com", "source_ids": ["s1", "s2"]},
                        tmp_path / "job-2", continuation=first["checkpoint"], **codex_kwargs())
     assert second["state"] == "complete" and second["attempt"] == 2
     observed = json.loads((tmp_path / "job-2" / "observed.json").read_text())
@@ -434,7 +449,7 @@ def test_codex_computer_reading_is_the_only_mcp_server(tmp_path, monkeypatch):
     fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
     computer = {"enabled": True, "roots": [str(readable)], "exclude_roots": [],
                 "previous": []}
-    report = run_codex(fake, {"question": "synthetic"}, job, computer=computer,
+    report = run_codex(fake, {"question": "synthetic https://example.com"}, job, computer=computer,
                        **codex_kwargs())
     assert report["state"] == "complete"
     assert report["capabilities"] == {"computer": True, "web_search": False}
@@ -453,7 +468,7 @@ def test_codex_computer_reading_is_the_only_mcp_server(tmp_path, monkeypatch):
     assert "read_computer_context" in observed["prompt"]
     assert str(readable) in observed["prompt"]  # authorized_roots are data
     # Without computer exploration there is no MCP server at all.
-    report = run_codex(fake, {"question": "synthetic"}, tmp_path / "job2", **codex_kwargs())
+    report = run_codex(fake, {"question": "synthetic https://example.com"}, tmp_path / "job2", **codex_kwargs())
     observed = json.loads((tmp_path / "job2" / "observed.json").read_text())
     assert "mcp_servers={}" in observed["argv"]
     assert report["capabilities"] == {"computer": False, "web_search": False}
@@ -692,3 +707,253 @@ def test_host_explore_codex_end_to_end(tmp_path, monkeypatch):
     assert 'model_provider="deepseek"' in argv
     assert 'forced_login_method="api"' in argv
     assert f'model_catalog_json="{catalog}"' in argv
+
+
+# --- C7 acceptance matrix additions --------------------------------------------
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+
+
+def test_codex_unbacked_citation_is_rejected(tmp_path, monkeypatch):
+    """C7-5: with web absent, a URL the run never supplied or observed is invented."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    job = tmp_path / "job"
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)  # cites https://example.com
+    report = run_codex(fake, {"question": "no source mentions that URL"}, job,
+                       **codex_kwargs())
+    assert report["state"] == "failed" and report["reason"] == "unbacked-citation"
+    assert report["result"] is None and report["partial"] is True
+    checkpoint = json.loads((job / "checkpoint.json").read_text())
+    assert any("https://example.com" in gap for gap in checkpoint["gaps"])
+
+
+def test_codex_citation_backed_by_the_observation_ledger(tmp_path, monkeypatch):
+    """C7-6/7: a computer citation must map to a ledger observation; a path the
+    reader never produced is rejected."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "notes.txt").write_text("Synthetic ledger note")
+    computer = {"enabled": True, "roots": [str(fixture)], "exclude_roots": [], "previous": []}
+
+    def write_fake(path, cite_locator):
+        cite = "entry['locator']" if cite_locator else repr(str(fixture / "never-read.txt"))
+        path.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, sys\n"
+            "if sys.argv[1:2] == ['--version']:\n"
+            "    sys.stdout.write('codex-cli 0.155.0\\n')\n"
+            "    raise SystemExit(0)\n"
+            "argv = sys.argv[1:]\n"
+            "last = argv[argv.index('--output-last-message') + 1]\n"
+            "sys.stdin.read()\n"
+            "sys.path.insert(0, " + repr(str(SRC)) + ")\n"
+            "from kin_mind.computer import ComputerReader\n"
+            "cfg = json.loads(open('computer-reader.json').read())\n"
+            "entry = ComputerReader(cfg).read_resource(" + repr(str(fixture / 'notes.txt')) + ")\n"
+            "payload = {'summary': 'Read the note', 'findings': ['It is green'], 'sources': "
+            "[{'url': " + cite + ", 'title': 'notes.txt'}], 'open_questions': [], 'suggested_share': None}\n"
+            "open(last, 'w').write(json.dumps(payload))\n"
+            "sys.stdout.write(json.dumps({'type': 'thread.started', 'thread_id': 'th_ledger'}) + '\\n')\n"
+            "sys.stdout.write(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 2}}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        path.chmod(0o700)
+        return path
+
+    backed = run_codex(write_fake(tmp_path / "fake-backed", True),
+                       {"question": "read the fixture"}, tmp_path / "job-backed",
+                       computer=computer, **codex_kwargs())
+    assert backed["state"] == "complete"
+    assert backed["result"]["sources"][0]["url"].endswith("notes.txt")
+    assert backed["observations"] and backed["observations"][0]["locator"].endswith("notes.txt")
+    unbacked = run_codex(write_fake(tmp_path / "fake-unbacked", False),
+                         {"question": "read the fixture"}, tmp_path / "job-unbacked",
+                         computer=computer, **codex_kwargs())
+    assert unbacked["state"] == "failed" and unbacked["reason"] == "unbacked-citation"
+
+
+def test_codex_empty_output_is_failed_not_complete(tmp_path, monkeypatch):
+    """C7-regression: turn.completed with no final message at all."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    fake = fake_codex(tmp_path / "fake-codex", THREAD_STARTED
+                      + "sys.stdout.write(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 3, 'output_tokens': 0}}) + '\\n')\nsys.stdout.flush()\n")
+    report = run_codex(fake, TOPIC, tmp_path / "job", **codex_kwargs())
+    assert report["state"] == "failed" and report["reason"] == "missing-final-result"
+    assert report["result"] is None
+    # The model did run and reported usage for the empty turn: reported, not zero.
+    assert report["usage"]["status"] == "reported"
+
+
+def test_codex_wrong_tool_call_is_recorded_not_fatal(tmp_path, monkeypatch):
+    """C7-regression: a tool the run does not have fails in-band; the run may still complete."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    fake = fake_codex(
+        tmp_path / "fake-codex",
+        THREAD_STARTED
+        + "sys.stdout.write(json.dumps({'type': 'item.completed', 'item': {'id': 'i1', 'type': 'mcp_tool_call', 'name': 'read_computer_resource', 'server': 'kin_computer'}}) + '\\n')\n"
+        + "sys.stdout.write(json.dumps({'type': 'item.completed', 'item': {'id': 'i2', 'type': 'error', 'message': 'unsupported call: send_message'}}) + '\\n')\n"
+        + "open(last, 'w').write(json.dumps(" + repr({**FINDINGS, 'open_questions': []}) + "))\n"
+        + "sys.stdout.write(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 9, 'output_tokens': 4}}) + '\\n')\n"
+        + "sys.stdout.flush()\n",
+    )
+    report = run_codex(fake, TOPIC, tmp_path / "job", **codex_kwargs())
+    assert report["state"] == "complete"
+    assert report["tool_results"][0]["type"] == "mcp_tool_call"
+    assert report["tool_results"][0]["tool"] == "read_computer_resource"
+    assert "unsupported call: send_message" in report["errors"]
+
+
+def test_codex_lease_loss_preempts_with_a_versioned_checkpoint(tmp_path, monkeypatch):
+    """C7-19: the lease/owner signal mid-run preempts; the checkpoint carries the
+    input sources with their versions so a later attempt resumes honestly."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    job = tmp_path / "job"
+    fake = fake_codex(tmp_path / "fake-codex", THREAD_STARTED + "import time\ntime.sleep(30)\n")
+    began = time.monotonic()
+    report = run_codex(fake, TOPIC, job,
+                       canceled=lambda: time.monotonic() - began > 0.5, **codex_kwargs())
+    assert report["state"] == "preempted" and report["result"] is None
+    checkpoint = json.loads((job / "checkpoint.json").read_text())
+    assert checkpoint["attempt"] == 1 and checkpoint["state"] == "preempted"
+    assert checkpoint["input_sources"] == [{"id": "s1", "source_id": "s1", "revision": 3}]
+    assert checkpoint["continuation"]
+
+
+def test_codex_budget_is_capped_at_twenty_minutes(tmp_path, monkeypatch):
+    """C7-17: the total budget ceiling is 1200 seconds, inclusive of everything."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)
+    with pytest.raises(ValueError):
+        run_codex(fake, TOPIC, tmp_path / "job-over", budget_seconds=1201, **codex_kwargs())
+    with pytest.raises(ValueError):
+        run_codex(fake, TOPIC, tmp_path / "job-zero", budget_seconds=0, **codex_kwargs())
+
+
+def test_executor_writes_only_inside_its_workdir(tmp_path, monkeypatch):
+    """C7-12: the executor touches nothing outside the per-exploration workdir."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    before = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")}
+    report = run_codex(fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE),
+                       TOPIC, tmp_path / "job", **codex_kwargs())
+    assert report["state"] == "complete"
+    created = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")} - before
+    assert created and all(path == "job" or path.startswith("job/") or path == "fake-codex" for path in created)
+
+
+def test_two_processes_claim_the_same_exploration_once(tmp_path):
+    """C7-15: a cross-process race on the same scope settles exactly one winner."""
+    world = tmp_path / "shared"
+    exploration_world(world)
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, sys, time\n"
+        "sys.path.insert(0, " + repr(str(SRC)) + ")\n"
+        "from eventmem.core import Engine\n"
+        "from eventmem.core.models import Scope\n"
+        "from kin_mind.state import Mind\n"
+        "from kin_mind.exploration import Explorations\n"
+        "engine = Engine(sys.argv[1])\n"
+        "mind = Mind(engine, Scope(persona='synthetic-codex-explorer'))\n"
+        "def runner(*a, **k):\n"
+        "    time.sleep(1.5)\n"
+        "    return {'state': 'complete', 'partial': False, 'executor': 'codex-cli', 'provider': 'deepseek',\n"
+        "            'result': {'summary': 'Done', 'findings': [], 'sources': [], 'open_questions': [], 'suggested_share': None}}\n"
+        "result = Explorations(mind).run('fake', sys.argv[2], 'test-v1', runner=runner)\n"
+        "print(json.dumps({'state': result['state'], 'id': result.get('id')}))\n"
+    )
+    import subprocess
+
+    processes = [
+        subprocess.Popen([sys.executable, str(child), str(world / "memory"), str(tmp_path / "jobs")],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    outcomes = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60)
+        assert process.returncode == 0, stderr[-800:]
+        outcomes.append(json.loads(stdout.strip()))
+    assert sorted(outcome["state"] for outcome in outcomes) == ["complete", "waiting"]
+    ids = {outcome.get("id") for outcome in outcomes if outcome["state"] == "complete"}
+    assert len(ids) == 1
+    from eventmem.core import Engine
+
+    with Engine(world / "memory").db.connect() as conn:
+        rows = conn.execute("SELECT state FROM mind_explorations").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "complete"
+
+
+def test_duplicate_result_submission_is_idempotent(tmp_path):
+    """C7-22: the kin-exploration source is keyed; the same payload twice is one row."""
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope, SourceInput
+
+    engine = Engine(tmp_path / "memory")
+    scope = Scope(persona="synthetic-codex-explorer")
+    payload = SourceInput(namespace="kin-exploration", key="explore_x", scope=scope,
+                          authority="model", kind="observation", session="explore_x",
+                          text='{"state":"complete"}')
+    first = engine.receive(payload)
+    second = engine.receive(payload)
+    assert first["id"] == second["id"]
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sources WHERE namespace='kin-exploration'").fetchone()[0] == 1
+
+
+def test_source_correction_after_submission_flags_review_without_a_model_call(tmp_path):
+    """C7-23: evidence corrected after the run settles leaves the review event
+    needs-review; no stale appraisal is ever dispatched."""
+    from test_kin_mind import FakeReviewer
+
+    from eventmem.core.models import SourceInput
+    from kin_mind.actions import ActionEvents
+    from kin_mind.appraisal import Appraisal, Appraisals
+    from kin_mind.exploration import Explorations
+
+    engine, mind, _ = exploration_world(tmp_path)
+
+    def correcting_runner(*args, **kwargs):
+        # A versioned correction of the desire's evidence lands after the claim.
+        engine.receive(SourceInput(namespace="synthetic", key="question", version="2",
+                                   scope=mind.scope, text="Corrected evidence text"))
+        return {
+            "state": "complete", "partial": False, "executor": "codex-cli", "provider": "deepseek",
+            "result": {"summary": "Done", "findings": [], "sources": [],
+                       "open_questions": [], "suggested_share": None},
+        }
+
+    result = Explorations(mind).run("fake", tmp_path / "jobs", "test-v1", runner=correcting_runner)
+    assert result["state"] == "complete"  # valid when claimed; the review layer reacts
+
+    actions, jobs = ActionEvents(mind), Appraisals(mind)
+    actions.drain(jobs)
+    with engine.db.connect() as conn:
+        event = conn.execute("SELECT state FROM mind_action_events WHERE kind='exploration-result'").fetchone()
+        assert event[0] == "needs-review"
+        assert conn.execute("SELECT COUNT(*) FROM mind_appraisals").fetchone()[0] == 0
+    reviewer = FakeReviewer(Appraisal(reason="Reviewed"))
+    assert jobs.run_one(reviewer)["state"] == "idle"
+    assert reviewer.calls == 0  # never paid to review on stale evidence
+
+
+def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path, monkeypatch):
+    """C7-regression: the executor path never touches the shared-session registry."""
+    from kin_mind.host import dispatch
+
+    _, mind, _ = exploration_world(tmp_path)
+    registry = tmp_path / "session-registry.json"
+    registry.write_text(json.dumps({"binding": {"threadId": "th_phone", "nativeSessionId": "native-1"}}))
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    before = registry.read_bytes()
+    config = host_config(
+        tmp_path, mind, exploration_backend="codex", exploration_command=str(fake),
+        exploration_model="deepseek-flash", exploration_reasoning="high",
+        exploration_budget_seconds=1200, exploration_max_running=1,
+        exploration_model_provider=PROVIDER,
+        session_registry_file=str(registry),
+    )
+    result = dispatch(config, "explore", {})
+    assert result["state"] == "complete"
+    assert registry.read_bytes() == before

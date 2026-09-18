@@ -230,3 +230,16 @@ test('the fifth concurrent background request waits; a foreground request is nev
     assert.equal(chatRow.leaseState, 'admitted');
   } finally {await exploration.close(); await chat.close();}
 });
+
+test('exploration and creation identities never share a purpose, and only deepseek-flash crosses', () => {
+  // C7-16: distinct background purposes on the same lane.
+  assert.equal(GATEWAY_PROFILES.exploration.purpose, 'native-exploration');
+  assert.equal(nativeTurnPurpose('creation').purpose, 'native-creation');
+  assert.equal(nativeTurnPurpose('contact-draft').purpose, 'native-contact-draft');
+  assert.notEqual(GATEWAY_PROFILES.exploration.purpose, nativeTurnPurpose('creation').purpose);
+  assert.equal(GATEWAY_PROFILES.exploration.lane, nativeTurnPurpose('creation').lane);
+  // C7-2: a non-DeepSeek model never crosses the gateway, whatever the request claims.
+  assert.throws(() => deepseekRequest({model:'gpt-6-astra', input:[]}), /unsupported-request/);
+  assert.throws(() => deepseekRequest({model:'deepseek-v4-pro', input:[],}), /unsupported-request/);
+  assert.throws(() => deepseekRequest({model:'deepseek-flash', input:[]}, 'extreme'), /unsupported-reasoning-effort/);
+});
