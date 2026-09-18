@@ -31,6 +31,7 @@ COMMIT_PATH_MODULES = (
     "kin_mind.sharing", "kin_mind.procedures", "kin_mind.exploration_decisions",
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
+    "kin_mind.next_move",
 )
 
 
@@ -262,6 +263,10 @@ REGISTRY = {
     "An owner instruction or correction must quote the owner's own words": ("semantic", "trait-quote-unverified", "section"),
     "A revoked trait needs an owner statement newer than its tombstone": ("semantic", "trait-revoked", "section"),
     "A faded trait needs new support before it stands again": ("semantic", "trait-needs-support", "section"),
+    # --- next_move.py: an audit of the move the same appraisal says it is making. Both are raised
+    # inside that section, so each drops the move alone and nothing else of the proposal. ---
+    "This move does not match what this appraisal committed": ("semantic", "next-move-inconsistent", "section"),
+    "This move rests on something the host cannot find": ("semantic", "next-move-forged-grounds", "section"),
     # --- model_lanes.py: a lease is the host's to check, never a question for the model ---
     "Model lease was lost before the result returned": ("runtime", "model-lease-lost", "block"),
     "Model lease was lost during the evaluation": ("runtime", "model-lease-lost", "block"),

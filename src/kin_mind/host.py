@@ -307,6 +307,10 @@ def dispatch(config, action, request):
             return ledger.revoke(request)
         # Idempotent, and a dry run writes nothing.
         return ledger.migrate(apply=bool(request.get("apply")))
+    if action == "next-moves":
+        # Read only: what each appraisal said it was doing, and what the host found behind it.
+        from .next_move import recent
+        return recent(mind, limit=request.get("limit", 20))
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":
