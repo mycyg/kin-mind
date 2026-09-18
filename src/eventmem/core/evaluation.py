@@ -81,7 +81,7 @@ def fixture_cases():
             "query": "shared garden experience",
             "sources": [
                 {
-                    "text": "shared garden experience on Sunday; the user said she enjoyed it",
+                    "text": "shared garden experience on Sunday; the user said they enjoyed it",
                     "kind": "episode",
                 }
             ],

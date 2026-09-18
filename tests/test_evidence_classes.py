@@ -43,7 +43,7 @@ def test_only_the_owners_own_turn_is_her_statement(world):
     assert owner_statement(engine.get(ids["lived"]), policy)
     for name in NOT_HER_WORDS:
         assert not owner_statement(engine.get(ids[name]), policy), name
-    # A configuration request is still an experience, and still recalled; it is not her saying
+    # A configuration request is still an experience, and still recalled; it is not the owner saying
     # what Kin has become.
     assert policy.classify(engine.get(ids["request"])).kind == "experience"
     assert policy.label(engine.get(ids["request"])) == "configuration_request"
@@ -163,7 +163,7 @@ def preferences(tmp_path):
 
 def pause(evidence, revision=0):
     return HabitProposal(preferences={"exploration_paused": True}, evidence_ids=[evidence],
-                         reason="She asked to pause", expected_revision=revision)
+                         reason="The owner asked to pause", expected_revision=revision)
 
 
 def test_a_preference_needs_her_own_words_not_merely_explicit_authority(preferences):

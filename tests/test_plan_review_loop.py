@@ -485,7 +485,7 @@ def test_stale_revision_with_a_changed_basis_is_held_and_reviewed_once(env, case
                 env.plans.settle_linked(conn, {"plan_id": plan["id"], "plan_step_id": "make"}, {"id": "partial-result", "complete": False})
         elif case == "owner-epoch-advanced":
             env.decide(current, "wait", step_id="tell")
-            env.owner_message("owner-changes-her-mind")
+            env.owner_message("owner-changes-their-mind")
         else:
             env.plans.manage({"command_id": "goal", "action": "update", "id": plan["id"], "expected_revision": current["revision"],
                 "reason": "Owner wants a poem", "evidence_ids": [env.initial], "goal": "Make a poem instead"})
@@ -509,7 +509,7 @@ def test_owner_message_during_evaluation_holds_even_at_the_current_revision(env)
     job = env.enqueue("owner-chat")
     def script(shown, context):
         env.owner_message("owner-writes-while-the-model-thinks")
-        return Appraisal(reason="Judged before her message", action_decisions=[env.decision(shown[plan["id"]], "execute")])
+        return Appraisal(reason="Judged before the owner's message", action_decisions=[env.decision(shown[plan["id"]], "execute")])
     env.evaluate(script, job_id=job)
     [held] = env.job(job)["held_decisions"]
     assert held["code"] == "basis-changed" and held["expected"]["plan_revision"] == held["actual"]["plan_revision"]
