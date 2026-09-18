@@ -43,7 +43,10 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned once when every package landed together: WP6's three switch-less changes to the
 # shared prompt (the widened half-life range, the stated procedure premise, the owner named by
 # role) move every request that offers anything, this one included.
-MOVE_REQUEST = "5f52f8c8f61f2db4a76553c153e837bc8351961184b31f6c233f38e08cde8455"
+# Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
+# already told it, that a host internal event is not evidence: production refused both
+# sections on two of its first four appraisals for citing exactly that.
+MOVE_REQUEST = "95aa8ca745cab34c08c1cf91eb887faf0ea86ab2cd7ec81dd4ec5d22440abbe4"
 MOVE_SECTIONS = ("next_move",)
 
 
