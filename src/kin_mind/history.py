@@ -120,7 +120,7 @@ def snapshot_row(payload, state):
 
     The request and the snapshot are exactly what they have always been, so the previous release
     reads this row without noticing anything. `state_hash` is the one addition, and it is what
-    makes every later rebuild checkable at all: a row written before stage 5 carries no hash, so
+    makes every later rebuild checkable at all: a row written before the release that introduced the hash carries none, so
     nothing can be said about it beyond that it parsed."""
     return {"request": payload, "snapshot": state, "state_hash": row_hash(state)}
 
@@ -222,7 +222,7 @@ def _apply(state, patch, *, at=None):
 def verify(state, expected, *, at=None):
     """Hand back `state` only when its canonical bytes hash to what the row recorded.
 
-    `expected` is None for every row written before stage 5. There is nothing to check against
+    `expected` is None for every row written before that release. There is nothing to check against
     those and nothing is claimed about them: they are trusted exactly as far as they were before
     this module existed, and no further."""
     if expected is not None and row_hash(state) != expected:
@@ -292,7 +292,7 @@ def materialize(conn, scope, revision, *, data=None, listing=False):
         if not listing or index == len(chain) - 1:
             verify(state, known, at=at)
     if state.get("revision") not in (None, revision):
-        # A row written before stage 5 carries no hash, so the only thing that can be checked
+        # A row written before the release that introduced the hash carries none, so the only thing that can be checked
         # about it is that the document it holds says it belongs to the revision it was filed
         # under. Every row in production does. A document with no revision of its own — another
         # table's history, later — is not asked for one.
