@@ -1,9 +1,18 @@
-"""Idempotent operational-lane migration, after the owning workers stop."""
+"""Idempotent operational-lane migration, after the owning workers stop.
+
+"After they stop" used to mean whatever the caller asserted in `workers_stopped`.
+The parameter is still accepted, so every existing caller keeps working, but with
+`liveness_checks` on it decides nothing: the lease ledger is asked instead. The two
+commands that release every `running` row refuse while one of those rows is still
+leased, and the historical resume, which only ever touched quarantined rows that no
+worker can hold, asks for nothing at all.
+"""
 import json
 import time
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
+from . import liveness
 from .memory import MemoryContinuity
 
 # Retry bookkeeping an approved resume gives back, preserved in recovery_history.
@@ -14,7 +23,9 @@ REUSE_FIELDS = ("reuse", "tier", "revalidation")
 
 
 def migrate_operational(mind, *, workers_stopped):
-    if workers_stopped is not True:
+    with mind.engine.db.connect() as conn:
+        evidence = liveness.checks_enabled(conn, mind.scope.key())
+    if not evidence and workers_stopped is not True:
         raise ValueError("Verify termination of the owning workers first")
     from .appraisal import Appraisals
     jobs = Appraisals(mind)
@@ -24,6 +35,11 @@ def migrate_operational(mind, *, workers_stopped):
         previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
         if previous:
             return json.loads(previous[0])
+        if evidence:
+            # This releases every `running` row below, so one still under lease is
+            # an evaluation this command would interrupt. A replay is already past
+            # this point: it returned the recorded receipt and writes nothing.
+            liveness.refuse_while_appraisal_leased(conn, mind.scope.key())
         config = memory.settings(conn) | {"operational_lanes": True}
         conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (mind.scope.key(), dumps(config)))
         # Collapse overdue clock wakeups into one current judgment. Their old
@@ -53,8 +69,15 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
 
     Reused structured results still pass the normal transactional validators.
     This operation neither writes emotions nor submits a chat/send operation.
+
+    It touches `needs-repair` rows only. A quarantined row is held by no worker and
+    carries no lease, so there is nothing here for a shutdown to protect: with
+    `liveness_checks` on, `workers_stopped` is accepted and ignored, exactly as
+    `recover_quarantined` has always worked.
     """
-    if workers_stopped is not True:
+    with mind.engine.db.connect() as conn:
+        evidence = liveness.checks_enabled(conn, mind.scope.key())
+    if not evidence and workers_stopped is not True:
         raise ValueError("Verify termination of the owning workers first")
     if not command_id or not source or not 1 <= len(job_ids) <= 50 or len(set(job_ids)) != len(job_ids):
         raise ValueError("Recovery requires a sourced command and unique bounded jobs")
@@ -202,7 +225,9 @@ def recover_batched(mind, *, command_id, workers_stopped):
     exact source version; everything else returns to the queue for a new
     judgment. This operation calls no model and writes no memory of its own.
     """
-    if workers_stopped is not True:
+    with mind.engine.db.connect() as conn:
+        evidence = liveness.checks_enabled(conn, mind.scope.key())
+    if not evidence and workers_stopped is not True:
         raise ValueError("Verify termination of the owning workers first")
     if not command_id:
         raise ValueError("Recovery requires a sourced command")
@@ -213,6 +238,11 @@ def recover_batched(mind, *, command_id, workers_stopped):
         previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
         if previous:
             return json.loads(previous[0])
+        if evidence:
+            # A `batched` child is settled against its parent's committed work. A
+            # parent still under lease may yet commit, so its children are not
+            # orphans yet and this command would decide their fate too early.
+            liveness.refuse_while_appraisal_leased(conn, mind.scope.key())
         parents = {}
         for row in conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.batch_ids') IS NOT NULL", (mind.scope.key(),)).fetchall():
             for child_id in json.loads(row["data"]).get("batch_ids", []):

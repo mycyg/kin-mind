@@ -90,6 +90,10 @@ DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False
             # which is the previous behavior exactly. The last two carry no appraisal section.
             "trait_ledger": True, "behavior_chain": True, "expression_intent": True,
             "next_move_audit": True, "wish_version_review": True, "rest_review_window": True,
+            # Stage 5: a recovery command asks the lease ledger and the process table instead of
+            # believing its caller's `workers_stopped`. Off restores that boolean as the only
+            # check, which is the stage-4 behaviour of all four recovery commands exactly.
+            "liveness_checks": True,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -206,7 +210,8 @@ class MemoryContinuity:
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
                     "chunked_reply_review", "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
-                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds"):
+                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
+                    "liveness_checks"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         with self.engine.db.connect(write=True) as conn:

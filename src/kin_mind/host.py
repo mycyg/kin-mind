@@ -18,6 +18,7 @@ from .context import Contexts
 from .continuity import ConcernChange, ContinuityConfig
 from .exploration import Explorations
 from .exploration_cadence import ExplorationCadence
+from .liveness import checks_enabled, record_alive
 from .memory import MemoryContinuity
 from .state import Mind
 
@@ -406,12 +407,22 @@ def dispatch(config, action, request):
     if action == "settle":
         return mind.settle_contact(**request)
     if action == "recover":
-        # Startup must follow verified termination of the previous service/owned worker.
+        # A start-up used to assume the previous service was gone and interrupt every
+        # running exploration. It asks now: a row is interrupted only when its worker
+        # is provably gone — the pid is dead, the pid became some other process, or
+        # the budget it recorded has run out. Anything it cannot establish is left
+        # running, because a start-up that races a live exploration must lose.
         with engine.db.connect(write=True) as conn:
-            interrupted = conn.execute("SELECT data FROM mind_explorations WHERE scope=? AND state='running'", (mind.scope.key(),)).fetchall()
+            evidence = checks_enabled(conn, mind.scope.key())
+            running = conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state='running'", (mind.scope.key(),)).fetchall()
             current = mind._load(conn)
-            for row in interrupted:
+            interrupted, retained = [], []
+            for row in running:
                 data = json.loads(row["data"])
+                if evidence and record_alive(data.get("liveness")):
+                    retained.append(row["id"])
+                    continue
+                interrupted.append(row["id"])
                 desire = current["desires"].get(data.get("desire_id"))
                 if desire and desire["status"] == "in_progress":
                     desire.update(status="wanted", revision=desire["revision"]+1, updated_at=mind.clock())
@@ -420,10 +431,11 @@ def dispatch(config, action, request):
                 current["updated_at"] = mind.clock()
                 mind._save(conn, current)
                 mind._history(conn, "mind_" + digest([mind.scope.key(), current["revision"]])[:32], current, "exploration-recovery", {"interrupted": len(interrupted)})
-            conn.execute(
-                "UPDATE mind_explorations SET state='interrupted' WHERE scope=? AND state='running'",
-                (mind.scope.key(),),
-            )
+            for identifier in interrupted:
+                conn.execute(
+                    "UPDATE mind_explorations SET state='interrupted' WHERE id=? AND scope=? AND state='running'",
+                    (identifier, mind.scope.key()),
+                )
             attempts = conn.execute(
                 "SELECT id FROM mind_contacts WHERE scope=? AND state='drafting'",
                 (mind.scope.key(),),
@@ -434,7 +446,8 @@ def dispatch(config, action, request):
                 state="canceled",
                 reason="Host restarted before sending",
             )
-        return {"state": "recovered", "canceled_drafts": len(attempts)}
+        return {"state": "recovered", "canceled_drafts": len(attempts),
+                "interrupted_explorations": interrupted, "live_explorations": retained}
     raise ValueError("Unknown host action")
 
 
