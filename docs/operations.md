@@ -89,6 +89,22 @@ The impact list carries identifiers and counts only — never a title and never 
 
 After an apply, check that the state reached `complete`. It does not when another writer moved a claim or a node between the plan and the write: those are listed as refused, the state stays strict, and a second `--apply` retries them against what is stored now. `--undo` reverses the applied steps from the archive, always by writing a new revision, restores the previously installed registry, and skips and lists anything that changed since; a store the migration never touched keeps its empty history and no row is written. Take a backup first, as for any migration.
 
+## Evidence key index
+
+A single underlying event may be appraised once. The record of what has already been scored used to exist only inside the state snapshot of each `affect` history row, so the guard read it by scanning every snapshot ever written — inside the write transaction of every new appraisal. `mind_evidence_keys` holds that one fact on its own, keyed by `(scope, evidence_key)`, with the event and the revision that introduced it. A store written before the table existed fills it once:
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG evidence-keys-backfill
+python -m kin_mind.host --config PRIVATE_CONFIG evidence-keys-backfill --apply
+python -m kin_mind.host --config PRIVATE_CONFIG evidence-keys-verify
+```
+
+`--dry-run` is the default and writes nothing at all, neither the rows nor the cursor; asking for both a dry run and an apply is refused. The backfill walks the `affect` rows oldest first, a batch per write transaction because production has other writers, and inserts each key only if it is not there already: a row that never went through the scoring path carries the key of the row before it, so the row that really introduced a key is the one recorded. Progress is the `cursor` of the `mind_memory_migrations` row named `evidence-keys-v1`, so an interrupted run resumes where it stopped and a finished one can be rerun without reading anything twice. An apply verifies itself when it has finished and reports what it found under `verification`, so its own `state` is `complete` only when the two sides line up.
+
+`evidence-keys-verify` compares the two directions row by row and is read only: forward, every key a history row introduced is in the table against the event and revision that introduced it; backward, every row of the table was introduced by a history row that is still there. `missing` would let evidence be scored twice, `extra` would refuse evidence that never was, and `mismatched` means the table credits the wrong row. Both actions work one scope at a time, the scope the configuration names.
+
+The table is never the only reader. Before it is consulted, a catch-up reads the rows written past the cursor, which is how a period spent on the previous release, or an imported history, cannot leave a hole. Run the backfill once soon after deploying, because a cursor still at zero leaves that first reading to the catch-up, inside the write transaction of whichever appraisal reaches it first. While both `evidence_key_index` and `history_legacy_guard` are on, the guard refuses when either the table or the old scan says it has seen the key, and a disagreement between them is recorded as the `evidence_key_guard_mismatch` metric — with the key digest and which side said what, never any evidence text. Turning `evidence_key_index` off leaves the old scan alone, which is the previous behavior exactly. Turning `history_legacy_guard` off stops paying for that scan and belongs only to a store whose snapshots no longer carry the key, once the two have agreed for long enough to be believed.
+
 ## Contact callbacks
 
 MCP and Python hosts can create, inspect and change source-backed reminders using the [contact task tools](contact-tasks.md). Configure a scoped policy first. Keep `eventmem serve` running for the worker to process due schedules. Model-composed reminder text retains model provenance; revisions and callback receipts distinguish scheduled tasks from delivered messages.

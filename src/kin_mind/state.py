@@ -175,9 +175,14 @@ def project(entry, at):
 class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
+        # What the dedupe guard found while its two records of scored evidence disagreed. It is
+        # carried out of the write rather than written inside it, because such a disagreement is
+        # always a refusal and a refusal takes its own transaction, and the note, back with it.
+        self._guard_mismatches = []
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
+        from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA)
+            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA)
 
     def _load(self, conn):
         row = conn.execute(
@@ -354,9 +359,22 @@ class Mind(Continuity):
                 dumps({"request": payload, "snapshot": state}),
             ),
         )
+        # The one place history is written is the one place the evidence key index hears about it,
+        # so no commit can leave the index behind the row that introduced a key.
+        from .evidence_keys import record as record_evidence_key
+        record_evidence_key(conn, self.scope.key(), state, kind, event_id)
 
     def _mutate(self, request, kind, fn, *, rebase=None):
         payload = request.model_dump() if hasattr(request, "model_dump") else request
+        try:
+            return self._transact(payload, kind, fn, rebase)
+        finally:
+            # Outside the transaction, so a refusal that rolled the write back still leaves the
+            # sign of what the guard disagreed with itself about.
+            from .evidence_keys import flush_mismatches
+            flush_mismatches(self.engine, self._guard_mismatches)
+
+    def _transact(self, payload, kind, fn, rebase):
         with self.engine.db.connect(write=True) as conn:
             from .autonomy_schema import optimized
             # The expected revision is this command's precondition, checked inside run(); it
@@ -572,13 +590,14 @@ class Mind(Continuity):
         unknown = set(request.values) - set(state["dimensions"])
         if unknown:
             raise ValueError("Unknown affective dimension")
-        # A single underlying event cannot be scored again under another command.
+        # A single underlying event cannot be scored again under another command. What has been
+        # scored is kept in its own table now, because the snapshots this used to scan are about to
+        # become patches; until that is finished the old scan still answers beside it, and either
+        # one saying yes is enough to refuse.
+        from .evidence_keys import already_scored
         evidence_key = digest(sorted({(r["source_id"], r["hash"]) for r in refs}))
-        duplicate = conn.execute(
-            "SELECT 1 FROM mind_events WHERE scope=? AND kind='affect' AND json_extract(data,'$.snapshot.last_evidence_key')=? LIMIT 1",
-            (self.scope.key(), evidence_key),
-        ).fetchone()
-        if duplicate:
+        if already_scored(conn, self.scope.key(), evidence_key, at=self.clock(),
+                          deferred=self._guard_mismatches):
             raise Conflict(
                 "This evidence was already appraised; use a source correction or new evidence"
             )
