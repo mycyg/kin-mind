@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 
-from .db import Conflict, Deleted, Missing, digest
+from .db import Conflict, Deleted, Missing, digest, dumps
 from .envelopes import current_message
 from .models import RecordInput, Scope, now
 from .providers import NotConfigured, ProviderError, Providers
@@ -647,3 +647,46 @@ class Worker:
                 ("canceled" if action == "cancel" else "pending", time.time(), jid),
             )
         return {"id": jid, "status": "canceled" if action == "cancel" else "pending"}
+
+    def recover(self, job_ids, *, command_id, target=None):
+        """Requeue failed jobs once, keeping the failure linked to the recovery.
+
+        `control(retry)` answers an operator's click; it drops the error and leaves
+        nothing behind. A derivative recovery needs the opposite bookkeeping: the
+        failed row keeps its identity, the failure moves into `job_recovery`, and a
+        second call for the same batch finds no `failed` row left to touch. Only
+        `failed` rows move, never to `complete`; a job that failed again after an
+        earlier recovery is a new failure and takes a new command id."""
+        if not command_id or not 1 <= len(job_ids) <= 50 or len(set(job_ids)) != len(job_ids):
+            raise ValueError("Recovery requires a sourced command and unique bounded jobs")
+        recovered, skipped = [], []
+        with self.engine.db.connect(write=True) as conn:
+            for jid in job_ids:
+                row = conn.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+                if not row:
+                    raise Missing(jid)
+                if row["state"] != "failed":
+                    skipped.append({"id": jid, "state": row["state"]})
+                    continue
+                payload = json.loads(row["payload"])
+                conn.execute(
+                    "INSERT OR IGNORE INTO job_recovery VALUES(?,?,?,?,?,?,?,?)",
+                    (jid, command_id, row["kind"],
+                     target or dumps(payload),
+                     row["state"], row["error"], row["attempts"], now()),
+                )
+                moved = conn.execute(
+                    "UPDATE jobs SET state='pending',available=?,owner=NULL,lease_until=NULL,fence=fence+1,error=NULL,attempts=0,updated_at=? WHERE id=? AND state='failed'",
+                    (time.time(), now(), jid),
+                ).rowcount
+                if moved:
+                    recovered.append(jid)
+                else:
+                    # Lost the race to another recovery; the audit row above is the
+                    # loser too, so take it back out.
+                    conn.execute(
+                        "DELETE FROM job_recovery WHERE job_id=? AND command_id=?",
+                        (jid, command_id),
+                    )
+                    skipped.append({"id": jid, "state": "changed-during-recovery"})
+        return {"recovered": recovered, "skipped": skipped, "command_id": command_id}

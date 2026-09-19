@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, kind TEXT NOT NULL, unique_
 CREATE INDEX IF NOT EXISTS job_claim ON jobs(state,available,lease_until);
 CREATE TABLE IF NOT EXISTS job_dependencies(job_id TEXT NOT NULL, dependency_id TEXT NOT NULL,
  PRIMARY KEY(job_id,dependency_id));
+CREATE TABLE IF NOT EXISTS job_recovery(job_id TEXT NOT NULL, command_id TEXT NOT NULL,
+ kind TEXT NOT NULL, target TEXT NOT NULL, prev_state TEXT NOT NULL, prev_error TEXT,
+ prev_attempts INTEGER NOT NULL, recovered_at TEXT NOT NULL,
+ PRIMARY KEY(job_id,command_id));
 CREATE TABLE IF NOT EXISTS families(id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL,
  state TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS family_revisions(id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL,
