@@ -9,13 +9,15 @@ held at each revision. So it is built the other way round from the rest: the que
 every step is not "may this proceed" but "is there anything at all to stop for", and every answer
 that is not a plain no stops it.
 
-**The archive comes first.** Before a single row is rewritten, its bytes — every column, verbatim —
-are copied into a separate database file, fsynced, then read back on a fresh connection and compared
-byte for byte with what is still in the store. Only then is that row touched, and only inside a
-transaction that also moves the cursor and rebuilds what it just wrote, so there is no committed
-state in which a row was rewritten and either nobody wrote down that it had been or nobody checked
-that it came out right. The archive is never deleted by any code here, at any point, for any reason;
-`history-restore` reads from it and leaves it exactly where it is.
+**The archive comes first — all of it.** A run is two phases, in the only order they may happen in.
+Phase one copies every row the run will touch — every column, verbatim — into a separate database
+file, fsyncs it, then reads each row back on a fresh connection and compares it byte for byte with
+what is still in the store. Only when the whole target set is archived and verified does the rewrite
+loop run, and the loop refuses any row that phase one did not cover, however that happened. Each
+batch is then rewritten inside a transaction that also moves the cursor and rebuilds what it just
+wrote, so there is no committed state in which a row was rewritten and either nobody wrote down that
+it had been or nobody checked that it came out right. The archive is never deleted by any code here,
+at any point, for any reason; `history-restore` reads from it and leaves it exactly where it is.
 
 What a rewrite does, precisely: `data` becomes what changed since the row before instead of the
 whole document, and **nothing else moves**. Every row stays, every column stays, and `id`, `scope`,
@@ -44,10 +46,21 @@ inferred.
 
 Preconditions, checked on every run and none of them skippable: the store is quiet by the proof in
 `liveness.quiescence` — this is that proof's first real caller — there is a backup of the database
-that can be shown to be of *this* store at *this* revision, there is enough free disk for the backup,
-the archive and the working room, and `meta.history_compaction_active` is set so that the live writer
-refuses to write a revision while this owns the rows. A failed precondition is a refusal that has
-written nothing.
+that can be shown to hold *this* history, there is enough free disk for the backup, the archive and
+the working room, and `meta.history_compaction_active` is set so that the live writer refuses to
+write a revision while this owns the rows. A failed precondition is a refusal that has written
+nothing.
+
+"Shown to hold this history" is literal, and it is not counted. At the start of a run the store is
+surveyed once: one content digest folded over every row's key columns and bytes, and a per-row
+manifest — id, kind, occurred_at and the same sha256 the archive records — of every row the run may
+touch. The manifest is frozen into the run's own progress record; the backup is opened read-only,
+`quick_check`ed and compared against the manifest row by row; and what was trusted — the file's
+hash, size, permissions and name — is written down with it. A file that holds the same number of
+rows between the same endpoints but different bytes is not a backup of this store, however it came
+to be named. And a resumed run checks the backup against the frozen manifest, never against rows
+the run itself has already rewritten: those are the archive's answer, and the two proofs — that the
+fallback is of this store, and that the originals are kept — do not stand in for each other.
 
 The marker is deliberately not self-clearing. A run that stops in the middle leaves it set, and the
 store stays closed to new revisions until someone decides what to do: resume, which is the ordinary
@@ -66,6 +79,7 @@ different claims, and only the second one is the reason this is allowed to run a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -86,11 +100,13 @@ ARCHIVE_STEM = "mind-events-v1"
 # for the same reason, and 0600 like everything else here.
 BACKUP_STEM = "memory-precompaction"
 # Progress, in the table every other resumable migration in this package uses. `cursor` is the
-# revision through which the history is archived and rewritten; those two facts and the rewrite
-# itself are one commit.
+# revision through which the history is rewritten — and therefore archived, because no row is
+# rewritten that the archive does not already hold verified. Cursor and rewrite are one commit.
 MIGRATION = "history-compaction-v1"
-# Rows per batch. Small on purpose: the batch is the unit an interruption can cost, and twenty-five
-# rows of half a megabyte is a write transaction measured in hundreds of milliseconds.
+# Rows per batch. Small on purpose: in the rewrite loop the batch is the unit an interruption can
+# cost, and twenty-five rows of half a megabyte is a write transaction measured in hundreds of
+# milliseconds. The archive phase reads in chunks of the same size, so the copy of the store it
+# holds in memory is never bigger than one batch either.
 BATCH = 25
 # Every n-th row keeps its whole document. Counted in rows, not revisions: the mind's revision has
 # always been allowed to move without a row here, so counting revisions would leave a store with
@@ -247,7 +263,7 @@ def archive_counts(path: Path, scope):
         conn.close()
 
 
-def _archive_batch(path, scope, rows, *, at, started_at, source):
+def _archive_batch(path, scope, rows, *, at, started_at, source, verified=None):
     """Copy originals into the archive verbatim, fsync, and read them back to compare.
 
     `OR IGNORE`, so a row the archive already holds keeps the copy it already has: the first copy
@@ -258,7 +274,10 @@ def _archive_batch(path, scope, rows, *, at, started_at, source):
     page cache can answer for the file, and it is every column, byte for byte. A row that differs is
     either an archive that did not receive what it was handed, or a store whose row has moved since
     the copy was taken — which would mean something other than this has been rewriting history — and
-    neither is a thing to write past."""
+    neither is a thing to write past.
+
+    `verified`, when given, collects the proof per row: its revision to the hash of the bytes the
+    archive was just shown to hold. The rewrite loop accepts no row without one."""
     written = 0
     conn = _archive_connection(path, create=True)
     try:
@@ -290,25 +309,184 @@ def _archive_batch(path, scope, rows, *, at, started_at, source):
                     _refuse("archive-row-differs", revision=row["revision"], column=column)
             if kept["data_sha256"] != digest(kept["data"].encode()):
                 _refuse("archive-digest-differs", revision=row["revision"])
+            if verified is not None:
+                verified[row["revision"]] = kept["data_sha256"]
     finally:
         check.close()
     return written
 
 
+def _archive_target_set(db, path, scope, through, settled, *, at, batch, limit):
+    """Phase one of the two: the whole target set of this run, archived and read-back-verified
+    before the first row is rewritten.
+
+    The target set is every row above the cursor, bounded by `limit` where the operator gave one —
+    exactly the rows this invocation may touch. It is taken in chunks so the copy held in memory is
+    never bigger than one batch; every chunk is committed, fsynced and read back before the next is
+    fetched, and the phase does not return until every target row has been compared.
+
+    Every row is first checked against the manifest the run froze at its start: its columns and its
+    digest must be what was frozen, so a store that moved since — between invocations, past the
+    marker, however — is a stop here, before the archive is asked to hold a row nobody froze.
+
+    What comes back is the coverage proof the rewrite loop checks every row against: revision to
+    the hash of the bytes the archive was verified to hold. A resumed run walks the same phase
+    again: `OR IGNORE` keeps the copies already there and the read-back compares them with the
+    store a second time, so an interruption here costs nothing but the walk.
+
+    `archived` counts rows this invocation copied in; `confirmed` counts the rows it read back out
+    and compared, which on a resumed or repeated run includes the ones that were already there. A
+    run that archived nothing and confirmed everything is a run over a history the archive already
+    holds, and saying so takes both numbers."""
+    entries = settled["manifest"]["rows"]
+    covered, archived, confirmed = {}, 0, 0
+    last = through
+    remaining = None if limit is None else int(limit)
+    while remaining is None or remaining > 0:
+        take = batch if remaining is None else min(batch, remaining)
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,scope,revision,kind,occurred_at,data FROM mind_events"
+                " WHERE scope=? AND revision>? ORDER BY revision LIMIT ?",
+                (scope, last, take)).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            _against_manifest(entries, row)
+        archived += _archive_batch(path, scope, rows, at=at, started_at=settled["started_at"],
+                                   source=Path(db.path).name, verified=covered)
+        confirmed += len(rows)
+        last = rows[-1]["revision"]
+        if remaining is not None:
+            remaining -= len(rows)
+    return covered, archived, confirmed
+
+
+def _against_manifest(entries, row):
+    """The row the run froze is the row the archive may hold. A target row missing from the
+    manifest, or one whose columns no longer match it, means the store moved since the freeze
+    without this run doing the moving — a stop found before anything is copied or rewritten."""
+    entry = entries.get(str(row["revision"]))
+    if entry is None:
+        _refuse("row-not-in-the-run-manifest", revision=row["revision"])
+    for column in ("id", "kind", "occurred_at"):
+        if row[column] != entry[column]:
+            _refuse("row-differs-from-the-run-manifest", revision=row["revision"], column=column)
+    if digest(row["data"].encode()) != entry["data_sha256"]:
+        _refuse("row-differs-from-the-run-manifest", revision=row["revision"], column="data")
+
+
+def _covered(covered, row):
+    """The proof the rewrite loop requires of phase one: this row is in the archive, verified, and
+    its bytes have not moved since.
+
+    A row with no verified archive copy is never rewritten, whatever the reason it is missing —
+    holding the whole set back until every row is covered is the point of running the archive as a
+    phase of its own. A row whose bytes moved since its copy was verified is the same refusal the
+    write guard below would give, found one read earlier."""
+    kept = covered.get(row["revision"])
+    if kept is None:
+        _refuse("row-not-in-verified-archive", revision=row["revision"])
+    if kept != digest(row["data"].encode()):
+        _refuse("row-changed-under-the-rewrite", revision=row["revision"])
+
+
 # --- the backup -----------------------------------------------------------------------------------
 
-def _store_identity(conn, scope):
+def _fold(h, row):
+    """One row into a running digest: its place in the history, its key columns, and the digest of
+    its bytes — the same sha256 the archive records for it. Fixed-width or terminated pieces, so
+    two different rows can never fold to the same bytes."""
+    h.update(row["revision"].to_bytes(8, "big"))
+    for column in ("id", "kind", "occurred_at"):
+        h.update(str(row[column]).encode())
+        h.update(b"\0")
+    h.update(digest(row["data"].encode()).encode())
+
+
+def _store_identity(conn, scope, *, content=True):
     """Which history, at which point, a copy of it is a copy of.
 
-    The history and not the database: how many rows this scope has and where they start and end.
-    Rows here are only ever appended and nothing deletes one, so a copy holding the same three
-    numbers holds the same set of revisions — which is what the fallback has to cover. The
-    database's generation would be stricter and would say nothing more about the history: it moves
-    every time anything at all is written, including a source arriving, which changes no revision."""
-    row = conn.execute(
-        "SELECT COUNT(*) AS held,COALESCE(MIN(revision),0) AS first,COALESCE(MAX(revision),0) AS head"
-        " FROM mind_events WHERE scope=?", (scope,)).fetchone()
-    return {"rows": row["held"], "first": row["first"], "head": row["head"]}
+    The history and not the database: how many rows this scope has, where they start and end, and —
+    with `content` — one digest folded over every row's key columns and bytes, so a copy that holds
+    the same number of rows between the same endpoints but holds different rows is not a copy of
+    this store. Count and endpoints alone were never enough to say that; for a while they were all
+    that was asked. The database's generation would be stricter still and would say nothing more
+    about the history: it moves every time anything at all is written, including a source arriving,
+    which changes no revision.
+
+    Without `content` this is the cheap structural answer. Rows here are only ever appended and
+    nothing deletes one, so count and endpoints still say which set of revisions a copy covers."""
+    if not content:
+        row = conn.execute(
+            "SELECT COUNT(*) AS held,COALESCE(MIN(revision),0) AS first,COALESCE(MAX(revision),0) AS head"
+            " FROM mind_events WHERE scope=?", (scope,)).fetchone()
+        return {"rows": row["held"], "first": row["first"], "head": row["head"]}
+    everything = hashlib.sha256()
+    rows, first, head = 0, 0, 0
+    for row in conn.execute(
+            "SELECT id,revision,kind,occurred_at,data FROM mind_events WHERE scope=?"
+            " ORDER BY revision", (scope,)):
+        rows += 1
+        first = first or row["revision"]
+        head = row["revision"]
+        _fold(everything, row)
+    return {"rows": rows, "first": first, "head": head,
+            "history_sha256": everything.hexdigest()}
+
+
+def _survey(conn, scope, through):
+    """One pass over the history that freezes both halves of a run's record: the store's content
+    identity, and the per-row manifest of the target set — every row above `through`, with each
+    column the rewrite could move and the digest of the bytes it would move them for.
+
+    The manifest is what the backup is verified against, and what the archive phase checks each row
+    against before it copies it: a store that moved since the freeze, however it moved, is a stop
+    found before the first rewrite rather than a surprise found after it."""
+    everything, target = hashlib.sha256(), hashlib.sha256()
+    rows, first, head = 0, 0, 0
+    entries = {}
+    for row in conn.execute(
+            "SELECT id,revision,kind,occurred_at,data FROM mind_events WHERE scope=?"
+            " ORDER BY revision", (scope,)):
+        rows += 1
+        first = first or row["revision"]
+        head = row["revision"]
+        _fold(everything, row)
+        if row["revision"] > through:
+            _fold(target, row)
+            entries[row["revision"]] = {
+                "id": row["id"], "kind": row["kind"], "occurred_at": row["occurred_at"],
+                "data_sha256": digest(row["data"].encode())}
+    return {"identity": {"rows": rows, "first": first, "head": head,
+                         "history_sha256": everything.hexdigest()},
+            "target_sha256": target.hexdigest(), "entries": entries}
+
+
+def _freeze_manifest(survey, scope, through, *, at):
+    """The maintenance object a run is, frozen before the backup is trusted and persisted before
+    the first rewrite. Every later invocation of the same run answers to it.
+
+    `run_id` names the run; `source` is the content identity of the store it started against;
+    `target` says which rows it will touch and `rows` is what each of them held, by column and by
+    digest. A resume never re-derives any of this from the store as it finds it — the store it
+    finds is half the run's own work, and comparing that against the original rows would be
+    unrecoverable by construction."""
+    entries = survey["entries"]
+    revisions = sorted(entries)
+    return {"run_id": digest(
+                f"history-compaction|{scope}|{through}|{at}|{survey['target_sha256']}"
+                .encode())[:16],
+            "scope": scope, "frozen_at": at, "through": through, "source": survey["identity"],
+            "target": {"rows": len(entries), "first": revisions[0] if revisions else None,
+                       "head": revisions[-1] if revisions else None,
+                       "sha256": survey["target_sha256"]},
+            "rows": {str(revision): entries[revision] for revision in revisions}}
+
+
+def _structure(identity):
+    """The shape of a history without its content: which set of revisions a store holds."""
+    return {key: identity[key] for key in ("rows", "first", "head")}
 
 
 def _backup_identity(path: Path, scope):
@@ -353,6 +531,62 @@ def _take_backup(db, path: Path):
     return path
 
 
+def _file_sha256(path: Path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _backup_verify(scope, path: Path, manifest, *, at):
+    """The apply-time proof that the fallback is a copy of this store as the run froze it.
+
+    The file is opened read-only, checked by SQLite's own `quick_check`, and its history compared
+    with the frozen manifest: the content identity first, then every target row's columns against
+    the manifest's own entries, so a disagreement names its revision and column rather than leaving
+    an operator to diff two hashes. What was then trusted is written down — the file's own hash,
+    its size, its permissions — so the basis the run stood on is reviewable afterwards.
+
+    This runs the same whether the file was just taken, was already there, or was named by the
+    operator: a copy nobody verified is a copy nobody has, whoever suggested it. It is compared
+    with the manifest and never with the store as it stands — on a resume the store is half the
+    run's own work, and the backup's job is to be what the run started against."""
+    held = _backup_identity(path, scope)
+    if held != manifest["source"]:
+        _refuse("backup-is-not-of-this-store", backup=held, store=manifest["source"])
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            problems = [row[0] for row in conn.execute("PRAGMA quick_check")]
+        except sqlite3.DatabaseError as error:
+            _refuse("backup-fails-integrity-check", backup=path.name, detail=str(error))
+        if problems != ["ok"]:
+            _refuse("backup-fails-integrity-check", backup=path.name, detail=problems[:3])
+        entries, found = manifest["rows"], set()
+        for row in conn.execute(
+                "SELECT id,revision,kind,occurred_at,data FROM mind_events WHERE scope=?"
+                " AND revision>? ORDER BY revision", (scope, manifest["through"])):
+            entry = entries.get(str(row["revision"]))
+            if entry is None:
+                _refuse("backup-row-not-in-the-manifest", revision=row["revision"])
+            for column in ("id", "kind", "occurred_at"):
+                if row[column] != entry[column]:
+                    _refuse("backup-row-differs", revision=row["revision"], column=column)
+            if digest(row["data"].encode()) != entry["data_sha256"]:
+                _refuse("backup-row-differs", revision=row["revision"], column="data")
+            found.add(row["revision"])
+        missing = sorted(int(revision) for revision in entries if int(revision) not in found)
+        if missing:
+            _refuse("backup-row-missing", revision=missing[0])
+    finally:
+        conn.close()
+    stat = path.stat()
+    return {"name": path.name, "sha256": _file_sha256(path), "bytes": stat.st_size,
+            "mode": oct(stat.st_mode & 0o777), "verified_at": at}
+
+
 # --- the preconditions ------------------------------------------------------------------------------
 
 def _disk_check(db, *, backup_bytes, archive_bytes):
@@ -367,9 +601,11 @@ def _backup_check(db, scope, path: Path, identity, *, take):
     """Whether there is a copy of this history, of what it holds now, to fall back to.
 
     Freshness is not an age. A backup is fresh when it holds the same history rows, between the same
-    first and last revision, as the store it would stand in for — which is checkable, and which an
-    mtime is not. A quiet store's history does not move, so one taken at the start of a run is still
-    fresh for every batch of it, including the batches a later invocation runs.
+    first and last revision, *with the same bytes row for row* — the identity compared here carries
+    the content digest, so same shape with different rows is not a match. A quiet store's history
+    does not move, so one taken at the start of a run is still fresh for every batch of it,
+    including the batches a later invocation runs — and a resumed run passes the identity its
+    manifest froze, not the store as it stands half-rewritten.
 
     `take` is false when the operator named the file. Then a copy that is of something else is a
     refusal and never quietly replaced: they meant that file. Left to itself this names the file
@@ -397,20 +633,23 @@ def _quiet_check(mind, config):
             "blocking": [entry["reason"] for entry in verdict["blocking"]]}
 
 
-def preconditions(mind, config, *, scope, backup: Path, take_backup, archive_bytes):
+def preconditions(mind, config, *, scope, backup: Path, take_backup, archive_bytes, identity):
     """Everything that has to be true, every run, in the order that costs least to ask.
 
     Quiescence first, because a running host is the common answer and the cheapest to get. The
     backup's identity next, because it reads the store. Disk last, because how much is needed
-    depends on whether a backup has to be taken."""
+    depends on whether a backup has to be taken.
+
+    `identity` is the caller's choice of what the backup must answer to: the store as it stands for
+    a fresh run, the frozen manifest's source identity for a resumed one — so the dry run and the
+    apply of the same invocation report and enforce the same verdict."""
     db = mind.engine.db
     checks = [_quiet_check(mind, config)]
     with db.connect() as conn:
         present = _has_migrations(conn)
-        checks.append({"check": "cursor", "ready": present,
-                       "reason": "migration-table-present" if present else "no-migration-table"})
-        identity = _store_identity(conn, scope) if present else None
-    if identity is None:
+    checks.append({"check": "cursor", "ready": present,
+                   "reason": "migration-table-present" if present else "no-migration-table"})
+    if not present:
         return checks
     held = _backup_check(db, scope, backup, identity, take=take_backup)
     checks.append(held)
@@ -423,7 +662,8 @@ def _require(checks):
     for check in checks:
         if not check["ready"]:
             _refuse(check["reason"], check=check["check"], blocking=check.get("blocking"),
-                    free=check.get("free"), needed=check.get("needed"))
+                    free=check.get("free"), needed=check.get("needed"),
+                    backup=check.get("backup"), store=check.get("store"))
 
 
 # --- what shape each row keeps ------------------------------------------------------------------------
@@ -644,12 +884,17 @@ def _archive_file(db, stored, at) -> Path:
 
 
 def _backup_file(db, identity, at, given) -> Path:
-    """Where the fallback copy lives. Named after the history it is a copy of, so a run that finds
-    the history has moved on since the last one takes a new copy under a new name rather than
-    writing over the one that is there. Nothing here replaces a backup and nothing removes one."""
+    """Where the fallback copy lives. Named after the history it is a copy of — its endpoint, its
+    row count and the first bytes of its content digest — so a run that finds the history has moved
+    on, or that finds rows changed in place under the same shape, takes a new copy under a new name
+    rather than writing over the one that is there or, worse, taking the one that is there as its
+    own. Nothing here replaces a backup and nothing removes one."""
     if given:
         return Path(given).expanduser()
-    return archive_dir(db) / f"{BACKUP_STEM}-{_day(at)}-r{identity['head']}n{identity['rows']}.sqlite3"
+    digest12 = (identity.get("history_sha256") or "")[:12]
+    suffix = f"-{digest12}" if digest12 else ""
+    return archive_dir(db) / (
+        f"{BACKUP_STEM}-{_day(at)}-r{identity['head']}n{identity['rows']}{suffix}.sqlite3")
 
 
 @command("history-compact", config=True)
@@ -661,14 +906,22 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
     the saving on one batch's worth of real patches — so what an operator reads before deciding is
     the decision the run will make and not a description of it.
 
-    With `apply`, a failed precondition is a refusal that has written nothing. Past that the work is
-    one batch at a time: archive, fsync, compare byte for byte, then one transaction that rewrites
-    the rows, rebuilds what it wrote, compares each rebuild with the original text and moves the
-    cursor. `limit` stops after that many rows, for an operator who wants to watch the first batch
-    before committing to the rest; the cursor makes the next invocation carry on from there.
+    With `apply`, a failed precondition is a refusal that has written nothing. Past that the run
+    freezes its manifest — the store's content identity, and for every row it may touch the columns
+    and the digest of the bytes it starts from — proves the backup against it (opened read-only,
+    `quick_check`ed, compared row by row, its own hash and permissions recorded), and only then runs
+    two phases: first the whole target set is archived, fsynced and read back byte for byte, and
+    once every one of those rows is verified in the archive the rewrite loop runs, one batch at a
+    time: one transaction that rewrites the rows, rebuilds what it wrote, compares each rebuild with
+    the original text and moves the cursor. `limit` stops after that many rows, for an operator who
+    wants to watch the first batch before committing to the rest; the cursor makes the next
+    invocation carry on from there.
 
-    Resumable and idempotent. The cursor and the rewrite commit together, so an interrupted run has
-    either done a batch or not done it, and a row already in the new format is passed over."""
+    Resumable and idempotent. The manifest is frozen once and answered to thereafter — a resume
+    verifies the backup against what the run started against, never against rows the run itself has
+    already rewritten — the archive phase repeats without harm, the cursor and the rewrite commit
+    together, so an interrupted run has either done a batch or not done it, and a row already in
+    the new format is passed over."""
     scope, at = mind.scope.key(), mind.clock()
     db, batch = mind.engine.db, max(1, min(200, int(batch)))
     with db.connect() as conn:
@@ -676,12 +929,37 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
         remaining = conn.execute(
             "SELECT COALESCE(SUM(LENGTH(data)),0) FROM mind_events WHERE scope=? AND revision>?",
             (scope, stored["through"])).fetchone()[0]
-        identity = _store_identity(conn, scope) if _has_migrations(conn) else {"head": 0, "rows": 0}
-    head = identity["head"]
+        present = _has_migrations(conn)
+        # A run that froze its manifest and has not finished is the same run, resumed: the backup
+        # and the rows answer to the manifest, never to the store as it stands half-rewritten. One
+        # that froze and died before the marker went on and before anything was rewritten, in a
+        # store that has legitimately moved since, never began — what is true now is what freezes.
+        manifest = stored.get("manifest") if present else None
+        resuming = manifest is not None and not stored.get("finished_at")
+        moved = False
+        if resuming:
+            current = _store_identity(conn, scope, content=False)
+            moved = _structure(current) != _structure(manifest["source"])
+            if moved and "counts" not in stored:
+                manifest, resuming, moved = None, False, False
+        survey = _survey(conn, scope, stored["through"]) if present and not resuming else None
+        if resuming:
+            identity, head = manifest["source"], current["head"]
+        elif survey:
+            identity, head = survey["identity"], survey["identity"]["head"]
+        else:
+            identity, head = {"rows": 0, "first": 0, "head": 0, "history_sha256": ""}, 0
     path = _archive_file(db, stored, at)
-    backup_path = _backup_file(db, identity, at, backup)
+    if resuming and not backup:
+        backup_path = archive_dir(db) / stored["backup"]
+    else:
+        backup_path = _backup_file(db, identity, at, backup)
     checks = preconditions(mind, config, scope=scope, backup=backup_path,
-                           take_backup=backup is None, archive_bytes=remaining)
+                           take_backup=backup is None, archive_bytes=remaining, identity=identity)
+    if resuming:
+        checks.append({"check": "history", "ready": not moved,
+                       "reason": "history-moved-since-the-run-started" if moved
+                       else "history-matches-the-run-manifest"})
     if not apply:
         return {"state": "dry-run", "scope": scope,
                 "ready": all(check["ready"] for check in checks), "preconditions": checks,
@@ -690,13 +968,19 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
                 **_estimate(db, scope, stored, shapes, remaining)}
 
     _require(checks)
+    if not resuming:
+        manifest = _freeze_manifest(survey, scope, stored["through"], at=at)
     if not backup_path.exists():
         _take_backup(db, backup_path)
-    # The backup is read back and checked against the history it was taken from, whether it was
-    # just taken or was already there. A copy nobody read back is a copy nobody has.
-    _require([_backup_check(db, scope, backup_path, identity, take=False)])
+    # Whether it was just taken, was already there, or was named by the operator, the backup is
+    # opened and proven against the frozen manifest before the run starts — and what was trusted
+    # is written into the run's own record, so the basis it stood on is reviewable afterwards.
+    verification = _backup_verify(scope, backup_path, manifest, at=at)
     settled = {"archive": path.name, "backup": backup_path.name,
-               "started_at": stored.get("started_at") or at, "updated_at": at}
+               "started_at": stored.get("started_at") or at, "updated_at": at,
+               "manifest": manifest, "backup_verified": verification}
+    with db.connect(write=True) as conn:
+        _record(conn, scope, stored["through"], settled)
     _set_marker(db, True)
     return _run(mind, scope, at, path, shapes, settled, batch=batch, limit=limit, head=head)
 
@@ -760,10 +1044,21 @@ def _counted(whole):
 
 
 def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
+    """The two phases, in the only order they may happen in.
+
+    Phase one archives and read-back-verifies the whole target set before anything moves, checking
+    each row against the frozen manifest as it goes. Phase two is the batch rewrite loop, which
+    accepts no row phase one did not cover: every row it reads is checked against the coverage
+    proof before it is prepared, so there is no committed state in which a row was rewritten
+    without a verified archive copy of what it held."""
     db = mind.engine.db
     done = {"rewritten": 0, "checkpoints": 0, "patched": 0, "passed_over": 0, "archived": 0,
             "archive_confirmed": 0, "bytes_before": 0, "bytes_after": 0}
     reasons, stopped = {}, None
+    with db.connect() as conn:
+        through = progress(conn, scope)["through"]
+    covered, done["archived"], done["archive_confirmed"] = _archive_target_set(
+        db, path, scope, through, settled, at=at, batch=batch, limit=limit)
     while True:
         # `limit` bounds the rows an invocation touches, not only the batches it runs, so an
         # operator who asked to see three rows before committing to the rest sees three.
@@ -782,6 +1077,7 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
             carried = _carry(conn, scope, through) if through else None
             prepared, landed = [], []
             for row in rows:
+                _covered(covered, row)
                 data = _parse(row["data"])
                 if data is not None and _new_format(data):
                     # Already the shape this produces. It is archived like every other row and then
@@ -797,15 +1093,8 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
                 for reason in fired:
                     reasons[reason] = reasons.get(reason, 0) + 1
 
-        # `archived` counts rows this invocation copied in; `archive_confirmed` counts the rows it
-        # read back out and compared, which on a resumed or repeated run includes the ones that
-        # were already there. A run that archived nothing and confirmed everything is a run over a
-        # history the archive already holds, and saying so takes both numbers.
-        done["archived"] += _archive_batch(path, scope, rows, at=at,
-                                           started_at=settled["started_at"],
-                                           source=Path(db.path).name)
-        done["archive_confirmed"] += len(rows)
-
+        # No per-batch archive here: phase one already holds every row this loop may touch, and
+        # `_covered` has just proved it of each row in this batch.
         with db.connect(write=True) as conn:
             for row, text, shape in prepared:
                 if text is None:
@@ -835,9 +1124,17 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
     # happened to land on the end finished the history, and the store is opened again for it.
     complete = through >= head
     if complete:
+        # The run's record is closed with what it did and when it finished: `finished_at` is what
+        # tells the next invocation that this manifest belongs to a completed run, and that a new
+        # run freezes its own.
+        with db.connect(write=True) as conn:
+            _record(conn, scope, through,
+                    {**settled, "updated_at": at, "counts": dict(done), "finished_at": at})
         _set_marker(db, False)
     return {"state": "complete" if complete else "stopped", "scope": scope,
             "cursor": through, "head": head, "archive": path.name, "backup": settled["backup"],
+            "run_id": settled["manifest"]["run_id"],
+            "backup_verified": settled["backup_verified"],
             "stopped_because": None if complete else stopped, "whole_reasons": reasons,
             "compaction_active": not complete,
             "rows": shapes["rows"], "already_new_format": shapes["already_new_format"],
