@@ -1,7 +1,48 @@
+const FAILURE_CATEGORIES=new Set(['contract','model-unavailable','source-changed','semantic-hold','model-output','unknown','delivery-uncertain','host-runtime']);
+const RETRY_CONDITIONS=new Set(['repair-input','backoff','source-change','deepseek-decision','reconcile','none']);
+const staticToken=(value,fallback)=>{value=String(value??'');return /^[A-Za-z0-9_.:-]{1,96}$/.test(value)?value:fallback;};
+const safeReceipt=(record,depth=0)=>{
+  if(!record||typeof record!=='object'||Array.isArray(record)||depth>2)return undefined;
+  const value={};
+  for(const key of ['provider','model','reasoning','purpose','request_id','outcome','usage_status','verified_at'])
+    if(typeof record[key]==='string'&&record[key].length<=200)value[key]=record[key];
+  for(const key of ['elapsed_ms','model_requests'])if(Number.isFinite(record[key])&&record[key]>=0)value[key]=record[key];
+  if(typeof record.cache_hit==='boolean')value.cache_hit=record.cache_hit;
+  if(record.usage===null)value.usage=null;
+  else if(record.usage&&typeof record.usage==='object'&&!Array.isArray(record.usage)) {
+    const usage=Object.fromEntries(Object.entries(record.usage).filter(([key,amount])=>/^[A-Za-z0-9_.:-]{1,64}$/.test(key)&&Number.isFinite(amount)&&amount>=0));
+    if(Object.keys(usage).length)value.usage=usage;
+  }
+  if(Array.isArray(record.chunks))value.chunks=record.chunks.slice(0,16).map(item=>safeReceipt(item,depth+1)).filter(Boolean);
+  if(record.schema_repair&&typeof record.schema_repair==='object') {
+    const repair={};
+    if(Number.isSafeInteger(record.schema_repair.attempts)&&record.schema_repair.attempts>=0)repair.attempts=record.schema_repair.attempts;
+    const rejected=safeReceipt(record.schema_repair.rejected_call,depth+1);if(rejected)repair.rejected_call=rejected;
+    if(Object.keys(repair).length)value.schema_repair=repair;
+  }
+  return Object.keys(value).length?value:undefined;
+};
+function failure(record={},fallback={}) {
+  const supplied=record?.failure&&typeof record.failure==='object'?record.failure:record;
+  const rawCode=supplied?.code??record?.code??record?.message;
+  const code=staticToken(rawCode,fallback.code??'contact-host-unclassified');
+  let category=FAILURE_CATEGORIES.has(supplied?.category)?supplied.category:fallback.category??'unknown';
+  let stage=staticToken(supplied?.stage,fallback.stage??'contact-host');
+  let retry=supplied?.retry_condition??supplied?.retryCondition??fallback.retry_condition??'backoff';
+  if(code==='contact-draft-invalid-result'){category='model-output';stage='contact-draft-format';retry='deepseek-decision';}
+  else if(/^deepseek-(timeout|network-error|http-|key-unavailable|background-capacity|foreground-priority)/.test(code)){category='model-unavailable';stage='contact-draft-execution';retry='backoff';}
+  else if(/^deepseek-(missing-structured-result|incomplete-or-unverified)/.test(code)){category='model-output';stage='contact-draft-format';retry='deepseek-decision';}
+  const retry_condition=RETRY_CONDITIONS.has(retry)?retry:'backoff';
+  const receipt=safeReceipt(supplied?.model_receipt??supplied?.modelReceipt??record?.receipt);
+  const model_invoked=typeof supplied?.model_invoked==='boolean'?supplied.model_invoked:undefined;
+  return {category,stage,code,retry_condition,...(model_invoked===undefined?{}:{model_invoked}),...(receipt?{model_receipt:receipt}:{})};
+}
+
 /** Single-session host orchestration. Each dependency is owner-bound by the adapter. */
 export class MindLoop {
-  constructor({call, eligibility, ownerEpoch, isBusy, draft, send, resume, recordStatus, stopExploration}) {
-    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,resume,recordStatus,stopExploration});
+  constructor({call, eligibility, ownerEpoch, isBusy, draft, send, resume, recordStatus, stopExploration,
+    withHostContext=(_context,run)=>run()}) {
+    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,resume,recordStatus,stopExploration,withHostContext});
     this.closed=false; this.contactRunning=false; this.reviewRunning=false;
   }
   start() {
@@ -36,7 +77,7 @@ export class MindLoop {
   async tick() {
     let result;
     try { result=await this.contactTick(); }
-    catch { result={state:'failed',reason:'contact-host-error'}; }
+    catch(error) { result={state:'failed',reason:'contact-host-error',failure:failure(error,{category:'host-runtime',stage:'contact-host',code:'contact-host-error'})}; }
     try { this.recordStatus?.({contact:{...result,checkedAt:new Date().toISOString()}}); } catch {}
     return result;
   }
@@ -54,7 +95,24 @@ export class MindLoop {
           const settled=await this.call('settle',{attempt_id:candidate.attempt_id,state:'accepted',message_id:receipt.messageId,message_ids:receipt.messageIds,partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles});
           void this.review();return settled;
         }
-        if(receipt?.state==='canceled')return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:{action:'abandon',reason:'A new owner turn superseded the unsent draft'}});
+        if(receipt?.state==='needs-review') {
+          if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
+            reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});
+          return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'Review failure crossed the send boundary; reconcile only',
+            failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-review-release-unproven',retry_condition:'reconcile'}});
+        }
+        if(receipt?.state==='canceled') {
+          if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
+            if(candidate.owner_epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
+              reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
+            if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
+              attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
+            return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
+              failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
+          }
+          return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'A possible send has a terminal receipt; reconciliation is required',
+            failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-delivery-canceled-after-boundary',retry_condition:'reconcile'}});
+        }
         return {...candidate,delivery:receipt};
       }
       if(!candidate.eligible)return candidate;
@@ -64,11 +122,15 @@ export class MindLoop {
       if(attempt.state!=='drafting')return attempt;
       let decision;
       try {
-        const result=await this.draft(attempt);
+        const result=await this.withHostContext({kind:'contact-draft',operation_id:attempt.id,lane:'background'},()=>this.draft(attempt));
         decision=typeof result==='string'?{action:'send',text:result}:result??{action:'wait',condition:'new_evidence',reason:'Legacy empty draft'};
         if(!['send','wait','abandon'].includes(decision.action))throw Error('contact-draft-invalid-result');
-      } catch {
-        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:!this.closed&&epoch===this.ownerEpoch()?'draft-failed':'Draft or delivery conditions changed'});
+      } catch(error) {
+        const current=!this.closed&&epoch===this.ownerEpoch();
+        const detail=failure(error,{stage:'contact-draft-execution',code:'contact-draft-execution-failed'});
+        const sourceMoved=current&&detail.category==='source-changed'&&detail.model_invoked===false;
+        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:current?(sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
+          ...(current?{failure:detail}:{})});
       }
       const content=decision.action==='send'?decision.text:null;
       const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch()});
@@ -76,7 +138,8 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});
       }
       if(decision.action!=='send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision});
-      if(typeof content!=='string'||!content.trim())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed'});
+      if(typeof content!=='string'||!content.trim())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
+        failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision'})});
       await this.call('settle',{attempt_id:attempt.id,state:'pending'});
       // Recheck after the durable write. Any ambiguity remains held, never retried.
       if(this.closed||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
@@ -85,16 +148,36 @@ export class MindLoop {
       possibleSend=true;
       const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files:attempt.desire?.delivery_artifacts??[],
         guard:()=>!this.closed&&!this.isBusy()&&this.eligibility().eligible&&epoch===this.ownerEpoch()});
-      if(receipt.state==='canceled')return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,decision:{action:'abandon',reason:receipt.reason??'The referenced content was already shared'}});
-      if(receipt.state==='pending')return {state:'pending',attempt_id:attempt.id,reason:receipt.reason??'Share review remains pending'};
+      if(receipt.state==='needs-review') {
+        if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
+          reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});
+        return this.call('settle',{attempt_id:attempt.id,state:'unconfirmed',reason:'Review failure crossed the send boundary; reconcile only',
+          failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-review-release-unproven',retry_condition:'reconcile'}});
+      }
+      if(receipt.state==='canceled') {
+        if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
+          if(epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
+            reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
+          if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
+            attempt_id:attempt.id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
+          return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
+            failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
+        }
+        return this.call('settle',{attempt_id:attempt.id,state:'unconfirmed',reason:'A possible send has a terminal receipt; reconciliation is required',
+          failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-delivery-canceled-after-boundary',retry_condition:'reconcile'}});
+      }
+      if(receipt.state==='pending')return {state:'pending',attempt_id:attempt.id,reason:receipt.reason??'Share review remains pending',...(receipt.failure?{failure:receipt.failure}:{})};
       const state=receipt.state==='accepted'&&receipt.messageId?'accepted':'unconfirmed';
       const settled=await this.call('settle',{attempt_id:attempt.id,state,message_id:receipt.messageId,message_ids:receipt.messageIds,
+                                      partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles,
                                       reason:state==='accepted'?'Platform accepted; phone read unverified':'Receipt requires reconciliation'});
       if(state==='accepted')void this.review();
       return settled;
-    } catch {
+    } catch(error) {
       if(attempt) {
-        try {return await this.call('settle',{attempt_id:attempt.id,state:possibleSend?'unconfirmed':'canceled',reason:'Host action failed'});}
+        try {return await this.call('settle',{attempt_id:attempt.id,state:possibleSend?'unconfirmed':'canceled',reason:'Host action failed',
+          failure:failure(error,{category:possibleSend?'delivery-uncertain':'host-runtime',stage:possibleSend?'contact-delivery':'contact-host',
+            code:'contact-host-action-failed',retry_condition:possibleSend?'reconcile':'backoff'})});}
         catch {this.recordStatus?.({contact:{state:'unconfirmed',id:attempt.id}});}
       }
       return {state:'failed',reason:'contact-host-error'};

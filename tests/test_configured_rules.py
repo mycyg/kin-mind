@@ -362,6 +362,15 @@ def test_the_prompt_states_what_a_method_candidate_may_rest_on():
     assert "procedure_candidates 留空" in SYSTEM
 
 
+def test_chat_voice_prefers_one_bubble_without_turning_frequency_into_a_timer():
+    assert "wish-review请求你确认一个已有联系或探索意图" in SYSTEM
+    assert "不把contact误解成explore" in SYSTEM
+    assert "优先用一个简短完整的气泡说完" in SYSTEM
+    assert "不设单气泡或字数硬限制" in SYSTEM
+    assert "不是机械抬分、固定间隔或定时必发" in SYSTEM
+    assert "通常每句话20字以内" not in SYSTEM
+
+
 def test_a_verified_result_resolves_by_the_id_the_model_was_shown(system):
     mind, memory, _, _ = system
     memory.ingest({"id": "host-task-7", "kind": "task-result", "at": mind.clock(), "task_id": "task-7",

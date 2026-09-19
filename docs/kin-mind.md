@@ -286,10 +286,13 @@ deterministic operation survives restart and never creates evidence or scores.
 Expired or corrected sources cannot resume. Every attempted draft still passes
 the existing send-boundary checks after a condition becomes ready.
 
-Invalid JSON and generation errors are technical failures, distinct from a valid
-decision to wait. Failed drafts retry after five and ten minutes; the third failure
-waits for new evidence. An uncertain send remains held and is never converted into
-a retryable draft error. Contact status exposes the last check and blocking reason.
+Invalid JSON, invalid structure, empty output and model execution errors are distinct
+technical stages, separate from a valid decision to wait. Their contact receipt keeps
+only a static category/code, retry condition and redacted model accounting. Failed
+drafts retry after five and ten minutes; the third failure waits for new evidence. A
+source change proven before model execution is reviewed without incrementing the bad-
+draft counter. An uncertain send remains held and is never converted into a retryable
+draft error. Contact status exposes the last check and blocking reason.
 Wishes already addressed in ordinary dialogue are retired without inventing a
 proactive delivery receipt.
 
@@ -350,10 +353,15 @@ Exploration wishes supplied through another tool are reviewed by DeepSeek before
 execution. The original shared conversation generates outreach only after its
 actual DeepSeek model is verified; active work defers it without changing GPT.
 
-`createContactBatch` freezes text and per-bubble IDs before sending. A restart
-reuses accepted receipts, reconciles uncertain bubbles, and only then sends the
-unsent remainder. The same paragraph splitter serves ordinary and proactive chat;
-it preserves fenced code, words and links rather than truncating them to fit.
+`createContactBatch` freezes text, one review ID per bubble, its bubble index and each
+transport ID before review or sending. The per-bubble review ID is used consistently
+by review, reservations, references and delivery; a fragmented transport still keeps
+the original bubble identity. A restart reuses accepted receipts, reconciles uncertain
+bubbles, and only then sends the unsent remainder. A legacy wholly-unsent batch adopts
+its already-stable item IDs; a legacy batch already reviewed or exposed keeps its old
+group review identity. The migration is written before any review or transport call.
+The same paragraph splitter serves ordinary and proactive chat; it preserves fenced
+code, words and links rather than truncating them to fit.
 
 The draft is persisted before anything is exposed, and the whole group is then
 reviewed once, before its first bubble leaves: released, held with a visible
@@ -362,12 +370,25 @@ to a single bubble, so a refusal cancels every bubble that was never exposed
 under one reason and keeps that reason on the finished batch; what was already
 sent stays sent. The verdict is persisted with the batch, so a group that has
 been reviewed is never charged for a second review and a group that has begun is
-never cut again. A hold that spent a model call is asked again a bounded number
-of times with a doubling wait, and after that the group is refused under
-`contact-review-held-too-long` rather than held for ever; a verdict that judged
-nothing because the reviewer was never reached backs off the same way but spends
-none of those tries, and the eligibility, guard and local file checks cost
-nothing at all.
+never cut again. The returned `checked` list must contain exactly the requested IDs
+in the same order, with nonempty string bodies and reference arrays, before any
+reviewed body is accepted. A null or malformed verdict is a deterministic contract
+failure, never an exception that crosses the send boundary. Transport IDs are also
+globally unique across text and file items; an invalid legacy journal is parked before
+receipt lookup, review, file verification or delivery. Semantic holds and review
+infrastructure failures have separate finite budgets and a doubling wait. Exhaustion,
+a deterministic contract fault, or changed source parks a wholly-unsent group as
+`needs-review`; it does not pretend DeepSeek abandoned the content. Only after that
+state is durable may the owner host release the active contact slot and queue the wish
+for a fresh DeepSeek continue/rewrite/abandon decision. A transport retry budget may
+use the same release only when every item durably records a terminal `never-started`
+receipt. A pending or unknown send can never use it and remains reconciliation-only.
+If a new owner turn supersedes a wholly-unsent attempt, the host releases that attempt
+as a source change and queues the still-valid wish for DeepSeek review; it does not
+invent an `abandon` decision. A semantic whole-group refusal carries the actual review
+decision through the batch receipt, so only that decision can retire the wish.
+Quiet hours, eligibility, the owner epoch guard and free local checks spend neither
+budget.
 
 Freezing is also where a body too long for the channel is cut, using the same
 fragment rule and the same transport identities as a phone reply, so each

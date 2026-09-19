@@ -294,7 +294,9 @@ flow; voluntary exploration and invitations use the proactive contact flow.
 `read_affective_state` adds `exploration_decisions`; its concerns expose
 `owner_request`. Host `read` also returns `exploration_capabilities`. Both channels
 use the same committed state and bounded expression projection. Normal chat and
-proactive messages use 1–4 natural bubbles, with usually short, complete sentences.
+ordinary proactive messages prefer one short, complete bubble; genuine pauses,
+emotional turns, deeper discussion, work, analysis and delivery may use more.
+This is voice guidance, not a transport limit or lossy text splitter.
 
 Synthetic tests cover share/defer/keep, restart and duplicate events, transactional
 rollback, source correction, request follow-up, resource identity, credential

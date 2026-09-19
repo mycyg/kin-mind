@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {deepseekRequest, responseNormalizer, startDeepSeekGateway, startExplorationGateway,
-  startComputerActionReviewGateway, replyContract, continuityContract, explorationContract,
+  startComputerActionReviewGateway, replyContract, contactDraftContract, continuityContract, explorationContract,
   computerActionReviewContract, computerActionReviewSchema, nativeTurnPurpose,
   flattenExplorationTools, GATEWAY_PROFILES} from './deepseek-gateway.mjs';
 import {createLeaseClient} from './model-lease.mjs';
@@ -152,7 +152,11 @@ test('purpose profiles are host-bound contracts, never request-declared', () => 
   assert.equal(deepseekRequest({model:'deepseek-flash',input:[event]}, 'high', 'exploration').instructions, explorationContract);
   assert.equal(deepseekRequest({model:'deepseek-flash',input:[event]}).instructions, continuityContract);
   assert.equal(deepseekRequest(body, 'high', 'chat').instructions, replyContract);
-  assert.equal(deepseekRequest(body, 'high', 'contact-draft').instructions, replyContract);
+  assert.equal(deepseekRequest(body, 'high', 'contact-draft').instructions, contactDraftContract);
+  assert.match(contactDraftContract,/exactly one structured JSON decision/);
+  assert.match(contactDraftContract,/read-only memory tools remain available/);
+  assert.match(contactDraftContract,/"action":"send"/);
+  assert.ok(!contactDraftContract.startsWith(replyContract));
   assert.equal(deepseekRequest(body, 'high', 'continuity-check').instructions, continuityContract);
   const review=deepseekRequest(body, 'high', 'computer-action-review');
   assert.equal(review.instructions,computerActionReviewContract);
@@ -160,6 +164,17 @@ test('purpose profiles are host-bound contracts, never request-declared', () => 
   assert.equal(review.text.format.strict,true);
   assert.throws(() => deepseekRequest(body, 'high', 'owner-asserted'), /unknown-gateway-profile/);
   assert.deepEqual(GATEWAY_PROFILES.exploration, {lane:'background', purpose:'native-exploration', contract:explorationContract});
+});
+
+test('trusted dynamic contact attribution selects the structured draft contract and background usage together',async()=>{
+  const forwarded=[],usage=[];
+  const gateway=await startDeepSeekGateway({key:'synthetic-secret',purposeFor:()=>nativeTurnPurpose('contact-draft'),onUsage:row=>usage.push(row),
+    fetchImpl:async(_url,options)=>{forwarded.push(JSON.parse(options.body));return new Response(JSON.stringify({id:'draft-call',model:'deepseek-flash',usage:{input_tokens:9},output:[]}),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    assert.equal((await turn(gateway,{model:'deepseek-flash',input:[{type:'message',role:'user',content:'untrusted body'}]})).status,200);
+    assert.equal(forwarded[0].instructions,contactDraftContract);
+    assert.deepEqual([usage[0].lane,usage[0].purpose,usage[0].usageStatus],['background','native-contact-draft','reported']);
+  } finally {await gateway.close();}
 });
 
 test('computer action review has a fixed high profile, strict schema and background usage identity', async () => {

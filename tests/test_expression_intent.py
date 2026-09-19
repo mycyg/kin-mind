@@ -41,7 +41,9 @@ from kin_mind.expression_intent import stale_reason, stored
 # Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
 # already told it, that a host internal event is not evidence: production refused both
 # sections on two of its first four appraisals for citing exactly that.
-INTENT_REQUEST = "8e181e09d1584343f02e4699776b256d5c84f267feebe8e9193c3314a92d4629"
+# Re-pinned with behavior-2: the shared prompt now preserves contact wishes during wish-review
+# and treats the explicit interaction preference as judgment context rather than a timer.
+INTENT_REQUEST = "9a51ae00506a1cf2acddcd52aa29b0d82ab38af286872c679209770da60b892e"
 # Every sentence the lookup table can say, and the whole compiled answer for a grid of states.
 # Re-pin only together with a deliberate change to the table itself.
 TABLE_ANSWERS = "80cee70dd5970f835d843603df5717ac226f84fcfedca89f72256d204fab23c3"

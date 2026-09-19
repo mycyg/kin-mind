@@ -46,7 +46,9 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned once more when the intent and the move were told, as the ledger's own paragraph
 # already told it, that a host internal event is not evidence: production refused both
 # sections on two of its first four appraisals for citing exactly that.
-MOVE_REQUEST = "520bce80a6c33347e937a16030aaed663a478ba5ec5477caedafd524a8bd4af7"
+# Re-pinned with behavior-2: the shared prompt now preserves contact wishes during wish-review
+# and treats the explicit interaction preference as judgment context rather than a timer.
+MOVE_REQUEST = "33e2937c5703774eb92a835e9fc99f87e7e888562165eeea2685905bc0886a80"
 MOVE_SECTIONS = ("next_move",)
 
 

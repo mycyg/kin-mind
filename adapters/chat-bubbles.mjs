@@ -11,7 +11,7 @@ export function splitChatText(text) {
   return parts.filter(Boolean);
 }
 
-export const chatVoice = '聊天通常每句话不超过20字，用有情绪的完整口语短句，词语写全。语气词、网络梗和颜文字随语境使用。按自然停顿分气泡，以空行分隔；必要说明可以更长，代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
+export const chatVoice = '普通聊天和主动分享优先用一个简短完整的气泡把意思自然说完；确有停顿、情绪转折或更多内容时再分开，不为了形式机械拆句。深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
 
 /** The internal draft protocol's control envelope, recognised on a normal chat
  * turn's reply body. This shape is how internal draft turns (proactive contact)

@@ -15,6 +15,21 @@ export function registryBinding(file,fallback){return fs.existsSync(file)?read(f
 
 export function currentCheckpoint(state){return state.restorePending&&state.restoreCheckpoint?state.restoreCheckpoint:state.rollingCheckpoint??state.candidate?.checkpoint??state.restoreCheckpoint;}
 
+/** An accepted native append is not safe to expose to a model turn until the
+ * private reply boundary has durably registered the exact source identity.
+ * Keep the public context body and dependency items out of that registry. */
+export function bindAcceptedPrivateContext({bridge,contextToken,source,receipt}) {
+  if(receipt?.state!=='accepted')throw Error('Restore receipt remains unconfirmed');
+  const identity={id:source?.id,marker:source?.marker,text_hash:source?.text_hash,session:source?.session,epoch:source?.epoch};
+  if(!identity.id||!identity.marker||!identity.text_hash||!identity.session||!identity.epoch||
+    receipt.id!==identity.id||receipt.marker!==identity.marker||receipt.text_hash!==identity.text_hash||
+    receipt.session!==identity.session||receipt.epoch!==identity.epoch)
+    throw Error('Restore accepted receipt identity mismatch');
+  if(typeof bridge?.bindPrivateContext!=='function'||bridge.bindPrivateContext(contextToken,identity)!==true)
+    throw Error('Restore private context binding unavailable');
+  return receipt;
+}
+
 export async function loadCandidateSession({client,connection,binding,candidate,cwd,gateway}) {
   client.beginSessionReplay();
   try {await connection.loadSession({sessionId:binding.threadId,cwd,mcpServers:[]});}
@@ -159,7 +174,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.name,checkedAt:new Date().toISOString()}});}
       finally{running=false;}
     },
-    async restoreBeforeDispatch(){
+    async restoreBeforeDispatch(contextToken){
       // Called inside the router's dispatch coordinator; never request DS here.
       // A native auto-compaction can finish between minute ticks and inputs.
       // Reconcile its lifecycle before consulting the current window ledger.
@@ -181,7 +196,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
           budget:checkpointBudget(cp,Math.max(manager.state.config.restoreBudget,router.tasks().length?4000:0)),kind:'restore',manifest_id:cp.id});
         if(prepared.state==='incomplete')throw Error('Restore envelope exceeds budget');
         const receipt=await background.deliver(prepared);
-        if(receipt.state!=='accepted')throw Error('Restore receipt remains unconfirmed');
+        bindAcceptedPrivateContext({bridge,contextToken,source:prepared,receipt});
         manager.state.restoration={id:prepared.id,state:'complete',checkpointId:cp.id,receipt:{state:receipt.state,textHash:receipt.text_hash}};
         manager.state.restorePending=false;manager.state.restoreRequired=false;manager.save('manifest-restore-complete');return;
       }

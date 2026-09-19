@@ -59,9 +59,12 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned for the executor-agnostic exploration wording: the shared prompt no longer names
 # Kimi as the exploration executor (the codex-cli backend reads and researches now). A
 # rewording only — what a check made under the old text meant is unchanged.
+# Re-pinned for the owner-approved one-bubble preference, the sourced semantic
+# proactive-contact preference, and the explicit contact-versus-explore wish
+# review wording.  The history-only lane withholds that live interaction prompt.
 UNCHANGED_REQUEST = {
-    "interaction": "84b8f29db399ad062151b6496c48608bd1f34e91312b5a21352c87208c9e865f",
-    "action": "89083464792ade3bcbb01cfcfa03d90eec2d3159dd40aaf4e4a35f3e99b49800",
+    "interaction": "01ad231129d3e9db06d8513c2c4bfca366a1fa4afd09f943bdc577d757215757",
+    "action": "f0c391e8fb762a5309c13d4c5af932ef7dba09f3ee7ebbac048d851ed1bd5291",
     "history": "b374eb359aee4f49e3a38990e5454c3e6667c76dab6b5f793dbbe677d80783a3",
 }
 

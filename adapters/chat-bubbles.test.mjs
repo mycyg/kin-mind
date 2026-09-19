@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {splitChatText,chatEnvelope} from './chat-bubbles.mjs';
+import {splitChatText,chatEnvelope,chatVoice} from './chat-bubbles.mjs';
+
+test('voice prefers one complete everyday bubble without making it a transport limit',()=>{
+  assert.match(chatVoice,/优先用一个简短完整的气泡/);
+  assert.match(chatVoice,/深度讨论、工作、分析与交付按内容展开/);
+  assert.doesNotMatch(chatVoice,/20字|1[—-]4|1-4/);
+  // Multiple intentional paragraphs remain supported; this preference is not
+  // a lossy splitter or a hard one-bubble protocol constraint.
+  assert.deepEqual(splitChatText('一个完整念头。\n\n内容需要时再分开。'),[
+    '一个完整念头。','内容需要时再分开。'
+  ]);
+});
 
 test('paragraph splitting keeps fences, words and URLs whole',()=>{
   const code='```js\nconst x = 1;\n\nprint(x);\n```';

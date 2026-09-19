@@ -6,7 +6,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {checkpointMarker} from './native-window.mjs';
-import {currentCheckpoint} from './mobile-session-host.mjs';
+import {bindAcceptedPrivateContext,currentCheckpoint} from './mobile-session-host.mjs';
 const hash=t=>createHash('sha256').update(t).digest('hex');
 function system(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-context-test-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -36,4 +36,28 @@ test('active conversation defers optional memory without beginning submission',a
  const host=new NativeContextDelivery({runtime:async()=>({known:true,active:true,threadId:'thread',rolloutPath:'/synthetic'}),
   call:async()=>assert.fail('No injection state may change'),inject:async()=>assert.fail('Must not append')});
  assert.equal((await host.deliver({id:'context',session:'thread'})).state,'deferred');
+});
+
+const acceptedSource=()=>({id:'context:restore',session:'thread',epoch:'epoch-1',marker:'kin-context:context:restore',text_hash:'a'.repeat(64),
+ text:'private body',items:[{id:'private-dependency'}]});
+
+test('accepted restore source is registered before dispatch continues',()=>{
+ const source=acceptedSource(),receipt={...source,state:'accepted'},steps=[];
+ const bridge={bindPrivateContext:(contextToken,identity)=>{steps.push(['bind',contextToken,identity]);return true;}};
+ bindAcceptedPrivateContext({bridge,contextToken:'owner-turn',source,receipt});steps.push(['dispatch']);
+ assert.deepEqual(steps,[['bind','owner-turn',{id:source.id,marker:source.marker,text_hash:source.text_hash,session:source.session,epoch:source.epoch}],['dispatch']]);
+ assert.equal('text' in steps[0][2],false);assert.equal('items' in steps[0][2],false);
+});
+
+test('binding failure blocks dispatch without changing the accepted receipt',()=>{
+ const source=acceptedSource(),receipt={...source,state:'accepted'},before=structuredClone(receipt);
+ assert.throws(()=>bindAcceptedPrivateContext({bridge:{bindPrivateContext:()=>false},contextToken:'owner-turn',source,receipt}),/binding unavailable/);
+ assert.deepEqual(receipt,before);
+});
+
+test('sending and unconfirmed restore states cannot bind as accepted',()=>{
+ const source=acceptedSource();let bindings=0;
+ const bridge={bindPrivateContext:()=>{bindings++;return true;}};
+ for(const state of ['sending','unconfirmed'])assert.throws(()=>bindAcceptedPrivateContext({bridge,contextToken:'owner-turn',source,receipt:{...source,state}}),/remains unconfirmed/);
+ assert.equal(bindings,0);
 });

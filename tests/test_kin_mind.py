@@ -618,6 +618,98 @@ def test_bad_drafts_back_off_and_stop_after_three_attempts(setup):
     assert mind.read()["desires"][0]["contact_failures"] == 3
 
 
+def test_wholly_unsent_review_failure_releases_the_slot_and_asks_ds_what_to_do(setup):
+    mind, source, _clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-review-failure", {"initiative": 95}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=attempt["id"], state="pending")
+    receipt = mind.settle_contact(
+        attempt_id=attempt["id"], state="canceled", reason="contact-review-failed",
+        aborted_before_send=True,
+        failure={"category":"contract", "stage":"contact-review-contract",
+                 "code":"contact-review-response-mismatch", "retry_condition":"repair-input",
+                 "model_invoked":False},
+    )
+    assert receipt["aborted_before_send"] is True
+    assert receipt["failure"]["stage"] == "contact-review-contract"
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "waiting" and desire["contact_review_failures"] == 1
+    assert "contact_failures" not in desire
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,data FROM mind_action_events WHERE kind='wish-review'").fetchone()
+    assert row["state"] == "pending"
+    asked = json.loads(row["data"])
+    assert asked["failure"] == {"category":"contract", "stage":"contact-review-contract",
+                                "code":"contact-review-response-mismatch", "retry_condition":"repair-input",
+                                "model_invoked":False}
+    assert "model_receipt" not in asked["failure"]
+
+
+def test_source_change_before_model_call_is_not_counted_as_a_bad_draft(setup):
+    mind, source, _clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-source-change", {"initiative": 95}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    receipt = mind.settle_contact(
+        attempt_id=attempt["id"], state="canceled", reason="draft-source-changed",
+        failure={"category":"source-changed", "stage":"contact-draft-source",
+                 "code":"contact-context-source-changed", "retry_condition":"source-change",
+                 "model_invoked":False},
+    )
+    assert receipt["failure"]["model_invoked"] is False
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "waiting"
+    assert "contact_failures" not in desire and "contact_review_failures" not in desire
+
+
+def test_owner_change_releases_only_the_unsent_attempt_and_queues_wish_review(setup):
+    mind, source, _clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-owner-change", {"initiative": 95}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=attempt["id"], state="pending")
+    receipt = mind.settle_contact(
+        attempt_id=attempt["id"], state="canceled", reason="contact-source-changed",
+        aborted_before_send=True,
+        failure={"category":"source-changed", "stage":"contact-send-boundary",
+                 "code":"contact-owner-epoch-superseded", "retry_condition":"deepseek-decision"},
+    )
+    assert receipt["decision"]["action"] == "wait"
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "waiting"
+    assert "contact_failures" not in desire and "contact_review_failures" not in desire
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,data FROM mind_action_events WHERE kind='wish-review'").fetchone()
+    assert row["state"] == "pending"
+    assert json.loads(row["data"])["failure"]["code"] == "contact-owner-epoch-superseded"
+
+
+def test_contact_failure_receipt_is_static_and_cannot_accompany_acceptance(setup):
+    mind, source, _clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-invalid-failure", {"initiative": 95}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    failure = {"category":"unknown", "stage":"not static prose", "code":"code", "retry_condition":"backoff"}
+    with pytest.raises(ValueError):
+        mind.settle_contact(attempt_id=attempt["id"], state="canceled", failure=failure)
+    valid = {"category":"unknown", "stage":"contact-draft-execution", "code":"draft-error", "retry_condition":"backoff"}
+    with pytest.raises(ValueError):
+        mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="message", failure=valid)
+    with pytest.raises(ValueError):
+        mind.settle_contact(attempt_id=attempt["id"], state="canceled",
+                            failure={**valid, "model_receipt":{"provider":"deepseek", "prompt":"private"}})
+    with pytest.raises(ValueError):
+        mind.settle_contact(attempt_id=attempt["id"], state="canceled",
+                            failure={**valid, "model_receipt":{"elapsed_ms":float("inf")}})
+    receipt = mind.settle_contact(
+        attempt_id=attempt["id"], state="canceled",
+        failure={**valid, "model_receipt":{"provider":"deepseek", "usage":{"input_tokens":2},
+                 "schema_repair":{"attempts":1, "rejected_call":{"request_id":"repair-1"}}}},
+    )
+    assert receipt["failure"]["model_receipt"]["schema_repair"]["rejected_call"]["request_id"] == "repair-1"
+
+
 def test_redundant_share_is_retired_without_claiming_delivery(setup):
     mind, source, _ = setup
     wish(mind, source)
@@ -643,6 +735,7 @@ def test_expression_policy_has_evidence_without_inflating_scores(setup):
     assert view["dimensions"] == before
     assert view["interaction_style"]["band"] == "direct"
     assert view["interaction_style"]["event_id"] == result["event_id"]
+    assert view["interaction_style"]["preference"] == "Explicit preference"
     assert view["contact"]["quiet_start"] == 0
     clock[0] += timedelta(seconds=1)
     source("style", "Withdraw that preference", version="2")

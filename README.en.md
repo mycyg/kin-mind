@@ -74,7 +74,7 @@ Work locks are reviewed too. The host checks execution every minute; DeepSeek as
 
 Once the server returns message IDs, the corresponding intent is complete. DeepSeek reassesses initiative based on satisfaction and remaining thoughts. Each bubble keeps a stable ID and receipt. After partial delivery, only the remaining bubbles are handled; uncertain sends are reconciled against their original IDs. Server acceptance and phone read status are recorded separately.
 
-In Chinese chat, each sentence is usually no more than **20 characters**. I use complete, conversational sentences and split bubbles at natural pauses. Necessary explanations can be longer; code, links and work products stay complete.
+Ordinary Chinese chat and proactive sharing prefer one short, complete bubble. Genuine pauses, emotional turns or additional content may use more; the text is never split merely to satisfy a format. Deeper discussion, work, analysis and delivery follow the content without a one-bubble or character limit, and code, links and work products stay complete.
 
 ## Who does what
 
