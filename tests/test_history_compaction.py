@@ -23,7 +23,7 @@ from test_history_layer import evolve, revert
 from test_history_patches import drive, live, patches, rows
 from test_liveness import probe, quiet_host
 
-from eventmem.core.db import Conflict, dumps
+from eventmem.core.db import Conflict, digest, dumps
 from kin_mind import history, history_compaction, liveness
 from kin_mind.history_admin import dispatch
 from kin_mind.memory import MemoryContinuity
@@ -764,6 +764,221 @@ def test_a_bad_rewrite_in_a_later_batch_is_still_caught(setup, quiet, monkeypatc
         if revision > through:
             assert current[revision] == row, revision
     assert marker(mind)
+
+
+# --- the fallback, proven ----------------------------------------------------------------------
+#
+# A backup used to be asked only for the shape of the history: how many rows, from where to where.
+# Two databases can answer that alike with not one row in common, and one of them is then on record
+# as the recovery basis for a store it holds nothing of. These tests pin the stronger question the
+# run now asks — the same bytes, row for row, against a manifest frozen at the run's start — and
+# what happens when the answer is no, for a file the run took itself, a file it found, and a file
+# an operator named. The archive's own guarantee is separate, and stays separate.
+
+
+def test_a_backup_with_the_same_shape_but_different_rows_is_refused(setup, quiet, tmp_path):
+    """Same scope, same row count, same first and last revision — different bodies. The review's
+    reproduction shape: the identity check once called this a match."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=3)
+    kept = tmp_path / "elsewhere" / "backup.sqlite3"
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    history_compaction._take_backup(mind.engine.db, kept)
+    # Every row is replaced in place; the shape of the history does not move at all.
+    with mind.engine.db.connect(write=True) as conn:
+        for revision in texts:
+            conn.execute(
+                "UPDATE mind_events SET data=? WHERE scope=? AND revision=?",
+                (dumps({"request": None, "snapshot": {"revision": revision, "impostor": True}}),
+                 mind.scope.key(), revision))
+    altered = stored_rows(mind)
+    with mind.engine.db.connect() as conn:
+        same_shape = history_compaction._store_identity(conn, mind.scope.key(), content=False)
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True, "backup": str(kept)}, quiet)
+    assert refusal.value.target == "backup-is-not-of-this-store"
+    # The refusal carries both identities: the shape agrees on every number, the content does not.
+    backup, store = refusal.value.actual["backup"], refusal.value.actual["store"]
+    assert {key: backup[key] for key in ("rows", "first", "head")} == same_shape
+    assert {key: store[key] for key in ("rows", "first", "head")} == same_shape
+    assert backup["history_sha256"] != store["history_sha256"]
+    assert stored_rows(mind) == altered
+    assert not marker(mind)
+
+
+def test_a_backup_of_a_different_store_with_the_same_scope_is_refused(setup, quiet, tmp_path):
+    """Two databases, one scope key, the same number of rows between the same revisions — built
+    alike, holding nothing alike. The file a run may fall back to must be of *this* store."""
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope, SourceInput
+    from kin_mind.state import Mind
+
+    mind, source, clock = setup
+    prepared(mind, source, clock, rounds=3)
+    before = stored_rows(mind)
+    # A second, genuinely separate store, driven through the same commands a month later.
+    other_clock = [clock[0] + timedelta(days=30)]
+    other_engine = Engine(tmp_path / "other")
+    other = Mind(other_engine, Scope(persona="synthetic"),
+                 clock=lambda: other_clock[0].isoformat())
+
+    def other_source(key):
+        return other_engine.receive(SourceInput(
+            namespace="test", key=key, version="1", scope=other.scope, text=key,
+            authority="explicit", occurred_at=other_clock[0].isoformat(),
+            metadata={"role": "user", "host_event": "message"}))["id"]
+
+    MemoryContinuity(other)
+    other.initialize(agent_version="synthetic-v1", evidence_ids=[other_source("configuration")])
+    drive(other, other_source, other_clock, rounds=3)
+    with mind.engine.db.connect() as conn:
+        mine = history_compaction._store_identity(conn, mind.scope.key(), content=False)
+    with other_engine.db.connect() as conn:
+        theirs = history_compaction._store_identity(conn, other.scope.key(), content=False)
+    assert mine == theirs
+    foreign = tmp_path / "foreign.sqlite3"
+    history_compaction._take_backup(other_engine.db, foreign)
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True, "backup": str(foreign)}, quiet)
+    assert refusal.value.target == "backup-is-not-of-this-store"
+    assert stored_rows(mind) == before
+    assert not marker(mind)
+
+
+def test_a_store_that_changed_since_the_backup_gets_a_fresh_one(setup, quiet):
+    """Same endpoints, same count, different bytes under one row. The name a backup is taken under
+    carries the content digest, so the stale copy keeps its name and its place, and the run takes
+    a new one: the old file is neither trusted nor replaced."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=3)
+    with mind.engine.db.connect() as conn:
+        identity = history_compaction._store_identity(conn, mind.scope.key())
+    first = history_compaction._backup_file(mind.engine.db, identity, mind.clock(), None)
+    history_compaction._take_backup(mind.engine.db, first)
+    # One row's bytes change in place; nothing about the shape of the history moves.
+    with mind.engine.db.connect(write=True) as conn:
+        data = json.loads(conn.execute(
+            "SELECT data FROM mind_events WHERE scope=? AND revision=2",
+            (mind.scope.key(),)).fetchone()[0])
+        data["request"] = {"edited": True}
+        conn.execute("UPDATE mind_events SET data=? WHERE scope=? AND revision=?",
+                     (dumps(data), mind.scope.key(), 2))
+    done = run(mind, "history-compact", {"apply": True}, quiet)
+    assert done["state"] == "complete"
+    assert done["backup"] != first.name
+    assert first.exists()
+    fresh = history_compaction.archive_dir(mind.engine.db) / done["backup"]
+    assert fresh.exists() and done["backup_verified"]["sha256"] == history_compaction._file_sha256(fresh)
+    rebuilds(mind, texts)
+
+
+def test_a_damaged_backup_is_refused_before_anything_moves(setup, quiet):
+    """A file that was a backup and was damaged where it lay is caught by the read-back — the
+    integrity check, the identity, or the per-row compare, whichever meets it first — and the run
+    stops with the store still closed and its cursor unmoved."""
+    mind, source, clock = setup
+    prepared(mind, source, clock, rounds=3)
+    stopped = run(mind, "history-compact", {"apply": True, "limit": 2}, quiet)
+    assert stopped["state"] == "stopped" and marker(mind)
+    path = history_compaction.archive_dir(mind.engine.db) / stopped["backup"]
+    size = path.stat().st_size
+    with open(path, "r+b") as handle:
+        handle.seek(size // 2)
+        handle.write(b"\0" * min(4096, size - size // 2))
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True}, quiet)
+    assert refusal.value.target in {"backup-fails-integrity-check", "backup-is-not-a-store",
+                                    "backup-is-not-of-this-store"}
+    assert marker(mind)
+    with mind.engine.db.connect() as conn:
+        assert history_compaction.progress(conn, mind.scope.key())["through"] == stopped["cursor"]
+
+
+def test_a_corrupted_archived_original_stops_the_run(setup, quiet, monkeypatch):
+    """The archive's guarantee, held separate from the backup's: an archived original whose bytes
+    moved between invocations is found by phase one's read-back on the resume, before anything
+    else is rewritten — the backup being intact is not an answer for it."""
+    mind, source, clock = setup
+    prepared(mind, source, clock, rounds=5)
+    before = stored_rows(mind)
+    real = history_compaction._archive_target_set
+
+    def archive_everything_then_fall_over(*args, **kwargs):
+        real(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted between the archive and the rewrite phases")
+
+    monkeypatch.setattr(history_compaction, "_archive_target_set", archive_everything_then_fall_over)
+    with pytest.raises(KeyboardInterrupt):
+        run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    monkeypatch.setattr(history_compaction, "_archive_target_set", real)
+    path = history_compaction.archive_dir(mind.engine.db) / archive_name(mind)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE mind_events_v1 SET data='{\"request\":null,\"snapshot\":{\"corrupt\":true}}'"
+                     " WHERE revision=2")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(Conflict) as refusal:
+        run(mind, "history-compact", {"apply": True, "batch": 4}, quiet)
+    assert refusal.value.target == "archive-row-differs"
+    assert refusal.value.actual["revision"] == 2
+    unchanged(mind, before)
+    assert marker(mind)
+
+
+def test_new_history_written_after_a_run_survives_a_restore_of_the_old(setup, quiet):
+    """Restore answers the archive, not the store: rows written after a compaction — patches
+    standing on rows the restore puts back — are never the archive's business, are not touched,
+    and still resolve, because a rewrite never changed what a row *meant*."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=4)
+    before = stored_rows(mind)
+    done = run(mind, "history-compact", {"apply": True}, quiet)
+    assert done["state"] == "complete"
+    patches(mind)
+    clock[0] += timedelta(minutes=11)
+    texts |= drive(mind, source, clock, rounds=2, start=20)
+    after_compact = stored_rows(mind)
+    # The new rows really are patches standing on compacted rows — the case that must resolve.
+    assert history.is_patch(rows(mind)[max(after_compact)])
+    restored = run(mind, "history-restore", {"apply": True}, quiet)
+    assert restored["state"] == "restored" and restored["restored"] == done["rewritten"]
+    current = stored_rows(mind)
+    # The old rows are byte for byte what they were before the compaction...
+    for revision in before:
+        assert current[revision] == before[revision], revision
+    # ...and the rows written after it are exactly what they were after it.
+    for revision in set(after_compact) - set(before):
+        assert current[revision] == after_compact[revision], revision
+    rebuilds(mind, texts)
+
+
+def test_what_the_run_trusted_is_written_down(setup, quiet):
+    """The manifest and the backup verification are part of the run's record: which store it
+    started against, what every target row held, and which file — by hash, size and permissions —
+    was trusted as the fallback."""
+    mind, source, clock = setup
+    texts = prepared(mind, source, clock, rounds=3)
+    before = stored_rows(mind)
+    done = run(mind, "history-compact", {"apply": True}, quiet)
+    with mind.engine.db.connect() as conn:
+        stored = history_compaction.progress(conn, mind.scope.key())
+    manifest, verification = stored["manifest"], stored["backup_verified"]
+    assert manifest["run_id"] == done["run_id"] and manifest["scope"] == mind.scope.key()
+    assert manifest["target"]["rows"] == len(texts) == done["archive_confirmed"]
+    assert {int(revision) for revision in manifest["rows"]} == set(texts)
+    for revision, entry in manifest["rows"].items():
+        row = before[int(revision)]
+        assert entry["id"] == row["id"] and entry["kind"] == row["kind"]
+        assert entry["occurred_at"] == row["occurred_at"]
+        assert entry["data_sha256"] == digest(row["data"].encode())
+    path = history_compaction.archive_dir(mind.engine.db) / done["backup"]
+    assert verification["name"] == done["backup"]
+    assert verification["sha256"] == history_compaction._file_sha256(path)
+    assert verification["bytes"] == path.stat().st_size
+    assert verification["mode"] == "0o600"
+    assert stored["finished_at"]
 
 
 # --- rows this will not touch ----------------------------------------------------------------------------
