@@ -1,6 +1,8 @@
 import hashlib
+import importlib.util
 import sqlite3
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +12,14 @@ from eventmem.core.jobs import Worker
 from eventmem.core.models import Scope, SourceInput
 from eventmem.core.vectors import VectorIndex
 from kin_mind import derivative_recovery as dr
-from scripts import recover_derivatives as cli
+
+# Console-entry pytest need not put the checkout root on sys.path. Load the
+# standalone maintenance script by its path, as an installed operator would.
+_spec = importlib.util.spec_from_file_location(
+    "recover_derivatives_cli", Path(__file__).resolve().parents[1] / "scripts" / "recover_derivatives.py"
+)
+cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cli)
 
 
 def test_snapshot_db_includes_committed_wal_pages(tmp_path):
