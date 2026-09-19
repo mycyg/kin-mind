@@ -379,28 +379,39 @@ SCOPE_DICT = {"project": "personal", "persona": "Kin", "collection": "default", 
 def dump_outputs(root: Path, output: Path):
     """Canonical per-query outputs of the light path, for before/after equivalence diffs."""
     import hashlib
-    copy = output.parent / (output.stem + "-store")
-    copy_fixture(root, copy)
     from eventmem.core.models import Scope
     from kin_mind.context import Contexts
     from kin_mind.state import Mind
-    engine = Engine(copy)
-    contexts = Contexts(Mind(engine, Scope.model_validate(SCOPE_DICT)))
+    # Time-projected motivations and temperature evidence are part of the result.
+    # Removing only a top-level clock does not make two wall-clock runs comparable.
+    manifest = json.loads((root / MANIFEST_FILE).read_text())
+    fixed_at = manifest["anchor_date"][:10] + "T12:00:00.000000+00:00"
     queries = load_queries(root)
     volatile = {"elapsed_ms", "local_recall_ms", "clock", "candidate_wait_ms"}
     results = {}
-    for i, case in enumerate(queries):
-        session = f"w4-dump-{i // 10}"
-        built = contexts.build(case["query"], purpose="chat", session=session, mode="auto", allow_model=False)
-        items, info = run_turn_collect(contexts, case["query"])
-        results[case["id"]] = {
-            "build": {k: v for k, v in built.items() if k not in volatile},
-            "collect": {"items": items, "info": {k: v for k, v in info.items() if k not in volatile}},
-        }
+    guard = install_no_model_guard()
+    try:
+        with tempfile.TemporaryDirectory(prefix="w4-equivalence-") as temporary:
+            copy = Path(temporary) / "store"
+            copy_fixture(root, copy)
+            engine = Engine(copy)
+            contexts = Contexts(Mind(engine, Scope.model_validate(SCOPE_DICT), clock=lambda: fixed_at))
+            for i, case in enumerate(queries):
+                session = f"w4-dump-{i // 10}"
+                built = contexts.build(case["query"], purpose="chat", session=session, mode="auto", allow_model=False)
+                items, info = run_turn_collect(contexts, case["query"])
+                results[case["id"]] = {
+                    "build": {k: v for k, v in built.items() if k not in volatile},
+                    "collect": {"items": items, "info": {k: v for k, v in info.items() if k not in volatile}},
+                }
+    finally:
+        restore_no_model_guard()
+    assert not guard, dict(guard)
     canonical = json.dumps(results, ensure_ascii=False, sort_keys=True, indent=1)
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(canonical)
-    print(json.dumps({"outputs": len(results), "sha256": hashlib.sha256(canonical.encode()).hexdigest()}))
-    shutil.rmtree(copy, ignore_errors=True)
+    print(json.dumps({"outputs": len(results), "at": fixed_at,
+                      "sha256": hashlib.sha256(canonical.encode()).hexdigest()}))
 
 
 def main():

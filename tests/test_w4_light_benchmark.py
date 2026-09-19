@@ -95,6 +95,29 @@ def test_percentile_nearest_rank_matches_frozen_sim():
     assert dist["n"] == 3 and dist["p50"] == 20 and dist["max"] == 30
 
 
+def test_output_equivalence_uses_fixture_time_and_preserves_existing_paths(fixture_root, tmp_path, monkeypatch):
+    queries = bench_mod.load_queries(fixture_root)[:2]
+    monkeypatch.setattr(bench_mod, "load_queries", lambda root: queries)
+    collect = bench_mod.run_turn_collect
+    observed = []
+
+    def checked_collect(contexts, query):
+        observed.append(contexts.mind.clock())
+        return collect(contexts, query)
+
+    monkeypatch.setattr(bench_mod, "run_turn_collect", checked_collect)
+    first, second = tmp_path / "before.json", tmp_path / "after.json"
+    existing = tmp_path / "before-store"
+    existing.mkdir()
+    (existing / "keep.txt").write_text("unrelated caller data")
+    bench_mod.dump_outputs(fixture_root, first)
+    bench_mod.dump_outputs(fixture_root, second)
+    assert first.read_bytes() == second.read_bytes()
+    assert observed == ["2026-09-17T12:00:00.000000+00:00"] * 4
+    assert (existing / "keep.txt").read_text() == "unrelated caller data"
+    assert not bench_mod._GUARD_ORIGINALS
+
+
 def test_graph_item_compact_edge_query_matches_or_form(fixture_root):
     """The indexed UNION read returns exactly the pre-optimization OR query's rows,
     including the self-loop edge (deduped) and the LIMIT 8 ordering by id."""
