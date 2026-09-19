@@ -137,6 +137,9 @@ test('purpose profiles are host-bound contracts, never request-declared', () => 
   const body = {model:'deepseek-flash',input:[{type:'message',role:'user',content:'Research this'}]};
   const exploration = deepseekRequest(body, 'high', 'exploration');
   assert.equal(exploration.instructions, explorationContract);
+  assert.match(explorationContract,
+    /host-owned computer\/kin_ui tool only when that tool returned state=observed/);
+  assert.match(explorationContract, /failed, reviewed, or acted-only receipt is never a source/);
   assert.ok(!exploration.instructions.includes(replyContract),
     'an exploration turn must not inherit the user-reply contract');
   // Even a trailing continuity host event cannot move a profiled instance off
