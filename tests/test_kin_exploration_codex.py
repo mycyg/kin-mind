@@ -457,6 +457,10 @@ def test_codex_preflight_failures(tmp_path, monkeypatch):
     with pytest.raises(CodexUnavailable) as credential:
         run_codex(ok, {}, tmp_path / "job", **codex_kwargs())
     assert credential.value.reason == "codex-credential-env-missing"
+    with pytest.raises(CodexUnavailable) as isolation:
+        codex_env(tmp_path / "isolated", env={"CODEX_HOME": "/tmp/not-isolated"},
+                  extra_env_keys=["CODEX_HOME"])
+    assert isolation.value.reason == "codex-env-isolation-refused"
 
 
 def test_codex_computer_reading_is_the_only_mcp_server(tmp_path, monkeypatch):
@@ -497,6 +501,13 @@ def test_codex_computer_use_is_a_real_separate_fixed_mcp_surface(tmp_path, monke
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
     monkeypatch.setenv("KIN_TEST_ACTION_REVIEW", "ephemeral-synthetic-review-token")
     monkeypatch.setenv("KIN_TEST_CUA_SURFACES", "browser,computer")
+    readiness = {"state": "ready", "protocol": "mcp",
+                 "tools": ["js", "turn_ended"], "bootstrap": "cua.getState",
+                 "scope": "host-exploration"}
+    monkeypatch.setattr(
+        "kin_mind.computer_use.probe_backend_readiness",
+        lambda *_args, **_kwargs: readiness,
+    )
     job = tmp_path / "job"
     fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
     computer = {
@@ -523,11 +534,13 @@ def test_codex_computer_use_is_a_real_separate_fixed_mcp_surface(tmp_path, monke
         "computer": True, "search": False, "fetch": False,
         "browser": True, "computer_interaction": True,
     }
+    assert report["computer_use_backend"] == readiness
     observed = json.loads((job / "observed.json").read_text())
     assert any(flag.startswith("mcp_servers.kin_ui.command=") for flag in observed["argv"])
     assert "mcp_optional_startup_grace_ms=10000" in observed["argv"]
     assert "mcp_servers.kin_ui.omit_tools_from=[]" in observed["argv"]
     assert "mcp_servers.kin_ui.tool_timeout_sec=90" in observed["argv"]
+    assert "mcp_servers.kin_ui.required=true" in observed["argv"]
     assert any(flag == ('mcp_servers.kin_ui.env_vars=["KIN_TEST_CUA_SURFACES",'
                         '"KIN_TEST_ACTION_REVIEW"]')
                for flag in observed["argv"])
@@ -553,6 +566,28 @@ def test_codex_computer_use_is_a_real_separate_fixed_mcp_surface(tmp_path, monke
     source = report["result"]["sources"][0]
     assert source["receipt"]["receipt_format"] == "kin-source-receipt-v1"
     assert source["receipt"]["verified_by_execution"] == "job"
+
+
+def test_codex_refuses_configured_but_unready_computer_use_before_dispatch(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setenv("KIN_TEST_CUA_SURFACES", "browser,computer")
+    fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("synthetic-backend-startup-failure")
+
+    monkeypatch.setattr("kin_mind.computer_use.probe_backend_readiness", unavailable)
+    computer = {"enabled": True, "file_reader_enabled": False, "ui": {
+        "enabled": True,
+        "backend": {"command": "/bin/false", "args": [],
+                    "env_vars": ["KIN_TEST_CUA_SURFACES"]},
+    }}
+    with pytest.raises(CodexUnavailable) as failed:
+        run_codex(fake, TOPIC, tmp_path / "job-unready", computer=computer,
+                  **codex_kwargs())
+    assert failed.value.reason == "computer-use-backend-unavailable"
+    assert not (tmp_path / "job-unready" / "observed.json").exists()
 
 
 def test_computer_reader_refusals_hold(tmp_path):

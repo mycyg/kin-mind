@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from kin_mind.computer_use import (
+    CuaBackend,
     MAX_STATE,
     ComputerUseController,
     DeepSeekActionReviewer,
@@ -381,6 +383,42 @@ def test_server_exposes_fixed_tools_and_backend_env_is_reference_only(tmp_path, 
     assert _backend_environment({"env_vars": ["KIN_CUA_TEST_SURFACE"]})[
         "KIN_CUA_TEST_SURFACE"
     ] == "browser,computer"
+
+
+def test_nested_cua_uses_one_host_scope_for_bootstrap_actions_and_cleanup():
+    calls = []
+
+    class Session:
+        async def call_tool(self, name, arguments, meta=None):
+            calls.append((name, arguments, meta))
+            return SimpleNamespace(isError=False, content=[])
+
+    backend = CuaBackend(
+        {"command": "/bin/false", "args": []}, execution_id="explore_42", attempt=3,
+    )
+    backend.session = Session()
+    asyncio.run(backend._call("void 0", "Synthetic operation"))
+    asyncio.run(backend.__aexit__(None, None, None))
+    scope = json.loads(backend.scope_meta["x-codex-turn-metadata"])
+    assert scope == {
+        "session_id": "kin-exploration:explore_42",
+        "turn_id": "kin-exploration:explore_42:attempt-3",
+        "model": "deepseek-flash",
+    }
+    assert calls[0][2] == calls[1][2] == backend.scope_meta
+    assert calls[1][0] == "turn_ended"
+    assert calls[1][1]["session_id"] == scope["session_id"]
+    assert calls[1][1]["turn_id"] == scope["turn_id"]
+    assert "call_id" not in scope and "authorization" not in scope
+
+
+def test_backend_initialization_failure_closes_its_stdio_stack():
+    backend = CuaBackend(
+        {"command": "/bin/false", "args": []}, execution_id="failed-probe", attempt=1,
+    )
+    with pytest.raises(Exception):
+        asyncio.run(backend.__aenter__())
+    assert backend.stack is None and backend.session is None
 
 
 def test_source_ledger_rejects_bare_history_stale_continuation_and_fake_computer():

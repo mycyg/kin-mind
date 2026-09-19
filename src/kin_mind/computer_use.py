@@ -16,6 +16,7 @@ sent to DeepSeek, so this path makes no claim that deepseek-flash processed imag
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -36,6 +37,8 @@ from .web_read import _blocked_address
 
 ADAPTER = "kin-computer-use-v1"
 MARKER = "__KIN_CUA__"
+TURN_META_KEY = "x-codex-turn-metadata"
+REQUIRED_BACKEND_TOOLS = frozenset({"js", "turn_ended"})
 MAX_STATE = 16000
 MAX_INPUT = 500
 MAX_ELEMENT_LINE = 4000
@@ -193,11 +196,17 @@ class CuaBackend:
         self.approvals = []
         self.stack = None
         self.session = None
-        self.meta = {"x-codex-turn-metadata": _j({
-            "session_id": self.execution_id,
-            "turn_id": f"{self.execution_id}-attempt-{self.attempt}",
+        # This is a private nested MCP client, not the outer Codex-native CUA
+        # client. One unique host correlation scope therefore stays fixed from
+        # bootstrap through actions and turn_ended. It is not an authorization
+        # identity: sender validation, app policy and elicitation still run in
+        # the installed PublicGateway/runtime.
+        self.scope_meta = {TURN_META_KEY: _j({
+            "session_id": f"kin-exploration:{self.execution_id}",
+            "turn_id": f"kin-exploration:{self.execution_id}:attempt-{self.attempt}",
             "model": self.model,
         })}
+        self.readiness = None
 
     async def __aenter__(self):
         from mcp import ClientSession, StdioServerParameters, types
@@ -208,55 +217,74 @@ class CuaBackend:
         if not isinstance(command, str) or not command or not isinstance(args, list):
             raise ValueError("computer-use-backend-unconfigured")
         self.stack = AsyncExitStack()
-        read, write = await self.stack.enter_async_context(stdio_client(StdioServerParameters(
-            command=command, args=[str(value) for value in args], env=_backend_environment(self.config),
-        )))
-        async def elicitation(_context, params):
-            # Computer Use asks once before binding a native app. The outer host
-            # already made the authorization exact; accept only that same low-risk
-            # app-state request. Everything else is declined, never delegated to DS.
-            raw = params.model_dump(by_alias=True)
-            meta = raw.get("_meta") or raw.get("meta") or {}
-            tool_params = meta.get("tool_params") or {}
-            action = {"get_app_state": "observe", "click": "click", "scroll": "scroll"}.get(
-                meta.get("tool_name")
-            )
-            allowed = (
-                action in self.allowed_app_actions
-                and meta.get("codex_approval_kind") == "mcp_tool_call"
-                and meta.get("connector_id") == "computer-use"
-                and meta.get("riskLevel") == "low"
-                and tool_params.get("app") in self.allowed_apps
-            )
-            if allowed:
-                self.approvals.append({
-                    "state": "approved", "source": "cua-elicitation",
-                    "tool": meta.get("tool_name"), "app": tool_params.get("app"),
-                    "risk_level": meta.get("riskLevel"), "approved_at": now(),
-                })
-            return types.ElicitResult(action="accept", content={}) if allowed else types.ElicitResult(action="decline")
+        try:
+            read, write = await self.stack.enter_async_context(stdio_client(StdioServerParameters(
+                command=command, args=[str(value) for value in args],
+                env=_backend_environment(self.config),
+            )))
 
-        self.session = await self.stack.enter_async_context(
-            ClientSession(read, write, elicitation_callback=elicitation)
-        )
-        await self.session.initialize()
-        # cua_repl requires this exact first API call in a fresh runtime.
-        await self._call("await cua.getState();", "Initialize controlled Computer Use")
-        await self.call_json(
-            "globalThis.__kinTabs = new Map(); globalThis.__kinApps = new Map(); "
-            f"nodeRepl.write({ _j(MARKER) }+JSON.stringify({{ready:true}}));",
-            "Initialize controlled target registry",
-        )
-        return self
+            async def elicitation(_context, params):
+                # Computer Use asks once before binding a native app. The outer host
+                # already made the authorization exact; accept only that same low-risk
+                # app-state request. Everything else is declined, never delegated to DS.
+                raw = params.model_dump(by_alias=True)
+                meta = raw.get("_meta") or raw.get("meta") or {}
+                tool_params = meta.get("tool_params") or {}
+                action = {"get_app_state": "observe", "click": "click", "scroll": "scroll"}.get(
+                    meta.get("tool_name")
+                )
+                allowed = (
+                    action in self.allowed_app_actions
+                    and meta.get("codex_approval_kind") == "mcp_tool_call"
+                    and meta.get("connector_id") == "computer-use"
+                    and meta.get("riskLevel") == "low"
+                    and tool_params.get("app") in self.allowed_apps
+                )
+                if allowed:
+                    self.approvals.append({
+                        "state": "approved", "source": "cua-elicitation",
+                        "tool": meta.get("tool_name"), "app": tool_params.get("app"),
+                        "risk_level": meta.get("riskLevel"), "approved_at": now(),
+                    })
+                return types.ElicitResult(action="accept", content={}) \
+                    if allowed else types.ElicitResult(action="decline")
+
+            self.session = await self.stack.enter_async_context(
+                ClientSession(read, write, elicitation_callback=elicitation)
+            )
+            await self.session.initialize()
+            listed = await self.session.list_tools()
+            tool_names = {tool.name for tool in listed.tools}
+            if not REQUIRED_BACKEND_TOOLS <= tool_names:
+                raise RuntimeError("computer-use-service-tools-missing")
+            # cua_repl requires this exact first API call in a fresh runtime.
+            await self._call("await cua.getState();", "Initialize controlled Computer Use")
+            await self.call_json(
+                "globalThis.__kinTabs = new Map(); globalThis.__kinApps = new Map(); "
+                f"nodeRepl.write({ _j(MARKER) }+JSON.stringify({{ready:true}}));",
+                "Initialize controlled target registry",
+            )
+            self.readiness = {
+                "state": "ready", "protocol": "mcp",
+                "tools": sorted(REQUIRED_BACKEND_TOOLS), "bootstrap": "cua.getState",
+                "scope": "host-exploration",
+            }
+            return self
+        except BaseException:
+            await self.stack.aclose()
+            self.stack = None
+            self.session = None
+            raise
 
     async def __aexit__(self, exc_type, exc, traceback):
         if self.session is not None:
             try:
+                turn = json.loads(self.scope_meta[TURN_META_KEY])
                 await self.session.call_tool("turn_ended", {
                     "hook_event_name": "turn_ended",
-                    "session_id": self.execution_id,
-                    "turn_id": f"{self.execution_id}-attempt-{self.attempt}",
-                }, meta=self.meta)
+                    "session_id": turn["session_id"],
+                    "turn_id": turn["turn_id"],
+                }, meta=self.scope_meta)
             except Exception:  # noqa: BLE001, S110 - shutdown must still close stdio
                 pass
         if self.stack is not None:
@@ -265,7 +293,7 @@ class CuaBackend:
     async def _call(self, code, title):
         result = await self.session.call_tool("js", {
             "code": code, "title": title[:80], "timeout_ms": 30000,
-        }, meta=self.meta)
+        }, meta=self.scope_meta)
         text = "\n".join(getattr(item, "text", "") for item in result.content)
         if result.isError:
             raise RuntimeError("computer-use-service-error:" + text[-500:])
@@ -283,6 +311,27 @@ class CuaBackend:
         if not isinstance(value, dict):
             raise TypeError("computer-use-service-invalid-receipt")
         return value
+
+
+def probe_backend_readiness(config, *, execution_id, attempt, model="deepseek-flash",
+                            allowed_apps=(), allowed_app_actions=("observe",),
+                            timeout_seconds=45):
+    """Prove the nested MCP and its required CUA bootstrap work before model dispatch."""
+    timeout_seconds = float(timeout_seconds)
+    if not 1 <= timeout_seconds <= 120:
+        raise ValueError("computer-use-readiness-timeout-invalid")
+
+    async def probe():
+        # The probe is a complete, closed logical turn. Its scope must not be
+        # reused by the later operational MCP server after turn_ended.
+        async with CuaBackend(
+            config, execution_id=f"{execution_id}:readiness-probe", attempt=attempt,
+            model=model,
+            allowed_apps=allowed_apps, allowed_app_actions=allowed_app_actions,
+        ) as backend:
+            return dict(backend.readiness)
+
+    return asyncio.run(asyncio.wait_for(probe(), timeout=timeout_seconds))
 
 
 class ComputerUseController:

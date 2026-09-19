@@ -282,8 +282,9 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
         "-c", 'web_search="disabled"',
         "-c", "model_reasoning_effort=" + dumps(reasoning),
         "-c", 'shell_environment_policy.inherit="none"',
-        # kin_ui initializes the installed CUA service before advertising tools.
-        # Wait for that bounded startup instead of snapshotting an empty registry.
+        # Optional read/search MCPs get a bounded grace period. kin_ui is marked
+        # required below, so Codex itself also fails closed if its second launch
+        # races with a runtime failure after our explicit readiness probe.
         "-c", "mcp_optional_startup_grace_ms=10000",
     ]
     if model_catalog:
@@ -311,6 +312,8 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
             ]
             if server.get("env_vars"):
                 argv += ["-c", f"mcp_servers.{name}.env_vars=" + dumps(server["env_vars"])]
+            if name == "kin_ui":
+                argv += ["-c", "mcp_servers.kin_ui.required=true"]
     else:
         argv += ["-c", "mcp_servers={}"]
     pid = provider["id"]
@@ -336,6 +339,8 @@ def codex_env(codex_home, *, env=None, env_key=None, extra_env_keys=()):
     child = {key: env[key] for key in CODEX_ENV_ALLOWLIST if key in env}
     child["CODEX_HOME"] = str(codex_home)
     for key in [value for value in (env_key, *extra_env_keys) if value]:
+        if key == "CODEX_HOME":
+            raise CodexUnavailable("codex-env-isolation-refused", key)
         if key not in env:
             raise CodexUnavailable("codex-credential-env-missing", key)
         child[key] = env[key]
@@ -532,6 +537,7 @@ def run_codex(
                  "previous_observations": reader_settings.get("previous", [])}
     ui_ledger = None
     ui_mcp = None
+    backend_readiness = None
     action_review_env_key = None
     ui = (computer or {}).get("ui") or {}
     if computer and computer.get("enabled") and ui.get("enabled"):
@@ -540,7 +546,11 @@ def run_codex(
             raise CodexUnavailable("computer-use-backend-unconfigured")
         if not isinstance(backend.get("args", []), list):
             raise ValueError("computer-use-backend-args-invalid")
-        from .computer_use import DeepSeekActionReviewer, _backend_environment
+        from .computer_use import (
+            DeepSeekActionReviewer,
+            _backend_environment,
+            probe_backend_readiness,
+        )
         _backend_environment(backend)  # validates names/types before the private config is written
         backend_env_keys = list(backend.get("env_vars") or [])
         backend_config = {
@@ -548,6 +558,20 @@ def run_codex(
             "args": [str(value) for value in backend.get("args", [])],
             "env_vars": backend_env_keys,
         }
+        try:
+            backend_readiness = probe_backend_readiness(
+                backend_config, execution_id=directory.name, attempt=attempt, model=model,
+                allowed_apps=ui.get("allowed_apps", []),
+                allowed_app_actions=ui.get("allowed_app_actions", ["observe"]),
+                timeout_seconds=ui.get("readiness_timeout_seconds", 45),
+            )
+        except Exception as error:
+            # Never start the provider with a configured-but-absent tool surface.
+            # The cause stays chained for local diagnostics; the public waiting
+            # reason is stable and carries no runtime paths or process output.
+            raise CodexUnavailable(
+                "computer-use-backend-unavailable", type(error).__name__
+            ) from error
         action_review = ui.get("action_review") or {}
         review_config = {
             "enabled": bool(action_review.get("enabled", False)),
@@ -645,6 +669,7 @@ def run_codex(
     identity = {"executor": "codex-cli", "executor_version": cli_version, "model": model,
                 "reasoning": reasoning, "sandbox": "read-only",
                 "capabilities": capabilities,
+                "computer_use_backend": backend_readiness,
                 "model_catalog": str(model_catalog) if model_catalog else None,
                 "provider": {key: value for key, value in provider.items() if key != "env_key"}}
     input_sources = _input_sources(topic)
@@ -891,6 +916,7 @@ def run_codex(
             "config_digest": digest(identity),
             # Declared, not assumed: what tools this run actually had.
             "capabilities": capabilities,
+            **({"computer_use_backend": backend_readiness} if backend_readiness else {}),
             # The accounting level is stated, not implied: codex reports one
             # aggregated turn usage; the gateway's per-request rows reconcile by
             # purpose=native-exploration within this run's time window. Cached
