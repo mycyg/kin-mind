@@ -107,6 +107,20 @@ class EventGraph:
                 return value
         raise Missing(identifier)
 
+    def _get_many(self, conn, identifiers):
+        """The `get` reads for a known id list in two IN-list passes. An id in neither
+        table is answered by `get`, which raises Missing exactly as before."""
+        found = {}
+        for table in ("mind_graph_nodes", "mind_graph_edges"):
+            missing = [i for i in identifiers if i not in found]
+            if not missing:
+                break
+            marks = ",".join("?" for _ in missing)
+            for row in conn.execute(f"SELECT id,data FROM {table} WHERE scope=? AND id IN ({marks})",
+                                    [self.scope.key(), *missing]):
+                found.setdefault(row["id"], json.loads(row["data"]))
+        return {i: found[i] if i in found else self.get(conn, i) for i in identifiers}
+
     def _put(self, conn, value, *, edge=False):
         value = dict(value)
         try:
@@ -417,7 +431,8 @@ class EventGraph:
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 300):
                             next_ids.update(row)
-                    reached = [known.setdefault(i, self.get(conn, i)) for i in sorted(next_ids - ids - known.keys())]
+                    batch = self._get_many(conn, sorted(next_ids - ids - known.keys()))
+                    reached = [known.setdefault(i, batch[i]) for i in sorted(next_ids - ids - known.keys())]
                     frontier = {n["id"] for n in self.visible(conn, reached, policy)}
                     ids.update(frontier)
                     if len(ids) >= 1200:
@@ -432,7 +447,8 @@ class EventGraph:
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 40):
                             additions.update(row)
-                    reached = [self.get(conn, i) for i in sorted(additions - seen)[:40]]
+                    wanted = sorted(additions - seen)[:40]
+                    reached = [self._get_many(conn, wanted)[i] for i in wanted]
                     seen.update(n["id"] for n in reached)
                     frontier = {n["id"] for n in self.visible(conn, reached, policy)}
                     known.update(frontier)

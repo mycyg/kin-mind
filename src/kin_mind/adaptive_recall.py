@@ -498,7 +498,10 @@ class AdaptiveRecall:
             # those rounds surfaced follows it.
             pool = {**first_pool, **pool}
             ranked_ids = list(dict.fromkeys([*first_ranked[:8], *ranked_ids]))
-        selected = [pool[i] for i in ranked_ids[:40] if i in pool and self.contexts._current(pool[i], policy)]
+        pending_selection = [pool[i] for i in ranked_ids[:40] if i in pool]
+        with self.engine.db.connect() as conn:
+            selected = [item for item in pending_selection
+                        if self.contexts._current(item, policy, conn=conn)]
         info["expanded_ids"] = [i["id"] for i in selected[:8]]
         info["evidence_versions"] = {i["id"]: i["revision"] for i in selected}
         info["candidate_count"] = len(selected)

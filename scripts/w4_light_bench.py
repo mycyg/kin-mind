@@ -203,6 +203,16 @@ def install_tracer(tracer):
         return result
     context_mod.Contexts._overview = overview
 
+    original_overviews = context_mod.Contexts._overviews
+    originals.append((context_mod.Contexts, "_overviews", original_overviews))
+
+    def overviews(self, items, policy=None):
+        with tracer.span("overview"):
+            result = original_overviews(self, items, policy)
+        tracer.note("overview_hits", sum(1 for i in result if i.get("cached_summary")))
+        return result
+    context_mod.Contexts._overviews = overviews
+
     # DB connection-block accounting (connection open + statements inside).
     original_connect = core_db.Database.connect
     originals.append((core_db.Database, "connect", original_connect))
