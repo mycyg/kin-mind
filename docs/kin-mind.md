@@ -194,10 +194,12 @@ The switch is `model_lanes`. The ledger is shared, so it is machine-wide: set to
 capacity only, no quarantine, no heartbeat, and a plan claim that looks at its own
 scope.
 
-The one-minute host timer is a local queue/threshold check, not a periodic model
-request. Lengthening it to twenty minutes delays threshold detection without
-reducing idle provider requests, which are already zero. Exploration retains its
-independent curiosity threshold and consumed wish identities.
+The one-minute host timer is a local queue and wake-up check, not a periodic model
+request. Lengthening it to twenty minutes delays detection of changed evidence,
+due reviews and runnable decisions without reducing idle provider requests, which
+are already zero. In the default semantic mode, contact and exploration scores are
+context rather than admission gates; only explicitly enabled legacy mode restores
+the stored initiative and curiosity thresholds.
 
 The optional [mobile routing host](mobile-routing.md) keeps conversation and work
 models in one native thread, protects ongoing tasks during model changes, and
@@ -307,11 +309,12 @@ reminders keep their requested timing and task identity.
 ## Validation
 
 Python tests cover independent trajectories, mixed states, restart/replay, revision
-conflicts, source correction, scope isolation, early threshold crossing, held unknown
-delivery, personality evidence and reversion, provider validation, and executor process
-cancellation. Node tests cover quiet/wait gates, owner input races, concurrent ticks,
-platform receipt requirements and uncertain sends. Real providers use private runtime
-verification; CI uses synthetic sources and controlled provider/CLI stubs.
+conflicts, source correction, scope isolation, semantic score independence and legacy
+threshold crossing, held unknown delivery, personality evidence and reversion, provider
+validation, and executor process cancellation. Node tests cover quiet/wait gates, owner
+input races, concurrent ticks, platform receipt requirements and uncertain sends. Real
+providers use private runtime verification; CI uses synthetic sources and controlled
+provider/CLI stubs.
 
 
 ## Affect-driven action episodes
@@ -330,13 +333,14 @@ calibration remains separate. A persisted crossing key prevents a high plateau
 or restart from calling the model repeatedly. Internal thoughts are model-origin
 sources and do not count as new owner interactions or personality evidence.
 
-`ActionEvents` is the transactional outbox for bootstrap, threshold crossings,
-exploration findings and accepted contact. It materializes idempotent sources and
-appraisal jobs. The owner host also ingests public assistant results. Failed model
-requests remain pending with bounded backoff; corrected evidence requires review.
-A delivery receipt can update satisfaction and remaining motivation but cannot
-create a new wish on its own. Existing useful, playful or affectionate intentions
-can continue without imposing a fixed reset or a fixed sending interval.
+`ActionEvents` is the transactional outbox for bootstrap, semantic wake-ups, explicitly
+enabled legacy threshold crossings, exploration findings and accepted contact. It
+materializes idempotent sources and appraisal jobs. The owner host also ingests public
+assistant results. Failed model requests remain pending with bounded backoff; corrected
+evidence requires review. A delivery receipt can update satisfaction and remaining
+motivation but cannot create a new wish on its own. Existing useful, playful or
+affectionate intentions can continue without imposing a fixed reset or a fixed sending
+interval.
 
 `configure-actions` requires explicit source evidence, configuration version and
 revision. It installs the policy and queues a one-time migration review without

@@ -124,9 +124,10 @@ def _derive(declared, committed):
 def _outward(committed):
     """What this commit started that leaves for the owner now.
 
-    A wish and an owner request are wants the host still gates by readiness, by the contact
-    threshold and by quiet hours, so either can stand beside a quiet move. A contact step this
-    commit set running is already on its way, and cannot.
+    A wish and an owner request are wants the host still gates by the current semantic decision,
+    authorization, readiness and quiet hours, so either can stand beside a quiet move. Only the
+    explicit legacy mode adds the contact score threshold. A contact step this commit set running
+    is already on its way, and cannot.
     """
     return [entry for entry in committed["decisions"]
             if entry["action"] == "execute" and entry["actor"] == "contact"]

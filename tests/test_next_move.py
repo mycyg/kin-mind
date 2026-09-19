@@ -263,9 +263,10 @@ def test_a_move_whose_decisions_were_refused_waits_with_them_and_still_asks_noth
 
 def test_a_want_the_host_still_gates_stands_beside_a_quiet_move_and_is_recorded_as_the_tension_it_is(world):
     """What is inconsistent is narrow on purpose. A contact wish is a want, still gated by
-    readiness, by the threshold and by quiet hours, and a step this commit set looking something up
-    never addresses the owner: neither contradicts staying quiet now. The host reads the fuller
-    word anyway, so a declared word and a derived one can be held against each other later."""
+    a current semantic decision, authorization, readiness and quiet hours; only explicit legacy
+    mode adds a score threshold. A step this commit set looking something up never addresses the
+    owner: neither contradicts staying quiet now. The host reads the fuller word anyway, so a
+    declared word and a derived one can be held against each other later."""
     plan = step_plan(world, "explore")
     asked = world.owner("owner-asks", "Anything on your mind?")
 

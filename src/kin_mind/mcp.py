@@ -108,5 +108,5 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def manage_desire(scope: Scope, request: DesireChange) -> dict:
-        """Create or change a source-backed contact, exploration or creative desire. Include strength, expiry and a concrete completion condition. User-assigned work remains a task, not a cancellable mood-dependent desire. Completion is based on actual results. These tools never send messages; the owner-bound host checks threshold, quiet hours, fresh context and delivery receipts."""
+        """Create or change a source-backed contact, exploration or creative desire. Include strength, expiry and a concrete completion condition. User-assigned work remains a task, not a cancellable mood-dependent desire. Completion is based on actual results. These tools never send messages; the owner-bound host checks the current semantic decision, existing authorization, quiet hours, fresh context and delivery receipts. Only explicitly enabled legacy mode uses the stored score threshold."""
         return Mind(engine, scope).manage_desire(request)
