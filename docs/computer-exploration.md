@@ -4,10 +4,9 @@ DeepSeek Flash/high chooses a question and its purpose in the existing appraisal
 `exploration_target` is `knowledge` (the backward-compatible default) or
 `computer`. The exploration executor runs the question for at most 1,200
 seconds — currently codex-cli with model provider DeepSeek (deepseek-flash,
-reasoning high) behind a dedicated local gateway; the legacy kimi-cli executor
-remains the rollback path (`exploration_backend` unset or `"kimi"`, requiring
-`kimi_executable`). Receipts carry executor and model provider separately, so
-consumers must not filter on `provider == "kimi-cli"`. A computer
+reasoning high) behind a dedicated local gateway; an executor that cannot start
+pauses the question with a recorded waiting reason instead of falling back to
+anything. Receipts carry executor and model provider separately. A computer
 question can concern the owner's authorized work or everyday activity. A high
 curiosity score alone does not authorize a scan: an actionable, sourced wish is
 required. There is no continuous screen recorder or new polling schedule.
@@ -28,9 +27,7 @@ system permissions or records continuously. An unavailable accessibility read
 is reported as such; file and page availability are separate facts. Office text
 is read locally; PDF text requires the optional `pdftotext` executable. The codex
 executor exposes no web access: a web-dependent gap is recorded in
-`open_questions` as unknown, never answered from model memory. Under the kimi
-rollback executor, Kimi's web tools remain available for public sources and do
-not inherit browser login.
+`open_questions` as unknown, never answered from model memory.
 
 All computer file reads pass through `ComputerReader`: configured roots and
 excluded runtime directories are checked after resolving symlinks. Credential
@@ -63,31 +60,19 @@ These keys extend an existing private host configuration:
     "roots": ["/authorized/documents"],
     "exclude_roots": ["/authorized/documents/private-runtime"],
     "snapshot_command": ["/private/bin/computer-context"],
-    "seen_database": "/private/state/computer-seen.sqlite",
-    "kimi_home": "/private/existing-kimi-login"
+    "seen_database": "/private/state/computer-seen.sqlite"
   }
 }
 ```
 
 Compile the native adapter with `swiftc adapters/computer-context.swift -o
-/private/bin/computer-context`. Under the codex executor, the same three tools
-are served by the host's own `kin_computer` MCP server, injected into the run's
-configuration alone: user configuration and rules are ignored, other MCP servers,
-hooks, multi-agent, the generic shell and web search are disabled, and the
-sandbox is read-only. No global Kimi configuration, workspace trust or desktop
-Codex setting is read or changed. Under the kimi rollback executor, `kimi_home`
-is optional and otherwise follows `KIMI_CODE_HOME` or `~/.kimi-code`; computer
-exploration creates a private Kimi home for that invocation, copies its model
-configuration and references the existing OAuth credential store, and only the
-three computer MCP tools are granted there. The custom agent profile exposes
-those tools and public web tools; it has no raw filesystem, shell, input-control
-or subagent tools. The ordinary knowledge profile is separate.
+/private/bin/computer-context`. The executor serves the same three tools from
+the host's own `kin_computer` MCP server, injected into the run's configuration
+alone: user configuration and rules are ignored, other MCP servers, hooks,
+multi-agent, the generic shell and web search are disabled, and the sandbox is
+read-only. No global CLI configuration, workspace trust or desktop Codex
+setting is read or changed. The ordinary knowledge profile is separate.
 
-The kimi rollback executor uses Kimi's documented [MCP configuration](https://moonshotai.github.io/kimi-code/en/customization/mcp),
-[custom agent tool allowlists](https://moonshotai.github.io/kimi-code/en/customization/agents)
-and [isolated configuration home](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html).
-In print mode, use `-p` with the configured rules; `--auto` cannot be combined
-with `-p`. A project-only MCP file may be omitted in an untrusted print session.
 Validate actual tool execution, not just a successful CLI exit.
 
 ## A result need not become a message

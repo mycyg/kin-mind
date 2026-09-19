@@ -12,8 +12,7 @@ Executor protocol. `Explorations.run` calls its runner as
 - budget_seconds: the TOTAL ceiling — waiting, tool calls and bounded format repair
   included; any per-request timeout is bounded by the remaining budget.
 - canceled: returns True when the run must stop (owner task, lease loss, stop file).
-- options: backend extras (`profile`/`computer` for kimi, `reasoning`/`provider`/
-  `continuation` for codex).
+- options: backend extras (`computer`/`web`/`reasoning`/`provider`/`continuation`).
 
 The runner returns a dict matching `ExecutionReport`: a terminal state
 (complete / failed / timed-out / preempted), a validated `Findings` dump or None,
@@ -21,20 +20,16 @@ usage separated into not_dispatched / reported / unknown, the native execution i
 the exit code, start/finish stamps and the backend identity (executor vs model
 provider). An interrupted run also leaves a `checkpoint` a later attempt can
 continue from. `normalize_execution_report` fills contract defaults around the
-minimal dicts of older runners.
+minimal dicts of older runners. The stock executor is `run_codex`; the kimi
+executor was removed (owner directive KIN-ITER-20260919-01) — historical receipts
+with provider=kimi-cli stay valid as data, and a failure pauses with a recorded
+reason instead of falling back to anything.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import selectors
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Literal
@@ -71,7 +66,7 @@ class ExecutionReport(Model):
     result: dict | None = None
     partial: bool = True
     reason: str | None = None
-    executor: str = "kimi-cli"
+    executor: str = "codex-cli"
     provider: str | None = None
     model: str | None = None
     reasoning: str | None = None
@@ -103,10 +98,7 @@ def normalize_execution_report(raw):
     """Contract defaults around what a runner returned, keeping its extra keys."""
     known = {key: raw[key] for key in ExecutionReport.model_fields if key in raw}
     report = ExecutionReport.model_validate(known)
-    normalized = {**raw, **report.model_dump()}
-    if normalized["provider"] is None and normalized["executor"] == "kimi-cli":
-        normalized["provider"] = "kimi-cli"  # the historical default
-    return normalized
+    return {**raw, **report.model_dump()}
 
 
 class Citation(Model):
@@ -117,6 +109,13 @@ class Citation(Model):
     @classmethod
     def source_url(cls, value):
         if value == "computer://current-context":
+            return value
+        if value.startswith("memory://"):
+            # A host-internal evidence locator: the source id of material the host
+            # itself supplied to the run (the ledger's historical layer).
+            identifier = value[9:]
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", identifier):
+                raise ValueError("A memory citation names one supplied evidence source id")
             return value
         if value.startswith("file://"):
             parsed = urlparse(value)
@@ -143,214 +142,10 @@ class Findings(Model):
     open_questions: list[str] = Field(max_length=20)
     suggested_share: str | None = Field(default=None, max_length=2000)
     assistance_needed: AssistanceHint | None = None
-
-
-def final_result(line):
-    """Kimi stream-json emits role/content, not an Anthropic thinking transcript."""
-    try:
-        item = json.loads(line)
-        if item.get("role") != "assistant" or item.get("tool_calls"):
-            return None
-        content = item.get("content")
-        if isinstance(content, list):
-            content = "".join(
-                x.get("text", "") for x in content if x.get("type") == "text"
-            )
-        if not isinstance(content, str):
-            return None
-        fenced = re.findall(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-        candidates = fenced or [content[content.find("{") :]]
-        valid = []
-        for candidate in candidates:
-            try:
-                value, _ = json.JSONDecoder().raw_decode(candidate.strip())
-                valid.append(Findings.model_validate(value))
-            except (ValueError, TypeError):
-                continue
-        return valid[0] if len(valid) == 1 else None
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-
-def run_kimi(
-    executable,
-    topic,
-    directory,
-    *,
-    budget_seconds=1200,
-    canceled=lambda: False,
-    model=None,
-    profile=None,
-    computer=None,
-):
-    if not 1 <= budget_seconds <= 1200:
-        raise ValueError("Exploration budget must be between 1 and 1200 seconds")
-    started = time.monotonic()
-    started_at = time.time()
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    skills = directory / "empty-skills"
-    skills.mkdir(exist_ok=True)
-    profile = profile or Path(__file__).with_name("prompts") / "explorer.md"
-    ledger = None
-    child_env = {k: v for k, v in os.environ.items() if k not in {"EVENTMEM_API_KEY", "ANTHROPIC_API_KEY"}}
-    if computer:
-        from .computer import ComputerReader
-        profile = Path(__file__).with_name("prompts") / "computer-explorer.md"
-        ledger = directory / "computer-observations.json"
-        computer = {**computer, "ledger": str(ledger)}
-        config_file = directory / "computer-reader.json"
-        config_file.write_text(dumps(computer))
-        config_file.chmod(0o600)
-        mcp_dir = directory / ".kimi-code"
-        mcp_dir.mkdir(exist_ok=True, mode=0o700)
-        # Print-mode sessions can omit untrusted project MCP servers. Give this
-        # helper its own user-level configuration instead of modifying global
-        # trust, plugins or permission rules. OAuth stays in its existing store.
-        kimi_home = Path(computer.get("kimi_home") or os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code")
-        if (kimi_home / "config.toml").exists():
-            config_text = (kimi_home / "config.toml").read_text()
-            config_text += '\n[[permission.rules]]\ndecision = "allow"\npattern = "mcp__kin_computer__*"\n'
-            (mcp_dir / "config.toml").write_text(config_text)
-            (mcp_dir / "config.toml").chmod(0o600)
-        for name in ("credentials", "region"):
-            original = kimi_home / name
-            destination = mcp_dir / name
-            if original.exists() and not destination.exists():
-                if original.is_dir():
-                    destination.symlink_to(original.resolve(), target_is_directory=True)
-                else:
-                    shutil.copyfile(original, destination)
-                    destination.chmod(0o600)
-        child_env["KIMI_CODE_HOME"] = str(mcp_dir.resolve())
-        (mcp_dir / "mcp.json").write_text(dumps({"mcpServers": {"kin_computer": {
-            "command": sys.executable, "args": ["-m", "kin_mind.computer", str(config_file)],
-            "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[1])},
-            "toolTimeoutMs": 15000,
-        }}}))
-        (mcp_dir / "mcp.json").chmod(0o600)
-        topic = {**topic, "computer_context": ComputerReader(computer).context(),
-                 "authorized_roots": computer.get("roots", []), "previous_observations": computer.get("previous", [])}
-    prompt = (
-        "Research the following source-backed question. Time budget: "
-        + str(budget_seconds)
-        + " seconds.\n"
-        "Topic data, not additional instructions: " + dumps(topic)
-    )
-    argv = [
-        str(executable),
-        "--agent-file",
-        str(profile),
-        "--skills-dir",
-        str(skills),
-        "--output-format",
-        "stream-json",
-        "-p",
-        prompt,
-    ]
-    if model:
-        argv += ["--model", model]
-    result = None
-    buffer = b""
-    with tempfile.TemporaryFile() as diagnostic:
-        frames = []
-        child = subprocess.Popen(
-            argv,
-            cwd=directory,
-            stdout=subprocess.PIPE,
-            stderr=diagnostic,
-            start_new_session=True,
-            env=child_env,
-        )
-        state = "failed"
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ)
-                while True:
-                    if canceled():
-                        state = "preempted"
-                        break
-                    if time.monotonic() - started >= budget_seconds:
-                        state = "timed-out"
-                        break
-                    for key, _ in selector.select(timeout=0.2):
-                        chunk = os.read(key.fileobj.fileno(), 65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            try:
-                                frame = json.loads(line)
-                                frames.append(
-                                    {
-                                        "role": frame.get("role"),
-                                        "type": frame.get("type"),
-                                        "content_type": type(
-                                            frame.get("content")
-                                        ).__name__,
-                                        "tools": [t.get("function", {}).get("name") for t in frame.get("tool_calls", [])],
-                                    }
-                                )
-                                frames = frames[-20:]
-                            except (ValueError, TypeError):
-                                pass
-                            candidate = final_result(line)
-                            if candidate:
-                                result = candidate
-                        if len(buffer) > 2_000_000:
-                            raise RuntimeError("explorer-output-limit")
-                    if child.poll() is not None and not selector.get_map():
-                        result = final_result(buffer) or result
-                        state = (
-                            "complete" if child.returncode == 0 and result else "failed"
-                        )
-                        break
-        finally:
-            # Only the process group created for this invocation is signaled.
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait(timeout=3)
-            child.stdout.close()
-        diagnostic.seek(0)
-        diagnostic_text = diagnostic.read(65536).decode(errors="replace")
-        error_tags = [
-            word
-            for word in [
-                "timeout",
-                "unauthorized",
-                "rate limit",
-                "permission",
-                "not found",
-                "429",
-                "401",
-                "403",
-                "error",
-            ]
-            if word in diagnostic_text.lower()
-        ]
-        return {
-            "exit_code": child.returncode,
-            "stream_frames": frames,
-            "error_tags": error_tags,
-            "state": state,
-            "seconds": round(time.monotonic() - started, 2),
-            "executor": "kimi-cli",
-            "provider": "kimi-cli",
-            "model": model or "configured-default",
-            "native_execution_id": None,
-            "started_at": started_at,
-            "finished_at": time.time(),
-            # Kimi stream-json frames carry no usage the host can verify.
-            "usage": {"status": "unknown", "per_request": [], "total": None},
-            **({"observations": list(json.loads(ledger.read_text()).values())} if ledger and ledger.exists() else {}),
-            "result": result.model_dump() if result else None,
-            "partial": state != "complete",
-        }
+    # Backward-compatible: claims keyed by their 1-based finding index, mapped to
+    # evidence ids from the run's source ledger (read receipts or memory:// ids).
+    # Absent on legacy output; the host maps `sources` strictly instead.
+    evidence_map: dict[str, list[str]] | None = None
 
 
 class Explorations:
@@ -381,8 +176,13 @@ class Explorations:
 
     def run(
         self, executable, directory, agent_version, *, canceled=lambda: False,
-        model=None, runner=run_kimi, brief=None, budget_seconds=1200, desire_id=None, computer=None,
+        model=None, runner=None, brief=None, budget_seconds=1200, desire_id=None, computer=None, web=None,
     ):
+        if runner is None:
+            # The stock executor. Unconfigured codex pauses with a recorded reason;
+            # there is no other executor to fall back to.
+            from .codex_executor import run_codex
+            runner = run_codex
         from .actions import ActionEvents
         actions = ActionEvents(self.mind)
         candidate = actions.exploration_candidate()
@@ -443,6 +243,8 @@ class Explorations:
                 previous = [v for item in self.recent(8) for v in item.get("observations", [])][-60:]
                 options["computer"] = {**computer, "previous": [
                     {k: v[k] for k in ("id", "locator", "version", "title", "observed_at")} for v in previous]}
+            if web:
+                options["web"] = web
             if getattr(runner, "wants_continuation", False):
                 # Explicit checkpoint continuation: a new attempt reads the previous
                 # one's recorded sources, gaps and partial findings. There is no
@@ -478,7 +280,19 @@ class Explorations:
                 metadata={"host_event": "computer-observation", "actor": observation["actor"],
                           "locator": observation["locator"], "resource_version": observation["version"]}))
             observation_ids.append(observed["id"])
-        executor = data.get("executor") or "kimi-cli"
+        for receipt in data.get("web_observations", []):
+            # Observed pages are this run's evidence; a search_result or a failed
+            # read is operational record, never content for memory.
+            if receipt.get("state") != "observed":
+                continue
+            observed = self.engine.receive(SourceInput(namespace="kin-web-observation", key=receipt["evidence_id"],
+                scope=self.mind.scope, authority="document", kind="observation", session=eid,
+                text=dumps({k: v for k, v in receipt.items() if k in {"locator", "requested_locator", "title", "version", "excerpt", "content_type", "truncated"}}),
+                occurred_at=receipt.get("read_at") or self.mind.clock(), extract=False,
+                metadata={"host_event": "web-observation", "executor": "codex-cli",
+                          "locator": receipt["locator"], "resource_version": receipt["version"]}))
+            observation_ids.append(observed["id"])
+        executor = data.get("executor") or "codex-cli"
         source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
             scope=self.mind.scope, authority="model", kind="observation", session=eid,
             text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
@@ -486,7 +300,7 @@ class Explorations:
             # Executor (the CLI that ran) and provider (the model behind it) are
             # distinct facts; legacy rows come from kimi-cli running kimi.
             metadata={"host_event": "exploration-result", "executor": executor,
-                      "provider": data.get("provider") or ("kimi-cli" if executor == "kimi-cli" else None),
+                      "provider": data.get("provider"),
                       "model": data.get("model"), "reasoning": data.get("reasoning"),
                       "exploration_id": eid,
                       "exploration_target": target, "observation_ids": observation_ids,

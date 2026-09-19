@@ -90,11 +90,9 @@ def dispatch(config, action, request):
     observation_file = config.get("session_observation_file")
     if observation_file and Path(observation_file).exists():
         session_context = json.loads(Path(observation_file).read_text())
-    jobs = Appraisals(mind, exploration_capabilities={
-        "computer": bool(config.get("computer_exploration", {}).get("enabled")),
-        "decisions": bool(config.get("exploration_decisions_enabled")),
-        "version": config.get("agent_version"),
-    }, session_context=session_context)
+    from .codex_executor import exploration_capabilities
+    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(config),
+                      session_context=session_context)
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
     actions = ActionEvents(mind)
@@ -429,40 +427,34 @@ def dispatch(config, action, request):
                 "autonomy": view.get("autonomy", {})}
     if action == "explore":
         stop = Path(config["exploration_stop_file"])
-        backend = config.get("exploration_backend") or "kimi"
-        if backend == "codex":
-            # The backend switch is explicit config. An executor that cannot start
-            # pauses the exploration with a recorded reason; there is no fallback.
-            from .codex_executor import prepare_codex_exploration
-            prepared = prepare_codex_exploration(config)
-            if prepared["state"] != "ready":
-                return prepared
-            budget = min(int(request.get("budget_seconds") or prepared["budget_seconds"]),
-                         prepared["budget_seconds"])
-            return explorer.run(
-                prepared["executable"],
-                config["exploration_directory"],
-                config["agent_version"],
-                canceled=stop.exists,
-                model=prepared["model"],
-                runner=prepared["runner"],
-                brief=request.get("brief"),
-                desire_id=request.get("desire_id"),
-                budget_seconds=budget,
-                computer=config.get("computer_exploration"),
-            )
-        if backend != "kimi":
-            raise ValueError("Unknown exploration_backend: " + str(backend))
+        backend = config.get("exploration_backend") or "codex"
+        if backend != "codex":
+            # Exploration is codex-cli/DeepSeek only (KIN-ITER-20260919-01). There is
+            # no kimi fallback: an unknown backend pauses instead of running anything.
+            return {"state": "waiting", "reason": "exploration-backend-unknown",
+                    "detail": str(backend)}
+        from .codex_executor import exploration_capabilities, prepare_codex_exploration
+        prepared = prepare_codex_exploration(config)
+        if prepared["state"] != "ready":
+            return prepared
+        capabilities = exploration_capabilities(config)
+        web = None
+        if capabilities["capabilities"]["search"]["available"]:
+            web = {**(config.get("exploration_web") or {}), "enabled": True}
+        budget = min(int(request.get("budget_seconds") or prepared["budget_seconds"]),
+                     prepared["budget_seconds"])
         return explorer.run(
-            config["kimi_executable"],
+            prepared["executable"],
             config["exploration_directory"],
             config["agent_version"],
             canceled=stop.exists,
-            model=config.get("kimi_model"),
+            model=prepared["model"],
+            runner=prepared["runner"],
             brief=request.get("brief"),
             desire_id=request.get("desire_id"),
-            budget_seconds=request.get("budget_seconds", 1200),
+            budget_seconds=budget,
             computer=config.get("computer_exploration"),
+            web=web,
         )
     if action == "candidate":
         return mind.contact_candidate()

@@ -94,7 +94,7 @@ flowchart LR
 
 DeepSeek uses the host's existing credentials for memory extraction, organization and affect assessment. Proposals enter a durable queue and are committed after version checks; failures preserve the previous state. Chat can read the committed state and see pending assessments.
 
-When there is a question I want to understand and DeepSeek judges exploration appropriate, it selects the topic using memory and the exploration executor explores it for up to **20 minutes** — currently codex-cli running DeepSeek (deepseek-flash, reasoning high) through a dedicated local gateway. User tasks take priority. I read the findings, sources and open questions; DeepSeek then assesses emotion and sharing intent. I can talk about a discovery, a doubt, a feeling or a strange thought it sparked. Finishing a question consumes its intent, and conversation can also begin without exploration. Luna can be connected through another host adapter; the executor is chosen by host configuration, with Kimi CLI kept as the rollback path.
+When there is a question I want to understand and DeepSeek judges exploration appropriate, it selects the topic using memory and the exploration executor explores it for up to **20 minutes** — currently codex-cli running DeepSeek (deepseek-flash, reasoning high) through a dedicated local gateway. User tasks take priority. I read the findings, sources and open questions; DeepSeek then assesses emotion and sharing intent. I can talk about a discovery, a doubt, a feeling or a strange thought it sparked. Finishing a question consumes its intent, and conversation can also begin without exploration. Luna can be connected through another host adapter; the exploration executor is codex-cli running DeepSeek (deepseek-flash, reasoning high).
 
 I can also wonder what she is working on and follow a question through computer content she has authorized. Work and everyday life can both provide clues. The executor reads windows and files on demand, retaining sources and versions; web access is unavailable there, so web-dependent gaps are recorded as unknown. DeepSeek then explicitly chooses to share, defer or keep the finding; a restart or a persistently high score does not repeat that decision's message.
 
@@ -119,7 +119,7 @@ node --test adapters/owner-host.test.mjs
 uv run python examples/mind_demo.py
 ```
 
-The example runs in a temporary database and does not access personal memory. A production host needs an existing database, a dedicated scope, a configuration version, an environment variable for DeepSeek credentials and exploration executor configuration (codex CLI; the rollback path still needs Kimi CLI login configuration).
+The example runs in a temporary database and does not access personal memory. A production host needs an existing database, a dedicated scope, a configuration version, an environment variable for DeepSeek credentials and exploration executor configuration (codex CLI).
 
 MCP adds four interfaces:
 
