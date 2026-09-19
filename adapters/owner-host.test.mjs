@@ -52,6 +52,22 @@ test('needs-review without proof of a wholly unsent batch remains reconciliation
  loop.review=async()=>{};await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');assert.equal(events.at(-1)[1].failure.retry_condition,'reconcile');
 });
 
+test('a superseded wholly-unsent attempt releases for DS review instead of host abandonment',async()=>{
+ const events=[];const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-2',isBusy:()=>false,
+   resume:async()=>({state:'canceled',safeToRelease:true,acceptedBubbles:0}),
+   call:async(action,request)=>{events.push([action,request]);if(action==='candidate')return{eligible:false,reason:'attempt-in-progress',state:'pending',attempt_id:'old',owner_epoch:'owner-1'};return request;}});
+ loop.review=async()=>{};await loop.tick();const settled=events.at(-1)[1];
+ assert.equal(settled.state,'canceled');assert.equal(settled.aborted_before_send,true);assert.equal(settled.reason,'contact-source-changed');
+ assert.equal(settled.decision,undefined);assert.equal(settled.failure.category,'source-changed');
+});
+
+test('only the semantic decision carried by a safe batch can retire a wish',async()=>{
+ const semantic={action:'abandon',reason:'The group repeats something already shared'};
+ const{loop,events}=fixture({send:async()=>({state:'canceled',safeToRelease:true,acceptedBubbles:0,decision:semantic})});
+ await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'canceled');assert.deepEqual(settled.decision,semantic);
+ assert.equal(settled.reason,undefined);
+});
+
 test('a malformed review verdict remains pre-send and releases the owner slot for DS review',async()=>{
  const journal=new Map();let transports=0;
  const send=createContactBatch({read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),

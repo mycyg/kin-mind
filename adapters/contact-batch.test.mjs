@@ -21,7 +21,7 @@ test('duplicate body does not leave a new orphan introduction',async()=>{
  let state,calls=0;
  const send=createContactBatch({read:()=>state,write:(_,v)=>{state=v;},preflight:async r=>({state:r.entries.some(e=>e.text==='body')?'duplicate':'ready'}),send:async()=>{calls++;}});
  const result=await send({id:'duplicate',bubbles:['Introduction:','body']});
- assert.equal(result.state,'canceled');assert.equal(calls,0);
+ assert.equal(result.state,'canceled');assert.equal(result.decision.action,'abandon');assert.equal(result.decision.reason,'duplicate');assert.equal(calls,0);
 });
 
 test('partial receipt reconciles the same ID then sends only unsent bubbles after restart',async()=>{

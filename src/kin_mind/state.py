@@ -1452,7 +1452,7 @@ class Mind(Continuity):
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-review-failed"}):
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-source-changed", "contact-review-failed"}):
                 current = self._load(conn)
                 desire = current["desires"].get(attempt["desire_id"])
                 # An empty draft is a decision to wait, not a failed send. Do not
@@ -1478,10 +1478,11 @@ class Mind(Continuity):
                         decision = ContactDecision(action="wait",
                             reason="The wholly unsent contact batch needs a new DeepSeek decision",
                             condition="new_evidence")
-                    elif reason == "draft-source-changed":
+                    elif reason in {"draft-source-changed", "contact-source-changed"}:
                         stranded = True
                         decision = ContactDecision(action="wait",
-                            reason="The draft source changed before model execution",
+                            reason=("The draft source changed before model execution" if reason == "draft-source-changed"
+                                    else "The owner context changed before the wholly unsent contact could be delivered"),
                             condition="new_evidence")
                     decision = decision or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
                     desire.update(status="abandoned" if decision.action == "abandon" else "waiting", revision=desire["revision"] + 1,

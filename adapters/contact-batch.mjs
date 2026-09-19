@@ -256,8 +256,9 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
    * one reason, and that reason stays on the finished batch. What was already
    * sent stays sent; the review precedes the first bubble, so usually nothing was. */
   async function refuse(batch,id,reason) {
+    const semanticReason=typeof reason==='string'&&reason.trim()?reason.trim().slice(0,1200):'Whole-group semantic review declined the unsent draft';
     for(const item of batch.items.filter(x=>x.state==='unsent'))Object.assign(item,{state:'canceled',reason});
-    batch.reason=reason;batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'canceled';
+    batch.reason=reason;batch.decision={action:'abandon',reason:semanticReason};batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'canceled';
     batch.safeToRelease=!batch.deliveryStarted&&!batch.items.some(x=>BEGUN.includes(x.state));delete batch.failure;
     await write(id,batch);return result(batch);
   }
@@ -266,7 +267,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     messageIds:ids,acceptedBubbles:ids.length,totalBubbles:batch.items.length,
     canceledBubbles:batch.items.filter(x=>x.state==='canceled').length,
     partial:batch.items.some(x=>x.state==='canceled'),visibility:'unverified',
-    ...(batch.failure?{failure:batch.failure}:{}),...(batch.safeToRelease?{safeToRelease:true}: {})};}
+    ...(batch.failure?{failure:batch.failure}:{}),...(batch.decision?{decision:batch.decision}:{}),
+    ...(batch.safeToRelease?{safeToRelease:true}: {})};}
   return request=>{
     if(active.has(request.id))return active.get(request.id);
     const pending=run(request).finally(()=>active.delete(request.id));active.set(request.id,pending);return pending;

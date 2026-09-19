@@ -663,6 +663,28 @@ def test_source_change_before_model_call_is_not_counted_as_a_bad_draft(setup):
     assert "contact_failures" not in desire and "contact_review_failures" not in desire
 
 
+def test_owner_change_releases_only_the_unsent_attempt_and_queues_wish_review(setup):
+    mind, source, _clock = setup
+    wish(mind, source)
+    mind.record(event(mind, source, "ready-owner-change", {"initiative": 95}))
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=attempt["id"], state="pending")
+    receipt = mind.settle_contact(
+        attempt_id=attempt["id"], state="canceled", reason="contact-source-changed",
+        aborted_before_send=True,
+        failure={"category":"source-changed", "stage":"contact-send-boundary",
+                 "code":"contact-owner-epoch-superseded", "retry_condition":"deepseek-decision"},
+    )
+    assert receipt["decision"]["action"] == "wait"
+    desire = mind.read()["desires"][0]
+    assert desire["status"] == "waiting"
+    assert "contact_failures" not in desire and "contact_review_failures" not in desire
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,data FROM mind_action_events WHERE kind='wish-review'").fetchone()
+    assert row["state"] == "pending"
+    assert json.loads(row["data"])["failure"]["code"] == "contact-owner-epoch-superseded"
+
+
 def test_contact_failure_receipt_is_static_and_cannot_accompany_acceptance(setup):
     mind, source, _clock = setup
     wish(mind, source)

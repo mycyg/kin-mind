@@ -383,6 +383,10 @@ state is durable may the owner host release the active contact slot and queue th
 for a fresh DeepSeek continue/rewrite/abandon decision. A transport retry budget may
 use the same release only when every item durably records a terminal `never-started`
 receipt. A pending or unknown send can never use it and remains reconciliation-only.
+If a new owner turn supersedes a wholly-unsent attempt, the host releases that attempt
+as a source change and queues the still-valid wish for DeepSeek review; it does not
+invent an `abandon` decision. A semantic whole-group refusal carries the actual review
+decision through the batch receipt, so only that decision can retire the wish.
 Quiet hours, eligibility, the owner epoch guard and free local checks spend neither
 budget.
 
