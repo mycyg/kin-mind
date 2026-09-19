@@ -5,11 +5,16 @@ import pytest
 from eventmem.core import Engine
 from eventmem.core.db import Conflict, Missing
 from eventmem.core.models import RevisionInput, Scope, SourceInput
+from eventmem.core.read_policy import ReadPolicy
 from kin_mind.context import Contexts
-from kin_mind.graph import GraphAssessment, GraphEdge, GraphNode
+from kin_mind.graph import EventGraph, GraphAssessment, GraphEdge, GraphNode
 from kin_mind.memory import MemoryAssessment, MemoryContinuity
-from kin_mind.sharing import ContentReference, CoverageAssessment, CoverageMapping
-from kin_mind.sharing import ShareCheck
+from kin_mind.sharing import (
+    ContentReference,
+    CoverageAssessment,
+    CoverageMapping,
+    ShareCheck,
+)
 from kin_mind.state import Mind
 
 
@@ -81,6 +86,100 @@ def send(system, unit, *, bubble="one", state="accepted", channel="a", mode="new
     if state == "accepted":
         event["message_id"] = channel + "-receipt-" + bubble
     return memory.ingest(event)
+
+
+def freshness_graph(system):
+    mind, memory, source, _ = system
+    graph = memory.graph
+    sid = source("freshness-cache", "One source supports two nodes and repeated edges.")
+    with mind.engine.db.connect(write=True) as conn:
+        refs = graph.proof(conn, [sid])
+        left = graph._put(conn, {"id": "freshness-left", "kind": "event", "title": "left",
+                                 "text": "", "source_ids": [sid], "evidence": refs,
+                                 "basis": "documented"})
+        right = graph._put(conn, {"id": "freshness-right", "kind": "event", "title": "right",
+                                  "text": "", "source_ids": [sid], "evidence": refs,
+                                  "basis": "documented"})
+        edges = [graph.link(conn, left["id"], relation, right["id"], refs,
+                            reason="Repeated endpoint freshness fixture")
+                 for relation in ("related", "supports", "continues")]
+    policy = ReadPolicy.load(mind.engine, mind.scope, "audit")
+    return graph, sid, refs[0]["record_id"], left["id"], edges, policy
+
+
+def test_graph_read_freshness_cache_reuses_repeated_edges_and_matches_uncached(system, monkeypatch):
+    mind = system[0]
+    graph, _, record_id, focus, _, policy = freshness_graph(system)
+    original_evidence_fresh = mind._fresh
+    original_get = graph.get
+    calls, gets = [], []
+
+    def counted(conn, refs):
+        calls.append([ref["record_id"] for ref in refs])
+        return original_evidence_fresh(conn, refs)
+
+    def counted_get(conn, identifier, **kwargs):
+        gets.append(identifier)
+        return original_get(conn, identifier, **kwargs)
+
+    monkeypatch.setattr(mind, "_fresh", counted)
+    monkeypatch.setattr(graph, "get", counted_get)
+    actual = graph.read(focus=focus, hops=1, limit=20, policy=policy)
+    assert len(actual["edges"]) == 3
+    assert calls == [[record_id]]
+    cached_gets = len(gets)
+    assert cached_gets == 1
+
+    cached_fresh = graph._fresh_value
+
+    def uncached(conn, node, **_):
+        return cached_fresh(conn, node)
+
+    calls.clear(); gets.clear()
+    monkeypatch.setattr(graph, "_fresh_value", uncached)
+    expected = graph.read(focus=focus, hops=1, limit=20, policy=policy)
+    assert actual == expected
+    assert len(calls) == 11
+    assert len(gets) == 7
+
+
+def test_graph_read_freshness_cache_is_request_local_after_correction(system):
+    mind = system[0]
+    graph, _, record_id, focus, _, policy = freshness_graph(system)
+    current = graph.read(focus=focus, hops=1, limit=20, policy=policy)
+    assert all(not item["needs_review"] for item in [*current["nodes"], *current["edges"]])
+
+    record = mind.engine.get(record_id)
+    mind.engine.revise(record_id, RevisionInput(
+        action="correct", expected_revision=record["revision"], command_id="correct-freshness-cache",
+        reason="The synthetic source was corrected", content="Corrected synthetic evidence."))
+
+    corrected = graph.read(focus=focus, hops=1, limit=20, policy=policy)
+    assert all(item["needs_review"] for item in [*corrected["nodes"], *corrected["edges"]])
+
+
+def test_graph_read_freshness_cache_keeps_deletion_scoped(tmp_path):
+    engine = Engine(tmp_path / "db")
+    worlds = []
+    for persona in ("freshness-scope-a", "freshness-scope-b"):
+        scope = Scope(persona=persona)
+        mind = Mind(engine, scope, clock=lambda: "2026-09-17T12:00:00.000000+00:00")
+        graph = EventGraph(mind)
+        sid = engine.receive(SourceInput(namespace="synthetic", key="same-key", scope=scope,
+            text=f"Evidence for {persona}", authority="explicit", occurred_at=mind.clock(), extract=False))["id"]
+        with engine.db.connect(write=True) as conn:
+            refs = graph.proof(conn, [sid])
+            node = graph._put(conn, {"id": graph.identifier("event", ["same-key"]), "kind": "event",
+                "title": persona, "text": "", "source_ids": [sid], "evidence": refs,
+                "basis": "documented"})
+        worlds.append((graph, sid, node["id"]))
+
+    for graph, _, focus in worlds:
+        assert not graph.read(focus=focus, hops=0)["nodes"][0]["needs_review"]
+
+    engine.delete(worlds[0][1])
+    assert worlds[0][0].read(focus=worlds[0][2], hops=0)["nodes"][0]["needs_review"]
+    assert not worlds[1][0].read(focus=worlds[1][2], hops=0)["nodes"][0]["needs_review"]
 
 
 def test_accepted_bubble_immediately_blocks_rewording_across_channels(system):
@@ -325,6 +424,7 @@ def test_history_queue_is_newest_first_persistent_and_does_not_change_affect(sys
 
 def test_exploration_only_migration_finishes_every_page(system):
     import json
+
     from kin_mind.exploration import Explorations
     from kin_mind.graph_migration import GraphMigration
     mind,memory,source,_=system

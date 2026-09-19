@@ -180,6 +180,32 @@ def test_graph_read_and_its_hops_do_not_cross_a_hidden_projection(world):
                for e in graph.read(focus=nodes["lived"]["id"], hops=2)["edges"])
 
 
+def test_graph_read_freshness_cache_preserves_hidden_evidence_policy(world, monkeypatch):
+    graph, ids = world["memory"].graph, world["ids"]
+    nodes = project(world, ("lived", "configuration"))
+    with world["engine"].db.connect(write=True) as conn:
+        refs = graph.proof(conn, [ids["lived"]])
+        for relation in ("related", "supports"):
+            graph.link(conn, nodes["lived"]["id"], relation, nodes["configuration"]["id"], refs,
+                       reason="Hidden evidence cache fixture")
+
+    cached = graph.read(focus=nodes["lived"]["id"], hops=1)
+    original_fresh = graph._fresh_value
+
+    def uncached(conn, node, **_):
+        return original_fresh(conn, node)
+
+    monkeypatch.setattr(graph, "_fresh_value", uncached)
+    expected = graph.read(focus=nodes["lived"]["id"], hops=1)
+    assert cached == expected
+    assert {node["id"] for node in cached["nodes"]} == {nodes["lived"]["id"]}
+    assert cached["edges"] == []
+
+    audited = graph.read(focus=nodes["lived"]["id"], hops=1, policy=policy(world, "audit"))
+    assert nodes["configuration"]["id"] in {node["id"] for node in audited["nodes"]}
+    assert len(audited["edges"]) == 2
+
+
 def test_graph_item_text_fallback_never_carries_a_role_declaration(world):
     """The projection of a role declaration has no text of its own. Falling back to the record
     is what carried the whole persona text out under basis `explicit`."""
