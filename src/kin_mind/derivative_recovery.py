@@ -1043,6 +1043,42 @@ def _model_usage(receipt) -> tuple[int | float | None, int | float | None, str]:
     return None, None, status
 
 
+def _digest_cost_identity(row, data, rec, verification, *, require_verification=False) -> list[str]:
+    """Return every reason a current digest cannot own the recovered job's receipt."""
+    issues = []
+    expected_generation = rec.get("generation")
+    expected_hash = rec.get("membership_input_hash")
+    if row is None:
+        issues.append("current-digest-missing")
+    else:
+        if row["state"] != "ready":
+            issues.append("current-digest-not-ready")
+        if not isinstance(expected_generation, int) or row["generation"] != expected_generation:
+            issues.append("current-generation-mismatch")
+        if expected_hash is not None and row["input_hash"] != expected_hash:
+            issues.append("current-membership-mismatch")
+    if verification is None:
+        if require_verification:
+            issues.append("digest-verification-missing")
+        return issues
+    if verification.get("verified") is not True:
+        issues.append("digest-verification-failed")
+    if verification.get("generation") != expected_generation:
+        issues.append("verification-generation-mismatch")
+    if expected_hash is not None and verification.get("membership_input_hash") != expected_hash:
+        issues.append("verification-membership-mismatch")
+    if row is not None:
+        if row["generation"] != verification.get("generation"):
+            issues.append("current-verification-generation-mismatch")
+        if row["revision"] != verification.get("digest_revision"):
+            issues.append("current-verification-revision-mismatch")
+        if row["input_hash"] != verification.get("membership_input_hash"):
+            issues.append("current-verification-membership-mismatch")
+        if data.get("source_versions") != verification.get("source_versions"):
+            issues.append("current-verification-sources-mismatch")
+    return issues
+
+
 def collect_costs(engine, result) -> list[dict]:
     """Per-item cost of a run: final state and wall time for every recovered job;
     for digests also the model receipt the normal digest path committed.
@@ -1061,6 +1097,11 @@ def collect_costs(engine, result) -> list[dict]:
     with engine.db.connect() as conn:
         for cycle in result["cycles"]:
             vector_revisions = (cycle.get("vector_verification") or {}).get("revisions", {})
+            verifications = cycle.get("digest_verification") or []
+            verification_by_target = {
+                (_scope_key(item["scope"]), item["event_id"], item["job_id"]): item
+                for item in verifications
+            }
             for target in cycle["embeds"].get("targets", []):
                 job_id = target["job_id"]
                 if ("embed", job_id) in seen:
@@ -1095,8 +1136,13 @@ def collect_costs(engine, result) -> list[dict]:
                     "WHERE scope=? AND event_id=?",
                     (scope_key, rec["event_id"]),
                 ).fetchone()
-                data = json.loads(row["data"]) if row and row["state"] == "ready" else {}
-                receipt = data.get("model_receipt")
+                data = json.loads(row["data"]) if row else {}
+                verification = verification_by_target.get((scope_key, rec["event_id"], rec["job_id"]))
+                attribution_issues = _digest_cost_identity(
+                    row, data, rec, verification, require_verification=bool(verifications)
+                )
+                identity_matched = not attribution_issues
+                receipt = data.get("model_receipt") if identity_matched else None
                 receipt = receipt if isinstance(receipt, dict) else {}
                 input_tokens, output_tokens, usage_status = _model_usage(receipt)
                 costs.append({
@@ -1106,7 +1152,16 @@ def collect_costs(engine, result) -> list[dict]:
                     "generation": row["generation"] if row else None,
                     "digest_revision": row["revision"] if row else None,
                     "membership_input_hash": row["input_hash"] if row else None,
-                    "source_versions": data.get("source_versions"),
+                    "expected_generation": rec.get("generation"),
+                    "expected_digest_revision": verification.get("digest_revision") if verification else None,
+                    "expected_membership_input_hash": (
+                        verification.get("membership_input_hash") if verification
+                        else rec.get("membership_input_hash")
+                    ),
+                    "digest_identity_matched": identity_matched,
+                    "attribution_status": "matched" if identity_matched else "unknown-digest-identity-mismatch",
+                    "attribution_issues": attribution_issues,
+                    "source_versions": data.get("source_versions") if identity_matched else None,
                     "model": receipt.get("model"),
                     "reasoning": receipt.get("reasoning"),
                     "input_tokens": input_tokens,

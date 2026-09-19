@@ -541,9 +541,60 @@ def test_runner_reports_digest_receipt_per_event(system, monkeypatch):
     assert cost["model"] == "synthetic" and cost["reasoning"] == "high"
     assert cost["input_tokens"] == 12 and cost["output_tokens"] == 7
     assert cost["usage_status"] == "reported"
+    assert cost["digest_identity_matched"] is True and not cost["attribution_issues"]
     (summary,) = outcome["costs_by_scope"]
     assert summary["input_tokens"] == 12 and summary["output_tokens"] == 7
     assert summary["token_receipts"] == 1 and summary["usage_status"] == "reported"
+
+
+@pytest.mark.parametrize(("generation", "revision", "input_hash", "expected_issue"), [
+    (5, 2, "input", "current-generation-mismatch"),
+    (4, 3, "input", "current-verification-revision-mismatch"),
+    (4, 2, "new-input", "current-membership-mismatch"),
+])
+def test_digest_cost_does_not_attribute_a_moved_digest(
+        system, generation, revision, input_hash, expected_issue):
+    engine = system[0].engine
+    event_id = "evt_moved_cost"
+    scope_obj = Scope(persona="moved-cost")
+    with engine.db.connect(write=True) as conn:
+        conn.execute(
+            "INSERT INTO mind_event_digests(scope,event_id,state,generation,revision,input_hash,dirty_at,due_at,data) "
+            "VALUES(?,?, 'ready', ?, ?, ?, '2026-09-19T00:00:00+00:00', 0, ?)",
+            (scope_obj.key(), event_id, generation, revision, input_hash, json.dumps({
+                "model_receipt": {"model": "newer", "usage": {
+                    "input_tokens": 99, "output_tokens": 88,
+                }},
+                "source_versions": {},
+            })),
+        )
+    recovered = {
+        "scope": scope_obj.model_dump(), "event_id": event_id,
+        "job_id": "job_original", "generation": 4,
+        "membership_input_hash": "input",
+    }
+    verification = {
+        **recovered, "digest_revision": 2, "source_versions": {},
+        "state": "ready", "verified": True,
+    }
+    result = {
+        "command_id": "moved-cost",
+        "cycles": [{
+            "embeds": {"targets": []},
+            "digests": {"recovered": [recovered], "replayed": []},
+            "digest_verification": [verification],
+        }],
+    }
+    (cost,) = dr.collect_costs(engine, result)
+    assert cost["digest_identity_matched"] is False
+    assert cost["attribution_status"] == "unknown-digest-identity-mismatch"
+    assert expected_issue in cost["attribution_issues"]
+    assert cost["model"] is None
+    assert cost["input_tokens"] is None and cost["output_tokens"] is None
+    assert cost["usage_status"] == "unknown"
+    (summary,) = dr.costs_by_scope([cost])
+    assert summary["input_tokens"] is None and summary["output_tokens"] is None
+    assert summary["token_receipts"] == 0 and summary["usage_status"] == "unknown"
 
 
 def test_target_moved_between_plan_and_apply_abandons_cleanly(system, monkeypatch):
