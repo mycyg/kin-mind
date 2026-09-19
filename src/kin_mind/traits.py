@@ -13,8 +13,9 @@ It never judges the trait itself: that sentence is Kin's own.
   observation that is not Kin's own words.
 - A **tombstone** is what a revoked trait leaves behind: the reason, the source that revoked it,
   and a history that stays readable. Proposing it again needs an owner statement newer than it.
-- **Fading** is nobody's decision. A trait whose support has decayed away reads as fading, on the
-  same curve effective use already decays by, and the next write of the ledger records it.
+- **Fading** is a semantic decision from the same appraisal that interprets the evidence. The
+  host exposes support recency on the existing decay curve, but elapsed time never changes a
+  trait's status by itself.
 """
 
 from __future__ import annotations
@@ -62,15 +63,14 @@ CREATE TABLE IF NOT EXISTS mind_trait_dependents(
  PRIMARY KEY(scope,trait_id,kind,dependent_id));
 """
 
-# A candidate already acts. `established` says the shared history carries it, `fading` that its
-# support decayed, `needs_review` that a source moved under it, `revoked` that it is over.
+# A candidate already acts. `established` says the shared history carries it, `fading` that the
+# appraisal judged it to be fading, `needs_review` that a source moved under it, `revoked` that it
+# is over.
 EFFECTIVE = ("candidate", "established")
 # The two audited sections this module owns, and whose refusals its projection carries back.
 SECTIONS = ("trait_observations", "trait_decisions")
-# The half-life effective use already decays by, with one support at one half-life as the floor.
-# No support inside that period leaves a trait fading; this is not a threshold for promotion.
+# The half-life used to expose evidence recency to the appraisal. It is context, not a state gate.
 SUPPORT_HALF_LIFE_DAYS = 30
-FADE_FLOOR = 0.5
 # What the persona contract calls the same category. The contract itself decides which of them a
 # trait may use; this only spells one category one way before asking it.
 CATEGORY_ALIASES = {"兴趣": "interests", "审美": "aesthetics", "幽默": "humor",
@@ -96,7 +96,7 @@ def local_day(at):
 
 
 def support_strength(observations, at):
-    """What is left of the support, on the curve effective use already decays by."""
+    """A bounded recency signal for the appraisal, never a verdict about the trait."""
     total = 0.0
     for observation in observations:
         if observation["polarity"] != "support":
@@ -248,7 +248,6 @@ class Traits:
         touched = {row["trait_id"] for row in stored}
         for identifier in touched:
             self._recount(conn, identifier, at)
-        self._settle(conn, at, skip=touched)
         return stored
 
     def _store(self, conn, row, identifier, episode, polarity):
@@ -279,7 +278,6 @@ class Traits:
             refs = (AutonomousPlans(self.mind)._refs(conn, decision.evidence_ids, allowed)
                     if decision.evidence_ids else [])
             applied.append(self._decide(conn, decision, command + ":" + str(index), receipt, refs, policy, event_id, at, cache))
-        self._settle(conn, at, skip={t["id"] for t in applied})
         return applied
 
     def _decide(self, conn, decision, command, receipt, refs, policy, event_id, at, cache):
@@ -312,8 +310,8 @@ class Traits:
         support = [o for o in self.observations(conn, trait["id"]) if o["polarity"] == "support"]
         if decision.action == "establish":
             self._established(conn, trait, decision, support, cache)
-        if decision.action == "restore" and support_strength(support, at) < FADE_FLOOR:
-            raise Conflict("A faded trait needs new support before it stands again",
+        if decision.action == "restore" and not support:
+            raise Conflict("A faded trait needs valid support before it stands again",
                            code="trait-needs-support", target=trait["id"])
         if decision.basis in {"owner_instruction", "owner_correction"} and not owner:
             raise Conflict("An owner instruction or correction must quote the owner's own words",
@@ -428,19 +426,6 @@ class Traits:
 
     # --- the facts the host counts -----------------------------------------------------------------
 
-    def _settle(self, conn, at, skip=()):
-        """A trait whose support decayed away is fading. Nobody decided that; it is written down
-        here so the history says when, and every projection reads the same predicate before it."""
-        for row in conn.execute("SELECT id FROM mind_traits WHERE scope=? AND status IN ('candidate','established')",
-                                (self.scope,)).fetchall():
-            if row[0] in skip:
-                continue
-            trait = self.get(conn, row[0])
-            if support_strength(self.observations(conn, trait["id"]), at) >= FADE_FLOOR:
-                continue
-            trait.update(status="fading", revision=trait["revision"] + 1, faded_at=at)
-            self._save(conn, trait, "fade:" + local_day(at), at)
-
     def _recount(self, conn, identifier, at):
         trait = self._find(conn, identifier)
         if not trait:
@@ -471,7 +456,6 @@ class Traits:
         found["distinct_episodes"] = len({o["episode_key"] for o in observations})
         found["single_window"] = found["distinct_episodes"] == 1
         found["counter_examples"] = sum(found["counter"].values())
-        found["fading"] = found["support_strength"] < FADE_FLOOR
         return found
 
     # --- what a reader is shown ---------------------------------------------------------------------
@@ -480,7 +464,7 @@ class Traits:
         facts = self.facts(conn, trait["id"], at)
         return {"id": trait["id"], "category": trait["category"], "slug": trait["slug"], "key": trait["key"],
                 "text": trait.get("text", ""), "revision": trait["revision"], "basis": trait.get("basis"),
-                "status": "fading" if facts["fading"] and trait["status"] in EFFECTIVE else trait["status"],
+                "status": trait["status"],
                 "stored_status": trait["status"], "reason": trait.get("reason", ""),
                 "updated_at": trait["updated_at"], "established_at": trait.get("established_at"),
                 "needs_review": trait["status"] == "needs_review", "facts": facts,

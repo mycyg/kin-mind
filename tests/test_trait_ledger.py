@@ -497,33 +497,78 @@ def test_an_observation_the_evaluation_never_saw_is_refused_before_anything_else
 
 # --- what time does to a trait, and what a moved source does -------------------------------------------
 
-def test_support_that_decayed_away_reads_and_then_records_as_fading(world):
+def test_elapsed_time_lowers_support_context_without_rewriting_the_trait(world):
     first_round(world)
-    assert world.ledger().read()["traits"][0]["status"] == "candidate"
+    before = world.ledger().read(history=True)["traits"][0]
+    assert before["status"] == "candidate" and before["revision"] == 1
     world.clock[0] += timedelta(days=45)
-    # Read first: the projection derives it from the same curve before anything is written.
-    assert world.ledger().read()["traits"][0]["status"] == "fading"
+    # The curve is useful context for the appraisal, but elapsed time is not a semantic decision.
+    later = world.ledger().read(history=True)["traits"][0]
+    assert later["facts"]["support_strength"] < 0.5
+    assert later["status"] == "candidate" and later["revision"] == 1
     assert world.rows("SELECT status FROM mind_traits")[0]["status"] == "candidate"
     fresh = world.owner("much-later", "Still the lanterns.")
     world.appraise([fresh], lambda state, shown: Appraisal(reason="A late evening",
         trait_observations=[notice(fresh, "tea")]))
-    assert world.rows("SELECT status FROM mind_traits WHERE json_extract(data,'$.slug')='lanterns'")[0]["status"] == "fading"
+    assert world.rows("SELECT status FROM mind_traits WHERE json_extract(data,'$.slug')='lanterns'")[0]["status"] == "candidate"
     history = world.ledger().read(history=True)["traits"]
-    assert [h["status"] for h in next(t for t in history if t["slug"] == "lanterns")["history"]] == ["candidate", "fading"]
+    lanterns = next(t for t in history if t["slug"] == "lanterns")
+    assert lanterns["revision"] == 1
+    assert [h["status"] for h in lanterns["history"]] == ["candidate"]
 
 
-def test_a_faded_trait_cannot_be_restored_without_new_support(world):
+def test_the_same_appraisal_lane_can_explicitly_fade_and_restore_old_valid_support(world):
     first_round(world)
-    trait = world.ledger().read()["traits"][0]
     world.clock[0] += timedelta(days=45)
-    stale = world.owner("late-question", "What are you thinking?")
+    late = world.owner("late-question", "What are you thinking?")
 
-    def script(state, shown):
-        return Appraisal(reason="Trying to bring it back", trait_decisions=[TraitDecision(action="restore",
-            trait_id=trait["id"], expected_revision=state["traits"]["candidate"][0]["revision"],
-            text=trait["text"], basis="inference", reason="It still feels true", evidence_ids=[stale])])
-    result, data, _ = world.appraise([stale], script)
-    assert result["state"] == "complete" and refused(data, "trait_decisions") == ["trait-needs-support"]
+    def fade(state, shown):
+        trait = state["traits"]["candidate"][0]
+        return Appraisal(reason="The evidence now reads differently", trait_decisions=[TraitDecision(action="fade",
+            trait_id=trait["id"], expected_revision=trait["revision"], text=trait["text"],
+            basis="inference", reason="The appraisal judges the trait to be fading", evidence_ids=[late])])
+
+    result, data, provider = world.appraise([late], fade)
+    faded = world.ledger().read()["traits"][0]
+    assert result["state"] == "complete" and "rejected_sections" not in data and provider.calls == 1
+    assert faded["status"] == "fading" and faded["facts"]["support_strength"] < 0.5
+
+    world.clock[0] += timedelta(hours=2)
+    return_turn = world.owner("return-question", "Does that still feel like you?")
+
+    def restore(state, shown):
+        trait = state["traits"]["candidate"][0]
+        return Appraisal(reason="Reconsidering the same valid history", trait_decisions=[TraitDecision(action="restore",
+            trait_id=trait["id"], expected_revision=trait["revision"], text=trait["text"],
+            basis="inference", reason="The appraisal judges the old support still meaningful",
+            evidence_ids=[return_turn])])
+
+    result, data, provider = world.appraise([return_turn], restore)
+    restored = world.ledger().read(history=True)["traits"][0]
+    assert result["state"] == "complete" and "rejected_sections" not in data and provider.calls == 1
+    assert restored["status"] == "candidate" and restored["facts"]["support_strength"] < 0.5
+    assert [entry["status"] for entry in restored["history"]] == ["candidate", "fading", "candidate"]
+
+
+def test_a_faded_trait_still_cannot_be_restored_without_valid_support(world):
+    source = first_round(world)
+    trait = world.ledger().read()["traits"][0]
+    world.clock[0] += timedelta(hours=2)
+    turn = world.owner("fade", "What changed?")
+    world.appraise([turn], lambda state, shown: Appraisal(reason="Fading explicitly",
+        trait_decisions=[TraitDecision(action="fade", trait_id=trait["id"], expected_revision=trait["revision"],
+            text=trait["text"], basis="inference", reason="The appraisal judges it fading", evidence_ids=[turn])]))
+    world.revise(source, "retract", "owner-retracted-own-words")
+    assert world.observations() == []
+    assert world.ledger().read()["traits"][0]["status"] == "fading"
+    world.clock[0] += timedelta(hours=2)
+    retry = world.owner("restore", "Does it return?")
+    result, data, provider = world.appraise([retry], lambda state, shown: Appraisal(reason="Trying to restore",
+        trait_decisions=[TraitDecision(action="restore", trait_id=trait["id"],
+            expected_revision=state["traits"]["candidate"][0]["revision"], text=trait["text"],
+            basis="inference", reason="It might return", evidence_ids=[retry])]))
+    assert result["state"] == "complete" and provider.calls == 1
+    assert refused(data, "trait_decisions") == ["trait-needs-support"]
 
 
 def test_a_source_that_moved_leaves_the_trait_and_its_observation_for_review(world):
