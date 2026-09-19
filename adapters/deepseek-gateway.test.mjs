@@ -140,6 +140,10 @@ test('purpose profiles are host-bound contracts, never request-declared', () => 
   assert.match(explorationContract,
     /host-owned computer\/kin_ui tool only when that tool returned state=observed/);
   assert.match(explorationContract, /failed, reviewed, or acted-only receipt is never a source/);
+  assert.match(explorationContract, /evidence_map is claim-to-evidence, never evidence-to-description/);
+  assert.match(explorationContract, /exact evidence_id or exact locator strings/);
+  assert.match(explorationContract, /Never use prose, shortened ids, version hashes/);
+  assert.match(explorationContract, /use null when no finding-level mapping is needed/);
   assert.ok(!exploration.instructions.includes(replyContract),
     'an exploration turn must not inherit the user-reply contract');
   // Even a trailing continuity host event cannot move a profiled instance off

@@ -369,12 +369,17 @@ def test_native_app_observation_and_reversible_click_receipts(tmp_path):
 
 def test_server_exposes_fixed_tools_and_backend_env_is_reference_only(tmp_path, monkeypatch):
     server = create_server({**config(tmp_path), "backend": {"command": "/bin/false"}})
-    tools = {tool.name for tool in server._tool_manager.list_tools()}
-    assert tools == {
+    listed = {tool.name: tool for tool in server._tool_manager.list_tools()}
+    assert set(listed) == {
         "open_browser_page", "read_browser_page", "navigate_browser_page",
         "click_browser_element", "type_browser_text", "close_browser_page",
         "observe_native_app", "click_native_element", "scroll_native_app",
     }
+    for name in (
+            "click_browser_element", "type_browser_text",
+            "click_native_element", "scroll_native_app"):
+        assert "Copy ``expected_text`` exactly from the freshest AX line" \
+            in listed[name].description
     with pytest.raises(ValueError, match="inline-env-refused"):
         _backend_environment({"env": {"API_TOKEN": "private"}})
     with pytest.raises(ValueError, match="inline-env-refused"):

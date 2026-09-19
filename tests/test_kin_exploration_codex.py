@@ -12,6 +12,8 @@ from kin_mind.codex_executor import (
     codex_argv,
     codex_env,
     codex_final_result,
+    codex_prompt,
+    findings_schema,
     run_codex,
 )
 from kin_mind.exploration import CodexUnavailable
@@ -220,6 +222,57 @@ def test_codex_final_result_bounded_repair():
     assert codex_final_result(json.dumps({"summary": 42, "findings": "no"})) is None
     ambiguous = json.dumps(FINDINGS) + "\n" + json.dumps(FINDINGS)
     assert codex_final_result(ambiguous) is None
+
+
+def test_findings_contract_explains_exact_evidence_map_and_ax_references():
+    description = findings_schema()["properties"]["evidence_map"]["description"]
+    assert "1-based decimal index" in description
+    assert "exact evidence_id or exact locator" in description
+    assert "Never put prose, shortened ids, version hashes" in description
+
+    prompt = codex_prompt(
+        TOPIC, budget_seconds=30, ui={"enabled": True}, output_schema=False,
+    )
+    assert "evidence_map is claim-to-evidence, never evidence-to-description" in prompt
+    assert "exact evidence_id or exact locator" in prompt
+    assert "Use null when no finding-level mapping is needed" in prompt
+    assert "copy the exact element text after its numeric index" in prompt
+    assert "expected_text `button Description: Toggle probe, ID: toggle`" in prompt
+
+
+@pytest.mark.parametrize(
+    ("evidence_map", "expected_state", "expected_coverage", "gap_fragment"),
+    [
+        (None, "complete", {"mapped_claims": 0, "covered_claims": 0}, None),
+        ({"1": ["s1"]}, "complete", {"mapped_claims": 1, "covered_claims": 1}, None),
+        ({"1": ["memory://s1"]}, "complete",
+         {"mapped_claims": 1, "covered_claims": 1}, None),
+        ({"1": ["Supplied evidence says the finding is true"]}, "failed",
+         {"mapped_claims": 1, "covered_claims": 0}, "Supplied evidence says"),
+        ({"s1": ["One finding"]}, "failed",
+         {"mapped_claims": 1, "covered_claims": 0}, "One finding"),
+    ],
+)
+def test_evidence_map_accepts_only_exact_citable_values(
+        tmp_path, monkeypatch, evidence_map, expected_state, expected_coverage,
+        gap_fragment):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    payload = {**FINDINGS, "evidence_map": evidence_map}
+    fake = fake_codex(
+        tmp_path / "fake-codex",
+        "open(last, 'w').write(json.dumps(" + repr(payload) + "))\n"
+        + THREAD_STARTED
+        + "sys.stdout.write(json.dumps({'type': 'turn.completed', 'usage': "
+          "{'input_tokens': 4, 'output_tokens': 2}}) + '\\n')\n"
+        + "sys.stdout.flush()\n",
+    )
+    report = run_codex(fake, TOPIC, tmp_path / "job", **codex_kwargs())
+    assert report["state"] == expected_state
+    assert report["evidence_coverage"] == expected_coverage
+    if expected_state == "failed":
+        assert report["reason"] == "unbacked-citation"
+        checkpoint = json.loads((tmp_path / "job" / "checkpoint.json").read_text())
+        assert any(gap_fragment in gap for gap in checkpoint["gaps"])
 
 
 def test_codex_complete_run(tmp_path, monkeypatch):

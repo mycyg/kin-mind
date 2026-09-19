@@ -146,7 +146,17 @@ class Findings(Model):
     # Backward-compatible: claims keyed by their 1-based finding index, mapped to
     # evidence ids from the run's source ledger (read receipts or memory:// ids).
     # Absent on legacy output; the host maps `sources` strictly instead.
-    evidence_map: dict[str, list[str]] | None = None
+    evidence_map: dict[str, list[str]] | None = Field(
+        default=None,
+        description=(
+            "Optional claim-to-evidence map. Each key is the 1-based decimal index "
+            "of an item in findings (for example, '1'). Each value is a non-empty "
+            "list containing only exact evidence_id or exact locator strings copied "
+            "from citable state=observed tool receipts or supplied/historical sources. "
+            "Never put prose, shortened ids, version hashes, review_* ids, or action_* "
+            "ids in a value. Use null when no finding-level mapping is needed."
+        ),
+    )
 
 
 class Explorations:

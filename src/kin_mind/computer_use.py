@@ -910,13 +910,23 @@ def create_server(config):
     @server.tool()
     async def click_browser_element(tab_id: str, element_index: int, expected_text: str,
                                     effect: str, ctx: Context) -> dict:
-        """Review, revalidate and click one fresh AX element in a run-owned tab."""
+        """Review, revalidate and click one fresh AX element in a run-owned tab.
+
+        Copy ``expected_text`` exactly from the freshest AX line after its numeric
+        index; a shorter semantic label is intentionally rejected as stale or
+        ambiguous.
+        """
         return await controller(ctx).click_browser_element(tab_id, element_index, expected_text, effect)
 
     @server.tool()
     async def type_browser_text(tab_id: str, element_index: int, expected_text: str,
                                 text: str, effect: str, ctx: Context) -> dict:
-        """Set bounded non-sensitive text when the host explicitly enabled text entry."""
+        """Set bounded non-sensitive text when the host explicitly enabled text entry.
+
+        Copy ``expected_text`` exactly from the freshest AX line after its numeric
+        index; a shorter semantic label is intentionally rejected as stale or
+        ambiguous.
+        """
         return await controller(ctx).type_browser_text(tab_id, element_index, expected_text, text, effect)
 
     @server.tool()
@@ -932,14 +942,24 @@ def create_server(config):
     @server.tool()
     async def click_native_element(app_id: str, element_index: int, expected_text: str,
                                    effect: str, ctx: Context) -> dict:
-        """Review, revalidate and click one fresh control in an allowlisted app."""
+        """Review, revalidate and click one fresh control in an allowlisted app.
+
+        Copy ``expected_text`` exactly from the freshest AX line after its numeric
+        index; a shorter semantic label is intentionally rejected as stale or
+        ambiguous.
+        """
         return await controller(ctx).click_native_element(app_id, element_index, expected_text, effect)
 
     @server.tool()
     async def scroll_native_app(app_id: str, element_index: int, expected_text: str,
                                 effect: str, ctx: Context, direction: str = "down",
                                 pages: int = 1) -> dict:
-        """Scroll one allowlisted app view by one to three pages, then return fresh AX text."""
+        """Scroll one allowlisted app view by one to three pages, then return fresh AX text.
+
+        Copy ``expected_text`` exactly from the freshest AX line after its numeric
+        index; a shorter semantic label is intentionally rejected as stale or
+        ambiguous.
+        """
         return await controller(ctx).scroll_native_app(
             app_id, element_index, expected_text, effect, direction, pages
         )
