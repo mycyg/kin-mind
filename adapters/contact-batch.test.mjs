@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import {createContactBatch} from './contact-batch.mjs';
 import {splitChatText} from './chat-bubbles.mjs';
 import {parseContactDraft} from './contact-draft.mjs';
+const approved=request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))});
 
 test('review the complete reply before sending its introduction; restart resumes in order',async()=>{
  const journal=new Map(),sent=[];let ready=false,now=0;
  const opts={read:id=>structuredClone(journal.get(id)),write:(id,v)=>journal.set(id,structuredClone(v)),now:()=>now,
-   preflight:async r=>r.entries.some(e=>e.text==='The full body')&&!ready?{state:'pending',reason:'deepseek-incomplete-or-unverified'}:{state:'ready'},
+   preflight:async r=>r.entries.some(e=>e.text==='The full body')&&!ready?{state:'pending',reason:'deepseek-incomplete-or-unverified'}:approved(r),
    send:async r=>{sent.push(r.text);return {state:'accepted',messageId:r.id};}};
  const draft={id:'whole',bubbles:['Here it is:','The full body','Closing sentence']};
  assert.equal((await createContactBatch(opts)(draft)).state,'pending');assert.deepEqual(sent,[]);
@@ -64,6 +65,17 @@ test('owner reply retires unsent remainder without blocking the next conversatio
   const settled=await batch({id:'superseded',superseded:true});
   assert.equal(settled.state,'accepted');assert.equal(settled.partial,true);assert.equal(settled.canceledBubbles,1);assert.equal(calls,1);
 });
+
+test('owner reply can release a wholly unsent superseded group with explicit proof',async()=>{
+  const journal=new Map();let calls=0;
+  const batch=createContactBatch({read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),
+    send:async()=>{calls++;return{state:'accepted',messageId:'must-not-send'};}});
+  assert.equal((await batch({id:'superseded-unsent',bubbles:['First','Second'],guard:()=>false})).state,'pending');
+  const settled=await batch({id:'superseded-unsent',superseded:true});
+  assert.equal(settled.state,'canceled');assert.equal(settled.safeToRelease,true);
+  assert.equal(settled.acceptedBubbles,0);assert.equal(calls,0);
+});
+
 test('each bubble carries the durable memory batch and expected count',async()=>{
   let state;const sent=[];
   const run=createContactBatch({read:()=>state,write:(_,v)=>{state=v;},send:async request=>{sent.push(request);return{state:'accepted',messageId:request.id};}});
@@ -77,7 +89,7 @@ test('a whole group is reviewed once and released or refused as a whole',async()
   const bubbles=['An opening line.','A second line.','A third line.','A fourth line.','A closing line.'];
   // The middle bubble is the one a per-bubble review would have refused after
   // its neighbours were already on the phone.
-  const verdict=request=>request.entries.some(entry=>entry.text===bubbles[2])?{state:'duplicate',reason:'already-said'}:{state:'ready'};
+  const verdict=request=>request.entries.some(entry=>entry.text===bubbles[2])?{state:'duplicate',reason:'already-said'}:approved(request);
   const refusedJournal=new Map(),refusedSeen=[],refusedSent=[];
   const refused=await createContactBatch({...store(refusedJournal),
     preflight:async request=>{refusedSeen.push(request.entries.map(entry=>entry.text));return verdict(request);},
@@ -90,7 +102,7 @@ test('a whole group is reviewed once and released or refused as a whole',async()
 
   const releasedJournal=new Map(),releasedSeen=[],releasedSent=[];
   const released=await createContactBatch({...store(releasedJournal),
-    preflight:async request=>{releasedSeen.push(request.entries.length);return {state:'ready'};},
+    preflight:async request=>{releasedSeen.push(request.entries.length);return approved(request);},
     send:async request=>{releasedSent.push(request.text);return {state:'accepted',messageId:'receipt-'+request.id};}})({id:'released-group',bubbles:bubbles.slice(0,4).concat(bubbles[4])});
   assert.deepEqual(releasedSeen,[5]);
   assert.deepEqual(releasedSent,bubbles);
@@ -162,7 +174,7 @@ test('a crash after the review and between two bubbles resumes without a second 
   const journal=new Map(),sent=[];let reviews=0,crashAt=null;
   const options={read:id=>structuredClone(journal.get(id)),
     write:(id,value)=>{journal.set(id,structuredClone(value));if(crashAt?.(value))throw Error('synthetic-crash');},
-    preflight:async request=>{reviews++;return {state:'ready',checked:request.entries.map(()=>({}))};},
+    preflight:async request=>{reviews++;return approved(request);},
     send:async request=>{sent.push(request.id);return {state:'accepted',messageId:'receipt-'+request.id};}};
   const request={id:'resumed',bubbles:['A first part.','A second part.','A third part.']};
   crashAt=value=>Boolean(value.review)&&value.items.every(item=>item.state==='unsent');
@@ -182,7 +194,7 @@ test('a resumable review reason holds the whole group and resumes later',async()
   const options={...store(journal),now:()=>clock,
     preflight:async request=>{reviews++;return reviews===1
       ?{state:'pending',reason:'reply-review-chunks-incomplete',chunks:{reviewed:1,total:2},retryAfterMs:60000}
-      :{state:'ready',checked:request.entries.map(entry=>({text:entry.text}))};},
+      :approved(request);},
     send:async request=>{sent.push(request.id);return {state:'accepted',messageId:'receipt-'+request.id};}};
   const held=await createContactBatch(options)({id:'chunked',bubbles:['One part.','Another part.','A last part.']});
   assert.equal(held.state,'pending');assert.equal(held.reason,'reply-review-chunks-incomplete');
@@ -195,17 +207,18 @@ test('a resumable review reason holds the whole group and resumes later',async()
   assert.equal(finished.state,'accepted');assert.equal(reviews,2);assert.equal(sent.length,3);
 });
 
-test('a review that never releases the group refuses it as a whole after a bounded number of tries',async()=>{
+test('a semantic hold that never releases the group is parked for DS review after a bounded number of tries',async()=>{
   const journal=new Map(),sent=[];let clock=0,reviews=0,last;
   const batch=createContactBatch({...store(journal),now:()=>clock,
     preflight:async()=>{reviews++;return {state:'pending',reason:'share-review-pending'};},
     send:async request=>{sent.push(request.id);return {state:'accepted',messageId:'receipt-'+request.id};}});
   for(let attempt=0;attempt<8;attempt++){last=await batch({id:'never-released',bubbles:['One part.','Another part.']});clock+=15*60000;}
   assert.equal(reviews,6);                                         // the default allowance, and not one call more
-  assert.equal(last.state,'canceled');assert.equal(last.reason,'contact-review-held-too-long');
-  assert.equal(last.canceledBubbles,2);assert.equal(last.acceptedBubbles,0);
+  assert.equal(last.state,'needs-review');assert.equal(last.reason,'contact-review-held-too-long');
+  assert.equal(last.failure.category,'semantic-hold');assert.equal(last.safeToRelease,true);
+  assert.equal(last.canceledBubbles,0);assert.equal(last.acceptedBubbles,0);
   assert.deepEqual(sent,[]);                                       // the review precedes the first bubble: nothing was exposed
-  assert.ok(journal.get('never-released').items.every(item=>item.state==='canceled'&&item.reason==='contact-review-held-too-long'));
+  assert.ok(journal.get('never-released').items.every(item=>item.state==='unsent'));
 });
 
 test('an unscheduled hold waits longer each time, up to a quarter of an hour',async()=>{
@@ -233,29 +246,29 @@ test('a review that names its own retry time is obeyed',async()=>{
   assert.equal(journal.get('own-schedule').reviewNotBefore,7500000);
 });
 
-test('a reviewer that could not be reached backs off but spends none of the group tries',async()=>{
+test('a temporarily unreachable reviewer backs off and can recover inside its separate failure budget',async()=>{
   const journal=new Map(),sent=[];let clock=0,reviews=0,reachable=false;
   const batch=createContactBatch({...store(journal),now:()=>clock,
-    preflight:async request=>{reviews++;return reachable?{state:'ready',checked:request.entries.map(()=>({}))}:{state:'pending',reason:'share-review-unavailable',transient:true};},
+    preflight:async request=>{reviews++;return reachable?approved(request):{state:'pending',reason:'share-review-unavailable',transient:true};},
     send:async request=>{sent.push(request.id);return {state:'accepted',messageId:'receipt-'+request.id};}});
   const waits=[];
-  for(let attempt=0;attempt<8;attempt++) {
+  for(let attempt=0;attempt<5;attempt++) {
     await batch({id:'unreachable',bubbles:['One part.','Another part.']});
     waits.push(journal.get('unreachable').reviewNotBefore-clock);
     clock=journal.get('unreachable').reviewNotBefore;
   }
-  assert.deepEqual(waits,[60000,120000,240000,480000,900000,900000,900000,900000]);
+  assert.deepEqual(waits,[60000,120000,240000,480000,900000]);
   assert.equal(journal.get('unreachable').holds,undefined);        // nothing was judged, so nothing was spent
   assert.deepEqual(sent,[]);
   reachable=true;
   assert.equal((await batch({id:'unreachable'})).state,'accepted');
-  assert.equal(sent.length,2);assert.equal(reviews,9);
+  assert.equal(sent.length,2);assert.equal(reviews,6);
 });
 
 test('an eligibility or guard refusal costs nothing and spends none of the group tries',async()=>{
   const journal=new Map(),sent=[];let allowed=false,reviews=0;
   const batch=createContactBatch({...store(journal),eligible:()=>allowed,
-    preflight:async request=>{reviews++;return {state:'ready',checked:request.entries.map(()=>({}))};},
+    preflight:async request=>{reviews++;return approved(request);},
     send:async request=>{sent.push(request.id);return {state:'accepted',messageId:'receipt-'+request.id};}});
   for(let attempt=0;attempt<10;attempt++)assert.equal((await batch({id:'not-now',bubbles:['One part.']})).state,'pending');
   allowed=true;
@@ -267,10 +280,132 @@ test('an eligibility or guard refusal costs nothing and spends none of the group
   assert.equal(sent.length,1);assert.equal(reviews,1);
 });
 
+test('new multi-bubble review IDs are unique, persisted and reused by review and delivery',async()=>{
+  const journal=new Map(),reviews=[],sent=[];
+  const options={...store(journal),preflight:async request=>{reviews.push(request.entries.map(entry=>entry.draft_id));return approved(request);},
+    send:async request=>{sent.push({id:request.id,draftId:request.draftId});return {state:'accepted',messageId:'message-'+request.id};}};
+  const request={id:'identity-v2',channel:'synthetic',bubbles:['One.','Two.','Three.']};
+  assert.equal((await createContactBatch(options)(request)).state,'accepted');
+  const persisted=journal.get(request.id).items.map(item=>({id:item.id,draftId:item.draftId,bubbleIndex:item.bubbleIndex}));
+  assert.equal(new Set(reviews[0]).size,3);assert.deepEqual(reviews[0],persisted.map(item=>item.draftId));
+  assert.deepEqual(sent,persisted.map(item=>({id:item.id,draftId:item.draftId})));
+  assert.deepEqual(persisted.map(item=>item.bubbleIndex),[0,1,2]);
+  await createContactBatch(options)({id:request.id});assert.equal(reviews.length,1);assert.equal(sent.length,3);
+});
+
+test('legacy identity migration protects wholly unsent, reviewed, accepted and uncertain batches',async()=>{
+  const legacy=(id,states,{review=false}={})=>({id,channel:'synthetic',state:'pending',...(review?{review:{at:1}}:{}),items:states.map((state,index)=>({
+    id:id+'-item-'+index,text:'Part '+index,references:[],state,...(state==='accepted'?{messageId:id+'-message-'+index}:{})}))});
+
+  // Wholly unsent and unreviewed: the existing per-item IDs become review IDs.
+  const freshJournal=new Map([['legacy-unsent',legacy('legacy-unsent',['unsent','unsent'])]]),freshEntries=[],freshSent=[];
+  const fresh=await createContactBatch({...store(freshJournal),preflight:async request=>{freshEntries.push(...request.entries);return approved(request);},
+    send:async request=>{freshSent.push(request);return {state:'accepted',messageId:'sent-'+request.id};}})({id:'legacy-unsent'});
+  assert.equal(fresh.state,'accepted');assert.deepEqual(freshEntries.map(entry=>entry.draft_id),['legacy-unsent-item-0','legacy-unsent-item-1']);
+  assert.deepEqual(freshSent.map(item=>item.draftId),freshEntries.map(entry=>entry.draft_id));
+
+  // A completed old review keeps the old group draft identity for its unsent tail.
+  const reviewedJournal=new Map([['legacy-reviewed',legacy('legacy-reviewed',['unsent','unsent'],{review:true})]]),reviewedSent=[];
+  await createContactBatch({...store(reviewedJournal),preflight:async()=>assert.fail('must not review twice'),
+    send:async request=>{reviewedSent.push(request);return {state:'accepted',messageId:'sent-'+request.id};}})({id:'legacy-reviewed'});
+  assert.deepEqual(reviewedSent.map(item=>item.draftId),['legacy-reviewed','legacy-reviewed']);
+
+  // A delivered head remains delivered; only the frozen tail is sent.
+  const acceptedJournal=new Map([['legacy-accepted',legacy('legacy-accepted',['accepted','unsent'],{review:true})]]),acceptedSent=[];
+  const accepted=await createContactBatch({...store(acceptedJournal),send:async request=>{acceptedSent.push(request);return {state:'accepted',messageId:'tail'};}})({id:'legacy-accepted'});
+  assert.equal(accepted.state,'accepted');assert.deepEqual(acceptedSent.map(item=>[item.id,item.draftId]),[['legacy-accepted-item-1','legacy-accepted']]);
+
+  // An uncertain head blocks the tail and neither transport ID is changed or replayed.
+  const uncertainJournal=new Map([['legacy-uncertain',legacy('legacy-uncertain',['unconfirmed','unsent'],{review:true})]]),uncertainSent=[];
+  const uncertain=await createContactBatch({...store(uncertainJournal),receipt:()=>null,send:async request=>{uncertainSent.push(request);}})({id:'legacy-uncertain'});
+  assert.equal(uncertain.state,'unconfirmed');assert.deepEqual(uncertainSent,[]);
+  assert.deepEqual(uncertainJournal.get('legacy-uncertain').items.map(item=>[item.id,item.draftId]),[
+    ['legacy-uncertain-item-0','legacy-uncertain'],['legacy-uncertain-item-1','legacy-uncertain']]);
+});
+
+test('identity migration must be durable before review or send and resumes with the same IDs after a write interruption',async()=>{
+  const original={id:'migration-crash',channel:'synthetic',state:'pending',items:[
+    {id:'old-one',text:'One',references:[],state:'unsent'},{id:'old-two',text:'Two',references:[],state:'unsent'}]};
+  let saved=structuredClone(original),interrupt=true,reviews=0,sends=0;
+  const args={read:()=>structuredClone(saved),write:(_,value)=>{if(interrupt&&value.identity?.version===2){interrupt=false;throw Error('migration-write-interrupted');}saved=structuredClone(value);},
+    preflight:async request=>{reviews++;return approved(request);},send:async request=>{sends++;return {state:'accepted',messageId:request.id};}};
+  await assert.rejects(createContactBatch(args)({id:original.id}),/migration-write-interrupted/);
+  assert.equal(reviews,0);assert.equal(sends,0);assert.deepEqual(saved,original);
+  const completed=await createContactBatch(args)({id:original.id});assert.equal(completed.state,'accepted');
+  assert.deepEqual(saved.items.map(item=>item.id),['old-one','old-two']);assert.deepEqual(saved.items.map(item=>item.draftId),['old-one','old-two']);
+});
+
+test('malformed reviewer identity or deterministic journal identity is quarantined before model cost or delivery',async()=>{
+  const mismatch=new Map(),sent=[];
+  const bad=await createContactBatch({...store(mismatch),preflight:async request=>({state:'ready',checked:[...request.entries].reverse().map(entry=>({draft_id:entry.draft_id,text:entry.text,references:[]}))}),
+    send:async request=>{sent.push(request);}})({id:'mismatched-review',bubbles:['One','Two']});
+  assert.equal(bad.state,'needs-review');assert.equal(bad.failure.code,'contact-review-response-mismatch');assert.equal(bad.safeToRelease,true);
+  assert.deepEqual(sent,[]);assert.equal(mismatch.get('mismatched-review').state,'needs-review');
+
+  const duplicate=new Map([['duplicate-identity',{id:'duplicate-identity',channel:'synthetic',state:'pending',items:[
+    {id:'same',text:'One',references:[],state:'unsent'},{id:'same',text:'Two',references:[],state:'unsent'}]}]]);let modelCalls=0;
+  const invalid=await createContactBatch({...store(duplicate),preflight:async()=>{modelCalls++;},send:async()=>assert.fail('must not send')})({id:'duplicate-identity'});
+  assert.equal(invalid.state,'needs-review');assert.equal(invalid.failure.category,'contract');assert.equal(modelCalls,0);
+
+  for(const [id,preflight] of [
+    ['null-verdict',async()=>null],
+    ['object-text',async request=>({state:'ready',checked:request.entries.map(entry=>({draft_id:entry.draft_id,text:{body:entry.text},references:[]}))})],
+  ]) {
+    const journal=new Map();let sends=0;
+    const result=await createContactBatch({...store(journal),preflight,send:async()=>{sends++;}})({id,bubbles:['One']});
+    assert.equal(result.state,'needs-review');assert.equal(result.safeToRelease,true);
+    assert.equal(result.failure.category,'contract');assert.equal(result.failure.code,id==='null-verdict'?'contact-review-verdict-invalid':'contact-review-response-mismatch');
+    assert.equal(sends,0);assert.equal(journal.get(id).state,'needs-review');
+  }
+});
+
+test('transport identities are globally unique across text and files before any external call',async()=>{
+  const journal=new Map([['cross-kind-collision',{id:'cross-kind-collision',channel:'synthetic',state:'pending',items:[
+    {id:'same-transport',text:'One',references:[],state:'unsent'},
+    {id:'same-transport',file:{sha256:'file-hash',path:'fixture'},state:'unsent'},
+  ]}]]);let receipts=0,reviews=0,sends=0;
+  const result=await createContactBatch({...store(journal),receipt:async()=>{receipts++;},preflight:async()=>{reviews++;},
+    verifyFile:async()=>assert.fail('must not verify files'),send:async()=>{sends++;}})({id:'cross-kind-collision'});
+  assert.equal(result.state,'needs-review');assert.equal(result.safeToRelease,true);
+  assert.equal(result.failure.code,'contact-transport-identities-invalid');
+  assert.deepEqual([receipts,reviews,sends],[0,0,0]);
+});
+
+test('operational review failure is bounded, redacted and an old retry storm is parked immediately',async()=>{
+  const journal=new Map();let clock=0;
+  const batch=createContactBatch({...store(journal),now:()=>clock,maxReviewFailures:2,
+    preflight:async()=>({state:'pending',reason:'share-review-unavailable',failure:{category:'model-unavailable',stage:'contact-review-model',code:'deepseek-timeout',retry_condition:'backoff',
+      model_invoked:true,model_receipt:{provider:'deepseek',model:'deepseek-flash',usage:null,usage_status:'unknown',outcome:'timeout',prompt:'must-not-persist'}}}),
+    send:async()=>assert.fail('must not send')});
+  assert.equal((await batch({id:'bounded-outage',bubbles:['One']})).state,'pending');clock=60000;
+  const parked=await batch({id:'bounded-outage'});
+  assert.equal(parked.state,'needs-review');assert.equal(parked.failure.category,'model-unavailable');assert.equal(parked.failure.model_invoked,true);
+  assert.equal(parked.failure.model_receipt.outcome,'timeout');assert.ok(!JSON.stringify(journal.get('bounded-outage')).includes('must-not-persist'));
+
+  const storm=new Map([['old-storm',{id:'old-storm',channel:'synthetic',state:'pending',backoffs:464,reason:'share-review-unavailable',items:[
+    {id:'old-storm-one',text:'One',references:[],state:'unsent'}]}]]);let calls=0;
+  const recovered=await createContactBatch({...store(storm),preflight:async()=>{calls++;},send:async()=>assert.fail('must not send')})({id:'old-storm'});
+  assert.equal(recovered.state,'needs-review');assert.equal(recovered.failure.code,'legacy-review-failures-exhausted');assert.equal(calls,0);
+});
+
+test('a thrown structured review failure keeps only its diagnostic receipt',async()=>{
+  const journal=new Map();
+  const error=Error('private provider response');
+  error.failure={category:'model-unavailable',stage:'contact-review-model',code:'deepseek-timeout',retry_condition:'backoff',model_invoked:true,
+    model_receipt:{provider:'deepseek',outcome:'timeout',usage:null,prompt:'secret prompt'}};
+  const batch=createContactBatch({...store(journal),maxReviewFailures:1,
+    preflight:async()=>{throw error;},send:async()=>assert.fail('must not send')});
+  const result=await batch({id:'structured-throw',bubbles:['One']});
+  assert.equal(result.state,'needs-review');assert.equal(result.failure.category,'model-unavailable');
+  assert.equal(result.failure.model_invoked,true);assert.deepEqual(result.failure.model_receipt,{provider:'deepseek',outcome:'timeout',usage:null});
+  assert.ok(!JSON.stringify(journal.get('structured-throw')).includes('private provider response'));
+  assert.ok(!JSON.stringify(journal.get('structured-throw')).includes('secret prompt'));
+});
+
 /** One interrupted send, then whatever the transport wrote down about it. */
 const interrupted=async(journal,receipts,sent,reviews)=>{
   const options={...store(journal),receipt:id=>receipts.get(id)??null,
-    preflight:async request=>{reviews.push(request.entries.length);return {state:'ready'};},
+    preflight:async request=>{reviews.push(request.entries.length);return approved(request);},
     send:async request=>{sent.push(request.id);if(sent.length===1)throw Error('connection lost');return {state:'accepted',messageId:'receipt-'+request.id};}};
   const first=await createContactBatch(options)({id:'interrupted',bubbles:['One part.','Another part.']});
   assert.equal(first.state,'unconfirmed');assert.equal(sent.length,1);
@@ -358,4 +493,17 @@ test('a bubble that never starts is re-sent a bounded number of times, then give
   assert.equal(attempts.filter(id=>id===first.id).length,7,'no eighth attempt at the bubble that was given up on');
   await batch({id:request.id});
   assert.equal(attempts.length,8,'seven at the first bubble, one at the second, and nothing once the group is settled');
+});
+
+test('a group whose every attempt is proven never-started releases safely for a new DS decision',async()=>{
+  const journal=new Map(),attempts=[];
+  const batch=createContactBatch({...store(journal),maxFailures:2,
+    receipt:()=>({state:'not-submitted',submissionStarted:false}),
+    send:async request=>{attempts.push(request.id);throw Error('pre-submit unavailable');}});
+  const request={id:'never-started-group',bubbles:['One']};let result=await batch(request);
+  while(result.state==='unconfirmed')result=await batch({id:request.id});
+  assert.equal(result.state,'needs-review');assert.equal(result.safeToRelease,true);
+  assert.equal(result.failure.stage,'contact-delivery');assert.equal(result.failure.code,'transport-never-started-exhausted');
+  assert.equal(journal.get(request.id).items[0].submission,'never-started');assert.equal(attempts.length,3);
+  const again=await batch({id:request.id});assert.equal(again.state,'needs-review');assert.equal(attempts.length,3);
 });

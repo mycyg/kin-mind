@@ -41,7 +41,7 @@ test('deliberate silence belongs to one casual input; work and new inputs remain
 test('semantic wait rechecks task/new-input guard; partial receipt IDs are stable',async()=>{
  const saved=new Map(),sent=[];let valid=true,first=true;
  const options={read:async id=>saved.get(id),write:async(id,data)=>saved.set(id,structuredClone(data)),
-  preflight:async request=>{if(first){valid=false;first=false;}return {state:'ready',checked:request.entries.map(entry=>({references:entry.references}))};},
+  preflight:async request=>{if(first){valid=false;first=false;}return {state:'ready',checked:request.entries.map(entry=>({draft_id:entry.draft_id,text:entry.text,references:entry.references}))};},
   send:async req=>{sent.push(req);return {state:'accepted',messageId:'receipt-'+req.id};},guard:()=>valid};
  const send=createContactBatch(options);
  const req={id:'batch',bubbles:['One finding','Another finding'],references:[[{unit_id:'x',version:1}],[{unit_id:'y',version:1}]],guard:()=>valid};

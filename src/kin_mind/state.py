@@ -7,6 +7,7 @@ source revisions remain inspectable. No model or transport runs inside this stor
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Literal
@@ -158,6 +159,79 @@ class ContactDecision(Model):
     reason: str = Field(min_length=1, max_length=1200)
     condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+
+
+_CONTACT_RECEIPT_STRINGS = {
+    "provider", "model", "reasoning", "purpose", "request_id", "outcome",
+    "usage_status", "verified_at",
+}
+_CONTACT_RECEIPT_NUMBERS = {"elapsed_ms", "model_requests"}
+
+
+def _validate_contact_receipt(value, depth=0):
+    if not isinstance(value, dict) or depth > 2:
+        raise ValueError("Invalid contact model receipt")
+    allowed = _CONTACT_RECEIPT_STRINGS | _CONTACT_RECEIPT_NUMBERS | {
+        "cache_hit", "usage", "chunks", "schema_repair",
+    }
+    if set(value) - allowed:
+        raise ValueError("Contact model receipt contains non-accounting fields")
+    for key in _CONTACT_RECEIPT_STRINGS & set(value):
+        if not isinstance(value[key], str) or len(value[key]) > 200:
+            raise ValueError("Invalid contact model receipt string")
+    for key in _CONTACT_RECEIPT_NUMBERS & set(value):
+        if (isinstance(value[key], bool) or not isinstance(value[key], (int, float))
+                or not math.isfinite(value[key]) or value[key] < 0):
+            raise ValueError("Invalid contact model receipt number")
+    if "cache_hit" in value and not isinstance(value["cache_hit"], bool):
+        raise ValueError("Invalid contact model cache receipt")
+    if value.get("usage") is not None and (
+        not isinstance(value.get("usage"), dict) or any(
+            not isinstance(key, str) or not key or len(key) > 64
+            or isinstance(amount, bool) or not isinstance(amount, (int, float))
+            or not math.isfinite(amount) or amount < 0
+            for key, amount in value["usage"].items()
+        )
+    ):
+        raise ValueError("Invalid contact model usage receipt")
+    if "chunks" in value:
+        if not isinstance(value["chunks"], list) or len(value["chunks"]) > 16:
+            raise ValueError("Invalid contact model chunk receipts")
+        for receipt in value["chunks"]:
+            _validate_contact_receipt(receipt, depth + 1)
+    if "schema_repair" in value:
+        repair = value["schema_repair"]
+        if not isinstance(repair, dict) or set(repair) - {"attempts", "rejected_call"}:
+            raise ValueError("Invalid contact schema repair receipt")
+        if "attempts" in repair and (isinstance(repair["attempts"], bool)
+                                     or not isinstance(repair["attempts"], int)
+                                     or repair["attempts"] < 0):
+            raise ValueError("Invalid contact schema repair attempts")
+        if "rejected_call" in repair:
+            _validate_contact_receipt(repair["rejected_call"], depth + 1)
+    return value
+
+
+class ContactFailure(Model):
+    """Redacted operational facts. Content and exception prose never enter it."""
+
+    category: Literal[
+        "contract", "model-unavailable", "source-changed", "semantic-hold",
+        "model-output", "unknown", "delivery-uncertain", "host-runtime",
+    ]
+    stage: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    code: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    retry_condition: Literal[
+        "repair-input", "backoff", "source-change", "deepseek-decision",
+        "reconcile", "none",
+    ]
+    model_invoked: bool | None = None
+    model_receipt: dict | None = None
+
+    @field_validator("model_receipt")
+    @classmethod
+    def receipt_is_redacted(cls, value):
+        return None if value is None else _validate_contact_receipt(value)
 
 
 def timestamp(value):
@@ -751,6 +825,7 @@ class Mind(Continuity):
             if not link_only:
                 desire.pop("contact_wait", None)
                 desire.pop("contact_failures", None)
+                desire.pop("contact_review_failures", None)
             if request.action == "wait":
                 desire["contact_wait"] = self._wait_details(
                     ContactDecision(action="wait", reason=request.reason,
@@ -1329,10 +1404,13 @@ class Mind(Continuity):
                 return True
         return False
 
-    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, partial=False, canceled_bubbles=0, aborted_before_send=False):
+    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False):
         decision = ContactDecision.model_validate(decision) if decision is not None else None
+        failure = ContactFailure.model_validate(failure) if failure is not None else None
         if decision and state != "canceled":
             raise ValueError("Wish decisions apply only before sending")
+        if failure and state == "accepted":
+            raise ValueError("Accepted delivery cannot carry an active failure")
         if state not in {"pending", "accepted", "unconfirmed", "canceled"}:
             raise ValueError("Unknown contact delivery state")
         if state == "accepted" and not (
@@ -1356,6 +1434,12 @@ class Mind(Continuity):
                     "A possible send requires reconciliation, not cancellation"
                 )
             attempt.update(state=state, updated_at=self.clock(), reason=reason)
+            if failure:
+                attempt["failure"] = failure.model_dump(exclude_none=True)
+            elif state == "accepted":
+                attempt.pop("failure", None)
+            if aborted_before_send:
+                attempt["aborted_before_send"] = True
             if message_id:
                 attempt.update(message_id=message_id, visibility="unverified")
             if message_ids:
@@ -1368,7 +1452,7 @@ class Mind(Continuity):
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed"}):
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-review-failed"}):
                 current = self._load(conn)
                 desire = current["desires"].get(attempt["desire_id"])
                 # An empty draft is a decision to wait, not a failed send. Do not
@@ -1376,7 +1460,7 @@ class Mind(Continuity):
                 if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
                     self._retarget(conn, current, self.clock())
                     eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
-                    stranded = False
+                    stranded, review_failures = False, None
                     if reason == "draft-failed":
                         failures = desire.get("contact_failures", 0) + 1
                         desire["contact_failures"] = failures
@@ -1386,6 +1470,19 @@ class Mind(Continuity):
                         decision = ContactDecision(action="wait", reason="Draft generation or parsing failed",
                             condition="time" if failures < 3 else "new_evidence",
                             retry_after_seconds=300 * failures)
+                        review_failures = failures
+                    elif reason == "contact-review-failed":
+                        failures = desire.get("contact_review_failures", 0) + 1
+                        desire["contact_review_failures"] = failures
+                        stranded, review_failures = True, failures
+                        decision = ContactDecision(action="wait",
+                            reason="The wholly unsent contact batch needs a new DeepSeek decision",
+                            condition="new_evidence")
+                    elif reason == "draft-source-changed":
+                        stranded = True
+                        decision = ContactDecision(action="wait",
+                            reason="The draft source changed before model execution",
+                            condition="new_evidence")
                     decision = decision or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
                     desire.update(status="abandoned" if decision.action == "abandon" else "waiting", revision=desire["revision"] + 1,
                                   updated_at=self.clock(), event_id=eid,
@@ -1403,11 +1500,15 @@ class Mind(Continuity):
                     self._history(conn, eid, current, "contact-deferred", attempt)
                     if stranded:
                         from .actions import ActionEvents
-                        ActionEvents(self).emit(conn, "wish-review", [desire["id"], "draft-failed", failures], {
+                        failure_view = ({k: v for k, v in attempt.get("failure", {}).items()
+                                         if k != "model_receipt"} or None)
+                        ActionEvents(self).emit(conn, "wish-review", [desire["id"], reason, review_failures, attempt_id], {
                             "desire_id": desire["id"],
                             "evidence_ids": [r["record_id"] for r in desire["evidence"]],
                             "agent_version": current["agent_version"],
-                            "reason": "Drafting this wish failed three times",
+                            "reason": ("Drafting this wish failed three times" if reason == "draft-failed"
+                                       else "A wholly unsent contact attempt needs a fresh semantic decision"),
+                            **({"failure": failure_view} if failure_view else {}),
                         })
             if state == "accepted":
                 current = self._load(conn)

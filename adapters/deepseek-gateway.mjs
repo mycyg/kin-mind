@@ -1,6 +1,7 @@
 import http from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {usageRow} from './model-lease.mjs';
+import {contactDraftInstructions} from './contact-draft.mjs';
 
 // A native turn is attributed per session, because the two kinds are not the same
 // spend: a chat turn is what the owner is waiting for, while contact drafts,
@@ -11,6 +12,7 @@ export const nativeTurnPurpose = (kind = 'chat') => BACKGROUND_TURN_KINDS.has(ki
   : {lane: 'foreground', purpose: 'native-chat-turn'};
 
 export const replyContract = 'Write only messages addressed to the user: the answer or a useful progress update. Do not narrate your interpretation of the user, response planning, private analysis, or internal tool-result commentary. Earlier assistant messages may contain that narration; do not imitate it. Keep tool calls separate from user-facing text. Runtime metadata is evidence to check, not a preface to repeat. Follow the conversation language and persona. When the owner has enabled autonomous casual replies, choose_reply can record silent or merged for the current input; the host applies that decision. Each new input is considered independently, and work deliveries follow the task workflow.';
+export const contactDraftContract = 'This is a host-owned proactive contact draft, not a user chat turn. Return exactly one structured JSON decision to the host; do not address the user outside that JSON, emit progress commentary, directly send or remind, mutate shared state, or treat internal context injection as a new user message. Host-authorized read-only memory tools remain available when necessary.\n'+contactDraftInstructions;
 export const continuityContract = 'This turn is an internal continuity verification requested by the host. Return the structured verification requested in the last internal-host event, using the supplied history. Do not call tools or send messages. Output only the public verification result, never private reasoning.';
 // Exploration answers the host, not the user: no reply contract, no message
 // wording rules. The output contract is the Findings shape the host validates.
@@ -38,7 +40,7 @@ export const computerActionReviewSchema = Object.freeze({
  * event swaps the contract. */
 export const GATEWAY_PROFILES = Object.freeze({
   chat: {lane: 'foreground', purpose: 'native-chat-turn', contract: replyContract},
-  'contact-draft': {lane: 'background', purpose: 'native-contact-draft', contract: replyContract},
+  'contact-draft': {lane: 'background', purpose: 'native-contact-draft', contract: contactDraftContract},
   'continuity-check': {lane: 'background', purpose: 'native-continuity-check', contract: continuityContract},
   exploration: {lane: 'background', purpose: 'native-exploration', contract: explorationContract},
   'computer-action-review': {lane: 'background', purpose: 'native-computer-action-review', contract: computerActionReviewContract},
@@ -191,9 +193,14 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         raw += chunk;
         if (Buffer.byteLength(raw) > 64 * 1024 * 1024) throw Error('request-too-large');
       }
-      const body = deepseekRequest(JSON.parse(raw), reasoningEffort, profile);
+      const parsed=JSON.parse(raw);
+      // The callback is trusted host state. A request never self-declares its
+      // purpose; dynamic contact drafts receive their structured contract from
+      // the same explicit attribution that owns their background usage lane.
+      attributed = attribute() ?? nativeTurnPurpose();
+      const requestProfile=profile??(attributed.purpose==='native-contact-draft'?'contact-draft':null);
+      const body = deepseekRequest(parsed, reasoningEffort, requestProfile);
       const reverseTools = profile === 'exploration' ? flattenExplorationTools(body) : new Map();
-      attributed = attribute(body) ?? nativeTurnPurpose();
       if (lease) {
         held = await lease.acquire({lane: attributed.lane, purpose: attributed.purpose});
         if (!held.proceed) {
