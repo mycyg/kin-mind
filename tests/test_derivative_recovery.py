@@ -56,7 +56,8 @@ class Summarizer:
         assert name == "submit_event_digest"
         records = context["records"]
         return EventSummary(narrative=[SummaryUnit(text=r["text"], record_ids=[r["id"]]) for r in records]), \
-            {"model": "synthetic", "reasoning": "high", "input_tokens": 12, "output_tokens": 7}
+            {"model": "synthetic", "reasoning": "high", "usage_status": "reported",
+             "usage": {"input_tokens": 12, "output_tokens": 7}}
 
 
 def make_event(system, key, texts=("星图报告最初版本还未发送。",)):
@@ -539,6 +540,10 @@ def test_runner_reports_digest_receipt_per_event(system, monkeypatch):
     assert cost["event_id"] == event_id and cost["state"] == "ready"
     assert cost["model"] == "synthetic" and cost["reasoning"] == "high"
     assert cost["input_tokens"] == 12 and cost["output_tokens"] == 7
+    assert cost["usage_status"] == "reported"
+    (summary,) = outcome["costs_by_scope"]
+    assert summary["input_tokens"] == 12 and summary["output_tokens"] == 7
+    assert summary["token_receipts"] == 1 and summary["usage_status"] == "reported"
 
 
 def test_target_moved_between_plan_and_apply_abandons_cleanly(system, monkeypatch):
@@ -1030,3 +1035,40 @@ def test_digest_cost_receipt_is_scoped(system):
     (summary,) = dr.costs_by_scope([cost])
     assert summary["scope"] == scope_b_obj.model_dump()
     assert summary["input_tokens"] == 3 and summary["output_tokens"] == 2
+    assert summary["token_receipts"] == 1 and summary["usage_status"] == "reported"
+
+
+@pytest.mark.parametrize(("model_receipt", "usage_status"), [
+    (None, "unknown"),
+    ({"model": "synthetic"}, "unknown"),
+    ({"model": "synthetic", "usage": {"input_tokens": 3}}, "partial-unknown"),
+])
+def test_digest_cost_missing_usage_is_unknown_not_zero(system, model_receipt, usage_status):
+    engine = system[0].engine
+    event_id = "evt_unknown_usage"
+    scope_obj = Scope(persona="unknown-usage")
+    data = {"source_versions": {}}
+    if model_receipt is not None:
+        data["model_receipt"] = model_receipt
+    with engine.db.connect(write=True) as conn:
+        conn.execute(
+            "INSERT INTO mind_event_digests(scope,event_id,state,generation,revision,input_hash,dirty_at,due_at,data) "
+            "VALUES(?,?, 'ready', 1, 1, 'input', '2026-09-19T00:00:00+00:00', 0, ?)",
+            (scope_obj.key(), event_id, json.dumps(data)),
+        )
+    result = {
+        "command_id": "unknown-usage-cost",
+        "cycles": [{
+            "embeds": {"targets": []},
+            "digests": {"recovered": [{
+                "scope": scope_obj.model_dump(), "event_id": event_id,
+                "job_id": "job_unknown_usage", "generation": 1,
+            }], "replayed": []},
+        }],
+    }
+    (cost,) = dr.collect_costs(engine, result)
+    assert cost["input_tokens"] is None and cost["output_tokens"] is None
+    assert cost["usage_status"] == usage_status
+    (summary,) = dr.costs_by_scope([cost])
+    assert summary["input_tokens"] is None and summary["output_tokens"] is None
+    assert summary["token_receipts"] == 0 and summary["usage_status"] == usage_status

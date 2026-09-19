@@ -26,6 +26,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.jobs import Worker
 from eventmem.core.models import Scope, now
 
+from .attempts import token_counts
 from .lifecycle import mark_dirty
 
 #: States a record may be in for its derivative to be worth rebuilding. Anything
@@ -1024,6 +1025,24 @@ def recover_digests(engine, entries, *, command_id, at=None, require_reviewed=Fa
             "abandoned": abandoned, "command_id": command_id}
 
 
+def _model_usage(receipt) -> tuple[int | float | None, int | float | None, str]:
+    """Normalize current nested usage and legacy top-level token receipts.
+
+    A complete provider-reported pair may legitimately contain zero. Missing or
+    incomplete counts remain unknown; neither side is synthesized as zero.
+    """
+    receipt = receipt if isinstance(receipt, dict) else {}
+    nested = receipt.get("usage")
+    for candidate in (nested, receipt):
+        counts = token_counts(candidate)
+        if counts is not None:
+            return counts[0], counts[1], "reported"
+    token_fields = {"prompt_tokens", "input_tokens", "completion_tokens", "output_tokens"}
+    candidates = [candidate for candidate in (nested, receipt) if isinstance(candidate, dict)]
+    status = "partial-unknown" if any(token_fields & candidate.keys() for candidate in candidates) else "unknown"
+    return None, None, status
+
+
 def collect_costs(engine, result) -> list[dict]:
     """Per-item cost of a run: final state and wall time for every recovered job;
     for digests also the model receipt the normal digest path committed.
@@ -1077,7 +1096,9 @@ def collect_costs(engine, result) -> list[dict]:
                     (scope_key, rec["event_id"]),
                 ).fetchone()
                 data = json.loads(row["data"]) if row and row["state"] == "ready" else {}
-                receipt = data.get("model_receipt", {})
+                receipt = data.get("model_receipt")
+                receipt = receipt if isinstance(receipt, dict) else {}
+                input_tokens, output_tokens, usage_status = _model_usage(receipt)
                 costs.append({
                     "kind": "event_digest", "scope": rec["scope"],
                     "event_id": rec["event_id"], "job_id": rec["job_id"],
@@ -1088,8 +1109,9 @@ def collect_costs(engine, result) -> list[dict]:
                     "source_versions": data.get("source_versions"),
                     "model": receipt.get("model"),
                     "reasoning": receipt.get("reasoning"),
-                    "input_tokens": receipt.get("input_tokens"),
-                    "output_tokens": receipt.get("output_tokens"),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_status": usage_status,
                     "elapsed_ms": receipt.get("elapsed_ms"),
                     "method": receipt.get("method"),
                     "priced": False,
@@ -1098,7 +1120,7 @@ def collect_costs(engine, result) -> list[dict]:
 
 
 def costs_by_scope(costs) -> list[dict]:
-    """Keep usage receipts partitioned by their real scope."""
+    """Keep usage receipts partitioned by scope without turning unknown into zero."""
     grouped = {}
     for cost in costs:
         scope = cost.get("scope") or {}
@@ -1107,20 +1129,47 @@ def costs_by_scope(costs) -> list[dict]:
             "scope": scope,
             "items": 0,
             "complete": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": None,
+            "output_tokens": None,
             "token_receipts": 0,
+            "usage_status": "unknown",
             "unpriced": True,
+            "_unknown_model_items": 0,
+            "_partial_model_items": 0,
         })
         group["items"] += 1
         group["complete"] += cost.get("state") == "complete" or (
             cost.get("kind") == "event_digest" and cost.get("state") == "ready"
         )
-        if cost.get("input_tokens") is not None:
-            group["input_tokens"] += cost["input_tokens"]
-            group["output_tokens"] += cost.get("output_tokens") or 0
+        if cost.get("kind") != "event_digest":
+            continue
+        counts = token_counts(cost)
+        usage_status = cost.get("usage_status")
+        if usage_status is None:
+            usage_status = "reported" if counts is not None else "unknown"
+        if usage_status == "reported" and counts is not None:
+            if group["token_receipts"] == 0:
+                group["input_tokens"] = 0
+                group["output_tokens"] = 0
+            group["input_tokens"] += counts[0]
+            group["output_tokens"] += counts[1]
             group["token_receipts"] += 1
-    return [grouped[key] for key in sorted(grouped)]
+        else:
+            group["_unknown_model_items"] += 1
+            group["_partial_model_items"] += usage_status == "partial-unknown"
+    result = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        if group["token_receipts"]:
+            group["usage_status"] = (
+                "partial-unknown" if group["_unknown_model_items"] else "reported"
+            )
+        elif group["_partial_model_items"]:
+            group["usage_status"] = "partial-unknown"
+        group.pop("_unknown_model_items")
+        group.pop("_partial_model_items")
+        result.append(group)
+    return result
 
 
 def _selection_preflight(engine, selection, command_id, vector_revisions) -> list[dict]:
