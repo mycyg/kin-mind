@@ -90,81 +90,88 @@ class Contexts:
         provider.timeout = 90
         return provider
 
-    def _current(self, item, policy=None):
+    def _current(self, item, policy=None, conn=None, state=None):
         """A derived view is current only while every input is one this read may still see.
         With a policy, an item that depends on something outside its purpose is a miss, so a
         cache written before the classification existed invalidates itself instead of replaying."""
-        with self.engine.db.connect() as conn:
-            dependency = item.get("digest_dependency")
-            if dependency:
-                row = conn.execute("SELECT state,revision,input_hash FROM mind_event_digests WHERE scope=? AND event_id=?",
-                                   (self.mind.scope.key(), dependency["id"])).fetchone()
-                if not row or row["state"] != "ready" or row["revision"] != dependency["revision"] or row["input_hash"] != dependency["input_hash"]:
-                    return False
-            pending = item.get('pending_dependency')
-            if pending:
-                row = conn.execute('SELECT digest,data FROM mind_runtime_events WHERE scope=? AND id=?',
-                    (self.mind.scope.key(), self.memory._id('runtime', pending['id']))).fetchone()
-                if row:
-                    event = json.loads(row['data'])
-                    if row['digest'] != pending['digest']:
-                        return False
-                    try:
-                        if not self.mind._fresh(conn, self.mind._evidence(conn, [event['source_id']])):
-                            return False
-                    except (Missing, Conflict):
-                        return False
-            for dependency in item.get("graph_dependencies", []):
-                try:
-                    node = self.memory.graph.get(conn, dependency["id"])
-                    if node["revision"] != dependency["revision"] or not self.memory.graph.fresh(conn, node):
-                        return False
-                    if policy is not None and not self.memory.graph.visible(conn, [node], policy):
-                        return False
-                except Missing:
-                    return False
-            coverage = item.get("coverage_dependency")
-            if coverage and digest(self.memory.sharing.coverage(conn, coverage["id"])) != coverage["digest"]:
+        if conn is not None:
+            return self._current_in(conn, item, policy, state=state)
+        with self.engine.db.connect() as connection:
+            return self._current_in(connection, item, policy)
+
+    def _current_in(self, conn, item, policy, state=None):
+        dependency = item.get("digest_dependency")
+        if dependency:
+            row = conn.execute("SELECT state,revision,input_hash FROM mind_event_digests WHERE scope=? AND event_id=?",
+                               (self.mind.scope.key(), dependency["id"])).fetchone()
+            if not row or row["state"] != "ready" or row["revision"] != dependency["revision"] or row["input_hash"] != dependency["input_hash"]:
                 return False
-            for dependency in item.get("dependencies", []):
-                identifier, revision = dependency["id"], dependency["revision"]
+        pending = item.get('pending_dependency')
+        if pending:
+            row = conn.execute('SELECT digest,data FROM mind_runtime_events WHERE scope=? AND id=?',
+                (self.mind.scope.key(), self.memory._id('runtime', pending['id']))).fetchone()
+            if row:
+                event = json.loads(row['data'])
+                if row['digest'] != pending['digest']:
+                    return False
                 try:
-                    record = self.engine._get(conn, identifier)
-                    if record["revision"] != revision or record["scope"] != self.mind.scope.model_dump():
-                        return False
-                    if policy is not None and not policy.visible(record, item.get("historical", False)):
-                        return False
-                    if record["status"] not in {"active", "unverified"} and not item.get("historical"):
-                        return False
-                    # Archived and unverified accounts remain readable with their
-                    # original status. They never become evidence for a new fact.
-                    for source_id in record["source_ids"]:
-                        source = conn.execute("SELECT deleted FROM sources WHERE id=? AND scope=?", (source_id, self.mind.scope.key())).fetchone()
-                        if not source or source[0]:
-                            return False
-                    if record["status"] == "active" and not item.get("historical") and not self.mind._fresh(conn, self.mind._evidence(conn, [identifier])):
+                    if not self.mind._fresh(conn, self.mind._evidence(conn, [event['source_id']])):
                         return False
                 except (Missing, Conflict):
                     return False
-            domain = item.get("state_dependency")
-            if domain:
-                value = self.mind._load(conn).get(domain['kind'], {}).get(domain['id'])
-                if not value or digest(value) != domain['digest']:
+        for dependency in item.get("graph_dependencies", []):
+            try:
+                node = self.memory.graph.get(conn, dependency["id"])
+                if node["revision"] != dependency["revision"] or not self.memory.graph.fresh(conn, node):
                     return False
-                if value.get('expires_at'):
-                    from .state import timestamp
-                    if timestamp(value['expires_at']) <= timestamp(self.mind.clock()):
-                        return False
-            node = item.get("node_dependency")
-            if node:
-                try:
-                    current = self.memory._get(conn, node["id"])
-                    if current["revision"] != node["revision"] or not self.memory._fresh(conn, current):
-                        return False
-                    if policy is not None and not self.memory.graph.visible(conn, [current], policy):
-                        return False
-                except Missing:
+                if policy is not None and not self.memory.graph.visible(conn, [node], policy):
                     return False
+            except Missing:
+                return False
+        coverage = item.get("coverage_dependency")
+        if coverage and digest(self.memory.sharing.coverage(conn, coverage["id"])) != coverage["digest"]:
+            return False
+        for dependency in item.get("dependencies", []):
+            identifier, revision = dependency["id"], dependency["revision"]
+            try:
+                record = self.engine._get(conn, identifier)
+                if record["revision"] != revision or record["scope"] != self.mind.scope.model_dump():
+                    return False
+                if policy is not None and not policy.visible(record, item.get("historical", False)):
+                    return False
+                if record["status"] not in {"active", "unverified"} and not item.get("historical"):
+                    return False
+                # Archived and unverified accounts remain readable with their
+                # original status. They never become evidence for a new fact.
+                for source_id in record["source_ids"]:
+                    source = conn.execute("SELECT deleted FROM sources WHERE id=? AND scope=?", (source_id, self.mind.scope.key())).fetchone()
+                    if not source or source[0]:
+                        return False
+                if record["status"] == "active" and not item.get("historical") and not self.mind._fresh(conn, self.mind._evidence(conn, [identifier])):
+                    return False
+            except (Missing, Conflict):
+                return False
+        domain = item.get("state_dependency")
+        if domain:
+            if state is None:
+                state = self.mind._load(conn)
+            value = state.get(domain['kind'], {}).get(domain['id'])
+            if not value or digest(value) != domain['digest']:
+                return False
+            if value.get('expires_at'):
+                from .state import timestamp
+                if timestamp(value['expires_at']) <= timestamp(self.mind.clock()):
+                    return False
+        node = item.get("node_dependency")
+        if node:
+            try:
+                current = self.memory._get(conn, node["id"])
+                if current["revision"] != node["revision"] or not self.memory._fresh(conn, current):
+                    return False
+                if policy is not None and not self.memory.graph.visible(conn, [current], policy):
+                    return False
+            except Missing:
+                return False
         return True
 
     def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None):
@@ -178,7 +185,15 @@ class Contexts:
         # Half-migrated: stored text was compressed under rules that are still being applied,
         # so every summary cache is a miss until the migration finishes.
         strict = policy is not None and policy.strict
-        stale_ids = [i["id"] for i in items if not self._current(i, policy)]
+        with self.engine.db.connect() as conn:
+            # One read transaction per pack: every item is checked against the same instant.
+            state = None
+            checked = []
+            for i in items:
+                if state is None and "state_dependency" in i:
+                    state = self.mind._load(conn)
+                checked.append(self._current_in(conn, i, policy, state=state))
+            stale_ids = [i["id"] for i, current in zip(items, checked) if not current]
         items = [redact(i) for i in items if i["id"] not in stale_ids]
         source = {i["id"]: i for i in items}
         raw = "\n".join(self._line(i) for i in items)
@@ -367,7 +382,14 @@ class Contexts:
     def graph_item(self, node, edges=(), *, compact=False, policy=None):
         with self.engine.db.connect() as conn:
             if compact:
-                edges = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) ORDER BY id LIMIT 8", (self.mind.scope.key(),node["id"],node["id"]))]
+                # The OR form walks the whole edge table per node; the UNION of the two
+                # single-column indexes returns the same first eight edges by id.
+                edges = [json.loads(r[0]) for r in conn.execute(
+                    "SELECT data FROM ("
+                    "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' "
+                    "UNION "
+                    "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active') "
+                    "ORDER BY id LIMIT 8", (self.mind.scope.key(), node["id"], self.mind.scope.key(), node["id"]))]
             related = [e for e in edges if node["id"] in (e["subject"], e["object"]) and self.memory.graph.fresh(conn, e)]
             facts = {k: node[k] for k in ("kind", "occurred_at", "basis", "owner_id", "created_by", "state", "entity_type", "aliases") if node.get(k) is not None}
             basis, fallback = node.get("basis", "inferred"), []
@@ -562,6 +584,35 @@ class Contexts:
             if tokens(cached["text"]) < tokens(item["text"]):
                 return {**item, "text": cached["text"], "cached_summary": True, "facts": {**item.get("facts", {}), "coverage": "overview; original available by ID"}}
         return item
+
+    def _overviews(self, items, policy=None):
+        """The per-item `_overview` answers, with the cache read and the dependency
+        checks each shared across the page instead of one connection per item."""
+        if policy is not None and policy.strict or not items:
+            return [self._overview(item, policy) for item in items]
+        keyed = [(item, self._overview_key(item)) for item in items]
+        marks = ",".join("?" for _ in keyed)
+        with self.engine.db.connect() as conn:
+            rows = {r["id"]: r["data"] for r in conn.execute(
+                f"SELECT id,data FROM mind_context_cache WHERE scope=? AND id IN ({marks})",
+                (self.mind.scope.key(), *(key for _, key in keyed)))}
+            state = None
+            out = []
+            for item, key in keyed:
+                row = rows.get(key)
+                if row:
+                    if state is None and "state_dependency" in item:
+                        state = self.mind._load(conn)
+                    if not self._current_in(conn, item, policy, state=state):
+                        row = None
+                if row:
+                    cached = json.loads(row)
+                    if tokens(cached["text"]) < tokens(item["text"]):
+                        out.append({**item, "text": cached["text"], "cached_summary": True,
+                                    "facts": {**item.get("facts", {}), "coverage": "overview; original available by ID"}})
+                        continue
+                out.append(item)
+            return out
 
     @staticmethod
     def _ledger_items(view):
@@ -762,7 +813,7 @@ class Contexts:
             items = AdaptiveRecall(self).temperature_order(items, explicit=explicit or mode == "deep")
         if not explicit:
             items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
-            items = [self._overview(i, policy) for i in items]
+            items = self._overviews(items, policy)
         start = int(cursor)
         page_size = 8 if explicit else 16
         selected = items[start:start + page_size]

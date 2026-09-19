@@ -5,6 +5,7 @@ are written directly (state='failed', attempts exhausted), which is exactly the
 shape the inspection reads; execution afterwards goes through the real Worker.
 """
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -128,6 +129,53 @@ def synthetic_index(engine, dims=4):
     return VectorIndex(engine, "vec_" + digest(["synthetic-model", dims, "test-v1"])[:24])
 
 
+def vector_receipt(engine, record_ids):
+    table = synthetic_index(engine).table()
+    predicate = "id IN (" + ",".join(
+        "'" + record_id.replace("'", "''") + "'" for record_id in record_ids
+    ) + ")"
+    rows = table.search().where(predicate).select(["id", "revision"]).limit(len(record_ids)).to_list()
+    return {"probed": True, "contract_verified": True,
+            "revisions": {row["id"]: row["revision"] for row in rows}}
+
+
+def reviewed_manifest(engine, vector_revisions=None):
+    with engine.db.connect() as conn:
+        current = dr.plan(conn, {} if vector_revisions is None else vector_revisions)
+    current["digests"] = dr.attach_digest_review_evidence(engine, current["digests"])
+    vector_targets = [
+        {"record_id": entry["record_id"], "vector_revision": entry["vector_revision"]}
+        for entry in current["embeds"] if entry.get("action") == "recover"
+    ]
+    manifest = {
+        "schema_version": 2,
+        "kind": "w2-derivative-recovery-dry-run",
+        "store": {"root": str(engine.db.root)},
+        "vector_store": {
+            "probed": True,
+            "contract_verified": True,
+            "table": "vec_synthetic",
+            "version": 1,
+            "dimensions": 4,
+            "query": "targeted-id-filter",
+            "targets": vector_targets,
+            "probe_receipt": digest({"table": "vec_synthetic", "version": 1,
+                                     "targets": vector_targets}),
+            "contract": {
+                "resolved": True,
+                "index_id": "vec_synthetic",
+                "model": "synthetic-model",
+                "dimensions": 4,
+                "preprocessing": "test-v1",
+            },
+        },
+        "embeds": current["embeds"],
+        "digests": current["digests"],
+    }
+    manifest["review_fingerprint"] = dr.manifest_review_fingerprint(manifest)
+    return manifest, current
+
+
 def drive_to_terminal(engine, job_ids, rounds=40):
     """Run the Worker until every named job is terminal. Retry backoff is elapsed
     by hand — the queue's own backoff window is not what a test waits for."""
@@ -227,6 +275,13 @@ def test_embed_inspection_and_end_to_end(system, monkeypatch):
     with engine.db.connect() as conn:
         healed = {e["record_id"]: e for e in dr.inspect_embeds(conn, {active: 1})}
     assert healed[active]["skip_reason"] == "vector-present"
+
+    # An older vector row is evidence, but not evidence at the failed target.
+    with engine.db.connect() as conn:
+        stale = {e["record_id"]: e for e in dr.inspect_embeds(conn, {active: 0})}
+    assert stale[active]["action"] == "recover"
+    assert stale[active]["vector_at_target"] is False
+    assert stale[active]["vector_revision"] == 0
 
     stub_embed(monkeypatch)
     result = dr.recover_embeddings(engine, list(entries.values()), command_id="w2-test-2")
@@ -387,9 +442,10 @@ def test_runner_stops_on_environmental_failure_with_backoff(system, monkeypatch)
     sleeps, probes = [], []
 
     runner = dr.Runner(engine, embed_batch=2, digest_batch=1,
-                       probe=lambda: probes.append(1) or False,
+                       probe=lambda: probes.append(1) or True,
                        backoff=(10.0,), sleep=sleeps.append, poll=0)
-    outcome = runner.run(command_id="w2-test-7", settle=lambda job_ids: drive_to_terminal(engine, job_ids))
+    outcome = runner.run(command_id="w2-test-7", allow_unreviewed=True,
+                         settle=lambda job_ids: drive_to_terminal(engine, job_ids))
     assert outcome["stopped"] == "environmental"
     assert sleeps == [10.0] and probes == [1]
     assert len(outcome["cycles"]) == 1
@@ -416,7 +472,8 @@ def test_runner_defers_to_foreground_leases(system, monkeypatch):
                      (mind.scope.key(), "owner-session", time.time() + 60))
     sleeps = []
     runner = dr.Runner(engine, sleep=sleeps.append, poll=0)
-    outcome = runner.run(command_id="w2-test-8", settle=lambda ids: [], max_cycles=2)
+    outcome = runner.run(command_id="w2-test-8", allow_unreviewed=True,
+                         settle=lambda ids: [], max_cycles=2)
     assert outcome["stopped"] == "preempted" and not outcome["cycles"]
     with engine.db.connect() as conn:
         assert conn.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()[0] == "failed"
@@ -424,7 +481,7 @@ def test_runner_defers_to_foreground_leases(system, monkeypatch):
     stub_embed(monkeypatch)
     with engine.db.connect(write=True) as conn:
         conn.execute("DELETE FROM mind_foreground_leases")
-    outcome = runner.run(command_id="w2-test-8",
+    outcome = runner.run(command_id="w2-test-8", allow_unreviewed=True,
                          settle=lambda job_ids: drive_to_terminal(engine, job_ids))
     assert outcome["stopped"] is None
     with engine.db.connect() as conn:
@@ -441,14 +498,14 @@ def test_runner_restart_mid_recovery_resumes(system, monkeypatch):
     stub_embed(monkeypatch)
 
     first = dr.Runner(engine, embed_batch=2, sleep=lambda s: None)
-    one = first.run(command_id="w2-test-9",
+    one = first.run(command_id="w2-test-9", allow_unreviewed=True,
                     settle=lambda job_ids: drive_to_terminal(engine, job_ids), max_cycles=1)
     assert len(one["cycles"]) == 1
     assert one["stopped"] == "cycle-limit"
 
     # The process dies here. A new runner with the same command id continues.
     second = dr.Runner(engine, embed_batch=2, sleep=lambda s: None)
-    two = second.run(command_id="w2-test-9",
+    two = second.run(command_id="w2-test-9", allow_unreviewed=True,
                      settle=lambda job_ids: drive_to_terminal(engine, job_ids))
     assert two["stopped"] is None
     with engine.db.connect() as conn:
@@ -475,7 +532,7 @@ def test_runner_reports_digest_receipt_per_event(system, monkeypatch):
     monkeypatch.setattr("kin_mind.appraisal.DeepSeek.from_engine", classmethod(lambda cls, eng: Summarizer()))
 
     runner = dr.Runner(engine, sleep=lambda s: None)
-    outcome = runner.run(command_id="w2-test-12",
+    outcome = runner.run(command_id="w2-test-12", allow_unreviewed=True,
                          settle=lambda job_ids: drive_to_terminal(engine, job_ids))
     assert outcome["stopped"] is None
     (cost,) = [c for c in outcome["costs"] if c["kind"] == "event_digest"]
@@ -551,3 +608,425 @@ def test_plan_counts_and_out_of_scope_listing(system):
     repairs = current["out_of_scope"]["needs_repair_appraisals"]
     assert [r["id"] for r in repairs] == ["appraise_quarantined"]
     assert repairs[0]["stimulus"] == "memory-enrichment"
+
+
+def test_missing_vector_evidence_blocks_recovery_and_runner_requires_review(system):
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    rid = record_of(engine, source("no-vector-proof", "Do not recompute without current Lance evidence"))
+    quiesce(engine)
+    failed_embed_job(engine, rid, 1)
+    with engine.db.connect() as conn:
+        (entry,) = [e for e in dr.inspect_embeds(conn) if e["record_id"] == rid]
+    assert entry["action"] == "blocked"
+    assert entry["block_reason"] == "vector-evidence-unavailable"
+    with pytest.raises(ValueError, match="reviewed selection"):
+        dr.Runner(engine).run(command_id="unsafe-enumeration")
+
+
+def test_reviewed_batch_is_fixed_and_same_command_cannot_take_next_targets(system, monkeypatch):
+    pytest.importorskip("lancedb")
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    ids = [record_of(engine, source(f"fixed-{n}", f"Reviewed vector gap {n}")) for n in range(5)]
+    quiesce(engine)
+    jids = [failed_embed_job(engine, rid, 1) for rid in ids]
+    from eventmem.core.vectors import VectorIndex
+    VectorIndex.register(engine, "synthetic-model", 4, "test-v1")
+    synthetic_index(engine).table()
+    manifest, current = reviewed_manifest(engine)
+    reviewed_order = [
+        entry["job_id"] for entry in manifest["embeds"] if entry["action"] == "recover"
+    ]
+    selection, review = dr.select_reviewed_targets(
+        manifest, current, embed_limit=2, digest_limit=0
+    )
+    assert [e["job_id"] for e in selection["embeds"]] == reviewed_order[:2]
+    assert review["remaining_reviewed"]["embeds"] == 3
+    stub_embed(monkeypatch)
+
+    runner = dr.Runner(
+        engine, embed_batch=2, digest_batch=0, sleep=lambda _: None,
+        vector_probe=lambda record_ids: vector_receipt(engine, record_ids),
+    )
+    first = runner.run(
+        command_id="fixed-command", selection=selection,
+        manifest_sha256="a" * 64, vector_revisions={},
+        vector_evidence={"probed": True, "version": 1},
+        settle=lambda job_ids: drive_to_terminal(engine, job_ids),
+    )
+    assert first["stopped"] is None
+    assert [item["job_id"] for item in first["selected"]["embeds"]] == reviewed_order[:2]
+    assert all(cost["vector_verified"] for cost in first["costs"])
+
+    current_vectors = vector_receipt(engine, ids)["revisions"]
+    with engine.db.connect() as conn:
+        later = dr.plan(conn, current_vectors)
+        later["reviewed_target_states"] = dr.reviewed_target_states(
+            conn, manifest, current_vectors
+        )
+    later["digests"] = dr.attach_digest_review_evidence(engine, later["digests"])
+    next_selection, _ = dr.select_reviewed_targets(
+        manifest, later, embed_limit=2, digest_limit=0
+    )
+    assert [e["job_id"] for e in next_selection["embeds"]] == reviewed_order[2:4]
+
+    replay = runner.run(
+        command_id="fixed-command", selection=next_selection,
+        manifest_sha256="a" * 64, vector_revisions=current_vectors,
+        vector_evidence={"probed": True, "version": 2},
+        settle=lambda job_ids: drive_to_terminal(engine, job_ids),
+    )
+    assert replay["idempotent_replay"] is True
+    assert [item["job_id"] for item in replay["selected"]["embeds"]] == reviewed_order[:2]
+    with engine.db.connect() as conn:
+        states = {row["id"]: row["state"] for row in conn.execute(
+            f"SELECT id,state FROM jobs WHERE id IN ({','.join('?' for _ in jids)})", jids
+        )}
+    assert [states[jid] for jid in reviewed_order[2:]] == ["failed", "failed", "failed"]
+
+    second = runner.run(
+        command_id="next-command", selection=next_selection,
+        manifest_sha256="a" * 64, vector_revisions=current_vectors,
+        vector_evidence={"probed": True, "version": 2},
+        settle=lambda job_ids: drive_to_terminal(engine, job_ids),
+    )
+    assert second["stopped"] is None
+    with engine.db.connect() as conn:
+        assert [conn.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()[0]
+                for jid in reviewed_order] == ["complete", "complete", "complete", "complete", "failed"]
+
+
+def test_command_lease_blocks_same_command_and_fences_other_command_receipt(system, monkeypatch):
+    pytest.importorskip("lancedb")
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    rid = record_of(engine, source("leased", "One command owns this recovery batch"))
+    quiesce(engine)
+    jid = failed_embed_job(engine, rid, 1)
+    from eventmem.core.vectors import VectorIndex
+    VectorIndex.register(engine, "synthetic-model", 4, "test-v1")
+    synthetic_index(engine).table()
+    manifest, current = reviewed_manifest(engine)
+    selection, _ = dr.select_reviewed_targets(
+        manifest, current, embed_limit=1, digest_limit=0
+    )
+    stub_embed(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    first_result = {}
+
+    def blocking_settle(job_ids):
+        entered.set()
+        assert release.wait(10)
+        return drive_to_terminal(engine, job_ids)
+
+    first_runner = dr.Runner(
+        engine, embed_batch=1, digest_batch=0,
+        vector_probe=lambda ids: vector_receipt(engine, ids),
+        command_lease_seconds=15,
+    )
+
+    def run_first():
+        first_result.update(first_runner.run(
+            command_id="leased-command", selection=selection,
+            manifest_sha256="e" * 64, vector_revisions={},
+            settle=blocking_settle,
+        ))
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert entered.wait(10)
+
+    second = dr.Runner(
+        engine, embed_batch=1, digest_batch=0,
+        vector_probe=lambda ids: vector_receipt(engine, ids),
+        command_lease_seconds=15,
+    ).run(
+        command_id="leased-command", selection=selection,
+        manifest_sha256="e" * 64, vector_revisions={},
+        settle=lambda _: pytest.fail("a second owner must not settle the command"),
+    )
+    assert second["stopped"] == "command-running" and second["state"] == "running"
+
+    other = dr.Runner(
+        engine, embed_batch=1, digest_batch=0,
+        vector_probe=lambda ids: vector_receipt(engine, ids),
+        command_lease_seconds=15,
+    ).run(
+        command_id="other-command", selection=selection,
+        manifest_sha256="e" * 64, vector_revisions={},
+        settle=lambda _: pytest.fail("another command must not settle the first command's job"),
+    )
+    assert other["stopped"] == "preflight-drift"
+    with engine.db.connect() as conn:
+        first_row = conn.execute(
+            "SELECT state,owner,fence,receipt FROM mind_derivative_recovery_runs "
+            "WHERE command_id='leased-command'"
+        ).fetchone()
+        other_row = conn.execute(
+            "SELECT state,receipt FROM mind_derivative_recovery_runs "
+            "WHERE command_id='other-command'"
+        ).fetchone()
+        audits = conn.execute(
+            "SELECT command_id FROM job_recovery WHERE job_id=?", (jid,)
+        ).fetchall()
+    assert first_row["state"] == "running" and first_row["owner"] == first_runner.owner
+    assert first_row["fence"] == 1 and first_row["receipt"] is None
+    assert other_row["state"] == "stopped" and other_row["receipt"] is not None
+    assert [row[0] for row in audits] == ["leased-command"]
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert first_result["stopped"] is None
+    with engine.db.connect() as conn:
+        row = conn.execute(
+            "SELECT state,owner,lease_until,fence,receipt FROM mind_derivative_recovery_runs "
+            "WHERE command_id='leased-command'"
+        ).fetchone()
+    assert row["state"] == "complete" and row["owner"] is None and row["lease_until"] == 0
+    assert row["fence"] == 1 and row["receipt"] is not None
+
+
+def test_expired_command_lease_resumes_original_selection(system, monkeypatch):
+    pytest.importorskip("lancedb")
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    ids = [record_of(engine, source(f"resume-{n}", f"Crash recovery target {n}")) for n in range(2)]
+    quiesce(engine)
+    jids = [failed_embed_job(engine, rid, 1) for rid in ids]
+    from eventmem.core.vectors import VectorIndex
+    VectorIndex.register(engine, "synthetic-model", 4, "test-v1")
+    synthetic_index(engine).table()
+    manifest, current = reviewed_manifest(engine)
+    all_selection, _ = dr.select_reviewed_targets(
+        manifest, current, embed_limit=2, digest_limit=0
+    )
+    original = all_selection | {"embeds": all_selection["embeds"][:1]}
+    proposed_after_crash = all_selection | {"embeds": all_selection["embeds"][1:]}
+    claimed = dr.bind_recovery_selection(
+        engine, command_id="crashed-command", manifest_sha256="f" * 64,
+        selection=original, embed_limit=1, digest_limit=0,
+        owner="crashed-owner", lease_seconds=15,
+    )
+    assert claimed["claimed"] is True and claimed["fence"] == 1
+    with engine.db.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE mind_derivative_recovery_runs SET lease_until=? "
+            "WHERE command_id='crashed-command'",
+            (time.time() - 1,),
+        )
+    stub_embed(monkeypatch)
+
+    resumed = dr.Runner(
+        engine, embed_batch=1, digest_batch=0,
+        vector_probe=lambda record_ids: vector_receipt(engine, record_ids),
+        command_lease_seconds=15,
+    ).run(
+        command_id="crashed-command", selection=proposed_after_crash,
+        manifest_sha256="f" * 64, vector_revisions={},
+        settle=lambda job_ids: drive_to_terminal(engine, job_ids),
+    )
+    original_job = original["embeds"][0]["job_id"]
+    proposed_job = proposed_after_crash["embeds"][0]["job_id"]
+    assert resumed["stopped"] is None
+    assert [entry["job_id"] for entry in resumed["selected"]["embeds"]] == [original_job]
+    with engine.db.connect() as conn:
+        states = dict(conn.execute(
+            f"SELECT id,state FROM jobs WHERE id IN ({','.join('?' for _ in jids)})", jids
+        ).fetchall())
+        run = conn.execute(
+            "SELECT state,fence,receipt FROM mind_derivative_recovery_runs "
+            "WHERE command_id='crashed-command'"
+        ).fetchone()
+    assert states[original_job] == "complete" and states[proposed_job] == "failed"
+    assert run["state"] == "complete" and run["fence"] == 2 and run["receipt"] is not None
+
+    stale_finish = dr._finish_recovery_run(
+        engine, "crashed-command", {"stopped": "stale-owner-overwrite"},
+        owner="crashed-owner", fence=1,
+    )
+    assert stale_finish["stopped"] is None
+    assert stale_finish["idempotent_replay"] is True
+    with engine.db.connect() as conn:
+        unchanged = conn.execute(
+            "SELECT state,fence,receipt FROM mind_derivative_recovery_runs "
+            "WHERE command_id='crashed-command'"
+        ).fetchone()
+    assert unchanged["state"] == "complete" and unchanged["fence"] == 2
+    assert unchanged["receipt"] == run["receipt"]
+
+
+def test_new_failure_outside_reviewed_manifest_is_never_selected(system):
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    reviewed_id = record_of(engine, source("reviewed-only", "Reviewed missing vector"))
+    quiesce(engine)
+    reviewed_job = failed_embed_job(engine, reviewed_id, 1)
+    manifest, _ = reviewed_manifest(engine)
+
+    new_id = record_of(engine, source("after-review", "New failure after review"))
+    quiesce(engine)
+    new_job = failed_embed_job(engine, new_id, 1)
+    with engine.db.connect() as conn:
+        current = dr.plan(conn, {})
+    current["digests"] = dr.attach_digest_review_evidence(engine, current["digests"])
+    selection, review = dr.select_reviewed_targets(
+        manifest, current, embed_limit=10, digest_limit=0
+    )
+    assert [entry["job_id"] for entry in selection["embeds"]] == [reviewed_job]
+    assert [entry["job_id"] for entry in review["unreviewed"]["embeds"]] == [new_job]
+
+
+def test_completed_job_without_target_vector_is_drift_not_success(system):
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    rid = record_of(engine, source("false-complete", "Queue state alone is not vector evidence"))
+    quiesce(engine)
+    jid = failed_embed_job(engine, rid, 1)
+    manifest, _ = reviewed_manifest(engine)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET state='complete',error=NULL WHERE id=?", (jid,))
+    with engine.db.connect() as conn:
+        current = dr.plan(conn, {})
+        current["reviewed_target_states"] = dr.reviewed_target_states(conn, manifest, {})
+    current["digests"] = dr.attach_digest_review_evidence(engine, current["digests"])
+    selection, review = dr.select_reviewed_targets(
+        manifest, current, embed_limit=1, digest_limit=0
+    )
+    assert not selection["embeds"]
+    assert review["drifted"] == [{
+        "kind": "embed", "job_id": jid, "record_id": rid,
+        "target_revision": 1, "reason": "failed-job-no-longer-proven",
+    }]
+
+
+def test_reviewed_digest_membership_drift_abandons_without_generation_bump(system):
+    mind = system[0]
+    engine = mind.engine
+    event_id = make_event(system, "reviewed-members")
+    publish(system, event_id)
+    quiesce(engine)
+    fail_digest(system, event_id)
+    with engine.db.connect() as conn:
+        entries = dr.inspect_digests(conn)
+    (entry,) = [
+        item for item in dr.attach_digest_review_evidence(engine, entries)
+        if item["event_id"] == event_id
+    ]
+    generation = entry["generation"]
+    moved = entry | {"membership_input_hash": "not-the-reviewed-membership"}
+    result = dr.recover_digests(
+        engine, [moved], command_id="digest-drift", require_reviewed=True
+    )
+    assert not result["recovered"]
+    assert result["abandoned"][0]["reason"] == "reviewed-generation-or-membership-moved"
+    with engine.db.connect() as conn:
+        row = conn.execute(
+            "SELECT state,generation FROM mind_event_digests WHERE scope=? AND event_id=?",
+            (mind.scope.key(), event_id),
+        ).fetchone()
+        assert row["state"] == "failed" and row["generation"] == generation
+        assert conn.execute(
+            "SELECT COUNT(*) FROM job_recovery WHERE command_id='digest-drift'"
+        ).fetchone()[0] == 0
+
+
+def test_reviewed_digest_runner_verifies_ready_receipt_and_replays(system, monkeypatch):
+    mind = system[0]
+    engine = mind.engine
+    event_id = make_event(system, "strict-digest", ("第一条事实。", "第二条事实。"))
+    publish(system, event_id)
+    quiesce(engine)
+    fail_digest(system, event_id)
+    manifest, current = reviewed_manifest(engine)
+    selection, _ = dr.select_reviewed_targets(
+        manifest, current, embed_limit=0, digest_limit=1
+    )
+    assert [entry["event_id"] for entry in selection["digests"]] == [event_id]
+    monkeypatch.setattr(
+        "kin_mind.appraisal.DeepSeek.from_engine",
+        classmethod(lambda cls, eng: Summarizer()),
+    )
+    runner = dr.Runner(engine, embed_batch=0, digest_batch=1, sleep=lambda _: None)
+    first = runner.run(
+        command_id="strict-digest-command", selection=selection,
+        manifest_sha256="d" * 64,
+        settle=lambda job_ids: drive_to_terminal(engine, job_ids),
+    )
+    assert first["stopped"] is None
+    assert first["cycles"][0]["digest_verification"][0]["verified"] is True
+    (cost,) = first["costs"]
+    assert cost["scope"] == mind.scope.model_dump()
+    assert cost["state"] == "ready" and cost["model"] == "synthetic"
+
+    replay = runner.run(
+        command_id="strict-digest-command", selection={
+            "review_fingerprint": "different-current-view", "embeds": [], "digests": []
+        },
+        manifest_sha256="d" * 64,
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["selection_digest"] == first["selection_digest"]
+
+
+def test_runner_stops_on_nonterminal_batch_without_expanding(system):
+    mind, _, _, source, _ = system
+    engine = mind.engine
+    ids = [record_of(engine, source(f"timeout-{n}", f"Timeout gap {n}")) for n in range(4)]
+    quiesce(engine)
+    jids = [failed_embed_job(engine, rid, 1) for rid in ids]
+    ordered = sorted(jids)
+    runner = dr.Runner(engine, embed_batch=2, digest_batch=0, sleep=lambda _: None)
+
+    outcome = runner.run(
+        command_id="timeout-command", allow_unreviewed=True,
+        settle=lambda job_ids: [
+            {"id": job_id, "state": "running", "error": None,
+             "updated_at": "2026-09-19T00:00:00+00:00"}
+            for job_id in job_ids
+        ],
+    )
+    assert outcome["stopped"] == "settle-timeout"
+    assert len(outcome["cycles"]) == 1
+    with engine.db.connect() as conn:
+        audited = {row[0] for row in conn.execute("SELECT job_id FROM job_recovery")}
+        states = {row["id"]: row["state"] for row in conn.execute(
+            f"SELECT id,state FROM jobs WHERE id IN ({','.join('?' for _ in jids)})", jids
+        )}
+    assert audited == set(ordered[:2])
+    assert [states[jid] for jid in ordered[2:]] == ["failed", "failed"]
+
+
+def test_digest_cost_receipt_is_scoped(system):
+    engine = system[0].engine
+    event_id = "evt_same_across_scopes"
+    scope_a = Scope(persona="scope-a").key()
+    scope_b_obj = Scope(persona="scope-b")
+    scope_b = scope_b_obj.key()
+    with engine.db.connect(write=True) as conn:
+        for scope, model in ((scope_a, "wrong-scope"), (scope_b, "right-scope")):
+            conn.execute(
+                "INSERT INTO mind_event_digests(scope,event_id,state,generation,revision,input_hash,dirty_at,due_at,data) "
+                "VALUES(?,?, 'ready', 4, 2, 'input', '2026-09-19T00:00:00+00:00', 0, ?)",
+                (scope, event_id, json.dumps({
+                    "model_receipt": {"model": model, "input_tokens": 3, "output_tokens": 2},
+                    "source_versions": {},
+                })),
+            )
+    result = {
+        "command_id": "scope-cost",
+        "cycles": [{
+            "embeds": {"targets": []},
+            "digests": {"recovered": [{
+                "scope": scope_b_obj.model_dump(), "event_id": event_id,
+                "job_id": "job_scope", "generation": 4,
+            }], "replayed": []},
+        }],
+    }
+    (cost,) = dr.collect_costs(engine, result)
+    assert cost["scope"] == scope_b_obj.model_dump()
+    assert cost["model"] == "right-scope"
+    (summary,) = dr.costs_by_scope([cost])
+    assert summary["scope"] == scope_b_obj.model_dump()
+    assert summary["input_tokens"] == 3 and summary["output_tokens"] == 2

@@ -267,7 +267,7 @@ REGISTRY = {
     "A trait decision names an observation the ledger does not hold": ("semantic", "trait-observation-unknown", "section"),
     "An owner instruction or correction must quote the owner's own words": ("semantic", "trait-quote-unverified", "section"),
     "A revoked trait needs an owner statement newer than its tombstone": ("semantic", "trait-revoked", "section"),
-    "A faded trait needs new support before it stands again": ("semantic", "trait-needs-support", "section"),
+    "A faded trait needs valid support before it stands again": ("semantic", "trait-needs-support", "section"),
     # --- expression_intent.py: an intent is worth what it rests on. Each of these refuses that one
     # section, is recorded as a static code the next projection shows, and costs no second call ---
     "An intent cites evidence this evaluation was not shown": ("semantic", "intent-evidence-unknown", "section"),
@@ -314,7 +314,7 @@ CALLER_CODES = {
 # code -> (kind, handling) for the callers that know only the code. Where one code is
 # raised with two handlings, the code alone resolves to the stricter of them.
 CODES = dict(CALLER_CODES)
-for _message, (_kind, _code, _handling) in REGISTRY.items():
+for _kind, _code, _handling in REGISTRY.values():
     if _kind not in KINDS or _handling not in HANDLINGS:
         raise RuntimeError("A registered conflict needs a known kind and handling")
     _known = CODES.get(_code)

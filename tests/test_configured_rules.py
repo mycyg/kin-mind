@@ -39,6 +39,7 @@ from kin_mind.appraisal import (
 from kin_mind.dialogue import is_public_dialogue
 from kin_mind.memory import MemoryContinuity
 from kin_mind.procedures import Procedures
+from kin_mind.profile import DIMENSIONS
 from kin_mind.rhythm import at_rest, quiet_hours
 from kin_mind.state import Mind, Motivation
 
@@ -89,6 +90,16 @@ def test_the_stored_threshold_stays_a_number_either_way(setup):
     stored = saved_profile(mind)["contact"]["threshold"]
     assert type(stored) is int and stored == 75
     assert mind.read()["contact"]["threshold"] == 75
+
+
+def test_the_model_is_told_scores_are_context_and_legacy_thresholds_are_explicit(monkeypatch):
+    guidance = DIMENSIONS["initiative"]["expression"]
+    assert "当前语义决策" in guidance and "既有授权" in guidance and "显式旧版模式" in guidance
+    assert "达到阈值" not in guidance
+    api = Recorded(monkeypatch)
+    body, _ = api.request({**CONTEXT, "definitions": DIMENSIONS})
+    rendered = json.dumps(body, ensure_ascii=False)
+    assert guidance in rendered and "达到阈值后请求有依据的联系" not in rendered
 
 
 def test_a_crossing_needs_the_gates_that_define_it(setup):

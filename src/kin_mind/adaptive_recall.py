@@ -498,7 +498,10 @@ class AdaptiveRecall:
             # those rounds surfaced follows it.
             pool = {**first_pool, **pool}
             ranked_ids = list(dict.fromkeys([*first_ranked[:8], *ranked_ids]))
-        selected = [pool[i] for i in ranked_ids[:40] if i in pool and self.contexts._current(pool[i], policy)]
+        pending_selection = [pool[i] for i in ranked_ids[:40] if i in pool]
+        with self.engine.db.connect() as conn:
+            selected = [item for item in pending_selection
+                        if self.contexts._current(item, policy, conn=conn)]
         info["expanded_ids"] = [i["id"] for i in selected[:8]]
         info["evidence_versions"] = {i["id"]: i["revision"] for i in selected}
         info["candidate_count"] = len(selected)
@@ -527,8 +530,15 @@ class AdaptiveRecall:
         if not settings["temperature_shadow"] or explicit:
             return items
         with self.engine.db.connect() as conn:
-            tiers = {r["identifier"]: dict(r) for r in conn.execute(
-                "SELECT identifier,tier,protected FROM mind_memory_temperature WHERE scope=?", (self.mind.scope.key(),))}
+            # Only the shown items' tiers are ever read below; the rest of the scope's
+            # ledger is not part of the answer and is not loaded.
+            ids = [item["id"] for item in items]
+            tiers = {}
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                tiers = {r["identifier"]: dict(r) for r in conn.execute(
+                    f"SELECT identifier,tier,protected FROM mind_memory_temperature WHERE scope=? AND identifier IN ({marks})",
+                    (self.mind.scope.key(), *ids))}
         # Only cold optional entries move. Required evidence and all neutral
         # runtime/context items preserve their order.
         def cold(item):

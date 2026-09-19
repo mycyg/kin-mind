@@ -44,9 +44,16 @@ class ContinuityManifest:
                                      + [x for x in ((intent or {}).get('exploration_id'), (intent or {}).get('work_id')) if x]))
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
+            entry_terms = {}
+            def overlap(entry):
+                # One tokenization per entry per select: the sort key and the priority
+                # test below ask the same question of the same topic+content.
+                if entry['id'] not in entry_terms:
+                    entry_terms[entry['id']] = set(query_terms(entry.get('topic', '') + ' ' + entry.get('content', '')))
+                return bool(terms & entry_terms[entry['id']])
             for kind in ('concerns', 'desires'):
                 active = [d for d in state.get(kind, {}).values() if d.get('status') in {'active', 'easing', 'wanted', 'in_progress', 'waiting'}]
-                active.sort(key=lambda d: (not bool(terms & set(query_terms(d.get('topic', '') + ' ' + d.get('content', '')))), -d.get('intensity', d.get('strength', 0)), d['id']))
+                active.sort(key=lambda d: (not overlap(d), -d.get('intensity', d.get('strength', 0)), d['id']))
                 for entry in active[:3 if kind == 'concerns' else 2]:
                     if entry.get('expires_at') and timestamp(entry['expires_at']) <= timestamp(self.mind.clock()):
                         continue
@@ -56,7 +63,7 @@ class ContinuityManifest:
                     items.append({'id': entry['id'], 'revision': digest(entry), 'text': dumps(value),
                         'basis': entry.get('basis', 'inferred'), 'facts': {'kind': kind, 'status': entry['status']},
                         'dependencies': [{'id': r['record_id'], 'revision': r['revision']} for r in entry.get('evidence', [])],
-                        'state_dependency': {'kind': kind, 'id': entry['id'], 'digest': digest(entry)}, 'priority': 0 if entry['id'] in active_matters else 1 if terms & set(query_terms(entry.get('topic', '') + ' ' + entry.get('content', ''))) else 3})
+                        'state_dependency': {'kind': kind, 'id': entry['id'], 'digest': digest(entry)}, 'priority': 0 if entry['id'] in active_matters else 1 if overlap(entry) else 3})
             for task_id in sorted(task_ids):
                 for row in conn.execute("SELECT DISTINCT n.data FROM mind_memory_nodes n, json_each(n.data,'$.task_ids') t WHERE n.scope=? AND n.kind='work' AND t.value=? ORDER BY n.updated_at DESC LIMIT 3", (self.mind.scope.key(), task_id)):
                     node = json.loads(row[0])

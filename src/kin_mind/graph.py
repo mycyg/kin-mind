@@ -40,6 +40,8 @@ RELATIONS = {"participates", "part_of", "continues", "responds_to", "produces", 
              "shares", "corrects", "resolves", "supports", "refutes", "causes", "association",
              "follows", "about", "related"}
 
+GET_MANY_PAGE_SIZE = 400
+
 
 def query_terms(query, limit=40):
     """Retain the user's language instead of taking ASCII-first tokenizer output."""
@@ -106,6 +108,27 @@ class EventGraph:
                     return self.get(conn, value["merged_into"], follow=True)
                 return value
         raise Missing(identifier)
+
+    def _get_many(self, conn, identifiers):
+        """Read a known id list in bounded IN-list pages across both graph tables.
+
+        An id in neither table is answered by `get`, which raises Missing exactly as
+        before. The final mapping follows the caller's order, independent of the
+        database's row order.
+        """
+        ordered = list(identifiers)
+        found = {}
+        for table in ("mind_graph_nodes", "mind_graph_edges"):
+            missing = list(dict.fromkeys(i for i in ordered if i not in found))
+            if not missing:
+                break
+            for start in range(0, len(missing), GET_MANY_PAGE_SIZE):
+                page = missing[start:start + GET_MANY_PAGE_SIZE]
+                marks = ",".join("?" for _ in page)
+                for row in conn.execute(f"SELECT id,data FROM {table} WHERE scope=? AND id IN ({marks})",
+                                        [self.scope.key(), *page]):
+                    found.setdefault(row["id"], json.loads(row["data"]))
+        return {i: found[i] if i in found else self.get(conn, i) for i in ordered}
 
     def _put(self, conn, value, *, edge=False):
         value = dict(value)
@@ -176,18 +199,58 @@ class EventGraph:
         return [n for n in nodes if policy.node_visible(n, records)]
 
     def fresh(self, conn, node):
+        return self._fresh_value(conn, node)
+
+    def _fresh_value(self, conn, node, node_cache=None, evidence_cache=None):
+        """Evaluate freshness, optionally reusing results in one caller-owned snapshot."""
+        identifier = node.get("id")
+        revision = node.get("revision")
+        cached = node_cache.get(identifier) if node_cache is not None and identifier is not None else None
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+
+        def remember(value):
+            if node_cache is not None and identifier is not None:
+                node_cache[identifier] = (revision, value)
+            return value
+
+        def evidence_fresh(refs):
+            if evidence_cache is None:
+                return self.mind._fresh(conn, refs)
+            for ref in refs:
+                # These are exactly the fields Mind._fresh reads. Metadata and display
+                # fields do not affect whether this evidence reference is current.
+                key = tuple(ref.get(field) for field in (
+                    "source_id", "record_id", "hash", "revision", "namespace", "source_key"))
+                if key not in evidence_cache:
+                    evidence_cache[key] = self.mind._fresh(conn, [ref])
+                if not evidence_cache[key]:
+                    return False
+            return True
+
         try:
             if node.get("reference_status") in {"unverified", "archived", "superseded", "deleted"}:
-                return False
+                return remember(False)
             if node["id"].startswith("mem_"):
                 record = self.engine._get(conn,node["id"])
                 if record["revision"] != node.get("reference_revision") or record["status"] != "active":
-                    return False
-            if node.get("kind") == "edge" and any(not self.fresh(conn,self.get(conn,nid)) for nid in (node["subject"],node["object"])):
-                return False
-            return node.get("state") == "active" and bool(node.get("evidence")) and self.mind._fresh(conn, node["evidence"])
+                    return remember(False)
+            if node.get("kind") == "edge":
+                def endpoint_fresh(endpoint):
+                    # graph.read evaluates its returned nodes before its induced edges.
+                    # A cached endpoint is therefore the same row in this read snapshot,
+                    # and does not need another point lookup.
+                    known = node_cache.get(endpoint) if node_cache is not None else None
+                    return known[1] if known is not None else self._fresh_value(
+                        conn, self.get(conn, endpoint), node_cache=node_cache,
+                        evidence_cache=evidence_cache)
+
+                if any(not endpoint_fresh(nid) for nid in (node["subject"], node["object"])):
+                    return remember(False)
+            return remember(node.get("state") == "active" and bool(node.get("evidence"))
+                            and evidence_fresh(node["evidence"]))
         except (Missing, Conflict):
-            return False
+            return remember(False)
 
     def ensure(self, conn, identifier):
         """Project canonical domain objects without copying their full contents."""
@@ -404,6 +467,14 @@ class EventGraph:
         if layer not in {None, "evidence", "association"}:
             raise ValueError("Unknown graph layer")
         with self.engine.db.connect() as conn:
+            # One read uses one SQLite transaction/snapshot. These dictionaries are
+            # deliberately local: a nested or later read starts with empty caches.
+            node_freshness, evidence_freshness = {}, {}
+
+            def fresh(node):
+                return self._fresh_value(conn, node, node_cache=node_freshness,
+                                         evidence_cache=evidence_freshness)
+
             policy, paged = self.policy(conn, policy=policy), False
             # Hidden nodes are also removed from the frontier: a configuration projection is not
             # a bridge this read may cross, so its neighbours are not reached through it.
@@ -417,7 +488,8 @@ class EventGraph:
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 300):
                             next_ids.update(row)
-                    reached = [known.setdefault(i, self.get(conn, i)) for i in sorted(next_ids - ids - known.keys())]
+                    batch = self._get_many(conn, sorted(next_ids - ids - known.keys()))
+                    reached = [known.setdefault(i, batch[i]) for i in sorted(next_ids - ids - known.keys())]
                     frontier = {n["id"] for n in self.visible(conn, reached, policy)}
                     ids.update(frontier)
                     if len(ids) >= 1200:
@@ -432,7 +504,9 @@ class EventGraph:
                     for identifier in sorted(frontier):
                         for row in self.neighbors(conn, identifier, layer, 40):
                             additions.update(row)
-                    reached = [self.get(conn, i) for i in sorted(additions - seen)[:40]]
+                    wanted = sorted(additions - seen)[:40]
+                    batch = self._get_many(conn, wanted)
+                    reached = [batch[i] for i in wanted]
                     seen.update(n["id"] for n in reached)
                     frontier = {n["id"] for n in self.visible(conn, reached, policy)}
                     known.update(frontier)
@@ -451,7 +525,7 @@ class EventGraph:
             nodes = values[cursor:cursor+limit] if focus or query else values[:limit]
             allowed, edges = {n["id"] for n in nodes}, {}
             for node in nodes:
-                node["needs_review"] = not self.fresh(conn, node)
+                node["needs_review"] = not fresh(node)
                 node["instruction_authority"] = "data"
             if allowed:
                 marks = ",".join("?" for _ in allowed)
@@ -460,7 +534,7 @@ class EventGraph:
                 # scan repeatedly walked unrelated edges before discarding them.
                 for row in conn.execute(f"SELECT data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND state='active' AND subject IN ({marks}) AND object IN ({marks}) AND (? IS NULL OR layer=?)", (self.scope.key(), *ordered_ids, *ordered_ids, layer, layer)):
                     edge = json.loads(row[0])
-                    edge["needs_review"] = not self.fresh(conn, edge)
+                    edge["needs_review"] = not fresh(edge)
                     edges[edge["id"]] = edge
                 edges = {e["id"]: e for e in self.visible(conn, list(edges.values()), policy)}
             return {"nodes": nodes, "edges": list(edges.values()), "cursor": cursor+limit if more else None, "limit": limit,

@@ -29,6 +29,7 @@ CREATE INDEX IF NOT EXISTS record_scope ON records(scope,deleted,status,kind,upd
 CREATE INDEX IF NOT EXISTS record_constraints ON records(scope) WHERE deleted=0 AND status='active' AND json_extract(data,'$.attributes.constraint')=1;
 CREATE INDEX IF NOT EXISTS record_startup ON records(scope,(CASE kind WHEN 'checkpoint' THEN 0 WHEN 'commitment' THEN 1 WHEN 'preference' THEN 2 ELSE 3 END),importance DESC,updated_at DESC) WHERE deleted=0 AND status='active';
 CREATE INDEX IF NOT EXISTS record_parent ON records(parent_id);
+CREATE INDEX IF NOT EXISTS record_self_knowledge ON records(scope,json_extract(data,'$.attributes.self_knowledge.entry')) WHERE deleted=0;
 CREATE TABLE IF NOT EXISTS revisions(
  record_id TEXT NOT NULL, revision INTEGER NOT NULL, changed_at TEXT NOT NULL,
  action TEXT NOT NULL, reason TEXT NOT NULL, data TEXT NOT NULL,
