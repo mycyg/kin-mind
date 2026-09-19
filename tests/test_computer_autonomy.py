@@ -12,7 +12,7 @@ from kin_mind.actions import ActionEvents
 from kin_mind.appraisal import Appraisal, Appraisals, Wish
 from kin_mind.computer import ComputerReader, create_server, redact
 from kin_mind.continuity import ConcernChange, ContinuityConfig, OwnerRequest
-from kin_mind.exploration import Explorations, final_result, run_kimi
+from kin_mind.exploration import Explorations
 from kin_mind.exploration_decisions import SharingDecision
 from kin_mind.state import Mind
 
@@ -20,7 +20,7 @@ setup = _setup
 
 
 def result(*args, **kwargs):
-    return {"state": "complete", "partial": False, "provider": "kimi-cli", "result": {
+    return {"state": "complete", "partial": False, "executor": "codex-cli", "provider": "deepseek", "result": {
         "summary": "A useful synthetic finding", "findings": ["The document discusses a draft"],
         "sources": [{"url": "https://example.com/draft", "title": "Synthetic document"}],
         "open_questions": [], "suggested_share": "An optional suggestion"}}
@@ -171,22 +171,6 @@ def test_computer_exploration_must_be_enabled_and_keeps_old_default(setup, tmp_p
         return result()
     value = explorer.run("fake", tmp_path / "jobs", "test", runner=runner, computer={"enabled": True})
     assert value["exploration_target"] == "computer"
-
-
-def test_computer_profile_only_exposes_filtered_tools_and_optional_help(tmp_path):
-    payload = result()["result"] | {"assistance_needed": {"action": "Choose a name", "reason": "Preference matters", "completion": "One name"}}
-    fake = tmp_path / "kimi"
-    fake.write_text('#!/usr/bin/env python3\nimport json,sys,os\nfrom pathlib import Path\n'
-        'profile=Path(sys.argv[sys.argv.index("--agent-file")+1]).read_text()\n'
-        'assert "  - Read\\n" not in profile and "mcp__kin_computer__read_computer_context" in profile\n'
-        'assert Path(".kimi-code/mcp.json").exists()\n'
-        'assert Path(os.environ["KIMI_CODE_HOME"]).resolve()==Path(".kimi-code").resolve()\n'
-        'print(json.dumps({"role":"assistant","content":'+repr(json.dumps(payload))+'}))\n')
-    fake.chmod(0o700)
-    value = run_kimi(fake, {"question": "synthetic"}, tmp_path / "job", computer={"enabled": True, "roots": [str(tmp_path)], "kimi_home": str(tmp_path / "synthetic-login")})
-    assert value["state"] == "complete" and value["result"]["assistance_needed"]["action"] == "Choose a name"
-    assert final_result(json.dumps({"role": "assistant", "content": [{"type": "thinking", "thinking": json.dumps(payload)}]})) is None
-
 
 def test_resource_identity_survives_short_context_window(tmp_path):
     path = tmp_path / "notes.txt"

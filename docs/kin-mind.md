@@ -224,13 +224,7 @@ day, and an assessment in the same agent version.
 
 `Explorations` claims an unexpired question selected by DeepSeek. With `semantic_actions` enabled, a current DS decision replaces the legacy curiosity threshold; scores remain dynamic context. The worker claim and desire transition are atomic. There is no elapsed-time admission gate; the 1,200-second maximum remains in the profile. The executor is pluggable: `Explorations.run(..., runner=...)` is the extension point, and every runner shares one contract — an isolated per-exploration workdir, one total budget covering waiting, tool calls and bounded format repair, a cancellation signal that terminates only its own child process group, and an explicit checkpoint a later attempt continues from.
 
-The current executor is `run_codex` (executor `codex-cli`, model provider DeepSeek — deepseek-flash, reasoning high — behind a dedicated local gateway). It runs `codex exec` with user configuration, rules, MCP servers, hooks, multi-agent, the generic shell and web search off, a read-only sandbox, an environment allowlist and host-side validation of the final Findings object. Receipts record executor and model provider separately; consumers must not filter on `provider == "kimi-cli"`. The legacy executor is `run_kimi` (the rollback path: `exploration_backend` unset or `"kimi"`, requiring `kimi_executable`), which starts the
-installed CLI with a dedicated [agent profile](https://moonshotai.github.io/kimi-code/en/customization/agents.html)
-that allows Read, Grep, Glob, WebSearch and FetchURL. It excludes write, shell,
-subagent and messaging tools and overrides automatic skill discovery. These are
-application tool restrictions, not an operating-system filesystem sandbox. The
-host should run it under the desired OS identity/sandbox and pass only authorized
-project paths. Remote search depends on the installed CLI's configured services.
+The current executor is `run_codex` (executor `codex-cli`, model provider DeepSeek — deepseek-flash, reasoning high — behind a dedicated local gateway). It runs `codex exec` with user configuration, rules, MCP servers, hooks, multi-agent, the generic shell and web search off, a read-only sandbox, an environment allowlist and host-side validation of the final Findings object. Receipts record executor and model provider separately. An executor that cannot start pauses the question with a recorded waiting reason; there is no fallback executor. The host should run it under the desired OS identity and pass only authorized project paths.
 
 The wrapper consumes the executor's stream and keeps only validated final reports. Tool
 transcripts and thinking blocks are discarded. Citations remain model-reported and
@@ -240,8 +234,8 @@ A new owner task sets
 the cancellation signal. The wrapper terminates only its own child process group.
 Timeouts retain any already completed final report as partial. A missing final report
 is recorded as incomplete, never fabricated. Crash-interrupted jobs stay inspectable.
-The `exploration_backend` configuration selects the runner (codex-cli or the
-legacy kimi-cli rollback); a host-provided runner with the same result and
+The `exploration_backend` configuration selects the runner (codex-cli; anything
+else pauses with a recorded reason); a host-provided runner with the same result and
 cancellation contract remains the extension point.
 
 ## Shared-session contact host

@@ -1,4 +1,4 @@
-"""On-demand, text-only computer observation tools for a bounded Kimi helper.
+"""On-demand, text-only computer observation tools for a bounded executor.
 
 All local reads pass through this layer; the computer profile has no raw Read,
 Bash or browser-control tools. A host supplies roots and a snapshot executable.
