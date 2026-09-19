@@ -214,9 +214,12 @@ def interaction_style(values, policy):
         "inviting": "偏爱逗弄、亲吻或拥抱的邀约，回应具体话语，避免客服式确认。",
         "direct": "用有主见的亲昵邀约和俏皮挑衅表达想靠近，不只复述对方的话。",
     }
-    return {"band": band, "expression": expressions[band],
-            "context": "工作中先保证任务质量，回应时可保留亲昵；高专注和高调情可以共存。拒绝、忙与停止要求优先，不施压或要求回报。",
-            "basis": "explicit_role_preference", "event_id": policy["event_id"]}
+    result = {"band": band, "expression": expressions[band],
+              "context": "工作中先保证任务质量，回应时可保留亲昵；高专注和高调情可以共存。拒绝、忙与停止要求优先，不施压或要求回报。",
+              "basis": "explicit_role_preference", "event_id": policy["event_id"]}
+    if policy.get("reason"):
+        result["preference"] = policy["reason"]
+    return result
 
 
 def default_profile():

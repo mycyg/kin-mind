@@ -643,6 +643,7 @@ def test_expression_policy_has_evidence_without_inflating_scores(setup):
     assert view["dimensions"] == before
     assert view["interaction_style"]["band"] == "direct"
     assert view["interaction_style"]["event_id"] == result["event_id"]
+    assert view["interaction_style"]["preference"] == "Explicit preference"
     assert view["contact"]["quiet_start"] == 0
     clock[0] += timedelta(seconds=1)
     source("style", "Withdraw that preference", version="2")
