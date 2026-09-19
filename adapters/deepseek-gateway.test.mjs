@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deepseekRequest, responseNormalizer, startDeepSeekGateway, startExplorationGateway, replyContract, continuityContract, explorationContract, nativeTurnPurpose, GATEWAY_PROFILES} from './deepseek-gateway.mjs';
+import {deepseekRequest, responseNormalizer, startDeepSeekGateway, startExplorationGateway,
+  startComputerActionReviewGateway, replyContract, continuityContract, explorationContract,
+  computerActionReviewContract, computerActionReviewSchema, nativeTurnPurpose,
+  flattenExplorationTools, GATEWAY_PROFILES} from './deepseek-gateway.mjs';
 import {createLeaseClient} from './model-lease.mjs';
 
 test('named native host events remain non-user data and do not corrupt ordinary tool receipts',()=>{
@@ -144,8 +147,77 @@ test('purpose profiles are host-bound contracts, never request-declared', () => 
   assert.equal(deepseekRequest(body, 'high', 'chat').instructions, replyContract);
   assert.equal(deepseekRequest(body, 'high', 'contact-draft').instructions, replyContract);
   assert.equal(deepseekRequest(body, 'high', 'continuity-check').instructions, continuityContract);
+  const review=deepseekRequest(body, 'high', 'computer-action-review');
+  assert.equal(review.instructions,computerActionReviewContract);
+  assert.deepEqual(review.text.format.schema,computerActionReviewSchema);
+  assert.equal(review.text.format.strict,true);
   assert.throws(() => deepseekRequest(body, 'high', 'owner-asserted'), /unknown-gateway-profile/);
   assert.deepEqual(GATEWAY_PROFILES.exploration, {lane:'background', purpose:'native-exploration', contract:explorationContract});
+});
+
+test('computer action review has a fixed high profile, strict schema and background usage identity', async () => {
+  const usage=[];let forwarded;
+  const gateway=await startComputerActionReviewGateway({key:'synthetic-secret',onUsage:row=>usage.push(row),
+    fetchImpl:async(_url,options)=>{forwarded=JSON.parse(options.body);return new Response(JSON.stringify({
+      id:'review-request',model:'deepseek-flash',usage:{input_tokens:5},output:[],
+    }),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    const body={model:'deepseek-flash',input:[{type:'message',role:'user',content:'{"candidate":"click"}'}],
+      tools:[{name:'unsafe'}],text:{format:{type:'text'}}};
+    const response=await turn(gateway,body);
+    assert.equal(response.status,200);
+    assert.equal(gateway.profile,'computer-action-review');
+    assert.equal(gateway.reasoningEffort,'high');
+    assert.equal(forwarded.reasoning.effort,'high');
+    assert.deepEqual(forwarded.text.format.schema,computerActionReviewSchema);
+    assert.equal(forwarded.tools,undefined);
+    assert.deepEqual([usage[0].lane,usage[0].purpose],['background','native-computer-action-review']);
+  } finally {await gateway.close();}
+});
+
+test('exploration flattens only host-owned MCP namespaces into DeepSeek function tools', () => {
+  const body={tools:[
+    {type:'custom',name:'exec'},
+    {type:'function',name:'request_user_input'},
+    {type:'namespace',name:'collaboration',tools:[{type:'function',name:'spawn_agent',parameters:{}}]},
+    {type:'namespace',name:'mcp__kin_ui',tools:[
+      {type:'function',name:'open_browser_page',description:'open',parameters:{type:'object'}},
+    ]},
+  ],input:[{type:'function_call',name:'open_browser_page',namespace:'mcp__kin_ui',call_id:'c'}]};
+  const reverse=flattenExplorationTools(body);
+  assert.deepEqual(body.tools.map(tool=>[tool.type,tool.name]),[
+    ['function','mcp__kin_ui__open_browser_page'],
+  ]);
+  assert.equal(body.input[0].name,'mcp__kin_ui__open_browser_page');
+  assert.equal(body.input[0].namespace,undefined);
+  const normalized=responseNormalizer(reverse)({type:'response.output_item.done',item:{
+    type:'function_call',name:'mcp__kin_ui__open_browser_page',call_id:'c',arguments:'{}',
+  }});
+  assert.equal(normalized.item.name,'open_browser_page');
+  assert.equal(normalized.item.namespace,'mcp__kin_ui');
+});
+
+test('one background slot is released after an exploration response before tool action review', async () => {
+  let occupied=false;const events=[];
+  const lease={acquire:async({purpose})=>{
+    if(occupied)return{proceed:false};
+    occupied=true;events.push('acquire:'+purpose);
+    return{proceed:true,detail:()=>({}),release:async()=>{events.push('release:'+purpose);occupied=false;}};
+  }};
+  const answer=async()=>new Response(JSON.stringify({id:'r',model:'deepseek-flash',output:[]}),
+    {headers:{'Content-Type':'application/json'}});
+  const exploration=await startExplorationGateway({key:'secret',lease,fetchImpl:answer});
+  const reviewer=await startComputerActionReviewGateway({key:'secret',lease,fetchImpl:answer});
+  try {
+    assert.equal((await turn(exploration)).status,200);
+    assert.equal((await turn(reviewer,{model:'deepseek-flash',input:[
+      {type:'message',role:'user',content:'{"candidate":"click"}'},
+    ]})).status,200);
+    assert.deepEqual(events,[
+      'acquire:native-exploration','release:native-exploration',
+      'acquire:native-computer-action-review','release:native-computer-action-review',
+    ]);
+  } finally {await exploration.close();await reviewer.close();}
 });
 
 test('a profiled gateway fixes lane and purpose for every request and never consults purposeFor', async () => {

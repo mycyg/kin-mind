@@ -90,8 +90,10 @@ def dispatch(config, action, request):
     observation_file = config.get("session_observation_file")
     if observation_file and Path(observation_file).exists():
         session_context = json.loads(Path(observation_file).read_text())
-    from .codex_executor import exploration_capabilities
-    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(config),
+    from .codex_executor import exploration_capabilities, resolve_computer_exploration
+    capability_computer = resolve_computer_exploration(config)
+    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(
+        config, computer_override=capability_computer),
                       session_context=session_context)
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
@@ -437,7 +439,8 @@ def dispatch(config, action, request):
         prepared = prepare_codex_exploration(config)
         if prepared["state"] != "ready":
             return prepared
-        capabilities = exploration_capabilities(config)
+        resolved_computer = prepared.get("computer") or config.get("computer_exploration")
+        capabilities = exploration_capabilities(config, computer_override=resolved_computer)
         web = None
         if capabilities["capabilities"]["search"]["available"]:
             web = {**(config.get("exploration_web") or {}), "enabled": True}
@@ -453,7 +456,7 @@ def dispatch(config, action, request):
             brief=request.get("brief"),
             desire_id=request.get("desire_id"),
             budget_seconds=budget,
-            computer=config.get("computer_exploration"),
+            computer=resolved_computer,
             web=web,
         )
     if action == "candidate":

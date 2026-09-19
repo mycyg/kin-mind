@@ -172,6 +172,22 @@ def test_computer_exploration_must_be_enabled_and_keeps_old_default(setup, tmp_p
     value = explorer.run("fake", tmp_path / "jobs", "test", runner=runner, computer={"enabled": True})
     assert value["exploration_target"] == "computer"
 
+
+def test_knowledge_exploration_can_use_ui_without_local_file_reader(setup, tmp_path):
+    mind, source, _ = setup
+    wish(mind, source, "inspect a dynamic public page", kind="explore", exploration_target="knowledge")
+
+    def runner(*args, **kwargs):
+        assert kwargs["computer"]["ui"]["enabled"] is True
+        assert kwargs["computer"]["file_reader_enabled"] is False
+        return result()
+
+    value = Explorations(mind).run(
+        "fake", tmp_path / "jobs", "test", runner=runner,
+        computer={"enabled": True, "ui": {"enabled": True}},
+    )
+    assert value["state"] == "complete" and value["exploration_target"] == "knowledge"
+
 def test_resource_identity_survives_short_context_window(tmp_path):
     path = tmp_path / "notes.txt"
     path.write_text("A stable synthetic note")
@@ -212,10 +228,17 @@ def test_observation_correction_marks_result_decision_for_review(setup, tmp_path
     from eventmem.core.models import SourceInput
     mind, source, clock = setup
     wish(mind, source, "investigate", kind="explore", exploration_target="computer")
-    observation = {"id": "computer_synthetic", "locator": "/synthetic/note.txt", "title": "Note", "version": "v1",
+    observation = {"id": "computer_synthetic", "evidence_id": "computer_" + "1" * 32,
+                   "execution_id": None, "attempt": 1, "tool": "read_computer_resource",
+                   "adapter": "kin-computer-reader-v1", "state": "observed",
+                   "locator": "/synthetic/note.txt", "title": "Note", "version": "a" * 64,
                    "observed_at": clock[0].isoformat(), "actor": "unknown", "basis": "observed", "excerpt": "A draft"}
+    def verified_runner(_executable, _topic, directory, **_kwargs):
+        return result() | {"attempt": 1, "observations": [
+            {**observation, "execution_id": directory.name}
+        ]}
     value = Explorations(mind).run("fake", tmp_path / "jobs", "test", computer={"enabled": True},
-        runner=lambda *a, **kw: result() | {"observations": [observation]})
+        runner=verified_runner)
     jobs = Appraisals(mind, exploration_capabilities={"decisions": True})
     jobs.enqueue([value["source_id"]], "test", stimulus="exploration-result", origin="exploration")
     share = SharingDecision(exploration_id=value["id"], decision="share", reason="A sourced result")

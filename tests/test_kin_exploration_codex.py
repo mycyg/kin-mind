@@ -493,6 +493,68 @@ def test_codex_computer_reading_is_the_only_mcp_server(tmp_path, monkeypatch):
     assert "Citation contract" in observed["prompt"]
 
 
+def test_codex_computer_use_is_a_real_separate_fixed_mcp_surface(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setenv("KIN_TEST_ACTION_REVIEW", "ephemeral-synthetic-review-token")
+    monkeypatch.setenv("KIN_TEST_CUA_SURFACES", "browser,computer")
+    job = tmp_path / "job"
+    fake = fake_codex(tmp_path / "fake-codex", OBSERVE + COMPLETE)
+    computer = {
+        "enabled": True,
+        "file_reader_enabled": False,
+        "ui": {
+            "enabled": True, "browser": "chrome", "host_allowlist": ["example.com"],
+            "allow_browser_click": True,
+            "allowed_browser_effects": ["local_edit"],
+            "browser_element_grants": [{"action": "click", "host": "example.com",
+                                        "expected_text": "Save", "effect": "local_edit"}],
+            "action_review": {
+                "enabled": True, "base_url": "http://127.0.0.1:4567/v1",
+                "env_key": "KIN_TEST_ACTION_REVIEW", "model": "deepseek-flash",
+                "reasoning": "high", "allowed_categories": ["local_reversible"],
+            },
+            "backend": {"command": "/bin/false", "args": [],
+                        "env_vars": ["KIN_TEST_CUA_SURFACES"]},
+        },
+    }
+    report = run_codex(fake, TOPIC, job, computer=computer, **codex_kwargs())
+    assert report["state"] == "complete"
+    assert report["capabilities"] == {
+        "computer": True, "search": False, "fetch": False,
+        "browser": True, "computer_interaction": True,
+    }
+    observed = json.loads((job / "observed.json").read_text())
+    assert any(flag.startswith("mcp_servers.kin_ui.command=") for flag in observed["argv"])
+    assert "mcp_optional_startup_grace_ms=10000" in observed["argv"]
+    assert "mcp_servers.kin_ui.omit_tools_from=[]" in observed["argv"]
+    assert "mcp_servers.kin_ui.tool_timeout_sec=90" in observed["argv"]
+    assert any(flag == ('mcp_servers.kin_ui.env_vars=["KIN_TEST_CUA_SURFACES",'
+                        '"KIN_TEST_ACTION_REVIEW"]')
+               for flag in observed["argv"])
+    assert observed["env"]["KIN_TEST_CUA_SURFACES"] == "browser,computer"
+    assert not any(flag.startswith("mcp_servers.kin_computer.command=") for flag in observed["argv"])
+    assert "Screenshots are not exposed" in observed["prompt"]
+    ui_config = json.loads((job / "computer-use.json").read_text())
+    assert ui_config["execution_id"] == "job" and ui_config["attempt"] == 1
+    assert ui_config["allowed_apps"] == [] and ui_config["allow_browser_click"] is True
+    assert ui_config["browser_element_grants"][0]["expected_text"] == "Save"
+    assert ui_config["native_element_grants"] == []
+    assert ui_config["backend"] == {
+        "command": "/bin/false", "args": [], "env_vars": ["KIN_TEST_CUA_SURFACES"],
+    }
+    assert ui_config["action_review"]["env_key"] == "KIN_TEST_ACTION_REVIEW"
+    assert "ephemeral-synthetic-review-token" not in (job / "computer-use.json").read_text()
+    assert "browser,computer" not in (job / "computer-use.json").read_text()
+    assert "browser,computer" not in (job / "input.json").read_text()
+    assert "browser,computer" not in (job / "receipt.json").read_text()
+    assert "browser,computer" not in observed["prompt"]
+    # Completed sources are host-sealed only after Findings validation. A later
+    # exploration can verify the exact origin instead of trusting a bare URL.
+    source = report["result"]["sources"][0]
+    assert source["receipt"]["receipt_format"] == "kin-source-receipt-v1"
+    assert source["receipt"]["verified_by_execution"] == "job"
+
+
 def test_computer_reader_refusals_hold(tmp_path):
     from kin_mind.computer import ComputerReader
 
@@ -505,12 +567,20 @@ def test_computer_reader_refusals_hold(tmp_path):
     excluded = allowed / "private"
     excluded.mkdir()
     (excluded / "inner.txt").write_text("Excluded")
+    execution = allowed / "execution"
+    execution.mkdir()
+    (execution / "computer-use.json").write_text("private host config")
     reader = ComputerReader({"roots": [str(allowed)], "exclude_roots": [str(excluded)],
+                             "internal_deny_roots": [str(execution)],
                              "ledger": str(tmp_path / "ledger.json")})
     with pytest.raises(ValueError, match="resource-outside-authorized-roots"):
         reader.read_resource(outside / "secret.txt")
     with pytest.raises(ValueError, match="private-runtime-material-excluded"):
         reader.read_resource(excluded / "inner.txt")
+    with pytest.raises(ValueError, match="host-execution-material-excluded"):
+        reader.read_resource(execution / "computer-use.json")
+    with pytest.raises(ValueError, match="host-execution-material-excluded"):
+        reader.list_files(execution)
     # A symlink inside the root pointing outside resolves before the check.
     link = allowed / "linked.txt"
     link.symlink_to(outside / "secret.txt")
@@ -521,6 +591,29 @@ def test_computer_reader_refusals_hold(tmp_path):
     with pytest.raises(ValueError, match="credential-or-runtime-material-excluded"):
         reader.read_resource(allowed / "auth.json")
     assert reader.read_resource(allowed / "note.txt")["locator"].endswith("note.txt")
+
+
+def test_inline_backend_env_never_reaches_run_artifacts_under_a_broad_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)
+    job = tmp_path / "job"
+    secret = "sk-inline-secret_123456789"
+    computer = {
+        "enabled": True, "roots": [str(tmp_path)], "exclude_roots": [],
+        "snapshot_command": [sys.executable, "-c", "import json;print(json.dumps({}))"],
+        "ui": {
+            "enabled": True,
+            "backend": {"command": "/bin/false", "env": {"FOO": secret}},
+        },
+    }
+    with pytest.raises(ValueError, match="computer-use-backend-inline-env-refused"):
+        run_codex(fake, TOPIC, job, computer=computer, **codex_kwargs())
+    files = [path for path in job.rglob("*") if path.is_file()]
+    assert files
+    assert all(secret not in path.read_text(errors="ignore") for path in files)
+    reader_config = json.loads((job / "computer-reader.json").read_text())
+    assert "ui" not in reader_config
+    assert reader_config["internal_deny_roots"] == [str(job)]
 
 
 def test_explorations_run_records_executor_unavailability_without_fallback(tmp_path):
@@ -1021,6 +1114,58 @@ def test_exploration_gateway_state_file_lifecycle(tmp_path):
     assert invalid.value.reason == "exploration-gateway-invalid"
 
 
+def test_action_review_gateway_is_resolved_per_dispatch_and_fails_closed(tmp_path, monkeypatch):
+    from kin_mind.codex_executor import (
+        computer_action_review_gateway_base_url,
+        exploration_capabilities,
+        prepare_codex_exploration,
+    )
+
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setenv("KIN_COMPUTER_ACTION_REVIEW_TOKEN", "ephemeral-review-token")
+    fake = fake_codex(tmp_path / "fake-codex", COMPLETE)
+    state = tmp_path / "computer-action-review-gateway.json"
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:42001/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid()}))
+    base = {
+        "exploration_command": str(fake), "exploration_model_provider": PROVIDER,
+        "computer_action_review_gateway_state_file": str(state),
+        "computer_exploration": {"enabled": True, "ui": {
+            "enabled": True, "backend": {"command": "/bin/false"},
+            "allow_browser_click": True,
+            "allowed_browser_effects": ["local_edit"],
+            "browser_element_grants": [
+                {"action": "click", "host": "example.com", "expected_text": "Save",
+                 "effect": "local_edit"},
+            ],
+            "action_review": {"enabled": True,
+                              "allowed_categories": ["navigation", "local_reversible"]},
+        }},
+    }
+    prepared = prepare_codex_exploration(base)
+    review = prepared["computer"]["ui"]["action_review"]
+    assert review["base_url"] == "http://127.0.0.1:42001/v1"
+    assert review["env_key"] == "KIN_COMPUTER_ACTION_REVIEW_TOKEN" and review["available"] is True
+    assert "base_url" not in base["computer_exploration"]["ui"]["action_review"]
+    capabilities = exploration_capabilities(base, computer_override=prepared["computer"])["capabilities"]
+    assert capabilities["computer_interaction"]["available"] is True
+    assert capabilities["ui_permissions"]["local_reversible"] is True
+    assert capabilities["write_experiment"]["available"] is False
+
+    # Extra fields cannot smuggle a token or alternative endpoint through state.
+    state.write_text(json.dumps({"baseUrl": "http://127.0.0.1:42001/v1",
+                                 "startedAt": "2026-09-19T00:00:00Z", "pid": os.getpid(),
+                                 "token": "must-not-be-read"}))
+    with pytest.raises(CodexUnavailable):
+        computer_action_review_gateway_base_url(state)
+    prepared = prepare_codex_exploration(base)
+    review = prepared["computer"]["ui"]["action_review"]
+    assert review["enabled"] is False and "base_url" not in review
+    capabilities = exploration_capabilities(base, computer_override=prepared["computer"])["capabilities"]
+    assert capabilities["browser"]["available"] is True
+    assert capabilities["computer_interaction"]["available"] is False
+
+
 def test_prepare_reads_the_gateway_state_file_only_without_static_base_url(tmp_path, monkeypatch):
     """C2: config wins over the state file; missing both pauses without claiming."""
     from kin_mind.codex_executor import prepare_codex_exploration
@@ -1179,9 +1324,18 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
     """W1.6: legitimate old material remains citable as historical — not rejected
     for 'not read this round'."""
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    from kin_mind.source_ledger import seal_source_receipt
+
+    old_receipt = seal_source_receipt({
+        "state": "observed", "locator": "https://verified.example.com/old",
+        "evidence_id": "web_" + "1" * 32, "version": "a" * 64,
+        "title": "Verified then", "basis": "read_page", "recorded_at": "2026-01-01T00:00:00+00:00",
+        "execution_id": "explore_old", "attempt": 1, "tool": "read_page", "adapter": "kin-web-reader-v1",
+    }, execution_id="explore_old", attempt=1)
     topic = {**TOPIC, "previous_explorations": [
         {"id": "explore_old", "state": "complete", "created_at": "2026-01-01T00:00:00+00:00",
-         "result": {"sources": [{"url": "https://verified.example.com/old", "title": "Verified then"}]}}]}
+         "result": {"sources": [{"url": "https://verified.example.com/old", "title": "Verified then",
+                                  "receipt": old_receipt}]}}]}
     historical = {**FINDINGS, "sources": [{"url": "https://verified.example.com/old", "title": "Verified then"}]}
     fake = fake_codex(tmp_path / "fake-historical",
                       "open(last, 'w').write(json.dumps(" + repr(historical) + "))\n"
@@ -1203,12 +1357,20 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
 def test_continuation_reverifies_and_drops_superseded(tmp_path, monkeypatch):
     """W1.3: a carried memory receipt whose evidence moved on is superseded."""
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    from kin_mind.source_ledger import seal_source_receipt
+
+    carried_web = seal_source_receipt({
+        "state": "observed", "locator": "https://read.example.com/page",
+        "version": "b" * 64, "evidence_id": "web_" + "2" * 32, "title": "Read",
+        "basis": "read_page", "recorded_at": "2026-09-19T00:00:00+00:00",
+        "execution_id": "explore_prior", "attempt": 1, "tool": "read_page",
+        "adapter": "kin-web-reader-v1",
+    }, execution_id="explore_prior", attempt=1)
     continuation = {"exploration_id": "explore_prior", "attempt": 1, "gaps": [],
                     "sources_used": [
                         {"state": "historical", "locator": "memory://s1", "version": 3,
                          "evidence_id": "s1", "title": "", "basis": "supplied-evidence"},
-                        {"state": "observed", "locator": "https://read.example.com/page",
-                         "version": "abc123", "evidence_id": "web_1", "title": "Read", "basis": "web"}]}
+                        carried_web]}
     current = {**TOPIC}  # s1 is at revision 3 here
     fake = fake_codex(tmp_path / "fake-cont", OBSERVE + COMPLETE)
     report = run_codex(fake, current, tmp_path / "job", continuation=continuation, **codex_kwargs())
@@ -1378,5 +1540,10 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
     assert citation == observed[0]["locator"] and observed[0]["version"]
     assert report["evidence_coverage"] == {"mapped_claims": 1, "covered_claims": 1}
     assert any(t.get("type") == "mcp_tool_call" and t.get("server") == "kin_web" for t in report["tool_results"])
+    # This test points Codex directly at the stub, so its native MCP namespace
+    # wrapper is expected here.  The production gateway's flattening is covered
+    # independently in deepseek-gateway.test.mjs.  Code mode itself stays off.
+    assert not any(tool.get("type") == "custom" and tool.get("name") == "exec"
+                   for tool in requests[0].get("tools", []))
     # No phone path: the tool surface has no send/message tool.
     assert not any("send" in str(t) or "message" in str(t.get("tool", "")) for t in report["tool_results"])
