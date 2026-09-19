@@ -319,24 +319,25 @@ def build(root: Path, *, seed: int, anchor: datetime, scale: float = 1.0) -> dic
             values={k: rng.randint(20, 90) for k in ("mood", "focus", "curiosity")},
             reason="Synthetic fixture affective event"))
     pad = "这是一段用于达到参考状态规模的合成填充文字，描述一次完整的偏好确认过程与依据。"
+    # Reference store: desire/concern content averages ~145 chars, topic ~22.
     for i in range(scaled(120, scale)):
         topic = rng.choice(TOPIC_KEYS)
         mind.manage_desire(DesireChange(
             command_id=f"fixture-desire-{i}", agent_version="synthetic-w4-v1",
             expected_revision=mind.read()["revision"], evidence_ids=[state_source(f"desire-{i}")],
-            action="create", content=(f"围绕{topic}的合成愿望：" + pad * 14)[:2000],
+            action="create", content=(f"围绕{topic}的合成愿望：" + pad)[:rng.randint(80, 300)],
             topic=topic, kind=rng.choice(["contact", "explore", "create"]),
             strength=rng.randint(20, 95), expires_at="2027-01-01T00:00:00+00:00",
-            completion=("合成完成条件。" + pad * 3)[:1000], reason=("合成依据。" + pad * 4)[:1200]))
+            completion="合成完成条件：对方确认收到。", reason=("合成依据。" + pad)[:300]))
     for i in range(scaled(30, scale)):
         topic = rng.choice(TOPIC_KEYS)
         mind.manage_concern(ConcernChange(
             command_id=f"fixture-concern-{i}", agent_version="synthetic-w4-v1",
             expected_revision=mind.read()["revision"], evidence_ids=[state_source(f"concern-{i}")],
             action="create", key=f"concern-{i}", kind="care",
-            content=(f"关于{topic}的合成关切：" + pad * 8)[:2000],
+            content=(f"关于{topic}的合成关切：" + pad)[:rng.randint(80, 300)],
             topic=topic, intensity=rng.randint(20, 90), basis="explicit",
-            confidence=0.9, reason=("合成关切依据。" + pad * 3)[:1200]))
+            confidence=0.9, reason="合成关切依据。"))
     ConversationHabits(mind).update({"command_id": "fixture-habits", "preferences": {
         "reply_choice": "autonomous", "exploration_min_interval_minutes": 30},
         "evidence_ids": [source_ids["user"][0]],

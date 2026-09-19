@@ -527,8 +527,15 @@ class AdaptiveRecall:
         if not settings["temperature_shadow"] or explicit:
             return items
         with self.engine.db.connect() as conn:
-            tiers = {r["identifier"]: dict(r) for r in conn.execute(
-                "SELECT identifier,tier,protected FROM mind_memory_temperature WHERE scope=?", (self.mind.scope.key(),))}
+            # Only the shown items' tiers are ever read below; the rest of the scope's
+            # ledger is not part of the answer and is not loaded.
+            ids = [item["id"] for item in items]
+            tiers = {}
+            if ids:
+                marks = ",".join("?" for _ in ids)
+                tiers = {r["identifier"]: dict(r) for r in conn.execute(
+                    f"SELECT identifier,tier,protected FROM mind_memory_temperature WHERE scope=? AND identifier IN ({marks})",
+                    (self.mind.scope.key(), *ids))}
         # Only cold optional entries move. Required evidence and all neutral
         # runtime/context items preserve their order.
         def cold(item):

@@ -367,7 +367,14 @@ class Contexts:
     def graph_item(self, node, edges=(), *, compact=False, policy=None):
         with self.engine.db.connect() as conn:
             if compact:
-                edges = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) ORDER BY id LIMIT 8", (self.mind.scope.key(),node["id"],node["id"]))]
+                # The OR form walks the whole edge table per node; the UNION of the two
+                # single-column indexes returns the same first eight edges by id.
+                edges = [json.loads(r[0]) for r in conn.execute(
+                    "SELECT data FROM ("
+                    "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' "
+                    "UNION "
+                    "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active') "
+                    "ORDER BY id LIMIT 8", (self.mind.scope.key(), node["id"], self.mind.scope.key(), node["id"]))]
             related = [e for e in edges if node["id"] in (e["subject"], e["object"]) and self.memory.graph.fresh(conn, e)]
             facts = {k: node[k] for k in ("kind", "occurred_at", "basis", "owner_id", "created_by", "state", "entity_type", "aliases") if node.get(k) is not None}
             basis, fallback = node.get("basis", "inferred"), []

@@ -1074,7 +1074,8 @@ class Mind(Continuity):
             raise ValueError("History must be between 0 and 100")
         with self.engine.db.connect() as conn:
             at = utc(as_of) if as_of else self.clock()
-            result = self._view(conn, self._load(conn), at)
+            state = self._load(conn)
+            result = self._view(conn, state, at)
             result["persona_contract"] = persona_metadata(load_persona(self.engine, self.scope))
             owner = conn.execute(
                 "SELECT occurred_at FROM sources WHERE scope=? AND namespace='kin-owner-input' "
@@ -1101,7 +1102,7 @@ class Mind(Continuity):
                 if receipt:
                     details = json.loads(receipt[0])
                     result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
-            state = self._load(conn)
+            # One snapshot per read: the block above neither writes nor mutates it.
             from .exploration_decisions import decision_view
             result["exploration_decisions"] = decision_view(self, conn, state)
             behavior = state.get("behavior", {})

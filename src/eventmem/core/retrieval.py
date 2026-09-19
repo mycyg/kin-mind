@@ -128,6 +128,22 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
                     loaded[rid] = None
             return loaded[rid]
 
+        def prefill(ids):
+            # The same current-revision read `load` performs, for the whole candidate
+            # set in one IN-list pass per 400 ids. The historical path pins revisions
+            # per id and keeps the per-record reads.
+            if request.known_at is not None:
+                return
+            pending = [rid for rid in ids if rid not in loaded]
+            for start in range(0, len(pending), 400):
+                page = pending[start:start + 400]
+                marks = ",".join("?" for _ in page)
+                for row in conn.execute(
+                        f"SELECT id,data FROM records WHERE id IN ({marks}) AND deleted=0", page):
+                    loaded[row["id"]] = docs.get(row["id"]) or json.loads(row["data"])
+                for rid in page:
+                    loaded.setdefault(rid, None)
+
         if request.known_at:
             # Historical evaluation uses revisions available at the cutoff, not a
             # current index whose future words could change candidate selection.
@@ -261,6 +277,7 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
                 except NotConfigured:
                     pass
             found = dict.fromkeys(x for rows in channels.values() for x in rows)
+            prefill(list(found))
             if policy.enabled:
                 # The policy is asked before a hit may seed the relation channel: a claim or a
                 # configuration this read refuses no longer ranks what it is related to. Status,
@@ -333,6 +350,9 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
             for rank, rid in enumerate(ids):
                 weight = 2 if channel == "exact" else 0.25 if channel == "graph" else 1
                 ranks[rid] += weight / (60 + rank + 1)
+        if ranks:
+            # Relation-seeded and vector ids joined after `found`; one pass for them too.
+            prefill(list(ranks))
         for rid in list(ranks):
             data = load(rid)
             if data is None:
