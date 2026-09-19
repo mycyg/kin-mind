@@ -376,6 +376,33 @@ def cold_probe():
 SCOPE_DICT = {"project": "personal", "persona": "Kin", "collection": "default", "world": "real"}
 
 
+def dump_outputs(root: Path, output: Path):
+    """Canonical per-query outputs of the light path, for before/after equivalence diffs."""
+    import hashlib
+    copy = output.parent / (output.stem + "-store")
+    copy_fixture(root, copy)
+    from eventmem.core.models import Scope
+    from kin_mind.context import Contexts
+    from kin_mind.state import Mind
+    engine = Engine(copy)
+    contexts = Contexts(Mind(engine, Scope.model_validate(SCOPE_DICT)))
+    queries = load_queries(root)
+    volatile = {"elapsed_ms", "local_recall_ms", "clock", "candidate_wait_ms"}
+    results = {}
+    for i, case in enumerate(queries):
+        session = f"w4-dump-{i // 10}"
+        built = contexts.build(case["query"], purpose="chat", session=session, mode="auto", allow_model=False)
+        items, info = run_turn_collect(contexts, case["query"])
+        results[case["id"]] = {
+            "build": {k: v for k, v in built.items() if k not in volatile},
+            "collect": {"items": items, "info": {k: v for k, v in info.items() if k not in volatile}},
+        }
+    canonical = json.dumps(results, ensure_ascii=False, sort_keys=True, indent=1)
+    output.write_text(canonical)
+    print(json.dumps({"outputs": len(results), "sha256": hashlib.sha256(canonical.encode()).hexdigest()}))
+    shutil.rmtree(copy, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Fixture root (never written to)")
@@ -383,7 +410,12 @@ def main():
     parser.add_argument("--runs", type=int, default=3, help="Measured warm passes per workload")
     parser.add_argument("--cold-processes", type=int, default=3)
     parser.add_argument("--workdir", type=Path, default=Path(tempfile.gettempdir()) / "w4-light-bench")
+    parser.add_argument("--dump-outputs", type=Path,
+                        help="Write canonical per-query build+collect outputs and exit (equivalence diffs)")
     args = parser.parse_args()
+    if args.dump_outputs:
+        dump_outputs(args.root, args.dump_outputs)
+        return
 
     manifest = json.loads((args.root / MANIFEST_FILE).read_text())
     queries = load_queries(args.root)

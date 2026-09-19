@@ -93,3 +93,75 @@ def test_percentile_nearest_rank_matches_frozen_sim():
     assert bench_mod.percentile([], 0.95) is None
     dist = bench_mod.distribution([10, 20, 30])
     assert dist["n"] == 3 and dist["p50"] == 20 and dist["max"] == 30
+
+
+def test_graph_item_compact_edge_query_matches_or_form(fixture_root):
+    """The indexed UNION read returns exactly the pre-optimization OR query's rows,
+    including the self-loop edge (deduped) and the LIMIT 8 ordering by id."""
+    import random
+
+    from eventmem.core.models import Scope
+
+    scope = Scope.model_validate(json.loads((fixture_root / "w4-fixture-manifest.json").read_text())["scope"])
+    or_form = ("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) "
+               "ORDER BY id LIMIT 8")
+    union_form = ("SELECT data FROM ("
+                  "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' "
+                  "UNION "
+                  "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active') "
+                  "ORDER BY id LIMIT 8")
+    rng = random.Random(7)
+    with sqlite3.connect(fixture_root / "memory.sqlite3") as conn:
+        node_ids = [r[0] for r in conn.execute("SELECT id FROM mind_graph_nodes LIMIT 200")]
+        sample = rng.sample(node_ids, 40)
+        for nid in sample:
+            expected = conn.execute(or_form, (scope.key(), nid, nid)).fetchall()
+            got = conn.execute(union_form, (scope.key(), nid, scope.key(), nid)).fetchall()
+            assert [r[0] for r in got] == [r[0] for r in expected], nid
+
+
+def test_graph_item_compact_edge_query_self_loop_once(tmp_path):
+    from eventmem.core import Engine
+    from eventmem.core.db import digest
+    from eventmem.core.models import Scope, SourceInput
+    from kin_mind.graph import EventGraph
+    from kin_mind.state import Mind
+
+    scope = Scope(persona="synthetic-w4-edges")
+    engine = Engine(tmp_path / "db")
+    mind = Mind(engine, scope, clock=lambda: "2026-09-17T12:00:00.000000+00:00")
+    sid = engine.receive(SourceInput(namespace="synthetic", key="edge-source", scope=scope,
+                                     text="edge source", authority="explicit",
+                                     occurred_at=mind.clock()))["id"]
+    graph = EventGraph(mind)
+    with engine.db.connect(write=True) as conn:
+        row = conn.execute("SELECT * FROM sources WHERE id=?", (sid,)).fetchone()
+        rid = "mem_" + digest([sid, "root"])[:32]
+        record = engine._get(conn, rid)
+        data = json.loads(row["data"])
+        ref = {"source_id": sid, "hash": row["hash"], "record_id": rid, "revision": record["revision"],
+               "authority": data["authority"], "session": row["session"], "occurred_at": row["occurred_at"],
+               "received_at": row["received_at"], "namespace": row["namespace"],
+               "source_key": row["source_key"], "metadata": {}}
+        graph._put(conn, {"id": "node-a", "kind": "knowledge", "title": "a", "text": "a",
+                          "evidence": [ref], "source_ids": [sid], "occurred_at": mind.clock()})
+        for i in range(10):
+            # i == 0 is the self-loop: present once in both query forms.
+            object_ = "node-a" if i == 0 else f"node-{i}"
+            graph._put(conn, {"id": f"edge-{i:02d}", "kind": "edge", "subject": "node-a", "object": object_,
+                              "predicate": "related", "layer": "evidence", "basis": "observed",
+                              "confidence": 1, "reason": "", "source_ids": [sid], "evidence": [ref],
+                              "state": "active"}, edge=True)
+    with engine.db.connect() as conn:
+        union_rows = conn.execute(
+            "SELECT data FROM ("
+            "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' "
+            "UNION "
+            "SELECT id, data FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active') "
+            "ORDER BY id LIMIT 8", (scope.key(), "node-a", scope.key(), "node-a")).fetchall()
+        or_rows = conn.execute(
+            "SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' AND (subject=? OR object=?) "
+            "ORDER BY id LIMIT 8", (scope.key(), "node-a", "node-a")).fetchall()
+    ids = [json.loads(r[0])["id"] for r in union_rows]
+    assert ids == [json.loads(r[0])["id"] for r in or_rows]
+    assert ids == [f"edge-{i:02d}" for i in range(8)]  # self-loop once, ordered, capped
