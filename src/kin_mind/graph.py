@@ -40,6 +40,8 @@ RELATIONS = {"participates", "part_of", "continues", "responds_to", "produces", 
              "shares", "corrects", "resolves", "supports", "refutes", "causes", "association",
              "follows", "about", "related"}
 
+GET_MANY_PAGE_SIZE = 400
+
 
 def query_terms(query, limit=40):
     """Retain the user's language instead of taking ASCII-first tokenizer output."""
@@ -108,18 +110,25 @@ class EventGraph:
         raise Missing(identifier)
 
     def _get_many(self, conn, identifiers):
-        """The `get` reads for a known id list in two IN-list passes. An id in neither
-        table is answered by `get`, which raises Missing exactly as before."""
+        """Read a known id list in bounded IN-list pages across both graph tables.
+
+        An id in neither table is answered by `get`, which raises Missing exactly as
+        before. The final mapping follows the caller's order, independent of the
+        database's row order.
+        """
+        ordered = list(identifiers)
         found = {}
         for table in ("mind_graph_nodes", "mind_graph_edges"):
-            missing = [i for i in identifiers if i not in found]
+            missing = list(dict.fromkeys(i for i in ordered if i not in found))
             if not missing:
                 break
-            marks = ",".join("?" for _ in missing)
-            for row in conn.execute(f"SELECT id,data FROM {table} WHERE scope=? AND id IN ({marks})",
-                                    [self.scope.key(), *missing]):
-                found.setdefault(row["id"], json.loads(row["data"]))
-        return {i: found[i] if i in found else self.get(conn, i) for i in identifiers}
+            for start in range(0, len(missing), GET_MANY_PAGE_SIZE):
+                page = missing[start:start + GET_MANY_PAGE_SIZE]
+                marks = ",".join("?" for _ in page)
+                for row in conn.execute(f"SELECT id,data FROM {table} WHERE scope=? AND id IN ({marks})",
+                                        [self.scope.key(), *page]):
+                    found.setdefault(row["id"], json.loads(row["data"]))
+        return {i: found[i] if i in found else self.get(conn, i) for i in ordered}
 
     def _put(self, conn, value, *, edge=False):
         value = dict(value)

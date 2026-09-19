@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,71 @@ def test_query_graph_expansion_batches_each_frontier_once(fixture_root, monkeypa
     assert len(batches) == 1
     assert len(batches[0]) > 1
     assert {node["id"] for node in result["nodes"]} == {anchor_id, *batches[0]}
+
+
+def test_focus_graph_high_fanout_stays_bounded_and_matches_per_id_reads(tmp_path, monkeypatch):
+    """A real two-hop frontier may exceed SQLite's variable limit before the
+    traversal's node cap applies. Paging the lookup must not change its output."""
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope
+    from kin_mind.graph import EventGraph
+    from kin_mind.state import Mind
+
+    scope = Scope(persona="synthetic-w4-high-fanout")
+    engine = Engine(tmp_path / "db")
+    mind = Mind(engine, scope, clock=lambda: "2026-09-17T12:00:00.000000+00:00")
+    graph = EventGraph(mind)
+    now = mind.clock()
+
+    def node(identifier):
+        value = {"id": identifier, "kind": "event", "title": identifier, "text": "",
+                 "revision": 1, "occurred_at": now, "updated_at": now, "state": "active",
+                 "evidence": [], "source_ids": []}
+        return (identifier, scope.key(), "event", 1, now, now, "active",
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+
+    def edge(identifier, subject, object_):
+        value = {"id": identifier, "kind": "edge", "subject": subject, "object": object_,
+                 "predicate": "related", "layer": "evidence", "revision": 1,
+                 "occurred_at": now, "updated_at": now, "state": "active",
+                 "basis": "observed", "confidence": 1, "reason": "", "evidence": [],
+                 "source_ids": []}
+        return (identifier, scope.key(), subject, object_, "related", "evidence", 1, "active",
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+
+    anchor = "anchor"
+    hops = [f"hop-{index:03d}" for index in range(3)]
+    leaves = [[f"leaf-{hop_index:03d}-{leaf_index:03d}" for leaf_index in range(300)]
+              for hop_index in range(len(hops))]
+    with engine.db.connect(write=True) as conn:
+        conn.executemany("INSERT INTO mind_graph_nodes VALUES(?,?,?,?,?,?,?,?)",
+                         [node(identifier) for identifier in [anchor, *hops, *(leaf for group in leaves for leaf in group)]])
+        rows = [edge(f"edge-anchor-{index:03d}", anchor, hop) for index, hop in enumerate(hops)]
+        rows.extend(edge(f"edge-{hop_index:03d}-{leaf_index:03d}", hop, leaf)
+                    for hop_index, (hop, group) in enumerate(zip(hops, leaves))
+                    for leaf_index, leaf in enumerate(group))
+        conn.executemany("INSERT INTO mind_graph_edges VALUES(?,?,?,?,?,?,?,?,?)", rows)
+
+    original_connect = engine.db.connect
+
+    @contextmanager
+    def limited_connect(write=False):
+        with original_connect(write=write) as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 700)
+            assert conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == 700
+            yield conn
+
+    monkeypatch.setattr(engine.db, "connect", limited_connect)
+    actual = graph.read(focus=anchor, hops=2, limit=300)
+
+    def per_id(conn, identifiers):
+        return {identifier: graph.get(conn, identifier) for identifier in identifiers}
+
+    monkeypatch.setattr(graph, "_get_many", per_id)
+    expected = graph.read(focus=anchor, hops=2, limit=300)
+    assert actual == expected
+    assert len(actual["nodes"]) == 300
+    assert actual["cursor"] == 300
 
 
 def test_graph_item_compact_edge_query_self_loop_once(tmp_path):
