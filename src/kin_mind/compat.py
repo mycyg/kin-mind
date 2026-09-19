@@ -23,7 +23,7 @@ from eventmem.core.persona import load_persona
 
 # Bumped by hand. Every open prediction and pending proposal made under the previous contract
 # becomes stale; none is deleted.
-BEHAVIOR_CONTRACT = "behavior-1"
+BEHAVIOR_CONTRACT = "behavior-2"
 # The approved persona: its version and the hashes of the three texts the contract already carries.
 PERSONA_FIELDS = ("version", "core_sha256", "voice_sha256", "maintenance_sha256")
 # What a dimension entry holds that an evolution may move. A definition change asks a different

@@ -50,7 +50,7 @@ pytest_plugins = ("test_memory_continuity",)
 # Re-pinned once when every package landed together: WP6's three switch-less changes to the
 # shared prompt (the widened half-life range, the stated procedure premise, the owner named by
 # role) move every request that offers anything, this one included.
-CHAIN_REQUEST = "d295f4c79bff822ecd263b3dd485be597becc1041ff4f9d77ee672d1f26e5210"
+CHAIN_REQUEST = "915e00dbe1e053706d9964c09ed1575d81d514f4520db66270b7b6fa56d84252"
 # Every behavior-relevant instruction, digested (compat.behavior_prompts: the shared appraisal
 # prompt and the paragraph of each audited section). A paragraph that moves fails the test below,
 # and its author chooses one of two things — see the message there.
@@ -64,7 +64,15 @@ CHAIN_REQUEST = "d295f4c79bff822ecd263b3dd485be597becc1041ff4f9d77ee672d1f26e521
 # sections on two of its first four appraisals for citing exactly that.
 # Re-pinned for the executor-agnostic exploration wording: the prompt no longer names Kimi as
 # the exploration executor. A rewording; the contract's meaning is unchanged.
-PINNED_PROMPTS = {"behavior-1": "1127108a01ae7243306da857ecc41602b97dfb8d00426b6bb6f585764529c204"}
+#
+# behavior-2 makes two behavioral decisions explicit: an interaction preference may influence
+# proactive contact without becoming a timer, and wish-review preserves an existing contact
+# wish's kind instead of treating every reviewed wish as exploration. Checks made under
+# behavior-1 remain named by their original digest and become stale through the contract part.
+PINNED_PROMPTS = {
+    "behavior-1": "1127108a01ae7243306da857ecc41602b97dfb8d00426b6bb6f585764529c204",
+    "behavior-2": "1c851685fc5b9e0a3cbaf49b985238a0b4aeb733a300931ddc45bb66c1fe5228",
+}
 # How to read the digest a change produced, in one command from the repository root:
 REPIN_COMMAND = ("uv run --extra dev python -c "
                  "'from kin_mind.compat import prompt_digest; print(prompt_digest())'")
@@ -319,6 +327,32 @@ def test_a_changed_contract_or_persona_voids_the_chain(env, monkeypatch):
     monkeypatch.undo()
     approve_persona(env, voice="A different approved voice.")
     assert openings(env)[0]["stale_reason"] == "compat-changed:persona"
+
+
+def test_behavior_1_predictions_and_proposals_stay_readable_but_stale_after_behavior_2(env, monkeypatch):
+    monkeypatch.setattr(compat, "BEHAVIOR_CONTRACT", "behavior-1")
+    record_hypothesis(env, key="old-contract-confirmed")
+    prediction = openings(env)[0]
+    env.clock[0] += timedelta(hours=2)
+    settle(env, prediction["id"], key="old-contract-outcome")
+    propose(env, prediction, key="old-contract-proposal", baseline_changes={"curiosity": 77})
+    record_hypothesis(env, key="old-contract-open")
+    old_open = openings(env)[0]
+    assert old_open["compat"] == "current"
+    assert [(p["state"], p["stale_reason"]) for p in proposals(env)] == [("pending", None)]
+
+    monkeypatch.undo()
+    assert compat.BEHAVIOR_CONTRACT == "behavior-2"
+    still_open = next(item for item in openings(env) if item["id"] == old_open["id"])
+    assert (still_open["compat"], still_open["stale_reason"]) == (
+        "stale", "compat-changed:contract"
+    )
+    assert merge(env)["reason"] == "proposal-incompatible"
+    old_proposal = proposals(env)[0]
+    assert (old_proposal["state"], old_proposal["stale_reason"]) == (
+        "stale", "compat-changed:contract"
+    )
+    assert old_proposal["evolution"]["baseline_changes"] == {"curiosity": 77}
 
 
 def test_the_key_moves_for_what_decides_behavior_and_for_nothing_else(env, monkeypatch):
