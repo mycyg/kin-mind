@@ -108,7 +108,8 @@ class Citation(Model):
     @field_validator("url")
     @classmethod
     def source_url(cls, value):
-        if value == "computer://current-context":
+        if value == "computer://current-context" or re.fullmatch(
+                r"computer://app/[A-Za-z0-9_.:-]{1,300}", value):
             return value
         if value.startswith("memory://"):
             # A host-internal evidence locator: the source id of material the host
@@ -145,7 +146,17 @@ class Findings(Model):
     # Backward-compatible: claims keyed by their 1-based finding index, mapped to
     # evidence ids from the run's source ledger (read receipts or memory:// ids).
     # Absent on legacy output; the host maps `sources` strictly instead.
-    evidence_map: dict[str, list[str]] | None = None
+    evidence_map: dict[str, list[str]] | None = Field(
+        default=None,
+        description=(
+            "Optional claim-to-evidence map. Each key is the 1-based decimal index "
+            "of an item in findings (for example, '1'). Each value is a non-empty "
+            "list containing only exact evidence_id or exact locator strings copied "
+            "from citable state=observed tool receipts or supplied/historical sources. "
+            "Never put prose, shortened ids, version hashes, review_* ids, or action_* "
+            "ids in a value. Use null when no finding-level mapping is needed."
+        ),
+    )
 
 
 class Explorations:
@@ -239,9 +250,11 @@ class Explorations:
             return {"state": "waiting", "reason": "exploration-claim-changed"}
         try:
             options = {}
-            if target == "computer":
+            ui_enabled = bool((computer or {}).get("enabled")
+                              and ((computer or {}).get("ui") or {}).get("enabled"))
+            if target == "computer" or ui_enabled:
                 previous = [v for item in self.recent(8) for v in item.get("observations", [])][-60:]
-                options["computer"] = {**computer, "previous": [
+                options["computer"] = {**computer, "file_reader_enabled": target == "computer", "previous": [
                     {k: v[k] for k in ("id", "locator", "version", "title", "observed_at")} for v in previous]}
             if web:
                 options["web"] = web
@@ -272,7 +285,12 @@ class Explorations:
         # A result without a definitive answer still supports reflection and sharing.
         # Only final reports and execution receipts enter memory, never tool traces.
         observation_ids = []
-        for observation in data.get("observations", []):
+        from .source_ledger import valid_computer_receipt, valid_web_receipt
+        observations = [observation for observation in data.get("observations", [])
+                        if valid_computer_receipt(observation, execution_id=eid,
+                                                  attempt=data.get("attempt", 1))]
+        data["observations"] = observations
+        for observation in observations:
             observed = self.engine.receive(SourceInput(namespace="kin-computer-observation", key=observation["id"],
                 scope=self.mind.scope, authority="document", kind="observation", session=eid,
                 text=dumps({k:v for k,v in observation.items() if k not in {"observed_at", "first_observed_at", "changed_since_last_observation"}}),
@@ -280,7 +298,11 @@ class Explorations:
                 metadata={"host_event": "computer-observation", "actor": observation["actor"],
                           "locator": observation["locator"], "resource_version": observation["version"]}))
             observation_ids.append(observed["id"])
-        for receipt in data.get("web_observations", []):
+        web_observations = [receipt for receipt in data.get("web_observations", [])
+                            if valid_web_receipt(receipt, execution_id=eid,
+                                                 attempt=data.get("attempt", 1))]
+        data["web_observations"] = web_observations
+        for receipt in web_observations:
             # Observed pages are this run's evidence; a search_result or a failed
             # read is operational record, never content for memory.
             if receipt.get("state") != "observed":

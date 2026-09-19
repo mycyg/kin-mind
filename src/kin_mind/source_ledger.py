@@ -12,6 +12,8 @@ existence, version and true read state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 
 LAYER_REQUESTED = "requested"
@@ -23,14 +25,110 @@ LAYER_SUPERSEDED = "superseded"
 
 CITABLE = {"observed", "historical"}
 MEMORY_LOCATOR = re.compile(r"^memory://([A-Za-z0-9_.:-]{1,200})$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_RECEIPT_FORMAT = "kin-source-receipt-v1"
+COMPUTER_ADAPTERS = {"kin-computer-reader-v1", "kin-computer-use-v1"}
 
 
-def _entry(state, locator, *, evidence_id=None, version=None, title="", basis="", recorded_at=None):
+def _entry(state, locator, *, evidence_id=None, version=None, title="", basis="", recorded_at=None,
+           execution_id=None, attempt=None, tool=None, adapter=None):
     return {"state": state, "locator": locator, "evidence_id": evidence_id,
-            "version": version, "title": title, "basis": basis, "recorded_at": recorded_at}
+            "version": version, "title": title, "basis": basis, "recorded_at": recorded_at,
+            "execution_id": execution_id, "attempt": attempt, "tool": tool, "adapter": adapter}
 
 
-def build_ledger(topic, *, web_observations=(), computer_observations=(), continuation=None):
+def _seal_payload(entry, execution_id, attempt):
+    return {
+        "receipt_format": SOURCE_RECEIPT_FORMAT,
+        "verified_by_execution": str(execution_id),
+        "verified_by_attempt": int(attempt),
+        **{key: entry.get(key) for key in (
+            "state", "locator", "evidence_id", "version", "title", "basis", "recorded_at",
+            "execution_id", "attempt", "tool", "adapter",
+        )},
+    }
+
+
+def seal_source_receipt(entry, *, execution_id, attempt):
+    """Seal a receipt after host verification.
+
+    This is an integrity envelope, not a cryptographic signature: its authority
+    comes from being added by the host after strict Findings validation. Model
+    output cannot add fields to Citation (pydantic forbids extras).
+    """
+    payload = _seal_payload(entry, execution_id, attempt)
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return {**payload, "receipt_digest": hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
+    if not isinstance(receipt, dict) or receipt.get("receipt_format") != SOURCE_RECEIPT_FORMAT:
+        return False
+    if receipt.get("state") not in CITABLE or not receipt.get("locator"):
+        return False
+    if (not receipt.get("evidence_id") or receipt.get("version") is None
+            or receipt.get("version") == ""):
+        return False
+    try:
+        verified_attempt = int(receipt.get("verified_by_attempt"))
+    except (TypeError, ValueError):
+        return False
+    verified_execution = str(receipt.get("verified_by_execution") or "")
+    if not verified_execution or verified_attempt < 1:
+        return False
+    if execution_id is not None and verified_execution != str(execution_id):
+        return False
+    if attempt is not None and verified_attempt != int(attempt):
+        return False
+    payload = _seal_payload(receipt, verified_execution, verified_attempt)
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return receipt.get("receipt_digest") == hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def valid_web_receipt(receipt, *, execution_id, attempt):
+    if not isinstance(receipt, dict) or receipt.get("execution_id") != str(execution_id):
+        return False
+    if receipt.get("attempt") != int(attempt) or receipt.get("state") not in {
+        LAYER_SEARCH_RESULT, LAYER_OBSERVED, LAYER_FAILED,
+    }:
+        return False
+    if not re.fullmatch(r"web_[0-9a-f]{32}", str(receipt.get("evidence_id") or "")):
+        return False
+    if receipt.get("tool") not in {"web_search", "read_page"} or not receipt.get("locator"):
+        return False
+    if receipt.get("state") == LAYER_OBSERVED:
+        return receipt.get("tool") == "read_page" and bool(
+            SHA256.fullmatch(str(receipt.get("version") or "")) and receipt.get("read_at")
+        )
+    return True
+
+
+def valid_computer_receipt(receipt, *, execution_id, attempt):
+    """Only a successful receipt written by a current host adapter is evidence."""
+    if not isinstance(receipt, dict) or receipt.get("state") != LAYER_OBSERVED:
+        return False
+    if receipt.get("execution_id") != str(execution_id) or receipt.get("attempt") != int(attempt):
+        return False
+    if receipt.get("adapter") not in COMPUTER_ADAPTERS:
+        return False
+    if receipt.get("tool") not in {
+        "read_computer_context", "read_computer_resource", "open_browser_page",
+        "read_browser_page", "navigate_browser_page", "click_browser_element",
+        "type_browser_text", "observe_native_app", "click_native_element",
+        "scroll_native_app",
+    }:
+        return False
+    evidence_id = receipt.get("evidence_id")
+    return bool(
+        re.fullmatch(r"computer_[0-9a-f]{32}", str(evidence_id or ""))
+        and SHA256.fullmatch(str(receipt.get("version") or ""))
+        and receipt.get("locator")
+        and receipt.get("observed_at")
+    )
+
+
+def build_ledger(topic, *, web_observations=(), computer_observations=(), continuation=None,
+                 execution_id=None, attempt=None):
     """The run's citable universe plus the known non-citable states."""
     entries = []
 
@@ -42,40 +140,59 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
                                   evidence_id=item.get("id"), version=item.get("revision"),
                                   basis="supplied-evidence"))
     for previous in topic.get("previous_explorations", []):
-        # Prior verified exploration results stay citable with their time nature:
-        # recorded then, not re-verified now.
-        if not isinstance(previous, dict):
+        # A URL in an old result is not proof. Only a source receipt sealed by the
+        # host after that exact completed exploration may become historical.
+        if not isinstance(previous, dict) or previous.get("state") != "complete":
             continue
         result = previous.get("result") or {}
         for source in result.get("sources", []):
-            if isinstance(source, dict) and source.get("url"):
-                entries.append(_entry(LAYER_HISTORICAL, source["url"], title=source.get("title", ""),
-                                      basis="exploration:" + str(previous.get("id")),
-                                      recorded_at=previous.get("created_at")))
+            receipt = source.get("receipt") if isinstance(source, dict) else None
+            if (not isinstance(source, dict) or not source.get("url")
+                    or not valid_source_receipt(receipt, execution_id=previous.get("id"))
+                    or receipt.get("locator") != source.get("url")):
+                continue
+            entries.append(_entry(
+                LAYER_HISTORICAL, source["url"], evidence_id=receipt.get("evidence_id"),
+                version=receipt.get("version"), title=source.get("title", ""),
+                basis="exploration:" + str(previous.get("id")),
+                recorded_at=receipt.get("recorded_at") or previous.get("created_at"),
+                execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
+                tool=receipt.get("tool"), adapter=receipt.get("adapter"),
+            ))
     for receipt in web_observations or []:
-        if not isinstance(receipt, dict) or not receipt.get("locator"):
+        if execution_id is None or attempt is None or not valid_web_receipt(
+                receipt, execution_id=execution_id, attempt=attempt):
             continue
         state = receipt.get("state") if receipt.get("state") in {
             LAYER_SEARCH_RESULT, LAYER_OBSERVED, LAYER_FAILED} else LAYER_FAILED
         entries.append(_entry(state, receipt["locator"], evidence_id=receipt.get("evidence_id"),
                               version=receipt.get("version"), title=receipt.get("title", ""),
-                              basis=receipt.get("tool", "web"), recorded_at=receipt.get("read_at")))
+                              basis=receipt.get("tool", "web"), recorded_at=receipt.get("read_at"),
+                              execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
+                              tool=receipt.get("tool"), adapter="kin-web-reader-v1"))
         if state == LAYER_OBSERVED and receipt.get("requested_locator") != receipt["locator"]:
             # A redirect's requested address and final address are both this read.
             entries.append(_entry(LAYER_OBSERVED, receipt["requested_locator"],
                                   evidence_id=receipt.get("evidence_id"), version=receipt.get("version"),
                                   title=receipt.get("title", ""), basis="web-redirect",
-                                  recorded_at=receipt.get("read_at")))
+                                  recorded_at=receipt.get("read_at"),
+                                  execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
+                                  tool=receipt.get("tool"), adapter="kin-web-reader-v1"))
     for observation in computer_observations or []:
-        if isinstance(observation, dict) and observation.get("locator"):
+        if (execution_id is not None and attempt is not None
+                and valid_computer_receipt(observation, execution_id=execution_id, attempt=attempt)):
             entries.append(_entry(LAYER_OBSERVED, observation["locator"],
-                                  evidence_id=observation.get("id"), version=observation.get("version"),
+                                  evidence_id=observation.get("evidence_id"), version=observation.get("version"),
                                   title=observation.get("title", ""), basis="computer",
-                                  recorded_at=observation.get("observed_at")))
-    for carried in (continuation or {}).get("sources_used", []):
+                                  recorded_at=observation.get("observed_at"),
+                                  execution_id=observation.get("execution_id"),
+                                  attempt=observation.get("attempt"), tool=observation.get("tool"),
+                                  adapter=observation.get("adapter")))
+    validated_carried, _ = validate_continuation_sources(continuation, topic)
+    for carried in validated_carried:
         # A previous attempt's legitimate receipts continue as historical — shape-
         # checked here, re-checked against the fresh ledger by callers.
-        if isinstance(carried, dict) and carried.get("locator") and carried.get("state") in CITABLE:
+        if isinstance(carried, dict):
             entries.append(_entry(LAYER_HISTORICAL, carried["locator"],
                                   evidence_id=carried.get("evidence_id"), version=carried.get("version"),
                                   title=carried.get("title", ""),
@@ -90,7 +207,8 @@ def validate_continuation_sources(continuation, topic):
     the host supplies now. A corrected evidence source supersedes the old one."""
     carried = (continuation or {}).get("sources_used", [])
     current = {str(item.get("source_id")): item.get("revision")
-               for item in topic.get("known_evidence", []) if isinstance(item, dict)}
+               for item in topic.get("known_evidence", [])
+               if isinstance(item, dict) and item.get("source_id") and item.get("revision") is not None}
     valid, dropped = [], []
     for entry in carried:
         if not isinstance(entry, dict) or not entry.get("locator") or entry.get("state") not in CITABLE:
@@ -100,9 +218,14 @@ def validate_continuation_sources(continuation, topic):
         memory = MEMORY_LOCATOR.match(str(entry["locator"]))
         if memory:
             source_id = memory.group(1)
-            if current.get(source_id) != entry.get("version"):
+            if entry.get("version") is None or source_id not in current or current[source_id] != entry.get("version"):
                 dropped.append({"locator": entry["locator"], "reason": "superseded-or-absent"})
                 continue
+        elif not valid_source_receipt(
+                entry, execution_id=(continuation or {}).get("exploration_id"),
+                attempt=(continuation or {}).get("attempt")):
+            dropped.append({"locator": entry["locator"], "reason": "host-receipt-missing-or-invalid"})
+            continue
         valid.append(entry)
     return valid, dropped
 
@@ -110,17 +233,17 @@ def validate_continuation_sources(continuation, topic):
 def legitimize(ledger, url):
     """The exact-match receipt for a citation, or None. No prefix matching."""
     if url == "computer://current-context":
-        for entry in ledger:
+        for entry in reversed(ledger):
             if entry["state"] == LAYER_OBSERVED and entry["basis"] == "computer" and entry["locator"] == url:
                 return entry
         return None
     memory = MEMORY_LOCATOR.match(str(url))
     if memory:
-        for entry in ledger:
+        for entry in reversed(ledger):
             if entry["state"] == LAYER_HISTORICAL and entry["locator"] == url:
                 return entry
         return None
-    for entry in ledger:
+    for entry in reversed(ledger):
         if entry["state"] in CITABLE and entry["locator"] == url:
             return entry
     return None
@@ -144,13 +267,17 @@ def verify_citations(findings, ledger):
     return rejected, sorted(set(unknown_ids))
 
 
-def verified_sources(findings, ledger):
+def verified_sources(findings, ledger, *, execution_id=None, attempt=None):
     """Per-source verification for checkpoints: only citable receipts, with state."""
     verified = []
     for citation in findings.sources:
         entry = legitimize(ledger, citation.url)
         if entry:
-            verified.append({**entry, "cited_as": citation.url, "citation_title": citation.title})
+            value = {**entry, "cited_as": citation.url, "citation_title": citation.title}
+            if execution_id is not None and attempt is not None:
+                value = seal_source_receipt(value, execution_id=execution_id, attempt=attempt)
+                value.update(cited_as=citation.url, citation_title=citation.title)
+            verified.append(value)
     return verified
 
 

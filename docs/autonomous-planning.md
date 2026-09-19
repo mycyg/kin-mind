@@ -20,6 +20,19 @@ A `wait` that repeats the stored decision unchanged — same action, strength, s
 
 The exploration executor receives a question plus actual memory excerpts, known findings, gaps and recent dialogue. The current executor is codex-cli running DeepSeek (deepseek-flash, reasoning high) through a dedicated local gateway; receipts record executor and model provider separately, so consumers must not filter on `provider == "kimi-cli"`. The creator uses the configured work model in an isolated Codex CLI workspace, with a separate native execution receipt. It does not resume the phone session, load its MCP tools, send messages or write shared state. One creator and one explorer may run initially; owner work preempts them and preserves checkpoints. The host verifies artifact containment, size, hashes, inspectable content and a separate DS completion review. Delivery requires a subsequent DS decision selecting verified artifact hashes, followed by the existing durable channel outbox. An uncertain send is reconciled with the same ID.
 
+When enabled, the explorer can use the host-owned `kin_ui` interface backed by
+Codex Computer Use. DeepSeek receives fresh accessibility/DOM text, never a
+screenshot, and chooses the semantic action. The host exposes only fixed tools,
+run-owned browser tabs and exact configured native apps. Every interaction needs
+a separate DeepSeek/high action review bound to the complete raw snapshot hash,
+exact selected element and input version. An optional exact control grant is only
+a reviewer hint. The host re-reads the full snapshot before action; model wording cannot create
+permission. Native Computer Use approval is also checked against the configured
+bundle ID and action. External
+messages, payments and destructive effects are not granted by default. See
+[computer exploration](computer-exploration.md) for configuration and validated
+limits.
+
 ## Storage, APIs and feature flags
 
 Additive SQLite tables store plans/history, fenced runs, the shared model-lease ledger, procedural memory/history/trials, effective-use events and independent strength observations. `mind_plan_reviews` keeps reviews that are not revisions — a repeated unchanged wait, and the agent version a completed review registered — with the reason, decision and provider receipt of each; `mind_plan_wakeups` keeps one row per answered wake-up reason. Both are created on demand and read by nobody else, so an older host ignores them and a rollback leaves them in place. Model calls run outside write transactions; source, revision and lease checks fence late results. Existing desires migrate by stable identity without granting execution.

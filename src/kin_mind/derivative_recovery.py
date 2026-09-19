@@ -26,6 +26,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.jobs import Worker
 from eventmem.core.models import Scope, now
 
+from .attempts import token_counts
 from .lifecycle import mark_dirty
 
 #: States a record may be in for its derivative to be worth rebuilding. Anything
@@ -1024,6 +1025,60 @@ def recover_digests(engine, entries, *, command_id, at=None, require_reviewed=Fa
             "abandoned": abandoned, "command_id": command_id}
 
 
+def _model_usage(receipt) -> tuple[int | float | None, int | float | None, str]:
+    """Normalize current nested usage and legacy top-level token receipts.
+
+    A complete provider-reported pair may legitimately contain zero. Missing or
+    incomplete counts remain unknown; neither side is synthesized as zero.
+    """
+    receipt = receipt if isinstance(receipt, dict) else {}
+    nested = receipt.get("usage")
+    for candidate in (nested, receipt):
+        counts = token_counts(candidate)
+        if counts is not None:
+            return counts[0], counts[1], "reported"
+    token_fields = {"prompt_tokens", "input_tokens", "completion_tokens", "output_tokens"}
+    candidates = [candidate for candidate in (nested, receipt) if isinstance(candidate, dict)]
+    status = "partial-unknown" if any(token_fields & candidate.keys() for candidate in candidates) else "unknown"
+    return None, None, status
+
+
+def _digest_cost_identity(row, data, rec, verification, *, require_verification=False) -> list[str]:
+    """Return every reason a current digest cannot own the recovered job's receipt."""
+    issues = []
+    expected_generation = rec.get("generation")
+    expected_hash = rec.get("membership_input_hash")
+    if row is None:
+        issues.append("current-digest-missing")
+    else:
+        if row["state"] != "ready":
+            issues.append("current-digest-not-ready")
+        if not isinstance(expected_generation, int) or row["generation"] != expected_generation:
+            issues.append("current-generation-mismatch")
+        if expected_hash is not None and row["input_hash"] != expected_hash:
+            issues.append("current-membership-mismatch")
+    if verification is None:
+        if require_verification:
+            issues.append("digest-verification-missing")
+        return issues
+    if verification.get("verified") is not True:
+        issues.append("digest-verification-failed")
+    if verification.get("generation") != expected_generation:
+        issues.append("verification-generation-mismatch")
+    if expected_hash is not None and verification.get("membership_input_hash") != expected_hash:
+        issues.append("verification-membership-mismatch")
+    if row is not None:
+        if row["generation"] != verification.get("generation"):
+            issues.append("current-verification-generation-mismatch")
+        if row["revision"] != verification.get("digest_revision"):
+            issues.append("current-verification-revision-mismatch")
+        if row["input_hash"] != verification.get("membership_input_hash"):
+            issues.append("current-verification-membership-mismatch")
+        if data.get("source_versions") != verification.get("source_versions"):
+            issues.append("current-verification-sources-mismatch")
+    return issues
+
+
 def collect_costs(engine, result) -> list[dict]:
     """Per-item cost of a run: final state and wall time for every recovered job;
     for digests also the model receipt the normal digest path committed.
@@ -1042,6 +1097,11 @@ def collect_costs(engine, result) -> list[dict]:
     with engine.db.connect() as conn:
         for cycle in result["cycles"]:
             vector_revisions = (cycle.get("vector_verification") or {}).get("revisions", {})
+            verifications = cycle.get("digest_verification") or []
+            verification_by_target = {
+                (_scope_key(item["scope"]), item["event_id"], item["job_id"]): item
+                for item in verifications
+            }
             for target in cycle["embeds"].get("targets", []):
                 job_id = target["job_id"]
                 if ("embed", job_id) in seen:
@@ -1076,8 +1136,15 @@ def collect_costs(engine, result) -> list[dict]:
                     "WHERE scope=? AND event_id=?",
                     (scope_key, rec["event_id"]),
                 ).fetchone()
-                data = json.loads(row["data"]) if row and row["state"] == "ready" else {}
-                receipt = data.get("model_receipt", {})
+                data = json.loads(row["data"]) if row else {}
+                verification = verification_by_target.get((scope_key, rec["event_id"], rec["job_id"]))
+                attribution_issues = _digest_cost_identity(
+                    row, data, rec, verification, require_verification=bool(verifications)
+                )
+                identity_matched = not attribution_issues
+                receipt = data.get("model_receipt") if identity_matched else None
+                receipt = receipt if isinstance(receipt, dict) else {}
+                input_tokens, output_tokens, usage_status = _model_usage(receipt)
                 costs.append({
                     "kind": "event_digest", "scope": rec["scope"],
                     "event_id": rec["event_id"], "job_id": rec["job_id"],
@@ -1085,11 +1152,21 @@ def collect_costs(engine, result) -> list[dict]:
                     "generation": row["generation"] if row else None,
                     "digest_revision": row["revision"] if row else None,
                     "membership_input_hash": row["input_hash"] if row else None,
-                    "source_versions": data.get("source_versions"),
+                    "expected_generation": rec.get("generation"),
+                    "expected_digest_revision": verification.get("digest_revision") if verification else None,
+                    "expected_membership_input_hash": (
+                        verification.get("membership_input_hash") if verification
+                        else rec.get("membership_input_hash")
+                    ),
+                    "digest_identity_matched": identity_matched,
+                    "attribution_status": "matched" if identity_matched else "unknown-digest-identity-mismatch",
+                    "attribution_issues": attribution_issues,
+                    "source_versions": data.get("source_versions") if identity_matched else None,
                     "model": receipt.get("model"),
                     "reasoning": receipt.get("reasoning"),
-                    "input_tokens": receipt.get("input_tokens"),
-                    "output_tokens": receipt.get("output_tokens"),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_status": usage_status,
                     "elapsed_ms": receipt.get("elapsed_ms"),
                     "method": receipt.get("method"),
                     "priced": False,
@@ -1098,7 +1175,7 @@ def collect_costs(engine, result) -> list[dict]:
 
 
 def costs_by_scope(costs) -> list[dict]:
-    """Keep usage receipts partitioned by their real scope."""
+    """Keep usage receipts partitioned by scope without turning unknown into zero."""
     grouped = {}
     for cost in costs:
         scope = cost.get("scope") or {}
@@ -1107,20 +1184,47 @@ def costs_by_scope(costs) -> list[dict]:
             "scope": scope,
             "items": 0,
             "complete": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": None,
+            "output_tokens": None,
             "token_receipts": 0,
+            "usage_status": "unknown",
             "unpriced": True,
+            "_unknown_model_items": 0,
+            "_partial_model_items": 0,
         })
         group["items"] += 1
         group["complete"] += cost.get("state") == "complete" or (
             cost.get("kind") == "event_digest" and cost.get("state") == "ready"
         )
-        if cost.get("input_tokens") is not None:
-            group["input_tokens"] += cost["input_tokens"]
-            group["output_tokens"] += cost.get("output_tokens") or 0
+        if cost.get("kind") != "event_digest":
+            continue
+        counts = token_counts(cost)
+        usage_status = cost.get("usage_status")
+        if usage_status is None:
+            usage_status = "reported" if counts is not None else "unknown"
+        if usage_status == "reported" and counts is not None:
+            if group["token_receipts"] == 0:
+                group["input_tokens"] = 0
+                group["output_tokens"] = 0
+            group["input_tokens"] += counts[0]
+            group["output_tokens"] += counts[1]
             group["token_receipts"] += 1
-    return [grouped[key] for key in sorted(grouped)]
+        else:
+            group["_unknown_model_items"] += 1
+            group["_partial_model_items"] += usage_status == "partial-unknown"
+    result = []
+    for key in sorted(grouped):
+        group = grouped[key]
+        if group["token_receipts"]:
+            group["usage_status"] = (
+                "partial-unknown" if group["_unknown_model_items"] else "reported"
+            )
+        elif group["_partial_model_items"]:
+            group["usage_status"] = "partial-unknown"
+        group.pop("_unknown_model_items")
+        group.pop("_partial_model_items")
+        result.append(group)
+    return result
 
 
 def _selection_preflight(engine, selection, command_id, vector_revisions) -> list[dict]:

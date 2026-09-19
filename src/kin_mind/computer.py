@@ -61,6 +61,13 @@ class ComputerReader:
         path = Path(value).expanduser().resolve()
         if not self.roots or not any(path == r or r in path.parents for r in self.roots):
             raise ValueError("resource-outside-authorized-roots")
+        # Host-created configs, credentials-by-reference, ledgers and Codex state
+        # live under the execution directory. This deny is injected by the host
+        # and cannot be relaxed by a broad authorized root or missing exclude.
+        for denied in self.config.get("internal_deny_roots", []):
+            root = Path(denied).expanduser().resolve()
+            if path == root or root in path.parents:
+                raise ValueError("host-execution-material-excluded")
         if any(p.lower() in SECRET_DIRS or SECRET_NAME.fullmatch(p) for p in path.parts):
             raise ValueError("credential-or-runtime-material-excluded")
         for excluded in self.config.get("exclude_roots", []):
@@ -69,11 +76,19 @@ class ComputerReader:
                 raise ValueError("private-runtime-material-excluded")
         return path
 
-    def record(self, locator, title, text, *, source_time=None, metadata=None):
+    def record(self, locator, title, text, *, tool, source_time=None, metadata=None):
         text = redact(text)[:16000]
         version = hashlib.sha256(text.encode()).hexdigest()
         identifier = hashlib.sha256((locator + "\0" + version).encode()).hexdigest()[:32]
-        entry = {"id": "computer_" + identifier, "locator": locator, "title": redact(title),
+        execution_id = self.config.get("execution_id")
+        attempt = self.config.get("attempt")
+        receipt_id = hashlib.sha256(
+            (str(execution_id) + "\0" + str(attempt) + "\0" + tool + "\0" + identifier).encode()
+        ).hexdigest()[:32]
+        entry = {"id": "computer_" + identifier, "evidence_id": "computer_" + receipt_id,
+                 "execution_id": execution_id, "attempt": attempt, "tool": tool,
+                 "tool_call_id": "computer_call_" + receipt_id, "adapter": "kin-computer-reader-v1",
+                 "state": "observed", "locator": locator, "title": redact(title),
                  "version": version, "observed_at": now(), "source_time": source_time,
                  "actor": "unknown", "basis": "observed", "excerpt": text[:2000],
                  "metadata": redact(metadata or {})}
@@ -90,9 +105,10 @@ class ComputerReader:
                 conn.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?)", (entry["id"], str(self.ledger.parent), entry["observed_at"]))
         with self.lock:
             data = json.loads(self.ledger.read_text()) if self.ledger.exists() else {}
-            if identifier in data:
-                entry["first_observed_at"] = data[identifier].get("first_observed_at", data[identifier]["observed_at"])
-            data[identifier] = entry
+            if entry["evidence_id"] in data:
+                prior = data[entry["evidence_id"]]
+                entry["first_observed_at"] = prior.get("first_observed_at", prior["observed_at"])
+            data[entry["evidence_id"]] = entry
             self.ledger.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             temporary = self.ledger.with_suffix(".tmp")
             temporary.write_text(json.dumps(data, ensure_ascii=False))
@@ -112,7 +128,7 @@ class ComputerReader:
         # Wall-clock timestamps do not participate in content identity.
         value.pop("observed_at", None)
         entry = self.record("computer://current-context", "Current application and readable windows",
-                            json.dumps(value, ensure_ascii=False))
+                            json.dumps(value, ensure_ascii=False), tool="read_computer_context")
         return {"state": "observed", "context": value, "observation": entry}
 
     def list_files(self, directory, query="", limit=60):
@@ -163,7 +179,7 @@ class ComputerReader:
             text = raw.decode("utf-8", errors="replace")
         text = redact(text)
         start, count = max(0, offset), min(16000, max(1, limit))
-        result = self.record(str(path), path.name, text[start:start + count],
+        result = self.record(str(path), path.name, text[start:start + count], tool="read_computer_resource",
                              source_time=path.stat().st_mtime,
                              metadata={"offset": start, "total_characters": len(text)})
         return {**result, "next_offset": start + count if start + count < len(text) else None}
