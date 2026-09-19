@@ -448,7 +448,8 @@ class EventGraph:
                         for row in self.neighbors(conn, identifier, layer, 40):
                             additions.update(row)
                     wanted = sorted(additions - seen)[:40]
-                    reached = [self._get_many(conn, wanted)[i] for i in wanted]
+                    batch = self._get_many(conn, wanted)
+                    reached = [batch[i] for i in wanted]
                     seen.update(n["id"] for n in reached)
                     frontier = {n["id"] for n in self.visible(conn, reached, policy)}
                     known.update(frontier)

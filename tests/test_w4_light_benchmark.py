@@ -143,6 +143,34 @@ def test_graph_item_compact_edge_query_matches_or_form(fixture_root):
             assert [r[0] for r in got] == [r[0] for r in expected], nid
 
 
+def test_query_graph_expansion_batches_each_frontier_once(fixture_root, monkeypatch):
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope
+    from kin_mind.graph import EventGraph
+    from kin_mind.state import Mind
+
+    graph = EventGraph(Mind(Engine(fixture_root), Scope.model_validate(bench_mod.SCOPE_DICT)))
+    with graph.engine.db.connect() as conn:
+        anchor_id = conn.execute(
+            "SELECT e.subject FROM mind_graph_edges e JOIN mind_graph_nodes n ON n.id=e.subject "
+            "WHERE e.scope=? GROUP BY e.subject HAVING COUNT(DISTINCT e.object)>2 ORDER BY e.subject LIMIT 1",
+            (graph.scope.key(),),
+        ).fetchone()[0]
+        anchor = graph.get(conn, anchor_id)
+    monkeypatch.setattr(graph, "candidates", lambda conn, query, **kwargs: [anchor])
+    original, batches = graph._get_many, []
+
+    def counted(conn, identifiers):
+        batches.append(list(identifiers))
+        return original(conn, identifiers)
+
+    monkeypatch.setattr(graph, "_get_many", counted)
+    result = graph.read(query="synthetic frontier", hops=1)
+    assert len(batches) == 1
+    assert len(batches[0]) > 1
+    assert {node["id"] for node in result["nodes"]} == {anchor_id, *batches[0]}
+
+
 def test_graph_item_compact_edge_query_self_loop_once(tmp_path):
     from eventmem.core import Engine
     from eventmem.core.db import digest
