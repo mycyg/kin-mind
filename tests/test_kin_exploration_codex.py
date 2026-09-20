@@ -1012,6 +1012,76 @@ def test_codex_wrong_tool_call_is_recorded_not_fatal(tmp_path, monkeypatch):
     assert "unsupported call: send_message" in report["errors"]
 
 
+def test_codex_mcp_results_record_status_and_redacted_failure_codes(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    failed_item = {
+        "id": "i-browser", "type": "mcp_tool_call", "server": "kin_ui",
+        "tool": "open_browser_page", "status": "failed",
+        "arguments": {"url": "https://example.test/?token=never-persist"},
+        "error": {"message": "computer-never-persist tool failed: browser-address-refused at "
+                               "https://example.test/?token=never-persist"},
+    }
+    observed_item = {
+        "id": "i-web", "type": "mcp_tool_call", "server": "kin_web",
+        "tool": "read_page", "status": "completed",
+        "result": {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps({
+                "state": "observed", "locator": "https://example.test/private",
+                "text": "model-visible private page body",
+            })}],
+        },
+    }
+    semantic_failure_item = {
+        "id": "i-web-failed", "type": "mcp_tool_call", "server": "kin_web",
+        "tool": "read_page", "status": "completed",
+        "result": {"isError": False, "content": [{"type": "text", "text": json.dumps({
+            "state": "failed", "reason": "address-not-public",
+            "url": "https://private.test/?token=never-persist-either",
+        })}]},
+    }
+    fake = fake_codex(
+        tmp_path / "fake-codex",
+        THREAD_STARTED
+        + "sys.stdout.write(json.dumps({'type': 'item.completed', 'item': "
+          + repr(failed_item) + "}) + '\\n')\n"
+        + "sys.stdout.write(json.dumps({'type': 'item.completed', 'item': "
+          + repr(observed_item) + "}) + '\\n')\n"
+        + "sys.stdout.write(json.dumps({'type': 'item.completed', 'item': "
+          + repr(semantic_failure_item) + "}) + '\\n')\n"
+        + "open(last, 'w').write(json.dumps(" + repr({**FINDINGS, "open_questions": []}) + "))\n"
+        + "sys.stdout.write(json.dumps({'type': 'turn.completed', 'usage': "
+          "{'input_tokens': 9, 'output_tokens': 4}}) + '\\n')\n"
+        + "sys.stdout.flush()\n",
+    )
+    job = tmp_path / "job"
+    report = run_codex(fake, TOPIC, job, **codex_kwargs())
+    assert report["state"] == "complete"
+    browser, web, web_failed = report["tool_results"]
+    assert browser == {
+        "id": "i-browser", "type": "mcp_tool_call", "tool": "open_browser_page",
+        "server": "kin_ui", "status": "failed", "outcome": "failed",
+        "has_result": False, "error_code": "browser-address-refused",
+    }
+    assert web == {
+        "id": "i-web", "type": "mcp_tool_call", "tool": "read_page",
+        "server": "kin_web", "status": "completed", "outcome": "succeeded",
+        "has_result": True, "is_error": False, "result_state": "observed",
+    }
+    assert web_failed == {
+        "id": "i-web-failed", "type": "mcp_tool_call", "tool": "read_page",
+        "server": "kin_web", "status": "completed", "outcome": "failed",
+        "has_result": True, "is_error": False, "result_state": "failed",
+        "result_reason": "address-not-public", "error_code": "address-not-public",
+    }
+    persisted = (job / "receipt.json").read_text()
+    assert "never-persist" not in persisted
+    assert "computer-never-persist" not in persisted
+    assert "model-visible private page body" not in persisted
+    assert "example.test/private" not in persisted
+    assert "never-persist-either" not in persisted
+
+
 def test_codex_lease_loss_preempts_with_a_versioned_checkpoint(tmp_path, monkeypatch):
     """C7-19: the lease/owner signal mid-run preempts; the checkpoint carries the
     input sources with their versions so a later attempt resumes honestly."""
@@ -1352,6 +1422,8 @@ def test_web_tools_mcp_wired_and_capabilities_recorded(tmp_path, monkeypatch):
     assert "mcp_servers={}" not in argv
     assert 'mcp_servers.kin_web.default_tools_approval_mode="approve"' in argv
     assert "web_search" in observed["prompt"] and "read_page" in observed["prompt"]
+    assert "next_offset" in observed["prompt"] and "delivered_ranges" in observed["prompt"]
+    assert "HTTP success proves transport" in observed["prompt"]
     reader_config = json.loads((job / "web-reader.json").read_text())
     assert reader_config["search_endpoint"] and reader_config["execution_id"] == "job"
 

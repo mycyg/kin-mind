@@ -64,6 +64,22 @@ HARD_DENIED_APPS = {
 }
 
 
+def _service_failure_code(value):
+    """Classify CUA failures without echoing UI content or backend diagnostics."""
+    text = str(value).lower()
+    if re.search(r"\b(?:timed?[- ]?out|timeout)\b", text):
+        return "computer-use-service-timeout"
+    if re.search(r"\b(?:permission|approval|unauthori[sz]ed|forbidden|denied|declined)\b", text):
+        return "computer-use-service-permission-denied"
+    if re.search(r"\b(?:disconnect(?:ed)?|connection|transport|unavailable)\b", text):
+        return "computer-use-service-unavailable"
+    if re.search(r"\b(?:invalid|argument|schema|malformed)\b", text):
+        return "computer-use-service-invalid-request"
+    if re.search(r"\b(?:stale|missing|not found|closed|unowned)[- ]?(?:tab|app|target)?\b", text):
+        return "computer-use-service-target-unavailable"
+    return "computer-use-service-error"
+
+
 class DeepSeekActionReviewer:
     """Independent high-reasoning classification of one proposed UI action.
 
@@ -267,7 +283,8 @@ class CuaBackend:
             self.readiness = {
                 "state": "ready", "protocol": "mcp",
                 "tools": sorted(REQUIRED_BACKEND_TOOLS), "bootstrap": "cua.getState",
-                "scope": "host-exploration",
+                "scope": "host-exploration", "proof": "bootstrap-only",
+                "operational_observation": False,
             }
             return self
         except BaseException:
@@ -296,7 +313,7 @@ class CuaBackend:
         }, meta=self.scope_meta)
         text = "\n".join(getattr(item, "text", "") for item in result.content)
         if result.isError:
-            raise RuntimeError("computer-use-service-error:" + text[-500:])
+            raise RuntimeError(_service_failure_code(text))
         return text
 
     async def call_json(self, code, title):

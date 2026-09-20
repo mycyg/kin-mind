@@ -52,6 +52,158 @@ PROVIDER_PASSTHROUGH = ("request_max_retries", "stream_max_retries", "stream_idl
 ERROR_TAGS = ("timeout", "unauthorized", "rate limit", "permission", "not found", "429", "401", "403", "error")
 DEEPSEEK_MODEL_CATALOG = Path(__file__).with_name("deepseek-models.json")
 
+# ``codex exec --json`` includes MCP arguments and full results on the item.
+# Exploration receipts only need enough information to prove whether the call
+# succeeded and, when it did not, which stable host/tool error stopped it.  Raw
+# arguments/results can contain page text, local UI state, URLs or credentials,
+# so never copy them into ``receipt.json``.
+_MCP_FAILURE_STATUSES = frozenset({"failed", "error", "declined", "cancelled", "canceled"})
+_MCP_SUCCESS_STATUSES = frozenset({"completed", "complete", "success", "succeeded"})
+_MCP_RESULT_STATES = frozenset({
+    "observed", "search_result", "acted", "reviewed", "closed", "ready",
+    "failed", "partial", "unavailable", "blocked", "denied", "unknown",
+})
+_MCP_KNOWN_ERROR_CODES = frozenset({
+    "accessibility-element-changed", "accessibility-element-index-invalid",
+    "accessibility-element-label-invalid", "accessibility-element-line-too-long",
+    "address-not-public", "browser-address-refused", "browser-click-disabled",
+    "browser-host-not-allowlisted", "browser-id-invalid", "browser-sensitive-query-refused",
+    "browser-tab-id-invalid", "browser-text-entry-disabled", "browser-text-refused",
+    "browser-url-credentials-refused", "browser-url-scheme-refused", "fetch-failed",
+    "native-app-action-not-authorized", "native-app-not-authorized", "native-scroll-invalid",
+    "response-over-512k", "search-failed", "tool-error", "tool-invalid-request",
+    "tool-permission-denied", "tool-timeout", "tool-unavailable", "ui-action-review-denied",
+    "ui-action-review-unavailable", "ui-effect-invalid", "ui-snapshot-changed-after-review",
+    "unsupported-content-type", "computer-action-review-binding-invalid",
+    "computer-action-review-credential-unavailable", "computer-action-review-model-unverified",
+    "computer-action-review-output-invalid", "computer-action-review-schema-invalid",
+    "computer-action-review-transport-unavailable", "computer-use-backend-env-invalid",
+    "computer-use-backend-env-missing", "computer-use-backend-env-refused",
+    "computer-use-backend-unconfigured", "computer-use-service-error",
+    "computer-use-service-invalid-receipt", "computer-use-service-invalid-request",
+    "computer-use-service-missing-receipt", "computer-use-service-permission-denied",
+    "computer-use-service-target-unavailable", "computer-use-service-timeout",
+    "computer-use-service-tools-missing", "computer-use-service-unavailable",
+})
+_MCP_CODE = re.compile(r"(?<![a-z0-9])([a-z][a-z0-9]*(?:-[a-z0-9]+){1,9})(?![a-z0-9])")
+
+
+def _mcp_text(value, *, limit=32000):
+    """Bound tool failure material for classification without persisting it."""
+    try:
+        rendered = value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), default=str,
+        )
+    except (TypeError, ValueError):
+        rendered = str(type(value).__name__)
+    return rendered[:limit]
+
+
+def _mcp_code(value, *, fallback="tool-error"):
+    """Return a stable, non-payload error code from an arbitrary MCP error."""
+    text = _mcp_text(value).lower()
+    for match in _MCP_CODE.finditer(text):
+        code = match.group(1)
+        if code in _MCP_KNOWN_ERROR_CODES or re.fullmatch(
+                r"computer-action-review-http-[1-5][0-9]{2}", code):
+            return code
+    if re.search(r"\b(?:timed?[- ]?out|timeout)\b", text):
+        return "tool-timeout"
+    if re.search(r"\b(?:unauthori[sz]ed|forbidden|permission|approval|denied|declined)\b", text):
+        return "tool-permission-denied"
+    if re.search(r"\b(?:disconnect(?:ed)?|connection|transport|unavailable)\b", text):
+        return "tool-unavailable"
+    if re.search(r"\b(?:invalid|argument|schema|malformed)\b", text):
+        return "tool-invalid-request"
+    return fallback
+
+
+def _mcp_safe_state(value):
+    if not isinstance(value, str):
+        return None
+    state = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", value.strip()).lower().replace("_", "-")
+    return state if state in _MCP_RESULT_STATES | _MCP_FAILURE_STATUSES | _MCP_SUCCESS_STATUSES else None
+
+
+def _mcp_result_metadata(result):
+    """Extract state/reason/isError only; discard all model-visible payload."""
+    metadata = {"has_result": result is not None}
+    if result is None:
+        return metadata
+    candidates = [result]
+    if isinstance(result, dict):
+        metadata["is_error"] = bool(result.get("isError") or result.get("is_error"))
+        for key in ("structuredContent", "structured_content"):
+            if isinstance(result.get(key), dict):
+                candidates.append(result[key])
+        content = result.get("content")
+        if isinstance(content, list):
+            candidates.extend(
+                entry.get("text") for entry in content
+                if isinstance(entry, dict) and isinstance(entry.get("text"), str)
+            )
+    elif isinstance(result, str):
+        metadata["is_error"] = False
+
+    for candidate in list(candidates):
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped.startswith("{") and len(stripped) <= 100000:
+                try:
+                    decoded = json.loads(stripped)
+                except (TypeError, ValueError):
+                    decoded = None
+                if isinstance(decoded, dict):
+                    candidates.append(decoded)
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        state = _mcp_safe_state(candidate.get("state") or candidate.get("status"))
+        if state and "result_state" not in metadata:
+            metadata["result_state"] = state
+        reason = candidate.get("reason") or candidate.get("error_code")
+        if reason and "result_reason" not in metadata:
+            metadata["result_reason"] = _mcp_code(reason)
+
+    text = _mcp_text(result)
+    if "result_state" not in metadata:
+        match = re.search(r"(?i)(?:\"?state\"?\s*[:=]\s*\"?)([A-Za-z_-]{2,40})", text)
+        if match:
+            state = _mcp_safe_state(match.group(1))
+            if state:
+                metadata["result_state"] = state
+    if "result_reason" not in metadata:
+        match = re.search(r"(?i)(?:\"?reason\"?\s*[:=]\s*\"?)([a-z][a-z0-9-]{2,120})", text)
+        if match:
+            metadata["result_reason"] = _mcp_code(match.group(1))
+    return metadata
+
+
+def _mcp_tool_receipt(item):
+    """Build a payload-free completion receipt for one Codex MCP item."""
+    status = _mcp_safe_state(item.get("status"))
+    error = item.get("error")
+    result_meta = _mcp_result_metadata(item.get("result"))
+    semantic_failure = result_meta.get("result_state") in {
+        "failed", "unavailable", "blocked", "denied",
+    }
+    is_error = bool(error) or result_meta.get("is_error", False) \
+        or status in _MCP_FAILURE_STATUSES or semantic_failure
+    receipt = {
+        "id": item.get("id"), "type": item.get("type"),
+        "tool": item.get("tool") or item.get("name"), "server": item.get("server"),
+        "status": status or ("failed" if is_error else "unknown"),
+        "outcome": "failed" if is_error else
+                   "succeeded" if status in _MCP_SUCCESS_STATUSES else "unknown",
+        **result_meta,
+    }
+    if is_error:
+        receipt["error_code"] = result_meta.get("result_reason") or _mcp_code(
+            error if error else item.get("result")
+        )
+    return receipt
+
 
 def _ui_authority(ui, *, available):
     """Describe only interaction authority that the configured tools can use.
@@ -380,9 +532,13 @@ def codex_prompt(topic, *, budget_seconds, continuation=None, computer=None, web
     if web:
         prompt += (
             "Web tools are available as the kin_web MCP server: web_search returns results "
-            "with snippets (visibility only), read_page fetches one public page (bounded, "
-            "content-type gated) and returns its receipt: evidence_id, locator, version, "
-            "truncation.\n"
+            "with snippets (visibility only). read_page returns a bounded page of text plus "
+            "next_offset and a receipt: evidence_id, locator, version, truncation and "
+            "delivered_ranges. Only delivered_ranges identify page content actually delivered "
+            "to you in this run. If the question needs material beyond those ranges, continue "
+            "from next_offset; do not claim unread sections. An HTTP success proves transport, "
+            "not that the page is relevant or that its text supports a claim: assess content "
+            "semantically and cite only what you actually read.\n"
         )
     if computer:
         prompt += (
@@ -714,8 +870,7 @@ def run_codex(
             tool_results.append({"id": item.get("id"), "type": item.get("type"), "exit_code": item.get("exit_code")})
             del tool_results[:-20]
         elif ftype == "item.completed" and item.get("type") == "mcp_tool_call":
-            tool_results.append({"id": item.get("id"), "type": item.get("type"),
-                                 "tool": item.get("tool") or item.get("name"), "server": item.get("server")})
+            tool_results.append(_mcp_tool_receipt(item))
             del tool_results[:-20]
         elif ftype == "item.completed" and item.get("type") == "error":
             errors.append(str(item.get("message"))[:500])
