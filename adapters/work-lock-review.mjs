@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
-import {atomicJson,loadState,ROUTER_MODELS} from './mobile-router.mjs';
+import {atomicJson,loadState} from './mobile-router.mjs';
 import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({reviewPolicyVersion:4,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,mode:router.state.mode,exitRequested:router.state.exitRequested});
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:5,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,
+  routing:{mode:router.state.mode,requestedMode:router.state.requestedMode,executionEpoch:router.state.executionEpoch,manualProfile:router.state.manualProfile,autoReturnProfile:router.state.autoReturnProfile},exitRequested:router.state.exitRequested});
 
 export const REVIEW_LIMITS=Object.freeze({bytes:64000,items:128,chunkItems:48,maxChunks:8,excerpt:4000,minExcerpt:250});
 /** Transport outcomes that will never become a delivery. They are reported to the review
@@ -106,7 +107,7 @@ export class WorkLockReview {
   }
   blocked(task,runtime) {
     if(this.router.busy(runtime))return 'native-work-active-or-unknown';
-    if(!this.router.verified(runtime,ROUTER_MODELS.work))return 'work-model-unverified';
+    if(!this.router.verified(runtime,this.router.desiredProfile(runtime,{route:'work'})))return 'active-profile-unverified';
     if(task.stopReason!=='end_turn'||!task.turnEndedAt)return 'native-turn-not-finished';
     if(this.now()-task.turnEndedAt<2000)return 'delivery-settling';
     if(task.handoff&&task.handoff.state!=='accepted')return 'handoff-not-settled';
@@ -209,7 +210,7 @@ export class WorkLockReview {
         task.status=d.disposition==='not_a_task'?'canceled':'completed';
         task.completedAt=this.now();task.workReview={id,disposition:d.disposition,reason:d.reason,evidenceIds:d.evidenceIds,receipt:result.receipt,inputVersion:task.inputVersion,canceledDraftIds:canceled,...(retired.length?{retiredDeliveryIds:retired}:{}),...(undelivered.length?{undeliveredDeliveryIds:undelivered}:{})};
         this.router.save('work-reviewed',{taskId:task.id,reviewId:id,disposition:d.disposition});
-        if(!this.router.tasks().length)this.router.recordModeRequest({mode:'auto',commandId:id,reason:'DeepSeek verified the work lifecycle: '+d.reason,notify:false,sourceInputId:'host:'+id});
+        if(!this.router.tasks().length&&this.router.state.mode!=='manual'&&!Object.values(this.router.state.requests).some(request=>request.state==='pending'&&['work','auto','manual'].includes(request.mode)))this.router.recordModeRequest({mode:'auto',commandId:id,reason:'DeepSeek verified the work lifecycle: '+d.reason,notify:false,sourceInputId:'host:'+id});
         return this.save({...attempt,state:'applied',appliedAt:this.now()});
       });
     } catch(error) {

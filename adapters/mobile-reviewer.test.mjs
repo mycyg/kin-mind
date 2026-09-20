@@ -95,15 +95,16 @@ test('without a lease client the request on the wire is exactly what it was befo
 const routed=(extra={})=>Response.json({id:'request-1',model:'deepseek-flash',usage:{input_tokens:1},stop_reason:'tool_use',content:[{type:'tool_use',name:'route_message',input:{route:'chat',reason:'casual',recall:{mode:'light',query:'q',reason:'r'},...extra}}]});
 const interruptedReply={reason:'new-owner-input',sent:[{text:'The first bubble.',receipt:{messageId:'om_1',acceptedAt:'2026-01-01T00:00:00.000Z'}}],unconfirmed:[],unsent:[{text:'The second bubble.'}],decisions:['continue','rewrite_remainder','supersede']};
 
-test('with no interrupted reply the routing request is byte for byte what it was before tails existed',async()=>{
+test('with no interrupted reply the routing request is pinned to the current route and model-control schema',async()=>{
   const bodies=[];
   const reviewer=createMobileReviewer({key:'synthetic',fetchImpl:async(url,options)=>{bodies.push(options.body);return routed();}});
   await reviewer.classify({text:'hello',clock:{now:'2026-01-01T00:00:00.000Z'},recent:[{role:'user',text:'earlier'}],task:null,mode:'auto',workHeld:false,timeoutMs:1000});
-  // Length and SHA-256 of this exact request, taken from the reviewer as it stood before it knew about reply tails.
-  assert.equal(bodies[0].length,2960);
-  assert.equal(createHash('sha256').update(bodies[0]).digest('hex'),'83893799c0395eee224bde698c5d196e860caf52e488bc48307ce65ea99a1db6');
+  // Length and SHA-256 pin the exact ordinary request. Reply-tail support adds
+  // nothing unless a remainder is actually supplied.
+  assert.equal(bodies[0].length,4433);
+  assert.equal(createHash('sha256').update(bodies[0]).digest('hex'),'3abd94af95fbd43ee0e09e15ec1cb9c832055ae1a778fe05f1b11fae9b772d7a');
   const plain=JSON.parse(bodies[0]);
-  assert.deepEqual(Object.keys(plain.tools[0].input_schema.properties),['route','control','reason','recall']);
+  assert.deepEqual(Object.keys(plain.tools[0].input_schema.properties),['route','control','profile','force','reason','recall']);
   assert.ok(!bodies[0].includes('interruptedReply')&&!bodies[0].includes('tail'));
 });
 
@@ -163,14 +164,14 @@ test('with intents on the added prompt and schema are one bounded block, and the
   const [off,on]=bodies;
   // The request as it stands with intents on and nothing sent with the message. Length and
   // SHA-256, so that every later change to these rules has to be pinned again on purpose.
-  assert.equal(on.length,3845);
-  assert.equal(createHash('sha256').update(on).digest('hex'),'e8e509a25b1e35d9fa0b980f16b92fc49260c0bfb41189e68a9e11d52f0569e6');
+  assert.equal(on.length,5318);
+  assert.equal(createHash('sha256').update(on).digest('hex'),'4163f499cdd061f29215125259e855222806966f89dc1b4f340b5511680a639c');
   assert.equal(on.length-off.length,885,'the whole cost of the intents on an ordinary message');
   const [before,after,carried]=bodies.map(body=>JSON.parse(body));
   assert.equal(after.system.length-before.system.length,434);
   assert.equal(JSON.stringify(after.tools[0].input_schema).length-JSON.stringify(before.tools[0].input_schema).length,451);
   assert.ok(after.system.startsWith(before.system),'the routing rules are untouched; the intent rules are appended');
-  assert.deepEqual(Object.keys(after.tools[0].input_schema.properties),['route','control','reason','recall','stop','file_send']);
+  assert.deepEqual(Object.keys(after.tools[0].input_schema.properties),['route','control','profile','force','reason','recall','stop','file_send']);
   assert.deepEqual(after.tools[0].input_schema.properties.stop.enum,['none','current_task']);
   assert.deepEqual(after.tools[0].input_schema.required,['route','reason','recall','stop'],'only the one enum token is required of every answer');
   assert.deepEqual(after.tools[0].input_schema.properties.recall.properties.owner_words,{type:'array',maxItems:8,items:{type:'string',maxLength:24}});

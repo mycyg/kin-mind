@@ -41,7 +41,7 @@ test('candidate activation suppresses history replay and restores the verified m
  const actual={known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',nativeStatus:'idle',model:'gpt-6-astra',reasoningEffort:'medium',providerOverride:false};
  let suppressed=false;const client={beginSessionReplay(){suppressed=true;},async endSessionReplay(){suppressed=false;calls.push('drained');}};
  const connection={async loadSession(){assert.ok(suppressed);calls.push('load');},async extMethod(method){calls.push(method);if(method==='providers/set'){actual.providerOverride=true;actual.providerBaseUrl=gateway.baseUrl;}return {...actual};},
- async setSessionConfigOption({configId,value}){actual[configId==='reasoning_effort'?'reasoningEffort':configId]=value;return {configOptions:[{id:configId,value}]};}};
+   async setSessionConfigOption({configId,value}){actual[configId==='reasoning_effort'?'reasoningEffort':configId==='fast-mode'?'fastMode':configId]=value;return {configOptions:[{id:configId,value}]};}};
  const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate:{verification:{model:'deepseek-flash',reasoningEffort:'high',fastMode:'off'}},cwd:'/synthetic',gateway});
  assert.equal(result.actual.model,'deepseek-flash');assert.equal(result.actual.profileReady,true);assert.deepEqual(calls.slice(0,2),['load','drained']);assert.equal(suppressed,false);
  connection.loadSession=async()=>{throw Error('load failed');};
