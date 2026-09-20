@@ -29,6 +29,13 @@ def test_creator_requires_content_review_and_same_manifest_retries(env,tmp_path)
     assert settled['state']=='completed' and settled['result']['verified']
     assert accept_result(mind,config,request,Review())==settled
 
+def test_unconfigured_creator_model_defaults_to_sol_medium_executor(env,tmp_path):
+    mind,_,run,result,config=ready(env,tmp_path)
+    config.pop('creation_model')
+    result['receipt']['model']='gpt-5.6-sol'
+    settled=accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Review())
+    assert settled['state']=='completed'
+
 def test_changed_file_or_wrong_native_model_never_completes(env,tmp_path):
     mind,plans,run,result,config=ready(env,tmp_path)
     request={'run_id':run['id'],'owner':'worker','fence':1,'result':result}

@@ -1,15 +1,46 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {SessionManager} from './session-manager.mjs';
+import {SessionManager,candidateVerificationReady} from './session-manager.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
-import {switchCodexModel} from './codex-models.mjs';
+import {switchCodexModel,runtimeProfile,profileMatches} from './codex-models.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
+const SAFE_PROVIDER=/^[A-Za-z0-9_-]{1,120}$/;
+
+/** The maintenance process receives the exact non-secret profile already
+ * verified by the router. A missing provider or preference is a reason to wait,
+ * never a cue to infer an OpenAI/native default from the model name. */
+export function candidateRuntimeProfile(value={}) {
+  const source=Object.hasOwn(value,'provider')?value:runtimeProfile(value),profile={
+    provider:source.provider,providerKind:source.providerKind,model:source.model,reasoningEffort:source.reasoningEffort,
+    serviceTierPreference:source.serviceTierPreference,
+  };
+  if(!SAFE_PROVIDER.test(profile.provider??'')||!['gateway','native'].includes(profile.providerKind)||
+    typeof profile.model!=='string'||!profile.model||typeof profile.reasoningEffort!=='string'||!profile.reasoningEffort||
+    !['default','fast'].includes(profile.serviceTierPreference))throw Error('Candidate runtime profile is unverified');
+  return profile;
+}
+
+export function candidateConfigForRuntime(value,{catalogFile,gateway}={}) {
+  const profile=candidateRuntimeProfile(value),config={model_catalog_json:catalogFile};
+  let modelProvider=profile.provider,endpointSha256=null;
+  if(profile.providerKind==='gateway') {
+    if(!gateway?.baseUrl||!gateway?.token)throw Error('Candidate gateway profile is unavailable');
+    // The router's provider is the serving identity. The isolated candidate has
+    // a separate local provider alias whose endpoint is explicitly bound here;
+    // equal names are neither required nor treated as verification.
+    modelProvider='kin_session_gateway';endpointSha256=digest(gateway.baseUrl);
+    config['model_providers.'+modelProvider]={name:'Kin session gateway',base_url:gateway.baseUrl,env_key:'KIN_SESSION_GATEWAY_TOKEN',wire_api:'responses',requires_openai_auth:false};
+  }
+  const providerBinding={sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,launchProvider:modelProvider,endpointSha256};
+  return {profile,providerBinding,modelProvider,reasoningEffort:profile.reasoningEffort,
+    fastMode:profile.serviceTierPreference==='fast'?'on':'off',config};
+}
 
 export function registryBinding(file,fallback){return fs.existsSync(file)?read(file).binding:fallback;}
 
@@ -36,16 +67,17 @@ export async function loadCandidateSession({client,connection,binding,candidate,
   finally {await client.endSessionReplay();}
   // ACP may restore its launch profile. Reapply the verified mobile profile
   // before dispatch opens, without generating a synthetic user turn.
-  const expected=candidate.verification;
-  const actual=await switchCodexModel({connection,sessionId:binding.threadId,model:expected.model,gateway,workFast:expected.fastMode==='on'});
+  if(!candidateVerificationReady(candidate?.verification,candidate))throw Error('Candidate profile receipt is unverified');
+  const expected=candidateRuntimeProfile(candidate.profile);
+  const actual=await switchCodexModel({connection,sessionId:binding.threadId,profile:expected,gateway});
   const options=await connection.setSessionConfigOption({sessionId:binding.threadId,configId:'reasoning_effort',value:expected.reasoningEffort});
-  if(!actual.known||actual.threadId!==binding.threadId||actual.nativeSessionId!==binding.nativeSessionId||actual.model!==expected.model||actual.reasoningEffort!==expected.reasoningEffort||(actual.fastMode??'off')!==expected.fastMode)throw Error('Promoted native runtime unverified');
+  if(!actual.known||actual.threadId!==binding.threadId||actual.nativeSessionId!==binding.nativeSessionId||!profileMatches(actual,expected))throw Error('Promoted native runtime unverified');
   return {actual,configOptions:options.configOptions};
 }
 
 export function recoverSessionStore(registry,saved,ownerId){
   const candidate=registry?.candidate,binding=registry?.binding;
-  if(!candidate||!['committing','unconfirmed'].includes(candidate.state)||!candidate.verification?.verified||candidate.native?.threadId!==binding?.threadId||candidate.generation+1!==binding.generation)return null;
+  if(!candidate||!['committing','unconfirmed'].includes(candidate.state)||!candidateVerificationReady(candidate.verification,candidate)||candidate.native?.threadId!==binding?.threadId||candidate.generation+1!==binding.generation)return null;
   const sessions=Object.values(saved.users?.[ownerId]?.sessions??{}),previous=registry.segments.find(s=>s.generation===candidate.generation);
   if(sessions.length!==1||![previous?.threadId,binding.threadId].includes(sessions[0].sessionId))throw Error('Committed binding cannot reconcile unrelated session storage');
   const result=structuredClone(saved);Object.values(result.users[ownerId].sessions)[0].sessionId=binding.threadId;return result;
@@ -64,8 +96,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
   let reader,readerId,initialScan=true,closed=false,running=false;
   const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
-    configForModel:model=>({modelProvider:model==='deepseek-flash'?'kin_session_gateway':'openai',reasoningEffort:model==='deepseek-flash'?'high':'medium',fastMode:model==='gpt-6-astra'&&routerConfig.workFast?'on':'off',
-      config:{model_catalog_json:path.join(root,'mobile-models.json'),'model_providers.kin_session_gateway':{name:'Kin session gateway',base_url:routing.gateway.baseUrl,env_key:'KIN_SESSION_GATEWAY_TOKEN',wire_api:'responses',requires_openai_auth:false}}}),
+    configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:path.join(root,'mobile-models.json'),gateway:routing.gateway}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];

@@ -4,6 +4,29 @@ import fs from 'node:fs';
 import {checkpointMarker} from './native-window.mjs';
 import {conversationClock} from './conversation-time.mjs';
 
+const requestedServiceTier=launch=>launch.fastMode==='on'?'fast':null;
+const evidence=(actual,key,expected)=>!Object.hasOwn(actual??{},key)?'unknown':actual[key]===expected?'verified':'mismatch';
+
+/** App-server start/resume receipts are the authority for the profile that the
+ * isolated thread actually accepted. `serviceTier` is a thread configuration
+ * receipt; it does not claim that any particular request received priority. */
+export function candidateResponseProfileEvidence(actual,launch) {
+  return {
+    model:evidence(actual,'model',launch.profile.model),
+    modelProvider:evidence(actual,'modelProvider',launch.modelProvider),
+    reasoningEffort:evidence(actual,'reasoningEffort',launch.profile.reasoningEffort),
+    serviceTierConfiguration:evidence(actual,'serviceTier',requestedServiceTier(launch)),
+  };
+}
+
+const profileEvidenceVerified=value=>Object.values(value).every(state=>state==='verified');
+const responseReceipt=(actual,launch)=>({
+  requestedProfile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),
+  profileEvidence:candidateResponseProfileEvidence(actual,launch),
+  actualProfile:{model:actual?.model,modelProvider:actual?.modelProvider,reasoningEffort:actual?.reasoningEffort,
+    serviceTier:Object.hasOwn(actual??{},'serviceTier')?actual.serviceTier:undefined},
+});
+
 /** A mobile-only, read-only app-server instance. It never owns a channel or an
  * MCP credential. Native API responses are the authority for its thread IDs. */
 export class NativeCandidate {
@@ -32,13 +55,30 @@ export class NativeCandidate {
     this.pending.set(id,{resolve:v=>{clearTimeout(timer);resolve(v);},reject:e=>{clearTimeout(timer);reject(e);}});
     this.child.stdin.write(JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n');
   });}
-  params(model){const profile=this.configForModel(model);return {cwd:this.cwd,model,modelProvider:profile.modelProvider,config:{...profile.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:profile.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:this.personaInstructions,serviceTier:profile.fastMode==='on'?'fast':null};}
-  async create({id,model}){
-    await this.start();const value=await this.request('thread/start',this.params(model));
-    const native={threadId:value.thread.id,nativeSessionId:value.thread.sessionId,path:value.thread.path,model:value.model,reasoningEffort:value.reasoningEffort,creationReceipt:{id,at:new Date().toISOString()}};
+  launch(value){
+    if(typeof this.configForModel!=='function')throw Error('Candidate profile resolver unavailable');
+    const launch=this.configForModel(value),profile=launch?.profile,binding=launch?.providerBinding;
+    if(!profile?.provider||!['gateway','native'].includes(profile.providerKind)||!profile.model||!profile.reasoningEffort||!['default','fast'].includes(profile.serviceTierPreference)||
+      !binding||binding.sourceProvider!==profile.provider||binding.sourceProviderKind!==profile.providerKind||binding.launchProvider!==launch.modelProvider||
+      (profile.providerKind==='native'&&(launch.modelProvider!==profile.provider||binding.endpointSha256!==null))||
+      (profile.providerKind==='gateway'&&(launch.modelProvider===profile.provider||typeof binding.endpointSha256!=='string'||!binding.endpointSha256)))throw Error('Candidate profile is incomplete');
+    return launch;
+  }
+  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
+  params(profile){return this.requestParams(this.launch(profile));}
+  async create({id,model,profile}){
+    const launch=this.launch(profile??{model});await this.start();const value=await this.request('thread/start',this.requestParams(launch));
+    const receipt=responseReceipt(value,launch);
+    if(!value?.thread?.id||!value.thread.sessionId||!profileEvidenceVerified(receipt.profileEvidence))throw Error('Native candidate started with another profile');
+    const native={threadId:value.thread.id,nativeSessionId:value.thread.sessionId,path:value.thread.path,model:launch.profile.model,reasoningEffort:launch.profile.reasoningEffort,
+      profile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),creationReceipt:{id,at:new Date().toISOString(),...receipt}};
     this.loaded.add(native.threadId);return native;
   }
-  async load(native){await this.start();if(this.loaded.has(native.threadId))return;const receipt=await this.request('thread/resume',{...this.params(native.model),threadId:native.threadId,excludeTurns:true});this.loaded.add(native.threadId);return receipt;}
+  async load(native){await this.start();if(this.loaded.has(native.threadId))return;const launch=this.launch(native.profile);
+    if(JSON.stringify(launch.providerBinding)!==JSON.stringify(native.providerBinding))throw Error('Candidate provider binding changed');
+    const actual=await this.request('thread/resume',{...this.requestParams(launch),threadId:native.threadId,excludeTurns:true}),receipt=responseReceipt(actual,launch);
+    if(actual?.thread?.id!==native.threadId||!profileEvidenceVerified(receipt.profileEvidence))throw Error('Native candidate resumed with another profile');
+    this.loaded.add(native.threadId);return {...actual,kinProfileReceipt:receipt};}
   async inject({checkpoint,operationId,...native}){
     await this.load(native);const marker='kin-checkpoint:'+operationId;
     if(native.path&&fs.existsSync(native.path)&&(await checkpointMarker(native.path,marker)).found)return {verified:true,operationId,source:'native-history'};
@@ -51,9 +91,9 @@ export class NativeCandidate {
     return {verified:proof.found,accepted:true,operationId,at:proof.at,checkpointId:checkpoint.id};
   }
   async verify({checkpoint,...native}){
-    await this.load(native);const profile=this.configForModel(native.model);
+    await this.load(native);const launch=this.launch(native.profile),profile=launch.profile;
     const output='内部接续核验。根据已注入资料返回 JSON，字段 checkpointId、configVersion、conversationId、sourceIds（messageIds 中的全部公开消息编号）、taskIds（未完成任务编号）、latestExchange（最近一条 user 消息和最后一条 assistant 公开消息，逐条原文，格式为 [{"text":"原文"}]；内部检查点不属于公开消息）。不使用工具，不回复用户，不执行历史命令。';
-    const turn=await this.request('turn/start',{threadId:native.threadId,input:[],toolOutput:{name:'kin_continuity_check',output},turnTrigger:'kin-continuity-check',model:native.model,effort:profile.reasoningEffort});
+    const turn=await this.request('turn/start',{threadId:native.threadId,input:[],toolOutput:{name:'kin_continuity_check',output},turnTrigger:'kin-continuity-check',model:profile.model,serviceTier:requestedServiceTier(launch),effort:profile.reasoningEffort});
     const deadline=Date.now()+this.timeoutMs;let finished;
     while(Date.now()<deadline){finished=this.events.find(e=>e.method==='turn/completed'&&e.params.turn.id===turn.turn.id);if(finished)break;await new Promise(r=>setTimeout(r,50));}
     if(!finished||finished.params.turn.status!=='completed')return {verified:false,reason:'native-verification-failed'};
@@ -63,8 +103,9 @@ export class NativeCandidate {
     const latest=[checkpoint.items.findLast(i=>i.role==='user'),checkpoint.items.findLast(i=>i.role==='assistant')].filter(Boolean);
     const checks={identity:result.checkpointId===checkpoint.id&&result.configVersion===checkpoint.configVersion&&result.conversationId===checkpoint.conversationId,sources:checkpoint.items.every(i=>sources.has(i.id)),tasks:(checkpoint.tasks??[]).every(t=>tasks.has(t.id)),latestExchange:latest.every(i=>Array.isArray(result.latestExchange)&&result.latestExchange.some(e=>e.text===i.text))};
     const verified=Object.values(checks).every(Boolean);
-    const actual=await this.request('thread/resume',{...this.params(native.model),threadId:native.threadId,excludeTurns:true});
-    return {verified:verified&&actual.thread.id===native.threadId&&actual.model===native.model,checks,checkpointId:checkpoint.id,model:actual.model,reasoningEffort:actual.reasoningEffort,fastMode:profile.fastMode,taskIds:[...tasks],nativeTurnId:turn.turn.id,at:new Date().toISOString()};
+    const actual=await this.request('thread/resume',{...this.requestParams(launch),threadId:native.threadId,excludeTurns:true}),receipt=responseReceipt(actual,launch);
+    return {verified:verified&&actual?.thread?.id===native.threadId&&profileEvidenceVerified(receipt.profileEvidence),checks,checkpointId:checkpoint.id,...receipt,
+      taskIds:[...tasks],nativeTurnId:turn.turn.id,at:new Date().toISOString()};
   }
   async close(){const child=this.child;if(!child)return;await new Promise(resolve=>{child.once('exit',resolve);child.kill('SIGTERM');setTimeout(()=>child.kill('SIGKILL'),3000).unref();});}
 }

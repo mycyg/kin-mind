@@ -6,22 +6,28 @@ import path from 'node:path';
 import {SessionManager} from './session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from './session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
-import {recoverSessionStore,loadCandidateSession} from './mobile-session-host.mjs';
+import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime} from './mobile-session-host.mjs';
+
+const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
+ launchProvider:profile.providerKind==='gateway'?'kin_session_gateway':profile.provider,endpointSha256:profile.providerKind==='gateway'?'a'.repeat(64):null});
+const verifiedProfileReceipt=(profile,binding=providerBinding(profile))=>({verified:true,requestedProfile:structuredClone(profile),providerBinding:structuredClone(binding),
+ profileEvidence:{model:'verified',modelProvider:'verified',reasoningEffort:'verified',serviceTierConfiguration:'verified'},
+ actualProfile:{model:profile.model,modelProvider:binding.launchProvider,reasoningEffort:profile.reasoningEffort,serviceTier:profile.serviceTierPreference==='fast'?'fast':null}});
 
 function fixture(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-sessions-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
- const clock={now:20000000},runtime={known:true,threadId:'old',sessionId:'old',nativeSessionId:'old',model:'deepseek-flash',reasoningEffort:'high',fastMode:'off',nativeStatus:'idle',modelContextWindow:100000,lastTokenUsage:{inputTokens:70000}};
- const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[];
+ const clock={now:20000000},runtime={known:true,threadId:'old',sessionId:'old',nativeSessionId:'old',model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',nativeStatus:'idle',modelContextWindow:100000,lastTokenUsage:{inputTokens:70000}};
+ const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[],candidateRequests=[];
  const config={...SESSION_DEFAULTS,prepare:true,rotate:true};
  const options={file:path.join(dir,'registry.json'),binding:{threadId:'old',nativeSessionId:'old',conversationId:'logical'},coordinator:{locked:f=>f()},inspect:async()=>({...runtime}),collect:async()=>structuredClone(context),now:()=>clock.now,config,lease:false,
   checkpoint:async(c,b)=>({id:'cp:'+c.cursors.input,conversationId:b.conversationId,generation:b.generation,configVersion:c.configVersion,cursors:c.cursors,complete:true,tokens:100,sourceRevisions:{u:1,a:1},items:[{id:'u',revision:1,role:'user',text:'蓝色机器人叫云朵。'},{id:'a',revision:1,role:'assistant',text:'你要云朵的方形贴纸吗？'}],pendingQuestions:[{sourceId:'a',target:'云朵的方形贴纸'}]}),
   compact:async id=>{calls.push('compact');runtime.lastTokenUsage.inputTokens=10000;return {completed:true,actual_session:'old',operationId:id,at:new Date(clock.now).toISOString()};},ackCompact:async()=>calls.push('ack'),
-  createCandidate:async()=>{calls.push('create');return {threadId:'new',nativeSessionId:'new'};},injectCandidate:async()=>{calls.push('inject');return {verified:true};},verifyCandidate:async({checkpoint})=>({verified:true,checkpointId:checkpoint.id,model:runtime.model,reasoningEffort:runtime.reasoningEffort,fastMode:runtime.fastMode}),
+  createCandidate:async request=>{calls.push('create');candidateRequests.push(structuredClone(request));return {threadId:'new',nativeSessionId:'new',profile:structuredClone(request.profile),providerBinding:providerBinding(request.profile)};},injectCandidate:async()=>{calls.push('inject');return {verified:true};},verifyCandidate:async({checkpoint,profile,providerBinding:binding})=>({checkpointId:checkpoint.id,...verifiedProfileReceipt(profile,binding)}),
   promote:async()=>{calls.push('promote');return {verified:true,threadId:'new'};},reviewRequested:async()=>calls.push('review')};
  const manager=new SessionManager(options);
  const advise=async(action,evidenceIds=[])=>{await manager.observe(runtime,context);return manager.advise({action,reason:'Synthetic review',evidenceIds,compactionId:manager.state.compactions.at(-1)?.id},{model:'deepseek-flash',reasoning:'high'},manager.state.observation.id);};
  const degraded=()=>{clock.now+=2000000;manager.evidence({id:'failure',sourceId:'owner-correction',revision:1,kind:'reference-error',basis:'owner-statement',at:clock.now});};
- return {manager,options,clock,runtime,context,calls,advise,degraded,dir};
+ return {manager,options,clock,runtime,context,calls,candidateRequests,advise,degraded,dir};
 }
 test('pressure uses current input, verified window and output reserve; cumulative use is irrelevant',()=>{
  const p=windowPressure({modelContextWindow:100000,lastTokenUsage:{inputTokens:30000,totalTokens:999999999},totalTokenUsage:{totalTokens:1e12}});
@@ -38,14 +44,30 @@ test('restart restores the last native measurement and recognizes a compaction c
 });
 test('candidate activation suppresses history replay and restores the verified mobile profile',async()=>{
  const calls=[],gateway={baseUrl:'http://synthetic.invalid',token:'synthetic-token',reasoningEffort:'high'};
- const actual={known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',nativeStatus:'idle',model:'gpt-6-astra',reasoningEffort:'medium',providerOverride:false};
+ const actual={known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',nativeStatus:'idle',model:'gpt-6-astra',modelProvider:'openai-15m',reasoningEffort:'medium',serviceTierPreference:'default',fastMode:'off',providerOverride:false};
  let suppressed=false;const client={beginSessionReplay(){suppressed=true;},async endSessionReplay(){suppressed=false;calls.push('drained');}};
- const connection={async loadSession(){assert.ok(suppressed);calls.push('load');},async extMethod(method){calls.push(method);if(method==='providers/set'){actual.providerOverride=true;actual.providerBaseUrl=gateway.baseUrl;}return {...actual};},
+ const connection={async loadSession(){assert.ok(suppressed);calls.push('load');},async extMethod(method){calls.push(method);if(method==='providers/set')Object.assign(actual,{providerOverride:true,providerBaseUrl:gateway.baseUrl,modelProvider:'custom-gateway'});return {...actual};},
    async setSessionConfigOption({configId,value}){actual[configId==='reasoning_effort'?'reasoningEffort':configId==='fast-mode'?'fastMode':configId]=value;return {configOptions:[{id:configId,value}]};}};
- const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate:{verification:{model:'deepseek-flash',reasoningEffort:'high',fastMode:'off'}},cwd:'/synthetic',gateway});
+ const profile={provider:'custom-gateway',providerKind:'gateway',model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'},native={providerBinding:providerBinding(profile)};
+ const candidate={profile,native,verification:verifiedProfileReceipt(profile,native.providerBinding)};
+ const result=await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate,cwd:'/synthetic',gateway});
  assert.equal(result.actual.model,'deepseek-flash');assert.equal(result.actual.profileReady,true);assert.deepEqual(calls.slice(0,2),['load','drained']);assert.equal(suppressed,false);
  connection.loadSession=async()=>{throw Error('load failed');};
  await assert.rejects(loadCandidateSession({client,connection,binding:{threadId:'new'},candidate:{},cwd:'/synthetic',gateway}),/load failed/);assert.equal(suppressed,false);
+});
+test('maintenance candidate configuration uses the exact verified provider and Fast preference',()=>{
+ const gateway={baseUrl:'http://synthetic.invalid',token:'token'};
+ const sol=candidateConfigForRuntime({known:true,model:'gpt-5.6-sol',modelProvider:'openai-15m',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on'},
+   {catalogFile:'/catalog.json',gateway});
+ assert.deepEqual(sol.profile,{provider:'openai-15m',providerKind:'native',model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'});
+ assert.deepEqual([sol.modelProvider,sol.fastMode,sol.config.model_catalog_json],['openai-15m','on','/catalog.json']);
+ assert.deepEqual(sol.providerBinding,{sourceProvider:'openai-15m',sourceProviderKind:'native',launchProvider:'openai-15m',endpointSha256:null});
+ assert.equal(Object.keys(sol.config).some(key=>key.startsWith('model_providers.')),false,'a native provider is never rewritten as a gateway');
+ const deepseek=candidateConfigForRuntime({model:'deepseek-flash',modelProvider:'private-ds',providerOverride:true,reasoningEffort:'high',fastMode:'off'},
+   {catalogFile:'/catalog.json',gateway});
+ assert.equal(deepseek.profile.provider,'private-ds');assert.equal(deepseek.modelProvider,'kin_session_gateway');assert.equal(deepseek.config['model_providers.kin_session_gateway'].base_url,gateway.baseUrl);
+ assert.deepEqual([deepseek.providerBinding.sourceProvider,deepseek.providerBinding.launchProvider,typeof deepseek.providerBinding.endpointSha256],['private-ds','kin_session_gateway','string']);
+ assert.throws(()=>candidateConfigForRuntime({model:'gpt-5.6-sol',reasoningEffort:'medium',fastMode:'on'},{catalogFile:'/catalog.json',gateway}),/unverified/);
 });
 test('high pressure is compacted first; fifty historical compactions do not authorize rotation',async t=>{
  const f=fixture(t);await f.advise('rotate');assert.equal((await f.manager.tick()).reason,'compact-first');assert.ok(!f.calls.includes('create'));
@@ -84,6 +106,14 @@ test('only post-compaction sourced degradation permits a verified handover',asyn
  const f=fixture(t);await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);const old=f.manager.fence();
  assert.equal((await f.manager.tick()).state,'complete');assert.equal(f.manager.fence().conversationId,old.conversationId);assert.equal(f.manager.fence().generation,2);assert.throws(()=>f.manager.assertFence(old),/STALE/);
  assert.deepEqual(f.calls.filter(c=>['create','inject','promote'].includes(c)),['create','inject','promote']);
+ assert.deepEqual(f.candidateRequests[0].profile,{provider:'custom-gateway',providerKind:'gateway',model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'});
+});
+test('a Sol Fast candidate keeps its provider, and provider drift blocks promotion',async t=>{
+ const f=fixture(t);Object.assign(f.runtime,{model:'gpt-5.6-sol',modelProvider:'openai-15m',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on'});
+ await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+ const verify=f.manager.verifyCandidate;f.manager.verifyCandidate=async args=>{const receipt=await verify(args);f.runtime.modelProvider='different-native-provider';return receipt;};
+ const result=await f.manager.tick();assert.deepEqual([result.state,result.reason],['waiting','candidate-profile-changed']);assert.ok(!f.calls.includes('promote'));
+ assert.deepEqual(f.candidateRequests[0].profile,{provider:'openai-15m',providerKind:'native',model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'});
 });
 test('source correction and ordinary latency never justify handover',async t=>{
  const f=fixture(t);await f.advise('compact');await f.manager.tick();f.degraded();f.manager.state.evidence.failure.needsReview=true;await f.advise('rotate',['failure']);assert.equal((await f.manager.tick()).state,'waiting');
@@ -92,6 +122,17 @@ test('source correction and ordinary latency never justify handover',async t=>{
 test('creation ambiguity survives restart and never opens a second candidate',async t=>{
  const f=fixture(t);await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);f.manager.createCandidate=async()=>{f.calls.push('create');throw Error('timeout');};
  assert.equal((await f.manager.tick()).state,'unconfirmed');const restored=new SessionManager(f.options);await restored.tick();assert.equal(f.calls.filter(c=>c==='create').length,1);
+});
+test('legacy candidates without profile evidence are retired only before binding commit',async t=>{
+ const f=fixture(t);await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+ f.manager.state.candidate={id:'legacy-ready',state:'ready',generation:1,native:{threadId:'legacy',nativeSessionId:'legacy'}};f.manager.save('synthetic-legacy-ready');
+ const restored=new SessionManager(f.options);assert.equal(restored.state.candidate.state,'stale');assert.equal(restored.state.retiredCandidates.at(-1).staleReason,'legacy-profile-evidence-missing');
+ assert.equal((await restored.tick()).state,'complete');assert.equal(f.calls.filter(c=>c==='create').length,1);assert.equal(f.candidateRequests[0].profile.provider,'custom-gateway');
+
+ const committed=fixture(t),old=committed.manager.fence();Object.assign(committed.manager.state,{binding:{...old,generation:2,threadId:'legacy-new',nativeSessionId:'legacy-new'},
+  candidate:{id:'legacy-committed',state:'unconfirmed',generation:1,native:{threadId:'legacy-new',nativeSessionId:'legacy-new'},previousBinding:old}});committed.manager.save('synthetic-legacy-committed');
+ const conservative=new SessionManager(committed.options),result=await conservative.tick();assert.deepEqual([result.state,result.reason],['waiting','candidate-profile-unverified']);
+ assert.equal(conservative.state.candidate.id,'legacy-committed');assert.equal(conservative.state.retiredCandidates,undefined);assert.ok(!committed.calls.includes('create'));
 });
 test('candidate model verification and input revision are checked again at promotion',async t=>{
  const f=fixture(t);await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);const verify=f.manager.verifyCandidate;
