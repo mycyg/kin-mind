@@ -31,6 +31,7 @@ def main():
         reasoning=request["reasoning"],
         provider=request["provider"],
         computer=request.get("computer"),
+        web=request.get("web"),
     )
     print(json.dumps(receipt, ensure_ascii=False))
 
