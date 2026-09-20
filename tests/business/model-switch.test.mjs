@@ -188,4 +188,3 @@ test('confirmed owner force bypasses stale coordinator processing, fences late o
   await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=>assert.fail('the original ID can never be resubmitted'));
   assert.equal(f.router.currentTask().id,taskId);
 });
-
