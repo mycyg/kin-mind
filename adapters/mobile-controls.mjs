@@ -13,7 +13,7 @@ export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
     // Compatibility alias; actual remains the only current-model evidence.
     transition:lastTransition,
     tasks:Object.values(state.tasks).filter(t=>!['completed','canceled'].includes(t.status)).map(t=>({id:t.id,status:t.status,summary:t.summary,inputVersion:t.inputVersion,completionRequested:Boolean(t.completion),handoff:t.handoff?.state})),
-    requests:Object.values(state.requests).slice(-8).map(({hash,...r})=>r),
+    requests:Object.values(state.requests).slice(-8).map(({hash,sourceHash,...r})=>r),
     notifications:Object.values(state.notices??{}).slice(-8).map(({text,...n})=>n),
     // What became of a damaged state file, if one was ever found: codes, counts and names only.
     ...(state.recovery?{recovery:state.recovery}:{})};
@@ -25,7 +25,7 @@ export function runtimeReply(view,{pending=false,switched=false}={}) {
   const model=actual.model==='deepseek-flash'?'DeepSeek Flash':actual.model==='gpt-6-astra'?'GPT‑6 Astra':actual.model==='gpt-5.6-sol'?'GPT‑5.6 Sol':actual.model;
   const mode=view.mode==='manual'?'手动模式':'自动模式';
   if(pending)return '切换正在处理。当前仍是 '+model+(actual.reasoningEffort?'（'+actual.reasoningEffort+'）':'')+'。';
-  if(switched)return '已切换到 '+model+'（'+mode+'）。';
+  if(switched)return '已切换到 '+model+(actual.reasoningEffort?' · '+actual.reasoningEffort:'')+(actual.serviceTierPreference==='fast'?' · Fast 配置已开启':'')+'（'+mode+'）。';
   return '我现在用的是 '+model+(actual.reasoningEffort?'（'+actual.reasoningEffort+'，'+mode+'）':'（'+mode+'）')+'。'+(view.tasks.length?'当前任务会继续保留。':'');
 }
 

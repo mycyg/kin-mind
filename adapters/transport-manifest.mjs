@@ -36,6 +36,12 @@ const iso=ms=>new Date(ms).toISOString();
 const terminal=manifest=>TERMINAL_GROUP_STATES.includes(manifest.state);
 const started=bubble=>bubble.fragments.some(f=>f.state!=='unsent');
 const open=bubble=>!TERMINAL_BUBBLES.includes(bubble.state);
+const executionNumber=value=>Number.isSafeInteger(value)&&value>=0;
+const routingBasis=value=>JSON.stringify([
+  [Object.hasOwn(value,'taskId'),value.taskId],
+  [Object.hasOwn(value,'inputVersion'),value.inputVersion],
+  [Object.hasOwn(value,'turnFence'),value.turnFence],
+]);
 
 /** Stored once in the manifest, never derived again. */
 export function transportId(bubbleId,index,bodySha256){return 'kin-frag-'+sha256(bubbleId+'\0'+index+'\0'+bodySha256).slice(0,48);}
@@ -65,7 +71,11 @@ export function legacyState(manifest) {
 
 /** A manifest in the shape the host's guard and `deliverGroup` callers read. Carries bubble text. */
 export function manifestView(manifest) {
-  const shared={kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,taskId:manifest.taskId,sessionFence:manifest.sessionFence};
+  const shared={kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
+    ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
+    ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
+    ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
+    ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{})};
   const entries=manifest.bubbles.map(b=>({request:b.request,state:b.state,delivery:{...shared,id:b.bubble_id,text:b.text,references:b.references,draftId:b.draft_id},
     fragments:b.fragments.map(f=>({transport_id:f.transport_id,kind:f.kind,state:f.state,messageId:f.receipt?.messageId}))}));
   return {state:legacyState(manifest),groupState:manifest.state,groupId:manifest.group_id,reason:manifest.reason??undefined,ownerEpoch:manifest.ownerEpoch,retryAt:manifest.retryAt,
@@ -116,6 +126,8 @@ export class TransportManifests {
 
   valid(manifest,id) {
     if(manifest?.schema!==MANIFEST_SCHEMA||manifest.group_id!==id||!GROUP_STATES.includes(manifest.state)||!Array.isArray(manifest.bubbles)||!manifest.bubbles.length)return false;
+    if((Object.hasOwn(manifest,'inputVersion')&&!executionNumber(manifest.inputVersion))||
+      (Object.hasOwn(manifest,'turnFence')&&!executionNumber(manifest.turnFence)))return false;
     return manifest.bubbles.every(b=>typeof b.text==='string'&&Array.isArray(b.fragments)&&BUBBLE_STATES.includes(b.state)&&sha256(b.text)===b.body_sha256&&
       b.fragments.every(f=>FRAGMENT_STATES.includes(f.state))&&(!b.fragments.length||verifyFragments(b.text,b.fragments)===null));
   }
@@ -178,19 +190,35 @@ export class TransportManifests {
   createDraft({entries,ownerEpoch,channel='feishu',hold=null,continues=null,continuation=null}) {
     if(!Array.isArray(entries)||!entries.length||entries.some(e=>!e?.request||!e.delivery?.id))throw Error('A reply group needs bubbles with stable IDs');
     const ids=entries.map(e=>e.delivery.id),first=entries[0],now=this.clock();
+    if((Object.hasOwn(first.delivery,'inputVersion')&&!executionNumber(first.delivery.inputVersion))||
+      (Object.hasOwn(first.delivery,'turnFence')&&!executionNumber(first.delivery.turnFence)))throw Error('Reply routing versions must be non-negative safe integers');
+    if(entries.some(entry=>routingBasis(entry.delivery)!==routingBasis(first.delivery)))throw Error('A reply group cannot mix routing versions');
     let id=groupIdFor(entries);
     const existing=this.load(id);
     // A batch ID that already names other bubbles: keep both, under separate groups.
     if(existing&&existing.bubbles.map(b=>b.bubble_id).join('\0')!==ids.join('\0'))id=(id+'-b'+sha256(ids.join('\0')).slice(0,12)).slice(-160);
+    else if(existing&&routingBasis(existing)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
     const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
-      kind:first.delivery.kind??'reply',work:Boolean(first.request.work),taskId:first.delivery.taskId,sessionFence:first.delivery.sessionFence,ownerEpoch,
+      kind:first.delivery.kind??'reply',work:Boolean(first.request.work),
+      ...(Object.hasOwn(first.delivery,'taskId')?{taskId:first.delivery.taskId}:{}),
+      ...(Object.hasOwn(first.delivery,'inputVersion')?{inputVersion:first.delivery.inputVersion}:{}),
+      ...(Object.hasOwn(first.delivery,'turnFence')?{turnFence:first.delivery.turnFence}:{}),
+      ...(Object.hasOwn(first.delivery,'sessionFence')?{sessionFence:first.delivery.sessionFence}:{}),ownerEpoch,
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:hold?'held':'draft',reason:hold?.reason??null,leaseGeneration:0,revision:0,prevDigest:null,review:null,
       created_at:now,updated_at:now,retryAt:hold?.retryAt??0,failures:0,
       ...(continues?.length?{continues_reply_id:continues[0].group_id,continues:continues.map(c=>({group_id:c.group_id,intent_id:c.intent_id??null}))}:{}),
       ...(continuation?{continuation}:{}),
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
         return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,body_sha256:sha256(text),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
-    return this.load(id)??(createJsonExclusive(this.file(id),manifest)?manifest:this.load(id));
+    const loaded=this.load(id);
+    if(loaded) {
+      if(routingBasis(loaded)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
+      return loaded;
+    }
+    if(createJsonExclusive(this.file(id),manifest))return manifest;
+    const raced=this.load(id);
+    if(raced&&routingBasis(raced)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
+    return raced;
   }
 
   /** Freeze bodies, references and fragment identities from a passed review.
@@ -380,7 +408,11 @@ export class TransportManifests {
     const body=bubble.text.slice(fragment.start,fragment.end);
     if(sha256(body)!==fragment.body_sha256)throw Error('Manifest fragment does not match its frozen body');
     const base={id:fragment.transport_id,kind:manifest.kind,draftId:bubble.draft_id,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
-      references:bubble.references,...(manifest.taskId?{taskId:manifest.taskId}:{}),...(manifest.sessionFence===undefined?{}:{sessionFence:manifest.sessionFence}),
+      references:bubble.references,
+      ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
+      ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
+      ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
+      ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{}),
       // Python hears about bubbles from this layer; the transport stays silent.
       memory:false,bubbleId:bubble.bubble_id,fragment:{index:fragment.index,count:bubble.fragments.length,start:fragment.start,end:fragment.end,body_sha256:fragment.body_sha256}};
     return fragment.kind==='file'?{...base,media:{type:'file',name:fragment.name,data:Buffer.from(body,'utf8')}}:{...base,text:body};
@@ -453,7 +485,10 @@ export class TransportManifests {
 
   bubbleEvent(manifest,bubble,kind) {
     const receipts=bubble.fragments.filter(f=>f.state==='accepted').map(f=>f.receipt??{}),at=bubble.event_at[kind];
-    const event=deliveryEvent({id:bubble.bubble_id,text:bubble.text,kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,taskId:manifest.taskId,
+    const event=deliveryEvent({id:bubble.bubble_id,text:bubble.text,kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
+      ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
+      ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
+      ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
       references:bubble.references,draftId:bubble.draft_id,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
       ...(kind==='accepted'?{messageId:receipts[0]?.messageId}:{})},{channel:manifest.channel});
     return kind==='accepted'&&receipts.length>1?{...event,message_ids:receipts.map(r=>r.messageId)}:event;
@@ -637,8 +672,13 @@ export class TransportManifests {
           return {bubble_id:item.delivery.id,draft_id:item.request.draft_id,order,request:item.request,text,body_sha256:body,references:item.delivery.references??[],legacy:true,
             state:'unsent',fragments,...(state==='accepted'?{emitted:{accepted:true}}:{})};
         });
-        const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:items[0].delivery.memoryBatchId??id,reply_id:entry.request.reply_id??null,channel:'feishu',kind:items[0].delivery.kind??'reply',
-          work:Boolean(entry.request.work),taskId:items[0].delivery.taskId,sessionFence:items[0].delivery.sessionFence,ownerEpoch:entry.ownerEpoch,
+        const firstDelivery=items[0].delivery;
+        const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:firstDelivery.memoryBatchId??id,reply_id:entry.request.reply_id??null,channel:'feishu',kind:firstDelivery.kind??'reply',
+          work:Boolean(entry.request.work),
+          ...(Object.hasOwn(firstDelivery,'taskId')?{taskId:firstDelivery.taskId}:{}),
+          ...(executionNumber(firstDelivery.inputVersion)?{inputVersion:firstDelivery.inputVersion}:{}),
+          ...(executionNumber(firstDelivery.turnFence)?{turnFence:firstDelivery.turnFence}:{}),
+          ...(Object.hasOwn(firstDelivery,'sessionFence')?{sessionFence:firstDelivery.sessionFence}:{}),ownerEpoch:entry.ownerEpoch,
           expected_bubbles:items[0].delivery.expectedBubbles??items.length,state:reviewed?'reviewed':'held',reason:reviewed?null:entry.reason??'share-review-pending',
           leaseGeneration:0,revision:0,prevDigest:null,review:reviewed?{id:entry.review?.review_id??null,checked_hashes:bubbles.map(b=>b.body_sha256)}:null,
           created_at:entry.at??now,updated_at:now,retryAt:entry.retryAt??0,failures:0,origin:'legacy-import',bubbles};

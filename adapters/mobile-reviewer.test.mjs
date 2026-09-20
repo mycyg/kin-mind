@@ -101,9 +101,11 @@ test('with no interrupted reply the routing request is pinned to the current rou
   await reviewer.classify({text:'hello',clock:{now:'2026-01-01T00:00:00.000Z'},recent:[{role:'user',text:'earlier'}],task:null,mode:'auto',workHeld:false,timeoutMs:1000});
   // Length and SHA-256 pin the exact ordinary request. Reply-tail support adds
   // nothing unless a remainder is actually supplied.
-  assert.equal(bodies[0].length,4433);
-  assert.equal(createHash('sha256').update(bodies[0]).digest('hex'),'3abd94af95fbd43ee0e09e15ec1cb9c832055ae1a778fe05f1b11fae9b772d7a');
+  assert.equal(bodies[0].length,4645);
+  assert.equal(createHash('sha256').update(bodies[0]).digest('hex'),'001f05d7c7b5b88edf519398d2afc3f8663d2c9dfc740a6a0469379efba9de50');
   const plain=JSON.parse(bodies[0]);
+  assert.doesNotMatch(plain.system,/If uncertain choose work/);
+  assert.match(plain.system,/uncertainty alone never upgrades a message to work/);
   assert.deepEqual(Object.keys(plain.tools[0].input_schema.properties),['route','control','profile','force','reason','recall']);
   assert.ok(!bodies[0].includes('interruptedReply')&&!bodies[0].includes('tail'));
 });
@@ -164,8 +166,8 @@ test('with intents on the added prompt and schema are one bounded block, and the
   const [off,on]=bodies;
   // The request as it stands with intents on and nothing sent with the message. Length and
   // SHA-256, so that every later change to these rules has to be pinned again on purpose.
-  assert.equal(on.length,5318);
-  assert.equal(createHash('sha256').update(on).digest('hex'),'4163f499cdd061f29215125259e855222806966f89dc1b4f340b5511680a639c');
+  assert.equal(on.length,5530);
+  assert.equal(createHash('sha256').update(on).digest('hex'),'802abeaeddec59c6becfdd4215cf78d44a774847211c308f283c2459f8b8b817');
   assert.equal(on.length-off.length,885,'the whole cost of the intents on an ordinary message');
   const [before,after,carried]=bodies.map(body=>JSON.parse(body));
   assert.equal(after.system.length-before.system.length,434);

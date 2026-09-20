@@ -57,6 +57,16 @@ The host answers status requests from verified runtime metadata. Asking for a
 switch notification attaches to the pending request; it does not start a GPT-6
 task. A mixed message that also requests code, a document or a repair remains work.
 
+Historical correction is a separate receipt, not a rewrite of the input record. An
+authenticated private host can call `reclassifyAcceptedControl` only for an already
+accepted owner input, with its semantic hash, the exact router revision, a bounded
+current-classifier result and hashed acceptance/owner/source evidence tied to the
+same session, conversation and generation. Only manual, auto or work control is
+accepted. The receipt leaves `record.route` untouched and authorizes one exact mode
+request; it never submits the source input or replays its task effects. An identical
+retry returns that receipt, while a changed command ID or newer explicit control
+makes the evidence stale.
+
 A mode request can set `notify: true`. After native model verification, the host
 creates a durable notification with a stable output ID. The owner-bound sender
 and its durable outbox are injected through `flushNotices({send, lookup})`.
@@ -172,10 +182,12 @@ it does not rewrite an existing native transcript. Provider keys never appear in
 the loopback client token or diagnostic errors.
 
 Classification uses the current message, a bounded recent conversation and task
-summary. A bounded timeout (15 seconds by default) or invalid result selects the work model before
-submission. Once native acceptance is uncertain, no model fallback may replay the
-message. Interrupted provider replacement requires reconciliation rather than a
-new conversation.
+summary. If the evidence does not establish that the owner wants substantive work,
+the classifier keeps the message in chat so the conversation can clarify. A bounded
+timeout (15 seconds by default) or invalid result decides no route: the input remains
+`semantic-pending` for its bounded DeepSeek review. Once native acceptance is
+uncertain, no model fallback may replay the message. Interrupted provider replacement
+requires reconciliation rather than a new conversation.
 
 ## Review cadence
 

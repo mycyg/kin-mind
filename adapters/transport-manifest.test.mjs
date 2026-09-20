@@ -26,7 +26,10 @@ function world(t,{contracts,hooks,retry,review,flavour}={}) {
   return {root,directory,outbox,state,clock,transport,platform:transport.platform,events,canceled,outcomes,open,manifests:open()};
 }
 const group=(batch,texts,extra={})=>texts.map((text,i)=>({request:{draft_id:`${batch}-draft-${i}`,reply_id:extra.replyId??'input-1',text},
-  delivery:{id:`${batch}-bubble-${i}`,text,kind:'reply',memoryBatchId:batch,expectedBubbles:texts.length,...(extra.taskId?{taskId:extra.taskId}:{})}}));
+  delivery:{id:`${batch}-bubble-${i}`,text,kind:'reply',memoryBatchId:batch,expectedBubbles:texts.length,
+    ...(Object.hasOwn(extra,'taskId')?{taskId:extra.taskId}:{}),
+    ...(Object.hasOwn(extra,'inputVersion')?{inputVersion:extra.inputVersion}:{}),
+    ...(Object.hasOwn(extra,'turnFence')?{turnFence:extra.turnFence}:{})}}));
 const fragments=manifest=>manifest.bubbles.flatMap(b=>b.fragments);
 const filed=(w,id)=>{const done=path.join(w.directory,'done');return (fs.existsSync(done)?fs.readdirSync(done):[]).map(month=>path.join(done,month,id+'.json')).find(file=>fs.existsSync(file));};
 const onDisk=(w,id)=>readJsonFile(path.join(w.directory,id+'.json')).value??readJsonFile(filed(w,id)??'').value;
@@ -401,12 +404,14 @@ test('memory side effects are delivered at least once, identically, and a failin
 
 test('legacy .pending.json: unfinished groups are imported once and marked migrated; finished ones are never imported',async t=>{
   const w=world(t),legacy=path.join(w.root,'share-checks');fs.mkdirSync(legacy);
-  const entry=(id,text,state,extra={})=>({request:{draft_id:'draft-'+id,reply_id:'input-legacy',text},delivery:{id,text,kind:'reply',draftId:'draft-'+id,memoryBatchId:extra.batch,expectedBubbles:extra.expected},state,...(extra.receipt?{receipt:extra.receipt}:{})});
+  const entry=(id,text,state,extra={})=>({request:{draft_id:'draft-'+id,reply_id:'input-legacy',text},delivery:{id,text,kind:'reply',draftId:'draft-'+id,memoryBatchId:extra.batch,expectedBubbles:extra.expected,
+    ...(Object.hasOwn(extra,'taskId')?{taskId:extra.taskId}:{}),...(Object.hasOwn(extra,'inputVersion')?{inputVersion:extra.inputVersion}:{}),
+    ...(Object.hasOwn(extra,'turnFence')?{turnFence:extra.turnFence}:{})},state,...(extra.receipt?{receipt:extra.receipt}:{})});
   const file=(name,value)=>fs.writeFileSync(path.join(legacy,name+'.pending.json'),JSON.stringify(value));
   const whole=[entry('kin-chat-a0','已经送达的一句。','accepted',{batch:'reply-legacy-a',expected:3,receipt:{state:'accepted',messageId:'om_old'}}),
     entry('kin-chat-a1','卡住的一句。','unconfirmed',{batch:'reply-legacy-a',expected:3}),entry('kin-chat-a2','还没发的一句。','unsent',{batch:'reply-legacy-a',expected:3})];
   file('stuck',{state:'unconfirmed',wholeReply:true,review:{state:'ready',review_id:'review-old',checked:whole.map(e=>({text:e.request.text}))},request:whole[0].request,delivery:whole[0].delivery,ownerEpoch:'epoch-old',at:500,retryAt:0,entries:whole});
-  file('single',{...entry('kin-chat-b0','单独排队的一句。','unsent',{batch:'reply-legacy-b',expected:2}),state:'pending',ownerEpoch:'epoch-old',at:600,retryAt:0});
+  file('single',{...entry('kin-chat-b0','单独排队的一句。','unsent',{batch:'reply-legacy-b',expected:2,taskId:'legacy-task',inputVersion:6,turnFence:2}),state:'pending',ownerEpoch:'epoch-old',at:600,retryAt:0});
   const finished={};
   for(const state of ['accepted','canceled','silent','merged','migrated','duplicate']) {
     const done=[entry('kin-chat-'+state,'历史回复，不得重放。','accepted',{batch:'reply-done-'+state})];
@@ -423,6 +428,7 @@ test('legacy .pending.json: unfinished groups are imported once and marked migra
   const imported=onDisk(w,'reply-legacy-a');
   assert.deepEqual(imported.bubbles.map(b=>[b.fragments[0].transport_id,b.fragments[0].state,b.state]),[['kin-chat-a0','accepted','accepted'],['kin-chat-a1','submitting','sending'],['kin-chat-a2','unsent','unsent']],'imported bubbles keep their bubble ID as transport ID');
   assert.deepEqual([imported.state,imported.review.id,imported.ownerEpoch,imported.origin],['reviewed','review-old','epoch-old','legacy-import']);
+  assert.deepEqual([onDisk(w,'reply-legacy-b').taskId,onDisk(w,'reply-legacy-b').inputVersion,onDisk(w,'reply-legacy-b').turnFence],['legacy-task',6,2]);
   // The group the old guard left blocked forever: no receipt means its send never began, so it goes out now, once, under its old ID.
   await w.manifests.resumeDue({transport:w.transport,limit:5});
   assert.deepEqual(w.transport.sends.map(d=>d.id),['kin-chat-a1','kin-chat-a2','kin-chat-b0']);
@@ -449,18 +455,24 @@ test('a receipt reader that looks in the wrong place never causes a second send 
 
 test('one batch ID never mixes different bubbles, and the guard sees what the old journal showed it',async t=>{
   const w=world(t),legacy=path.join(w.root,'share-checks');fs.mkdirSync(legacy);
-  const work=group('batch-ad',['工作回复。'],{taskId:'task-7'});work[0].request.work=true;work[0].delivery.sessionFence={generation:3};
+  const work=group('batch-ad',['工作回复。'],{taskId:'task-7',inputVersion:4,turnFence:2});work[0].request.work=true;work[0].delivery.sessionFence={generation:3};
   const first=w.manifests.createDraft({entries:work,ownerEpoch:'epoch-9',hold:{reason:'share-review-pending',retryAt:5}});
-  assert.deepEqual([first.group_id,first.state,first.retryAt],['batch-ad','held',5]);
+  assert.deepEqual([first.group_id,first.state,first.retryAt,first.taskId,first.inputVersion,first.turnFence],['batch-ad','held',5,'task-7',4,2]);
   assert.equal(w.manifests.createDraft({entries:work,ownerEpoch:'epoch-9'}).state,'held','the same entries are the same group');
+  const changedFence=structuredClone(work);changedFence[0].delivery.turnFence=3;
+  assert.throws(()=>w.manifests.createDraft({entries:changedFence,ownerEpoch:'epoch-9'}),/routing basis conflicts/,'the durable group cannot be rebound to another execution');
   const other=group('batch-ad',['同一批次的另一个气泡。']);other[0].delivery.id='batch-ad-bubble-late';
   const second=w.manifests.createDraft({entries:other,ownerEpoch:'epoch-9'});
   assert.match(second.group_id,/^batch-ad-b[0-9a-f]{12}$/);assert.equal(second.delivery_id,'batch-ad','memory still hears the batch ID');
   const views=[];
   await w.manifests.run('batch-ad',{transport:w.transport,guard:async view=>{views.push(view);return 'send';}});
-  assert.deepEqual([views[0].ownerEpoch,views[0].request.work,views[0].delivery.taskId,views[0].delivery.id,views[0].state,views[0].groupState],['epoch-9',true,'task-7','batch-ad-bubble-0','pending','held']);
+  assert.deepEqual([views[0].ownerEpoch,views[0].request.work,views[0].delivery.taskId,views[0].delivery.inputVersion,views[0].delivery.turnFence,views[0].delivery.id,views[0].state,views[0].groupState],['epoch-9',true,'task-7',4,2,'batch-ad-bubble-0','pending','held']);
   assert.deepEqual(w.transport.sends[0].sessionFence,{generation:3},'the session fence travels with every fragment for the host to assert');
-  assert.equal(w.transport.sends[0].taskId,'task-7');
+  assert.deepEqual([w.transport.sends[0].taskId,w.transport.sends[0].inputVersion,w.transport.sends[0].turnFence],['task-7',4,2]);
+  assert.deepEqual([w.events[0].task_id,w.events[0].input_version,w.events[0].turn_fence],['task-7',4,2],'the bubble receipt retains the exact task execution basis');
+  const chat=group('batch-ad-chat',['闲聊回复。'],{taskId:null,inputVersion:0,turnFence:2});
+  w.manifests.createDraft({entries:chat,ownerEpoch:'epoch-9'});await w.manifests.run('batch-ad-chat',{transport:w.transport});
+  assert.equal(w.transport.sends.at(-1).taskId,null);assert.equal(Object.hasOwn(w.events.at(-1),'task_id'),true);assert.equal(w.events.at(-1).task_id,null);
   // Two old single-bubble files of one batch become two groups; neither hides the other.
   for(const [name,id] of [['one','kin-chat-c0'],['two','kin-chat-c1']])fs.writeFileSync(path.join(legacy,name+'.pending.json'),JSON.stringify({state:'pending',ownerEpoch:'e',at:1,retryAt:0,
     request:{draft_id:'draft-'+id,reply_id:'input-1',text:'排队的一句。'},delivery:{id,text:'排队的一句。',kind:'reply',memoryBatchId:'reply-legacy-c',expectedBubbles:2}}));

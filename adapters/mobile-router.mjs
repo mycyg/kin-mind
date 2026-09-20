@@ -10,6 +10,8 @@ import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile}
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
+const SHA256=/^[a-f0-9]{64}$/i;
+const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conversationId','generation','id','ownerBindingSha256','sourceSha256','version'];
 export const ROUTER_PROFILES = Object.freeze({
   chat:Object.freeze({model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}),
   work:Object.freeze({model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
@@ -116,7 +118,7 @@ export class MobileRouter {
       if(this.state.sessionId!==sessionId&&!this.state.conversationId)throw Error('Unmigrated router session mismatch');
       this.state.conversationId=binding.conversationId;this.state.generation=binding.generation;this.state.nativeSessionId=binding.nativeSessionId;this.state.sessionId=sessionId;
     }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
-    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};
+    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};this.state.reclassifications??={};
     this.state.executionEpoch??=0;this.state.forceBoundaries??=[];this.state.autoIdleProfile??=clone(ROUTER_PROFILES.chat);
     for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
     for(const request of Object.values(this.state.requests))if(request.forceState==='interrupting')request.forceState='unconfirmed';
@@ -415,7 +417,7 @@ export class MobileRouter {
         const runtime=await this.reconcileTransition(await this.inspect());
         if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
         if(record.route==='control') {
-          const request=this.acceptControl(record,runtime);
+          const request=await this.acceptControl(record,runtime);
           const applied=request?await this.applyModeRequest(request,runtime):{runtime};
           record.state='accepted';record.acceptedAt=this.now();
           this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:(applied.runtime??runtime).model,state:request?.state};
@@ -532,6 +534,59 @@ export class MobileRouter {
       return this.recordModeRequest(request);
     });
   }
+  /** Recover one already accepted owner message whose original semantic route was
+   * wrong. The private host authenticates the source and asks the current DS
+   * classifier; this boundary validates and records only cryptographic evidence
+   * plus the bounded control decision. It never dispatches the old input again. */
+  async reclassifyAcceptedControl({commandId,sourceInputId,sourceHash,expectedRevision,evidence,decision}) {
+    return this.locked(async()=>{
+      const exactId=(value,max=200)=>{const v=label(value,max);if(v!==value)throw Error('Invalid reclassification identifier');return v;};
+      commandId=exactId(commandId);sourceInputId=exactId(sourceInputId);
+      if(!SHA256.test(sourceHash??'')||!Number.isSafeInteger(expectedRevision)||expectedRevision<0||!evidence||typeof evidence!=='object')throw Error('Invalid reclassification basis');
+      if(JSON.stringify(Object.keys(evidence).sort())!==JSON.stringify(RECLASSIFICATION_EVIDENCE_KEYS))throw Error('Invalid reclassification evidence fields');
+      const summary={id:exactId(evidence.id),version:evidence.version,sourceSha256:evidence.sourceSha256,acceptanceSha256:evidence.acceptanceSha256,
+        ownerBindingSha256:evidence.ownerBindingSha256,actualSessionId:exactId(evidence.actualSessionId),conversationId:exactId(evidence.conversationId),generation:evidence.generation};
+      if(!Number.isSafeInteger(summary.version)||summary.version<1||!Number.isSafeInteger(summary.generation)||summary.generation<1||
+        !SHA256.test(summary.sourceSha256??'')||!SHA256.test(summary.acceptanceSha256??'')||!SHA256.test(summary.ownerBindingSha256??''))throw Error('Invalid reclassification evidence');
+      const encoded=JSON.stringify(decision);if(!decision||typeof decision!=='object'||encoded.length>8000)throw Error('Invalid reclassification decision');
+      const basisHash=digest({commandId,sourceInputId,sourceHash,expectedRevision,evidence:summary,decision});
+      const receipts=Object.values(this.state.reclassifications);
+      const collision=receipts.find(receipt=>receipt?.commandId===commandId||receipt?.sourceInputId===sourceInputId||receipt?.evidence?.id===summary.id);
+      if(collision) {
+        if(collision.basisHash!==basisHash)throw Error('Reclassification receipt conflict');
+        return {receipt:clone(collision),request:clone(this.state.requests[collision.requestId])};
+      }
+      if(this.state.requests[commandId])throw Error('Reclassification command id conflict');
+      if(expectedRevision!==this.state.revision)throw Error('Router revision changed; reauthenticate source evidence');
+      const source=this.state.inputs[sourceInputId];
+      if(!source||source.kind!=='owner'||source.state!=='accepted')throw Error('Reclassification source is not an accepted owner input');
+      // `sourceHash` is the router's semantic input hash. `sourceSha256` names the
+      // private host's authenticated source evidence and is deliberately a separate
+      // digest: the public adapter can validate its shape without pretending both
+      // byte streams were identical.
+      if(source.hash!==sourceHash)throw Error('Reclassification source hash mismatch');
+      if(summary.actualSessionId!==this.sessionId||summary.actualSessionId!==source.nativeThreadId||summary.conversationId!==this.state.conversationId||summary.conversationId!==source.conversationId||summary.generation!==this.state.generation||summary.generation!==source.generation)throw Error('Reclassification source identity mismatch');
+      const inputs=Object.values(this.state.inputs),sourceIndex=inputs.indexOf(source);
+      const newerControl=inputs.slice(sourceIndex+1).some(input=>input.kind==='owner'&&input.state==='accepted'&&input.route==='control'&&['manual','auto','work'].includes(input.command));
+      const newerReceipt=receipts.some(receipt=>(receipt.recordedAt??Infinity)>=(source.at??-Infinity));
+      if(newerControl||newerReceipt)throw Error('Reclassification evidence is stale');
+      const read=this.readClassification(decision,{owner:true,intents:false,allowStop:false});
+      if(read.decision!=='control'||!['manual','auto','work'].includes(read.command))throw Error('Reclassification must be a model control');
+      const profile=read.command==='manual'?await this.resolvedProfile(read.profile):null;
+      const id='reclassification-'+digest([this.sessionId,sourceInputId,summary.id,summary.version]).slice(0,40);
+      const modeRequest={commandId,mode:read.command,reason:'Verified owner control reclassification: '+read.reason,sourceInputId,sourceHash,notify:true,force:read.force,reclassificationId:id,...(profile?{profile}: {})};
+      const receipt={id,version:1,state:'recorded',basisHash,basisRevision:expectedRevision,commandId,requestId:commandId,modeRequestState:'pending',sourceInputId,sourceHash,originalRoute:source.route,evidence:summary,
+        decision:{control:read.command,force:read.force,reason:read.reason,...(profile?{profile}: {})},requestHash:digest(modeRequest),recordedAt:this.now()};
+      this.state.reclassifications[id]=receipt;
+      try {this.recordModeRequest(modeRequest);}
+      catch(error){delete this.state.reclassifications[id];throw error;}
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-requested',{id,commandId});
+      const runtime=await this.reconcileTransition(await this.inspect());
+      await this.applyModeRequest(this.state.requests[commandId],runtime);
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-applied',{id,commandId,state:receipt.modeRequestState});
+      return {receipt:clone(receipt),request:clone(this.state.requests[commandId])};
+    });
+  }
   recordModeRequest(request) {
       if(!request.commandId||!['work','auto','manual'].includes(request.mode)||!request.reason?.trim()||(request.mode==='manual'&&!request.profile?.model))throw Error('Invalid mode request');
       const hash=digest(request), previous=this.state.requests[request.commandId];
@@ -554,11 +609,24 @@ export class MobileRouter {
       }
       const sourceInputId=request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
       const source=sourceInputId?this.state.inputs[sourceInputId]:null;
-      const forceAuthorized=request.force===true&&source?.kind==='owner'&&source.route==='control'&&source.force===true&&['manual','auto','work'].includes(source.command);
-      const deferAuthorized=request.force===false&&source?.kind==='owner'&&source.route==='control'&&source.force===false&&['manual','auto','work'].includes(source.command);
+      const reclassification=request.reclassificationId?this.state.reclassifications[request.reclassificationId]:null;
+      const reclassificationAuthorized=Boolean(reclassification?.state==='recorded'&&reclassification.commandId===request.commandId&&
+        reclassification.sourceInputId===sourceInputId&&reclassification.sourceHash===source?.hash&&reclassification.originalRoute===source?.route&&
+        reclassification.decision?.control===request.mode&&reclassification.requestHash===hash&&request.sourceHash===source?.hash);
+      // A classified owner control authorizes only the exact request assembled by
+      // acceptControl: same owner source/hash, owner-mode command id, mode, force
+      // choice and (for manual mode) catalog-resolved profile. An old `auto` source
+      // can therefore never be repurposed as force authority for an arbitrary model.
+      const directAuthorized=Boolean(source?.kind==='owner'&&source.state==='selected'&&source.route==='control'&&
+        request.commandId==='owner-mode:'+source.id&&request.mode===source.command&&request.sourceHash===source.hash&&
+        source.controlRequestHash===hash&&['manual','auto','work'].includes(source.command));
+      const directForce=directAuthorized&&source.force===true;
+      const directDefer=directAuthorized&&source.force===false;
+      const forceAuthorized=request.force===true&&(directForce||reclassificationAuthorized&&reclassification.decision.force===true);
+      const deferAuthorized=request.force===false&&(directDefer||reclassificationAuthorized&&reclassification.decision.force===false);
       this.state.configRevision++;
       const result={state:'pending',mode:request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
-        sourceInputId,notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.profile?{profile:clone(request.profile)}:{}),at:this.now()};
+        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...(request.profile?{profile:clone(request.profile)}:{}),at:this.now()};
       for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto','manual'].includes(prior.mode)){
         if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
         prior.state='superseded';prior.supersededBy=request.commandId;
@@ -584,7 +652,7 @@ export class MobileRouter {
     if(!this.forceSwitch){this.failModeRequest(request,'force-switch-unavailable','没有切换：当前宿主不能安全中断正在进行的任务。');this.save('force-switch-failed',{commandId:request.commandId,reason:'force-switch-unavailable'});return null;}
     request.forceState='interrupting';request.forceStartedAt=this.now();this.save('force-switch-requested',{commandId:request.commandId});
     let receipt;
-    try {receipt=await this.forceSwitch({sessionId:this.sessionId,commandId:request.commandId,sourceInputId:request.sourceInputId,fromEpoch:this.state.executionEpoch,toEpoch:this.state.executionEpoch+1});}
+    try {receipt=await this.forceSwitch({sessionId:this.sessionId,commandId:request.commandId,sourceInputId:request.sourceInputId,reclassificationId:request.reclassificationId??null,fromEpoch:this.state.executionEpoch,toEpoch:this.state.executionEpoch+1});}
     catch {request.forceState='unconfirmed';request.waitingReason='force-interrupt-unconfirmed';this.pendingModeNotice(request);this.save('force-switch-unconfirmed',{commandId:request.commandId});return null;}
     if(!['interrupted','idle'].includes(receipt?.state)) {
       if(receipt?.state==='failed'){this.failModeRequest(request,receipt?.reason??'force-interrupt-failed','没有切换：当前任务未能安全中断。');this.save('force-switch-failed',{commandId:request.commandId,reason:request.failureReason});}
@@ -778,10 +846,20 @@ export class MobileRouter {
     if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
     else if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model,targetProfile:runtimeProfile(runtime),mode:this.state.mode});
   }
-  acceptControl(record,runtime) {
+  async acceptControl(record,runtime) {
     if(['work','auto','manual'].includes(record.command)) {
       const commandId='owner-mode:'+record.id;
-      this.recordModeRequest({commandId,mode:record.command,reason:'Explicit owner mode command',sourceInputId:record.id,notify:true,force:record.force===true,...(record.profile?{profile:record.profile}:{})});
+      let profile=record.profile,resolved=true;
+      if(record.command==='manual') {
+        try {profile=await this.resolvedProfile(record.profile);record.resolvedControlProfile=clone(profile);}
+        catch {resolved=false;}
+      }
+      const modeRequest={commandId,mode:record.command,reason:'Explicit owner mode command',sourceInputId:record.id,sourceHash:record.hash,notify:true,force:record.force===true,...(profile?{profile}: {})};
+      // Invalid profiles still become an honest failed request/notice, but they
+      // never receive interrupt authority. Supported controls bind authority to
+      // the exact resolved request hash before it enters recordModeRequest.
+      if(resolved)record.controlRequestHash=digest(modeRequest);
+      this.recordModeRequest(modeRequest);
       const request=this.state.requests[commandId];
       if(!request.force&&(this.busy(runtime)||record.command==='auto'&&this.tasks().length))this.queueNotice(record.id,'mode-pending',{requestId:commandId});
       return request;
@@ -869,24 +947,70 @@ export class MobileRouter {
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
-      const task=data.taskId?this.state.tasks[data.taskId]:this.currentTask();
+      // An explicit null belongs to a no-task/chat turn. It must not be rebound to
+      // whichever task happens to be current when a delayed callback arrives.
+      const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
       const turnFence=data.turnFence??data.executionEpoch;
-      if(Number.isInteger(turnFence)&&turnFence<this.state.executionEpoch) {
+      const taskEvent=['prompt-start','prompt-end','tool','delivery'].includes(kind);
+      const storeHistorical=(reason,{authoritative=false}={})=>{
+        const at=this.now();
+        const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
+          id:data.id,state:data.state,status:data.status,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,stopReason:data.stopReason};
         this.state.lateEvents??=[];
-        this.state.lateEvents.push({kind,taskId:task?.id,inputVersion:data.inputVersion,turnFence,currentEpoch:this.state.executionEpoch,at:this.now(),id:data.id,state:data.state,status:data.status});
-        this.state.lateEvents=this.state.lateEvents.slice(-100);
-        // A platform receipt remains evidence about the original id even after its
-        // turn lost authority. It cannot satisfy a later input version.
-        if(task&&kind==='delivery')task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence,lateAfterForce:true,at:this.now()};
-        if(task&&kind==='tool')task.tools[data.id]={status:data.status??task.tools[data.id]?.status??'pending',inputVersion:data.inputVersion,turnFence,lateAfterForce:true,...(data.reason?{reason:data.reason}:{})};
-        this.save('late-'+kind,{taskId:task?.id,turnFence,currentEpoch:this.state.executionEpoch});return;
+        this.state.lateEvents.push(event);this.state.lateEvents=this.state.lateEvents.slice(-512);
+        // External-effect evidence is retained under a fence/version-specific
+        // history key. It never overwrites the current ledger entry with the same
+        // id. Only an explicit older fence may later settle a completion that was
+        // intentionally preserved across an already-idle force boundary.
+        if(task&&kind==='delivery') {
+          task.deliveryHistory??={};
+          const key='delivery-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
+          task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,
+            submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence:turnFence??null,lateAfterForce:true,
+            authority:authoritative?'historical-fence':'evidence-only',reason,at};
+        }
+        if(task&&kind==='tool') {
+          task.toolHistory??={};
+          const key='tool-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
+          task.toolHistory[key]={id:data.id,status:data.status??'pending',inputVersion:data.inputVersion,turnFence:turnFence??null,
+            lateAfterForce:true,authority:authoritative?'historical-fence':'evidence-only',reason,...(data.reason?{detailReason:data.reason}:{}),at};
+        }
+        this.save('late-'+kind,{taskId:task?.id,reason,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch});
+      };
+      let historicalReason=null;
+      if(taskEvent) {
+        if((data.turnFence!==undefined||data.executionEpoch!==undefined)&&!Number.isInteger(turnFence))historicalReason='invalid-turn-fence';
+        else if(data.inputVersion!==undefined&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
+        else if(this.state.executionEpoch>0&&(turnFence===undefined||data.inputVersion===undefined))historicalReason='unversioned-after-force';
+        else if(Number.isInteger(turnFence)&&turnFence<this.state.executionEpoch)historicalReason='older-fence';
+        else if(Number.isInteger(turnFence)&&turnFence>this.state.executionEpoch)historicalReason='future-fence';
+        else if(task&&data.inputVersion!==undefined&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
+        else if(task&&kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
+      }
+      if(historicalReason) {
+        storeHistorical(historicalReason,{authoritative:historicalReason==='older-fence'&&Number.isInteger(turnFence)&&Number.isSafeInteger(data.inputVersion)});
+        return;
       }
       if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
         if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
         if(kind==='prompt-end') {task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
-        if(kind==='tool')task.tools[data.id]={status:data.status??task.tools[data.id]?.status??'pending',inputVersion:data.inputVersion??task.inputVersion,turnFence:turnFence??task.executionEpoch,...(data.reason?{reason:data.reason}: {})};
-        if(kind==='delivery')task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,inputVersion:data.inputVersion??task.inputVersion,turnFence:turnFence??task.executionEpoch,at:this.now()};
+        if(kind==='tool') {
+          const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
+          if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
+            task.toolHistory??={};const key='tool-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
+            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+          }
+          task.tools[data.id]={status:data.status??previous?.status??'pending',inputVersion,turnFence:fence,...(data.reason?{reason:data.reason}: {})};
+        }
+        if(kind==='delivery') {
+          const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.deliveries[data.id];
+          if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
+            task.deliveryHistory??={};const key='delivery-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
+            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+          }
+          task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,inputVersion,turnFence:fence,at:this.now()};
+        }
       }
       this.save(kind);
     });
@@ -910,8 +1034,12 @@ export class MobileRouter {
         // Internal repairs retain their separate verified-result protocol.
         if(this.workReviewerEnabled&&task.requiresDelivery!==false)continue;
         const fence=task.completion?.turnFence;
-        const deliveries=Object.values(task.deliveries).filter(delivery=>(delivery.inputVersion===undefined||delivery.inputVersion===task.completion?.inputVersion)&&(fence===undefined||delivery.turnFence===undefined||delivery.turnFence===fence));
-        const tools=Object.values(task.tools).filter(tool=>fence===undefined||tool.turnFence===undefined||tool.turnFence===fence);
+        const deliveryMap=new Map(Object.entries(task.deliveries).filter(([,delivery])=>(delivery.inputVersion===undefined||delivery.inputVersion===task.completion?.inputVersion)&&(fence===undefined||delivery.turnFence===undefined||delivery.turnFence===fence)));
+        if(fence!==undefined)for(const delivery of Object.values(task.deliveryHistory??{}))if(delivery.authority==='historical-fence'&&delivery.turnFence===fence&&delivery.inputVersion===task.completion?.inputVersion)deliveryMap.set(delivery.id,delivery);
+        const deliveries=[...deliveryMap.values()];
+        const toolMap=new Map(Object.entries(task.tools).filter(([,tool])=>(fence===undefined||tool.turnFence===undefined||tool.turnFence===fence)));
+        if(fence!==undefined)for(const tool of Object.values(task.toolHistory??{}))if(tool.authority==='historical-fence'&&tool.turnFence===fence&&tool.inputVersion===task.completion?.inputVersion)toolMap.set(tool.id,tool);
+        const tools=[...toolMap.values()];
         if(task.completion?.state!=='historical-proposal'&&task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
           (fence===undefined||task.turnEndedFence===undefined||task.turnEndedFence===fence) && tools.every(tool=>['completed','failed'].includes(tool.status)) &&
           (task.requiresDelivery===false?task.internalReceipt?.verified:

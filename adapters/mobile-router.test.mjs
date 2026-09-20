@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,noticeReceiptClass} from './mobile-router.mjs';
 import {compactPrompt,publicMobileRuntime} from './mobile-controls.mjs';
+import {TransportManifests} from './transport-manifest.mjs';
+import {createFakeTransport} from './testing/fake-transport.mjs';
 
 function fixture(t, options={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-routing-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -34,7 +36,7 @@ function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m'
     classify:async input=>{classifications.push(input);return classify?classify(input):{route:'chat',reason:'casual',recall:{mode:'light',query:input.text,reason:'current message'}};},
     switchModel:async(model,profile,context)=>{switches.push({model,profile:structuredClone(profile),context:structuredClone(context)});Object.assign(runtime,{model,modelProvider:profile.provider,providerOverride:profile.providerKind==='gateway',reasoningEffort:profile.reasoningEffort,serviceTierPreference:profile.serviceTierPreference,fastMode:profile.serviceTierPreference==='fast'?'on':'off'});return{...runtime};},
     forceSwitch,waitForIdle:async()=>{throw Error('must not wait');},now:()=>++now};
-  return {router:new MobileRouter(args),runtime,args,switches,classifications,now:()=>++now};
+  return {root,router:new MobileRouter(args),runtime,args,switches,classifications,now:()=>++now};
 }
 
 test('automatic changes notify once per verified transition, including a delayed intermediate model',async t=>{
@@ -1070,7 +1072,7 @@ test('a natural manual Astra profile is catalog-validated, announced once and pe
   assert.deepEqual(f.router.state.manualProfile,{provider:'custom-gateway',providerKind:'native',model:'gpt-6-astra',reasoningEffort:'medium',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
   const sent=[];
   await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'manual-ok'};},lookup:async()=>null});
-  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 GPT‑6 Astra（手动模式）。']);
+  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 GPT‑6 Astra · medium（手动模式）。']);
   let work;
   await f.router.dispatch({id:'work-after-manual',text:'现在写代码并交付'},async detail=>{work=detail;return'new-turn';});
   assert.equal(work.model,'gpt-6-astra');assert.equal(f.switches.length,1,'automatic work routing cannot override the manual pin');
@@ -1116,7 +1118,8 @@ test('confirmed owner force bypasses stale coordinator processing, fences late o
   await f.router.observe('tool',{taskId,id:'old-tool',status:'completed',turnFence:0,inputVersion});
   await f.router.observe('delivery',{taskId,id:'old-delivery',state:'accepted',messageId:'already-sent',turnFence:0,inputVersion});
   assert.equal(task.stopReason,undefined,'the canceled turn cannot become a completed turn');
-  assert.equal(task.deliveries['old-delivery'].lateAfterForce,true,'an already-sent platform receipt remains evidence at its old fence');
+  assert.equal(task.deliveries['old-delivery'],undefined,'an old fence never overwrites the current delivery ledger');
+  assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.id==='old-delivery'&&delivery.messageId==='already-sent'&&delivery.lateAfterForce),true,'an already-sent platform receipt remains independent evidence at its old fence');
   await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=>assert.fail('the original ID can never be resubmitted'));
   assert.equal(f.router.currentTask().id,taskId);
 });
@@ -1183,6 +1186,152 @@ test('forced auto with live work exits a manual pin immediately, uses the work p
   assert.equal((await f.router.reconcile()).state,'idle');assert.equal(f.runtime.model,'gpt-5.6-sol','completion records the restore request but does not claim it already happened');
   await f.router.applyPendingMode();
   assert.deepEqual([f.runtime.model,f.router.state.mode,f.router.tasks().length],['deepseek-flash','auto',0]);
+});
+
+test('an accepted control source authorizes only its exact owner-mode request and resolved profile',async t=>{
+  const f=profileFixture(t,{classify:async input=>({route:'control',control:'auto',force:true,reason:'explicit automatic mode',recall:{mode:'light',query:input.text,reason:'current control'}})});
+  await f.router.dispatch({id:'owner-auto',text:'恢复自动模式'},async()=>assert.fail('control is host-owned'));
+  const source=f.router.state.inputs['owner-auto'];
+  assert.equal(source.state,'accepted');assert.ok(source.controlRequestHash);
+  const forged=await f.router.requestMode({commandId:'forged-manual',mode:'manual',reason:'reuse old source',sourceInputId:source.id,sourceHash:source.hash,force:true,
+    profile:{provider:'custom-gateway',providerKind:'native',model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'}});
+  assert.equal(forged.force,false,'an old auto source cannot authorize a different mode/profile');
+  const renamed=await f.router.requestMode({commandId:'renamed-auto',mode:'auto',reason:'reuse old source',sourceInputId:source.id,sourceHash:source.hash,force:true});
+  assert.equal(renamed.force,false,'even the same mode needs the exact owner-mode command id and request hash');
+});
+
+test('post-force unversioned and old-fence events stay historical and cannot overwrite current ledgers',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    classify:async input=>input.text.includes('ASTRA')
+      ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit switch',recall:{mode:'light',query:input.text,reason:'control'}}
+      :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'work'}},
+    forceSwitch:async()=>({state:'interrupted'})});
+  await f.router.dispatch({id:'ledger-work',text:'完成当前工作'},async()=> 'new-turn');
+  const task=f.router.currentTask(),version=task.inputVersion;
+  f.runtime.active=true;
+  await f.router.dispatch({id:'ledger-force',text:'切到 ASTRA'},async()=>assert.fail('control is host-owned'));
+  f.runtime.active=false;
+  await f.router.observe('prompt-start',{taskId:task.id,inputVersion:version,turnFence:1});
+  await f.router.observe('tool',{taskId:task.id,id:'shared-tool',status:'pending',inputVersion:version,turnFence:1});
+  await f.router.observe('delivery',{taskId:task.id,id:'shared-delivery',state:'pending',inputVersion:version,turnFence:1});
+  await f.router.observe('tool',{taskId:task.id,id:'shared-tool',status:'completed',inputVersion:version});
+  await f.router.observe('delivery',{taskId:task.id,id:'shared-delivery',state:'accepted',messageId:'unversioned-message',inputVersion:version});
+  await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',inputVersion:version});
+  assert.deepEqual([task.tools['shared-tool'].status,task.deliveries['shared-delivery'].state,task.stopReason],["pending","pending",undefined]);
+  await f.router.observe('tool',{taskId:task.id,id:'shared-tool',status:'completed',inputVersion:version,turnFence:0});
+  await f.router.observe('delivery',{taskId:task.id,id:'shared-delivery',state:'accepted',messageId:'old-fence-message',outboxId:'outbox-old',inputVersion:version,turnFence:0});
+  assert.deepEqual([task.tools['shared-tool'].status,task.tools['shared-tool'].turnFence,task.deliveries['shared-delivery'].state,task.deliveries['shared-delivery'].turnFence],["pending",1,"pending",1]);
+  assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.messageId==='unversioned-message'&&delivery.authority==='evidence-only'),true);
+  assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.messageId==='old-fence-message'&&delivery.outboxId==='outbox-old'&&delivery.turnFence===0),true);
+  assert.equal(f.router.state.lateEvents.some(event=>event.reason==='unversioned-after-force'),true);
+  assert.equal(f.router.state.lateEvents.some(event=>event.reason==='older-fence'),true);
+  const historyCount=Object.keys(task.deliveryHistory).length,ledgerCount=Object.keys(task.deliveries).length;
+  await f.router.observe('delivery',{taskId:null,id:'old-chat-send',state:'accepted',messageId:'chat-message',outboxId:'chat-outbox',inputVersion:0,turnFence:0});
+  assert.deepEqual([Object.keys(task.deliveryHistory).length,Object.keys(task.deliveries).length],[historyCount,ledgerCount],'an explicit no-task callback is never rebound to the new current task');
+  assert.equal(f.router.state.lateEvents.some(event=>event.id==='old-chat-send'&&event.taskId===undefined),true);
+  await f.router.observe('tool',{taskId:task.id,id:'shared-tool',status:'completed',inputVersion:version,turnFence:1});
+  await f.router.observe('delivery',{taskId:task.id,id:'shared-delivery',state:'accepted',messageId:'current-message',inputVersion:version,turnFence:1});
+  await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',inputVersion:version,turnFence:1});
+  assert.deepEqual([task.tools['shared-tool'].status,task.deliveries['shared-delivery'].messageId,task.stopReason],["completed","current-message","end_turn"]);
+});
+
+test('delivery manifests keep old force receipts historical while current receipts settle the live ledger',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    classify:async input=>input.text==='force ASTRA'
+      ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit switch',recall:{mode:'light',query:input.text,reason:'control'}}
+      :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'work'}},
+    forceSwitch:async()=>({state:'interrupted'})});
+  await f.router.dispatch({id:'manifest-work',text:'complete this work'},async()=> 'new-turn');
+  const task=f.router.currentTask(),inputVersion=task.inputVersion;
+  const transport=createFakeTransport({directory:path.join(f.root,'outbox'),clock:f.now});
+  const manifests=new TransportManifests({directory:path.join(f.root,'manifests'),clock:f.now,lease:{heartbeat:false},emit:async event=>{
+    const observation={id:event.bubble_id,state:event.state,messageId:event.message_id,inputVersion:event.input_version,turnFence:event.turn_fence};
+    if(Object.hasOwn(event,'task_id'))observation.taskId=event.task_id;
+    await f.router.observe('delivery',observation);
+  }});
+  const entries=(batch,turnFence)=>[{request:{draft_id:batch+'-draft',reply_id:'manifest-work',text:batch},delivery:{id:batch+'-bubble',text:batch,kind:'reply',
+    memoryBatchId:batch,expectedBubbles:1,taskId:task.id,inputVersion,turnFence}}];
+  manifests.createDraft({entries:entries('old-manifest',0),ownerEpoch:'owner-1'});
+  f.runtime.active=true;await f.router.dispatch({id:'force-manifest',text:'force ASTRA'},async()=>assert.fail('control is host-owned'));f.runtime.active=false;
+  assert.equal(f.router.state.executionEpoch,1);
+  await f.router.observe('prompt-start',{taskId:task.id,inputVersion,turnFence:1});
+  await manifests.run('old-manifest',{transport});
+  assert.equal(task.deliveries['old-manifest-bubble'],undefined);
+  assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.id==='old-manifest-bubble'&&delivery.turnFence===0&&delivery.authority==='historical-fence'),true);
+  manifests.createDraft({entries:entries('current-manifest',1),ownerEpoch:'owner-1'});
+  await manifests.run('current-manifest',{transport});
+  assert.deepEqual([task.deliveries['current-manifest-bubble'].state,task.deliveries['current-manifest-bubble'].inputVersion,task.deliveries['current-manifest-bubble'].turnFence],['accepted',inputVersion,1]);
+});
+
+test('a verified historical control reclassification is exact-once, preserves ledgers and never redispatches the source',async t=>{
+  let forceCall=null,forceCalls=0,submits=0;
+  const f=profileFixture(t,{initial:{model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    classify:async input=>({route:'work',reason:'historically misclassified work',recall:{mode:'light',query:input.text,reason:'current'}}),
+    forceSwitch:async request=>{forceCalls++;forceCall=request;return{state:'idle'};}});
+  Object.assign(f.router.state,{conversationId:'conversation-1',generation:3,nativeSessionId:'synthetic'});f.router.save('synthetic-binding');
+  await f.router.dispatch({id:'misclassified-control',text:'切换到 Astra high'},async()=>{submits++;return'new-turn';});
+  const source=f.router.state.inputs['misclassified-control'],task=f.router.currentTask();
+  task.status='completed';task.tools.kept={status:'completed',inputVersion:task.inputVersion,turnFence:0};task.deliveries.kept={state:'accepted',messageId:'already-delivered',inputVersion:task.inputVersion,turnFence:0};task.artifacts={report:{sha256:'d'.repeat(64),state:'delivered'}};
+  f.router.state.artifacts={global:{sha256:'e'.repeat(64),state:'delivered'}};f.router.save('synthetic-settled-ledger');
+  await f.router.requestMode({commandId:'prior-auto',mode:'auto',reason:'older pending restore'});
+  const beforeTask=structuredClone(task),beforeArtifacts=structuredClone(f.router.state.artifacts),expectedRevision=f.router.state.revision;
+  f.runtime.active=true;
+  const evidence={id:'ds-reclass-1',version:1,sourceSha256:'a'.repeat(64),acceptanceSha256:'b'.repeat(64),ownerBindingSha256:'c'.repeat(64),actualSessionId:'synthetic',conversationId:'conversation-1',generation:3};
+  const decision={route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},force:true,reason:'owner selected Astra',recall:{mode:'light',query:'original authenticated input',reason:'reclassification'}};
+  const args={commandId:'reclass-command-1',sourceInputId:source.id,sourceHash:source.hash,expectedRevision,evidence,decision};
+  const applied=await f.router.reclassifyAcceptedControl(args);
+  assert.deepEqual([applied.request.state,applied.request.force,f.runtime.model,f.runtime.reasoningEffort],['applied',true,'gpt-6-astra','high']);
+  assert.equal(applied.receipt.evidence.sourceSha256,'a'.repeat(64),'raw source bytes have their own digest, distinct from the router semantic hash');
+  assert.doesNotMatch(JSON.stringify(applied.receipt),/切换到 Astra high/,'the receipt persists hashes and bounded decisions, not original owner text');
+  assert.deepEqual([forceCall.reclassificationId,forceCall.sourceInputId],[applied.receipt.id,source.id]);
+  assert.equal(source.route,'work','the historical route remains immutable');assert.equal(submits,1,'the original input is never reinjected');
+  assert.deepEqual(task,beforeTask);assert.deepEqual(f.router.state.artifacts,beforeArtifacts);
+  assert.deepEqual([f.router.state.requests['prior-auto'].state,f.router.state.requests['prior-auto'].supersededBy],['superseded','reclass-command-1']);
+  assert.equal(Object.keys(f.router.state.reclassifications).length,1);
+  const publicRequest=(await f.router.readRuntime()).requests.find(request=>request.commandId==='reclass-command-1');
+  assert.equal(Object.hasOwn(publicRequest,'sourceHash'),false,'the semantic source hash stays out of the public runtime projection');
+  const switches=f.switches.length;
+  const restarted=new MobileRouter(f.args),retried=await restarted.reclassifyAcceptedControl(args);
+  assert.deepEqual([retried.receipt.id,retried.request.state,forceCalls,f.switches.length,submits],[applied.receipt.id,'applied',1,switches,1],'an exact retry bypasses the now-stale revision without another effect');
+  await assert.rejects(restarted.reclassifyAcceptedControl({...args,commandId:'changed-command'}),/receipt conflict/);
+});
+
+test('historical control reclassification rejects unauthenticated, mismatched, non-control and stale evidence',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    classify:async input=>({route:'work',reason:'historical work',recall:{mode:'light',query:input.text,reason:'current'}})});
+  Object.assign(f.router.state,{conversationId:'conversation-r',generation:4,nativeSessionId:'synthetic'});f.router.save('synthetic-binding');
+  await f.router.dispatch({id:'old-source',text:'model control read as work'},async()=> 'new-turn');
+  const source=f.router.state.inputs['old-source'];
+  const evidence={id:'evidence-r',version:1,sourceSha256:'1'.repeat(64),acceptanceSha256:'2'.repeat(64),ownerBindingSha256:'3'.repeat(64),actualSessionId:'synthetic',conversationId:'conversation-r',generation:4};
+  const decision={route:'control',control:'auto',force:true,reason:'restore auto',recall:{mode:'light',query:'q',reason:'r'}};
+  const basis=(overrides={})=>({commandId:'reclass-reject',sourceInputId:source.id,sourceHash:source.hash,expectedRevision:f.router.state.revision,evidence,decision,...overrides});
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({expectedRevision:f.router.state.revision-1})),/revision changed/);
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({sourceHash:'f'.repeat(64)})),/source hash mismatch/);
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({evidence:{...evidence,actualSessionId:'other'}})),/identity mismatch/);
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({evidence:{...evidence,sourceSha256:'bad'}})),/Invalid reclassification evidence/);
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({evidence:{...evidence,text:'must not cross'}})),/evidence fields/);
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({decision:{route:'work',reason:'not control'}})),/must be a model control/);
+  for(const control of ['status','watch'])await assert.rejects(f.router.reclassifyAcceptedControl(basis({decision:{route:'control',control,reason:'not a switch'}})),/must be a model control/);
+  f.router.state.inputs.notOwner={...structuredClone(source),id:'not-owner',kind:'system',hash:'4'.repeat(64)};f.router.save('synthetic-non-owner');
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({commandId:'non-owner-command',sourceInputId:'not-owner',sourceHash:'4'.repeat(64),expectedRevision:f.router.state.revision,evidence:{...evidence,id:'non-owner-evidence',sourceSha256:'5'.repeat(64)}})),/not an accepted owner/);
+  f.router.state.inputs.unconfirmed={...structuredClone(source),id:'unconfirmed',state:'unconfirmed',hash:'6'.repeat(64)};f.router.save('synthetic-unconfirmed');
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({commandId:'unconfirmed-command',sourceInputId:'unconfirmed',sourceHash:'6'.repeat(64),expectedRevision:f.router.state.revision,evidence:{...evidence,id:'unconfirmed-evidence',sourceSha256:'7'.repeat(64)}})),/not an accepted owner/);
+  f.router.state.inputs.newerControl={...structuredClone(source),id:'newer-control',route:'control',intent:'control',command:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,at:f.now()};f.router.save('synthetic-newer-control');
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({expectedRevision:f.router.state.revision})),/evidence is stale/);
+  delete f.router.state.inputs.newerControl;
+  f.router.state.reclassifications.syntheticNewer={id:'synthetic-newer',commandId:'other-command',sourceInputId:'other-source',evidence:{id:'other-evidence'},recordedAt:f.now()};f.router.save('synthetic-newer-reclassification');
+  await assert.rejects(f.router.reclassifyAcceptedControl(basis({expectedRevision:f.router.state.revision})),/evidence is stale/);
+  delete f.router.state.reclassifications.syntheticNewer;
+  assert.equal(Object.keys(f.router.state.reclassifications).length,0,'rejected evidence never appends a receipt');
+});
+
+test('same-model control notices name verified effort and describe Fast only as configuration',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    classify:async input=>({route:'control',control:'manual',profile:{model:'gpt-5.6-sol',reasoningEffort:'high',serviceTierPreference:'fast'},force:true,reason:'same model higher effort',recall:{mode:'light',query:input.text,reason:'control'}})});
+  await f.router.dispatch({id:'sol-high',text:'Sol 保持不变，改成 high 和 Fast'},async()=>assert.fail('control is host-owned'));
+  const sent=[];await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'same-model-notice'};},lookup:async()=>null});
+  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 GPT‑5.6 Sol · high · Fast 配置已开启（手动模式）。']);
+  assert.doesNotMatch(sent[0].text,/priority|实际.*Fast/);
 });
 
 test('automatic work restores the exact prior full profile only after every open task settles',async t=>{
