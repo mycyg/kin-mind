@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
-const marker = '// KIN_MODEL_ROUTING_V1';
+const marker = '// KIN_MODEL_ROUTING_V2';
+const legacyMarker = '// KIN_MODEL_ROUTING_V1';
+const legacyFastMode = 'fastMode: value("fast-mode")';
+const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 
 const runtimeMethods = `
   async kinLastReply(sessionId) {
@@ -32,7 +35,7 @@ const runtimeMethods = `
       return { known: true, sessionId, threadId: thread.id, nativeSessionId: thread.sessionId,
         active: this.activePrompts.has(sessionId) || this.pendingTurnStarts.has(sessionId) || thread.status?.type === "active",
         nativeStatus: thread.status?.type, backgroundTasks,
-        model: value("model"), reasoningEffort: value("reasoning_effort"), fastMode: value("fast-mode"),
+        model: value("model"), reasoningEffort: value("reasoning_effort"), ${sessionFastMode},
         modelProvider: await this.codexAcpClient.getCurrentModelProvider(sessionId),
         providerBaseUrl: provider?.baseUrl, providerOverride: this.codexAcpClient.gatewayConfig !== null,
         lastTokenUsage: state.lastTokenUsage, totalTokenUsage: state.totalTokenUsage,
@@ -50,7 +53,17 @@ const runtimeMethods = `
 `;
 
 export function patchCodexRuntime(source) {
-  if (source.includes(marker)) return source;
+  if (source.includes(marker)) {
+    if (!source.includes(sessionFastMode) || source.includes(legacyFastMode)) throw Error('Codex ACP runtime patch marker is inconsistent');
+    return source;
+  }
+  if (source.includes(legacyMarker)) {
+    if (source.includes(legacyFastMode)) {
+      if (source.split(legacyFastMode).length !== 2) throw Error('Codex ACP runtime upgrade needs compatibility review');
+      source = source.replace(legacyFastMode, sessionFastMode);
+    } else if (!source.includes(sessionFastMode)) throw Error('Codex ACP runtime upgrade needs compatibility review');
+    return source.replace(legacyMarker, marker);
+  }
   const replacements = [
     ['  async extMethod(method, params) {\n    const methodRequest = { method, params };',
       runtimeMethods + '\n  async extMethod(method, params) {\n    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);\n    if (method === "_kin/last-reply") return await this.kinLastReply(params.sessionId);\n    const methodRequest = { method, params };'],
