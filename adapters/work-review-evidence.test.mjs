@@ -225,6 +225,12 @@ test('native proof IDs and platform message IDs are unique and cannot collide wi
   await assert.rejects(collect([base],unfinished),/Native delivery message collision/);
 });
 
+test('duplicate original platform identities fail even when direct outbox lookup succeeds',async t=>{
+  const f=fixture(t);
+  f.put('outbox','another',{id:'another',state:'accepted',messageId:'receipt',text:'Different record'});
+  await assert.rejects(f.adapter.collect(f.snapshot),/Platform message identity collision/);
+});
+
 test('native media proof cannot belong to a different session, task or unfinished tool',async t=>{
   const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
   const base={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};

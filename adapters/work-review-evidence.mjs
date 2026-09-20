@@ -35,9 +35,17 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
   async function collect(snapshot) {
     const ids=[...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])];
     const allMessages=fs.existsSync(outboxDirectory)?fs.readdirSync(outboxDirectory).filter(f=>f.endsWith('.json')).map(f=>read(path.join(outboxDirectory,f))).filter(Boolean):[];
-    const byMessage=new Map(allMessages.filter(r=>r.state==='accepted'&&r.messageId).map(r=>[r.messageId,r]));
+    const byMessage=new Map();
+    for(const record of allMessages.filter(r=>r.messageId)){
+      const list=byMessage.get(record.messageId)??[];list.push(record);byMessage.set(record.messageId,list);
+    }
+    const messageById=id=>{
+      const records=byMessage.get(id)??[];
+      if(records.length>1)throw Error('Platform message identity collision');
+      return records[0];
+    };
     const acceptedFiles=Object.values(snapshot.task.deliveries??{}).filter(d=>d.state==='accepted'&&d.messageId)
-      .map(d=>byMessage.get(d.messageId)).filter(r=>r?.artifact);
+      .map(d=>messageById(d.messageId)).filter(r=>r?.artifact);
     const inputs=ids.map(id=>{
       if(!/^[\w:-]+$/.test(id))throw Error('Invalid host input id');
       let source=read(path.join(inputDirectory,id+'.json'));
@@ -52,7 +60,9 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
     const receipts={},outputs=[],cancellableDeferred=[],deferredProofs={},deferredGroups={};
     for(const [id,delivery] of Object.entries(snapshot.task.deliveries??{})) {
       const reconciliation=reconciliationFile?read(reconciliationFile)?.deliveries?.[id]:null;
-      const message=outbox(delivery.outboxId??reconciliation?.attemptId??id)??byMessage.get(delivery.messageId);
+      const messageByOutbox=outbox(delivery.outboxId??reconciliation?.attemptId??id);
+      const messageByPlatform=delivery.messageId?messageById(delivery.messageId):null;
+      const message=messageByOutbox??messageByPlatform;
       if(reconciliation&&verifyReplacement) {
         const proof=await verifyReplacement(reconciliation,message);
         if(proof?.state==='not-submitted'&&proof.fulfilledBy?.length) {
@@ -154,7 +164,7 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
         const owner=owners[0],delivery=snapshot.task.deliveries?.[owner];
         if(delivery?.state!=='accepted'||delivery.messageId!==proof.messageId)
           throw Error('Native delivery message collision');
-        const output=outputs.find(item=>item.id===owner),message=byMessage.get(proof.messageId);
+        const output=outputs.find(item=>item.id===owner),message=messageById(proof.messageId);
         if(output?.toolId&&output.toolId!==proof.toolId)throw Error('Native delivery tool collision');
         if(owner.startsWith('file-tool:')&&owner.slice(10)!==proof.toolId)
           throw Error('Native delivery tool collision');
