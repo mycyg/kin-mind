@@ -788,6 +788,7 @@ def run_codex(
         web_config = {"execution_id": directory.name, "attempt": attempt,
                       "ledger": str(web_ledger),
                       "search_endpoint": web.get("search_endpoint") or DEFAULT_SEARCH_ENDPOINT,
+                      "public_transport": web.get("public_transport"),
                       "allow_hosts": list(web.get("allow_hosts", []))}
         web_config_file = directory / "web-reader.json"
         web_config_file.write_text(dumps(web_config))
