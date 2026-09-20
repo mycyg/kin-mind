@@ -28,6 +28,7 @@ CITABLE = {"observed", "historical"}
 MEMORY_LOCATOR = re.compile(r"^memory://([A-Za-z0-9_.:-]{1,200})$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RECEIPT_FORMAT = "kin-source-receipt-v1"
+SOURCE_RECEIPT_V2 = "kin-source-receipt-v2"
 COMPUTER_ADAPTERS = {"kin-computer-reader-v1", "kin-computer-use-v1"}
 WEB_RECEIPT_V2 = "kin-web-receipt-v2"
 
@@ -38,7 +39,7 @@ def web_delivery(receipt):
         return None
     return {key: copy.deepcopy(receipt.get(key)) for key in (
         "receipt_format", "content_sha256", "content_chars", "raw_body_sha256",
-        "raw_body_bytes", "delivered_ranges",
+        "raw_body_bytes", "delivered_ranges", "semantic_classification",
     )}
 
 
@@ -46,6 +47,8 @@ def valid_web_delivery(delivery, version):
     if not isinstance(delivery, dict) or delivery.get("receipt_format") != WEB_RECEIPT_V2:
         return False
     if delivery.get("content_sha256") != version or not SHA256.fullmatch(str(version or "")):
+        return False
+    if delivery.get("semantic_classification") != "model-required":
         return False
     length = delivery.get("content_chars")
     raw_bytes = delivery.get("raw_body_bytes")
@@ -74,9 +77,9 @@ def _entry(state, locator, *, evidence_id=None, version=None, title="", basis=""
             **({"delivery": copy.deepcopy(delivery)} if delivery is not None else {})}
 
 
-def _seal_payload(entry, execution_id, attempt):
+def _seal_payload(entry, execution_id, attempt, receipt_format=None):
     return {
-        "receipt_format": SOURCE_RECEIPT_FORMAT,
+        "receipt_format": receipt_format or (SOURCE_RECEIPT_V2 if "delivery" in entry else SOURCE_RECEIPT_FORMAT),
         "verified_by_execution": str(execution_id),
         "verified_by_attempt": int(attempt),
         **{key: entry.get(key) for key in (
@@ -101,7 +104,9 @@ def seal_source_receipt(entry, *, execution_id, attempt):
 
 
 def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
-    if not isinstance(receipt, dict) or receipt.get("receipt_format") != SOURCE_RECEIPT_FORMAT:
+    if not isinstance(receipt, dict) or receipt.get("receipt_format") not in {SOURCE_RECEIPT_FORMAT, SOURCE_RECEIPT_V2}:
+        return False
+    if receipt["receipt_format"] == SOURCE_RECEIPT_V2 and "delivery" not in receipt:
         return False
     if receipt.get("state") not in CITABLE or not receipt.get("locator"):
         return False
@@ -121,7 +126,7 @@ def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
         return False
     if attempt is not None and verified_attempt != int(attempt):
         return False
-    payload = _seal_payload(receipt, verified_execution, verified_attempt)
+    payload = _seal_payload(receipt, verified_execution, verified_attempt, receipt["receipt_format"])
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return receipt.get("receipt_digest") == hashlib.sha256(canonical.encode()).hexdigest()
 

@@ -21,6 +21,7 @@ def receipt():
             "locator": "https://example.com/article", "requested_locator": "https://example.com/article",
             "version": sha(text), "read_at": "2026-09-20T01:00:00Z",
             "receipt_format": "kin-web-receipt-v2", "content_sha256": sha(text),
+            "semantic_classification": "model-required",
             "content_chars": len(text), "raw_body_sha256": sha(text), "raw_body_bytes": len(text),
             "delivered_ranges": [{"start": 0, "end": 11, "sha256": sha(text[:11]),
                                   "delivered_at": "2026-09-20T01:00:00Z"}]}
@@ -31,6 +32,7 @@ def test_delivery_seal_survives_historical_and_continuation():
     ledger = build_ledger({}, web_observations=[current], execution_id="run1", attempt=1)
     sealed = seal_source_receipt(ledger[0], execution_id="run1", attempt=1)
     assert valid_source_receipt(sealed)
+    assert sealed["receipt_format"] == "kin-source-receipt-v2"
     historical = build_ledger({"previous_explorations": [{
         "id": "run1", "state": "complete", "result": {"sources": [{
             "url": current["locator"], "receipt": sealed,
@@ -44,12 +46,15 @@ def test_delivery_seal_survives_historical_and_continuation():
     altered = copy.deepcopy(sealed)
     altered["delivery"]["delivered_ranges"][0]["end"] += 1
     assert not valid_source_receipt(altered)
+    del altered["delivery"]
+    assert not valid_source_receipt(altered)
 
 
 @pytest.mark.parametrize("change", [
     {"content_sha256": "b" * 64}, {"content_chars": 0}, {"content_chars": True},
     {"delivered_ranges": []}, {"raw_body_bytes": 0}, {"raw_body_sha256": "invalid"},
     {"receipt_format": "unknown"},
+    {"semantic_classification": "article-confirmed"},
 ])
 def test_malformed_new_receipt_not_citable(change):
     current = {**receipt(), **change}
