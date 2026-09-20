@@ -121,7 +121,7 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
     // Re-read this on every collect, including the pre-commit evidence check.
     const native=await toolDeliveries(snapshot);
     if(!native||!Array.isArray(native.proofs))throw Error('Invalid native delivery evidence');
-    const nativeSeen=new Set();
+    const nativeSeen=new Set(),nativeMessages=new Set();
     for(const proof of native.proofs) {
       if(proof?.state!=='accepted'||proof.source!=='native-tool-outbox'
         ||proof.sessionId!==sessionId||proof.taskId!==snapshot.task.id
@@ -133,12 +133,52 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
         ||!Number.isSafeInteger(proof.artifact?.bytes)||proof.artifact.bytes<=0
         ||!['image','file','audio','video'].includes(proof.artifact?.type)
         ||typeof proof.artifact?.name!=='string')throw Error('Invalid native delivery proof');
-      const id='native-tool:'+proof.id;
+      const id='native-tool:'+proof.id,proofHash=digest(proof);
       if(nativeSeen.has(id))throw Error('Duplicate native delivery proof');
       nativeSeen.add(id);
+      if(nativeMessages.has(proof.messageId))throw Error('Duplicate native delivery message');
+      nativeMessages.add(proof.messageId);
+
+      // One platform message is one result. If the router already owns that accepted
+      // delivery, the independently verified artifact enriches the same output; it
+      // never creates a second result under the supplemental namespace.
+      const deliveryOwners=Object.entries(snapshot.task.deliveries??{})
+        .filter(([,delivery])=>delivery?.messageId===proof.messageId).map(([owner])=>owner);
+      const receiptOwners=Object.entries(receipts)
+        .filter(([,receipt])=>receipt?.messageId===proof.messageId).map(([owner])=>owner);
+      const owners=[...new Set([...deliveryOwners,...receiptOwners])];
+      if(Object.hasOwn(receipts,id)&&(!owners.length||owners.length!==1||owners[0]!==id))
+        throw Error('Native delivery identity collision');
+      if(owners.length) {
+        if(owners.length!==1)throw Error('Native delivery message collision');
+        const owner=owners[0],delivery=snapshot.task.deliveries?.[owner];
+        if(delivery?.state!=='accepted'||delivery.messageId!==proof.messageId)
+          throw Error('Native delivery message collision');
+        const output=outputs.find(item=>item.id===owner),message=byMessage.get(proof.messageId);
+        if(output?.toolId&&output.toolId!==proof.toolId)throw Error('Native delivery tool collision');
+        if(owner.startsWith('file-tool:')&&owner.slice(10)!==proof.toolId)
+          throw Error('Native delivery tool collision');
+        const originalFile={
+          type:output?.file?.type??message?.media?.type??message?.artifact?.type,
+          name:output?.file?.name??message?.media?.name??message?.artifact?.name,
+          sha256:output?.file?.sha256??message?.artifact?.sha256,
+          bytes:output?.file?.bytes??message?.artifact?.bytes??message?.media?.bytes,
+        };
+        if(output?.file||message?.media||message?.artifact) {
+          for(const key of ['type','name','sha256','bytes'])
+            if(originalFile[key]!=null&&originalFile[key]!==proof.artifact[key])
+              throw Error('Native delivery artifact collision');
+        }
+        receipts[owner]={...receipts[owner],state:'accepted',messageId:proof.messageId,
+          nativeSourceHash:proof.sourceHash,proofHash};
+        const enriched={toolId:proof.toolId,file:{...proof.artifact},receivedByServer:true};
+        if(output)Object.assign(output,enriched);
+        else outputs.push({id:owner,text:'',...enriched});
+        continue;
+      }
       // Do not let supplemental evidence overwrite a router-owned delivery.
-      if(Object.hasOwn(receipts,id))throw Error('Native delivery identity collision');
-      receipts[id]={state:'accepted',messageId:proof.messageId,source:'native-tool-outbox',sourceHash:digest(proof)};
+      receipts[id]={state:'accepted',messageId:proof.messageId,source:'native-tool-outbox',
+        sourceHash:proof.sourceHash,proofHash};
       outputs.push({id,toolId:proof.toolId,text:'',file:{...proof.artifact},receivedByServer:true});
     }
     const reply=await lastReply();
