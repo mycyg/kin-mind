@@ -1,8 +1,9 @@
 # Persistent mobile model routing
 
 The mobile host keeps one native conversation across channels and model providers.
-DeepSeek Flash handles conversation; GPT-6 handles creative work, research,
-documents, code and computer tasks. Routing selects a conversation mode, not an
+DeepSeek Flash handles conversation and lightweight tool use. The default work
+profile is GPT-5.6 Sol / medium with Fast preference, for substantive creative
+work, research, documents, code and computer tasks. Routing selects a conversation mode, not an
 independent model for every message. Deployment-specific identities, credentials,
 state files and personas remain private.
 
@@ -13,7 +14,8 @@ revisions and transition history. Input acceptance and provider replacement shar
 one mutex. New work received during a DeepSeek turn waits for that turn to finish.
 DeepSeek classifies natural language using the current message, recent conversation,
 mode and task summary, including during work. Its result describes intent; the
-host independently keeps active work on GPT-6. Runtime enquiries and notification
+host independently preserves the active work profile unless the owner explicitly
+changes it. Runtime enquiries and notification
 requests do not create work or invalidate a completion proposal. Literal native
 commands have their own protocol path; natural phrasing is not matched by a
 collection of regular expressions.
@@ -54,7 +56,7 @@ native transcript and host journal without becoming new interpersonal evidence.
 The classifier returns `chat`, `work`, or `control`. Control intentions are
 `status`, `watch`, `work` (enter work mode) and `auto` (request automatic routing).
 The host answers status requests from verified runtime metadata. Asking for a
-switch notification attaches to the pending request; it does not start a GPT-6
+switch notification attaches to the pending request; it does not start a work-model
 task. A mixed message that also requests code, a document or a repair remains work.
 
 Historical correction is a separate receipt, not a rewrite of the input record. An
@@ -163,8 +165,9 @@ bounded runtime query and rejects provider changes while native execution or
 background terminals remain active. An unsupported adapter version fails closed.
 
 The mobile process uses its own combined model catalogue. Global desktop model
-configuration and account credentials are not rewritten. GPT-6 retains the host's
-configured Fast setting. DeepSeek conversation uses the reasoning effort the host
+configuration and account credentials are not rewritten. Work uses the selected
+profile's Fast preference; an actual service tier remains a separate receipt.
+DeepSeek conversation uses the reasoning effort the host
 configures for the gateway; classification, the tail decision, work review and
 health review enable thinking at high effort, and their receipts record it.
 Private reasoning never enters the channel output.
@@ -210,7 +213,9 @@ key, allowing corrected reviewers to reassess a previously failed attempt.
 The host rechecks the exact task/input version, actual runtime and evidence
 after the model returns, under the same mutex used for new input and model
 switches. A changed input, unfinished tool, background terminal, missing evidence
-or uncertain send preserves GPT-6. Deferred share approval is recorded as
+or uncertain send prevents an automatic return. An explicit owner force switch
+uses its separate interruption boundary and preserves these outstanding facts.
+Deferred share approval is recorded as
 `deferred`, separately from a transport request in progress. DeepSeek may discard
 an older ordinary acknowledgement only when it judges the task `not_a_task`, a
 later authenticated input supersedes it and the host proves transport never
@@ -227,7 +232,7 @@ lifecycle paths.
 
 `MobileAudit` performs a durable four-hour review of structured health evidence.
 The DeepSeek reviewer has no repair or messaging tools. It returns findings with
-source fields; the host schedules a repair in the shared GPT-6 conversation when
+source fields; the host schedules a repair using the configured work profile when
 user work permits. Repeated findings do not create duplicate repair jobs. A failed
 review waits for the next review period rather than retrying every minute.
 
@@ -266,7 +271,7 @@ above.
 
 Run `node --test adapters/*.test.mjs` for synthetic routing, delivery, concurrency,
 gateway and cadence checks. Before enabling a host, additionally verify a live
-DeepSeek → GPT-6 → DeepSeek round trip in an isolated native conversation, tool
+conversation → configured work → exact prior profile round trip in an isolated native conversation, tool
 calls on both providers, model-requested handoff, task completion and restoration
 of automatic routing. The live check must produce zero owner messages.
 
