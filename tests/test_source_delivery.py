@@ -22,6 +22,7 @@ def receipt():
             "version": sha(text), "read_at": "2026-09-20T01:00:00Z",
             "receipt_format": "kin-web-receipt-v2", "content_sha256": sha(text),
             "semantic_classification": "model-required",
+            "body_bytes_representation": "decoded-http-entity", "raw_body_complete": True,
             "content_chars": len(text), "raw_body_sha256": sha(text), "raw_body_bytes": len(text),
             "delivered_ranges": [{"start": 0, "end": 11, "sha256": sha(text[:11]),
                                   "delivered_at": "2026-09-20T01:00:00Z"}]}
@@ -55,6 +56,7 @@ def test_delivery_seal_survives_historical_and_continuation():
     {"delivered_ranges": []}, {"raw_body_bytes": 0}, {"raw_body_sha256": "invalid"},
     {"receipt_format": "unknown"},
     {"semantic_classification": "article-confirmed"},
+    {"raw_body_complete": False},
 ])
 def test_malformed_new_receipt_not_citable(change):
     current = {**receipt(), **change}

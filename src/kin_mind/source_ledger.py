@@ -39,7 +39,8 @@ def web_delivery(receipt):
         return None
     return {key: copy.deepcopy(receipt.get(key)) for key in (
         "receipt_format", "content_sha256", "content_chars", "raw_body_sha256",
-        "raw_body_bytes", "delivered_ranges", "semantic_classification",
+        "raw_body_bytes", "body_bytes_representation", "raw_body_complete",
+        "delivered_ranges", "semantic_classification",
     )}
 
 
@@ -49,6 +50,9 @@ def valid_web_delivery(delivery, version):
     if delivery.get("content_sha256") != version or not SHA256.fullmatch(str(version or "")):
         return False
     if delivery.get("semantic_classification") != "model-required":
+        return False
+    if (delivery.get("body_bytes_representation") != "decoded-http-entity"
+            or delivery.get("raw_body_complete") is not True):
         return False
     length = delivery.get("content_chars")
     raw_bytes = delivery.get("raw_body_bytes")

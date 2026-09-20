@@ -317,7 +317,7 @@ class Explorations:
                     "locator", "requested_locator", "title", "version", "excerpt", "content_type",
                     "truncated", "receipt_format", "content_sha256", "content_chars",
                     "raw_body_sha256", "raw_body_bytes", "delivered_ranges", "http_status",
-                    "semantic_classification",
+                    "semantic_classification", "body_bytes_representation", "raw_body_complete",
                 }}),
                 occurred_at=receipt.get("read_at") or self.mind.clock(), extract=False,
                 metadata={"host_event": "web-observation", "executor": "codex-cli",
