@@ -106,8 +106,8 @@ export function manifestSummary(manifest) {
 
 export class TransportManifests {
   constructor({directory,clock=()=>Date.now(),contracts={},receipt,emit,cancelShare,review,onOutcome=()=>{},role='service',lease={},hooks={},
-    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={}}) {
-    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep});
+    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={},keepLive=()=>false}) {
+    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep,keepLive});
     this.lease={...LEASE_DEFAULTS,heartbeat:true,...lease};
     this.retry={baseMs:60000,maxMs:15*60000,maxFailures:6,sideEffectAttempts:5,maxHolds:6,...retry};
     this.lastSubmitAt=null;this.notified=new Map();
@@ -523,7 +523,7 @@ export class TransportManifests {
   /** Nothing more will happen to a settled terminal group: move it out of the live set. */
   async settle(manifest,context) {
     // The operator's tool has no memory host: what it settles is reported, released and filed by the service's next pass.
-    if(this.role==='cli'||!terminal(manifest)||tailOpen(manifest)||this.owes(manifest))return;
+    if(this.role==='cli'||!terminal(manifest)||tailOpen(manifest)||this.owes(manifest)||this.keepLive(manifest))return;
     context.lease.assertHeld();
     const filed=this.doneFile(manifest.group_id);
     fs.mkdirSync(path.dirname(filed),{recursive:true,mode:0o700});
