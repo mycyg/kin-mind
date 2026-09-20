@@ -10,7 +10,7 @@ export function directReply(entries) {
   if(!Array.isArray(entries)||!entries.length)return {state:'pending',reason:'empty-reply',route:'repair'};
   const invalid=entries.find(e=>e.repair_reason||typeof e.text!=='string'||!e.text.trim());
   if(invalid)return {state:'pending',reason:invalid.repair_reason??'empty-reply',route:'repair'};
-  return {state:'ready',checked:entries.map(e=>({state:'ready',draft_id:e.draft_id,text:e.text,references:e.references??[]}))};
+  return {state:'ready',mode:'direct',checked:entries.map(e=>({state:'ready',draft_id:e.draft_id,text:e.text,references:e.references??[]}))};
 }
 
 export function outboxEvidence(directories) {

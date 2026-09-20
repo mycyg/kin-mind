@@ -116,8 +116,8 @@ WeChat、Feishu、デスクトップは同じデータベースとスコープ�
 
 ```bash
 uv sync --extra dev
-uv run pytest -q
-node --test adapters/owner-host.test.mjs
+uv run pytest -q tests/business
+node --test tests/business/*.test.mjs
 uv run python examples/mind_demo.py
 ```
 

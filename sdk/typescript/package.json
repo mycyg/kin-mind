@@ -4,11 +4,16 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "generate": "openapi-typescript ../../contracts/openapi.json -o src/schema.ts --default-non-nullable false",
     "build": "tsc -p tsconfig.json",
-    "test": "node --test tests/*.mjs"
+    "test": "node --test ../../tests/clients/sdk.mjs"
   },
-  "devDependencies": {"typescript": "^5.9.2", "openapi-typescript": "^7.9.1"}
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "openapi-typescript": "^7.9.1"
+  }
 }

@@ -263,6 +263,3 @@ def recent(mind, *, limit=SHOWN_MOVES):
                           "receipt": data.get("receipt")})
         return {"moves": moves, "enabled": enabled,
                 "last_refusal": appraisal.last_refusal(conn, scope, "next_move")}
-
-
-appraisal.register_audit_section("next_move", commit_move)

@@ -89,7 +89,6 @@ from pathlib import Path
 from eventmem.core.db import Conflict, digest, dumps
 
 from . import history
-from .history_admin import command
 
 # The archive lives beside the database it was taken from, in a directory of its own, one file per
 # compaction. Not inside the store: a safety net sharing a file with the thing it is the net for is
@@ -897,7 +896,6 @@ def _backup_file(db, identity, at, given) -> Path:
         f"{BACKUP_STEM}-{_day(at)}-r{identity['head']}n{identity['rows']}{suffix}.sqlite3")
 
 
-@command("history-compact", config=True)
 def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=None):
     """Rewrite the stored history into patches, in place, keeping every row and every column.
 
@@ -1143,7 +1141,6 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
 
 # --- checking it afterwards ------------------------------------------------------------------------------
 
-@command("history-compact-verify")
 def compact_verify(mind, *, limit=SAMPLE, deep=False, archive=None):
     """Rebuild every revision the archive holds and compare it with the archived original bytes.
 
@@ -1237,7 +1234,6 @@ def _step(conn, scope, revision, state, previous):
 
 # --- putting it back -------------------------------------------------------------------------------------
 
-@command("history-restore", config=True)
 def restore(mind, config=None, *, apply=False, batch=BATCH, archive=None):
     """Write the archived originals back into the history, row by row.
 

@@ -65,3 +65,18 @@ test('an intentional quiet choice remains quiet, not a failed reply',async t=>{
   assert.equal((await h.guard.deliver(h.entries('不用发送'),'epoch',{send:h.send})).state,'silent');
   assert.equal(h.sent.length,0);assert.equal(h.notices.length,0);
 });
+
+test('a DS-approved replacement settles the old unsent remainder only after its delivery',async t=>{
+ const h=chat(t,{replyTailDecision:true,ownerEpoch:()=>1});
+ h.guard.draft(h.entries('旧的未发正文'),1,'feishu');
+ await h.guard.manifests.mutate('reply',m=>{m.state='interrupted';},{operatorOnly:true});
+ const old=h.guard.manifests.read('reply');
+ await h.guard.tail.decided({inputId:'new-input',key:h.guard.tail.key(old),tail:{decision:'rewrite_remainder',reason:'Continue in the new reply'}});
+ await h.guard.tail.recover();
+ const next=h.entries('新的完整回复');next[0].request.draft_id='new-draft';next[0].request.reply_id='new-input';
+ Object.assign(next[0].delivery,{id:'new-bubble',memoryBatchId:'new-reply'});
+ assert.equal((await h.guard.deliver(next,1,{send:h.send})).state,'accepted');
+ await h.guard.tail.recover();
+ assert.deepEqual(h.sent,['新的完整回复']);assert.equal(h.guard.tail.owed().length,0);
+ assert.equal(h.guard.manifests.read('reply').tail_intent.outcome.state,'replaced');
+});

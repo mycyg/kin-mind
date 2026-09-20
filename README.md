@@ -116,8 +116,8 @@ DeepSeek 使用宿主已有的凭据，完成记忆抽取、整理和情绪评�
 
 ```bash
 uv sync --extra dev
-uv run pytest -q
-node --test adapters/owner-host.test.mjs
+uv run pytest -q tests/business
+node --test tests/business/*.test.mjs
 uv run python examples/mind_demo.py
 ```
 

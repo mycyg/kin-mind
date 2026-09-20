@@ -42,3 +42,9 @@ markers = [
     "llm: 需要真实 LLM 端点与 env key 的集成测试，CI 默认跳过",
 ]
 addopts = "-m 'not llm'"
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/build_frontend.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "scripts/build_frontend.py", "pyproject.toml", "README.md", "LICENSE", "console", "uv.lock"]

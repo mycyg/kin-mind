@@ -88,28 +88,12 @@ Examples, tests and benchmark data are synthetic. Keep actual conversations, gra
 
 ## Verification
 
-Run `pytest`, `node --test adapters/*.test.mjs` and the console's Playwright suite. The synthetic [scale probe](../scripts/benchmark_event_graph.py) builds 50,000 events, 1,000 works and 10,000 disclosure records, then checks paging, old-event retrieval and chat injection limits. Focused tests cover partial/unconfirmed sends, cross-channel duplicates, concurrent reservations, corrections, merge/split undo, source invalidation, atomic rollback and per-input silence.
+Run `pytest`, `node --test tests/business/*.test.mjs` and the console's Playwright suite. The synthetic [scale probe](../scripts/benchmark_event_graph.py) builds 50,000 events, 1,000 works and 10,000 disclosure records, then checks paging, old-event retrieval and chat injection limits. Focused tests cover partial/unconfirmed sends, cross-channel duplicates, concurrent reservations, corrections, merge/split undo, source invalidation, atomic rollback and per-input silence.
 
 See [the recorded validation results](event-graph-validation.md) for measured results and the limits of those measurements.
 
-Pending ordinary replies retain their public body, task association and stable transport ID across restarts. The host rechecks the original input and active task before retrying a completed semantic review. Uncertain transport receipts remain held for reconciliation.
+Ordinary replies use the durable group sender without a second semantic review. Shared findings inform generation; repeating a game, joke or old topic is allowed. Proactive contact uses the existing DS decision and current contact conditions. An explicit `choose_reply` decision can still choose silence or merge inputs.
 
-A reply group and a proactive batch are each reviewed once, as a whole, before
-the first of their bubbles is exposed, and a group that has been reviewed is
-never charged for a second review. A pending check retains the complete
-remainder, with its order and original IDs. A bubble the platform accepted is
-never rewritten and never sent again, after a restart or after the review's
-evidence has moved; only an unsent remainder can be judged afresh. The share
-checker sees the whole reply as context and preserves requested creative text.
-Its 64K high-reasoning result is rejected on truncation; the host deadline
-exceeds the provider timeout. A reply too long for one call is reviewed in
-bounded chunks rather than refused; see
-[reply review](autonomous-planning.md#reply-review-admission-waits-and-step-verification).
-The durable delivery of a reply group — frozen bodies, fragments, receipts and
-the operator commands over them — is described in
-[mobile recovery](mobile-recovery.md#complete-phone-replies), and the proactive
-batch in [Kin Mind](kin-mind.md#affect-driven-action-episodes). Recently retained
-dialogue includes only timestamped owner messages and public replies, excluding
-model control notices, internal events, tool payloads and reasoning.
+Malformed public content is regenerated once from the original input, recent public conversation, original draft and the specific error. This correction runs no tools and changes only unsent text. If it cannot finish, a short status bypasses the content review. Partial deliveries preserve accepted fragments; unknown receipts are reconciled under their original IDs. Delivery accounting uses the existing background journal.
 
-A full automatic-context window resumes native compaction at an idle turn boundary, even while a persistent work task remains open. Running tools, queued turns, unresolved native operations and background tasks still hold it. The host verifies the same model, session and task snapshot before resetting the injection ledger; restart reloads the pending window epoch.
+`share-preflight` and `share-preflight-group` remain available to explicit API callers for compatibility. They are not automatic gates in the phone reply path.

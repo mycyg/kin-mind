@@ -360,7 +360,3 @@ def merge_daily(mind, agent_version):
             conn.execute("UPDATE mind_evolution_proposals SET state='applied',data=json_set(data,'$.applied_event_id',?)"
                          " WHERE scope=? AND id=?", (data["result"]["event_id"], scope, chosen["id"]))
     return dict(state=state_name, day=day, **data)
-
-
-appraisal.register_audit_section("self_hypothesis", commit_hypothesis)
-appraisal.register_audit_section("prediction_outcomes", commit_outcomes)

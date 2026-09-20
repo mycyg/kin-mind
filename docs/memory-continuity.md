@@ -75,6 +75,6 @@ Feature flags `records`, `semantic`, `context` and `idle` default to false. Enab
 
 `kin_mind.backfill.HistoryImport` imports host-supplied events and selected source namespaces with a persistent cursor. Backfill preserves original timestamps and marks historical data. It creates no new emotion, contact or exploration wish and cannot change a completed wish. The lower-priority semantic history queue yields to live inputs. Deferred sources keep a review record.
 
-Run `PYTHONPATH=src python examples/memory_benchmark.py` for a synthetic 10,000-share/1,000-work check. `tests/test_memory_continuity.py` covers archive identity, partial receipts, source corrections, failed compression, idle reviews, delayed input, backfill and evidence status. The adapter tests cover journal recovery, immutable observed bytes and native compaction under work locks. Provider latency and cache usage must also be measured in the private deployment; the synthetic benchmark makes no API request.
+Run `PYTHONPATH=src python examples/memory_benchmark.py` for a synthetic 10,000-share/1,000-work check. The compact [business suite](../tests/README.md) covers current memory and delivery workflows. Extended replay and fault injection are local acceptance work. Provider latency and cache usage must also be measured in the private deployment; the synthetic benchmark makes no API request.
 
 The public repository contains mechanisms and synthetic fixtures. Actual files, shared experiences, recipients and credentials remain private.

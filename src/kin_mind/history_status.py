@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 
 from .history import PATCH_FLAG, compacting, shape_of, sweep, writes_patches
-from .history_admin import command
 from .history_compaction import compacted_through
 
 # How many revisions a report names before it stops listing. The counts are always complete, and
@@ -67,7 +66,6 @@ def _shapes(conn, scope):
     return found
 
 
-@command("history-status")
 def status(mind):
     """What this store's history is made of, and what the previous release could still read.
 
@@ -82,7 +80,6 @@ def status(mind):
                 "compacted_through": compacted_through(conn, scope), **found}
 
 
-@command("history-verify")
 def verify(mind, *, limit=SAMPLE):
     """Rebuild every revision and check its bytes against what its row claims.
 

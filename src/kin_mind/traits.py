@@ -656,9 +656,3 @@ def commit_observations(commit):
 def commit_decisions(commit):
     Traits(commit.mind).decide(commit.conn, commit.value, commit.event_id + ":trait",
                                commit.receipt, commit.sources, commit.event_id)
-
-
-# What was observed did happen, so it still commits when the owner wrote again while the appraisal
-# ran; what was decided from it waits for the next round.
-appraisal.register_audit_section("trait_observations", commit_observations, commits_on_new_interaction=True)
-appraisal.register_audit_section("trait_decisions", commit_decisions)
