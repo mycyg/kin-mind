@@ -6,6 +6,8 @@ import {FINAL_NON_DELIVERY} from './work-lock-review.mjs';
 import {readThroughArchive} from './state-pruner.mjs';
 
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const NATIVE_DELIVERY_GAPS=new Set(['native-tool-outbox-not-unique','native-tool-outbox-invalid','native-tool-artifact-invalid']);
+const NATIVE_DELIVERY_CONFLICTS=new Set(['native-tool-receipt-ambiguous','native-tool-event-invalid','native-tool-proof-conflict']);
 
 /** Owner-bound evidence readers are injected by the private host. No model
  * is allowed to supply a filesystem path, recipient or delivery receipt.
@@ -130,7 +132,20 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
     // A model's completion claim or a matching filename is not a delivery proof.
     // Re-read this on every collect, including the pre-commit evidence check.
     const native=await toolDeliveries(snapshot);
-    if(!native||!Array.isArray(native.proofs))throw Error('Invalid native delivery evidence');
+    if(!native||!Array.isArray(native.proofs)||(native.diagnostics!==undefined&&!Array.isArray(native.diagnostics)))throw Error('Invalid native delivery evidence');
+    const deliveryEvidenceGaps=[],diagnosticSeen=new Set();
+    for(const diagnostic of native.diagnostics??[]) {
+      const keys=diagnostic&&typeof diagnostic==='object'&&!Array.isArray(diagnostic)?Object.keys(diagnostic).sort():[];
+      const key=keys.length===2&&keys[0]==='code'&&keys[1]==='toolId'?diagnostic.toolId+'\u0000'+diagnostic.code:'';
+      if(!key||typeof diagnostic.toolId!=='string'||!/^[\w:-]+$/.test(diagnostic.toolId)
+        ||snapshot.task.tools?.[diagnostic.toolId]?.status!=='completed'
+        ||(!NATIVE_DELIVERY_GAPS.has(diagnostic.code)&&!NATIVE_DELIVERY_CONFLICTS.has(diagnostic.code))
+        ||diagnosticSeen.has(key))throw Error('Invalid native delivery evidence');
+      diagnosticSeen.add(key);
+      if(NATIVE_DELIVERY_CONFLICTS.has(diagnostic.code))throw Error('Native delivery evidence integrity conflict');
+      deliveryEvidenceGaps.push({toolId:diagnostic.toolId,code:diagnostic.code});
+    }
+    deliveryEvidenceGaps.sort((a,b)=>a.toolId.localeCompare(b.toolId)||a.code.localeCompare(b.code));
     const nativeSeen=new Set(),nativeMessages=new Set();
     for(const proof of native.proofs) {
       if(proof?.state!=='accepted'||proof.source!=='native-tool-outbox'
@@ -199,7 +214,7 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
       toolSummary:{total:toolEntries.length,completed:toolEntries.filter(([,t])=>t.status==='completed').length},
       tools:Object.fromEntries(toolEntries.filter(([,t])=>t.status!=='completed'))},inputs,outputs,
       lastPublicReply:reply?{text:reply.text,status:reply.status,turnId:reply.turnId}:null,
-      backgroundWishes:background,cancellableDeferred},receipts,deferredProofs,...(Object.keys(deferredGroups).length?{deferredGroups}:{})};
+      backgroundWishes:background,cancellableDeferred,...(deliveryEvidenceGaps.length?{deliveryEvidenceGaps}:{})},receipts,deferredProofs,...(Object.keys(deferredGroups).length?{deferredGroups}:{})};
   }
   /** A deferred group is cancelled as the unit it was deferred as: the reservation of every one of
    * its bubbles is released, not only the first one's. */

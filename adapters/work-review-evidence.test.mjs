@@ -231,6 +231,33 @@ test('duplicate original platform identities fail even when direct outbox lookup
   await assert.rejects(f.adapter.collect(f.snapshot),/Platform message identity collision/);
 });
 
+test('native delivery gaps are review evidence while malformed or conflicting diagnostics fail',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'},second:{status:'completed'}};
+  const args={sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null};
+  let diagnostics=[{toolId:'second',code:'native-tool-artifact-invalid'},{toolId:'original',code:'native-tool-outbox-not-unique'}];
+  const adapter=workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics})});
+  const first=await adapter.collect(f.snapshot);
+  assert.deepEqual(first.input.deliveryEvidenceGaps,[
+    {toolId:'original',code:'native-tool-outbox-not-unique'},
+    {toolId:'second',code:'native-tool-artifact-invalid'},
+  ]);
+  diagnostics=[{toolId:'original',code:'native-tool-outbox-invalid'}];
+  const second=await adapter.collect(f.snapshot);
+  assert.notEqual(digest(first),digest(second),'the review evidence hash covers changed delivery gaps');
+  assert.equal(second.receipts.reply.messageId,'receipt','a gap does not erase independently accepted output');
+
+  for(const value of [
+    {},
+    [{toolId:'original',code:'unknown'}],
+    [{toolId:'missing',code:'native-tool-outbox-invalid'}],
+    [{toolId:'original',code:'native-tool-outbox-invalid',detail:'private'}],
+    [{toolId:'original',code:'native-tool-outbox-invalid'},{toolId:'original',code:'native-tool-outbox-invalid'}],
+  ]) await assert.rejects(workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics:value})}).collect(f.snapshot),/Invalid native delivery evidence/);
+
+  for(const code of ['native-tool-receipt-ambiguous','native-tool-event-invalid','native-tool-proof-conflict'])
+    await assert.rejects(workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics:[{toolId:'original',code}]})}).collect(f.snapshot),/Native delivery evidence integrity conflict/);
+});
+
 test('native media proof cannot belong to a different session, task or unfinished tool',async t=>{
   const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
   const base={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
