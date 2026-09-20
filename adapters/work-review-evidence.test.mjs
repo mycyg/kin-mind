@@ -137,3 +137,27 @@ test('a bubble the transport will never deliver is reported as that, not as an u
     assert.deepEqual(evidence.input.cancellableDeferred,[],'a group one of whose bubbles is settled is no longer a deferred draft');
   }
 });
+
+test('native media receipts supplement task evidence and are re-read before commit',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  let calls=0;
+  const proof={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
+  const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async snapshot=>{assert.equal(snapshot.task.id,'task');calls++;return{proofs:[proof]};}});
+  const first=await adapter.collect(f.snapshot);
+  assert.equal(first.input.outputs.find(o=>o.id==='native-tool:image-outbox').file.sha256,'b'.repeat(64));
+  assert.equal(first.receipts.reply.messageId,'receipt');
+  proof.sourceHash='c'.repeat(64);
+  const second=await adapter.collect(f.snapshot);
+  assert.equal(calls,2);
+  assert.notEqual(first.receipts['native-tool:image-outbox'].sourceHash,second.receipts['native-tool:image-outbox'].sourceHash);
+  assert.equal(f.snapshot.task.deliveries['native-tool:image-outbox'],undefined,'collection never manufactures a task delivery');
+});
+
+test('native media proof cannot belong to a different session, task or unfinished tool',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  const base={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
+  for(const change of [{sessionId:'other'},{taskId:'other'},{toolId:'invented'},{state:'unconfirmed'},{sourceHash:''}]) {
+    const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[{...base,...change}]})});
+    await assert.rejects(adapter.collect(f.snapshot),/Invalid native delivery proof/);
+  }
+});

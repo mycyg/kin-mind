@@ -13,7 +13,7 @@ const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('h
  * because the router starts before the reply guard does): a deferred reply is
  * a held manifest there, and the old `.pending.json` journal stays readable
  * for a host that runs with the manifest switched off. */
-export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null,archivedState={}}) {
+export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null,archivedState={},toolDeliveries=async()=>({proofs:[]})}) {
   // Every lookup here asks for one record by name, so each of them can afford to
   // look in the archive after missing. The directory scan below deliberately does
   // not: walking the archive as well would undo the reason anything was moved
@@ -115,6 +115,31 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
           if(found)deferredGroups[id]=found.manifest.group_id;
         }
       }
+    }
+    // The host joins original completed tool results to current platform receipts.
+    // A model's completion claim or a matching filename is not a delivery proof.
+    // Re-read this on every collect, including the pre-commit evidence check.
+    const native=await toolDeliveries(snapshot);
+    if(!native||!Array.isArray(native.proofs))throw Error('Invalid native delivery evidence');
+    const nativeSeen=new Set();
+    for(const proof of native.proofs) {
+      if(proof?.state!=='accepted'||proof.source!=='native-tool-outbox'
+        ||proof.sessionId!==sessionId||proof.taskId!==snapshot.task.id
+        ||typeof proof.id!=='string'||!/^[\w:-]+$/.test(proof.id)
+        ||typeof proof.messageId!=='string'||!proof.messageId
+        ||snapshot.task.tools?.[proof.toolId]?.status!=='completed'
+        ||!/^[a-f0-9]{64}$/.test(proof.sourceHash??'')
+        ||!/^[a-f0-9]{64}$/.test(proof.artifact?.sha256??'')
+        ||!Number.isSafeInteger(proof.artifact?.bytes)||proof.artifact.bytes<=0
+        ||!['image','file','audio','video'].includes(proof.artifact?.type)
+        ||typeof proof.artifact?.name!=='string')throw Error('Invalid native delivery proof');
+      const id='native-tool:'+proof.id;
+      if(nativeSeen.has(id))throw Error('Duplicate native delivery proof');
+      nativeSeen.add(id);
+      // Do not let supplemental evidence overwrite a router-owned delivery.
+      if(Object.hasOwn(receipts,id))throw Error('Native delivery identity collision');
+      receipts[id]={state:'accepted',messageId:proof.messageId,source:'native-tool-outbox',sourceHash:digest(proof)};
+      outputs.push({id,toolId:proof.toolId,text:'',file:{...proof.artifact},receivedByServer:true});
     }
     const reply=await lastReply();
     const background=(await wishes()).filter(w=>w.kind==='explore'&&['wanted','waiting','in_progress'].includes(w.status)&&!w.expired&&!w.needs_review)
