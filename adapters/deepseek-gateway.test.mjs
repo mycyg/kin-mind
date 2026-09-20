@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {deepseekRequest, responseNormalizer, startDeepSeekGateway, startExplorationGateway,
   startComputerActionReviewGateway, replyContract, contactDraftContract, continuityContract, explorationContract,
   computerActionReviewContract, computerActionReviewSchema, nativeTurnPurpose,
@@ -90,6 +91,92 @@ const sse = frames => new Response(new ReadableStream({start(controller){
   {headers:{'Content-Type':'text/event-stream'}});
 const turn = (gateway,body={model:'deepseek-flash',input:[]}) => fetch(gateway.baseUrl+'/responses',
   {method:'POST',headers:{Authorization:'Bearer '+gateway.token},body:JSON.stringify(body)});
+
+test('request evidence is hash-only, attempt-correlated and terminally linked',async()=>{
+  const evidence=[],forwarded=[];
+  const base='PRIVATE BASE SENTINEL 小光\n',user='PRIVATE USER SENTINEL',tool='PRIVATE TOOL SENTINEL';
+  const hash=value=>createHash('sha256').update(value).digest('hex');
+  const gateway=await startDeepSeekGateway({key:'PRIVATE KEY SENTINEL',profile:'chat',onRequestEvidence:event=>evidence.push(structuredClone(event)),
+    fetchImpl:async(_url,options)=>{forwarded.push(JSON.parse(options.body));return new Response(JSON.stringify({
+      id:'resp_synthetic',status:'completed',model:'deepseek-flash',usage:{input_tokens:2},output:[],
+    }),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    const response=await turn(gateway,{model:'deepseek-flash',instructions:base,input:[{type:'message',role:'user',content:user}],
+      tools:[{type:'function',name:'private_tool',description:tool,parameters:{type:'object'}}]});
+    assert.equal(response.status,200);assert.equal(forwarded.length,1);assert.equal(evidence.length,2);
+    assert.deepEqual(evidence.map(event=>event.stage),['forward-attempted','terminal']);
+    assert.equal(evidence[0].requestAttemptId,evidence[1].requestAttemptId);
+    assert.deepEqual([evidence[0].requestAttempt,evidence[0].lane,evidence[0].purpose,evidence[0].model,evidence[0].reasoningEffort],
+      [1,'foreground','native-chat-turn','deepseek-flash','high']);
+    assert.equal(evidence[0].attempted,true);
+    assert.deepEqual(evidence[0].incomingInstructions,{present:true,sha256:hash(base),utf8Bytes:Buffer.byteLength(base)});
+    const sent=base+'\n\n'+replyContract;
+    assert.deepEqual(evidence[0].forwardedInstructions,{present:true,sha256:hash(sent),utf8Bytes:Buffer.byteLength(sent)});
+    assert.deepEqual([evidence[0].outcome,evidence[0].providerResponseId,evidence[0].nativeRequestIdentity],[null,null,'unknown']);
+    assert.deepEqual([evidence[1].outcome,evidence[1].providerResponseId],['completed','resp_synthetic']);
+    const serialized=JSON.stringify(evidence);
+    for(const secret of [base,user,tool,'PRIVATE KEY SENTINEL'])assert.equal(serialized.includes(secret),false);
+    assert.equal(serialized.includes('providerAccepted'),false);assert.equal(serialized.includes('instructionSources'),false);
+  } finally {await gateway.close();}
+});
+
+test('requests rejected before the forward boundary produce no request evidence',async()=>{
+  const evidence=[];let upstream=0;
+  const lease={acquire:async()=>({proceed:false,detail:()=>({}),release:async()=>{}})};
+  const gateway=await startDeepSeekGateway({key:'secret',lease,profile:'exploration',onRequestEvidence:event=>evidence.push(event),
+    fetchImpl:async()=>{upstream++;throw Error('must not forward');}});
+  try {
+    assert.equal((await fetch(gateway.baseUrl+'/responses',{method:'POST'})).status,401);
+    assert.equal((await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token},body:'{'})).status,502);
+    assert.equal((await turn(gateway,{model:'deepseek-flash',instructions:7,input:[]})).status,502);
+    assert.equal((await turn(gateway)).status,503);
+    assert.equal(upstream,0);assert.deepEqual(evidence,[]);
+  } finally {await gateway.close();}
+});
+
+test('an optional incoming instruction requirement fails closed before provider fetch',async()=>{
+  const base='Exact verified companion base\n',hash=value=>createHash('sha256').update(value).digest('hex');
+  let upstream=0;const evidence=[];
+  await assert.rejects(startDeepSeekGateway({key:'secret',requiredIncomingInstructions:{sha256:'bad',utf8Bytes:1}}),/requirement-invalid/);
+  const gateway=await startDeepSeekGateway({key:'secret',profile:'chat',
+    requiredIncomingInstructions:{sha256:hash(base),utf8Bytes:Buffer.byteLength(base)},
+    onRequestEvidence:event=>evidence.push(event),fetchImpl:async()=>{upstream++;return new Response(JSON.stringify({id:'ok',output:[]}),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    const rejected=await turn(gateway,{model:'deepseek-flash',instructions:'wrong',input:[]});
+    assert.equal(rejected.status,400);assert.equal((await rejected.json()).error.code,'instruction_requirement_mismatch');
+    assert.equal(upstream,0);assert.equal(evidence.length,1);
+    assert.deepEqual([evidence[0].stage,evidence[0].attempted,evidence[0].requestAttempt,evidence[0].requestAttemptId,evidence[0].outcome],
+      ['rejected-before-forward',false,0,null,'instruction-requirement-mismatch']);
+    assert.deepEqual(evidence[0].requiredIncomingInstructions,{sha256:hash(base),utf8Bytes:Buffer.byteLength(base)});
+    assert.equal(JSON.stringify(evidence[0]).includes('wrong'),false);
+    assert.equal((await turn(gateway,{model:'deepseek-flash',instructions:base,input:[]})).status,200);
+    assert.equal(upstream,1);assert.deepEqual(evidence.map(event=>event.stage),['rejected-before-forward','forward-attempted','terminal']);
+  } finally {await gateway.close();}
+});
+
+test('usage and request observers cannot fail or duplicate the sole provider request',async()=>{
+  let upstream=0,evidenceCalls=0,usageCalls=0;
+  const gateway=await startDeepSeekGateway({key:'secret',onRequestEvidence:()=>{evidenceCalls++;if(evidenceCalls===1)throw Error('observer failed');return Promise.reject(Error('observer failed async'));},
+    onUsage:()=>{usageCalls++;throw Error('usage failed');},
+    fetchImpl:async()=>{upstream++;return new Response(JSON.stringify({id:'one',model:'deepseek-flash',output:[]}),{headers:{'Content-Type':'application/json'}});}});
+  try {
+    const response=await turn(gateway);assert.equal(response.status,200);await response.text();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(upstream,1);assert.equal(evidenceCalls,2);assert.equal(usageCalls,1);
+  } finally {await gateway.close();}
+});
+
+test('a transport failure closes the same observed attempt once without claiming provider acceptance',async()=>{
+  const evidence=[];let upstream=0;
+  const gateway=await startDeepSeekGateway({key:'secret',onRequestEvidence:event=>evidence.push(structuredClone(event)),
+    fetchImpl:async()=>{upstream++;throw Error('offline');}});
+  try {
+    assert.equal((await turn(gateway)).status,502);assert.equal(upstream,1);
+    assert.deepEqual(evidence.map(event=>event.stage),['forward-attempted','terminal']);
+    assert.equal(evidence[0].requestAttemptId,evidence[1].requestAttemptId);
+    assert.deepEqual([evidence[1].outcome,evidence[1].providerResponseId],['transport-incomplete',null]);
+  } finally {await gateway.close();}
+});
 
 test('native turns are attributed per session, and a background session yields a lane it cannot have',async()=>{
   const usage=[];let kind='creation',upstream=0;

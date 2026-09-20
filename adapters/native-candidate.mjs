@@ -3,6 +3,7 @@ import {createInterface} from 'node:readline';
 import fs from 'node:fs';
 import {checkpointMarker} from './native-window.mjs';
 import {conversationClock} from './conversation-time.mjs';
+import {isCompanionInstructionBinding,sameInstructionBinding} from './instruction-evidence.mjs';
 
 const requestedServiceTier=launch=>launch.fastMode==='on'?'fast':null;
 const evidence=(actual,key,expected)=>!Object.hasOwn(actual??{},key)?'unknown':actual[key]===expected?'verified':'mismatch';
@@ -20,8 +21,10 @@ export function candidateResponseProfileEvidence(actual,launch) {
 }
 
 const profileEvidenceVerified=value=>Object.values(value).every(state=>state==='verified');
+const instructionBindingVerified=value=>value==null||isCompanionInstructionBinding(value);
 const responseReceipt=(actual,launch)=>({
   requestedProfile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),
+  requestedInstructionBinding:structuredClone(launch.instructionBinding??null),
   profileEvidence:candidateResponseProfileEvidence(actual,launch),
   actualProfile:{model:actual?.model,modelProvider:actual?.modelProvider,reasoningEffort:actual?.reasoningEffort,
     serviceTier:Object.hasOwn(actual??{},'serviceTier')?actual.serviceTier:undefined},
@@ -61,21 +64,27 @@ export class NativeCandidate {
     if(!profile?.provider||!['gateway','native'].includes(profile.providerKind)||!profile.model||!profile.reasoningEffort||!['default','fast'].includes(profile.serviceTierPreference)||
       !binding||binding.sourceProvider!==profile.provider||binding.sourceProviderKind!==profile.providerKind||binding.launchProvider!==launch.modelProvider||
       (profile.providerKind==='native'&&(launch.modelProvider!==profile.provider||binding.endpointSha256!==null))||
-      (profile.providerKind==='gateway'&&(launch.modelProvider===profile.provider||typeof binding.endpointSha256!=='string'||!binding.endpointSha256)))throw Error('Candidate profile is incomplete');
+      (profile.providerKind==='gateway'&&(launch.modelProvider===profile.provider||typeof binding.endpointSha256!=='string'||!binding.endpointSha256))||
+      !instructionBindingVerified(launch.instructionBinding)||
+      (launch.instructionBinding!==null&&launch.instructionBinding!==undefined&&
+        (typeof launch.config?.model_instructions_file!=='string'||typeof launch.developerInstructions!=='string')))
+      throw Error('Candidate profile is incomplete');
     return launch;
   }
-  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
+  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
   params(profile){return this.requestParams(this.launch(profile));}
   async create({id,model,profile}){
     const launch=this.launch(profile??{model});await this.start();const value=await this.request('thread/start',this.requestParams(launch));
     const receipt=responseReceipt(value,launch);
     if(!value?.thread?.id||!value.thread.sessionId||!profileEvidenceVerified(receipt.profileEvidence))throw Error('Native candidate started with another profile');
     const native={threadId:value.thread.id,nativeSessionId:value.thread.sessionId,path:value.thread.path,model:launch.profile.model,reasoningEffort:launch.profile.reasoningEffort,
-      profile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),creationReceipt:{id,at:new Date().toISOString(),...receipt}};
+      profile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),instructionBinding:structuredClone(launch.instructionBinding??null),creationReceipt:{id,at:new Date().toISOString(),...receipt}};
     this.loaded.add(native.threadId);return native;
   }
-  async load(native){await this.start();if(this.loaded.has(native.threadId))return;const launch=this.launch(native.profile);
+  async load(native){const launch=this.launch(native.profile);
     if(JSON.stringify(launch.providerBinding)!==JSON.stringify(native.providerBinding))throw Error('Candidate provider binding changed');
+    if(!sameInstructionBinding(launch.instructionBinding,native.instructionBinding))throw Error('Candidate instruction binding changed');
+    if(this.loaded.has(native.threadId))return;await this.start();
     const actual=await this.request('thread/resume',{...this.requestParams(launch),threadId:native.threadId,excludeTurns:true}),receipt=responseReceipt(actual,launch);
     if(actual?.thread?.id!==native.threadId||!profileEvidenceVerified(receipt.profileEvidence))throw Error('Native candidate resumed with another profile');
     this.loaded.add(native.threadId);return {...actual,kinProfileReceipt:receipt};}

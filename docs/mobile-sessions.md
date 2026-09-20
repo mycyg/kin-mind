@@ -1,5 +1,8 @@
 # Compression-first mobile sessions
 
+For private companion instructions and pinned runtime upgrades, see
+[mobile runtime](mobile-runtime.md) ([中文](mobile-runtime.zh.md), [日本語](mobile-runtime.ja.md)).
+
 The host keeps a long-lived logical conversation across its channels. Each native thread is a numbered segment of that conversation. Shared memory, tasks, input IDs and delivery receipts remain in their existing stores.
 
 ## Decision order
