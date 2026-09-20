@@ -6,11 +6,16 @@ const OUTBOX_ID=/^[A-Za-z0-9_-]{1,160}$/;
 const RECEIPT_TOKEN=/^[A-Za-z0-9_.:-]{1,256}$/;
 const SHA256=/^[a-f0-9]{64}$/;
 const MAX_RECORD_BYTES=2*1024*1024;
+// Real native tool records can exceed 8 MiB; keep the stream bounded without
+// rejecting the current canonical rollout (whose largest line is ~8.7 MiB).
+const MAX_LINE_BYTES=16*1024*1024;
+const MEDIA_TYPES=new Set(['image','file','audio','video']);
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const failure=code=>Object.assign(Error(code),{code});
 const diagnostic=(toolId,code)=>({toolId,code});
-const iso=value=>Number.isFinite(value)?new Date(value).toISOString():null;
+const epoch=value=>Number.isFinite(value)&&Number.isFinite(new Date(value).getTime());
+const iso=value=>epoch(value)?new Date(value).toISOString():null;
 const time=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?Date.parse(value):null;
 const contained=(root,file)=>{const relative=path.relative(root,file);return relative!==''&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);};
 
@@ -24,7 +29,8 @@ async function completeLines(file,visit) {
   try{
     for await(const chunk of input){
       tail+=chunk;let newline;
-      while((newline=tail.indexOf('\n'))>=0){const line=tail.slice(0,newline);tail=tail.slice(newline+1);if(line)await visit(line);}
+      while((newline=tail.indexOf('\n'))>=0){const line=tail.slice(0,newline);tail=tail.slice(newline+1);if(Buffer.byteLength(line)>MAX_LINE_BYTES)throw failure('native-rollout-line-too-large');if(line)await visit(line);}
+      if(Buffer.byteLength(tail)>MAX_LINE_BYTES)throw failure('native-rollout-line-too-large');
     }
   }catch(error){if(error?.code?.startsWith?.('native-'))throw error;throw failure('native-rollout-unreadable');}
   // The canonical file may be observed during an append. An unterminated tail
@@ -80,15 +86,18 @@ async function outboxRecords(directory,receipts) {
   const byId=new Map(),byMessage=new Map(),wantedIds=new Set(),wantedMessages=new Set();
   for(const receipt of receipts){if(receipt.id)wantedIds.add(receipt.id);if(receipt.messageId)wantedMessages.add(receipt.messageId);}
   let entries;try{entries=await fs.promises.readdir(directory,{withFileTypes:true});}catch{throw failure('native-tool-outbox-unreadable');}
+  const records=[];
   for(const entry of entries.sort((a,b)=>a.name.localeCompare(b.name))) {
     if(!entry.isFile()||!entry.name.endsWith('.json'))continue;
-    const base=entry.name.slice(0,-5),direct=wantedIds.has(base);
+    const base=entry.name.slice(0,-5);
     const record=await readJson(path.join(directory,entry.name),'native-tool-outbox-unreadable');
-    const message=typeof record?.messageId==='string'&&wantedMessages.has(record.messageId);
-    if(!direct&&!message)continue;
     if(!OUTBOX_ID.test(base)||record.id!==base)throw failure('native-tool-outbox-identity-mismatch');
-    byId.set(base,record);
-    if(typeof record.messageId==='string'){
+    records.push(record);
+    if(wantedIds.has(base)&&typeof record.messageId==='string')wantedMessages.add(record.messageId);
+  }
+  for(const record of records){
+    if(wantedIds.has(record.id))byId.set(record.id,record);
+    if(typeof record.messageId==='string'&&wantedMessages.has(record.messageId)){
       const list=byMessage.get(record.messageId)??[];list.push(record);byMessage.set(record.messageId,list);
     }
   }
@@ -96,17 +105,17 @@ async function outboxRecords(directory,receipts) {
 }
 
 function matchingOutbox(receipt,index) {
-  if(receipt.id){const record=index.byId.get(receipt.id);if(!record)return null;if(receipt.messageId&&record.messageId!==receipt.messageId)return null;return record;}
+  if(receipt.id){const record=index.byId.get(receipt.id);if(!record||!RECEIPT_TOKEN.test(record.messageId??''))return null;if(receipt.messageId&&record.messageId!==receipt.messageId)return null;return (index.byMessage.get(record.messageId)??[]).length===1?record:null;}
   const records=index.byMessage.get(receipt.messageId)??[];return records.length===1?records[0]:null;
 }
 
 function validOutbox(record,event) {
   if(!record||record.state!=='accepted'||record.stage!=='platform-accepted'||record.submissionStarted!==true||record.kind!=='reply')return false;
   if(!RECEIPT_TOKEN.test(record.messageId??'')||!record.artifact||!record.media)return false;
-  if(!SHA256.test(record.artifact.sha256??'')||!Number.isSafeInteger(record.artifact.bytes)||record.artifact.bytes<0)return false;
+  if(!SHA256.test(record.artifact.sha256??'')||!Number.isSafeInteger(record.artifact.bytes)||record.artifact.bytes<=0)return false;
   if(record.artifact.bytes!==record.media.bytes||record.artifact.name!==record.media.name)return false;
-  if(typeof record.media.type!=='string'||!/^[a-z][a-z0-9-]{0,31}$/.test(record.media.type))return false;
-  if(typeof record.artifact.name!=='string'||record.artifact.name.length>255||path.basename(record.artifact.name)!==record.artifact.name)return false;
+  if(!MEDIA_TYPES.has(record.media.type))return false;
+  if(typeof record.artifact.name!=='string'||record.artifact.name.length===0||record.artifact.name.length>255||path.basename(record.artifact.name)!==record.artifact.name)return false;
   const points=[event.startedAt,time(record.attemptedAt),time(record.uploadedAt),time(record.submittedAt),time(record.acceptedAt),event.completedAt];
   return points.every(Number.isFinite)&&points.every((value,index)=>index===0||value>=points[index-1]);
 }
@@ -145,7 +154,7 @@ export async function readNativeToolDeliveries({file,sessionId,task,outboxDirect
   for(const toolId of [...completed].sort()){
     const list=events.get(toolId)??[];
     if(list.length>1){diagnostics.push(diagnostic(toolId,'native-tool-receipt-ambiguous'));continue;}
-    if(list.length===1){const event=list[0];if(event.threadId!==sessionId||!Number.isFinite(event.startedAt)||!Number.isFinite(event.completedAt)||event.startedAt>event.completedAt){diagnostics.push(diagnostic(toolId,'native-tool-event-invalid'));continue;}candidates.push(event);}
+    if(list.length===1){const event=list[0];if(event.threadId!==sessionId||!epoch(event.startedAt)||!epoch(event.completedAt)||event.startedAt>event.completedAt){diagnostics.push(diagnostic(toolId,'native-tool-event-invalid'));continue;}candidates.push(event);}
   }
   if(!candidates.length)return {proofs:[],diagnostics};
   const index=await outboxRecords(outboxDirectory,candidates),roots=await rootsFor(outboxDirectory,artifactRoots),proofs=[];
@@ -162,5 +171,9 @@ export async function readNativeToolDeliveries({file,sessionId,task,outboxDirect
       artifact:{sha256:actual.sha256,bytes:actual.bytes,type:record.media.type,name:record.artifact.name},toolStartedAt:iso(event.startedAt),toolCompletedAt:iso(event.completedAt),acceptedAt:new Date(time(record.acceptedAt)).toISOString()});
   }
   proofs.sort((a,b)=>a.toolCompletedAt.localeCompare(b.toolCompletedAt)||a.toolId.localeCompare(b.toolId));
-  return {proofs,diagnostics};
+  const idCount=new Map(),messageCount=new Map();
+  for(const proof of proofs){idCount.set(proof.id,(idCount.get(proof.id)??0)+1);messageCount.set(proof.messageId,(messageCount.get(proof.messageId)??0)+1);}
+  const unique=[];
+  for(const proof of proofs){if(idCount.get(proof.id)>1||messageCount.get(proof.messageId)>1)diagnostics.push(diagnostic(proof.toolId,'native-tool-proof-conflict'));else unique.push(proof);}
+  return {proofs:unique,diagnostics};
 }

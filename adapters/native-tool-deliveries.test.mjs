@@ -49,6 +49,13 @@ test('an accepted stdout receipt may bind by its exact outbox id when it has no 
   assert.deepEqual(result.proofs.map(p=>[p.id,p.messageId]),[[f.outboxId,f.messageId]]);
 });
 
+test('an id-only receipt still rejects a second outbox that reuses its platform message id',async t=>{
+  const f=fixture(t),copy={...f.record,id:'kin-cat-proof-2'};
+  f.event.payload.item.stdout=JSON.stringify({state:'accepted',id:f.outboxId})+'\n';f.writeRollout();f.writeOutbox(copy);
+  const result=await readNativeToolDeliveries(f.args());
+  assert.equal(result.proofs.length,0);assert.deepEqual(result.diagnostics,[{toolId:f.toolId,code:'native-tool-outbox-not-unique'}]);
+});
+
 test('session ownership is mandatory and an incomplete task tool has no authority',async t=>{
   const f=fixture(t);
   await assert.rejects(readNativeToolDeliveries({...f.args(),sessionId:'another-session'}),error=>error.code==='native-rollout-session-mismatch');
@@ -77,6 +84,13 @@ test('a nonterminal, failed, cross-session or duplicate terminal event is never 
   }
 });
 
+test('two completed task tools cannot count the same platform delivery twice',async t=>{
+  const f=fixture(t),secondId='exec-native-2',second=structuredClone(f.event);
+  second.payload.item.id=secondId;second.payload.turn_id='turn-native-2';f.task.tools[secondId]={status:'completed'};f.writeRollout([f.meta,f.event,second]);
+  const result=await readNativeToolDeliveries(f.args());
+  assert.deepEqual(result.proofs,[]);assert.deepEqual(result.diagnostics,[{toolId:f.toolId,code:'native-tool-proof-conflict'},{toolId:secondId,code:'native-tool-proof-conflict'}]);
+});
+
 test('only one exact outbox with the stdout message id can satisfy the tool receipt',async t=>{
   await t.test('no matching message id',async st=>{const f=fixture(st);f.event.payload.item.stdout=JSON.stringify({state:'accepted',messageId:'om_absent'})+'\n';f.writeRollout();const result=await readNativeToolDeliveries(f.args());assert.equal(result.proofs.length,0);assert.equal(result.diagnostics[0].code,'native-tool-outbox-not-unique');});
   await t.test('duplicate platform message id',async st=>{const f=fixture(st),copy={...f.record,id:'kin-cat-proof-2'};f.writeOutbox(copy);const result=await readNativeToolDeliveries(f.args());assert.equal(result.proofs.length,0);assert.equal(result.diagnostics[0].code,'native-tool-outbox-not-unique');});
@@ -96,8 +110,16 @@ test('artifact scope, bytes and sha256 are independently verified',async t=>{
   await t.test('artifact path is a symlink',async st=>{const f=fixture(st),link=path.join(f.artifactDirectory,'link');fs.symlinkSync(f.artifactPath,link);f.writeOutbox({...f.record,artifact:{...f.record.artifact,path:link}});const result=await readNativeToolDeliveries(f.args());assert.equal(result.proofs.length,0);});
 });
 
+test('proof media uses the same nonempty contract as work evidence',async t=>{
+  await t.test('zero byte artifact',async st=>{const f=fixture(st),empty=Buffer.alloc(0);fs.writeFileSync(f.artifactPath,empty);f.writeOutbox({...f.record,artifact:{...f.record.artifact,sha256:sha256(empty),bytes:0},media:{...f.record.media,bytes:0}});assert.equal((await readNativeToolDeliveries(f.args())).proofs.length,0);});
+  await t.test('unknown media type',async st=>{const f=fixture(st);f.writeOutbox({...f.record,media:{...f.record.media,type:'thumbnail'}});assert.equal((await readNativeToolDeliveries(f.args())).proofs.length,0);});
+  await t.test('empty artifact name',async st=>{const f=fixture(st);f.writeOutbox({...f.record,artifact:{...f.record.artifact,name:''},media:{...f.record.media,name:''}});assert.equal((await readNativeToolDeliveries(f.args())).proofs.length,0);});
+});
+
 test('read corruption fails closed while a live unterminated rollout tail is ignored',async t=>{
   await t.test('relevant malformed JSONL',async st=>{const f=fixture(st);fs.writeFileSync(f.file,'{"type":"session_meta"\n');await assert.rejects(readNativeToolDeliveries(f.args()),error=>error.code==='native-rollout-invalid-session-meta');});
   await t.test('missing artifact',async st=>{const f=fixture(st);fs.unlinkSync(f.artifactPath);await assert.rejects(readNativeToolDeliveries(f.args()),error=>error.code==='native-tool-artifact-unreadable');});
   await t.test('partial append',async st=>{const f=fixture(st);f.writeRollout([f.meta,f.event],'{"type":"event_msg"');assert.equal((await readNativeToolDeliveries(f.args())).proofs.length,1);});
+  await t.test('oversize unterminated line',async st=>{const f=fixture(st);f.writeRollout([f.meta],'{'.padEnd(16*1024*1024+2,'x'));await assert.rejects(readNativeToolDeliveries(f.args()),error=>error.code==='native-rollout-line-too-large');});
+  await t.test('out of range native time',async st=>{const f=fixture(st);f.event.payload.started_at_ms=Number.MAX_VALUE;f.writeRollout();const result=await readNativeToolDeliveries(f.args());assert.equal(result.proofs.length,0);assert.equal(result.diagnostics[0].code,'native-tool-event-invalid');});
 });
