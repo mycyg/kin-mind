@@ -6,7 +6,6 @@ source authority. Queue errors contain categories, not private response bodies.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
@@ -369,44 +368,20 @@ class SectionCommit:
             setattr(self, name, given.get(name))
 
 
-def unavailable_section(commit):
-    """What a section does until its own module claims it: accept nothing. An empty section passes,
-    so the switch may be on before the module lands; anything else is refused and recorded alone."""
-    if commit.value:
-        raise Conflict("No module has claimed this section yet", code="section-unavailable")
-
-
-# Section -> what applies it, run inside that section's savepoint in the order of AUDIT_SECTIONS.
-AUDIT_HANDLERS = {name: unavailable_section for name in AUDIT_SECTIONS}
-# Whether a section still commits when the owner wrote again while the appraisal ran. What was
-# observed did happen; a decision or an intent formed before that message waits for the next round.
-NEW_INTERACTION_COMMITS = {name: name == "trait_observations" for name in AUDIT_SECTIONS}
-
-
-def register_audit_section(name, handler, *, commits_on_new_interaction=False):
-    """The module that owns a section claims it here, at import time, and apply() stays as it is.
-    Which module owns what is declared in SECTION_OWNERS, and claim_audit_sections() imports them
-    all where the queue is built, so a claim never depends on what a path happened to read first."""
-    if name not in AUDIT_SECTIONS:
-        raise RuntimeError("Unknown audited section")
-    AUDIT_HANDLERS[name] = handler
-    NEW_INTERACTION_COMMITS[name] = commits_on_new_interaction
-
-
-# The module of this package that owns each audited section. A module that has not landed yet is
-# simply not there; one that is there is imported, and an error inside it is not hidden.
-SECTION_OWNERS = ("traits", "behavior_chain", "expression_intent", "next_move")
-
-
-def claim_audit_sections():
-    """Import every module that owns an audited section, once, on the commit path.
-
-    A handler is claimed by importing the module that owns it, so the claim used to depend on which
-    projection a path had already read: one that reached apply() without reading the state found a
-    section still unclaimed and refused it as unavailable. This is the one place that settles it."""
-    for name in SECTION_OWNERS:
-        if importlib.util.find_spec("." + name, __package__):
-            importlib.import_module("." + name, __package__)
+def audit_handlers():
+    """Fixed sections, in the same commit order and transaction as the appraisal."""
+    from .traits import commit_observations, commit_decisions
+    from .behavior_chain import commit_hypothesis, commit_outcomes
+    from .expression_intent import commit_intent
+    from .next_move import commit_move
+    return {
+        "trait_observations": commit_observations,
+        "trait_decisions": commit_decisions,
+        "self_hypothesis": commit_hypothesis,
+        "prediction_outcomes": commit_outcomes,
+        "expression_intent": commit_intent,
+        "next_move": commit_move,
+    }
 
 
 def audit_switches(conn, scope):
@@ -1238,8 +1213,7 @@ class Appraisals:
         self.exploration_capabilities = exploration_capabilities or {}
         self.session_context = session_context
         self.memory = MemoryContinuity(mind)
-        # Whatever else this process has read, every audited section has its own handler from here on.
-        claim_audit_sections()
+        self.audit_handlers = audit_handlers()
         with self.engine.db.connect() as conn:
             conn.executescript(QUEUE_SCHEMA + REFUSAL_SCHEMA)
 
@@ -1953,10 +1927,7 @@ class Appraisals:
                 )
 
                 def apply(conn, state, eid):
-                    from . import (  # noqa: F401 - claimed by claim_audit_sections(); named here
-                        behavior_chain,
-                        next_move,
-                    )
+                    from . import behavior_chain, next_move
                     owned = conn.execute("SELECT state,lease,data FROM mind_appraisals WHERE id=?", (row["id"],)).fetchone()
                     if not owned or owned["state"] != "running" or owned["lease"] <= time.time() or json.loads(owned["data"]).get("attempt_token") != data.get("attempt_token"):
                         raise Conflict("Appraisal lease no longer owns this proposal")
@@ -2257,10 +2228,9 @@ class Appraisals:
                     if proposal.session_advice and self.session_context and not historical:
                         section("session_advice", apply_advice)
                     # The audited sections, last and in one fixed order, each inside its own savepoint.
-                    # apply() knows none of them: a module claims its own through register_audit_section.
                     for name in offered:
                         value = getattr(proposal, name)
-                        if not NEW_INTERACTION_COMMITS[name] and new_interaction:
+                        if name != "trait_observations" and new_interaction:
                             # The owner wrote again while this ran: what was observed still holds, what
                             # was decided or intended before that message waits for the next round.
                             continue
@@ -2270,7 +2240,7 @@ class Appraisals:
                         commit = SectionCommit(mind=self.mind, conn=conn, state=state, event_id=eid, section=name,
                                                value=value, proposal=proposal, receipt=receipt, sources=list(semantic_refs.values()),
                                                stimulus=data.get("stimulus"), version=effective_version, job_id=row["id"], settings=settings)
-                        section(name, lambda name=name, commit=commit: AUDIT_HANDLERS[name](commit))
+                        section(name, lambda name=name, commit=commit: self.audit_handlers[name](commit))
                     if proposal.evolution and "self_hypothesis" in offered:
                         # Not applied here: a proposal to move the slow parameters waits for the day's
                         # merge, which checks the chain and the limits. Dropping it was how a valid

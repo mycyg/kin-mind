@@ -116,8 +116,8 @@ These judgements now have a ledger of their own. Evidence about me is counted un
 
 ```bash
 uv sync --extra dev
-uv run pytest -q
-node --test adapters/owner-host.test.mjs
+uv run pytest -q tests/business
+node --test tests/business/*.test.mjs
 uv run python examples/mind_demo.py
 ```
 

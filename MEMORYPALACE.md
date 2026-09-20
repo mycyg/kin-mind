@@ -12,7 +12,7 @@
 
 这套系统面向单用户，支持工具协作、陪伴与知识积累。插件、命令行、管理台、HTTP、MCP 与 Python／TypeScript SDK 提供接入方式；项目、角色、知识库及现实／虚构领域决定记忆的适用范围。
 
-![MemoryPalace 总架构](docs/diagrams/overview.png)
+![MemoryPalace 总架构](docs/diagrams/overview.svg)
 
 ## 我保存什么
 
@@ -30,7 +30,7 @@
 
 小光的纠正更新当前读取的有效状态，修订历史保留旧内容与修改关系。来源接收执行去重并记录处理进度。模型请求失败的任务保留来源和完成的进度，重试接续未完成的处理。
 
-![写入与纠正](docs/diagrams/write-correct.png)
+![写入与纠正](docs/diagrams/write-correct.svg)
 
 ## 我怎样想起需要的内容
 
@@ -38,7 +38,7 @@
 
 我可以使用精确线索、全文、语义、图片或关系查找记忆。快速查询服务日常对话，深度查询支持关系与历史的追查。宿主间的去重减少重复注入；共用数据库和记忆范围的宿主可以读取同一份经历。原生对话会话的共享由宿主管理。
 
-![召回与上下文](docs/diagrams/recall-context.png)
+![召回与上下文](docs/diagrams/recall-context.svg)
 
 ## 经历怎样成为可用的记忆
 
@@ -46,7 +46,7 @@
 
 我生成的叙事属于对经历的解释，推断保留推断身份。来源的纠正使受影响的派生内容进入待核实状态，后续读取检查它们的有效性。后台整理的进度和当前对话的请求使用各自的处理流程。
 
-![后台整理](docs/diagrams/background.png)
+![后台整理](docs/diagrams/background.svg)
 
 ## 我怎样检验对自己的判断
 
@@ -68,7 +68,7 @@
 
 任务创建回执确认保存，投递回执记录回调结果。渠道无法确认的投递保留不确定状态，重试遵循渠道的幂等约定。
 
-![主动联系](docs/diagrams/proactive-contact.png)
+![主动联系](docs/diagrams/proactive-contact.svg)
 
 MCP 的 `create_contact_task`、`list_contact_tasks` 与 `manage_contact_task` 提供任务管理。调用需要指定记忆范围与联系策略。[任务管理指南](docs/contact-tasks.md)提供 MCP 和 Python 用法。
 

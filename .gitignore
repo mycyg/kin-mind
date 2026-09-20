@@ -31,3 +31,6 @@ dist/
 .DS_Store
 
 *.tsbuildinfo
+
+# Console assets are built into distributions, not committed.
+src/eventmem/web/

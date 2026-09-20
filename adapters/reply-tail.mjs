@@ -360,6 +360,13 @@ export class ReplyTail {
     if(intent?.state!=='linked')return;
     const target=this.manifests.read(intent.linked_group);
     if(target&&!terminal(target))return;
+    // DS already chose to replace this remainder. A complete direct reply ends
+    // that delivery obligation without inventing item-by-item semantic coverage.
+    if(intent.decision==='rewrite_remainder'&&target?.state==='accepted'&&target.review?.mode==='direct') {
+      await this.finish(groupId,'linked',{state:'replaced',replacement_group:target.group_id});
+      if(this.manifests.isLive(target.group_id))await this.release(target);
+      return;
+    }
     const accepted=new Set((target?.bubbles??[]).filter(b=>b.state==='accepted').map(itemId)),covered={};
     if(intent.decision==='continue')(target?.continuation?.items??[]).forEach((item,index)=>{const bubble=target.bubbles[index];if(bubble?.state==='accepted')covered[item]=itemId(bubble);});
     else if(intent.decision==='rewrite_remainder')for(const claim of target?.review?.covers_remainder??[])

@@ -106,8 +106,8 @@ export function manifestSummary(manifest) {
 
 export class TransportManifests {
   constructor({directory,clock=()=>Date.now(),contracts={},receipt,emit,cancelShare,review,onOutcome=()=>{},role='service',lease={},hooks={},
-    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={}}) {
-    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep});
+    sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={},keepLive=()=>false}) {
+    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep,keepLive});
     this.lease={...LEASE_DEFAULTS,heartbeat:true,...lease};
     this.retry={baseMs:60000,maxMs:15*60000,maxFailures:6,sideEffectAttempts:5,maxHolds:6,...retry};
     this.lastSubmitAt=null;this.notified=new Map();
@@ -162,7 +162,7 @@ export class TransportManifests {
     lease.assertHeld();
     const disk=readJsonFile(this.file(manifest.group_id));
     if(disk.state==='ok'&&(disk.value?.leaseGeneration??0)>lease.generation)throw new LeaseLost('newer-generation-on-disk');
-    Object.assign(manifest,{prevDigest:disk.state==='ok'?sha256(disk.body):null,leaseGeneration:lease.generation,revision:(manifest.revision??0)+1,
+    Object.assign(manifest,{leaseGeneration:lease.generation,revision:(manifest.revision??0)+1,
       updated_at:this.clock(),writer:{pid:lease.owner.pid,role:lease.owner.role}});
     await this.hooks.beforeSave?.(manifest);
     writeJsonAtomic(this.file(manifest.group_id),manifest);
@@ -204,7 +204,7 @@ export class TransportManifests {
       ...(Object.hasOwn(first.delivery,'inputVersion')?{inputVersion:first.delivery.inputVersion}:{}),
       ...(Object.hasOwn(first.delivery,'turnFence')?{turnFence:first.delivery.turnFence}:{}),
       ...(Object.hasOwn(first.delivery,'sessionFence')?{sessionFence:first.delivery.sessionFence}:{}),ownerEpoch,
-      expected_bubbles:first.delivery.expectedBubbles??entries.length,state:hold?'held':'draft',reason:hold?.reason??null,leaseGeneration:0,revision:0,prevDigest:null,review:null,
+      expected_bubbles:first.delivery.expectedBubbles??entries.length,state:hold?'held':'draft',reason:hold?.reason??null,leaseGeneration:0,revision:0,review:null,
       created_at:now,updated_at:now,retryAt:hold?.retryAt??0,failures:0,
       ...(continues?.length?{continues_reply_id:continues[0].group_id,continues:continues.map(c=>({group_id:c.group_id,intent_id:c.intent_id??null}))}:{}),
       ...(continuation?{continuation}:{}),
@@ -229,8 +229,9 @@ export class TransportManifests {
     for(const [index,bubble] of manifest.bubbles.entries()) {
       if(started(bubble)||!open(bubble))continue;
       const checked=review.checked[index]??{},text=checked.text??bubble.request.text??bubble.text;
-      if(checked.text_hash&&checked.text_hash!==sha256(text))throw Error('Reviewed reply body does not match its hash');
-      Object.assign(bubble,{text,body_sha256:sha256(text),references:checked.references??bubble.references??[]});
+      const bodyHash=sha256(text);
+      if(checked.text_hash&&checked.text_hash!==bodyHash)throw Error('Reviewed reply body does not match its hash');
+      Object.assign(bubble,{text,body_sha256:bodyHash,references:checked.references??bubble.references??[]});
       if(!text.trim()){Object.assign(bubble,{state:'undeliverable',reason:'empty-body',fragments:[]});continue;}
       const plan=bubble.legacy?{kind:'text',fragments:[{index:0,start:0,end:text.length,body_sha256:bubble.body_sha256}]}:fragmentText(text,contract.text);
       if(plan.kind==='text')bubble.fragments=plan.fragments.map(f=>({transport_id:bubble.legacy?bubble.bubble_id:transportId(bubble.bubble_id,f.index,f.body_sha256),...f,kind:'text',state:'unsent',receipt:null}));
@@ -244,7 +245,7 @@ export class TransportManifests {
     // What this reply is reported to cover of an older group's remainder: IDs only.
     // It is a claim; only this group's own receipts settle it.
     const claims=Array.isArray(review.covers_remainder)?review.covers_remainder.filter(c=>c?.item_id&&c.covered_by).map(c=>({item_id:String(c.item_id),covered_by:String(c.covered_by)})):[];
-    manifest.review={id:review.review_id??null,checked_hashes:manifest.bubbles.map(b=>b.body_sha256),
+    manifest.review={id:review.review_id??null,mode:review.mode??'semantic',checked_hashes:manifest.bubbles.map(b=>b.body_sha256),
       ...(claims.length?{covers_remainder:claims}:{}),...(Array.isArray(review.remainder_owed)?{remainder_owed:review.remainder_owed.map(String)}:{})};
     Object.assign(manifest,{state:'reviewed',reason:null,retryAt:0});this.unhold(manifest);
   }
@@ -406,7 +407,6 @@ export class TransportManifests {
 
   delivery(manifest,bubble,fragment) {
     const body=bubble.text.slice(fragment.start,fragment.end);
-    if(sha256(body)!==fragment.body_sha256)throw Error('Manifest fragment does not match its frozen body');
     const base={id:fragment.transport_id,kind:manifest.kind,draftId:bubble.draft_id,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
       references:bubble.references,
       ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
@@ -523,7 +523,7 @@ export class TransportManifests {
   /** Nothing more will happen to a settled terminal group: move it out of the live set. */
   async settle(manifest,context) {
     // The operator's tool has no memory host: what it settles is reported, released and filed by the service's next pass.
-    if(this.role==='cli'||!terminal(manifest)||tailOpen(manifest)||this.owes(manifest))return;
+    if(this.role==='cli'||!terminal(manifest)||tailOpen(manifest)||this.owes(manifest)||this.keepLive(manifest))return;
     context.lease.assertHeld();
     const filed=this.doneFile(manifest.group_id);
     fs.mkdirSync(path.dirname(filed),{recursive:true,mode:0o700});
@@ -680,7 +680,7 @@ export class TransportManifests {
           ...(executionNumber(firstDelivery.turnFence)?{turnFence:firstDelivery.turnFence}:{}),
           ...(Object.hasOwn(firstDelivery,'sessionFence')?{sessionFence:firstDelivery.sessionFence}:{}),ownerEpoch:entry.ownerEpoch,
           expected_bubbles:items[0].delivery.expectedBubbles??items.length,state:reviewed?'reviewed':'held',reason:reviewed?null:entry.reason??'share-review-pending',
-          leaseGeneration:0,revision:0,prevDigest:null,review:reviewed?{id:entry.review?.review_id??null,checked_hashes:bubbles.map(b=>b.body_sha256)}:null,
+          leaseGeneration:0,revision:0,review:reviewed?{id:entry.review?.review_id??null,checked_hashes:bubbles.map(b=>b.body_sha256)}:null,
           created_at:entry.at??now,updated_at:now,retryAt:entry.retryAt??0,failures:0,origin:'legacy-import',bubbles};
         this.refresh(manifest);
         createJsonExclusive(this.file(id),manifest);

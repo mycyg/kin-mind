@@ -175,6 +175,12 @@ def dispatch(config, action, request):
     if action == "configure-model-capacity":
         from .model_runtime import configure_capacity
         return configure_capacity(engine, request["limit"])
+    if action == "reply-regenerate":
+        from .reply_review import ReplyReviews
+        provider = DeepSeek.from_engine(engine)
+        provider.timeout = 120
+        with declared("foreground", action):
+            return ReplyReviews(memory.sharing).regenerate(request, provider)
     if action == "share-preflight-group":
         from .reply_review import ReplyReviews
         provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None

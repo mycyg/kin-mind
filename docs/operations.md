@@ -250,21 +250,18 @@ Start `uvicorn examples.v1.callback:app --host 127.0.0.1 --port 8320`. Configure
 
 The callback runs with no database transaction open, so it may write back to MemoryPalace, including `acknowledge_delivery`, before it answers. Answer 2xx only after the effect is durable, and repeat the delivery id as `id` or `delivery_id` in the JSON answer. A 4xx answer is a definite refusal and may be retried. After a 5xx answer, a timeout or a network error the same body is sent again under the same `Idempotency-Key` only when the policy sets `idempotent_channel` and the channel's last 2xx answer repeated the id; `outbox_channel_contracts` records that evidence per callback URL. The body is frozen at the first dispatch, so a later correction of the record never changes the bytes of a retry. `GET /v1/contact/outbox` adds `phase: "dispatching"` to a `sending` delivery whose request is out.
 
-## Reproduce checks
+## Development and release checks
+
+Run relevant business regressions after implementation:
 
 ```sh
-uv run pytest -q
-npm test --prefix sdk/typescript
-npm test --prefix dsh-plugin
-npm test --prefix console
-uv run python scripts/generate_contract.py
-npm run generate --prefix sdk/typescript
-npm ci
-npm run docs:render
-uv run eventmem evaluate --output /tmp/replay.json
-uv run eventmem benchmark --scale full --root /tmp/new-scale-root --output /tmp/scale.json
-uv build
-uv run python scripts/check_wheel.py
+uv sync --extra dev --extra vector --extra graph
+uv run pytest -q tests/business
+node --test tests/business/*.test.mjs
 ```
 
-Scale fixtures need an empty root and roughly 10 GB disk space. The full test creates 100,000 memories, 1,000,000 knowledge vectors and corresponding SQLite records, and reports actual hardware and all target checks. CI runs routine tests; the scale workflow is separately invocable. The legacy replay adapter reads the fixed historical git commit, so use a full GitHub checkout for that comparison.
+Client checks use `npm test --prefix sdk/typescript`, `npm test --prefix dsh-plugin` and `npm test --prefix console` after their dependencies are installed. Tests live under `tests/`; optional historical and fault replays stay outside the working tree.
+
+`uv build` compiles console sources and includes the assets in both wheel and source distribution. Building from Git needs Node.js 22 and npm; installing a release wheel or building from its sdist needs no Node runtime. For editable development, run `npm ci --prefix console && npm run build --prefix console` when using the UI. Generated assets are ignored by Git.
+
+CI checks affected components once. Python 3.11 compatibility is run for release tags or the manual release option; ordinary checks use Python 3.13. Real-model replay, diagram rendering and large-scale benchmarks are deliberate acceptance tasks, not per-commit gates. Diagram sources and SVGs remain in the repository; render with `npm run docs:render` when a source changes.

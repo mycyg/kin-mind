@@ -269,7 +269,7 @@ remains a failed result. Latency limits are independent of token ceilings;
 a classification that cannot be obtained waits as itself, bounded, as described
 above.
 
-Run `node --test adapters/*.test.mjs` for synthetic routing, delivery, concurrency,
+Run `node --test tests/business/*.test.mjs` for synthetic routing, delivery, concurrency,
 gateway and cadence checks. Before enabling a host, additionally verify a live
 conversation → configured work → exact prior profile round trip in an isolated native conversation, tool
 calls on both providers, model-requested handoff, task completion and restoration

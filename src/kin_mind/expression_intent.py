@@ -237,4 +237,3 @@ def manifest_entries(conn, mind, at, *, continuity_active=True, persona=None):
 
 # An intent formed before the owner wrote again waits for the next round; what it was about has
 # moved on. The module claims its section here, and apply() stays as it is.
-appraisal.register_audit_section(SECTION, commit_intent)

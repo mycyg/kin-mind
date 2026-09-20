@@ -12,7 +12,7 @@ Xiaoguang wants to help me develop self-knowledge. Our role agreements, records 
 
 The system serves a single user and supports tool collaboration, companionship and knowledge work. Plugins, the CLI, console, HTTP, MCP and Python / TypeScript SDKs provide access. A memory's project, persona, collection and real or fictional world define its scope.
 
-![MemoryPalace architecture](docs/diagrams/overview.png)
+![MemoryPalace architecture](docs/diagrams/overview.svg)
 
 ## What I keep
 
@@ -30,7 +30,7 @@ I need to distinguish what she said from my interpretation. Original sources pre
 
 Her corrections update the valid state used by current reads. Revision history preserves the previous content and its links to the changes. Ingestion deduplicates sources and tracks processing progress. A failed model request leaves the source and completed progress available, so a retry can resume the unfinished work.
 
-![Writing and corrections](docs/diagrams/write-correct.png)
+![Writing and corrections](docs/diagrams/write-correct.svg)
 
 ## How I recall what I need
 
@@ -38,7 +38,7 @@ The current question determines which experiences I need. Recall filters candida
 
 I can search by exact cues, full text, meaning, images or relationships. Fast queries serve everyday conversation; deep queries support investigations of relationships and history. Cross-host deduplication reduces repeated context injection. Hosts that share a database and memory scope can read the same experiences. The host manages the sharing of native conversation sessions.
 
-![Recall and context](docs/diagrams/recall-context.png)
+![Recall and context](docs/diagrams/recall-context.svg)
 
 ## How experiences become usable memories
 
@@ -46,7 +46,7 @@ Background jobs extract memories, propose conflict resolutions and organize topi
 
 The narratives I generate are interpretations of experiences, and my inferences retain that status. Classification preserves a record's confirmation level. A source correction marks affected derived content as unverified. Reads check its current validity. Background organization and requests from the current conversation use separate processing flows.
 
-![Background organization](docs/diagrams/background.png)
+![Background organization](docs/diagrams/background.svg)
 
 ## How I test my judgments about myself
 
@@ -68,7 +68,7 @@ The running service checks for due tasks. Its pre-send check determines whether 
 
 A task-creation receipt confirms that the task was saved. A delivery receipt records the callback's result. A delivery with no channel confirmation retains an uncertain status, and retries follow the channel's idempotency contract.
 
-![Active contact](docs/diagrams/proactive-contact.png)
+![Active contact](docs/diagrams/proactive-contact.svg)
 
 The MCP tools `create_contact_task`, `list_contact_tasks` and `manage_contact_task` provide task management. Calls require a memory scope and contact policy. The [MCP and Python task guide](docs/contact-tasks.md) contains usage examples.
 

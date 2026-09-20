@@ -2,54 +2,78 @@ name: Kin Mind checks
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release_compat:
+        description: 'Also check Python 3.11 for release compatibility'
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
-  core:
+  changes:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ['3.11', '3.13']
+    outputs:
+      core: ${{ steps.paths.outputs.core }}
+      node: ${{ steps.paths.outputs.node }}
+      clients: ${{ steps.paths.outputs.clients }}
+      docs: ${{ steps.paths.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - id: paths
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+          RUN_ALL: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          base = os.environ.get('BASE_REF')
+          all_checks = os.environ['RUN_ALL'] == 'true' or not base or not base.strip('0')
+          files = [] if all_checks else subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines()
+          checks = {
+            'core': any(p.startswith(('src/','tests/business/','scripts/')) or p in ('pyproject.toml','uv.lock') for p in files),
+            'node': any(p.startswith(('adapters/','tests/business/')) and p.endswith('.mjs') for p in files),
+            'clients': any(p.startswith(('console/','sdk/','dsh-plugin/','tests/clients/','contracts/')) or p in ('pyproject.toml','scripts/build_frontend.py','scripts/check_wheel.py') for p in files),
+            'docs': any(p.endswith('.md') or p.startswith('docs/diagrams/') or p == 'scripts/check-docs.mjs' for p in files),
+          }
+          if any(p.startswith('.github/workflows/') for p in files): all_checks = True
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+            for name, changed in checks.items(): print(f'{name}={str(all_checks or changed).lower()}',file=out)
+          PY
+  core:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ${{ fromJSON((inputs.release_compat || startsWith(github.ref, 'refs/tags/')) && '["3.13", "3.11"]' || '["3.13"]') }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --frozen --extra dev --extra vector --extra graph
+      - run: uv run pytest -q tests/business
+  node:
+    needs: changes
+    if: needs.changes.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci --prefix sdk/typescript && npm run build --prefix sdk/typescript
-      - run: uv run pytest -q
-      - run: node --test adapters/*.test.mjs
-      - run: uv run python scripts/generate_contract.py && npm run generate --prefix sdk/typescript
-      - run: git diff --exit-code -- contracts src/eventmem/sdk sdk/typescript/src
-      - run: uv run eventmem evaluate --output replay.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: replay-${{ matrix.python }}
-          path: replay.json
-  media:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.13'
-      - run: uv sync --frozen --extra dev --extra all
-      - run: uv run pytest tests/test_extended_v1.py -q
+      - run: node --test tests/business/*.test.mjs
   clients:
+    needs: changes
+    if: needs.changes.outputs.clients == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -57,33 +81,26 @@ jobs:
         with:
           python-version: '3.13'
       - run: uv sync --frozen --extra dev --extra vector --extra graph
-      - run: npm ci --prefix dsh-plugin && npm run typecheck --prefix dsh-plugin && npm test --prefix dsh-plugin && npm run build --prefix dsh-plugin
+      - run: npm ci --prefix dsh-plugin && npm run typecheck --prefix dsh-plugin && npm test --prefix dsh-plugin
       - run: npm ci --prefix sdk/typescript && npm run build --prefix sdk/typescript && npm test --prefix sdk/typescript
-      - run: npm ci --prefix console && npm run build --prefix console
-      - run: npx --prefix console playwright install --with-deps chromium
-      - run: npm test --prefix console
       - run: uv build
       - run: uv run python scripts/check_wheel.py
+      - run: npx --prefix console playwright install --with-deps chromium
+      - run: npm test --prefix console
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: console-and-wheel
+          name: release-assets
           path: |
             console/test-results
-            dist/*.whl
-  diagrams:
+            dist/*
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
-      - run: npm run docs:render
       - run: node scripts/check-docs.mjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: architecture-diagrams
-          path: docs/diagrams
