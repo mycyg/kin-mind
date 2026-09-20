@@ -2,6 +2,7 @@ import http from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {usageRow} from './model-lease.mjs';
 import {contactDraftInstructions} from './contact-draft.mjs';
+import {emitInstructionEvidence,instructionTextEvidence,nativeInstructionRequestIdentity,developerInstructionEvidence,sha256,MAX_COMPANION_INSTRUCTION_BYTES} from './instruction-evidence.mjs';
 
 // A native turn is attributed per session, because the two kinds are not the same
 // spend: a chat turn is what the owner is waiting for, while contact drafts,
@@ -95,6 +96,7 @@ const unflattenItem = (item, reverse) => {
 // instructions to its supported system role; leave user data and receipts alone.
 export function deepseekRequest(body, reasoningEffort = 'high', profile = null) {
   if (body.model !== 'deepseek-flash' || !Array.isArray(body.input)) throw Error('unsupported-request');
+  if(body.instructions!==undefined&&typeof body.instructions!=='string')throw Error('unsupported-request');
   if (!['none','low','high','max'].includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
   const bound = profile === null ? null : gatewayProfile(profile);
   const result = {...body, reasoning: {effort: reasoningEffort}, max_output_tokens:Math.max(65536,body.max_output_tokens??0), store: false};
@@ -157,9 +159,14 @@ export function responseNormalizer(reverseTools = new Map()) {
   };
 }
 
-export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, timeoutMs = 300000,
-  reasoningEffort = 'high', lease = null, purposeFor = null, profile = null}) {
+export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = () => {}, onRequestEvidence = null,
+  requiredIncomingInstructions = null, timeoutMs = 300000, reasoningEffort = 'high', lease = null,
+  purposeFor = null, profile = null}) {
   if (!key) throw Error('deepseek-key-unavailable');
+  if(requiredIncomingInstructions!==null&&(!/^[a-f0-9]{64}$/.test(requiredIncomingInstructions?.sha256??'')||
+    !Number.isSafeInteger(requiredIncomingInstructions?.utf8Bytes)||requiredIncomingInstructions.utf8Bytes<1||
+    requiredIncomingInstructions.utf8Bytes>MAX_COMPANION_INSTRUCTION_BYTES))
+    throw Error('instruction-requirement-invalid');
   // A profile is host config, bound once here: every request this instance
   // serves gets the profile's lane/purpose and contract. Nothing in a request
   // body can move a profiled instance to another lane.
@@ -183,9 +190,16 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
     // One usage row per turn that actually reached the provider, on every exit.
     // A request that never got that far is not a call and is not billed as one.
     let attributed = {lane: null, purpose: null}, held = null, attempted = false, reported = false;
+    let requestEvidence = null, evidenceFinished = false;
     const report = value => {
       if (reported) return; reported = true;
-      onUsage(usageRow({...attributed, ...(held ? held.detail() : {}), ...value}));
+      try {emitInstructionEvidence(onUsage,usageRow({...attributed, ...(held ? held.detail() : {}), ...value}));} catch {}
+    };
+    const finishEvidence=(outcome,providerResponseId=null)=>{
+      if(!requestEvidence||evidenceFinished)return;evidenceFinished=true;
+      emitInstructionEvidence(onRequestEvidence,{...requestEvidence,stage:'terminal',outcome,
+        providerResponseId:typeof providerResponseId==='string'&&providerResponseId.length<=256?providerResponseId:null,
+        recordedAt:new Date().toISOString()});
     };
     try {
       let raw = '';
@@ -200,6 +214,19 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       attributed = attribute() ?? nativeTurnPurpose();
       const requestProfile=profile??(attributed.purpose==='native-contact-draft'?'contact-draft':null);
       const body = deepseekRequest(parsed, reasoningEffort, requestProfile);
+      const incomingInstructions=instructionTextEvidence(parsed.instructions);
+      const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:'deepseek',lane:attributed.lane,
+        purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,nativeRequestIdentity:nativeInstructionRequestIdentity(req.headers,parsed),
+        nativeRequestSha256:sha256(raw),developerInstructions:developerInstructionEvidence(parsed),
+        incomingInstructions,forwardedInstructions:instructionTextEvidence(body.instructions)};
+      if(requiredIncomingInstructions&&(incomingInstructions.sha256!==requiredIncomingInstructions.sha256||
+        incomingInstructions.utf8Bytes!==requiredIncomingInstructions.utf8Bytes)){
+        emitInstructionEvidence(onRequestEvidence,{...instructionContext,stage:'rejected-before-forward',
+          requestAttemptId:null,requestAttempt:0,attempted:false,outcome:'instruction-requirement-mismatch',
+          providerResponseId:null,requiredIncomingInstructions:{...requiredIncomingInstructions},recordedAt:new Date().toISOString()});
+        res.writeHead(400, {'Content-Type':'application/json'});
+        res.end(JSON.stringify({error:{message:'Instruction requirement mismatch',type:'configuration_error',code:'instruction_requirement_mismatch'}}));return;
+      }
       const reverseTools = profile === 'exploration' ? flattenExplorationTools(body) : new Map();
       if (lease) {
         held = await lease.acquire({lane: attributed.lane, purpose: attributed.purpose});
@@ -212,12 +239,17 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         held.signal?.addEventListener('abort', () => abort.abort(), {once: true});
       }
       attempted = true;
+      requestEvidence={...instructionContext,requestAttemptId:'ds-'+randomBytes(16).toString('hex'),
+        requestAttempt:1,attempted:true};
+      emitInstructionEvidence(onRequestEvidence,{...requestEvidence,stage:'forward-attempted',outcome:null,
+        providerResponseId:null,recordedAt:new Date().toISOString()});
       const upstream = await fetchImpl('https://api.deepseek.com/responses', {
         method: 'POST', redirect: 'error', signal: abort.signal,
         headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + key},
         body: JSON.stringify(body),
       });
       if (!upstream.ok) {
+        finishEvidence('provider-http-' + upstream.status);
         report({usage: null, usageStatus: 'unknown', outcome: 'provider-http-' + upstream.status});
         res.writeHead(upstream.status, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({error: {message: 'DeepSeek HTTP ' + upstream.status, type: 'provider_error'}})); return;
@@ -227,7 +259,9 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         const value = await upstream.json();
         value.output = (value.output ?? []).filter(item => !isPrivateOutput(item))
           .map(item => unflattenItem(item, reverseTools));
-        report({model: value.model, usage: value.usage, requestId: value.id, outcome: 'answered'});
+        const outcome=typeof value.status==='string'?value.status:'answered';
+        finishEvidence(outcome,value.id);
+        report({model: value.model, usage: value.usage, requestId: value.id, outcome});
         res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(value)); return;
       }
       res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'});
@@ -241,9 +275,11 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         if (['response.completed','response.failed','response.incomplete','error'].includes(event.type)) terminal = true;
         // A failed or incomplete response was still a call. Whatever usage it
         // reported is recorded; what it did not report is recorded as unknown.
-        if (['response.completed','response.failed','response.incomplete'].includes(event.type))
-          report({model: event.response?.model, usage: event.response?.usage, requestId: event.response?.id, outcome: event.type.slice(9)});
-        else if (event.type === 'error') report({usage: null, usageStatus: 'unknown', outcome: 'provider-error'});
+        if (['response.completed','response.failed','response.incomplete'].includes(event.type)) {
+          const outcome=event.type.slice(9);finishEvidence(outcome,event.response?.id);
+          report({model: event.response?.model, usage: event.response?.usage, requestId: event.response?.id, outcome});
+        } else if (event.type === 'error') {finishEvidence('provider-error',event.response?.id);
+          report({usage: null, usageStatus: 'unknown', outcome: 'provider-error'});}
         res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       };
       for await (const chunk of upstream.body) {
@@ -258,7 +294,10 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
     } catch {
       // An abort, a timeout and a broken stream all spent a call whose usage nobody
       // ever reported. That is unknown, not zero, and not nothing.
-      if (attempted) report({usage: null, usageStatus: 'unknown', outcome: held?.lost ? 'lease-lost' : held?.expired ? 'lease-expired-unconfirmed' : 'transport-incomplete'});
+      if (attempted) {
+        const outcome=held?.lost ? 'lease-lost' : held?.expired ? 'lease-expired-unconfirmed' : 'transport-incomplete';
+        finishEvidence(outcome);report({usage: null, usageStatus: 'unknown', outcome});
+      }
       // Never return provider bodies, credentials, or raw conversation data in errors.
       if (!res.headersSent) {
         res.writeHead(502, {'Content-Type': 'application/json'});
@@ -280,8 +319,8 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
  * The task lease stays on the python side; this instance only ever holds the
  * per-request model lease, one background slot per actual call. */
 export async function startExplorationGateway({key, lease = null, onUsage = () => {}, fetchImpl = fetch,
-  timeoutMs = 300000, reasoningEffort = 'high'} = {}) {
-  return startDeepSeekGateway({key, lease, onUsage, fetchImpl, timeoutMs, reasoningEffort,
+  onRequestEvidence = null, timeoutMs = 300000, reasoningEffort = 'high'} = {}) {
+  return startDeepSeekGateway({key, lease, onUsage, onRequestEvidence, fetchImpl, timeoutMs, reasoningEffort,
     profile: 'exploration'});
 }
 
@@ -291,7 +330,7 @@ export async function startExplorationGateway({key, lease = null, onUsage = () =
  * whether its trusted outer job lease makes a second model-lease acquisition
  * appropriate; this adapter never manufactures an admission bypass. */
 export async function startComputerActionReviewGateway({key, lease = null, onUsage = () => {},
-  fetchImpl = fetch, timeoutMs = 60000} = {}) {
-  return startDeepSeekGateway({key, lease, onUsage, fetchImpl, timeoutMs,
+  onRequestEvidence = null, fetchImpl = fetch, timeoutMs = 60000} = {}) {
+  return startDeepSeekGateway({key, lease, onUsage, onRequestEvidence, fetchImpl, timeoutMs,
     reasoningEffort: 'high', profile: 'computer-action-review'});
 }

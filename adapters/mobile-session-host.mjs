@@ -8,6 +8,7 @@ import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
 import {switchCodexModel,runtimeProfile,profileMatches} from './codex-models.mjs';
+import {sameInstructionBinding,verifyCompanionInstructions} from './instruction-evidence.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 const SAFE_PROVIDER=/^[A-Za-z0-9_-]{1,120}$/;
@@ -26,8 +27,10 @@ export function candidateRuntimeProfile(value={}) {
   return profile;
 }
 
-export function candidateConfigForRuntime(value,{catalogFile,gateway}={}) {
+export function candidateConfigForRuntime(value,{catalogFile,gateway,companionInstructions}={}) {
   const profile=candidateRuntimeProfile(value),config={model_catalog_json:catalogFile};
+  const companion=verifyCompanionInstructions(companionInstructions);
+  if(companion.enabled)config.model_instructions_file=companion.modelInstructionsFile;
   let modelProvider=profile.provider,endpointSha256=null;
   if(profile.providerKind==='gateway') {
     if(!gateway?.baseUrl||!gateway?.token)throw Error('Candidate gateway profile is unavailable');
@@ -39,7 +42,9 @@ export function candidateConfigForRuntime(value,{catalogFile,gateway}={}) {
   }
   const providerBinding={sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,launchProvider:modelProvider,endpointSha256};
   return {profile,providerBinding,modelProvider,reasoningEffort:profile.reasoningEffort,
-    fastMode:profile.serviceTierPreference==='fast'?'on':'off',config};
+    fastMode:profile.serviceTierPreference==='fast'?'on':'off',config,
+    developerInstructions:companion.enabled?companion.developerInstructions:undefined,
+    instructionBinding:companion.enabled?companion.evidence:null};
 }
 
 export function registryBinding(file,fallback){return fs.existsSync(file)?read(file).binding:fallback;}
@@ -61,7 +66,9 @@ export function bindAcceptedPrivateContext({bridge,contextToken,source,receipt})
   return receipt;
 }
 
-export async function loadCandidateSession({client,connection,binding,candidate,cwd,gateway}) {
+export async function loadCandidateSession({client,connection,binding,candidate,cwd,gateway,instructionBinding=null}) {
+  if(!sameInstructionBinding(candidate?.native?.instructionBinding,instructionBinding))
+    throw Error('Candidate instruction binding changed');
   client.beginSessionReplay();
   try {await connection.loadSession({sessionId:binding.threadId,cwd,mcpServers:[]});}
   finally {await client.endSessionReplay();}
@@ -87,6 +94,10 @@ export function recoverSessionStore(registry,saved,ownerId){
  * credentials, channel IDs or shared experiences are built into this module. */
 export async function startMobileSessions({bridge,root,config,routerConfig,mindCall,recordStatus=()=>{}}) {
   if(!config.adaptive_sessions)return null;
+  const companionInstructions=config.companion_instructions??{enabled:false};
+  // This is a preflight gate. Each later candidate launch verifies the bytes
+  // again so a long-running host cannot silently use a changed versioned file.
+  verifyCompanionInstructions(companionInstructions);
   const routing=bridge.mobileRouting,router=routing.router;
   const file=config.session_registry_file??path.join(root,'state/conversation-registry.json');
   const observationFile=config.session_observation_file??path.join(root,'state/session-observation.json');
@@ -96,7 +107,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
   let reader,readerId,initialScan=true,closed=false,running=false;
   const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
-    configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:path.join(root,'mobile-models.json'),gateway:routing.gateway}),
+    configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:path.join(root,'mobile-models.json'),gateway:routing.gateway,companionInstructions}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
@@ -143,7 +154,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       if(!session||session.processing||session.queue.length)throw Error('Host became busy before promotion');
       const connection=session.agentInfo.connection;
       if(!(await mindCall('session-validate',{checkpoint:candidate.checkpoint})).valid)throw Error('Checkpoint sources changed before promotion');
-      const loaded=await loadCandidateSession({client:session.client,connection,binding,candidate,cwd:path.join(root,'conversation'),gateway:routing.gateway});
+      const companion=verifyCompanionInstructions(companionInstructions);
+      const loaded=await loadCandidateSession({client:session.client,connection,binding,candidate,cwd:path.join(root,'conversation'),gateway:routing.gateway,
+        instructionBinding:companion.enabled?companion.evidence:null});
       const {actual}=loaded;
       session.agentInfo.sessionId=binding.threadId;session.configOptions=loaded.configOptions;session.agentInfo.configOptions=loaded.configOptions;
       await bridge.sessionManager.opts.persistSessionId(bridge.ownerId,binding.threadId);session.sessionIdPersisted=true;

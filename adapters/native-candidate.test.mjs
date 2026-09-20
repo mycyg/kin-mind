@@ -37,6 +37,24 @@ test('candidate request parameters preserve the supplied provider and do not inv
   assert.throws(()=>candidate.params({model:'gpt-5.6-sol',reasoningEffort:'medium'}),/incomplete/);
 });
 
+test('candidate start and resume bind companion instructions without exposing collaboration mode',async()=>{
+  const binding={modelInstructionsSha256:'a'.repeat(64),modelInstructionsUtf8Bytes:10,
+    developerInstructionsSha256:'b'.repeat(64),developerInstructionsUtf8Bytes:12};
+  let current=binding,started=0;
+  const config=value=>({...configForModel(value),config:{model_catalog_json:'/catalog.json',model_instructions_file:'/private/base.md'},
+    developerInstructions:'verified developer',instructionBinding:current});
+  const candidate=new NativeCandidate({cwd:'/synthetic',personaInstructions:'old persona',configForModel:config});
+  const params=candidate.params(nativeProfile);
+  assert.equal(params.config.model_instructions_file,'/private/base.md');assert.equal(params.developerInstructions,'verified developer');
+  assert.equal(Object.hasOwn(params,'collaborationMode'),false);assert.equal(Object.keys(params.config).some(key=>key.includes('collaboration')),false);
+  candidate.start=async()=>{started++;};candidate.request=async()=>response();
+  const native=await candidate.create({id:'candidate',profile:nativeProfile});
+  assert.deepEqual(native.instructionBinding,binding);assert.deepEqual(native.creationReceipt.requestedInstructionBinding,binding);
+  current={...binding,modelInstructionsSha256:'c'.repeat(64)};
+  await assert.rejects(candidate.load(native),/instruction binding changed/);
+  assert.equal(started,1,'the changed binding is rejected before another app-server start');
+});
+
 test('native response evidence never substitutes requested provider, effort or tier configuration',()=>{
   const candidate=new NativeCandidate({cwd:'/synthetic',personaInstructions:'persona',configForModel}),launch=candidate.launch(nativeProfile);
   assert.deepEqual(candidateResponseProfileEvidence(response(),launch),{model:'verified',modelProvider:'verified',reasoningEffort:'verified',serviceTierConfiguration:'verified'});

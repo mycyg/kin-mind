@@ -6,7 +6,8 @@ import path from 'node:path';
 import {SessionManager} from './session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from './session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
-import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime} from './mobile-session-host.mjs';
+import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime,startMobileSessions} from './mobile-session-host.mjs';
+import {sha256} from './instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
  launchProvider:profile.providerKind==='gateway'?'kin_session_gateway':profile.provider,endpointSha256:profile.providerKind==='gateway'?'a'.repeat(64):null});
@@ -68,6 +69,41 @@ test('maintenance candidate configuration uses the exact verified provider and F
  assert.equal(deepseek.profile.provider,'private-ds');assert.equal(deepseek.modelProvider,'kin_session_gateway');assert.equal(deepseek.config['model_providers.kin_session_gateway'].base_url,gateway.baseUrl);
  assert.deepEqual([deepseek.providerBinding.sourceProvider,deepseek.providerBinding.launchProvider,typeof deepseek.providerBinding.endpointSha256],['private-ds','kin_session_gateway','string']);
  assert.throws(()=>candidateConfigForRuntime({model:'gpt-5.6-sol',reasoningEffort:'medium',fastMode:'on'},{catalogFile:'/catalog.json',gateway}),/unverified/);
+});
+
+test('maintenance candidates keep the verified companion base and developer layers across launch and promotion',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-candidate-instructions-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const baseFile=path.join(dir,'base.md'),base='Verified base\n',developer='Verified developer\n';fs.writeFileSync(baseFile,base);
+ const companionInstructions={enabled:true,allowedRoot:dir,modelInstructionsFile:baseFile,modelInstructionsSha256:sha256(base),
+   developerInstructions:developer,developerInstructionsSha256:sha256(developer)};
+ const profile={provider:'openai-15m',providerKind:'native',model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'default'};
+ const launch=candidateConfigForRuntime(profile,{catalogFile:'/catalog.json',companionInstructions});
+ assert.equal(launch.config.model_instructions_file,fs.realpathSync(baseFile));assert.equal(launch.developerInstructions,developer);
+ assert.deepEqual(launch.instructionBinding,{modelInstructionsSha256:sha256(base),modelInstructionsUtf8Bytes:14,
+   developerInstructionsSha256:sha256(developer),developerInstructionsUtf8Bytes:19});
+ assert.equal(Object.hasOwn(launch.config,'developer_instructions'),false);
+ assert.equal(Object.keys(launch.config).some(key=>key.includes('collaboration')),false);
+
+ let loaded=0;const client={beginSessionReplay(){},async endSessionReplay(){}};
+ const connection={async loadSession(){loaded++;},async extMethod(){return {known:true,sessionId:'new',threadId:'new',nativeSessionId:'new',active:false,backgroundTasks:0,nativeStatus:'idle',model:'gpt-5.6-sol',modelProvider:'openai-15m',reasoningEffort:'medium',serviceTierPreference:'default',fastMode:'off',providerOverride:false};},
+   async setSessionConfigOption(){return {configOptions:[]};}};
+ const candidate={profile,native:{providerBinding:launch.providerBinding,instructionBinding:launch.instructionBinding},
+   verification:verifiedProfileReceipt(profile,launch.providerBinding)};
+ await loadCandidateSession({client,connection,binding:{threadId:'new',nativeSessionId:'new'},candidate,cwd:'/synthetic',instructionBinding:launch.instructionBinding});
+ assert.equal(loaded,1);
+ await assert.rejects(loadCandidateSession({client,connection,binding:{threadId:'new'},candidate,cwd:'/synthetic',instructionBinding:{...launch.instructionBinding,modelInstructionsSha256:'0'.repeat(64)}}),/instruction binding changed/);
+ assert.equal(loaded,1,'a changed instruction binding is rejected before main ACP load');
+
+ fs.writeFileSync(baseFile,'changed\n');
+ assert.throws(()=>candidateConfigForRuntime(profile,{catalogFile:'/catalog.json',companionInstructions}),/hash mismatch/);
+ assert.throws(()=>candidateConfigForRuntime(profile,{catalogFile:'/catalog.json',companionInstructions:{enabled:true}}),/incomplete/);
+});
+
+test('enabled companion maintenance fails before touching the live router when its instruction contract is incomplete',async()=>{
+ let touched=false;const bridge={get mobileRouting(){touched=true;throw Error('router must not be touched');}};
+ await assert.rejects(startMobileSessions({bridge,root:'/synthetic',config:{adaptive_sessions:true,companion_instructions:{enabled:true}},
+   mindCall:async()=>{}}),/configuration is incomplete/);
+ assert.equal(touched,false);
 });
 test('high pressure is compacted first; fifty historical compactions do not authorize rotation',async t=>{
  const f=fixture(t);await f.advise('rotate');assert.equal((await f.manager.tick()).reason,'compact-first');assert.ok(!f.calls.includes('create'));
