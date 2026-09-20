@@ -6,6 +6,8 @@ import {FINAL_NON_DELIVERY} from './work-lock-review.mjs';
 import {readThroughArchive} from './state-pruner.mjs';
 
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const NATIVE_DELIVERY_GAPS=new Set(['native-tool-outbox-not-unique','native-tool-outbox-invalid','native-tool-artifact-invalid']);
+const NATIVE_DELIVERY_CONFLICTS=new Set(['native-tool-receipt-ambiguous','native-tool-event-invalid','native-tool-proof-conflict']);
 
 /** Owner-bound evidence readers are injected by the private host. No model
  * is allowed to supply a filesystem path, recipient or delivery receipt.
@@ -13,7 +15,7 @@ const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('h
  * because the router starts before the reply guard does): a deferred reply is
  * a held manifest there, and the old `.pending.json` journal stays readable
  * for a host that runs with the manifest switched off. */
-export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null,archivedState={}}) {
+export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredDirectory,lastReply,wishes=async()=>[],cancelShare,failedInputDirectory,reconciliationFile,verifyReplacement,manifests=null,archivedState={},toolDeliveries=async()=>({proofs:[]})}) {
   // Every lookup here asks for one record by name, so each of them can afford to
   // look in the archive after missing. The directory scan below deliberately does
   // not: walking the archive as well would undo the reason anything was moved
@@ -35,9 +37,17 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
   async function collect(snapshot) {
     const ids=[...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])];
     const allMessages=fs.existsSync(outboxDirectory)?fs.readdirSync(outboxDirectory).filter(f=>f.endsWith('.json')).map(f=>read(path.join(outboxDirectory,f))).filter(Boolean):[];
-    const byMessage=new Map(allMessages.filter(r=>r.state==='accepted'&&r.messageId).map(r=>[r.messageId,r]));
+    const byMessage=new Map();
+    for(const record of allMessages.filter(r=>r.messageId)){
+      const list=byMessage.get(record.messageId)??[];list.push(record);byMessage.set(record.messageId,list);
+    }
+    const messageById=id=>{
+      const records=byMessage.get(id)??[];
+      if(records.length>1)throw Error('Platform message identity collision');
+      return records[0];
+    };
     const acceptedFiles=Object.values(snapshot.task.deliveries??{}).filter(d=>d.state==='accepted'&&d.messageId)
-      .map(d=>byMessage.get(d.messageId)).filter(r=>r?.artifact);
+      .map(d=>messageById(d.messageId)).filter(r=>r?.artifact);
     const inputs=ids.map(id=>{
       if(!/^[\w:-]+$/.test(id))throw Error('Invalid host input id');
       let source=read(path.join(inputDirectory,id+'.json'));
@@ -52,7 +62,9 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
     const receipts={},outputs=[],cancellableDeferred=[],deferredProofs={},deferredGroups={};
     for(const [id,delivery] of Object.entries(snapshot.task.deliveries??{})) {
       const reconciliation=reconciliationFile?read(reconciliationFile)?.deliveries?.[id]:null;
-      const message=outbox(delivery.outboxId??reconciliation?.attemptId??id)??byMessage.get(delivery.messageId);
+      const messageByOutbox=outbox(delivery.outboxId??reconciliation?.attemptId??id);
+      const messageByPlatform=delivery.messageId?messageById(delivery.messageId):null;
+      const message=messageByOutbox??messageByPlatform;
       if(reconciliation&&verifyReplacement) {
         const proof=await verifyReplacement(reconciliation,message);
         if(proof?.state==='not-submitted'&&proof.fulfilledBy?.length) {
@@ -116,6 +128,84 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
         }
       }
     }
+    // The host joins original completed tool results to current platform receipts.
+    // A model's completion claim or a matching filename is not a delivery proof.
+    // Re-read this on every collect, including the pre-commit evidence check.
+    const native=await toolDeliveries(snapshot);
+    if(!native||!Array.isArray(native.proofs)||(native.diagnostics!==undefined&&!Array.isArray(native.diagnostics)))throw Error('Invalid native delivery evidence');
+    const deliveryEvidenceGaps=[],diagnosticSeen=new Set();
+    for(const diagnostic of native.diagnostics??[]) {
+      const keys=diagnostic&&typeof diagnostic==='object'&&!Array.isArray(diagnostic)?Object.keys(diagnostic).sort():[];
+      const key=keys.length===2&&keys[0]==='code'&&keys[1]==='toolId'?diagnostic.toolId+'\u0000'+diagnostic.code:'';
+      if(!key||typeof diagnostic.toolId!=='string'||!/^[\w:-]+$/.test(diagnostic.toolId)
+        ||snapshot.task.tools?.[diagnostic.toolId]?.status!=='completed'
+        ||(!NATIVE_DELIVERY_GAPS.has(diagnostic.code)&&!NATIVE_DELIVERY_CONFLICTS.has(diagnostic.code))
+        ||diagnosticSeen.has(key))throw Error('Invalid native delivery evidence');
+      diagnosticSeen.add(key);
+      if(NATIVE_DELIVERY_CONFLICTS.has(diagnostic.code))throw Error('Native delivery evidence integrity conflict');
+      deliveryEvidenceGaps.push({toolId:diagnostic.toolId,code:diagnostic.code});
+    }
+    deliveryEvidenceGaps.sort((a,b)=>a.toolId.localeCompare(b.toolId)||a.code.localeCompare(b.code));
+    const nativeSeen=new Set(),nativeMessages=new Set();
+    for(const proof of native.proofs) {
+      if(proof?.state!=='accepted'||proof.source!=='native-tool-outbox'
+        ||proof.sessionId!==sessionId||proof.taskId!==snapshot.task.id
+        ||typeof proof.id!=='string'||!/^[\w:-]+$/.test(proof.id)
+        ||typeof proof.messageId!=='string'||!proof.messageId
+        ||snapshot.task.tools?.[proof.toolId]?.status!=='completed'
+        ||!/^[a-f0-9]{64}$/.test(proof.sourceHash??'')
+        ||!/^[a-f0-9]{64}$/.test(proof.artifact?.sha256??'')
+        ||!Number.isSafeInteger(proof.artifact?.bytes)||proof.artifact.bytes<=0
+        ||!['image','file','audio','video'].includes(proof.artifact?.type)
+        ||typeof proof.artifact?.name!=='string')throw Error('Invalid native delivery proof');
+      const id='native-tool:'+proof.id,proofHash=digest(proof);
+      if(nativeSeen.has(id))throw Error('Duplicate native delivery proof');
+      nativeSeen.add(id);
+      if(nativeMessages.has(proof.messageId))throw Error('Duplicate native delivery message');
+      nativeMessages.add(proof.messageId);
+
+      // One platform message is one result. If the router already owns that accepted
+      // delivery, the independently verified artifact enriches the same output; it
+      // never creates a second result under the supplemental namespace.
+      const deliveryOwners=Object.entries(snapshot.task.deliveries??{})
+        .filter(([,delivery])=>delivery?.messageId===proof.messageId).map(([owner])=>owner);
+      const receiptOwners=Object.entries(receipts)
+        .filter(([,receipt])=>receipt?.messageId===proof.messageId).map(([owner])=>owner);
+      const owners=[...new Set([...deliveryOwners,...receiptOwners])];
+      if(Object.hasOwn(receipts,id)&&(!owners.length||owners.length!==1||owners[0]!==id))
+        throw Error('Native delivery identity collision');
+      if(owners.length) {
+        if(owners.length!==1)throw Error('Native delivery message collision');
+        const owner=owners[0],delivery=snapshot.task.deliveries?.[owner];
+        if(delivery?.state!=='accepted'||delivery.messageId!==proof.messageId)
+          throw Error('Native delivery message collision');
+        const output=outputs.find(item=>item.id===owner),message=messageById(proof.messageId);
+        if(output?.toolId&&output.toolId!==proof.toolId)throw Error('Native delivery tool collision');
+        if(owner.startsWith('file-tool:')&&owner.slice(10)!==proof.toolId)
+          throw Error('Native delivery tool collision');
+        const originalFile={
+          type:output?.file?.type??message?.media?.type??message?.artifact?.type,
+          name:output?.file?.name??message?.media?.name??message?.artifact?.name,
+          sha256:output?.file?.sha256??message?.artifact?.sha256,
+          bytes:output?.file?.bytes??message?.artifact?.bytes??message?.media?.bytes,
+        };
+        if(output?.file||message?.media||message?.artifact) {
+          for(const key of ['type','name','sha256','bytes'])
+            if(originalFile[key]!=null&&originalFile[key]!==proof.artifact[key])
+              throw Error('Native delivery artifact collision');
+        }
+        receipts[owner]={...receipts[owner],state:'accepted',messageId:proof.messageId,
+          nativeSourceHash:proof.sourceHash,proofHash};
+        const enriched={toolId:proof.toolId,file:{...proof.artifact},receivedByServer:true};
+        if(output)Object.assign(output,enriched);
+        else outputs.push({id:owner,text:'',...enriched});
+        continue;
+      }
+      // Do not let supplemental evidence overwrite a router-owned delivery.
+      receipts[id]={state:'accepted',messageId:proof.messageId,source:'native-tool-outbox',
+        sourceHash:proof.sourceHash,proofHash};
+      outputs.push({id,toolId:proof.toolId,text:'',file:{...proof.artifact},receivedByServer:true});
+    }
     const reply=await lastReply();
     const background=(await wishes()).filter(w=>w.kind==='explore'&&['wanted','waiting','in_progress'].includes(w.status)&&!w.expired&&!w.needs_review)
       .map(w=>({id:w.id,kind:w.kind,status:w.status,topic:w.topic,content:w.content,sourceInputIds:(w.evidence??[]).map(e=>e.source_key).filter(id=>ids.includes(id))})).filter(w=>w.sourceInputIds.length);
@@ -124,7 +214,7 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
       toolSummary:{total:toolEntries.length,completed:toolEntries.filter(([,t])=>t.status==='completed').length},
       tools:Object.fromEntries(toolEntries.filter(([,t])=>t.status!=='completed'))},inputs,outputs,
       lastPublicReply:reply?{text:reply.text,status:reply.status,turnId:reply.turnId}:null,
-      backgroundWishes:background,cancellableDeferred},receipts,deferredProofs,...(Object.keys(deferredGroups).length?{deferredGroups}:{})};
+      backgroundWishes:background,cancellableDeferred,...(deliveryEvidenceGaps.length?{deliveryEvidenceGaps}:{})},receipts,deferredProofs,...(Object.keys(deferredGroups).length?{deferredGroups}:{})};
   }
   /** A deferred group is cancelled as the unit it was deferred as: the reservation of every one of
    * its bubbles is released, not only the first one's. */

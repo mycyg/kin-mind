@@ -285,7 +285,11 @@ class Explorations:
         # A result without a definitive answer still supports reflection and sharing.
         # Only final reports and execution receipts enter memory, never tool traces.
         observation_ids = []
-        from .source_ledger import valid_computer_receipt, valid_web_receipt
+        from .source_ledger import (
+            valid_computer_receipt,
+            valid_web_receipt,
+            web_delivery,
+        )
         observations = [observation for observation in data.get("observations", [])
                         if valid_computer_receipt(observation, execution_id=eid,
                                                   attempt=data.get("attempt", 1))]
@@ -309,10 +313,16 @@ class Explorations:
                 continue
             observed = self.engine.receive(SourceInput(namespace="kin-web-observation", key=receipt["evidence_id"],
                 scope=self.mind.scope, authority="document", kind="observation", session=eid,
-                text=dumps({k: v for k, v in receipt.items() if k in {"locator", "requested_locator", "title", "version", "excerpt", "content_type", "truncated"}}),
+                text=dumps({k: v for k, v in receipt.items() if k in {
+                    "locator", "requested_locator", "title", "version", "excerpt", "content_type",
+                    "truncated", "receipt_format", "content_sha256", "content_chars",
+                    "raw_body_sha256", "raw_body_bytes", "delivered_ranges", "http_status",
+                    "semantic_classification", "body_bytes_representation", "raw_body_complete",
+                }}),
                 occurred_at=receipt.get("read_at") or self.mind.clock(), extract=False,
                 metadata={"host_event": "web-observation", "executor": "codex-cli",
-                          "locator": receipt["locator"], "resource_version": receipt["version"]}))
+                          "locator": receipt["locator"], "resource_version": receipt["version"],
+                          "stored_content": "excerpt", "delivery": web_delivery(receipt)}))
             observation_ids.append(observed["id"])
         executor = data.get("executor") or "codex-cli"
         source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,

@@ -42,7 +42,7 @@ def accept_result(mind, config, request, provider=None):
     if result.get("state") != "produced" or renewal["state"] != "renewed":
         return plans.settle(run_id, owner, fence, state="interrupted" if result.get("state") == "interrupted" or renewal["state"] != "renewed" else "failed", result=base)
     receipt = result.get("receipt", {})
-    if receipt.get("model") != config.get("creation_model", "gpt-6-astra") or receipt.get("run_id") != run_id or receipt.get("exit_code") != 0 or not receipt.get("thread_id"):
+    if receipt.get("model") != config.get("creation_model", "gpt-5.6-sol") or receipt.get("run_id") != run_id or receipt.get("exit_code") != 0 or not receipt.get("thread_id"):
         raise Conflict("Native creation receipt is incomplete")
     root = Path(config["creation_directory"]).resolve(strict=True)
     workspace = Path(receipt["workspace"]).resolve(strict=True)

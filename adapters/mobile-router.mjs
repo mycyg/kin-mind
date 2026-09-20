@@ -5,11 +5,18 @@ import {writeJsonAtomic,readJsonFile,loadJson} from './atomic-json.mjs';
 import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {messageIntents} from './mobile-reviewer.mjs';
+import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile} from './codex-models.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
-export const ROUTER_MODELS = Object.freeze({chat:'deepseek-flash',work:'gpt-6-astra'});
+const SHA256=/^[a-f0-9]{64}$/i;
+const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conversationId','generation','id','ownerBindingSha256','sourceSha256','version'];
+export const ROUTER_PROFILES = Object.freeze({
+  chat:Object.freeze({model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}),
+  work:Object.freeze({model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
+});
+export const ROUTER_MODELS = Object.freeze({chat:ROUTER_PROFILES.chat.model,work:ROUTER_PROFILES.work.model});
 const LEDGER_TAIL_BYTES=1024*1024;
 /** The longest a second attempt at one classification may wait. */
 export const CLASSIFY_RETRY_MAX_MS=45000;
@@ -97,8 +104,8 @@ export class MobileRouter {
    * whether to stop the running task, whether a file was asked for, what they call themselves
    * — and lets an owner message with attachments be classified instead of assumed to be work.
    * Left off, every request and every record is what it was before intents existed. */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true});
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
     this.tail=Promise.resolve();this.inflight=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
@@ -111,8 +118,10 @@ export class MobileRouter {
       if(this.state.sessionId!==sessionId&&!this.state.conversationId)throw Error('Unmigrated router session mismatch');
       this.state.conversationId=binding.conversationId;this.state.generation=binding.generation;this.state.nativeSessionId=binding.nativeSessionId;this.state.sessionId=sessionId;
     }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
-    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};
+    this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};this.state.reclassifications??={};
+    this.state.executionEpoch??=0;this.state.forceBoundaries??=[];this.state.autoIdleProfile??=clone(ROUTER_PROFILES.chat);
     for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
+    for(const request of Object.values(this.state.requests))if(request.forceState==='interrupting')request.forceState='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
     // A classification attempt interrupted mid-call is retried, never concluded.
     for(const entry of Object.values(this.state.semanticPending))if(entry.state==='classifying')entry.state='retry';
@@ -164,26 +173,77 @@ export class MobileRouter {
       runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) || runtime.nativeStatus!=='idle' || runtime.active ||
       runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0 || runtime.handoffTasks>0;
   }
-  verified(runtime,model) {
-    return runtime.known&&runtime.profileReady!==false&&runtime.model===model&&
+  nativeBusy(runtime,{confirmedForce=false}={}) {
+    const wrongNative=!runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
+      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) || runtime.nativeStatus!=='idle';
+    // Once forceSwitch has confirmed `interrupted`/`idle`, `active` and
+    // backgroundTasks may still describe the old coordinator sender/tool ledger.
+    // They remain durable evidence, but no longer veto the hot switch.
+    return wrongNative||!confirmedForce&&(runtime.active||runtime.backgroundTasks>0);
+  }
+  verified(runtime,profile) {
+    return runtime.known&&runtime.profileReady!==false&&profileMatches(runtime,profile)&&
       runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===(this.state.nativeSessionId??this.sessionId);
+  }
+  async availableModels() {
+    try{return normalizeModelCatalog(await this.modelCatalog?.()??[]);}catch{return [];}
+  }
+  async resolvedProfile(profile) {
+    if(!profile||profile.model==='__unsupported__'||profile.reasoningEffort==='__unsupported__'||profile.serviceTierPreference==='__unsupported__')throw Error('Unsupported model profile');
+    if(this.resolveProfile)return clone(await this.resolveProfile(clone(profile)));
+    if(this.modelCatalog)return resolveModelProfile(profile,await this.modelCatalog());
+    return clone(profile);
+  }
+  async switchTo(profile,{forceBoundary=null}={}) {
+    const target=await this.resolvedProfile(profile);
+    const actual=await this.switchModel(target.model,target,{forceBoundary:forceBoundary?clone(forceBoundary):null});
+    actual.serviceTierPreference??=actual.fastMode==='on'||actual.fastMode===true?'fast':actual.fastMode==='off'||actual.fastMode===false?'default':null;
+    return {actual,target};
+  }
+  automaticIdleProfile() {return clone(this.state.autoReturnProfile??this.state.autoIdleProfile??ROUTER_PROFILES.chat);}
+  desiredProfile(runtime,{route=null}={}) {
+    if(this.state.mode==='manual'&&this.state.manualProfile)return clone(this.state.manualProfile);
+    if(this.tasks().length||this.state.mode==='work'||route==='work')return clone(ROUTER_PROFILES.work);
+    return this.automaticIdleProfile()??runtimeProfile(runtime);
+  }
+  captureAutomaticReturn(runtime) {
+    if(this.state.mode==='manual')return false;
+    const complete=profile=>Boolean(profile?.provider&&profile?.providerKind&&profile?.model&&profile?.reasoningEffort&&profile?.serviceTierPreference);
+    if(this.state.autoReturnProfile)return complete(this.state.autoReturnProfile);
+    if(!this.verified(runtime,runtime.model))return false;
+    const profile=runtimeProfile(runtime);if(!complete(profile))return false;
+    this.state.autoReturnProfile=profile;this.state.autoIdleProfile=clone(profile);return true;
   }
   async reconcileTransition(runtime) {
     const transition=this.state.transition;
     if(transition?.state!=='unconfirmed'||this.busy(runtime))return runtime;
-    const expected=this.tasks().length?ROUTER_MODELS.work:runtime.model;
-    if(Object.values(ROUTER_MODELS).includes(expected)&&this.verified(runtime,expected)) {
+    // Pre-profile revisions persisted only model names. They can be reconciled
+    // when the live runtime proves it is already at `to` or back at `from`, but
+    // they do not authorize inventing an old effort/provider/tier and switching
+    // to modern defaults.
+    if(!transition.targetProfile&&transition.to&&this.verified(runtime,{model:transition.to})) {
+      this.finishTransition(runtime);transition.state='applied-reconciled';this.state.actual=runtime;this.save('switch-reconciled',{model:runtime.model,legacy:true});return runtime;
+    }
+    if(!transition.fromProfile&&transition.from&&this.verified(runtime,{model:transition.from})) {
+      this.finishTransition(runtime);transition.state='failed-restored';this.state.actual=runtime;this.save('switch-reconciled',{model:runtime.model,legacy:true});return runtime;
+    }
+    if(!transition.targetProfile||!transition.fromProfile) {
+      if(transition.waitingReason!=='legacy-profile-unavailable') {transition.waitingReason='legacy-profile-unavailable';this.save('switch-reconciliation-pending',{model:runtime.model,reason:transition.waitingReason});}
+      return runtime;
+    }
+    const expected=transition.targetProfile;
+    if(expected?.model&&this.verified(runtime,expected)) {
       this.finishTransition(runtime);
-      transition.state=runtime.model===transition.to?'applied-reconciled':'failed-restored';
+      transition.state=profileMatches(runtime,transition.targetProfile??{model:transition.to})?'applied-reconciled':'failed-restored';
       this.state.actual=runtime;this.save('switch-reconciled',{model:runtime.model});return runtime;
     }
-    // One recovery attempt restores the work provider. It never replays an input
-    // whose native acceptance is uncertain, and never replaces a busy runtime.
+    // One recovery attempt restores the exact pre-switch profile. It never replays
+    // an input whose native acceptance is uncertain, and never replaces a busy runtime.
     if(transition.recoveryAttemptedAt)return runtime;
     transition.recoveryAttemptedAt=this.now();this.save('switch-recovery-requested');
     try {
-      const actual=await this.switchModel(ROUTER_MODELS.work);
-      if(!this.verified(actual,ROUTER_MODELS.work))throw Error('Unverified recovery');
+      const recovery=transition.fromProfile,{actual,target}=await this.switchTo(recovery);
+      if(!this.verified(actual,target))throw Error('Unverified recovery');
       this.finishTransition(actual);transition.state='failed-restored';this.save('switch-recovered');return actual;
     } catch {this.save('switch-recovery-unconfirmed');return runtime;}
   }
@@ -191,12 +251,12 @@ export class MobileRouter {
     let task=this.currentTask();
     if(!task) {
       const id='work-'+digest(input.id).slice(0,24);
-      task={id,conversationId:this.state.conversationId,generation:this.state.generation,status:'running',requiresDelivery:!['repair','exploration-plan','proactive'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text.slice(0,1200),tools:{},deliveries:{},createdAt:this.now()};
+      task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text.slice(0,1200),tools:{},deliveries:{},createdAt:this.now()};
       this.state.tasks[id]=task;
     }
     if(!task.inputIds.includes(input.id)) {task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
     if(!input.kind||input.kind==='owner')task.requiresDelivery=true;
-    this.state.mode='work'; return task;
+    return task;
   }
   async select(input) {
     return this.locked(async()=>{
@@ -216,7 +276,7 @@ export class MobileRouter {
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
       if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
+      let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null,profile=null,force=false;
       // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
       const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
       let tail=null,offered=null,classified=false,semanticFailure=null;
@@ -225,7 +285,7 @@ export class MobileRouter {
         // A literal stop needs no model: whatever is still unsent is retired by the host itself.
         if(owner&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
       }
-      else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;
+      else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;force=['work','auto'].includes(command);
       } else if(command==='compact') {decision='maintenance';reason='native-compact';
       // An owner message with attachments used to be work without anyone reading it. With
       // intents on it is classified like any other, with the attachment metadata in view.
@@ -241,7 +301,7 @@ export class MobileRouter {
         const files=intents?attachmentMetadata(input.attachments):[];
         try {
           const result=await this.askClassification(input,{files,intents,offered,runtime,wait:this.state.config.classifierTimeoutMs});
-          ({decision,reason,command,recall,fileSend,stopIntent}=this.readClassification(result,{owner,intents,allowStop:true}));
+          ({decision,reason,command,recall,fileSend,stopIntent,profile,force}=this.readClassification(result,{owner,intents,allowStop:true}));
           if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
             :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
         } catch(error) {
@@ -275,7 +335,8 @@ export class MobileRouter {
       const locked=this.applyRouteLock(input,{decision,reason,intent,command,runtime});
       ({decision,reason}=locked);
       const task=locked.task;
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{})};
+      const modeControl=decision==='control'&&['manual','auto','work'].includes(command);
+      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}: {})};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner')this.rememberOwner(input);
       this.save('input-selected',{id:input.id,route:decision,reason});return clone(record);
@@ -286,7 +347,8 @@ export class MobileRouter {
   async askClassification(input,{files=[],intents=false,offered=null,runtime=null,wait}) {
     let timer;
     const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime?.active&&runtime.model===ROUTER_MODELS.work),timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+    const availableModels=await this.availableModels();
+    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
   /** A classification answer, validated and read within its bounds. Never owns the
@@ -294,7 +356,7 @@ export class MobileRouter {
   readClassification(result,{owner,intents,allowStop=false}={}) {
     if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
     let command=null;
-    if(result.route==='control') {if(!owner||!['status','watch','work','auto'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
+    if(result.route==='control') {if(!owner||!['status','watch','work','auto','manual'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
     const decision=result.route,reason=result.reason?.slice(0,200)??'classification';
     let recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
     // Only the bounded reading of the intents is kept, and only when they were asked for.
@@ -312,7 +374,13 @@ export class MobileRouter {
       for(const task of this.tasks())task.cancelRequested=true;
       stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
     }
-    return {decision,reason,command,recall,fileSend,stopIntent};
+    const profile=command==='manual'?clone(result.profile):null;
+    if(command==='manual'&&(!profile?.model||!profile.reasoningEffort||!profile.serviceTierPreference))throw Error('Invalid model profile');
+    if(result.force!==undefined&&typeof result.force!=='boolean')throw Error('Invalid force decision');
+    // An explicit owner profile/mode control is immediate by default. `false` is
+    // reserved for the semantic case where the owner expressly asked to wait.
+    const force=owner&&['manual','auto','work'].includes(command)&&result.force!==false;
+    return {decision,reason,command,recall,fileSend,stopIntent,profile,force};
   }
   /** DeepSeek judges meaning; its answer never owns the execution lock. Real work
    * keeps its model, tools and delivery lock; a chat that arrives while work is
@@ -349,43 +417,48 @@ export class MobileRouter {
         const runtime=await this.reconcileTransition(await this.inspect());
         if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
         if(record.route==='control') {
-          this.acceptControl(record,runtime);record.state='accepted';record.acceptedAt=this.now();
-          this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:runtime.model};
+          const request=await this.acceptControl(record,runtime);
+          const applied=request?await this.applyModeRequest(request,runtime):{runtime};
+          record.state='accepted';record.acceptedAt=this.now();
+          this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:(applied.runtime??runtime).model,state:request?.state};
         }
         if(record.route==='maintenance'&&this.busy(runtime))return null;
-        let target=record.route==='maintenance'?runtime.model:ROUTER_MODELS[record.route];
-        if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work'))target=ROUTER_MODELS.work;
+        let targetProfile=record.route==='maintenance'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+        if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
+        if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
+        targetProfile=await this.resolvedProfile(targetProfile);
+        let target=targetProfile.model;
         // A queued work request must not change the provider mid-DeepSeek turn.
-        if((target!==runtime.model||runtime.profileReady===false)&&this.busy(runtime))return null;
+        if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&this.busy(runtime))return null;
         if(!runtime.known)throw Error('Native runtime requires reconciliation');
         if(this.state.transition?.state==='unconfirmed')throw Error('Provider switch requires reconciliation');
-        if(target!==runtime.model||runtime.profileReady===false) {
-          this.startTransition(runtime,target,record.reason,'input',input.id);this.save('switch-requested');
+        if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
+          this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
           try {
-            const actual=await this.switchModel(target);
-            if(!this.verified(actual,target))throw Error('Provider verification failed');
+            const switched=await this.switchTo(targetProfile),actual=switched.actual;targetProfile=switched.target;target=targetProfile.model;
+            if(!this.verified(actual,targetProfile))throw Error('Provider verification failed');
             this.finishTransition(actual);this.save('switch-applied',{model:target});
           } catch {
-            // No owner input has been submitted. Restore the work provider only
-            // after a fresh idle check; ambiguous restoration remains held.
+            // No owner input has been submitted. Restore the exact profile observed
+            // before this attempt; ambiguous restoration remains held.
             try {
               const current=await this.inspect();if(this.busy(current))throw Error('busy');
-              const restored=await this.switchModel(ROUTER_MODELS.work);
-              if(!this.verified(restored,ROUTER_MODELS.work))throw Error('restore-unconfirmed');
-              this.finishTransition(restored);this.state.transition.state='failed-restored';target=ROUTER_MODELS.work;
+              const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
+              if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
+              this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
               if(!record.taskId&&!record.command)record.taskId=this.addTask(input).id;
               this.save('switch-failed-restored');
             } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
           }
         } else this.state.actual=runtime;
-        if(target===ROUTER_MODELS.work&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
+        if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
         if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-        if(input.kind==='proactive'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
-        record.state='preparing';record.model=target;this.save('input-preparing',{id:input.id});
+        if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
+        record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;this.save('input-preparing',{id:input.id});
         const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
         if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
         try {
-          const route=await submit({model:target,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null},markSubmitted);
+          const route=await submit({model:target,profile:targetProfile,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
           if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
           record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
           return{route,model:target};
@@ -449,7 +522,7 @@ export class MobileRouter {
         const runtime=await this.inspect();
         const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,runtime});
         Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
-          taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{})});
+          taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(read.decision==='control'&&['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
         if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
         e.state='classified';e.updatedAt=this.now();
         this.save('input-classified-late',{id,route:locked.decision,reason:locked.reason,attempts:e.attempts});
@@ -461,77 +534,243 @@ export class MobileRouter {
       return this.recordModeRequest(request);
     });
   }
+  /** Recover one already accepted owner message whose original semantic route was
+   * wrong. The private host authenticates the source and asks the current DS
+   * classifier; this boundary validates and records only cryptographic evidence
+   * plus the bounded control decision. It never dispatches the old input again. */
+  async reclassifyAcceptedControl({commandId,sourceInputId,sourceHash,expectedRevision,evidence,decision}) {
+    return this.locked(async()=>{
+      const exactId=(value,max=200)=>{const v=label(value,max);if(v!==value)throw Error('Invalid reclassification identifier');return v;};
+      commandId=exactId(commandId);sourceInputId=exactId(sourceInputId);
+      if(!SHA256.test(sourceHash??'')||!Number.isSafeInteger(expectedRevision)||expectedRevision<0||!evidence||typeof evidence!=='object')throw Error('Invalid reclassification basis');
+      if(JSON.stringify(Object.keys(evidence).sort())!==JSON.stringify(RECLASSIFICATION_EVIDENCE_KEYS))throw Error('Invalid reclassification evidence fields');
+      const summary={id:exactId(evidence.id),version:evidence.version,sourceSha256:evidence.sourceSha256,acceptanceSha256:evidence.acceptanceSha256,
+        ownerBindingSha256:evidence.ownerBindingSha256,actualSessionId:exactId(evidence.actualSessionId),conversationId:exactId(evidence.conversationId),generation:evidence.generation};
+      if(!Number.isSafeInteger(summary.version)||summary.version<1||!Number.isSafeInteger(summary.generation)||summary.generation<1||
+        !SHA256.test(summary.sourceSha256??'')||!SHA256.test(summary.acceptanceSha256??'')||!SHA256.test(summary.ownerBindingSha256??''))throw Error('Invalid reclassification evidence');
+      const encoded=JSON.stringify(decision);if(!decision||typeof decision!=='object'||encoded.length>8000)throw Error('Invalid reclassification decision');
+      const basisHash=digest({commandId,sourceInputId,sourceHash,expectedRevision,evidence:summary,decision});
+      const receipts=Object.values(this.state.reclassifications);
+      const collision=receipts.find(receipt=>receipt?.commandId===commandId||receipt?.sourceInputId===sourceInputId||receipt?.evidence?.id===summary.id);
+      if(collision) {
+        if(collision.basisHash!==basisHash)throw Error('Reclassification receipt conflict');
+        return {receipt:clone(collision),request:clone(this.state.requests[collision.requestId])};
+      }
+      if(this.state.requests[commandId])throw Error('Reclassification command id conflict');
+      if(expectedRevision!==this.state.revision)throw Error('Router revision changed; reauthenticate source evidence');
+      const source=this.state.inputs[sourceInputId];
+      if(!source||source.kind!=='owner'||source.state!=='accepted')throw Error('Reclassification source is not an accepted owner input');
+      // `sourceHash` is the router's semantic input hash. `sourceSha256` names the
+      // private host's authenticated source evidence and is deliberately a separate
+      // digest: the public adapter can validate its shape without pretending both
+      // byte streams were identical.
+      if(source.hash!==sourceHash)throw Error('Reclassification source hash mismatch');
+      if(summary.actualSessionId!==this.sessionId||summary.actualSessionId!==source.nativeThreadId||summary.conversationId!==this.state.conversationId||summary.conversationId!==source.conversationId||summary.generation!==this.state.generation||summary.generation!==source.generation)throw Error('Reclassification source identity mismatch');
+      const inputs=Object.values(this.state.inputs),sourceIndex=inputs.indexOf(source);
+      const newerControl=inputs.slice(sourceIndex+1).some(input=>input.kind==='owner'&&input.state==='accepted'&&input.route==='control'&&['manual','auto','work'].includes(input.command));
+      const newerReceipt=receipts.some(receipt=>(receipt.recordedAt??Infinity)>=(source.at??-Infinity));
+      if(newerControl||newerReceipt)throw Error('Reclassification evidence is stale');
+      const read=this.readClassification(decision,{owner:true,intents:false,allowStop:false});
+      if(read.decision!=='control'||!['manual','auto','work'].includes(read.command))throw Error('Reclassification must be a model control');
+      const profile=read.command==='manual'?await this.resolvedProfile(read.profile):null;
+      const id='reclassification-'+digest([this.sessionId,sourceInputId,summary.id,summary.version]).slice(0,40);
+      const modeRequest={commandId,mode:read.command,reason:'Verified owner control reclassification: '+read.reason,sourceInputId,sourceHash,notify:true,force:read.force,reclassificationId:id,...(profile?{profile}: {})};
+      const receipt={id,version:1,state:'recorded',basisHash,basisRevision:expectedRevision,commandId,requestId:commandId,modeRequestState:'pending',sourceInputId,sourceHash,originalRoute:source.route,evidence:summary,
+        decision:{control:read.command,force:read.force,reason:read.reason,...(profile?{profile}: {})},requestHash:digest(modeRequest),recordedAt:this.now()};
+      this.state.reclassifications[id]=receipt;
+      try {this.recordModeRequest(modeRequest);}
+      catch(error){delete this.state.reclassifications[id];throw error;}
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-requested',{id,commandId});
+      const runtime=await this.reconcileTransition(await this.inspect());
+      await this.applyModeRequest(this.state.requests[commandId],runtime);
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-applied',{id,commandId,state:receipt.modeRequestState});
+      return {receipt:clone(receipt),request:clone(this.state.requests[commandId])};
+    });
+  }
   recordModeRequest(request) {
-      if(!request.commandId||!['work','auto'].includes(request.mode)||!request.reason?.trim())throw Error('Invalid mode request');
+      if(!request.commandId||!['work','auto','manual'].includes(request.mode)||!request.reason?.trim()||(request.mode==='manual'&&!request.profile?.model))throw Error('Invalid mode request');
       const hash=digest(request), previous=this.state.requests[request.commandId];
       if(previous) {if(previous.hash!==hash)throw Error('Command id conflict');return clone(previous);}
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
       if(request.completedTaskId&&(!this.state.tasks[request.completedTaskId]||!open(this.state.tasks[request.completedTaskId])))throw Error('Task is not open');
       if(request.completedTaskId&&request.completedInputVersion!==this.state.tasks[request.completedTaskId].inputVersion)throw Error('Task input version changed; read current runtime');
       if(request.mode==='work') {
-        this.state.mode='work';this.state.exitRequested=false;
+        this.state.exitRequested=false;
         if(request.handoff) {
           const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
           task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
         }
-      } else {
+      } else if(request.mode==='auto') {
         this.state.exitRequested=true;
         if(request.completedTaskId) {
           const task=this.state.tasks[request.completedTaskId];
-          task.completion={inputVersion:task.inputVersion,at:this.now(),summary:request.reason};
+          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason};
         }
-        if(!this.tasks().length)this.state.mode='auto';
       }
+      const sourceInputId=request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
+      const source=sourceInputId?this.state.inputs[sourceInputId]:null;
+      const reclassification=request.reclassificationId?this.state.reclassifications[request.reclassificationId]:null;
+      const reclassificationAuthorized=Boolean(reclassification?.state==='recorded'&&reclassification.commandId===request.commandId&&
+        reclassification.sourceInputId===sourceInputId&&reclassification.sourceHash===source?.hash&&reclassification.originalRoute===source?.route&&
+        reclassification.decision?.control===request.mode&&reclassification.requestHash===hash&&request.sourceHash===source?.hash);
+      // A classified owner control authorizes only the exact request assembled by
+      // acceptControl: same owner source/hash, owner-mode command id, mode, force
+      // choice and (for manual mode) catalog-resolved profile. An old `auto` source
+      // can therefore never be repurposed as force authority for an arbitrary model.
+      const directAuthorized=Boolean(source?.kind==='owner'&&source.state==='selected'&&source.route==='control'&&
+        request.commandId==='owner-mode:'+source.id&&request.mode===source.command&&request.sourceHash===source.hash&&
+        source.controlRequestHash===hash&&['manual','auto','work'].includes(source.command));
+      const directForce=directAuthorized&&source.force===true;
+      const directDefer=directAuthorized&&source.force===false;
+      const forceAuthorized=request.force===true&&(directForce||reclassificationAuthorized&&reclassification.decision.force===true);
+      const deferAuthorized=request.force===false&&(directDefer||reclassificationAuthorized&&reclassification.decision.force===false);
       this.state.configRevision++;
       const result={state:'pending',mode:request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
-        sourceInputId:request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id,notify:request.notify===true,at:this.now()};
-      for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto'].includes(prior.mode)){
+        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...(request.profile?{profile:clone(request.profile)}:{}),at:this.now()};
+      for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto','manual'].includes(prior.mode)){
         if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
         prior.state='superseded';prior.supersededBy=request.commandId;
       }
-      this.state.requests[request.commandId]=result;this.save('mode-request',{commandId:request.commandId,mode:request.mode});
+      this.state.requests[request.commandId]=result;this.state.requestedMode=request.mode;this.save('mode-request',{commandId:request.commandId,mode:request.mode,force:forceAuthorized});
       return clone(result);
   }
   async applyPendingMode() {
     return this.locked(async()=>{
       const runtime=await this.reconcileTransition(await this.inspect());
-      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto'].includes(r.mode));
-      if(!request||this.busy(runtime)||this.state.transition?.state==='unconfirmed')return{state:'pending'};
-      if(request.mode==='auto'&&this.tasks().length)return{state:'work-held'};
-      const target=ROUTER_MODELS[request.mode==='work'?'work':'chat'];
-      try {
-        if(!this.verified(runtime,target)) {
-          this.startTransition(runtime,target,request.reason,'mode-request',request.commandId);this.save('switch-requested');
-          const actual=await this.switchModel(target);
-          if(!this.verified(actual,target))throw Error('Unverified mode change');
-          this.finishTransition(actual);
-        } else this.state.actual=runtime;
-        // A later request replaces earlier pending mode intents, but preserves
-        // their receipts and the task completion proposal they may have carried.
-        for(const prior of Object.values(this.state.requests))if(prior!==request&&prior.state==='pending'){prior.state='superseded';prior.supersededBy=request.commandId;}
-        this.modeApplied(request,this.state.actual);this.save('mode-applied',{commandId:request.commandId,model:target});
-      } catch {
-        request.state='failed';request.failedAt=this.now();
-        this.state.transition.state='unconfirmed';this.save('mode-failed',{commandId:request.commandId});
-        await this.reconcileTransition(await this.inspect());
-      }
-      return clone(request);
+      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode));
+      if(!request)return{state:'pending'};
+      await this.applyModeRequest(request,runtime);return clone(request);
     });
   }
-  startTransition(before,model,reason,source,sourceId) {
-    this.state.transition={id:'switch-'+digest([this.sessionId,this.state.revision,sourceId,model]).slice(0,24),state:'switching',
-      from:before.model,to:model,reason,source,sourceId,at:this.now()};
+  async forceBoundary(request,runtime) {
+    if(!request.force)return null;
+    if(request.forceBoundary)return request.forceBoundary;
+    if(request.forceState==='unconfirmed'&&!this.nativeBusy(runtime)) {
+      return this.applyForceFence(request,{state:'idle',reconciled:true,checkedAt:runtime.checkedAt});
+    }
+    if(request.forceState==='unconfirmed')return null;
+    if(!this.forceSwitch){this.failModeRequest(request,'force-switch-unavailable','没有切换：当前宿主不能安全中断正在进行的任务。');this.save('force-switch-failed',{commandId:request.commandId,reason:'force-switch-unavailable'});return null;}
+    request.forceState='interrupting';request.forceStartedAt=this.now();this.save('force-switch-requested',{commandId:request.commandId});
+    let receipt;
+    try {receipt=await this.forceSwitch({sessionId:this.sessionId,commandId:request.commandId,sourceInputId:request.sourceInputId,reclassificationId:request.reclassificationId??null,fromEpoch:this.state.executionEpoch,toEpoch:this.state.executionEpoch+1});}
+    catch {request.forceState='unconfirmed';request.waitingReason='force-interrupt-unconfirmed';this.pendingModeNotice(request);this.save('force-switch-unconfirmed',{commandId:request.commandId});return null;}
+    if(!['interrupted','idle'].includes(receipt?.state)) {
+      if(receipt?.state==='failed'){this.failModeRequest(request,receipt?.reason??'force-interrupt-failed','没有切换：当前任务未能安全中断。');this.save('force-switch-failed',{commandId:request.commandId,reason:request.failureReason});}
+      else {request.forceState='unconfirmed';request.waitingReason=receipt?.reason??'force-interrupt-unconfirmed';this.pendingModeNotice(request);this.save('force-switch-unconfirmed',{commandId:request.commandId});}
+      return null;
+    }
+    return this.applyForceFence(request,receipt);
+  }
+  applyForceFence(request,receipt) {
+    if(request.forceBoundary)return request.forceBoundary;
+    const fromEpoch=this.state.executionEpoch,toEpoch=fromEpoch+1,at=this.now();
+    const interruptedTask=receipt.state==='interrupted'?((receipt.taskId&&this.state.tasks[receipt.taskId])??this.currentTask()):null;
+    const boundary={id:'force-'+digest([this.sessionId,request.commandId,fromEpoch]).slice(0,24),commandId:request.commandId,sourceInputId:request.sourceInputId,fromEpoch,toEpoch,at,taskId:interruptedTask?.id??null,receipt:clone(receipt)};
+    this.state.executionEpoch=toEpoch;this.state.forceBoundaries.push(boundary);this.state.forceBoundaries=this.state.forceBoundaries.slice(-32);
+    for(const operation of Object.values(this.state.operations))if(['submitted','running','unconfirmed'].includes(operation.state)){operation.state='fenced-unconfirmed';operation.fencedBy=boundary.id;operation.fencedAt=at;}
+    for(const input of Object.values(this.state.inputs))if(['submitting','unconfirmed'].includes(input.state)){input.state='fenced-unconfirmed';input.fencedBy=boundary.id;input.fencedAt=at;}
+    if(interruptedTask) {
+      if(interruptedTask.completion) {
+        const historical={...clone(interruptedTask.completion),turnFence:interruptedTask.completion.turnFence??interruptedTask.executionEpoch,state:'historical-proposal',fencedBy:boundary.id,fencedAt:at};
+        interruptedTask.completionHistory??=[];interruptedTask.completionHistory.push(historical);interruptedTask.completionHistory=interruptedTask.completionHistory.slice(-16);interruptedTask.completion=historical;
+      }
+      if(interruptedTask.turnStartedAt||interruptedTask.turnEndedAt||interruptedTask.stopReason) {
+        interruptedTask.turnHistory??=[];interruptedTask.turnHistory.push({turnFence:interruptedTask.executionEpoch,turnStartedAt:interruptedTask.turnStartedAt,turnEndedAt:interruptedTask.turnEndedAt,stopReason:interruptedTask.stopReason,fencedBy:boundary.id});interruptedTask.turnHistory=interruptedTask.turnHistory.slice(-16);
+      }
+      interruptedTask.executionEpoch=toEpoch;interruptedTask.continuationRequired=true;interruptedTask.interruptedBy=boundary.id;
+      delete interruptedTask.turnStartedAt;delete interruptedTask.turnEndedAt;delete interruptedTask.turnEndedFence;delete interruptedTask.stopReason;
+    }
+    request.forceState='confirmed';request.forceBoundary=boundary;request.waitingReason=null;this.save('force-switch-fenced',{commandId:request.commandId,boundaryId:boundary.id,toEpoch});return boundary;
+  }
+  pendingModeNotice(request) {
+    if(!request?.notify)return null;
+    return this.queueNotice(request.sourceInputId??request.commandId,'mode-pending',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],text:'切换正在处理，当前模型尚未完成核验。'});
+  }
+  failModeRequest(request,reason,text) {
+    request.state='failed';request.forceState=request.forceState==='unconfirmed'?'unconfirmed':'failed';request.failedAt=this.now();request.failureReason=String(reason).slice(0,160);request.waitingReason=null;
+    if(this.state.requestedMode===request.mode)this.state.requestedMode=null;
+    if(request.notify)this.queueNotice(request.sourceInputId??request.commandId,'mode-failed',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],text});
+  }
+  async applyModeRequest(request,runtime) {
+    if(!request||request.state!=='pending')return {runtime};
+    let target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:
+      this.tasks().length?ROUTER_PROFILES.work:this.automaticIdleProfile();
+    if(request.mode==='auto'&&request.force){
+      try {request.plannedAutoReturnProfile=await this.resolvedProfile(ROUTER_PROFILES.chat);}catch(error){
+        this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持自动聊天配置。');this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-auto-profile'});return {runtime};
+      }
+      target=this.tasks().length?ROUTER_PROFILES.work:request.plannedAutoReturnProfile;
+    }
+    // Validate the exact model/effort/tier before interrupting anything. A
+    // nonexistent or unsupported profile is a failed control request, not a
+    // reason to cancel the owner's current native turn.
+    try {target=await this.resolvedProfile(target);}catch(error){
+      this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持这组模型设置。');
+      this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-profile'});return {runtime};
+    }
+    if(request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
+    if(request.mode==='work'&&!this.state.autoReturnProfile)this.captureAutomaticReturn(runtime);
+    let forced=Boolean(request.forceBoundary);
+    if(this.busy(runtime)) {
+      if(!request.force){request.waitingReason='coordinator-busy';return {runtime};}
+      const boundary=await this.forceBoundary(request,runtime);if(!boundary)return {runtime};forced=true;
+      runtime=await this.inspect();
+      if(this.nativeBusy(runtime,{confirmedForce:true})){request.waitingReason='native-interrupt-pending';this.pendingModeNotice(request);this.save('force-native-idle-pending',{commandId:request.commandId});return {runtime};}
+    }
+    if(this.state.transition?.state==='unconfirmed') {
+      if(!request.force)return {runtime};
+      if(this.nativeBusy(runtime,{confirmedForce:Boolean(request.forceBoundary)}))return {runtime};
+      this.state.transition.state='superseded-by-owner';this.save('switch-superseded',{commandId:request.commandId});
+    }
+    if(request.mode==='auto'&&this.tasks().length&&!request.force)return {state:'work-held',runtime};
+    try {
+      let actual=runtime;
+      if(!this.verified(runtime,target)) {
+        this.startTransition(runtime,target,request.reason,'mode-request',request.commandId);this.save('switch-requested');
+        const switched=await this.switchTo(target,{forceBoundary:request.forceBoundary});actual=switched.actual;target=switched.target;
+        if(!this.verified(actual,target))throw Error('Unverified mode change');
+        this.applyModeState(request,actual,target);this.finishTransition(actual);
+      } else {this.applyModeState(request,runtime,target);this.state.actual=runtime;}
+      for(const prior of Object.values(this.state.requests))if(prior!==request&&prior.state==='pending'){prior.state='superseded';prior.supersededBy=request.commandId;}
+      this.modeApplied(request,this.state.actual);this.save('mode-applied',{commandId:request.commandId,model:target.model,forced});return {runtime:this.state.actual};
+    } catch(error) {
+      request.failedAt=this.now();request.waitingReason='switch-unconfirmed';
+      if(this.state.transition)this.state.transition.state='unconfirmed';
+      this.pendingModeNotice(request);
+      this.save('mode-switch-unconfirmed',{commandId:request.commandId,reason:String(error?.message??error).slice(0,120)});
+      return {runtime:await this.inspect()};
+    }
+  }
+  applyModeState(request,actual,target) {
+    const applied=runtimeProfile({...actual,serviceTierPreference:target.serviceTierPreference??actual.serviceTierPreference});
+    if(request.mode==='manual') {this.state.mode='manual';this.state.manualProfile=applied;delete this.state.autoReturnProfile;}
+    else if(request.mode==='work') {this.state.mode='work';delete this.state.manualProfile;}
+    else {
+      this.state.mode='auto';delete this.state.manualProfile;
+      if(request.force) {
+        const returnProfile=clone(request.plannedAutoReturnProfile??ROUTER_PROFILES.chat);this.state.autoIdleProfile=returnProfile;
+        if(this.tasks().length)this.state.autoReturnProfile=clone(returnProfile);else delete this.state.autoReturnProfile;
+      } else if(!this.tasks().length){this.state.autoIdleProfile=applied;delete this.state.autoReturnProfile;}
+    }
+    this.state.requestedMode=null;this.state.exitRequested=false;
+  }
+  startTransition(before,profile,reason,source,sourceId) {
+    if(typeof profile==='string')profile={model:profile};
+    const fromProfile=runtimeProfile(before);
+    this.state.transition={id:'switch-'+digest([this.sessionId,this.state.revision,sourceId,profile]).slice(0,24),state:'switching',
+      from:before.model,to:profile.model,fromProfile,targetProfile:clone(profile),reason,source,sourceId,at:this.now()};
   }
   finishTransition(actual) {
     this.state.actual=actual;Object.assign(this.state.transition,{state:'applied',actualModel:actual.model,verifiedAt:actual.checkedAt,appliedAt:this.now()});
     const transition=this.state.transition;
-    if(transition.from&&transition.from!==actual.model&&this.verified(actual,actual.model)) {
+    const changed=transition.fromProfile?digest(transition.fromProfile)!==digest(runtimeProfile(actual)):transition.from&&transition.from!==actual.model;
+    if(transition.from&&changed&&this.verified(actual,transition.targetProfile??actual.model)) {
       const view=publicMobileRuntime(this.state,actual,this.sessionId);
       // A maintenance restart that puts back the model the owner was last told about
       // changed nothing they can see: the notice is settled as suppressed, never sent.
       const silent=transition.source==='host-restart'&&actual.model===this.lastToldModel();
       const notice=this.queueNotice(transition.id,'model-switched',{transitionId:transition.id,sourceInputId:this.state.inputs[transition.sourceId]?transition.sourceId:this.state.requests[transition.sourceId]?.sourceInputId,
-        target:actual.model,from:transition.from,runtime:view.actual,
+        target:actual.model,targetProfile:transition.targetProfile,from:transition.from,runtime:view.actual,mode:this.state.mode,
         ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true})})});
       transition.noticeId=notice.id;
       // KIN-ITER-20260918-03: every real change records what became of its owner
@@ -555,9 +794,10 @@ export class MobileRouter {
   }
   observeRuntime(runtime) {
     if(this.verified(runtime,runtime.model)&&this.state.actual?.known&&this.state.actual.model!==runtime.model&&this.state.transition?.state!=='switching'&&this.state.transition?.state!=='unconfirmed') {
-      this.startTransition(this.state.actual,runtime.model,'Observed native model change','runtime-observation');
+      this.startTransition(this.state.actual,runtimeProfile(runtime),'Observed native model change','runtime-observation');
       this.finishTransition(runtime);this.state.transition.state='observed';this.save('runtime-model-observed');
     }
+    if(this.state.mode==='auto'&&!this.tasks().length&&!this.state.autoReturnProfile&&this.verified(runtime,runtime.model))this.state.autoIdleProfile=runtimeProfile(runtime);
     this.state.actual=runtime;
   }
   async readRuntime(loaded=true) {
@@ -570,10 +810,10 @@ export class MobileRouter {
       if(this.busy(runtime)||Object.values(this.state.inputs).some(i=>['selected','submitting','unconfirmed'].includes(i.state)))return {state:'waiting'};
       runtime=await this.reconcileTransition(runtime);
       if(this.state.transition?.state==='unconfirmed')return {state:'waiting'};
-      const target=this.tasks().length||this.state.mode==='work'?ROUTER_MODELS.work:ROUTER_MODELS.chat;
+      let target=await this.resolvedProfile(this.desiredProfile(runtime));
       if(!this.verified(runtime,target)){
         this.startTransition(runtime,target,'Restore persisted mobile routing mode','host-restart');this.save('restart-profile-requested');
-        try {runtime=await this.switchModel(target);if(!this.verified(runtime,target))throw Error('Restart profile unverified');this.finishTransition(runtime);}
+        try {const switched=await this.switchTo(target);runtime=switched.actual;target=switched.target;if(!this.verified(runtime,target))throw Error('Restart profile unverified');this.finishTransition(runtime);}
         catch(error){this.state.transition.state='unconfirmed';this.save('restart-profile-unconfirmed');throw error;}
       }
       this.observeRuntime(runtime);this.runtimeRestored=true;this.save('restart-profile-restored',{model:runtime.model});
@@ -584,9 +824,10 @@ export class MobileRouter {
     return this.locked(async()=>{
       const runtime=await this.inspect();
       if(this.tasks().length||this.busy(runtime))throw Error('Work prevents model verification');
-      if(this.verified(runtime,model)){this.observeRuntime(runtime);return runtime;}
-      this.startTransition(runtime,model,'Host model verification','probe');this.save('switch-requested');
-      try {const actual=await this.switchModel(model);if(!this.verified(actual,model))throw Error('Unverified model');this.finishTransition(actual);this.save('switch-applied');return actual;}
+      let profile=await this.resolvedProfile(typeof model==='string'?{model}:model);
+      if(this.verified(runtime,profile)){this.observeRuntime(runtime);return runtime;}
+      this.startTransition(runtime,profile,'Host model verification','probe');this.save('switch-requested');
+      try {const switched=await this.switchTo(profile),actual=switched.actual;profile=switched.target;if(!this.verified(actual,profile))throw Error('Unverified model');this.finishTransition(actual);this.save('switch-applied');return actual;}
       catch(error){this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw error;}
     });
   }
@@ -597,21 +838,37 @@ export class MobileRouter {
   modeApplied(request,runtime) {
     request.state='applied';request.appliedAt=this.now();
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
-      sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id};
+      serviceTier:runtime.serviceTier??null,serviceTierVerified:Boolean(runtime.serviceTier&&runtime.serviceTierVerified!==false),
+      serviceTierPreference:runtime.serviceTierPreference??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null),
+      mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
     const transition=this.state.transition;
     const notice=transition?.sourceId===request.commandId&&this.state.notices[transition.noticeId];
     if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
-    else if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model});
+    else if(request.notify)this.queueNotice(request.notificationOrigin??request.commandId,'mode-applied',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],target:runtime.model,targetProfile:runtimeProfile(runtime),mode:this.state.mode});
   }
-  acceptControl(record,runtime) {
-    if(['work','auto'].includes(record.command)) {
-      this.recordModeRequest({commandId:'owner-mode:'+record.id,mode:record.command,reason:'Explicit owner mode command',sourceInputId:record.id,notify:true});
-      if(this.busy(runtime)||this.tasks().length)this.queueNotice(record.id,'mode-pending');
+  async acceptControl(record,runtime) {
+    if(['work','auto','manual'].includes(record.command)) {
+      const commandId='owner-mode:'+record.id;
+      let profile=record.profile,resolved=true;
+      if(record.command==='manual') {
+        try {profile=await this.resolvedProfile(record.profile);record.resolvedControlProfile=clone(profile);}
+        catch {resolved=false;}
+      }
+      const modeRequest={commandId,mode:record.command,reason:'Explicit owner mode command',sourceInputId:record.id,sourceHash:record.hash,notify:true,force:record.force===true,...(profile?{profile}: {})};
+      // Invalid profiles still become an honest failed request/notice, but they
+      // never receive interrupt authority. Supported controls bind authority to
+      // the exact resolved request hash before it enters recordModeRequest.
+      if(resolved)record.controlRequestHash=digest(modeRequest);
+      this.recordModeRequest(modeRequest);
+      const request=this.state.requests[commandId];
+      if(!request.force&&(this.busy(runtime)||record.command==='auto'&&this.tasks().length))this.queueNotice(record.id,'mode-pending',{requestId:commandId});
+      return request;
     } else if(record.command==='watch') {
-      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto'].includes(r.mode));
+      const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode));
       if(request){request.notify=true;request.notificationSubscribers=[...new Set([...(request.notificationSubscribers??[]),record.id])];this.queueNotice(record.id,'mode-pending',{requestId:request.commandId});}
       else this.queueNotice(record.id,'status');
     } else this.queueNotice(record.id,'status');
+    return null;
   }
   observeOperation(inputId,phase,result={}) {
     return this.locked(async()=>{
@@ -644,16 +901,18 @@ export class MobileRouter {
         // A reconcile-able id and stage are durable BEFORE any failable preparation.
         n.stage='preparing';n.updatedAt=this.now();this.save('notice-preparing',{id});
         const runtime=await this.inspect();const view=publicMobileRuntime(this.state,runtime,this.sessionId);
-        if(!view.actual.verified)return null;
-        if(n.kind==='mode-applied'&&runtime.model!==n.target){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
-        if(n.kind==='model-switched'&&runtime.model!==n.target) {
-          const past=runtimeReply({actual:n.runtime,tasks:[]},{switched:true}).replace('已经切到 ','此前已切到 ');
+        const controlWithoutActual=['mode-pending','mode-failed'].includes(n.kind)&&Boolean(n.text);
+        if(!view.actual.verified&&!controlWithoutActual)return null;
+        if(n.kind==='mode-pending'&&this.state.requests[n.requestId]?.state!=='pending'){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
+        if(view.actual.verified&&n.kind==='mode-applied'&&(!profileMatches(runtime,n.targetProfile??{model:n.target}))){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
+        if(view.actual.verified&&n.kind==='model-switched'&&!profileMatches(runtime,n.targetProfile??{model:n.target})) {
+          const past=runtimeReply({actual:n.runtime,tasks:[],mode:n.mode},{switched:true}).replace('已切换到 ','此前已切换到 ');
           n.text=past+' '+runtimeReply(view);
         }
         if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
         n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
         // Whatever else the message recalls, this is the model it names as the current one.
-        n.runtime??=view.actual;n.toldModel=view.actual.model;n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
+        if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
         this.save('notice-sending',{id});return {...clone(n),sendNow:true};
       });
       if(!notice)continue;
@@ -688,13 +947,70 @@ export class MobileRouter {
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
-      const task=data.taskId?this.state.tasks[data.taskId]:this.currentTask();
+      // An explicit null belongs to a no-task/chat turn. It must not be rebound to
+      // whichever task happens to be current when a delayed callback arrives.
+      const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
+      const turnFence=data.turnFence??data.executionEpoch;
+      const taskEvent=['prompt-start','prompt-end','tool','delivery'].includes(kind);
+      const storeHistorical=(reason,{authoritative=false}={})=>{
+        const at=this.now();
+        const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
+          id:data.id,state:data.state,status:data.status,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,stopReason:data.stopReason};
+        this.state.lateEvents??=[];
+        this.state.lateEvents.push(event);this.state.lateEvents=this.state.lateEvents.slice(-512);
+        // External-effect evidence is retained under a fence/version-specific
+        // history key. It never overwrites the current ledger entry with the same
+        // id. Only an explicit older fence may later settle a completion that was
+        // intentionally preserved across an already-idle force boundary.
+        if(task&&kind==='delivery') {
+          task.deliveryHistory??={};
+          const key='delivery-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
+          task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,
+            submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence:turnFence??null,lateAfterForce:true,
+            authority:authoritative?'historical-fence':'evidence-only',reason,at};
+        }
+        if(task&&kind==='tool') {
+          task.toolHistory??={};
+          const key='tool-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
+          task.toolHistory[key]={id:data.id,status:data.status??'pending',inputVersion:data.inputVersion,turnFence:turnFence??null,
+            lateAfterForce:true,authority:authoritative?'historical-fence':'evidence-only',reason,...(data.reason?{detailReason:data.reason}:{}),at};
+        }
+        this.save('late-'+kind,{taskId:task?.id,reason,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch});
+      };
+      let historicalReason=null;
+      if(taskEvent) {
+        if((data.turnFence!==undefined||data.executionEpoch!==undefined)&&!Number.isInteger(turnFence))historicalReason='invalid-turn-fence';
+        else if(data.inputVersion!==undefined&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
+        else if(this.state.executionEpoch>0&&(turnFence===undefined||data.inputVersion===undefined))historicalReason='unversioned-after-force';
+        else if(Number.isInteger(turnFence)&&turnFence<this.state.executionEpoch)historicalReason='older-fence';
+        else if(Number.isInteger(turnFence)&&turnFence>this.state.executionEpoch)historicalReason='future-fence';
+        else if(task&&data.inputVersion!==undefined&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
+        else if(task&&kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
+      }
+      if(historicalReason) {
+        storeHistorical(historicalReason,{authoritative:historicalReason==='older-fence'&&Number.isInteger(turnFence)&&Number.isSafeInteger(data.inputVersion)});
+        return;
+      }
       if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
-        if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();delete task.turnEndedAt;}
-        if(kind==='prompt-end') {task.turnEndedAt=this.now();task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
-        if(kind==='tool')task.tools[data.id]={status:data.status??task.tools[data.id]?.status??'pending',...(data.reason?{reason:data.reason}: {})};
-        if(kind==='delivery')task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,at:this.now()};
+        if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
+        if(kind==='prompt-end') {task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
+        if(kind==='tool') {
+          const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
+          if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
+            task.toolHistory??={};const key='tool-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
+            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+          }
+          task.tools[data.id]={status:data.status??previous?.status??'pending',inputVersion,turnFence:fence,...(data.reason?{reason:data.reason}: {})};
+        }
+        if(kind==='delivery') {
+          const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.deliveries[data.id];
+          if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
+            task.deliveryHistory??={};const key='delivery-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
+            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+          }
+          task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,inputVersion,turnFence:fence,at:this.now()};
+        }
       }
       this.save(kind);
     });
@@ -703,7 +1019,7 @@ export class MobileRouter {
     return this.locked(async()=>{
       const task=this.state.tasks[taskId];
       if(!task||task.requiresDelivery||task.inputVersion!==inputVersion||!receipt?.verified)return{state:'superseded'};
-      task.completion={inputVersion,at:task.turnStartedAt??this.now(),summary:'Host verified internal result'};
+      task.completion={inputVersion,turnFence:task.executionEpoch,at:task.turnStartedAt??this.now(),summary:'Host verified internal result'};
       task.internalReceipt=receipt;this.save('internal-result',{taskId});return{state:'recorded'};
     });
   }
@@ -717,17 +1033,28 @@ export class MobileRouter {
         // With semantic review installed, assistant completion is a proposal.
         // Internal repairs retain their separate verified-result protocol.
         if(this.workReviewerEnabled&&task.requiresDelivery!==false)continue;
-        const deliveries=Object.values(task.deliveries);
-        if(task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
-          Object.values(task.tools).every(tool=>['completed','failed'].includes(tool.status)) &&
+        const fence=task.completion?.turnFence;
+        const deliveryMap=new Map(Object.entries(task.deliveries).filter(([,delivery])=>(delivery.inputVersion===undefined||delivery.inputVersion===task.completion?.inputVersion)&&(fence===undefined||delivery.turnFence===undefined||delivery.turnFence===fence)));
+        if(fence!==undefined)for(const delivery of Object.values(task.deliveryHistory??{}))if(delivery.authority==='historical-fence'&&delivery.turnFence===fence&&delivery.inputVersion===task.completion?.inputVersion)deliveryMap.set(delivery.id,delivery);
+        const deliveries=[...deliveryMap.values()];
+        const toolMap=new Map(Object.entries(task.tools).filter(([,tool])=>(fence===undefined||tool.turnFence===undefined||tool.turnFence===fence)));
+        if(fence!==undefined)for(const tool of Object.values(task.toolHistory??{}))if(tool.authority==='historical-fence'&&tool.turnFence===fence&&tool.inputVersion===task.completion?.inputVersion)toolMap.set(tool.id,tool);
+        const tools=[...toolMap.values()];
+        if(task.completion?.state!=='historical-proposal'&&task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
+          (fence===undefined||task.turnEndedFence===undefined||task.turnEndedFence===fence) && tools.every(tool=>['completed','failed'].includes(tool.status)) &&
           (task.requiresDelivery===false?task.internalReceipt?.verified:
             deliveries.length && deliveries.every(d=>d.state==='accepted'&&d.messageId) && deliveries.some(d=>d.at>=task.completion.at))) {
           task.status='completed';task.completedAt=this.now();changed=true;
         }
       }
-      if(changed&&!this.tasks().length) {this.state.mode='auto';this.state.exitRequested=false;}
+      if(changed&&!this.tasks().length&&this.state.mode!=='manual'&&this.state.autoReturnProfile&&!Object.values(this.state.requests).some(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode))) {
+        const commandId='automatic-restore:'+digest([this.state.revision,this.state.autoReturnProfile]).slice(0,24);
+        this.recordModeRequest({commandId,mode:'auto',reason:'All automatic work tasks are settled',notify:true});
+      }
       for(const request of Object.values(this.state.requests))if(request.state==='pending') {
-        if(request.mode==='work'&&this.verified(runtime,ROUTER_MODELS.work) || request.mode==='auto'&&!this.tasks().length&&this.verified(runtime,ROUTER_MODELS.chat)) {this.modeApplied(request,runtime);changed=true;}
+        if(request.deferUntilSettled&&this.tasks().length)continue;
+        const target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:!this.tasks().length?this.automaticIdleProfile():null;
+        if(target&&this.verified(runtime,target)) {this.applyModeState(request,runtime,target);this.modeApplied(request,runtime);changed=true;}
       }
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });

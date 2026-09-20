@@ -12,6 +12,7 @@ existence, version and true read state.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -27,25 +28,70 @@ CITABLE = {"observed", "historical"}
 MEMORY_LOCATOR = re.compile(r"^memory://([A-Za-z0-9_.:-]{1,200})$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RECEIPT_FORMAT = "kin-source-receipt-v1"
+SOURCE_RECEIPT_V2 = "kin-source-receipt-v2"
 COMPUTER_ADAPTERS = {"kin-computer-reader-v1", "kin-computer-use-v1"}
+WEB_RECEIPT_V2 = "kin-web-receipt-v2"
+
+
+def web_delivery(receipt):
+    """Content version and tool-delivered ranges; not a claim of comprehension."""
+    if receipt.get("receipt_format") != WEB_RECEIPT_V2:
+        return None
+    return {key: copy.deepcopy(receipt.get(key)) for key in (
+        "receipt_format", "content_sha256", "content_chars", "raw_body_sha256",
+        "raw_body_bytes", "body_bytes_representation", "raw_body_complete",
+        "delivered_ranges", "semantic_classification",
+    )}
+
+
+def valid_web_delivery(delivery, version):
+    if not isinstance(delivery, dict) or delivery.get("receipt_format") != WEB_RECEIPT_V2:
+        return False
+    if delivery.get("content_sha256") != version or not SHA256.fullmatch(str(version or "")):
+        return False
+    if delivery.get("semantic_classification") != "model-required":
+        return False
+    if (delivery.get("body_bytes_representation") != "decoded-http-entity"
+            or delivery.get("raw_body_complete") is not True):
+        return False
+    length = delivery.get("content_chars")
+    raw_bytes = delivery.get("raw_body_bytes")
+    if (type(length) is not int or length <= 0 or type(raw_bytes) is not int or raw_bytes <= 0
+            or not SHA256.fullmatch(str(delivery.get("raw_body_sha256") or ""))):
+        return False
+    ranges = delivery.get("delivered_ranges")
+    if not isinstance(ranges, list) or not ranges:
+        return False
+    for page in ranges:
+        if not isinstance(page, dict):
+            return False
+        start, end = page.get("start"), page.get("end")
+        if (type(start) is not int or type(end) is not int or not 0 <= start < end <= length
+                or not SHA256.fullmatch(str(page.get("sha256") or ""))
+                or not isinstance(page.get("delivered_at"), str) or not page["delivered_at"]):
+            return False
+    return True
 
 
 def _entry(state, locator, *, evidence_id=None, version=None, title="", basis="", recorded_at=None,
-           execution_id=None, attempt=None, tool=None, adapter=None):
+           execution_id=None, attempt=None, tool=None, adapter=None, delivery=None):
     return {"state": state, "locator": locator, "evidence_id": evidence_id,
             "version": version, "title": title, "basis": basis, "recorded_at": recorded_at,
-            "execution_id": execution_id, "attempt": attempt, "tool": tool, "adapter": adapter}
+            "execution_id": execution_id, "attempt": attempt, "tool": tool, "adapter": adapter,
+            **({"delivery": copy.deepcopy(delivery)} if delivery is not None else {})}
 
 
-def _seal_payload(entry, execution_id, attempt):
+def _seal_payload(entry, execution_id, attempt, receipt_format=None):
     return {
-        "receipt_format": SOURCE_RECEIPT_FORMAT,
+        "receipt_format": receipt_format or (SOURCE_RECEIPT_V2 if "delivery" in entry else SOURCE_RECEIPT_FORMAT),
         "verified_by_execution": str(execution_id),
         "verified_by_attempt": int(attempt),
         **{key: entry.get(key) for key in (
             "state", "locator", "evidence_id", "version", "title", "basis", "recorded_at",
             "execution_id", "attempt", "tool", "adapter",
         )},
+        # Omit this extension for old receipts: their original digest stays valid.
+        **({"delivery": copy.deepcopy(entry["delivery"])} if "delivery" in entry else {}),
     }
 
 
@@ -62,12 +108,16 @@ def seal_source_receipt(entry, *, execution_id, attempt):
 
 
 def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
-    if not isinstance(receipt, dict) or receipt.get("receipt_format") != SOURCE_RECEIPT_FORMAT:
+    if not isinstance(receipt, dict) or receipt.get("receipt_format") not in {SOURCE_RECEIPT_FORMAT, SOURCE_RECEIPT_V2}:
+        return False
+    if receipt["receipt_format"] == SOURCE_RECEIPT_V2 and "delivery" not in receipt:
         return False
     if receipt.get("state") not in CITABLE or not receipt.get("locator"):
         return False
     if (not receipt.get("evidence_id") or receipt.get("version") is None
             or receipt.get("version") == ""):
+        return False
+    if "delivery" in receipt and not valid_web_delivery(receipt["delivery"], receipt["version"]):
         return False
     try:
         verified_attempt = int(receipt.get("verified_by_attempt"))
@@ -80,7 +130,7 @@ def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
         return False
     if attempt is not None and verified_attempt != int(attempt):
         return False
-    payload = _seal_payload(receipt, verified_execution, verified_attempt)
+    payload = _seal_payload(receipt, verified_execution, verified_attempt, receipt["receipt_format"])
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return receipt.get("receipt_digest") == hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -97,6 +147,11 @@ def valid_web_receipt(receipt, *, execution_id, attempt):
     if receipt.get("tool") not in {"web_search", "read_page"} or not receipt.get("locator"):
         return False
     if receipt.get("state") == LAYER_OBSERVED:
+        if "receipt_format" in receipt and (
+            receipt["receipt_format"] != WEB_RECEIPT_V2
+            or not valid_web_delivery(web_delivery(receipt), receipt.get("version"))
+        ):
+            return False
         return receipt.get("tool") == "read_page" and bool(
             SHA256.fullmatch(str(receipt.get("version") or "")) and receipt.get("read_at")
         )
@@ -158,6 +213,7 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
                 recorded_at=receipt.get("recorded_at") or previous.get("created_at"),
                 execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
                 tool=receipt.get("tool"), adapter=receipt.get("adapter"),
+                delivery=receipt.get("delivery"),
             ))
     for receipt in web_observations or []:
         if execution_id is None or attempt is None or not valid_web_receipt(
@@ -169,7 +225,8 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
                               version=receipt.get("version"), title=receipt.get("title", ""),
                               basis=receipt.get("tool", "web"), recorded_at=receipt.get("read_at"),
                               execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
-                              tool=receipt.get("tool"), adapter="kin-web-reader-v1"))
+                              tool=receipt.get("tool"), adapter="kin-web-reader-v1",
+                              delivery=web_delivery(receipt)))
         if state == LAYER_OBSERVED and receipt.get("requested_locator") != receipt["locator"]:
             # A redirect's requested address and final address are both this read.
             entries.append(_entry(LAYER_OBSERVED, receipt["requested_locator"],
@@ -177,7 +234,8 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
                                   title=receipt.get("title", ""), basis="web-redirect",
                                   recorded_at=receipt.get("read_at"),
                                   execution_id=receipt.get("execution_id"), attempt=receipt.get("attempt"),
-                                  tool=receipt.get("tool"), adapter="kin-web-reader-v1"))
+                                  tool=receipt.get("tool"), adapter="kin-web-reader-v1",
+                                  delivery=web_delivery(receipt)))
     for observation in computer_observations or []:
         if (execution_id is not None and attempt is not None
                 and valid_computer_receipt(observation, execution_id=execution_id, attempt=attempt)):
@@ -197,7 +255,8 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
                                   evidence_id=carried.get("evidence_id"), version=carried.get("version"),
                                   title=carried.get("title", ""),
                                   basis="continuation:" + str((continuation or {}).get("exploration_id")),
-                                  recorded_at=carried.get("recorded_at")))
+                                  recorded_at=carried.get("recorded_at"),
+                                  delivery=carried.get("delivery")))
     return entries
 
 

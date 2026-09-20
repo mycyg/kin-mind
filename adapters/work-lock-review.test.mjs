@@ -11,8 +11,8 @@ import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 async function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-review-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   let time=10000,calls=0;
-  const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',model:'gpt-6-astra',active:false,backgroundTasks:0,handoffTasks:0,queued:0,pendingDeliveries:0};
-  const args={file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),classify:async()=>({route:'work',reason:'classifier-unconfirmed'}),switchModel:async model=>({...runtime,model:runtime.model=model}),waitForIdle:async()=>{throw Error('must not wait');},now:()=>time};
+  const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',model:'deepseek-flash',modelProvider:'openai-15m',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',active:false,backgroundTasks:0,handoffTasks:0,queued:0,pendingDeliveries:0};
+  const args={file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),classify:async()=>({route:'work',reason:'classifier-unconfirmed'}),switchModel:async(model,profile={model})=>{const target={reasoningEffort:model==='deepseek-flash'?'high':'medium',serviceTierPreference:model==='deepseek-flash'?'default':'fast',...profile};Object.assign(runtime,{model,reasoningEffort:target.reasoningEffort,serviceTierPreference:target.serviceTierPreference,fastMode:target.serviceTierPreference==='fast'?'on':'off'});return{...runtime};},waitForIdle:async()=>{throw Error('must not wait');},now:()=>time};
   const router=new MobileRouter(args);
   await router.dispatch({id:'input-1',text:'You may explore when idle'},async()=> 'new-turn');
   await router.observe('prompt-end',{stopReason:'end_turn'});
@@ -31,6 +31,16 @@ test('DeepSeek can close an accidental chat lock after verified delivery and res
   assert.equal(f.router.state.tasks[tid].status,'canceled');assert.equal(f.router.state.inputs['input-1'].state,'accepted');
   await f.router.applyPendingMode();assert.equal(f.runtime.model,'deepseek-flash');assert.equal(f.router.sessionId,'synthetic');
   assert.equal(f.review.view().model,'deepseek-flash');assert.equal(f.review.view().reasoning,'high');
+});
+
+test('completion review accepts the verified manual profile and never clears the manual pin',async t=>{
+  const f=await fixture(t);
+  Object.assign(f.runtime,{model:'deepseek-flash',modelProvider:'openai-15m',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off'});
+  f.router.state.mode='manual';f.router.state.manualProfile={provider:'openai-15m',providerKind:'gateway',model:'deepseek-flash',reasoningEffort:'high',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'};f.router.save('manual-profile');
+  const applied=await f.review.tick();
+  assert.equal(applied.state,'applied');assert.equal(f.router.tasks().length,0);
+  assert.deepEqual([f.router.state.mode,f.router.state.manualProfile.model,f.runtime.model],['manual','deepseek-flash','deepseek-flash']);
+  assert.equal(Object.values(f.router.state.requests).some(request=>request.state==='pending'&&request.mode==='auto'),false);
 });
 
 test('a real finished task uses semantic and delivery evidence, never just end_turn',async t=>{
@@ -53,7 +63,7 @@ test('unchanged held work is reassessed every twenty minutes including after res
 
 test('long native tools, queued inputs, background work, unknown runtime and handoffs preserve the work provider',async t=>{
   for(const field of ['active','backgroundTasks','handoffTasks','queued','pendingDeliveries']) {
-    const f=await fixture(t);f.runtime[field]=1;assert.equal((await f.review.tick()).state,'waiting');assert.equal(f.calls(),0);assert.equal(f.runtime.model,'gpt-6-astra');
+    const f=await fixture(t);f.runtime[field]=1;assert.equal((await f.review.tick()).state,'waiting');assert.equal(f.calls(),0);assert.equal(f.runtime.model,'gpt-5.6-sol');
   }
   const f=await fixture(t);f.runtime.known=false;await f.review.tick();assert.equal(f.calls(),0);
 });
@@ -63,7 +73,7 @@ test('new owner input while DeepSeek is judging supersedes its completion decisi
   f.review.review=()=>new Promise(r=>resolve=r);
   const pending=f.review.tick();while(!resolve)await new Promise(r=>setTimeout(r,0));
   await f.router.dispatch({id:'input-2',text:'Also write the code'},async()=> 'new-turn');
-  resolve(f.result());assert.equal((await pending).state,'superseded');assert.equal(f.router.currentTask().inputVersion,2);assert.equal(f.runtime.model,'gpt-6-astra');
+  resolve(f.result());assert.equal((await pending).state,'superseded');assert.equal(f.router.currentTask().inputVersion,2);assert.equal(f.runtime.model,'gpt-5.6-sol');
 });
 
 test('changed source evidence, a new background tool, cannot close work while terminal failures remain reviewable',async t=>{

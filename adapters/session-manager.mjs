@@ -3,8 +3,32 @@ import {createHash,randomUUID} from 'node:crypto';
 import {readJsonFile,createJsonExclusive} from './atomic-json.mjs';
 import {atomicJson,loadState} from './mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validateCheckpoint} from './session-policy.mjs';
+import {runtimeProfile} from './codex-models.mjs';
 const hash=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const copy=v=>structuredClone(v);
+const candidateProfile=value=>{
+  const source=Object.hasOwn(value??{},'provider')?value:runtimeProfile(value),profile={provider:source.provider,providerKind:source.providerKind,model:source.model,reasoningEffort:source.reasoningEffort,serviceTierPreference:source.serviceTierPreference};
+  return profile.provider&&['gateway','native'].includes(profile.providerKind)&&profile.model&&profile.reasoningEffort&&['default','fast'].includes(profile.serviceTierPreference)?profile:null;
+};
+const sameCandidateProfile=(left,right)=>Boolean(left&&right&&['provider','providerKind','model','reasoningEffort','serviceTierPreference'].every(key=>left[key]===right[key]));
+const sameProviderBinding=(left,right)=>Boolean(left&&right&&['sourceProvider','sourceProviderKind','launchProvider','endpointSha256'].every(key=>left[key]===right[key]));
+const validProviderBinding=(binding,profile)=>Boolean(binding&&profile&&binding.sourceProvider===profile.provider&&binding.sourceProviderKind===profile.providerKind&&
+  (profile.providerKind==='native'?binding.launchProvider===profile.provider&&binding.endpointSha256===null:
+    binding.launchProvider!==profile.provider&&/^[a-f0-9]{64}$/.test(binding.endpointSha256??'')));
+const candidateHasProfileAuthority=candidate=>{
+  const profile=candidateProfile(candidate?.profile),nativeProfile=candidateProfile(candidate?.native?.profile),binding=candidate?.native?.providerBinding;
+  return Boolean(sameCandidateProfile(profile,nativeProfile)&&validProviderBinding(binding,profile));
+};
+const RESPONSE_EVIDENCE=['model','modelProvider','reasoningEffort','serviceTierConfiguration'];
+export const candidateVerificationReady=(verification,candidate)=>Boolean(verification?.verified&&
+  sameCandidateProfile(candidateProfile(verification.requestedProfile),candidateProfile(candidate?.profile))&&
+  sameProviderBinding(verification.providerBinding,candidate?.native?.providerBinding)&&
+  RESPONSE_EVIDENCE.every(key=>verification.profileEvidence?.[key]==='verified'));
+const retireLegacyCandidate=state=>{
+  const candidate=state.candidate;
+  if(!candidate||!['created','injected','ready','waiting'].includes(candidate.state)||candidateHasProfileAuthority(candidate))return false;
+  candidate.state='stale';candidate.staleReason='legacy-profile-evidence-missing';state.retiredCandidates??=[];state.retiredCandidates.push(copy(candidate));return true;
+};
 
 /** One durable binding, used by every channel. Acquiring this lease is a host
  * operation. A second live host cannot silently steal dispatch or sending. */
@@ -25,7 +49,8 @@ export class SessionManager {
     if(!this.state.segments.length)this.state.segments.push({...this.state.binding,state:'active',activatedAt:null});
     // A crash cannot turn an uncertain create, compact or promotion into retry.
     for(const op of [this.state.candidate,...this.state.compactions])if(op&&['creating','injecting','committing','running'].includes(op.state))op.state='unconfirmed';
-    this.save('open');
+    const legacyCandidateRetired=retireLegacyCandidate(this.state);
+    this.save('open',legacyCandidateRetired?{candidateMigration:'legacy-profile-evidence-missing'}:{});
   }
   save(kind,details={}) {
     this.state.revision++;
@@ -87,6 +112,7 @@ export class SessionManager {
   async recoverPromotion() {
     const candidate=this.state.candidate;
     if(candidate?.state!=='unconfirmed'||candidate.native?.threadId!==this.state.binding.threadId||candidate.generation+1!==this.state.binding.generation)return null;
+    if(!candidateHasProfileAuthority(candidate)||!candidateVerificationReady(candidate.verification,candidate))return {state:'waiting',reason:'candidate-profile-unverified'};
     return this.locked(async()=>{
       const boundary=safeBoundary({...await this.collect(),runtime:await this.inspect()});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
       const previous=candidate.previousBinding??this.state.segments.find(s=>s.generation===candidate.generation);
@@ -186,7 +212,9 @@ export class SessionManager {
   }
   async prepare(advice,context) {
     let candidate=this.state.candidate;
+    if(retireLegacyCandidate(this.state)){this.save('legacy-candidate-retired',{id:candidate.id});await this.closeCandidate?.(candidate);candidate=this.state.candidate;}
     if(candidate?.state==='unconfirmed'){
+      if(!candidateHasProfileAuthority(candidate))return {state:'waiting',reason:'candidate-operation-unconfirmed'};
       if(candidate.native&&candidate.injectionId&&await this.reconcileCandidate?.(candidate)){candidate.state='injected';this.save('candidate-injection-reconciled');}
       else return {state:'waiting',reason:'candidate-operation-unconfirmed'};
     }
@@ -198,9 +226,11 @@ export class SessionManager {
     if(invalid)return {state:'waiting',reason:invalid};
     this.assertFence(fence);
     if(!candidate||['retired','failed','stale'].includes(candidate.state)){
-      candidate={id:'rotation:'+randomUUID(),state:'creating',generation:fence.generation,checkpoint,at:this.now()};
+      const runtime=await this.inspect(),profile=candidateProfile(runtime);
+      if(!profile)return {state:'waiting',reason:'candidate-profile-unverified'};
+      candidate={id:'rotation:'+randomUUID(),state:'creating',generation:fence.generation,checkpoint,profile,at:this.now()};
       this.state.candidate=candidate;this.save('candidate-creating',{id:candidate.id});
-      try{candidate.native=await this.createCandidate({id:candidate.id,checkpoint,model:(await this.inspect()).model});if(!candidate.native?.threadId||!candidate.native?.nativeSessionId)throw Error('Missing native creation receipt');candidate.state='created';this.save('candidate-created',{id:candidate.id});}
+      try{candidate.native=await this.createCandidate({id:candidate.id,checkpoint,model:profile.model,profile:copy(profile)});if(!candidate.native?.threadId||!candidate.native?.nativeSessionId||!candidateHasProfileAuthority(candidate))throw Error('Missing native creation receipt');candidate.state='created';this.save('candidate-created',{id:candidate.id});}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
     if(candidate.checkpoint.id!==checkpoint.id){
@@ -213,6 +243,7 @@ export class SessionManager {
     }
     const verification=await this.verifyCandidate({...candidate.native,checkpoint});
     if(!verification?.verified||verification.checkpointId!==checkpoint.id){candidate.state='waiting';this.save('candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
+    if(!candidateVerificationReady(verification,candidate)){candidate.state='waiting';this.save('candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
     candidate.state='ready';candidate.verification=verification;this.save('candidate-ready');
     if(advice.action!=='rotate'||!this.state.config.rotate)return {state:'ready',reason:'promotion-not-enabled-or-requested'};
     return this.locked(async()=>{
@@ -223,7 +254,7 @@ export class SessionManager {
       if(invalid)return {state:'waiting',reason:invalid};
       if(!rotationEligibility(this.state,advice,this.now()).eligible)return {state:'waiting',reason:'rotation-evidence-changed'};
       if(!await this.validateEvidence(advice.evidenceIds.map(id=>this.state.evidence[id])))return {state:'waiting',reason:'degradation-source-invalidated'};
-      if(verification.model!==runtime.model||verification.reasoningEffort!==runtime.reasoningEffort||verification.fastMode!==(runtime.fastMode??'off'))return {state:'waiting',reason:'candidate-profile-changed'};
+      if(!sameCandidateProfile(candidate.profile,candidateProfile(runtime)))return {state:'waiting',reason:'candidate-profile-changed'};
       if(!this.state.config.prepare||!this.state.config.rotate)return {state:'ready',reason:'promotion-disabled'};
       candidate.state='committing';candidate.previousBinding=fence;this.save('promotion-start');
       const next={conversationId:fence.conversationId,generation:fence.generation+1,threadId:candidate.native.threadId,nativeSessionId:candidate.native.nativeSessionId};

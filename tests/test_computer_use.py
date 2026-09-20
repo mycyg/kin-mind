@@ -8,9 +8,9 @@ import httpx
 import pytest
 
 from kin_mind.computer_use import (
-    CuaBackend,
     MAX_STATE,
     ComputerUseController,
+    CuaBackend,
     DeepSeekActionReviewer,
     _backend_environment,
     create_server,
@@ -415,6 +415,27 @@ def test_nested_cua_uses_one_host_scope_for_bootstrap_actions_and_cleanup():
     assert calls[1][1]["session_id"] == scope["session_id"]
     assert calls[1][1]["turn_id"] == scope["turn_id"]
     assert "call_id" not in scope and "authorization" not in scope
+
+
+def test_nested_cua_failure_is_stable_and_does_not_echo_backend_payload():
+    class Session:
+        async def call_tool(self, _name, _arguments, meta=None):
+            assert meta
+            return SimpleNamespace(
+                isError=True,
+                content=[SimpleNamespace(
+                    text="Permission denied for https://example.test/?token=private-value",
+                )],
+            )
+
+    backend = CuaBackend(
+        {"command": "/bin/false", "args": []}, execution_id="failed-call", attempt=1,
+    )
+    backend.session = Session()
+    with pytest.raises(RuntimeError, match="^computer-use-service-permission-denied$") as failed:
+        asyncio.run(backend._call("void 0", "Synthetic operation"))
+    assert "private-value" not in str(failed.value)
+    assert "example.test" not in str(failed.value)
 
 
 def test_backend_initialization_failure_closes_its_stdio_stack():

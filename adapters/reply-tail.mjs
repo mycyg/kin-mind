@@ -319,7 +319,10 @@ export class ReplyTail {
     const entries=items.map(bubble=>{
       const draft=itemId(bubble)+'-c'+intent.round;
       return {request:{...bubble.request,draft_id:draft,text:bubble.text},delivery:{id:'kin-cont-'+sha(bubble.bubble_id+'\0'+intent.round).slice(0,48),text:bubble.text,kind:manifest.kind,
-        draftId:draft,memoryBatchId:batch,expectedBubbles:items.length,references:bubble.references??[],...(manifest.taskId?{taskId:manifest.taskId}:{})}};
+        draftId:draft,memoryBatchId:batch,expectedBubbles:items.length,references:bubble.references??[],
+        ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
+        ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
+        ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{})}};
     });
     return this.manifests.createDraft({entries,ownerEpoch:this.ownerEpoch?.()??manifest.ownerEpoch,channel:manifest.channel,
       continues:[{group_id:manifest.group_id,intent_id:intent.id}],continuation:{of:manifest.group_id,intent_id:intent.id,items:items.map(itemId)}});

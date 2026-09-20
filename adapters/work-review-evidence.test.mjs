@@ -7,6 +7,8 @@ import {createHash} from 'node:crypto';
 import {workEvidence} from './work-review-evidence.mjs';
 import {TransportManifests} from './transport-manifest.mjs';
 
+const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
 function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-evidence-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   for(const dir of ['inputs','outbox','deferred'])fs.mkdirSync(path.join(root,dir));
@@ -135,5 +137,133 @@ test('a bubble the transport will never deliver is reported as that, not as an u
     assert.deepEqual(evidence.input.outputs.find(o=>o.id==='bubble-0'),{id:'bubble-0',undelivered:true,reason:reported,receivedByServer:false});
     assert.equal(evidence.receipts.reply.state,'accepted','what was delivered is unchanged');
     assert.deepEqual(evidence.input.cancellableDeferred,[],'a group one of whose bubbles is settled is no longer a deferred draft');
+  }
+});
+
+test('native media receipts supplement task evidence and are re-read before commit',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  let calls=0;
+  const proof={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
+  const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async snapshot=>{assert.equal(snapshot.task.id,'task');calls++;return{proofs:[proof]};}});
+  const first=await adapter.collect(f.snapshot);
+  assert.equal(first.input.outputs.find(o=>o.id==='native-tool:image-outbox').file.sha256,'b'.repeat(64));
+  assert.deepEqual(first.receipts['native-tool:image-outbox'],{state:'accepted',messageId:'image-message',source:'native-tool-outbox',sourceHash:'a'.repeat(64),proofHash:digest(proof)});
+  assert.equal(first.receipts.reply.messageId,'receipt');
+  proof.sourceHash='c'.repeat(64);
+  const second=await adapter.collect(f.snapshot);
+  assert.equal(calls,2);
+  assert.equal(second.receipts['native-tool:image-outbox'].sourceHash,'c'.repeat(64));
+  assert.notEqual(first.receipts['native-tool:image-outbox'].sourceHash,second.receipts['native-tool:image-outbox'].sourceHash);
+  assert.notEqual(first.receipts['native-tool:image-outbox'].proofHash,second.receipts['native-tool:image-outbox'].proofHash);
+  assert.notEqual(digest(first),digest(second),'the pre-commit evidence hash covers the complete native proof');
+  assert.equal(f.snapshot.task.deliveries['native-tool:image-outbox'],undefined,'collection never manufactures a task delivery');
+});
+
+test('a native proof enriches one original accepted delivery without counting the platform message twice',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  const original=(await f.adapter.collect(f.snapshot)).receipts.reply.sourceHash;
+  const artifact={sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'};
+  const proof={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'receipt',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact};
+  const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[proof]})});
+  const evidence=await adapter.collect(f.snapshot),output=evidence.input.outputs.find(o=>o.id==='reply');
+  assert.equal(evidence.input.outputs.filter(o=>evidence.receipts[o.id]?.messageId==='receipt').length,1);
+  assert.equal(evidence.receipts['native-tool:image-outbox'],undefined);
+  assert.deepEqual(output,{id:'reply',toolId:'original',text:'Welcome back',file:artifact,receivedByServer:true});
+  assert.deepEqual(evidence.receipts.reply,{state:'accepted',messageId:'receipt',sourceHash:original,nativeSourceHash:'a'.repeat(64),proofHash:digest(proof)});
+
+  // The verified native source may also supply the missing independent receipt
+  // for an accepted router delivery; it still keeps the router's delivery ID.
+  const g=fixture(t);g.snapshot.task.tools={original:{status:'completed'}};
+  fs.rmSync(path.join(g.root,'outbox','reply.json'));
+  const recovered=await workEvidence({sessionId:'synthetic',inputDirectory:path.join(g.root,'inputs'),outboxDirectory:path.join(g.root,'outbox'),deferredDirectory:path.join(g.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[proof]})}).collect(g.snapshot);
+  assert.equal(recovered.receipts.reply.state,'accepted');
+  assert.equal(recovered.receipts.reply.nativeSourceHash,'a'.repeat(64));
+  assert.deepEqual(recovered.input.outputs.find(o=>o.id==='reply').file,artifact);
+  assert.equal(recovered.input.outputs.some(o=>o.id==='native-tool:image-outbox'),false);
+});
+
+test('native enrichment refuses an original artifact or tool identity conflict',async t=>{
+  const artifact={sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'};
+  const proof={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'receipt',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact};
+  for(const change of [
+    {artifact:{...artifact,type:'audio'}},
+    {artifact:{...artifact,name:'other.jpg'}},
+    {artifact:{...artifact,sha256:'c'.repeat(64)}},
+    {artifact:{...artifact,bytes:13}},
+  ]) {
+    const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+    f.put('outbox','reply',{id:'reply',state:'accepted',messageId:'receipt',text:'Welcome back',media:{type:'image',name:'result.jpg',bytes:12},artifact});
+    const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[{...proof,...change}]})});
+    await assert.rejects(adapter.collect(f.snapshot),/Native delivery artifact collision/);
+  }
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'},other:{status:'completed'}};
+  f.snapshot.task.deliveries['file-tool:other']={state:'accepted',messageId:'image-message'};
+  const differentTool={...proof,messageId:'image-message'};
+  const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[differentTool]})});
+  await assert.rejects(adapter.collect(f.snapshot),/Native delivery tool collision/);
+});
+
+test('native proof IDs and platform message IDs are unique and cannot collide with router evidence',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  const base={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
+  const collect=(proofs,snapshot=f.snapshot)=>workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs})}).collect(snapshot);
+  await assert.rejects(collect([base,{...base,messageId:'another-message'}]),/Duplicate native delivery proof/);
+  await assert.rejects(collect([base,{...base,id:'another-proof'}]),/Duplicate native delivery message/);
+
+  const identityCollision=structuredClone(f.snapshot);
+  identityCollision.task.deliveries['native-tool:image-outbox']={state:'accepted',messageId:'router-message'};
+  await assert.rejects(collect([base],identityCollision),/Native delivery identity collision/);
+  identityCollision.task.deliveries.reply.messageId='image-message';
+  await assert.rejects(collect([base],identityCollision),/Native delivery identity collision/,
+    'matching another original message cannot hide a collision with the synthetic proof ID');
+
+  const messageCollision=structuredClone(f.snapshot);
+  messageCollision.task.deliveries.other={state:'accepted',messageId:'receipt'};
+  await assert.rejects(collect([{...base,messageId:'receipt'}],messageCollision),/Native delivery message collision/);
+  const unfinished=structuredClone(f.snapshot);
+  unfinished.task.deliveries.other={state:'unconfirmed',messageId:'image-message'};
+  await assert.rejects(collect([base],unfinished),/Native delivery message collision/);
+});
+
+test('duplicate original platform identities fail even when direct outbox lookup succeeds',async t=>{
+  const f=fixture(t);
+  f.put('outbox','another',{id:'another',state:'accepted',messageId:'receipt',text:'Different record'});
+  await assert.rejects(f.adapter.collect(f.snapshot),/Platform message identity collision/);
+});
+
+test('native delivery gaps are review evidence while malformed or conflicting diagnostics fail',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'},second:{status:'completed'}};
+  const args={sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null};
+  let diagnostics=[{toolId:'second',code:'native-tool-artifact-invalid'},{toolId:'original',code:'native-tool-outbox-not-unique'}];
+  const adapter=workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics})});
+  const first=await adapter.collect(f.snapshot);
+  assert.deepEqual(first.input.deliveryEvidenceGaps,[
+    {toolId:'original',code:'native-tool-outbox-not-unique'},
+    {toolId:'second',code:'native-tool-artifact-invalid'},
+  ]);
+  diagnostics=[{toolId:'original',code:'native-tool-outbox-invalid'}];
+  const second=await adapter.collect(f.snapshot);
+  assert.notEqual(digest(first),digest(second),'the review evidence hash covers changed delivery gaps');
+  assert.equal(second.receipts.reply.messageId,'receipt','a gap does not erase independently accepted output');
+
+  for(const value of [
+    {},
+    [{toolId:'original',code:'unknown'}],
+    [{toolId:'missing',code:'native-tool-outbox-invalid'}],
+    [{toolId:'original',code:'native-tool-outbox-invalid',detail:'private'}],
+    [{toolId:'original',code:'native-tool-outbox-invalid'},{toolId:'original',code:'native-tool-outbox-invalid'}],
+  ]) await assert.rejects(workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics:value})}).collect(f.snapshot),/Invalid native delivery evidence/);
+
+  for(const code of ['native-tool-receipt-ambiguous','native-tool-event-invalid','native-tool-proof-conflict'])
+    await assert.rejects(workEvidence({...args,toolDeliveries:async()=>({proofs:[],diagnostics:[{toolId:'original',code}]})}).collect(f.snapshot),/Native delivery evidence integrity conflict/);
+});
+
+test('native media proof cannot belong to a different session, task or unfinished tool',async t=>{
+  const f=fixture(t);f.snapshot.task.tools={original:{status:'completed'}};
+  const base={id:'image-outbox',toolId:'original',sessionId:'synthetic',taskId:'task',messageId:'image-message',state:'accepted',source:'native-tool-outbox',sourceHash:'a'.repeat(64),artifact:{sha256:'b'.repeat(64),bytes:12,type:'image',name:'result.jpg'}};
+  for(const change of [{sessionId:'other'},{taskId:'other'},{toolId:'invented'},{state:'unconfirmed'},{messageId:''},{sourceHash:''},
+    {artifact:{...base.artifact,sha256:''}},{artifact:{...base.artifact,bytes:0}},{artifact:{...base.artifact,type:'text'}},{artifact:{...base.artifact,name:null}}]) {
+    const adapter=workEvidence({sessionId:'synthetic',inputDirectory:path.join(f.root,'inputs'),outboxDirectory:path.join(f.root,'outbox'),deferredDirectory:path.join(f.root,'deferred'),lastReply:async()=>null,toolDeliveries:async()=>({proofs:[{...base,...change}]})});
+    await assert.rejects(adapter.collect(f.snapshot),/Invalid native delivery proof/);
   }
 });
