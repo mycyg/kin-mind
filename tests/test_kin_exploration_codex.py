@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from kin_mind.codex_executor import (
+    _mcp_result_metadata,
     codex_argv,
     codex_env,
     codex_final_result,
@@ -1080,6 +1081,30 @@ def test_codex_mcp_results_record_status_and_redacted_failure_codes(tmp_path, mo
     assert "model-visible private page body" not in persisted
     assert "example.test/private" not in persisted
     assert "never-persist-either" not in persisted
+
+
+def test_mcp_result_metadata_never_reads_state_words_from_page_body():
+    plain_body = {
+        "isError": False,
+        "content": [{"type": "text", "text":
+                     "The page documents state: failed and reason: address-not-public."}],
+    }
+    json_body = {
+        "isError": False,
+        "content": [{"type": "text", "text": json.dumps({
+            "html": "<code>state: failed</code>",
+            "description": "reason: address-not-public",
+        })}],
+    }
+    assert _mcp_result_metadata(plain_body) == {"has_result": True, "is_error": False}
+    assert _mcp_result_metadata(json_body) == {"has_result": True, "is_error": False}
+    assert _mcp_result_metadata({
+        "isError": False,
+        "structuredContent": {"state": "failed", "reason": "address-not-public"},
+    }) == {
+        "has_result": True, "is_error": False,
+        "result_state": "failed", "result_reason": "address-not-public",
+    }
 
 
 def test_codex_lease_loss_preempts_with_a_versioned_checkpoint(tmp_path, monkeypatch):

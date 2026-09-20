@@ -166,17 +166,6 @@ def _mcp_result_metadata(result):
         if reason and "result_reason" not in metadata:
             metadata["result_reason"] = _mcp_code(reason)
 
-    text = _mcp_text(result)
-    if "result_state" not in metadata:
-        match = re.search(r"(?i)(?:\"?state\"?\s*[:=]\s*\"?)([A-Za-z_-]{2,40})", text)
-        if match:
-            state = _mcp_safe_state(match.group(1))
-            if state:
-                metadata["result_state"] = state
-    if "result_reason" not in metadata:
-        match = re.search(r"(?i)(?:\"?reason\"?\s*[:=]\s*\"?)([a-z][a-z0-9-]{2,120})", text)
-        if match:
-            metadata["result_reason"] = _mcp_code(match.group(1))
     return metadata
 
 
