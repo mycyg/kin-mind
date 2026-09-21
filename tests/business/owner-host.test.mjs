@@ -105,3 +105,37 @@ test('repeated proven pre-submit failures release for DS review while unknown de
  assert.equal(unknown.getState(),'unconfirmed');assert.equal(unknown.sent.length,1);
  assert.ok(unknown.settlements.every(value=>value.aborted_before_send!==true));
 });
+
+for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
+ test(`a ${boundary} after durable pending never becomes an unknown send`,async()=>{
+  let state,epoch='owner-1',busy=false,eligible=true,first=true,sends=0,claims=0;
+  const loop=new MindLoop({eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,
+   draft:async()=> 'A current thought',send:async()=>{sends++;return{state:'accepted',messageId:'receipt'};},
+   resume:async()=>assert.fail('a proven unsent attempt must not require transport reconciliation'),
+   call:async(action,request)=>{
+    if(action==='candidate')return ['pending','unconfirmed'].includes(state)
+     ?{eligible:false,reason:'attempt-in-progress',state,attempt_id:'attempt-'+claims}:{eligible:true};
+    if(action==='claim'){claims++;state='drafting';return{id:'attempt-'+claims,state};}
+    if(action==='check')return{eligible:true};
+    if(action==='settle'){
+     if(state==='pending'&&request.state==='canceled')assert.equal(request.aborted_before_send,true);
+     state=request.state;
+     if(state==='pending'&&first){first=false;
+      if(boundary==='owner-input')epoch='owner-2';
+      if(boundary==='busy')busy=true;
+      if(boundary==='quiet')eligible=false;
+      if(boundary==='closed')loop.closed=true;
+      if(boundary==='write-error')throw Error('write completed but response failed');
+     }
+     return request;
+    }
+    return{};
+   }});
+  loop.review=async()=>{};
+  const result=await loop.tick();
+  assert.equal(result.state,'canceled');assert.equal(result.aborted_before_send,true);assert.equal(sends,0);
+  if(boundary==='owner-input')assert.equal(result.reason,'contact-source-changed');
+  busy=false;eligible=true;loop.closed=false;
+  assert.equal((await loop.tick()).state,'accepted');assert.equal(claims,2);assert.equal(sends,1);
+ });
+}
