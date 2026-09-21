@@ -156,7 +156,8 @@ export function reconcileOutbox({directory,journal,historicalBefore}) {
       const receipt=path.join(journal.directory,'receipts',hash(event.id)+'.json');
       if(readThroughArchive(receipt,journal.archivedState??{}).value?.id===event.id){recorded++;continue;}
       if(record.attemptedAt<historicalBefore&&!record.memoryHistorical){record.memoryHistorical=true;writeJsonAtomic(file,record,{previous:false});}
-      journal.append(deliveryEvent(record));queued++;
+      const result=journal.append(deliveryEvent(record));
+      if(result?.state==='queued')queued++;else if(result?.state==='recorded')recorded++;
     } catch {failed++;} // One unresolved memory record cannot prevent chat startup.
   }
   return {queued,...(recorded?{recorded}:{}),...(unreadable?{unreadable}:{}),...(failed?{failed}:{})};
