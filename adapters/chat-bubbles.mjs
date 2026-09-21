@@ -11,6 +11,24 @@ export function splitChatText(text) {
   return parts.filter(Boolean);
 }
 
+// These are wire-envelope openings, not private topic keywords or source IDs.
+export const privateReplyPrefixes = ['kin-context:context:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜'];
+export function privateReplyBoundary(text) {
+  let offset=0,fence=null;
+  for(const line of text.split('\n')) {
+    const mark=line.trimStart().match(/^(`{3,}|~{3,})/);
+    if(mark){if(!fence)fence=mark[1][0];else if(fence===mark[1][0])fence=null;}
+    else if(!fence&&!line.trimStart().startsWith('>')) {
+      // Quoted code remains a useful explanation, including protocol examples.
+      const visible=line.replace(/(`+)(.*?)\1/g,m=>' '.repeat(m.length));
+      const match=/^\s*kin-context:context:|<\/?[｜]{1,2}DSML[｜]{1,2}/u.exec(visible);
+      if(match)return offset+match.index;
+    }
+    offset+=line.length+1;
+  }
+  return null;
+}
+
 export const chatVoice = '普通聊天和主动分享优先用一个简短完整的气泡把意思自然说完；确有停顿、情绪转折或更多内容时再分开，不为了形式机械拆句。深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
 
 /** The internal draft protocol's control envelope, recognised on a normal chat
@@ -55,6 +73,11 @@ const PROTOCOL_ACTIONS=new Set(['send','wait','abandon']);
 const ENVELOPE_HEAD=/^\{\s*"(?:action|bubbles)"\s*:/;
 export function chatEnvelope(text) {
   if(typeof text!=='string')return null;
+  const boundary=privateReplyBoundary(text);
+  if(boundary!==null) {
+    const publicText=text.slice(0,boundary).trim();
+    return publicText?{state:'send',bubbles:splitChatText(publicText)}:{state:'invalid',reason:'private-reply-envelope'};
+  }
   const trimmed=text.trim();
   if(!trimmed.startsWith('{'))return null;
   let value;

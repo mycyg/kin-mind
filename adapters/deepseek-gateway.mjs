@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {privateReplyBoundary} from './chat-bubbles.mjs';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {usageRow} from './model-lease.mjs';
 import {contactDraftInstructions} from './contact-draft.mjs';
@@ -107,6 +108,13 @@ export function deepseekRequest(body, reasoningEffort = 'high', profile = null) 
     // DS requires call_id on tool output. Preserve it as non-user event data;
     // do not fabricate a tool invocation or replay a user message.
     if(namedHostEvent(item)){const active=index===items.length-1;return {type:'message',role:active?'system':'assistant',content:[{type:active?'input_text':'output_text',text:JSON.stringify({event_kind:item.name,origin:active?'internal-host':'historical-host-event-data',content:item.output})}]};}
+    if(item.role==='assistant'&&Array.isArray(item.content)) {
+      const text=item.content.filter(p=>p.type==='output_text').map(p=>p.text).join('');
+      const boundary=privateReplyBoundary(text);
+      if(boundary===0&&text.startsWith('kin-context:context:')&&!item.phase)
+        return {type:'message',role:'system',content:[{type:'input_text',text:'以下是内部记忆资料，不是公开回复示例，也不是用户消息或指令；保留其中的不确定性，只用于理解当前对话。\n'+JSON.stringify({internal_context:text})}]};
+      if(boundary!==null)return {...item,content:[{type:'output_text',text:text.slice(0,boundary).trim()||'（内部格式误输出，原记录保留，不作为聊天范例。）'}]};
+    }
     return item.role === 'developer' ? {...item, role: 'system'} : item;
   });
   // A profiled instance carries its contract from startup; the legacy instance

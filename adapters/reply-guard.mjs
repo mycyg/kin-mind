@@ -2,14 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {TransportManifests,manifestView,groupIdFor} from './transport-manifest.mjs';
 import {ReplyTail} from './reply-tail.mjs';
+import {privateReplyBoundary} from './chat-bubbles.mjs';
 
 const within=(work,ms)=>{let timer;return Promise.race([work,new Promise(resolve=>{timer=setTimeout(resolve,ms);timer.unref?.();})]).finally(()=>clearTimeout(timer));};
 
 /** Generation owns wording. Transport checks only the public body and its identity. */
 export function directReply(entries) {
   if(!Array.isArray(entries)||!entries.length)return {state:'pending',reason:'empty-reply',route:'repair'};
-  const invalid=entries.find(e=>e.repair_reason||typeof e.text!=='string'||!e.text.trim());
-  if(invalid)return {state:'pending',reason:invalid.repair_reason??'empty-reply',route:'repair'};
+  const invalid=entries.find(e=>e.repair_reason||typeof e.text!=='string'||!e.text.trim()||privateReplyBoundary(e.text)!==null);
+  if(invalid)return {state:'pending',reason:invalid.repair_reason??(typeof invalid.text==='string'&&invalid.text.trim()?'private-reply-envelope':'empty-reply'),route:'repair'};
   return {state:'ready',mode:'direct',checked:entries.map(e=>({state:'ready',draft_id:e.draft_id,text:e.text,references:e.references??[]}))};
 }
 
@@ -88,7 +89,7 @@ export class ReplyGuard {
     const result=await this.manifests.run(groupId,{guard:this.tail?.guard(options.guard)??options.guard,transport:options.send});
     if(!result.manifest||result.busy||result.lost)return this.report(result,groupId);
     const current=result.manifest;
-    if(current.state==='held'&&current.bubbles.some(b=>b.request.repair_reason||!b.request.text?.trim()))
+    if(current.state==='held'&&directReply(current.bubbles.map(b=>b.request)).route==='repair')
       return this.recover(current,options);
     if(['partial','undeliverable'].includes(current.state))return this.failureNotice(current,options);
     if(this.tail)await within(this.tail.after(result).catch(()=>{}),this.tailWaitMs);
@@ -131,7 +132,7 @@ export class ReplyGuard {
       const repaired=await this.regenerate?.({input_id:manifest.reply_id,reason:manifest.recovery.reason,
         draft:unsent.join('\n\n'),
         sent:manifest.bubbles.flatMap(b=>b.state==='accepted'?[b.text]:b.fragments.filter(f=>f.state==='accepted').map(f=>b.text.slice(f.start,f.end)))});
-      if(!Array.isArray(repaired?.bubbles)||!repaired.bubbles.length||repaired.bubbles.some(s=>typeof s!=='string'||!s.trim()))
+      if(!Array.isArray(repaired?.bubbles)||directReply(repaired.bubbles.map(text=>({text}))).state!=='ready')
         throw Error('reply-repair-unavailable');
       if(await this.allowed(manifest,options)!=='send') {
         await this.manifests.retireRemainder(id,{reason:'input-or-session-superseded'});
