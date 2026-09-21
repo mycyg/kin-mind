@@ -181,3 +181,12 @@ def test_uncertain_background_keeps_its_identity_without_blocking_fresh_context(
     new=delivery.prepare('same-main',epoch,'owner-two','current optional background',[])
     assert delivery.begin('same-main',epoch,new['id'])['state']=='sending'
     assert delivery.begin('same-main',epoch,old['id'])['state']=='unconfirmed'
+
+
+def test_generated_internal_envelopes_do_not_become_public_memory():
+    from kin_mind.dialogue import is_public_dialogue
+    body = "kin-context:context:invented-id\n共享记忆资料"
+    assert not is_public_dialogue({"kind": "delivery", "state": "accepted", "text": body})
+    assert not is_public_dialogue({"kind": "assistant-message", "text": "</｜｜DSML｜｜ invoke>"})
+    assert is_public_dialogue({"kind": "owner-message", "text": body})
+    assert is_public_dialogue({"kind": "assistant-message", "text": "解释 `kin-context:context:id` 是什么。"})

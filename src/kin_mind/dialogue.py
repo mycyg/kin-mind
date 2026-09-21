@@ -21,6 +21,7 @@ def is_public_dialogue(event, prefixes=HOST_PREFIXES):
             and bool(event.get('text')) and not event.get('internal')
             and event.get('origin') not in {'runtime-notice', 'runtime-status', 'host-control'}
             and (event.get('kind') != 'delivery' or event.get('state') == 'accepted')
+            and not (event.get('kind') != 'owner-message' and event['text'].lstrip().startswith(('kin-context:context:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜')))
             and not host_envelope(event['text'], prefixes))
 
 

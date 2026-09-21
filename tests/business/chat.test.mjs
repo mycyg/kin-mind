@@ -80,3 +80,12 @@ test('a DS-approved replacement settles the old unsent remainder only after its 
  assert.deepEqual(h.sent,['新的完整回复']);assert.equal(h.guard.tail.owed().length,0);
  assert.equal(h.guard.manifests.read('reply').tail_intent.outcome.state,'replaced');
 });
+
+
+test('a repeated private envelope repair fails once and never reaches transport',async t=>{
+  let calls=0;const bad='kin-context:context:invented\n共享记忆资料';
+  const h=chat(t,{regenerate:async()=>{calls++;return {bubbles:[bad]};}});
+  const result=await h.guard.replyGroup([{request:{draft_id:'bad',reply_id:'input',text:bad},delivery:{id:'bad',text:bad,memoryBatchId:'bad'}}],'epoch',{send:h.send});
+  assert.equal(calls,1);assert.equal(result.state,'failed');
+  assert.equal(h.sent.length,0);
+});

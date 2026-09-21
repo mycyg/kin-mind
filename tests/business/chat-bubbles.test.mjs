@@ -65,3 +65,15 @@ test('everything else is body text: fences, prose, arbitrary JSON, arrays',()=>{
   assert.equal(chatEnvelope(null),null);
   assert.equal(chatEnvelope(''),null);
 });
+
+
+test('private envelopes keep the public prefix without trusting a generated source id',()=>{
+  const suffix='kin-context:context:invented-id\n共享记忆资料\n{"basis":"inferred"}';
+  assert.deepEqual(chatEnvelope('我也想你啦～\n\n'+suffix),{state:'send',bubbles:['我也想你啦～']});
+  for(const text of [suffix,'</｜｜DSML｜｜ invoke>','<｜DSML｜function_calls>'])
+    assert.deepEqual(chatEnvelope(text),{state:'invalid',reason:'private-reply-envelope'});
+  assert.deepEqual(chatEnvelope('继续做事啦。</｜｜DSML｜｜ calls>'),{state:'send',bubbles:['继续做事啦。']});
+  for(const text of ['可以讨论记忆、情绪和内部状态。','这个 `kin-context:context:example` 是编号。',
+    '```text\n'+suffix+'\n```','> kin-context:context:example','协议 `</｜｜DSML｜｜ calls>` 不是正文。'])
+    assert.equal(chatEnvelope(text),null);
+});
