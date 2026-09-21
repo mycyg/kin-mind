@@ -144,16 +144,22 @@ export function snapshotArtifact(file,directory) {
 /** Reconcile the local outbox/journal gap; never call a transport API here. */
 export function reconcileOutbox({directory,journal,historicalBefore}) {
   if(!fs.existsSync(directory))return {queued:0};
-  let queued=0,unreadable=0;
+  let queued=0,recorded=0,unreadable=0,failed=0;
   for(const name of fs.readdirSync(directory).filter(n=>n.endsWith('.json'))) {
-    // One unreadable receipt of the sender's is skipped, never repaired from here.
     const file=path.join(directory,name),record=readJsonFile(file).value;
     if(!record){unreadable++;continue;}
     if(!record.id||!record.attemptedAt)continue;
-    if(record.attemptedAt<historicalBefore&&!record.memoryHistorical){record.memoryHistorical=true;writeJsonAtomic(file,record,{previous:false});}
-    journal.append(deliveryEvent(record));queued++;
+    try {
+      const event=deliveryEvent(record);
+      // Recovery fills gaps. A committed event already owns its identity; later
+      // outbox metadata is not another ingestion and must not rewrite that event.
+      const receipt=path.join(journal.directory,'receipts',hash(event.id)+'.json');
+      if(readThroughArchive(receipt,journal.archivedState??{}).value?.id===event.id){recorded++;continue;}
+      if(record.attemptedAt<historicalBefore&&!record.memoryHistorical){record.memoryHistorical=true;writeJsonAtomic(file,record,{previous:false});}
+      journal.append(deliveryEvent(record));queued++;
+    } catch {failed++;} // One unresolved memory record cannot prevent chat startup.
   }
-  return {queued,...(unreadable?{unreadable}:{})};
+  return {queued,...(recorded?{recorded}:{}),...(unreadable?{unreadable}:{}),...(failed?{failed}:{})};
 }
 /** Only an observed edit effect establishes creator provenance. */
 export class ToolArtifactObserver {
