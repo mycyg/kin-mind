@@ -298,7 +298,7 @@ class Providers:
     def rerank(self, query, records):
         result = self.json(
             "rerank",
-            'Rank relevant record ids for the query. Return {"ids":[id,...]}. Do not add ids.',
+            '按与问题的相关性排列已有记录编号，只返回 {"ids":[id,...]}，不添加输入以外的编号。',
             {
                 "query": query,
                 "records": [
