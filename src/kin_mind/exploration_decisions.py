@@ -12,8 +12,8 @@ from eventmem.core.models import Model
 class SharingDecision(Model):
     exploration_id: str = Field(min_length=1, max_length=100)
     decision: Literal["share", "defer", "keep"]
-    reason: str = Field(min_length=1, max_length=600)
-    reconsider_when: str | None = Field(default=None, max_length=600)
+    reason: str = Field(min_length=1)
+    reconsider_when: str | None = None
 
     @model_validator(mode="after")
     def condition(self):

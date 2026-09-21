@@ -17,3 +17,20 @@ test('existing adapter upgrade retains full final text and its original input id
  assert.equal(receipt.text.length,12000);assert.equal(receipt.inputText,'[internal-assessment:original]');
  assert.equal(patchCodexRuntime(upgraded),upgraded);
 });
+
+import {ownerSessionWork} from '../../adapters/mobile-session-host.mjs';
+import {developerInstructionEvidence,instructionTextEvidence} from '../../adapters/instruction-evidence.mjs';
+test('assessment does not claim foreground capacity but owner input still does',()=>{
+ const session={processing:true,activeMessage:{contextToken:'assessment-1'},queue:[]};
+ assert.equal(ownerSessionWork(session,[],'assessment-1'),false);
+ assert.equal(ownerSessionWork({...session,queue:[{contextToken:'owner'}]},[],'assessment-1'),true);
+ assert.equal(ownerSessionWork(session,[{id:'owner-work'}],'assessment-1'),true);
+ assert.equal(ownerSessionWork({...session,activeMessage:{contextToken:'owner'}},[],'assessment-1'),true);
+ assert.equal(ownerSessionWork(session,[],undefined),true);
+});
+test('native collaboration envelope retains the exact approved developer body',()=>{
+ const approved='当前人格和二十三组范本。\n';
+ const evidence=text=>developerInstructionEvidence({input:[{role:'developer',content:[{type:'input_text',text}]}]})[0];
+ assert.deepEqual(evidence('<collaboration_mode>'+approved+'</collaboration_mode>'),instructionTextEvidence(approved));
+ assert.notDeepEqual(evidence('前缀<collaboration_mode>'+approved+'</collaboration_mode>'),instructionTextEvidence(approved));
+});

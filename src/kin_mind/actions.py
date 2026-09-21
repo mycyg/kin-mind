@@ -6,6 +6,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import SourceInput
 
 from .state import project
+from .model_runtime import verified_decision
 
 
 class ActionEvents:
@@ -198,7 +199,7 @@ class ActionEvents:
                 if d["status"] != "wanted" or d["expired"] or d["needs_review"]:
                     continue
                 receipt = d.get("decision_receipt", {})
-                if d["kind"] == "explore" and receipt.get("provider") != "deepseek":
+                if d["kind"] == "explore" and not verified_decision(receipt):
                     self.emit(
                         conn,
                         "wish-review",
@@ -212,7 +213,7 @@ class ActionEvents:
                 elif (
                     versions
                     and semantic
-                    and receipt.get("provider") == "deepseek"
+                    and verified_decision(receipt)
                     and receipt.get("agent_version") != view["agent_version"]
                 ):
                     # A wish decided under an earlier version is not ready any more, and nothing
@@ -279,7 +280,7 @@ class ActionEvents:
             choices = [
                 d
                 for d in choices
-                if d.get("decision_receipt", {}).get("provider") == "deepseek"
+                if verified_decision(d.get("decision_receipt", {}))
                 and (not semantic or d.get("decision_receipt", {}).get("agent_version") == view["agent_version"])
             ]
         if not choices:

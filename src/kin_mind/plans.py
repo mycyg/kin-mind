@@ -17,6 +17,7 @@ from eventmem.core.idempotency import stamp as fingerprint
 from . import liveness
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled, optimized
+from .model_runtime import verified_decision
 from .state import project, timestamp
 
 
@@ -215,8 +216,8 @@ class AutonomousPlans:
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
         rebased: that proof, not the model's stale expected_revision, fenced this decision."""
         d = ActionDecision.model_validate(proposal)
-        if receipt.get("provider") != "deepseek" or receipt.get("reasoning") != "high":
-            raise Conflict("Autonomous action requires a verified DeepSeek high decision")
+        if not verified_decision(receipt):
+            raise Conflict("Autonomous action requires a verified assessment decision")
         plan = self._target(conn, d.plan_id)
         if plan["revision"] != d.expected_revision or plan["status"] != "active":
             raise Conflict("Decision plan revision is no longer active", target=plan["id"],

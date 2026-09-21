@@ -9,6 +9,15 @@ import httpx
 from .model_lanes import ModelAdmissionWait, background_calls, configure, evaluation_slot, slot  # noqa: F401
 
 
+def verified_decision(receipt):
+    """Accept the host-confirmed native profile or a legacy DS high receipt."""
+    native = receipt.get("native_receipt")
+    if native:
+        return bool(native.get("native_turn_id") and native.get("native_session_id") and native.get("verified_at")
+                    and all(native.get(k) and native[k] == receipt.get(k) for k in ("provider", "model", "reasoning")))
+    return receipt.get("provider") == "deepseek" and receipt.get("reasoning") == "high"
+
+
 def model_slot(provider, purpose, *, default=None):
     """Delegates to the one admission implementation. `default` is the lane a call site
     declares for itself when nothing above it declared one."""

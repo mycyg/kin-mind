@@ -567,10 +567,11 @@ class Mind(Continuity):
 
     def _desire_ready(self, conn, desire, at, *, state=None):
         from .autonomy_schema import enabled
+        from .model_runtime import verified_decision
         if enabled(conn, self.scope.key()):
             receipt = desire.get("decision_receipt", {})
             current = state or self._load(conn)
-            if receipt.get("provider") != "deepseek" or receipt.get("agent_version") != current["agent_version"]:
+            if not verified_decision(receipt) or receipt.get("agent_version") != current["agent_version"]:
                 return False
             from .plans import AutonomousPlans
             if not AutonomousPlans(self).linked_ready(conn, desire):
