@@ -134,7 +134,7 @@ node --test tests/business/*.test.mjs
 uv run python examples/mind_demo.py
 ```
 
-The example uses a temporary database without accessing personal memory. A production host needs an existing database, a dedicated scope, a configuration version, an environment variable for DeepSeek credentials and a codex CLI exploration executor. Enable `main_session_review` and connect an existing native session for main-session assessment; `memory.native_window_context` selects native capacity management. These are host integration options; installing the library alone does not attach to a session.
+The example uses a temporary database without accessing personal memory. A production host needs an existing database, a dedicated scope, a configuration version, an environment variable for DeepSeek credentials and a codex CLI exploration executor. Enable `main_session_review` and connect an existing native session for main-session assessment; the memory setting `native_window_context` selects native capacity management. These are host integration options; installing the library alone does not attach to a session.
 
 Some useful affect and wish interfaces:
 

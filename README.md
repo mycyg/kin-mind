@@ -136,7 +136,7 @@ node --test tests/business/*.test.mjs
 uv run python examples/mind_demo.py
 ```
 
-示例在临时库中运行，不访问个人记忆。生产宿主需配置已有数据库、独立范围、配置版本、DeepSeek 凭据环境变量，以及 codex CLI 探索执行器。主会话评估需启用 `main_session_review` 并接入现有原生会话；`memory.native_window_context` 启用原生容量策略。这些是宿主接入选项，安装库本身不会自动接管一个会话。
+示例在临时库中运行，不访问个人记忆。生产宿主需配置已有数据库、独立范围、配置版本、DeepSeek 凭据环境变量，以及 codex CLI 探索执行器。主会话评估需启用 `main_session_review` 并接入现有原生会话；记忆设置中的 `native_window_context` 启用原生容量策略。这些是宿主接入选项，安装库本身不会自动接管一个会话。
 
 情绪与愿望的几个常用接口：
 
