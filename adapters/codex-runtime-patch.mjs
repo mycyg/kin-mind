@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
-const marker = '// KIN_MODEL_ROUTING_V2';
+const marker = '// KIN_MODEL_ROUTING_V3';
+const previousMarker = '// KIN_MODEL_ROUTING_V2';
 const legacyMarker = '// KIN_MODEL_ROUTING_V1';
 const legacyFastMode = 'fastMode: value("fast-mode")';
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
@@ -12,7 +13,7 @@ const runtimeMethods = `
     const turn = page.data[0];
     const messages = (turn?.items ?? []).filter(item => item.type === "agentMessage");
     const item = messages.findLast(item => item.phase === "final_answer") ?? messages.at(-1);
-    return {known: true, turnId: turn?.id, status: turn?.status, text: item?.text?.slice(-4000) ?? ""};
+    return {known: true, turnId: turn?.id, status: turn?.status, text: item?.text ?? "", inputText: (turn?.items ?? []).filter(item => item.type === "userMessage").flatMap(item => item.content ?? []).filter(part => part.type === "text").map(part => part.text).join("\\n")};
   }
   async kinRuntime(sessionId) {
     const state = this.sessions.get(sessionId);
@@ -57,12 +58,19 @@ export function patchCodexRuntime(source) {
     if (!source.includes(sessionFastMode) || source.includes(legacyFastMode)) throw Error('Codex ACP runtime patch marker is inconsistent');
     return source;
   }
-  if (source.includes(legacyMarker)) {
+  if (source.includes(previousMarker) || source.includes(legacyMarker)) {
+    const oldReply = 'text: item?.text ?? ""';
+    const truncatedReply = 'text: item?.text?.slice(-4000) ?? ""';
+    if (!source.includes('inputText: (turn?.items')) {
+      const from = source.includes(truncatedReply) ? truncatedReply : oldReply;
+      if (source.split(from).length !== 2) throw Error('Codex ACP reply identity upgrade needs compatibility review');
+      source = source.replace(from, 'text: item?.text ?? "", inputText: (turn?.items ?? []).filter(item => item.type === "userMessage").flatMap(item => item.content ?? []).filter(part => part.type === "text").map(part => part.text).join("\\n")');
+    }
     if (source.includes(legacyFastMode)) {
       if (source.split(legacyFastMode).length !== 2) throw Error('Codex ACP runtime upgrade needs compatibility review');
       source = source.replace(legacyFastMode, sessionFastMode);
     } else if (!source.includes(sessionFastMode)) throw Error('Codex ACP runtime upgrade needs compatibility review');
-    return source.replace(legacyMarker, marker);
+    return source.replace(legacyMarker, marker).replace(previousMarker, marker);
   }
   const replacements = [
     ['  async extMethod(method, params) {\n    const methodRequest = { method, params };',

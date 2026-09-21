@@ -131,17 +131,17 @@ class Citation(Model):
 
 
 class AssistanceHint(Model):
-    action: str = Field(min_length=1, max_length=500)
-    reason: str = Field(min_length=1, max_length=500)
-    completion: str = Field(min_length=1, max_length=500)
+    action: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    completion: str = Field(min_length=1)
 
 
 class Findings(Model):
-    summary: str = Field(min_length=1, max_length=6000)
-    findings: list[str] = Field(max_length=30)
-    sources: list[Citation] = Field(max_length=30)
-    open_questions: list[str] = Field(max_length=20)
-    suggested_share: str | None = Field(default=None, max_length=2000)
+    summary: str = Field(min_length=1)
+    findings: list[str]
+    sources: list[Citation]
+    open_questions: list[str]
+    suggested_share: str | None = None
     assistance_needed: AssistanceHint | None = None
     # Backward-compatible: claims keyed by their 1-based finding index, mapped to
     # evidence ids from the run's source ledger (read receipts or memory:// ids).

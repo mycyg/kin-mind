@@ -102,12 +102,12 @@ def error_detail(error, reported):
 
 
 class Wish(Model):
-    content: str = Field(min_length=1, max_length=2000)
-    topic: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
     kind: Literal["contact", "explore", "create"]
     strength: StrictInt = Field(ge=0, le=100)
     ttl_hours: StrictInt = Field(ge=1, le=168)
-    completion: str = Field(min_length=1, max_length=1000)
+    completion: str = Field(min_length=1)
     concern_ids: list[str] = Field(default_factory=list, max_length=10)
     exploration_target: Literal["knowledge", "computer"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
@@ -124,7 +124,7 @@ class WishUpdate(Model):
     desire_id: str
     action: Literal["wait", "resume", "complete", "abandon", "link"]
     concern_ids: list[str] | None = Field(default=None, max_length=10)
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
 
@@ -187,7 +187,7 @@ class TraitDecision(Model):
     episodes: list[TraitEpisode] = Field(default_factory=list, max_length=4)
     quote: str | None = Field(default=None, max_length=1000)
     evidence_ids: list[Identifier] = Field(default_factory=list, max_length=8)
-    reason: str = Field(min_length=1, max_length=400)
+    reason: str = Field(min_length=1)
 
 
 class Prediction(Model):
@@ -201,7 +201,7 @@ class SelfHypothesis(Model):
     predictions: list[Prediction] = Field(default_factory=list, max_length=2)
     trait_refs: list[Identifier] = Field(default_factory=list, max_length=4)
     evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
-    reason: str = Field(min_length=1, max_length=400)
+    reason: str = Field(min_length=1)
 
 
 class PredictionOutcome(Model):
@@ -209,7 +209,7 @@ class PredictionOutcome(Model):
     outcome: Literal["confirmed", "refuted", "inconclusive"]
     result_ids: list[Identifier] = Field(default_factory=list, max_length=4)
     evidence_ids: list[Identifier] = Field(default_factory=list, max_length=6)
-    reason: str = Field(min_length=1, max_length=400)
+    reason: str = Field(min_length=1)
 
 
 class IntentTopic(Model):
@@ -232,13 +232,13 @@ class NextMove(Model):
     step_ref: Identifier | None = None
     grounds: list[Identifier] = Field(default_factory=list, max_length=6)
     alternative: str = Field(default="", max_length=300)
-    reason: str = Field(min_length=1, max_length=300)
+    reason: str = Field(min_length=1)
 
 
 class Appraisal(Model):
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     wishes: list[Wish] = Field(default_factory=list, max_length=2)
     wish_updates: list[WishUpdate] = Field(default_factory=list, max_length=6)
     evolution: Evolution | None = None
@@ -557,7 +557,7 @@ SYSTEM += PREVIOUS_ATTEMPT_PROMPT
 
 
 class HistoryAssessment(Model):
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
 
 
@@ -890,7 +890,7 @@ class DeepSeek:
                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                     json={"model": APPRAISAL_MODEL, "max_tokens": max_tokens, "system": system,
                           "messages": [{"role": "user", "content": dumps(context)}],
-                          "tools": [{"name": name, "description": "Submit sourced structured results", "input_schema": schema.model_json_schema()}],
+                          "tools": [{"name": name, "description": "提交保留来源的结构化结果", "input_schema": schema.model_json_schema()}],
                           "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"}, "output_config": {"effort": APPRAISAL_EFFORT}})
             if response.status_code != 200:
                 # A refused request still made one: it leaves a record with unknown usage.
@@ -899,7 +899,7 @@ class DeepSeek:
             body = response.json()
             if hasattr(self, "engine"):
                 self.engine.db.metric("structured_model_usage", 1, {"tool": name, "model": body.get("model"),
-                    "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
+                    "reasoning": body.get("native_receipt", {}).get("reasoning", APPRAISAL_EFFORT), "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
             if body.get("model") != APPRAISAL_MODEL or body.get("stop_reason") == "max_tokens":
                 if hasattr(self,"engine"):
                     self.engine.db.metric("structured_rejected", 1, {"tool":name,"reported_model":body.get("model"),"stop_reason":body.get("stop_reason"),"max_tokens":max_tokens, **attempts.usage_entry(body.get("usage"))})
@@ -916,7 +916,7 @@ class DeepSeek:
                 raise
             record("ok")
             self.failure_receipt = None
-            receipt = {"provider": "deepseek", "model": body["model"], "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"),
+            receipt = {"provider": "deepseek", "model": body["model"], "reasoning": body.get("native_receipt", {}).get("reasoning", APPRAISAL_EFFORT), "request_id": body.get("id"),
                        **attempts.usage_entry(body.get("usage")), "verified_at": datetime.now(timezone.utc).isoformat(),
                        "elapsed_ms": elapsed(), "cache_hit": False}
             token = self._cache_put(cache_state, name, context, judgment, depends_on, valid_for, result, receipt)
@@ -930,6 +930,24 @@ class DeepSeek:
             record("network-error")
             raise RuntimeError("deepseek-network-error") from None
 
+    def _request_appraisal(self, context, rendered, policy, timeout, record):
+        with request_client(self, timeout, "submit_appraisal") as client:
+            response = client.post(self.endpoint + "/v1/messages",
+                headers={"x-api-key": os.environ[self.key_env], "anthropic-version": "2023-06-01"},
+                json={"model": self.model, "max_tokens": 131072,
+                      "system": self._system(context, policy),
+                      "messages": [{"role": "user", "content": rendered}],
+                      "tools": [{"name": "submit_appraisal", "description": "提交有来源的状态提案",
+                                 "input_schema": appraisal_schema(context.get("operational_only", False),
+                                     context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
+                                     self._sections(context), self._review_max())}],
+                      "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"},
+                      "output_config": {"effort": APPRAISAL_EFFORT}})
+        if response.status_code != 200:
+            record("http-" + str(response.status_code))
+            raise RuntimeError("deepseek-http-" + str(response.status_code))
+        return response.json()
+
     def appraise(self, context):
         started = time.monotonic()
         self.failure_receipt = None
@@ -938,6 +956,7 @@ class DeepSeek:
         purpose = getattr(self, "call_purpose", None) or "appraise"
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         request_context = appraisal_context(context)
+        input_budget = getattr(self, "input_budget", APPRAISAL_INPUT_BUDGET)
         compression_receipt = None
         if hasattr(self, "engine") and request_context.get("memory_context"):
             from eventmem.core.models import Scope
@@ -947,11 +966,13 @@ class DeepSeek:
             from .context import Contexts
             from .state import Mind
             request_context = redact(request_context)
-            if tokens(dumps(request_context)) > APPRAISAL_INPUT_BUDGET:
+            overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
+                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max()))) + 160
+            if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
                 # foreground recall. Completed parts survive the worker boundary.
                 preparation_seconds = min(480, max(30, self.timeout - 120))
-                compressor = DeepSeek(self.endpoint, self.model, self.key_env, timeout=min(240, preparation_seconds), transport=self.transport)
+                compressor = self if getattr(self, "native_review", False) else DeepSeek(self.endpoint, APPRAISAL_MODEL, self.key_env, timeout=min(240, preparation_seconds), transport=self.transport)
                 compressor.engine, compressor.background = self.engine, getattr(self, "background", False)
                 # Preparation calls belong to this attempt, including the ones a pass that
                 # ends in `compression-pending` made before it gave up.
@@ -978,20 +999,27 @@ class DeepSeek:
                 for dimension, value in projected_state.get("dimensions", {}).items():
                     if value.get("reason"):
                         items.append({"id": "dimension:" + dimension, "text": value.pop("reason"), "basis": "inferred"})
-                unique = {i["id"]: i for i in items}
-                result = compact.pack(list(unique.values()), "Summarize this appraisal batch; retain outcomes, corrections and already answered questions. Recent interaction resolves late events. Keep work/share IDs and source IDs.", 11000, provider=compressor, work_seconds=preparation_seconds, require_all=True)
-                if result["omitted_ids"]:
-                    raise RuntimeError("deepseek-evidence-compression-pending:" + result.get("reason", result["state"]))
-                request_context["new_evidence"] = [{k: v for k, v in s.items() if k != "text"} for s in evidence]
-                request_context["evidence_summary"] = result["text"]
-                request_context["memory_context"]["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in request_context["memory_context"]["pending_events"]]
+                for index, dialogue in enumerate(request_context.get("recent_dialogue", [])):
+                    items.append({"id": "dialogue:" + str(index), "text": dumps(dialogue), "basis": "documented"})
+                request_context["recent_dialogue"] = [{k: v for k, v in dialogue.items() if k in {"id", "source_id", "role", "occurred_at", "received_at"}}
+                                                     for dialogue in request_context.get("recent_dialogue", [])]
+                request_context["new_evidence"] = [{k: v for k, v in source.items() if k != "text"} for source in evidence]
+                memory_data["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in memory_data["pending_events"]]
                 for kind in ("works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
+                available = max(0, input_budget - overhead - tokens(dumps(request_context)) - 80)
+                if available < 128:
+                    raise RuntimeError("deepseek-appraisal-budget-unfit")
+                unique = {i["id"]: i for i in items}
+                result = compact.pack(list(unique.values()), "压缩本轮评估资料，保留结果、更正和已回答的问题。根据最近互动解释晚到事件；保留作品、分享及来源编号。", available, provider=compressor, work_seconds=preparation_seconds, require_all=True, on_progress=getattr(self, "compression_parts", set()).add)
+                if result["omitted_ids"]:
+                    raise RuntimeError("deepseek-evidence-compression-pending:" + result.get("reason", result["state"]))
+                request_context["evidence_summary"] = result["text"]
                 # The compression receipt belongs to this attempt's calls, not to the
                 # prompt: it costs tokens and made the rendered request differ every time.
                 compression_receipt = result.get("receipt")
-                if tokens(dumps(request_context)) > APPRAISAL_INPUT_BUDGET:
+                if tokens(dumps(request_context)) + overhead > input_budget:
                     raise RuntimeError("deepseek-appraisal-budget-pending")
                 if time.monotonic() - started > self.timeout - 120:
                     # A slow provider can keep an HTTP stream alive beyond its
@@ -999,7 +1027,7 @@ class DeepSeek:
                     # subsequent appraisal a fresh worker budget on retry.
                     raise RuntimeError("deepseek-appraisal-preparation-complete")
         key = os.environ.get(self.key_env)
-        if not key:
+        if not key and not getattr(self, "native_review", False):
             raise RuntimeError("deepseek-key-unavailable")
         if request_context.get('clock', {}).get('authority') == 'host-clock':
             elapsed = int(max(0, time.monotonic() - started))
@@ -1012,43 +1040,20 @@ class DeepSeek:
                 model=body.get("model"), request_id=body.get("id"), usage=body.get("usage"),
                 elapsed_ms=round((time.monotonic() - started) * 1000), context_digest=request_digest, **extra)
         try:
-            with request_client(self, max(30, self.timeout - (time.monotonic() - started)), "submit_appraisal") as client:
-                response = client.post(
-                    self.endpoint + "/v1/messages",
-                    headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                    json={
-                        "model": self.model,
-                        "max_tokens": 131072,
-                        "system": self._system(context, policy),
-                        "messages": [{"role": "user", "content": rendered}],
-                        "tools": [
-                            {
-                                "name": "submit_appraisal",
-                                "description": "Submit a validated state proposal",
-                                "input_schema": appraisal_schema(context.get("operational_only", False), context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max()),
-                            }
-                        ],
-                        "tool_choice": {"type": "auto"},
-                        "thinking": {"type": "enabled"},
-                        "output_config": {"effort": APPRAISAL_EFFORT},
-                    },
-                )
-                if response.status_code != 200:
-                    record("http-" + str(response.status_code))
-                    raise RuntimeError("deepseek-http-" + str(response.status_code))
-            body = response.json()
+            body = self._request_appraisal(context, rendered, policy,
+                max(1, self.timeout - (time.monotonic() - started)), record)
             if hasattr(self, "engine"):
                 # The main call was the only one that reached no metric at all.
                 self.engine.db.metric("structured_model_usage", 1, {"tool": "submit_appraisal", "model": body.get("model"),
-                    "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
-            self.failure_receipt = {"provider": "deepseek", "model": body.get("model"), "request_id": body.get("id"),
+                    "reasoning": body.get("native_receipt", {}).get("reasoning", APPRAISAL_EFFORT), "request_id": body.get("id"), **attempts.usage_entry(body.get("usage"))})
+            self.failure_receipt = {"provider": body.get("native_receipt", {}).get("provider", "deepseek"), "model": body.get("model"), "request_id": body.get("id"),
                 "stop_reason": body.get("stop_reason"), **attempts.usage_entry(body.get("usage")),
                 "block_types": [b.get("type") for b in body.get("content", [])],
                 "verified_at": datetime.now(timezone.utc).isoformat()}
             if body.get("stop_reason") == "max_tokens":
                 record("max-tokens")
                 raise RuntimeError("deepseek-output-budget-exhausted")
-            if body.get("model") != APPRAISAL_MODEL:
+            if body.get("model") != (self.model if getattr(self, "native_review", False) else APPRAISAL_MODEL):
                 record("model-unverified")
                 raise RuntimeError("deepseek-model-unverified")
             tool_calls = [
@@ -1093,8 +1098,8 @@ class DeepSeek:
                 self.failure_receipt = None
                 try:
                     fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment if historical else Appraisal,
-                        "Correct only the listed schema errors in this structured result; preserve evidence and meaning. graph basis is explicit/documented/inferred/internal_thought. Submit no private reasoning."
-                        + ("" if historical else " Remove fields the schema does not define and leave every valid field as it is."),
+                        "只修正列出的结构错误，保留原意和证据。graph 的 basis 使用 explicit/documented/inferred/internal_thought，不提交内部推理。"
+                        + ("" if historical else " 删除结构未定义的字段，保留其余有效字段。"),
                         {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
                 except Exception:
                     appraisal_receipt["schema_repair"] = self.failure_receipt or {
@@ -1106,11 +1111,12 @@ class DeepSeek:
                 self.failure_receipt = appraisal_receipt
                 proposal = Appraisal.model_validate({**fixed.model_dump(), **({"memory": {}} if context.get("operational_only") else {})})
             receipt = {
-                "provider": "deepseek",
+                "provider": body.get("native_receipt", {}).get("provider", "deepseek"),
                 "model": body["model"],
                 **attempts.usage_entry(body.get("usage")),
                 "request_id": body.get("id"),
-                "reasoning": APPRAISAL_EFFORT,
+                "reasoning": body.get("native_receipt", {}).get("reasoning", APPRAISAL_EFFORT),
+                **({"native_receipt": body["native_receipt"]} if body.get("native_receipt") else {}),
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
                 "context_projection": request_context.get("context_projection", "affect-decision-v3"),
@@ -1119,7 +1125,7 @@ class DeepSeek:
                 **({"compression_receipt": compression_receipt} if compression_receipt else {}),
                 "context_characters": len(rendered),
                 "request_digest": request_digest,
-                "max_output_tokens": 131072,
+                "max_output_tokens": None if getattr(self, "native_review", False) else 131072,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
             }
             # A8: this call succeeded, so nothing about it may be reported as a failed
@@ -1197,6 +1203,76 @@ class DeepSeek:
         return {"system": digest(self._system(context, policy)),
                 "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max())),
                 "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"})}
+
+
+
+class NativeReview(DeepSeek):
+    """Use the existing action worker's pipe to assess in the owner's idle session.
+
+    No private reasoning is transferred. The ordinary appraisal attempt and native
+    input IDs own retries; this adapter adds no queue or durable synchronization state.
+    """
+    native_review = True
+
+    @classmethod
+    def from_engine(cls, engine, *, profile, exchange):
+        provider = super().from_engine(engine)
+        provider.profile, provider.exchange = profile, exchange
+        provider.model = profile["model"]
+        provider.input_budget = max(0, profile["modelContextWindow"] - profile["outputReserve"] - profile["toolReserve"])
+        provider.native_call_number = 0
+        provider.absolute_deadline = time.monotonic() + provider.timeout
+        return provider
+
+    def _system(self, context, policy):
+        # The main session already loads the approved persona once as stable instructions.
+        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做。想记感想时，understanding.meaning 使用自然中文，basis=internal_thought，关联已有真实来源；长久惦记放入 concerns，活动安排放入 plan_changes。没有实质变化时相应字段留空，更新复核时间即可。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
+
+    def request_profile(self, context):
+        return {**super().request_profile(context), "parameters": self.profile}
+
+    def _native(self, name, schema, system, context, timeout):
+        self.native_call_number += 1
+        row_id, token = self.native_attempt
+        request_id = f"{row_id}:{token}:{self.native_call_number}"
+        started = time.monotonic()
+        answer = self.exchange({"id": request_id, "name": name, "schema": schema,
+            "system": system, "context": context, "profile": self.profile,
+            "timeout_ms": max(1, int(timeout * 1000))})
+        if answer.get("state") == "waiting":
+            if answer.get("model_invoked"):
+                attempts.record_call(self, name, outcome="owner-preempted", model=None, usage=None,
+                                     elapsed_ms=round((time.monotonic()-started)*1000))
+            raise ModelAdmissionWait("foreground-active")
+        receipt = answer.get("receipt") or {}
+        if answer.get("state") != "complete" or not receipt.get("native_turn_id") or receipt.get("model") != self.model:
+            self.failure_receipt = {**receipt, **attempts.usage_entry(receipt.get("usage")), "outcome": "native-review-unconfirmed"}
+            attempts.record_call(self, name, outcome="native-review-unconfirmed", model=receipt.get("model"),
+                                 request_id=receipt.get("native_turn_id"), usage=receipt.get("usage"),
+                                 elapsed_ms=round((time.monotonic()-started)*1000))
+            raise RuntimeError("native-review-unconfirmed")
+        receipt = {**receipt, "elapsed_ms": round((time.monotonic()-started)*1000),
+                   **attempts.usage_entry(receipt.get("usage"))}
+        return answer["result"], receipt
+
+    def _request_appraisal(self, context, rendered, policy, timeout, record):
+        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max())
+        result, receipt = self._native("submit_appraisal", schema, self._system(context, policy), json.loads(rendered), timeout)
+        return {"model": receipt["model"], "id": receipt["native_turn_id"], "usage": receipt.get("usage"),
+                "stop_reason": "end_turn", "native_receipt": receipt,
+                "content": [{"type": "tool_use", "name": "submit_appraisal", "input": result}]}
+
+    def structured(self, name, schema, system, context, *, max_tokens=65536, **unused):
+        result, receipt = self._native(name, schema.model_json_schema(), system, context,
+            min(self.timeout, max(1, getattr(self, "absolute_deadline", time.monotonic()+self.timeout)-time.monotonic())))
+        call = attempts.record_call(self, name, outcome="ok", model=receipt["model"],
+            request_id=receipt["native_turn_id"], elapsed_ms=receipt["elapsed_ms"], usage=receipt.get("usage"))
+        try:
+            return schema.model_validate(result), receipt
+        except ValidationError:
+            call["outcome"] = "schema-invalid"
+            self.failure_receipt = receipt
+            raise
 
 
 QUEUE_SCHEMA = """
@@ -1383,24 +1459,6 @@ class Appraisals:
         except Exception:  # noqa: BLE001
             return
 
-    def _cache_mark(self):
-        """O(1) mark; compression parts written after it belong to this pass."""
-        with self.engine.db.connect() as conn:
-            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_context_cache'").fetchone():
-                return 0
-            return conn.execute("SELECT COALESCE(MAX(rowid),0) FROM mind_context_cache").fetchone()[0]
-
-    def _compression_progress(self, mark):
-        """Newly cached evidence parts. Each one survives the worker boundary, so
-        a pass that wrote any of them moved this batch forward."""
-        with self.engine.db.connect() as conn:
-            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_context_cache'").fetchone():
-                return 0
-            return conn.execute(
-                "SELECT COUNT(*) FROM mind_context_cache WHERE rowid>? AND scope=? AND json_extract(data,'$.value') IS NOT NULL",
-                (mark, self.mind.scope.key()),
-            ).fetchone()[0]
-
     def _quarantine(self, data, reason):
         """A quarantined row is judged afresh when an operator resumes it."""
         data["repair_reason"] = reason
@@ -1489,10 +1547,9 @@ class Appraisals:
             return self._quarantine(data, "transient-failures-exhausted:" + str(failures))
         return "pending"
 
-    def _compression_wait(self, data, mark):
+    def _compression_wait(self, data, progress):
         """Preparation waits are continuations, not charged attempts. The frozen
         inputs stay so the cached parts keep their keys; progress bounds them."""
-        progress = self._compression_progress(mark)
         waits = data.get("compression_waits", 0) + 1
         stalls = 0 if progress else data.get("compression_stalls", 0) + 1
         data.update(compression_waits=waits, compression_stalls=stalls, compression_parts=progress,
@@ -1590,7 +1647,7 @@ class Appraisals:
         admission_wait = False
         uncharged_wait = False
         model_admitted = False
-        cache_mark = 0
+        provider.compression_parts = set()
         # Everything up to the provider call is host-side assembly: a conflict raised
         # there costs nothing and is retried without spending a charged attempt.
         preparing = True
@@ -1599,7 +1656,7 @@ class Appraisals:
         light, lighting, committing, manifest, deferred_memory, flags = None, False, False, None, None, {}
         key = self.mind._key(row["id"])
         try:
-            cache_mark = self._cache_mark()
+            provider.native_attempt = (row["id"], data["attempt_token"])
             # If a process died after commit, use the durable command receipt.
             done = self._committed_receipt(key)
             if done:
@@ -2309,7 +2366,7 @@ class Appraisals:
                 data.pop(field, None)
             state = "complete"
         except ModelAdmissionWait as error:
-            admission_wait = not model_admitted
+            admission_wait = not model_admitted or getattr(provider, "native_review", False)
             state = "pending"
             if admission_wait:
                 data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),
@@ -2331,7 +2388,7 @@ class Appraisals:
             # No payload/validation repr: these can contain private text or key values.
             data["error"] = (
                 str(error)
-                if type(error) is RuntimeError and str(error).startswith("deepseek-")
+                if type(error) is RuntimeError and str(error).startswith(("deepseek-", "native-review-"))
                 else type(error).__name__
             )
             if isinstance(error, Missing):
@@ -2356,7 +2413,7 @@ class Appraisals:
                 # these frozen inputs, so a preparation pass keeps them and is a
                 # wait, not a charged attempt. Stalled preparation is quarantined.
                 uncharged_wait = "compression"
-                state = self._compression_wait(data, cache_mark)
+                state = self._compression_wait(data, len(provider.compression_parts))
             elif re.fullmatch(TRANSIENT_PATTERN, data["error"]):
                 # The request never produced model output; an outage must not
                 # spend this row's repair budget or quarantine the whole queue.
@@ -2485,7 +2542,7 @@ class DailyReview:
         with self.engine.db.connect(write=True) as conn:
             provider.section_isolation = optimized(conn, self.mind.scope.key(), SECTION_ISOLATION)
             if conn.execute(
-                "SELECT 1 FROM mind_daily_reviews WHERE scope=? AND day=?",
+                "SELECT 1 FROM mind_daily_reviews WHERE scope=? AND day=? AND state!='waiting'",
                 (self.mind.scope.key(), day),
             ).fetchone():
                 return {"state": "already-evaluated", "day": day}
@@ -2518,7 +2575,7 @@ class DailyReview:
                     "reason": "need-prospective-behavioral-check",
                 }
             conn.execute(
-                "INSERT INTO mind_daily_reviews VALUES(?,?,?,?)",
+                "INSERT INTO mind_daily_reviews VALUES(?,?,?,?) ON CONFLICT(scope,day) DO UPDATE SET state=excluded.state,data=excluded.data",
                 (self.mind.scope.key(), day, "evaluating", "{}"),
             )
         data = {}
@@ -2538,7 +2595,7 @@ class DailyReview:
                     "self_knowledge": SelfKnowledge(self.engine, self.mind.scope).view(
                         agent_version=agent_version
                     ),
-                    "instruction": "Only propose evolution with the supplied current hypothesis and prospective assessment IDs. No short-term values or wishes. Retain counterexamples. If evidence is inadequate return evolution null.",
+                    "instruction": "只依据给定的当前假设与事前行为检验编号提出人格发展建议。不修改短期情绪值或愿望，保留反例；证据不足时 evolution=null。",
                 }
             )
             data = {"receipt": receipt, "reason": proposal.reason}
@@ -2555,6 +2612,9 @@ class DailyReview:
                     )
                 )
             state = "complete"
+        except ModelAdmissionWait:
+            state = "waiting"
+            data["reason"] = "owner-work"
         except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
             state = "needs-review"
             data["error"] = type(error).__name__

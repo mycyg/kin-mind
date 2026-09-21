@@ -27,8 +27,8 @@ CREATE TABLE IF NOT EXISTS mind_concern_evidence(
 
 
 class Understanding(Model):
-    meaning: str = Field(min_length=1, max_length=600)
-    topic: str = Field(min_length=1, max_length=300)
+    meaning: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
     importance: StrictInt = Field(ge=0, le=100)
     confidence: FiniteFloat = Field(ge=0, le=1)
     basis: Literal["explicit", "inferred", "internal_thought"]
@@ -40,15 +40,15 @@ class RhythmProposal(Model):
     alertness: StrictInt = Field(ge=0, le=100)
     target: StrictInt = Field(ge=0, le=100)
     half_life_minutes: Literal[20, 60, 180]
-    reason: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
 class OwnerRequest(Model):
     kind: Literal["help", "invitation", "request"]
-    action: str = Field(min_length=1, max_length=500)
-    reason: str = Field(min_length=1, max_length=500)
-    completion: str = Field(min_length=1, max_length=500)
+    action: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    completion: str = Field(min_length=1)
     status: Literal["proposed", "accepted", "waiting", "completed", "declined"] = "proposed"
 
 
@@ -59,14 +59,14 @@ class ConcernProposal(Model):
     kind: (
         Literal["care", "anticipation", "curiosity", "distress", "shared_plan"] | None
     ) = None
-    content: str | None = Field(default=None, min_length=1, max_length=1600)
-    topic: str | None = Field(default=None, min_length=1, max_length=400)
-    target: str | None = Field(default=None, max_length=300)
+    content: str | None = Field(default=None, min_length=1)
+    topic: str | None = Field(default=None, min_length=1)
+    target: str | None = Field(default=None)
     intensity: StrictInt | None = Field(default=None, ge=0, le=100)
     basis: Literal["explicit", "inferred", "internal_thought"] | None = None
     confidence: FiniteFloat | None = Field(default=None, ge=0, le=1)
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
-    reason: str = Field(min_length=1, max_length=600)
+    reason: str = Field(min_length=1)
     owner_request: OwnerRequest | None = None
 
     @model_validator(mode="after")
@@ -111,7 +111,7 @@ class ContinuityConfig(ContinuityCommand):
         Literal["interpretation", "concerns", "expression", "rhythm"], StrictBool
     ]
     activation: Literal["shadow", "active"] = "active"
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
 
 
 def evidence_key(ref):

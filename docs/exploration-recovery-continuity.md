@@ -39,3 +39,8 @@ Hosts should reserve the clock envelope in their background budget and deliver i
 Synthetic tests cover cross-kind forward references and transaction rollback, unrelated concurrent mood updates, exploration target ordering, history recovery idempotency, recent multi-bubble exchanges, timezone conversion, compression preserving recent public text, and thinking-block isolation. The existing task locks, quiet hours, send reconciliation and session identity checks remain in force.
 
 Operational rollout uses a private SQLite backup, isolated replay, validation of current dependencies, a safe idle host boundary, and post-restart receipts. Private histories and provider credentials are excluded from the public repository.
+
+
+A completed exploration with invalid final JSON may use one text-only repair within the original deadline, with at most 60 seconds remaining. The existing attempt receipt records repair admission before the request. Repair never reruns tools or adds sources; citation validation remains mandatory. Prose fields have no arbitrary short character cap. Multiple ambiguous JSON objects are rejected until a valid single result is supplied.
+
+Compression progress counts newly completed valid parts for the current frozen input only. Cached parts from another job cannot reset a stalled attempt. Provenance and message envelopes count toward capacity; chunk completion and appraisal commit are separate outcomes.

@@ -63,7 +63,7 @@ def test_downstream_delivery_and_executor_notes_do_not_block_current_step(env,tm
     result['remaining']=['Deliver later when appropriate', 'Owner response is still pending']
     class Scoped(Review):
         def structured(self,name,schema,system,context,**kwargs):
-            assert 'step_remaining' in system and 'separate downstream step' in system
+            assert 'step_remaining' in system and '后续' in system
             decision,receipt=super().structured(name,schema,system,context,**kwargs)
             return decision.model_copy(update={'downstream':context['result']['remaining']}),receipt
     settled=accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Scoped())

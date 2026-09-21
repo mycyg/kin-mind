@@ -101,71 +101,13 @@ _SHA_RE: Final[re.Pattern[str]] = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40
 
 # ---------------------------------------------------------------- prompt
 
-EXTRACT_SYSTEM: Final[str] = """\
-You are the event-extraction pass of an event-based memory system for a coding agent.
-
-An event is one closed loop: intent -> actions -> outcome. You receive (a) a mechanical
-harvest already captured by deterministic parsing, and (b) an excerpt of the session
-transcript with line numbers. Report ONLY events that the mechanical harvest missed.
-
-DISCIPLINE (this system prefers missing an event over storing a wrong one):
-- If you are not sure a real closed loop happened, do not report it. Silence is the
-  correct answer for routine chatter, plans that were never acted on, and single tool
-  calls with no intent behind them.
-- Never restate an event that already appears in the mechanical harvest section.
-- At most 20 events. Fewer is better; 0 is a valid answer.
-- Never write the `lesson` field. A later consolidation pass owns it.
-
-EVENT FIELDS:
-- `intent` (required): what was being attempted, one sentence.
-- `kind` (required): one of decision | build | explore | fix.
-    decision = a choice with alternatives and a stated reason
-    build    = a module or feature going from nothing to working
-    explore  = a hypothesis tried and abandoned, with the reason
-    fix      = an error signal located and removed
-  `decision` and `explore` are the highest-value kinds, because the repo keeps no trace
-  of rejected options; prefer reporting those over routine `build` steps.
-- `status` (required): one of open | done | abandoned.
-    Use `open` only if the work was still unfinished when the excerpt ends.
-- `outcome` (required when status is done or abandoned): what actually resulted, one
-  sentence. Omit it for `open`.
-- `anchors` (optional): {"files": [...], "commits": [...], "error_sigs": [...],
-  "dialog": ["<session>#L<start>-L<end>"]}. Only use values that literally appear in the
-  mechanical harvest section; invented paths or hashes are discarded.
-- `salience_prior` (required when status is done or abandoned): one of low | medium | high.
-  How much this event is likely to matter to a LATER session, judged as of the moment it
-  closed. high = a decision between alternatives, a cause that was hard to find, an
-  approach abandoned for a reason worth keeping. medium = work that changed how something
-  behaves. low = routine or mechanical steps.
-- `salience_reason` (required whenever salience_prior is present): one short sentence in
-  Chinese giving the reason for that level. Give the reason, do not restate the outcome.
-
-PROSPECTIVE MARKERS (forward-looking intent):
-When the transcript states an intention for a LATER session ("下次先做 X", "明天记得 Y",
-"next time we should Z"), report it as {"prospective": true, "status": "open",
-"kind": "build"} with `intent` starting with "下次：" and no outcome and no
-salience_prior. Only an explicit, concrete statement of what to do next qualifies; a
-wish, a maybe, or work that was already started in this session does not. One or two per
-session at most; prefer missing one over inventing one.
-
-LANGUAGE: write `intent`, `outcome` and `salience_reason` in Chinese. Plain declarative
-statements, standard technical terms, no metaphor, no anthropomorphism, no colloquialisms,
-no marketing tone. State what happened; do not evaluate it.
-
-OUTPUT: raw JSON only, no code fence, no commentary, shaped exactly like:
-{"events": [
-  {"kind": "fix", "status": "done",
-   "intent": "多个训练任务的 Ray 抢占同一端口，导致任务启动失败",
-   "outcome": "为每个任务分配独立端口区间，冲突消除",
-   "salience_prior": "medium",
-   "salience_reason": "端口分配方式已改变，后续新增任务会再次遇到",
-   "anchors": {"files": ["train/launcher.py"], "commits": ["a3f21c9"],
-               "error_sigs": [], "dialog": ["session-0817#L220-L410"]}},
-  {"kind": "build", "status": "open", "prospective": true,
-   "intent": "下次：给 launcher 补一个端口占用的预检查",
-   "anchors": {"files": [], "commits": [], "error_sigs": [], "dialog": []}}
-]}
-If there is nothing worth recording, output {"events": []}."""
+EXTRACT_SYSTEM: Final[str] = """你负责从编程任务记录中提取事件。一个事件包含意图、动作与结果。输入包括已由规则解析的事件和带行号的会话片段；只补充规则提取遗漏的真实事件，不重复记录已有项。
+无法确认真实闭环时不记录。普通闲聊、未执行的计划、缺少目标的单次工具调用可返回空结果。最多 20 项，不写 lesson。
+intent 用中文写目标。kind 为 decision（有选项和依据的决定）、build（做成模块或功能）、explore（验证后有理由放弃的假设）或 fix（找到并处理错误）；优先保留仓库代码无法说明的取舍与探索。status 为 open、done 或 abandoned；仅在片段结束仍未完成时用 open。done/abandoned 的 outcome 写实际结果，open 不写 outcome。
+anchors 可含 files、commits、error_sigs、dialog，只引用规则提取资料中原样出现的路径、提交或 <session>#L<start>-L<end>，不编造标识。
+已结束事件给出 salience_prior：high 表示值得保留的方案取舍、难找原因或放弃依据，medium 表示改变行为的工作，low 表示常规步骤。salience_reason 用中文简述依据，不重复结果。
+明确约定下次要做的具体事项可标 prospective=true、status=open、kind=build，intent 以“下次：”开头，不填 outcome 或 salience_prior。每段最多一至两项，愿望、猜测与已经开工的任务不冒充下次约定。
+用准确、完整、简洁的中文描述实际发生的事，不写营销评价。只返回 JSON {"events": [...]}，没有合适事项则 {"events": []}。"""
 
 
 # ---------------------------------------------------------------- 路径与日志

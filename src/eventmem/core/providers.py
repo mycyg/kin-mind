@@ -145,7 +145,7 @@ class Providers:
                     role,
                     instruction
                     + (
-                        " Return only a valid JSON object, without commentary or reasoning."
+                        " 只返回有效 JSON 对象，不附旁白或内部推理。"
                         if attempt
                         else ""
                     ),

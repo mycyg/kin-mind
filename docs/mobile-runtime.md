@@ -34,3 +34,6 @@ and base/developer pair. Drafts and failed or unbound requests remain unverified
 File digests protect release and instruction boundaries. Ordinary state uses
 versions and transactions; a digest is not a semantic decision or delivery receipt.
 Complete changes first, then run affected checks without repeating unchanged matrices.
+
+
+The owned ACP adapter now reapplies stable developer instructions on every ordinary native turn as well as profile changes. `_kin/last-reply` returns the complete final and original input text so internal assessment completion can bind the native turn to its existing attempt identifier. This does not add a second receipt ledger.

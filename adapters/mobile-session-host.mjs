@@ -129,11 +129,19 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     }
     return value;
   };
+  const buildCheckpoint=async request=>{
+    if(config.main_session_review===true){
+      const runtime=await inspect();
+      const capacity=runtime.modelContextWindow-(runtime.lastTokenUsage?.inputTokens??0)-(config.session_management?.outputReserve??32768)-(config.session_management?.toolReserve??8192);
+      if(Number.isFinite(capacity))request.native_capacity=Math.max(0,Math.floor(capacity));
+    }
+    return mindCall('session-checkpoint',request);
+  };
   const background=new NativeContextDelivery({call:mindCall,
     runtime:async()=>{const current=await routing.ensureSession('kin-host:context-status');return current.agentInfo.connection.extMethod('_kin/runtime',{sessionId:manager.fence().threadId});},
     inject:async request=>{const current=await routing.ensureSession('kin-host:context');return current.agentInfo.connection.extMethod('_kin/inject-checkpoint',request);}});
   const manager=new SessionManager({file,binding:{threadId:initial.threadId,nativeSessionId:initial.nativeSessionId},coordinator:router,inspect,collect,config:config.session_management??{},
-    checkpoint:async(snapshot,binding,budget)=>mindCall('session-checkpoint',{snapshot,binding,budget:router.tasks().length?Math.max(budget,4000):budget}),
+    checkpoint:async(snapshot,binding,budget)=>buildCheckpoint({snapshot,binding,budget:router.tasks().length?Math.max(budget,4000):budget}),
     compact:async operationId=>{const session=await routing.ensureSession('kin-host:compact');return session.agentInfo.connection.extMethod('_kin/compact',{sessionId:manager.fence().threadId,operationId});},
     ackCompact:async(receipt,checkpoint)=>{
       const id=receipt.nativeEventId??receipt.operationId;
@@ -201,7 +209,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         if(snapshot.manifestVersion&&preparation.safe){
           const key=digest(snapshot.cursors);
           if(manager.state.rollingCursor!==key){
-            const cp=await mindCall('session-checkpoint',{snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
+            const cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
           }
         }
@@ -229,7 +237,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       if(!manager.state.restorePending||!cp||!(await mindCall('session-validate',{checkpoint:cp})).valid){
         manager.state.restorePending=false;manager.state.restoreCheckpoint=null;manager.save('restore-source-refresh');
         const snapshot=await collect();
-        cp=await mindCall('session-checkpoint',{snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false});
+        cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false});
         if(!cp.complete)throw Error('Restore coverage pending outside dispatch');
         manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('fresh-restore-checkpoint-ready');
       }

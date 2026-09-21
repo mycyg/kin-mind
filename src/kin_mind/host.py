@@ -145,7 +145,7 @@ def dispatch(config, action, request):
         # The checkpoint carries the user's session across a rotation, so somebody is waiting
         # for it unless the host says this one is maintenance.
         with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
-            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True, native_capacity=request.get("native_capacity") if memory.settings()["native_window_context"] else None)
     if action == "continuity-manifest":
         from .continuity_manifest import ContinuityManifest
         return ContinuityManifest(mind).read(**request)
@@ -272,7 +272,7 @@ def dispatch(config, action, request):
         return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
     if action == "memory-window":
         window = Contexts(mind).window(config["session_id"])
-        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":window["used"]>=12000}
+        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":not memory.settings()["native_window_context"] and window["used"]>=12000}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":
@@ -391,6 +391,22 @@ def dispatch(config, action, request):
         if config.get("review_paused") or not memory.settings()["operational_lanes"]:
             return {"state": "paused"}
         return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment", job_id=request.get("job_id"))
+    def review_provider():
+        if config.get("main_session_review"):
+            from .appraisal import NativeReview
+            import sys
+            def exchange(payload):
+                print(json.dumps({"native_review": payload}, ensure_ascii=False), flush=True)
+                response = json.loads(sys.stdin.readline())
+                if response.get("id") != payload["id"]:
+                    raise RuntimeError("native-review-response-mismatch")
+                return response
+            if not request.get("native_review_profile"):
+                raise RuntimeError("main-session-required")
+            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange)
+        else:
+            return DeepSeek.from_engine(engine)
+
     if action == "review":
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
@@ -408,7 +424,8 @@ def dispatch(config, action, request):
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
-        result = jobs.run_one(DeepSeek.from_engine(engine), lane="action")
+        provider = review_provider()
+        result = jobs.run_one(provider, lane="action")
         plans.sync_wishes()
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":
@@ -422,9 +439,9 @@ def dispatch(config, action, request):
                 atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
         return result
     if action == "daily":
-        return DailyReview(mind).run(
-            DeepSeek.from_engine(engine), config["agent_version"]
-        )
+        provider = review_provider()
+        provider.native_attempt = ("daily:" + mind.clock()[:10], config["agent_version"])
+        return DailyReview(mind).run(provider, config["agent_version"])
     if action == "prepare-exploration":
         view = mind.read()
         reservation = cadence.reserve(config["agent_version"])
@@ -442,7 +459,19 @@ def dispatch(config, action, request):
             return {"state": "waiting", "reason": "exploration-backend-unknown",
                     "detail": str(backend)}
         from .codex_executor import exploration_capabilities, prepare_codex_exploration
-        prepared = prepare_codex_exploration(config)
+        def repair_final(text, ledger, *, timeout):
+            from .exploration import Findings
+            provider = DeepSeek.from_engine(engine)
+            provider.timeout = timeout
+            try:
+                fixed, receipt = provider.structured("repair_exploration_result", Findings,
+                    "只修正原探索结果的 JSON 包装、结构与字段格式。只使用原结果和给定来源账本，不执行工具、不添加发现或证据、不降低引用要求。返回单个完整结果；无法补足的来源保留缺口。",
+                    {"original_result": text, "source_ledger": ledger})
+                return fixed.model_dump(), receipt
+            except Exception as error:
+                error.receipt = getattr(provider, "failure_receipt", None)
+                raise
+        prepared = prepare_codex_exploration(config, repair=repair_final)
         if prepared["state"] != "ready":
             return prepared
         resolved_computer = prepared.get("computer") or config.get("computer_exploration")
@@ -554,7 +583,7 @@ def main():
         # hurt it, and refusing would remove the one path still able to report it.
         warn_interpreter(config.get("python"))
         # An operator runs these from a terminal, with no request to pipe in.
-        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if args.action in {"review", "daily"} and config.get("main_session_review") else sys.stdin.read())
         request = json.loads(raw) if raw.strip() else {}
         if args.action in APPLY_ACTIONS:
             if args.apply and args.dry_run:

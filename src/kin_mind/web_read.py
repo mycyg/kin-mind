@@ -534,8 +534,7 @@ def create_server(config):
 
     @server.tool()
     def web_search(query: str, max_results: int = 5) -> dict:
-        """Search the configured public endpoint. Results prove a page was visible in
-        results, never that it was read — call read_page before citing content."""
+        """搜索当前公开检索入口。结果只证明页面出现在搜索中；引用正文前先调用 read_page。"""
         receipt = reader.search(query, max_results=max(1, min(MAX_RESULTS, max_results)))
         if receipt["state"] != "search_result":
             return {"state": "failed", "reason": receipt["failure_reason"], "results": []}
@@ -548,11 +547,7 @@ def create_server(config):
     @server.tool()
     def read_page(url: str, offset: int = 0, limit: int = MAX_TEXT,
                   evidence_id: str | None = None, expected_version: str | None = None) -> dict:
-        """Read one bounded page of public HTML/text/JSON. The first call fetches and
-        freezes the complete readable text; use the returned continuation fields for
-        later character ranges without mixing versions. HTTP success proves that the
-        returned text was read, not that it is an article: classify login, challenge,
-        consent and error-shell pages from the text before citing the exact locator."""
+        """分段读取公开 HTML、文本或 JSON。首次读取冻结可读正文；之后沿 continuation 字段读取其他字符范围，避免混用版本。HTTP 成功只证明取到了返回文本；先辨认登录、验证、同意或错误页，再引用确切 locator。"""
         receipt = reader.read_page(
             url, offset=offset, limit=limit, evidence_id=evidence_id,
             expected_version=expected_version,
