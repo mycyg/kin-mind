@@ -473,7 +473,7 @@ class Worker:
                 records = [r for r in records if policy.visible(r)]
             result = Providers(engine).json(
                 "summary" if kind != "prediction" else "prediction",
-                'Return {"content":"...","evidence_ids":[id,...]}. Write only supported observations, preserving uncertainty. Predictions must be explicitly tentative. Do not invent feelings or user commitments.',
+                '只返回 {"content":"...","evidence_ids":[id,...]}。只写来源支持的观察，保留不确定性；预测明确标为猜测，不编造感受或用户承诺。',
                 {"kind": kind, "records": records, "scope": scope.model_dump()},
             )
             evidence = list(

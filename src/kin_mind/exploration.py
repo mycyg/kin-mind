@@ -149,12 +149,9 @@ class Findings(Model):
     evidence_map: dict[str, list[str]] | None = Field(
         default=None,
         description=(
-            "Optional claim-to-evidence map. Each key is the 1-based decimal index "
-            "of an item in findings (for example, '1'). Each value is a non-empty "
-            "list containing only exact evidence_id or exact locator strings copied "
-            "from citable state=observed tool receipts or supplied/historical sources. "
-            "Never put prose, shortened ids, version hashes, review_* ids, or action_* "
-            "ids in a value. Use null when no finding-level mapping is needed."
+            "可选的结论与证据映射。键是 findings 中从 1 开始的序号，如 '1'；值是非空列表，"
+            "只填可引用的 state=observed 工具回执或已给来源、历史来源中的完整 evidence_id 或 locator。"
+            "不填说明文字、缩短编号、版本哈希、review_* 或 action_* 编号；不需要逐项映射时使用 null。"
         ),
     )
 
