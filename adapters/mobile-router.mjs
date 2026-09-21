@@ -532,7 +532,10 @@ export class MobileRouter {
         try{read=this.readClassification(result,{owner,intents,allowStop:basisSame});}catch(error){return fail(classificationFailure(error));}
         // A stop that landed while the answer was in flight retires the input: a
         // late work decision must never resurrect or extend what the owner canceled.
-        const canceled=Object.values(this.state.tasks).some(t=>t.cancelRequested||t.status==='canceled'&&(t.canceledAt??0)>=e.createdAt);
+        const canceled=Object.keys(e.taskVersions??{}).some(id=>{
+          const task=this.state.tasks[id];
+          return task?.cancelRequested||task?.status==='canceled'&&(task.canceledAt??0)>=e.createdAt;
+        });
         if(canceled&&read.decision==='work') {
           e.state='superseded';record.state='semantic-canceled';record.reason='superseded-by-cancel';
           this.save('semantic-canceled',{id,reason:'superseded-by-cancel'});return;

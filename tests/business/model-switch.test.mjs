@@ -292,3 +292,43 @@ test('an actual effort change still interrupts once and notifies after profile v
   assert.equal(interruptions,1);assert.equal(f.runtime.reasoningEffort,'high');assert.equal(f.switches.length,2);
   assert.equal(Object.values(f.router.state.notices).length,2);
 });
+
+test('a historical canceled task cannot discard another task input after a classification retry or restart',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'append a conclusion'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  f.router.state.tasks.old={...structuredClone(task),id:'old',status:'canceled',cancelRequested:true,canceledAt:1};
+  const input={id:'conclusion',text:'append the conclusion'};
+  await f.router.select(input);
+  const restarted=new MobileRouter(f.args);
+  await restarted.reviewSemanticPending();
+  assert.equal(restarted.state.inputs.conclusion.state,'selected');
+  assert.equal(restarted.state.inputs.conclusion.taskId,task.id);
+  let submitted=0;
+  await restarted.dispatch(input,async detail=>{submitted++;assert.equal(detail.taskId,task.id);return'steer';});
+  await restarted.dispatch(input,async()=>assert.fail('duplicate'));
+  assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
+});
+
+test('a real stop of the captured task still retires late work classification',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'pending',text:'append a conclusion'});
+  task.cancelRequested=true;
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs.pending.state,'semantic-canceled');
+  assert.equal(f.router.state.inputs.pending.reason,'superseded-by-cancel');
+  assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+});
+
+test('new independent work can retry after a prior task was canceled',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'independent new work'};}});
+  const old=f.router.addTask({id:'old-work',text:'old task'});old.cancelRequested=true;old.status='canceled';old.canceledAt=1;
+  await f.router.select({id:'new-work',text:'start the new article'});
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs['new-work'].state,'selected');
+  assert.notEqual(f.router.state.inputs['new-work'].taskId,old.id);
+  assert.equal(old.status,'canceled');assert.equal(old.cancelRequested,true);
+});

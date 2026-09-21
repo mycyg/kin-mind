@@ -69,6 +69,9 @@ identical manual profile settles without canceling the native turn, fencing tool
 creating a continuation or notifying another switch. An uncertain prior switch
 still reconciles through its original receipt. Task completion retains a manual
 profile; returning to automatic routing requires the owner's explicit request.
+A classification retry considers cancellation only for the tasks captured with
+that input. A retained cancellation on an unrelated historical task cannot discard
+a new message; a real stop of the captured task still prevents late work revival.
 
 Historical correction is a separate receipt, not a rewrite of the input record. An
 authenticated private host can call `reclassifyAcceptedControl` only for an already
