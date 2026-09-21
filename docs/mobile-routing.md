@@ -285,3 +285,26 @@ to settle before replacing the process.
 The owner's explicit model, effort or tier selection is independent of the content route. A mixed request retains `route=work` and its `control=manual` profile together. The router verifies the selected profile before submitting that work; failure does not run it under the old profile. A confirmed interruption preserves the original task and delivery receipts. A control-only switch resumes interrupted work through the existing handoff, unless cancellation was requested.
 
 The private mobile host groups consecutive messages from the same bound owner and channel when their reception gap is less than twenty seconds. It waits twenty seconds after the last message, then routes the combined text and attachments once. Each original input and platform receipt stays identifiable. Frozen batch membership is stored on the first existing inbox job so restart or late arrivals cannot change a submitted request. An explicit stop bypasses the wait. A waiting dispatch does not prevent later model controls from reaching the router; the existing coordinator still serializes native execution.
+
+
+## Conversation during work
+
+Owner chat keeps its semantic `intent=chat` while the work profile stays fixed.
+The existing live steering path admits it to the same native session after the
+normal message-burst window. The model can respond between tools and continue;
+ordinary conversation never cancels an in-flight tool or completes the task.
+Public message segments pass the existing source/format checks and delivery
+receipts at their ACP boundaries, without waiting for the whole native turn.
+Private assessments stay private. A possible split source marker retains only
+its unfinished suffix until the next segment.
+
+When an accepted work-time chat precedes an early native turn end, the existing
+work review may return `resume`. This requires outstanding executable work and
+references to both the original task and chat input. Waiting, cancellation and
+uncertain effects retain `keep`. The original task's existing handoff carries
+one continuation per chat input; its durable input identity prevents loops after
+restart. No extra review call, queue or conversation is created.
+
+固定运行包保留同一供应版本的 `codex`、`codex-code-mode-host` 与可用的 shell 资源。构建缺少必需执行组件时立即失败；真实原生隔离执行与协议回放分别验收。旧包仍可回退，但旧包已有缺件时不会因回退自动恢复工具能力。
+
+明确取消的旧原生回合，其工具状态按原执行代次和已保存的取消回执移入已有历史记录。原状态与编号保留，外部操作是否成功仍沿实际回执核对，不把历史 `in_progress` 当作当前活动。

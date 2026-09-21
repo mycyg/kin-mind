@@ -5,14 +5,22 @@ import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({reviewPolicyVersion:5,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:6,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,
   routing:{mode:router.state.mode,requestedMode:router.state.requestedMode,executionEpoch:router.state.executionEpoch,manualProfile:router.state.manualProfile,autoReturnProfile:router.state.autoReturnProfile},exitRequested:router.state.exitRequested});
 
 export const REVIEW_LIMITS=Object.freeze({bytes:64000,items:128,chunkItems:48,maxChunks:8,excerpt:4000,minExcerpt:250});
 /** Transport outcomes that will never become a delivery. They are reported to the review
  * as what they are, instead of holding the work lock open for a receipt that cannot come. */
 export const FINAL_NON_DELIVERY=Object.freeze(['rejected','undeliverable']);
-const DISPOSITIONS=['keep','complete','not_a_task'];
+const DISPOSITIONS=['keep','resume','complete','not_a_task'];
+// Reuse original input identity and the existing handoff. No separate chat ledger.
+export function workChatInput(router,task) {
+  const id=task.contextInputIds?.findLast(id=>{const r=router.state.inputs[id];return r?.intent==='chat'&&r.kind==='owner'&&r.state==='accepted';});
+  const input=id&&router.state.inputs[id];
+  if(!input||input.executionEpoch!==task.executionEpoch||input.at<task.turnStartedAt||
+    task.handoff?.id==='work-chat:'+id||router.state.inputs['handoff:work-chat:'+id])return null;
+  return id;
+}
 const EXCERPT_GAP='\n[…]\n';
 const malformed=d=>!DISPOSITIONS.includes(d?.disposition)||!d.reason?.trim()||!Array.isArray(d.evidenceIds)||!d.evidenceIds.length||!Array.isArray(d.remaining)||!Array.isArray(d.discardDraftIds);
 const unverified=r=>r?.provider!=='deepseek'||r?.model!=='deepseek-flash'||r?.reasoning!=='high'||!r?.requestId;
@@ -135,6 +143,8 @@ export class WorkLockReview {
       }
       if(previous&&(previous.state==='applied'||previous.retryAt>this.now()))return previous;
       const evidence=await this.collect(snapshot);
+      const chatInput=workChatInput(this.router,snapshot.task);
+      if(chatInput)evidence.input.workChatInputId=chatInput;
       if(this.closed)return {state:'closed'};
       // Never silently truncate a task into a misleading completion decision: oversized
       // evidence is excerpted and reviewed in bounded chunks, so no size ever leaves the
@@ -165,13 +175,21 @@ export class WorkLockReview {
           const repeats=previous?.state==='kept'&&previous.decision?.disposition==='keep'?(previous.repeats??0)+1:0;
           return this.save({...attempt,state:'kept',repeats,retryAt:this.keptRetryAt(repeats)});
         }
-        if(d.remaining.length||!d.evidenceIds.includes(task.inputIds[0])||!d.evidenceIds.includes(task.inputIds.at(-1)))throw Error('Work review does not cover original and current inputs');
         // Re-read evidence under the input/switch mutex. Changed receipts or
         // sources cannot be accepted using the earlier model decision.
         const fresh=await this.collect(snapshot);
+        if(chatInput)fresh.input.workChatInputId=chatInput;
         if(hash(fresh)!==attempt.evidenceHash)return this.save({...attempt,state:'superseded',reason:'evidence-changed-during-review',retryAt:this.now()});
         const changedRuntime=this.blocked(task,await this.router.inspect());
         if(changedRuntime)return this.save({...attempt,state:'waiting',reason:changedRuntime,retryAt:this.now()+this.retryMs});
+        if(d.disposition==='resume') {
+          if(!chatInput||workChatInput(this.router,task)!==chatInput||!d.remaining.length||d.discardDraftIds.length||
+            !d.evidenceIds.includes(chatInput)||!d.evidenceIds.includes(task.inputIds[0]))throw Error('Work chat continuation lacks its original inputs');
+          task.handoff={id:'work-chat:'+chatInput,state:'pending',text:'刚才的插话已经接过。继续原任务尚未完成的部分：'+d.remaining.join('；')+'。先使用已有进度、文件与工具结果，已发送内容不重复发送；如有新的暂停或取消要求，按新要求处理。'};
+          this.router.save('work-chat-continuation',{taskId:task.id,inputId:chatInput});
+          return this.save({...attempt,state:'applied',appliedAt:this.now()});
+        }
+        if(d.remaining.length||!d.evidenceIds.includes(task.inputIds[0])||!d.evidenceIds.includes(task.inputIds.at(-1)))throw Error('Work review does not cover original and current inputs');
         const canceled=[],replacements=[],retired=[],undelivered=[];
         for(const [deliveryId,delivery] of Object.entries(task.deliveries??{})) {
           const proof=fresh.receipts?.[deliveryId];

@@ -476,7 +476,7 @@ export class MobileRouter {
         const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
         if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
         try {
-          const route=await submit({model:target,profile:targetProfile,taskId:record.taskId,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
+          const route=await submit({model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
           if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
           record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
           return{route,model:target};
@@ -1045,11 +1045,29 @@ export class MobileRouter {
       task.internalReceipt=receipt;this.save('internal-result',{taskId});return{state:'recorded'};
     });
   }
+  archiveInterruptedTools() {
+    let changed=false;
+    for(const task of this.tasks())for(const [id,tool] of Object.entries(task.tools??{})) {
+      if(['completed','failed','canceled','cancelled'].includes(tool.status))continue;
+      const boundary=this.state.forceBoundaries.find(b=>b.taskId===task.id&&b.fromEpoch===tool.turnFence&&
+        b.toEpoch<=task.executionEpoch&&b.receipt?.state==='interrupted'&&b.receipt.cancel?.cancelledTurn===true&&
+        b.receipt.runtime?.known===true&&b.receipt.runtime.sessionId===this.sessionId&&
+        b.receipt.runtime.nativeStatus==='idle'&&b.receipt.runtime.active===false&&b.receipt.runtime.backgroundTasks===0);
+      if(!boundary)continue;
+      task.toolHistory??={};
+      task.toolHistory[id+':fence:'+tool.turnFence]={id,...clone(tool),authority:'historical-fence',
+        reason:'native-turn-interrupted',fencedBy:boundary.id};
+      // Preserve the original status: a canceled native turn does not prove an
+      // external action succeeded or was undone. It is no longer active work.
+      delete task.tools[id];changed=true;
+    }
+    return changed;
+  }
   async reconcile() {
     return this.locked(async()=>{
       const runtime=await this.reconcileTransition(await this.inspect());this.observeRuntime(runtime);
       if(this.busy(runtime))return {state:'busy'};
-      let changed=false;
+      let changed=this.archiveInterruptedTools();
       for(const task of this.tasks()) {
         if(task.cancelRequested) {task.status='canceled';task.canceledAt=this.now();changed=true;continue;}
         // With semantic review installed, assistant completion is a proposal.
