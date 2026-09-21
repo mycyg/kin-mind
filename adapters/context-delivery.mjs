@@ -15,9 +15,14 @@ export class NativeContextDelivery {
     const runtime=await this.runtime();
     if(!runtime.known||!runtime.rolloutPath||runtime.threadId!==context.session)throw Error('Context native boundary unverified');
     if(runtime.active)return {state:'deferred',reason:'native-turn-active',id:context.id};
+    // An ended, failed turn can leave systemError until the next prompt. No
+    // append was attempted; the optional background must not invent uncertainty.
+    if(runtime.backgroundTasks||runtime.nativeStatus&&runtime.nativeStatus!=='idle')
+      return {state:'deferred',reason:'native-context-unavailable',id:context.id};
     for(const pending of await this.call('context-delivery-pending',{session:context.session})){
       const receipt=await this.reconcile(pending,runtime);
-      if(receipt.state!=='accepted')return {state:'waiting',reason:'previous-context-unconfirmed',id:pending.id};
+      // Reconcile each original identity, without making one uncertain append
+      // a global barrier to unrelated new context. Never replay that identity.
       if(pending.id===context.id)return receipt;
     }
     const operation=await this.call('context-delivery-begin',{session:context.session,epoch:context.epoch,id:context.id});
