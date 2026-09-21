@@ -332,3 +332,9 @@ def test_only_proven_unsent_attempt_can_release_persistent_contact_slot(env):
     restarted.settle_contact(attempt_id=next_attempt['id'],state='accepted',message_id='real-receipt')
     with pytest.raises((Conflict,ValueError)):
         restarted.settle_contact(attempt_id=next_attempt['id'],state='canceled',aborted_before_send=True)
+
+
+def test_plan_explanations_are_not_limited_to_twelve_items(env):
+    explanations = ['Context explanation ' + str(i) for i in range(20)]
+    plan = decide(env, create(env), conditions_met=explanations)
+    assert plan['steps'][0]['decision']['conditions_met'] == explanations
