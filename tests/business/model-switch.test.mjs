@@ -239,3 +239,96 @@ test('control-only interruption schedules the existing handoff after verified mo
  await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
  assert.equal(task.handoff.state,'pending');assert.equal(task.handoff.id,'owner-mode:control-only');assert.equal(f.router.state.requests[task.handoff.id].state,'applied');assert.equal(task.inputVersion,1);
 });
+
+test('repeated manual profile keeps active work, tools and pending delivery intact, including restart',async t=>{
+  let interruptions=0;
+  const profile={model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'};
+  const f=profileFixture(t,{classify:async input=>input.text==='work'
+    ?{route:'work',reason:'new work'}
+    :{route:input.text==='mixed'?'work':'control',control:'manual',profile,force:true,reason:'same selected profile'},
+    forceSwitch:async()=>{interruptions++;return{state:'interrupted'};}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  await f.router.dispatch({id:'work',text:'work'},async()=> 'new-turn');
+  const task=f.router.currentTask(),version=task.inputVersion,epoch=f.router.state.executionEpoch;
+  task.tools.tool={status:'in_progress',turnFence:epoch};
+  task.deliveries.file={state:'unconfirmed',inputVersion:version};
+  f.runtime.active=true;f.runtime.backgroundTasks=1;f.runtime.pendingDeliveries=1;f.runtime.nativeStatus='running';
+  const notices=structuredClone(f.router.state.notices),tools=structuredClone(task.tools),deliveries=structuredClone(task.deliveries);
+  await f.router.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('control'));
+  assert.equal(f.router.state.requests['owner-mode:same-control'].state,'applied');
+  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.equal(f.router.state.executionEpoch,epoch);
+  assert.deepEqual(f.router.state.notices,notices);assert.deepEqual(task.tools,tools);assert.deepEqual(task.deliveries,deliveries);
+  assert.equal(task.inputVersion,version);assert.equal(task.handoff,undefined);
+  const restarted=new MobileRouter(f.args);
+  await restarted.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('duplicate control'));
+  let submitted;
+  await restarted.dispatch({id:'mixed-repeat',text:'mixed'},async detail=>{submitted=detail;return'steer';});
+  assert.equal(submitted.taskId,task.id);assert.equal(submitted.inputVersion,version+1);
+  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.deepEqual(restarted.state.notices,JSON.parse(JSON.stringify(notices)));
+});
+
+test('manual content and task completion retain the full profile without choosing another model',async t=>{
+  const f=profileFixture(t,{classify:async input=>input.text==='pin'
+    ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},reason:'owner choice'}
+    :{route:input.text==='chat'?'chat':'work',reason:'content only'}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  for(const text of ['work','chat','progress'])await f.router.dispatch({id:text,text},async detail=>{assert.equal(detail.model,'gpt-6-astra');assert.equal(detail.profile.reasoningEffort,'high');return'new-turn';});
+  assert.equal(f.classifications.length,4,'one existing content/recall call per owner message');
+  for(const call of f.classifications.slice(1))assert.deepEqual([call.mode,call.currentProfile.model,call.currentProfile.reasoningEffort,call.currentProfile.serviceTierPreference],['manual','gpt-6-astra','high','default']);
+  const task=f.router.currentTask(),notices=structuredClone(f.router.state.notices);
+  await f.router.requestMode({commandId:'task-complete',mode:'auto',completedTaskId:task.id,completedInputVersion:task.inputVersion,reason:'task finished',notify:false});
+  await f.router.reconcile();await f.router.applyPendingMode();
+  assert.ok(task.completion);assert.equal(f.router.state.mode,'manual');assert.equal(f.router.state.requestedMode,null);
+  assert.equal(f.switches.length,1);assert.deepEqual(f.router.state.notices,notices);
+});
+
+test('an actual effort change still interrupts once and notifies after profile verification',async t=>{
+  let interruptions=0;
+  const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:input.text==='pin'?'medium':'high',serviceTierPreference:'default'},force:true,reason:'fresh owner request'}),
+    forceSwitch:async()=>{interruptions++;f.runtime.active=false;f.runtime.nativeStatus='idle';return{state:'interrupted'};}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  f.runtime.active=true;f.runtime.nativeStatus='running';
+  await f.router.dispatch({id:'higher',text:'higher'},async()=>assert.fail('control'));
+  assert.equal(interruptions,1);assert.equal(f.runtime.reasoningEffort,'high');assert.equal(f.switches.length,2);
+  assert.equal(Object.values(f.router.state.notices).length,2);
+});
+
+test('a historical canceled task cannot discard another task input after a classification retry or restart',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'append a conclusion'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  f.router.state.tasks.old={...structuredClone(task),id:'old',status:'canceled',cancelRequested:true,canceledAt:1};
+  const input={id:'conclusion',text:'append the conclusion'};
+  await f.router.select(input);
+  const restarted=new MobileRouter(f.args);
+  await restarted.reviewSemanticPending();
+  assert.equal(restarted.state.inputs.conclusion.state,'selected');
+  assert.equal(restarted.state.inputs.conclusion.taskId,task.id);
+  let submitted=0;
+  await restarted.dispatch(input,async detail=>{submitted++;assert.equal(detail.taskId,task.id);return'steer';});
+  await restarted.dispatch(input,async()=>assert.fail('duplicate'));
+  assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
+});
+
+test('a real stop of the captured task still retires late work classification',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'pending',text:'append a conclusion'});
+  task.cancelRequested=true;
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs.pending.state,'semantic-canceled');
+  assert.equal(f.router.state.inputs.pending.reason,'superseded-by-cancel');
+  assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+});
+
+test('new independent work can retry after a prior task was canceled',async t=>{
+  let calls=0;
+  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'independent new work'};}});
+  const old=f.router.addTask({id:'old-work',text:'old task'});old.cancelRequested=true;old.status='canceled';old.canceledAt=1;
+  await f.router.select({id:'new-work',text:'start the new article'});
+  await f.router.reviewSemanticPending();
+  assert.equal(f.router.state.inputs['new-work'].state,'selected');
+  assert.notEqual(f.router.state.inputs['new-work'].taskId,old.id);
+  assert.equal(old.status,'canceled');assert.equal(old.cancelRequested,true);
+});

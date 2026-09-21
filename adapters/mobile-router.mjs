@@ -349,7 +349,7 @@ export class MobileRouter {
     let timer;
     const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
     const availableModels=await this.availableModels();
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
   /** A classification answer, validated and read within its bounds. Never owns the
@@ -532,7 +532,10 @@ export class MobileRouter {
         try{read=this.readClassification(result,{owner,intents,allowStop:basisSame});}catch(error){return fail(classificationFailure(error));}
         // A stop that landed while the answer was in flight retires the input: a
         // late work decision must never resurrect or extend what the owner canceled.
-        const canceled=Object.values(this.state.tasks).some(t=>t.cancelRequested||t.status==='canceled'&&(t.canceledAt??0)>=e.createdAt);
+        const canceled=Object.keys(e.taskVersions??{}).some(id=>{
+          const task=this.state.tasks[id];
+          return task?.cancelRequested||task?.status==='canceled'&&(task.canceledAt??0)>=e.createdAt;
+        });
         if(canceled&&read.decision==='work') {
           e.state='superseded';record.state='semantic-canceled';record.reason='superseded-by-cancel';
           this.save('semantic-canceled',{id,reason:'superseded-by-cancel'});return;
@@ -642,14 +645,15 @@ export class MobileRouter {
       const directDefer=directAuthorized&&source.force===false;
       const forceAuthorized=request.force===true&&(directForce||reclassificationAuthorized&&reclassification.decision.force===true);
       const deferAuthorized=request.force===false&&(directDefer||reclassificationAuthorized&&reclassification.decision.force===false);
+      const keepManual=request.mode==='auto'&&request.completedTaskId&&this.state.mode==='manual'&&this.state.manualProfile;
       this.state.configRevision++;
-      const result={state:'pending',mode:request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
-        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...(request.profile?{profile:clone(request.profile)}:{}),at:this.now()};
+      const result={state:'pending',mode:keepManual?'manual':request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
+        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...((keepManual||request.profile)?{profile:clone(keepManual||request.profile)}:{}),at:this.now()};
       for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto','manual'].includes(prior.mode)){
         if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
         prior.state='superseded';prior.supersededBy=request.commandId;
       }
-      this.state.requests[request.commandId]=result;this.state.requestedMode=request.mode;this.save('mode-request',{commandId:request.commandId,mode:request.mode,force:forceAuthorized});
+      this.state.requests[request.commandId]=result;this.state.requestedMode=result.mode;this.save('mode-request',{commandId:request.commandId,mode:result.mode,force:forceAuthorized});
       return clone(result);
   }
   async applyPendingMode() {
@@ -726,10 +730,15 @@ export class MobileRouter {
       this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持这组模型设置。');
       this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-profile'});return {runtime};
     }
-    if(request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
+    // Retaining an already active manual profile is not an interruption or a
+    // model transition. Keep task/tools/delivery ownership exactly as it is.
+    const unchanged=request.mode==='manual'&&this.state.mode==='manual'&&
+      this.state.manualProfile&&this.verified(runtime,this.state.manualProfile)&&this.verified(runtime,target)&&
+      !request.forceState&&this.state.transition?.state!=='unconfirmed';
+    if(!unchanged&&request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
     if(request.mode==='work'&&!this.state.autoReturnProfile)this.captureAutomaticReturn(runtime);
     let forced=Boolean(request.forceBoundary);
-    if(this.busy(runtime)) {
+    if(!unchanged&&this.busy(runtime)) {
       if(!request.force){request.waitingReason='coordinator-busy';return {runtime};}
       const boundary=await this.forceBoundary(request,runtime);if(!boundary)return {runtime};forced=true;
       runtime=await this.inspect();
@@ -750,7 +759,7 @@ export class MobileRouter {
         this.applyModeState(request,actual,target);this.finishTransition(actual);
       } else {this.applyModeState(request,runtime,target);this.state.actual=runtime;}
       for(const prior of Object.values(this.state.requests))if(prior!==request&&prior.state==='pending'){prior.state='superseded';prior.supersededBy=request.commandId;}
-      this.modeApplied(request,this.state.actual);this.save('mode-applied',{commandId:request.commandId,model:target.model,forced});return {runtime:this.state.actual};
+      this.modeApplied(request,this.state.actual,{unchanged});this.save(unchanged?'mode-unchanged':'mode-applied',{commandId:request.commandId,model:target.model,forced});return {runtime:this.state.actual};
     } catch(error) {
       request.failedAt=this.now();request.waitingReason='switch-unconfirmed';
       if(this.state.transition)this.state.transition.state='unconfirmed';
@@ -853,12 +862,14 @@ export class MobileRouter {
     const id='kin-mode-'+digest([this.sessionId,key,kind]).slice(0,40);
     this.state.notices[id]??={id,kind,state:'pending',sourceInputId:this.state.inputs[key]?key:this.state.requests[key]?.sourceInputId,createdAt:this.now(),...extra};return this.state.notices[id];
   }
-  modeApplied(request,runtime) {
+  modeApplied(request,runtime,{unchanged=false}={}) {
     request.state='applied';request.appliedAt=this.now();
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
       serviceTier:runtime.serviceTier??null,serviceTierVerified:Boolean(runtime.serviceTier&&runtime.serviceTierVerified!==false),
       serviceTierPreference:runtime.serviceTierPreference??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null),
       mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
+    request.waitingReason=null;
+    if(unchanged)return;
     const task=this.currentTask(),source=this.state.inputs[request.sourceInputId];
     if(task?.continuationRequired&&source?.route==='control'&&!task.cancelRequested)
       task.handoff={id:request.commandId,text:'模型已按小光要求切换。继续原任务，读取已有进度和交付回执，不重做已完成的动作；结果发飞书。',state:'pending'};
@@ -1094,7 +1105,7 @@ export class MobileRouter {
       for(const request of Object.values(this.state.requests))if(request.state==='pending') {
         if(request.deferUntilSettled&&this.tasks().length)continue;
         const target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:!this.tasks().length?this.automaticIdleProfile():null;
-        if(target&&this.verified(runtime,target)) {this.applyModeState(request,runtime,target);this.modeApplied(request,runtime);changed=true;}
+        if(target&&this.verified(runtime,target)) {await this.applyModeRequest(request,runtime);changed=true;}
       }
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });
