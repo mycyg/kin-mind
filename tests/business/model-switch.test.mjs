@@ -232,3 +232,10 @@ test('explicit deferred mixed control without prior work does not wait on its ow
  await f.router.dispatch({id:'deferred-new-work',kind:'owner',text:'After old work ends, switch and start the next document'},async()=> 'new-turn');
  assert.equal(f.router.state.requests['owner-mode:deferred-new-work'].state,'applied');assert.equal(f.router.tasks().length,1);
 });
+
+test('control-only interruption schedules the existing handoff after verified model application',async t=>{
+ let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
+ const task=f.router.addTask({id:'original',text:'finish original deliverable'});Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+ await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
+ assert.equal(task.handoff.state,'pending');assert.equal(task.handoff.id,'owner-mode:control-only');assert.equal(f.router.state.requests[task.handoff.id].state,'applied');assert.equal(task.inputVersion,1);
+});

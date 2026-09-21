@@ -861,7 +861,7 @@ export class MobileRouter {
       mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
     const task=this.currentTask(),source=this.state.inputs[request.sourceInputId];
     if(task?.continuationRequired&&source?.route==='control'&&!task.cancelRequested)
-      task.handoff={id:'resume:'+request.commandId,text:'模型已按小光要求切换。继续原任务，读取已有进度和交付回执，不重做已完成的动作；结果发飞书。',state:'pending'};
+      task.handoff={id:request.commandId,text:'模型已按小光要求切换。继续原任务，读取已有进度和交付回执，不重做已完成的动作；结果发飞书。',state:'pending'};
     const transition=this.state.transition;
     const notice=transition?.sourceId===request.commandId&&this.state.notices[transition.noticeId];
     if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
