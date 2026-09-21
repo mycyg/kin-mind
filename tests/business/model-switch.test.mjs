@@ -239,3 +239,56 @@ test('control-only interruption schedules the existing handoff after verified mo
  await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
  assert.equal(task.handoff.state,'pending');assert.equal(task.handoff.id,'owner-mode:control-only');assert.equal(f.router.state.requests[task.handoff.id].state,'applied');assert.equal(task.inputVersion,1);
 });
+
+test('repeated manual profile keeps active work, tools and pending delivery intact, including restart',async t=>{
+  let interruptions=0;
+  const profile={model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'};
+  const f=profileFixture(t,{classify:async input=>input.text==='work'
+    ?{route:'work',reason:'new work'}
+    :{route:input.text==='mixed'?'work':'control',control:'manual',profile,force:true,reason:'same selected profile'},
+    forceSwitch:async()=>{interruptions++;return{state:'interrupted'};}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  await f.router.dispatch({id:'work',text:'work'},async()=> 'new-turn');
+  const task=f.router.currentTask(),version=task.inputVersion,epoch=f.router.state.executionEpoch;
+  task.tools.tool={status:'in_progress',turnFence:epoch};
+  task.deliveries.file={state:'unconfirmed',inputVersion:version};
+  f.runtime.active=true;f.runtime.backgroundTasks=1;f.runtime.pendingDeliveries=1;f.runtime.nativeStatus='running';
+  const notices=structuredClone(f.router.state.notices),tools=structuredClone(task.tools),deliveries=structuredClone(task.deliveries);
+  await f.router.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('control'));
+  assert.equal(f.router.state.requests['owner-mode:same-control'].state,'applied');
+  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.equal(f.router.state.executionEpoch,epoch);
+  assert.deepEqual(f.router.state.notices,notices);assert.deepEqual(task.tools,tools);assert.deepEqual(task.deliveries,deliveries);
+  assert.equal(task.inputVersion,version);assert.equal(task.handoff,undefined);
+  const restarted=new MobileRouter(f.args);
+  await restarted.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('duplicate control'));
+  let submitted;
+  await restarted.dispatch({id:'mixed-repeat',text:'mixed'},async detail=>{submitted=detail;return'steer';});
+  assert.equal(submitted.taskId,task.id);assert.equal(submitted.inputVersion,version+1);
+  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.deepEqual(restarted.state.notices,JSON.parse(JSON.stringify(notices)));
+});
+
+test('manual content and task completion retain the full profile without choosing another model',async t=>{
+  const f=profileFixture(t,{classify:async input=>input.text==='pin'
+    ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},reason:'owner choice'}
+    :{route:input.text==='chat'?'chat':'work',reason:'content only'}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  for(const text of ['work','chat','progress'])await f.router.dispatch({id:text,text},async detail=>{assert.equal(detail.model,'gpt-6-astra');assert.equal(detail.profile.reasoningEffort,'high');return'new-turn';});
+  assert.equal(f.classifications.length,4,'one existing content/recall call per owner message');
+  for(const call of f.classifications.slice(1))assert.deepEqual([call.mode,call.currentProfile.model,call.currentProfile.reasoningEffort,call.currentProfile.serviceTierPreference],['manual','gpt-6-astra','high','default']);
+  const task=f.router.currentTask(),notices=structuredClone(f.router.state.notices);
+  await f.router.requestMode({commandId:'task-complete',mode:'auto',completedTaskId:task.id,completedInputVersion:task.inputVersion,reason:'task finished',notify:false});
+  await f.router.reconcile();await f.router.applyPendingMode();
+  assert.ok(task.completion);assert.equal(f.router.state.mode,'manual');assert.equal(f.router.state.requestedMode,null);
+  assert.equal(f.switches.length,1);assert.deepEqual(f.router.state.notices,notices);
+});
+
+test('an actual effort change still interrupts once and notifies after profile verification',async t=>{
+  let interruptions=0;
+  const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:input.text==='pin'?'medium':'high',serviceTierPreference:'default'},force:true,reason:'fresh owner request'}),
+    forceSwitch:async()=>{interruptions++;f.runtime.active=false;f.runtime.nativeStatus='idle';return{state:'interrupted'};}});
+  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
+  f.runtime.active=true;f.runtime.nativeStatus='running';
+  await f.router.dispatch({id:'higher',text:'higher'},async()=>assert.fail('control'));
+  assert.equal(interruptions,1);assert.equal(f.runtime.reasoningEffort,'high');assert.equal(f.switches.length,2);
+  assert.equal(Object.values(f.router.state.notices).length,2);
+});

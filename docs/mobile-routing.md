@@ -59,6 +59,17 @@ The host answers status requests from verified runtime metadata. Asking for a
 switch notification attaches to the pending request; it does not start a work-model
 task. A mixed message that also requests code, a document or a repair remains work.
 
+In manual mode, ordinary messages retain the selected model, effort and Fast
+preference. The existing classifier still reads content, recall and stop/file
+intentions, but does not select a model for those messages. Only a fresh control
+in the current owner text changes the profile or routing mode; an old control in
+the task summary or recent conversation is context, not renewed authority.
+Partial effort/tier changes retain the other current fields. An already verified,
+identical manual profile settles without canceling the native turn, fencing tools,
+creating a continuation or notifying another switch. An uncertain prior switch
+still reconciles through its original receipt. Task completion retains a manual
+profile; returning to automatic routing requires the owner's explicit request.
+
 Historical correction is a separate receipt, not a rewrite of the input record. An
 authenticated private host can call `reclassifyAcceptedControl` only for an already
 accepted owner input, with its semantic hash, the exact router revision, a bounded
