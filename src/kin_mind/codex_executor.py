@@ -598,8 +598,8 @@ def run_codex(
     # retry loops are bounded inside the total wall-clock budget, which the loop
     # below still owns. The host may tighten both via the provider config.
     provider.setdefault("stream_idle_timeout_ms", min(300_000, budget_seconds * 1000))
-    provider.setdefault("request_max_retries", 2)
-    provider.setdefault("stream_max_retries", 2)
+    provider["request_max_retries"] = min(provider.get("request_max_retries", 3), 3)
+    provider["stream_max_retries"] = 0
     if cli_version is None:
         cli_version = codex_cli_version(executable)
     started = time.monotonic()

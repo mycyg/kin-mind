@@ -91,7 +91,7 @@ export function patchCodexRuntime(source) {
 }
 
 export function installCodexRuntimePatch(file) {
-  const original = fs.readFileSync(file,'utf8'), patched = patchSessionRuntime(patchMemoryRuntime(patchCodexRuntime(original)));
+  const original = fs.readFileSync(file,'utf8'), patched = patchModelRetries(patchSessionRuntime(patchMemoryRuntime(patchCodexRuntime(original))));
   if (original === patched) return;
   const hash = createHash('sha256').update(original).digest('hex').slice(0,16);
   const backup = file + '.kin-routing-backup-' + hash;
@@ -99,6 +99,15 @@ export function installCodexRuntimePatch(file) {
   const temporary = file + '.kin-routing-' + process.pid;
   fs.writeFileSync(temporary, patched, {mode:fs.statSync(file).mode & 0o777});
   fs.renameSync(temporary,file);
+}
+
+/** Let the native HTTP client own retries, without a second stream replay loop. */
+export function patchModelRetries(source) {
+  const before='        wire_api: wireApi\n';
+  const after='        wire_api: wireApi,\n        request_max_retries: 3,\n        stream_max_retries: 0\n';
+  if(source.includes(after))return source;
+  if(source.split(before).length!==2)throw Error('Codex gateway retry configuration needs compatibility review');
+  return source.replace(before,after);
 }
 
 /** Runtime warnings are events, never assistant prose. Injection is restricted

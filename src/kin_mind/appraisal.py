@@ -48,12 +48,12 @@ REVIEW_MAX_MINUTES = 120
 REVIEW_REST_MAX_MINUTES = 480
 # Every lane is bounded: a charged attempt is a real appraisal call, and an
 # identical failure twice in a row is quarantined instead of paid for again.
-MAX_CHARGED_ATTEMPTS = 5
+MAX_CHARGED_ATTEMPTS = 4
 REPEATED_FAILURE_LIMIT = 2
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either.
 TRANSIENT_PATTERN = r"deepseek-(?:network-error|http-(?:5\d\d|429))"
-MAX_TRANSIENT_FAILURES = 24
+MAX_TRANSIENT_FAILURES = 3
 # A long context can time out deterministically, so a timeout is charged; it is
 # simply never the repeated signature that quarantines a row.
 NO_REPEAT_QUARANTINE = {"deepseek-timeout"}
@@ -345,8 +345,8 @@ AUDIT_SECTION_SWITCH = {"trait_observations": "trait_ledger", "trait_decisions":
 SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continuity-bootstrap", "session-maintenance"}
 # One short paragraph per section, appended only where that section is offered. Each belongs to the
 # module that applies the section: it replaces its own paragraph here and nothing else.
-TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、内部事件都不能作证据。category 与 slug 决定这条证据归哪条特征，同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
-TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历、至少一条非自述的支持，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
+TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法，也包括有来源的日记与反思。反思形成的新认识可以影响性格；保留其想法性质，不把想象当作外部事实，也不把同一篇日记的重读或复述算成新的经历。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、计时唤醒等宿主内部运行记录不能作证据。category 与 slug 决定这条证据归哪条特征，同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
+TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历或形成新认识的反思，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
 SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
@@ -1226,7 +1226,7 @@ class NativeReview(DeepSeek):
 
     def _system(self, context, policy):
         # The main session already loads the approved persona once as stable instructions.
-        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做。想记感想时，understanding.meaning 使用自然中文，basis=internal_thought，关联已有真实来源；长久惦记放入 concerns，活动安排放入 plan_changes。没有实质变化时相应字段留空，更新复核时间即可。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
+        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做。反思形成的新认识也能影响性格，通过已有 trait_observations 与 trait_decisions 记录；不必等小光确认每次成长。想记感想时，understanding.meaning 使用自然中文，basis=internal_thought，关联已有真实来源；长久惦记放入 concerns，活动安排放入 plan_changes。没有实质变化时相应字段留空，更新复核时间即可。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
 
     def request_profile(self, context):
         return {**super().request_profile(context), "parameters": self.profile}
@@ -1484,7 +1484,11 @@ class Appraisals:
         repeats = data.get("error_repeats", 0) + 1 if data.get("error_signature") == signature else 1
         data.update(error_signature=signature, error_repeats=repeats)
         charged = row["attempts"] + 1
-        limit = settings.get("max_charged_attempts") or MAX_CHARGED_ATTEMPTS
+        limit = min(settings.get("max_charged_attempts") or MAX_CHARGED_ATTEMPTS, MAX_CHARGED_ATTEMPTS)
+        if data.get("error") == "native-review-unconfirmed":
+            # The native request already owns transport retries. Never rerun a
+            # possibly tool-bearing internal turn under a fresh attempt token.
+            return self._quarantine(data, "native-review-unconfirmed")
         if settings["operational_lanes"] and historical and row["attempts"] >= 1:
             return self._quarantine(data, data["error"])
         if repeats >= REPEATED_FAILURE_LIMIT and detail.get("code") not in NO_REPEAT_QUARANTINE:
@@ -2357,6 +2361,7 @@ class Appraisals:
 
                 committing = True
                 data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+            self.memory.remember_reflection(data["result"])
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.

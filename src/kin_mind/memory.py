@@ -705,6 +705,30 @@ class MemoryContinuity:
         for ref in refs:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
 
+    def remember_reflection(self, result):
+        """Keep a committed personal reflection in the ordinary searchable store.
+
+        The appraisal event is its identity. Re-entering after a restart reuses
+        the source; it does not evaluate or score the experience again.
+        """
+        understanding = (result.get("proposal") or {}).get("understanding")
+        if not understanding or understanding.get("basis") != "internal_thought":
+            return None
+        with self.engine.db.connect() as conn:
+            event = conn.execute("SELECT occurred_at FROM mind_events WHERE id=? AND scope=?",
+                                 (result.get("event_id"), self.scope.key())).fetchone()
+        if not event:
+            return None
+        return self.engine.receive(SourceInput(
+            namespace="kin-reflection", key=result["event_id"],
+            scope=self.scope, occurred_at=event["occurred_at"], authority="model",
+            kind="episode", title="小Kin自己琢磨的：日记与感想",
+            text="小Kin自己琢磨的（日记与感想，不是小光的原话或已确认事实）：\n" + understanding["meaning"],
+            metadata={"role": "assistant", "basis": "internal_thought", "internal": True,
+                      "host_event": "diary", "topic": understanding.get("topic"), "appraisal_event_id": result["event_id"],
+                      "evidence_ids": understanding.get("evidence_ids", []),
+                      "confidence": understanding.get("confidence")}))
+
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None):
         """Called inside the same transaction as affect/concerns/wishes.
 

@@ -9,8 +9,8 @@ It never judges the trait itself: that sentence is Kin's own.
   `state` ever changes. One trait takes one observation per episode and polarity: ten messages
   inside one interaction window are one time something happened, not ten.
 - A **trait** acts from the moment it is proposed. `establish` says the shared history carries
-  it, and on inference that costs at least two separate episodes and at least one supporting
-  observation that is not Kin's own words.
+  it, and on inference that takes two separate episodes. Personal reflection is
+  a valid self-statement, without becoming proof of external facts.
 - A **tombstone** is what a revoked trait leaves behind: the reason, the source that revoked it,
   and a history that stays readable. Proposing it again needs an owner statement newer than it.
 - **Fading** is a semantic decision from the same appraisal that interprets the evidence. The
@@ -373,16 +373,14 @@ class Traits:
         return self._find(conn, first["trait_id"]), identity
 
     def _established(self, conn, trait, decision, support, cache):
-        """The narrow invariant: on inference, separate episodes, support that is not Kin's own,
-        and the decision naming two of those observations and why they are different times."""
+        """Repeated copies are one episode; distinct reflections can support growth."""
         if decision.basis != "inference":
             return
         episodes = [o["episode_key"] for o in
                     self._lookup(conn, [entry.ref for entry in decision.episodes], trait, cache)]
         if (len({o["episode_key"] for o in support}) < 2
-                or not any(o["class"] != "self_statement" for o in support)
                 or len(set(episodes)) < 2):
-            raise Conflict("Establishing on inference needs separate episodes and support that is not Kin's own",
+            raise Conflict("Establishing on inference needs separate episodes",
                            code="trait-single-episode", target=trait["id"])
 
     def _owner_words(self, conn, decision, refs, policy):

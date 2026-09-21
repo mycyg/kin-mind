@@ -80,9 +80,6 @@ class ContextDelivery:
                 value['state'] = 'stale'
                 self._put(conn, value)
                 return self.view(value)
-            held = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND state IN ('sending','unconfirmed')", (self.scope, session, epoch)).fetchall()
-            if held:
-                return {'state': 'waiting', 'reason': 'previous-context-unconfirmed'}
             if not self.ctx.memory.settings(conn)['native_window_context'] and window['used'] + value['tokens'] > 12000:
                 return {'state': 'waiting', 'reason': 'automatic-background-budget'}
             value['state'] = 'sending'
