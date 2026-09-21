@@ -83,7 +83,8 @@ export class MindLoop {
   }
   async contactTick() {
     if(this.closed||this.contactRunning||this.isBusy())return {state:'busy'};
-    if(!this.eligibility().eligible)return {state:'waiting',reason:this.eligibility().reason};
+    const eligibility=this.eligibility();
+    if(!eligibility.eligible)return {state:'waiting',reason:eligibility.reason};
     this.contactRunning=true;
     let attempt,possibleSend=false;
     try {
@@ -141,9 +142,10 @@ export class MindLoop {
       if(typeof content!=='string'||!content.trim())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision'})});
       await this.call('settle',{attempt_id:attempt.id,state:'pending'});
-      // Recheck after the durable write. Any ambiguity remains held, never retried.
+      // The durable pending write is not a send. Yield safely if context moved.
       if(this.closed||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
-        return await this.call('settle',{attempt_id:attempt.id,state:'unconfirmed',reason:'Context changed at send boundary; no automatic replay'});
+        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
+          reason:epoch!==this.ownerEpoch()?'contact-source-changed':'Delivery conditions changed before sending'});
       }
       possibleSend=true;
       const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files:attempt.desire?.delivery_artifacts??[],
@@ -175,10 +177,10 @@ export class MindLoop {
       return settled;
     } catch(error) {
       if(attempt) {
-        try {return await this.call('settle',{attempt_id:attempt.id,state:possibleSend?'unconfirmed':'canceled',reason:'Host action failed',
+        try {return await this.call('settle',{attempt_id:attempt.id,state:possibleSend?'unconfirmed':'canceled',aborted_before_send:!possibleSend,reason:'Host action failed',
           failure:failure(error,{category:possibleSend?'delivery-uncertain':'host-runtime',stage:possibleSend?'contact-delivery':'contact-host',
             code:'contact-host-action-failed',retry_condition:possibleSend?'reconcile':'backoff'})});}
-        catch {this.recordStatus?.({contact:{state:'unconfirmed',id:attempt.id}});}
+        catch {this.recordStatus?.({contact:{state:possibleSend?'unconfirmed':'failed',reason:'contact-settlement-failed',id:attempt.id}});}
       }
       return {state:'failed',reason:'contact-host-error'};
     } finally {this.contactRunning=false;}

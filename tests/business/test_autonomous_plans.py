@@ -284,3 +284,51 @@ def test_native_main_profile_authorizes_plan_and_contact_without_ds_label(env,mo
         plans.decide(conn,proposal,'native',receipt,mind._evidence(conn,[initial]))
     plans.sync_wishes()
     assert mind.contact_candidate()['eligible'] is True
+
+@pytest.mark.parametrize('explanations', [
+    ['卡片已产出并核验：已有完成回执；当前联系条件由宿主核对。'],
+    ['作品已准备好，接下来送给她。'],
+    [],
+])
+def test_semantic_preconditions_accept_explanation_without_exact_prose_tokens(env, explanations):
+    mind, plans, *_ = env
+    p = create(env, actor='contact', steps=[{'id':'make','actor':'contact','goal':'Share a thought',
+        'completion':'Platform accepted','preconditions':['卡片已产出并核验','宿主核对免打扰与联系偏好']}])
+    p = decide(env, p, conditions_met=explanations)
+    assert p['steps'][0]['decision']['conditions_met'] == explanations
+    plans.sync_wishes()
+    assert mind.contact_candidate()['eligible'] is True
+
+
+def test_semantic_assurance_cannot_bypass_unfinished_dependency(env):
+    mind, plans, *_ = env
+    p = create(env, steps=[
+        {'id':'input','actor':'owner','goal':'Choose a photo','completion':'Photo received'},
+        {'id':'make','actor':'create','goal':'Make the card','completion':'Saved card',
+         'depends_on':['input'],'preconditions':['Photo is ready']},
+    ])
+    p = decide(env, p, conditions_met=['The requested photo is already here.'])
+    assert plans.claim('create','worker')['state'] == 'waiting'
+    assert plans.read(p['id'])['plans'][0]['steps'][1]['waiting_reason'] == 'dependency-unfinished'
+
+
+def test_only_proven_unsent_attempt_can_release_persistent_contact_slot(env):
+    mind, plans, *_ = env
+    p = decide(env, create(env, actor='contact'))
+    plans.sync_wishes()
+    attempt = mind.claim_contact(owner_epoch='original')
+    mind.settle_contact(attempt_id=attempt['id'],state='pending')
+    # A new host instance reads the same durable state, not an in-memory flag.
+    restarted = Mind(mind.engine, mind.scope, clock=mind.clock)
+    with pytest.raises(Conflict):
+        restarted.settle_contact(attempt_id=attempt['id'],state='canceled')
+    assert restarted.contact_candidate()['reason'] == 'attempt-in-progress'
+    retired = restarted.settle_contact(attempt_id=attempt['id'],state='canceled',
+        aborted_before_send=True,reason='Delivery conditions changed before sending')
+    assert retired['aborted_before_send'] and retired['state'] == 'canceled'
+    assert restarted.contact_candidate()['eligible'] is True
+    next_attempt = restarted.claim_contact(owner_epoch='current')
+    assert next_attempt['id'] != attempt['id']
+    restarted.settle_contact(attempt_id=next_attempt['id'],state='accepted',message_id='real-receipt')
+    with pytest.raises((Conflict,ValueError)):
+        restarted.settle_contact(attempt_id=next_attempt['id'],state='canceled',aborted_before_send=True)

@@ -272,8 +272,8 @@ class AutonomousPlans:
         elif step["actor"] == "owner":
             raise Conflict("The host cannot execute on the owner's behalf")
         else:
-            if set(step["preconditions"]) - set(d.conditions_met):
-                raise Conflict("DeepSeek must explicitly account for each precondition")
+            # Preconditions are semantic context for the assessment, not exact-text tokens.
+            # waiting_reason still checks actual dependencies, sources and time windows.
             from .procedures import Procedures
             for pid in d.procedure_ids:
                 Procedures(self.mind).require_current(conn, pid)
