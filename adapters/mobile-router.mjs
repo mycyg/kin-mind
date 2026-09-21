@@ -336,7 +336,7 @@ export class MobileRouter {
       const locked=this.applyRouteLock(input,{decision,reason,intent,command,runtime});
       ({decision,reason}=locked);
       const task=locked.task;
-      const modeControl=decision==='control'&&['manual','auto','work'].includes(command);
+      const modeControl=['manual','auto','work'].includes(command);
       const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}: {})};
       this.state.inputs[input.id]=record;
       if(!input.kind||input.kind==='owner')this.rememberOwner(input);
@@ -357,7 +357,10 @@ export class MobileRouter {
   readClassification(result,{owner,intents,allowStop=false}={}) {
     if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
     let command=null;
-    if(result.route==='control') {if(!owner||!['status','watch','work','auto','manual'].includes(result.control))throw Error('Invalid runtime control');command=result.control;}
+    if(result.route==='control'||result.control!==undefined) {
+      if(!owner||!['status','watch','work','auto','manual'].includes(result.control)||result.route!=='control'&&!['manual','auto','work'].includes(result.control))throw Error('Invalid runtime control');
+      command=result.control;
+    }
     const decision=result.route,reason=result.reason?.slice(0,200)??'classification';
     let recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null;
     // Only the bounded reading of the intents is kept, and only when they were asked for.
@@ -415,14 +418,27 @@ export class MobileRouter {
         if(record.state==='semantic-pending')return null;
         if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
-        const runtime=await this.reconcileTransition(await this.inspect());
+        let runtime=await this.reconcileTransition(await this.inspect());
         if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
-        if(record.route==='control') {
+        if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
           const request=await this.acceptControl(record,runtime);
           const applied=request?await this.applyModeRequest(request,runtime):{runtime};
-          record.state='accepted';record.acceptedAt=this.now();
-          this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:(applied.runtime??runtime).model,state:request?.state};
+          runtime=applied.runtime??runtime;
+          if(record.route==='control') {
+            record.state='accepted';record.acceptedAt=this.now();
+            this.save('control-accepted',{id:input.id,command:record.command});
+            return{route:'host-control',model:runtime.model,state:request?.state};
+          }
+          // Mixed requests execute their work only after the exact requested
+          // profile is verified. Failure never silently runs it on the old model.
+          if(request?.state==='pending')return null;
+          if(request?.state!=='applied') {
+            record.state='failed-before-submit';record.failureStage='model-control';
+            this.save('input-failed-before-submit',{id:input.id});
+            return {route:'control-failed',state:request?.state,model:runtime.model};
+          }
         }
+        if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input).id;
         if(record.route==='maintenance'&&this.busy(runtime))return null;
         let targetProfile=record.route==='maintenance'||input.kind==='assessment'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
         if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {route:'deferred',reason:'native-profile-unconfirmed'};
@@ -524,7 +540,7 @@ export class MobileRouter {
         const runtime=await this.inspect();
         const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,runtime});
         Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
-          taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(read.decision==='control'&&['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
+          taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
         if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
         e.state='classified';e.updatedAt=this.now();
         this.save('input-classified-late',{id,route:locked.decision,reason:locked.reason,attempts:e.attempts});
@@ -569,11 +585,11 @@ export class MobileRouter {
       if(source.hash!==sourceHash)throw Error('Reclassification source hash mismatch');
       if(summary.actualSessionId!==this.sessionId||summary.actualSessionId!==source.nativeThreadId||summary.conversationId!==this.state.conversationId||summary.conversationId!==source.conversationId||summary.generation!==this.state.generation||summary.generation!==source.generation)throw Error('Reclassification source identity mismatch');
       const inputs=Object.values(this.state.inputs),sourceIndex=inputs.indexOf(source);
-      const newerControl=inputs.slice(sourceIndex+1).some(input=>input.kind==='owner'&&input.state==='accepted'&&input.route==='control'&&['manual','auto','work'].includes(input.command));
+      const newerControl=inputs.slice(sourceIndex+1).some(input=>input.kind==='owner'&&input.state==='accepted'&&['manual','auto','work'].includes(input.command));
       const newerReceipt=receipts.some(receipt=>(receipt.recordedAt??Infinity)>=(source.at??-Infinity));
       if(newerControl||newerReceipt)throw Error('Reclassification evidence is stale');
       const read=this.readClassification(decision,{owner:true,intents:false,allowStop:false});
-      if(read.decision!=='control'||!['manual','auto','work'].includes(read.command))throw Error('Reclassification must be a model control');
+      if(!['manual','auto','work'].includes(read.command))throw Error('Reclassification must be a model control');
       const profile=read.command==='manual'?await this.resolvedProfile(read.profile):null;
       const id='reclassification-'+digest([this.sessionId,sourceInputId,summary.id,summary.version]).slice(0,40);
       const modeRequest={commandId,mode:read.command,reason:'Verified owner control reclassification: '+read.reason,sourceInputId,sourceHash,notify:true,force:read.force,reclassificationId:id,...(profile?{profile}: {})};
@@ -596,12 +612,12 @@ export class MobileRouter {
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
       if(request.completedTaskId&&(!this.state.tasks[request.completedTaskId]||!open(this.state.tasks[request.completedTaskId])))throw Error('Task is not open');
       if(request.completedTaskId&&request.completedInputVersion!==this.state.tasks[request.completedTaskId].inputVersion)throw Error('Task input version changed; read current runtime');
+      if(request.handoff) {
+        const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
+        task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
+      }
       if(request.mode==='work') {
         this.state.exitRequested=false;
-        if(request.handoff) {
-          const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
-          task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
-        }
       } else if(request.mode==='auto') {
         this.state.exitRequested=true;
         if(request.completedTaskId) {
@@ -619,7 +635,7 @@ export class MobileRouter {
       // acceptControl: same owner source/hash, owner-mode command id, mode, force
       // choice and (for manual mode) catalog-resolved profile. An old `auto` source
       // can therefore never be repurposed as force authority for an arbitrary model.
-      const directAuthorized=Boolean(source?.kind==='owner'&&source.state==='selected'&&source.route==='control'&&
+      const directAuthorized=Boolean(source?.kind==='owner'&&source.state==='selected'&&['chat','work','control'].includes(source.route)&&
         request.commandId==='owner-mode:'+source.id&&request.mode===source.command&&request.sourceHash===source.hash&&
         source.controlRequestHash===hash&&['manual','auto','work'].includes(source.command));
       const directForce=directAuthorized&&source.force===true;
@@ -843,6 +859,9 @@ export class MobileRouter {
       serviceTier:runtime.serviceTier??null,serviceTierVerified:Boolean(runtime.serviceTier&&runtime.serviceTierVerified!==false),
       serviceTierPreference:runtime.serviceTierPreference??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null),
       mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
+    const task=this.currentTask(),source=this.state.inputs[request.sourceInputId];
+    if(task?.continuationRequired&&source?.route==='control'&&!task.cancelRequested)
+      task.handoff={id:request.commandId,text:'模型已按小光要求切换。继续原任务，读取已有进度和交付回执，不重做已完成的动作；结果发飞书。',state:'pending'};
     const transition=this.state.transition;
     const notice=transition?.sourceId===request.commandId&&this.state.notices[transition.noticeId];
     if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
@@ -851,6 +870,7 @@ export class MobileRouter {
   async acceptControl(record,runtime) {
     if(['work','auto','manual'].includes(record.command)) {
       const commandId='owner-mode:'+record.id;
+      if(this.state.requests[commandId])return this.state.requests[commandId];
       let profile=record.profile,resolved=true;
       if(record.command==='manual') {
         try {profile=await this.resolvedProfile(record.profile);record.resolvedControlProfile=clone(profile);}
