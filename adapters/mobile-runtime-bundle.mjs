@@ -172,14 +172,20 @@ export function prepareMobileRuntimeBundle({rootDir,bundleId,candidateKind='mobi
   try{
     const closure=resolveAcpDependencyClosure({acpPackageRoot,nodeModulesRoot,allowedPackages});
     const modules=fs.realpathSync(nodeModulesRoot);
-    const binary=path.join(staging,'bin','codex');copyRegularFile(codexBinary,binary,{executable:true});
+    const binary=path.join(staging,'bin','codex');
+    const sourceBinary=copyRegularFile(codexBinary,binary,{executable:true});
+    // Code-mode execution resolves this sibling executable, not the copy in
+    // node_modules. Keep the vendor layout and its optional shell resources.
+    copyRegularFile(path.join(path.dirname(sourceBinary),'codex-code-mode-host'),path.join(staging,'bin','codex-code-mode-host'),{executable:true});
+    const resources=path.join(path.dirname(sourceBinary),'..','codex-resources');
+    if(fs.existsSync(resources))copyPackageTree(resources,path.join(staging,'codex-resources'));
     for(const packageInfo of closure)copyPackageTree(path.join(modules,packageInfo.install_path),path.join(staging,'lib','node_modules',packageInfo.install_path));
     const acp=closure.find(item=>item.install_name==='@agentclientprotocol/codex-acp');if(!acp)throw Error('ACP root is absent from dependency closure');
     const acpRoot=path.join(staging,'lib','node_modules',acp.install_path),acpJson=readJsonStrict(path.join(acpRoot,'package.json'),'Bundled ACP package metadata');
     const vendorEntryRelative=safeRelative(path.join('lib','node_modules',acp.install_path,acpJson.bin?.['codex-acp']??acpJson.main),'ACP vendor entry');
     const vendorEntry=path.join(staging,vendorEntryRelative),entryRelative='lib/owned/codex-acp.mjs',entry=path.join(staging,entryRelative),ownedEntry=copyOwnedAcpEntry(ownedAcpEntry,vendorEntry,entry);
     const manifest={schema_version:MOBILE_RUNTIME_BUNDLE_SCHEMA,bundle_id:bundleId,candidate_kind:candidateKind,created_at:createdAt,
-      runtime:{codex:{path:'bin/codex',version:codexVersion(binary)},acp:{package_name:acpJson.name,version:acpJson.version,
+      runtime:{codex:{path:'bin/codex',code_mode_host:'bin/codex-code-mode-host',version:codexVersion(binary)},acp:{package_name:acpJson.name,version:acpJson.version,
         declared_codex_range:acpJson.dependencies?.['@openai/codex']??null,package_path:'lib/node_modules/'+acp.install_path,
         vendor_entry_path:vendorEntryRelative,vendor_entry_sha256:sha256(fs.readFileSync(vendorEntry)),entry_path:entryRelative,
         package_json_sha256:sha256(fs.readFileSync(path.join(acpRoot,'package.json'))),entry_sha256:sha256(fs.readFileSync(entry)),owned_entry:ownedEntry}},
@@ -218,6 +224,12 @@ export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
   if(sha256(fs.readFileSync(vendorEntry))!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.source_vendor_sha256!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.generated_sha256!==manifest.runtime.acp.entry_sha256)throw Error('Vendor and owned ACP bytes are not independently bound');
   validateBundledClosure(bundle,manifest);
   const binary=path.join(bundle,safeRelative(manifest.runtime.codex.path,'Codex binary'));ensureInside(bundle,binary,'Codex binary');
+  if(manifest.runtime.codex.code_mode_host) {
+    const helper=path.join(bundle,safeRelative(manifest.runtime.codex.code_mode_host,'Code-mode host'));
+    ensureInside(bundle,helper,'Code-mode host');
+    if(!fs.statSync(helper).isFile())throw Error('Bundled code-mode host missing');
+    fs.accessSync(helper,fs.constants.X_OK);
+  }
   if(executeBinary&&codexVersion(binary)!==manifest.runtime.codex.version)throw Error('Bundled Codex version changed');
   return {bundleDir:bundle,manifestPath:manifestFile,manifest,manifestSha256:sha256(manifestBytes),state:'prepared'};
 }
