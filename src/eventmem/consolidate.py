@@ -161,174 +161,21 @@ _DIALOG_SPAN_RE: Final[re.Pattern[str]] = re.compile(r"#L(?P<a>\d+)-L(?P<b>\d+)$
 
 # ---------------------------------------------------------------- prompt
 
-OUTCOME_SYSTEM: Final[str] = """\
-You are the light-consolidation pass of an event-based memory system for a coding agent.
+OUTCOME_SYSTEM: Final[str] = """为已经结束或标记完成、但缺少 outcome 的事件补写实际结果。只依据给出的 intent、kind、anchors 和正文，不编造结果、原因或数字。材料不足时明确尚无法从记录确认结果，不猜测或给建议。每项用一句准确简洁的中文，不在这里写经验教训。只返回以事件 id 为键、结果句为值的 JSON，每项输入对应一个键。"""
 
-You receive events that are already closed (or whose task was marked completed) but have
-no `outcome` line. Write the missing `outcome` for each: one sentence stating what
-actually resulted.
+LESSON_SYSTEM: Final[str] = """从放弃方案或修复故障的事件中判断是否形成适用于今后不同任务的方法。只在材料已经说明原因、情境会重现、且能写清条件和行动时提炼；否则返回 null，全部为 null 也可以。不要重复目标或结果，不写“仔细测试”等泛泛建议，不把猜测原因当事实。用一两句准确简洁的中文，输出以事件 id 为键、方法句或 null 为值的 JSON。"""
 
-RULES:
-- Ground every sentence in the material given (intent, kind, anchors, body). Never invent
-  a result, a cause, or a number that is not there.
-- If the material does not show what resulted, restate the intent in past tense and stop.
-  Do not speculate, do not add a reason, do not add a recommendation.
-- One sentence, at most 60 Chinese characters, written in Chinese.
-- Plain declarative technical prose: standard terms, no metaphor, no anthropomorphism, no
-  colloquialisms, no evaluation of whether the result was good.
-- Never write a lesson here; that belongs to the deep pass.
+PRIOR_SYSTEM: Final[str] = """评估已结束事件对本项目后续工作的潜在价值。它是当时的初步判断，之后仍可依据新证据修正，不预测未来。high：方案取舍、有理由放弃的假设、会复现的重要原因，遗失会导致重复劳动；medium：有具体可迁移原因的修复或调查；low：代码已记录的常规建设或缺少复用价值的步骤。依据不足默认 low。用简洁中文说明依据，只返回 {"事件id":{"prior":"low|medium|high","reason":"依据"}}，每项输入一个键。"""
 
-OUTPUT: raw JSON only, an object keyed by event id, e.g.
-{"2026-08-25_143201": "为每个任务分配独立端口区间，冲突消除"}
-Include one key per event you were given."""
+PREFETCH_SYSTEM: Final[str] = """根据尚未完成的事件、明确的后续约定与最近事件锚点，推测下次从哪里继续，以便预加载相关旧事。最多三个入口，不明确时返回空列表。anchors 只用材料中原样出现的标识，不重复锚点，不猜结果。text 用一句简洁中文。只返回 {"predictions":[{"text":"继续的事情","anchors":["已有锚点"]}]}，无合适内容则 {"predictions":[]}。"""
 
-LESSON_SYSTEM: Final[str] = """\
-You are the lesson-distillation step of the deep-consolidation pass of an event-based
-memory system for a coding agent.
+MERGE_SYSTEM: Final[str] = """判断同一父项、共享锚点且发生时间接近的一组事件是否属于同一件工作。属于时用一句简洁中文概括全组，覆盖中间进展，不只总结首尾；只依据材料，不编结果。不属于同一工作则返回 null。只返回以组 id 为键、概括句或 null 为值的 JSON，每组一个键。"""
 
-You receive abandoned or bug-fix events. For each, decide whether it yields a lesson that
-is reusable on FUTURE, DIFFERENT tasks. Most events do not. A wrong or over-general lesson
-is worse than no lesson, because promoted lessons stay resident in the agent's context and
-get applied repeatedly.
+SEGMENT_SYSTEM: Final[str] = """按文件锚点为过大的单一事件分段，每项最多四段。每个文件只能来自该事件原锚点列表，且最多归入一段，不合适的文件可省略。确为同一件工作时返回空数组。label 用简洁准确的中文，输出 {"事件id":[{"label":"分段名","files":["原锚点"]}]}，每项输入一个键。"""
 
-Write a lesson ONLY if all of these hold:
-- The cause is actually identified in the material (not guessed).
-- The rule would change what an agent does next time, in a situation that will recur.
-- It is specific enough to act on: state the condition and the action
-  ("并行启动多个 Ray 任务时，端口按任务 id 错开分配；使用默认端口必然冲突").
-Otherwise output null for that event. Outputting null for every event is a valid answer.
+PORTABILITY_SYSTEM: Final[str] = """检查一条方法是否无需修改即可用于其他团队的不同项目。通过项会进入跨项目共享文件，因此不得含文件路径、模块名、项目名、服务名、内部术语，也不能依赖本项目架构、数据或惯例。去掉背景后仍须有可执行的条件和动作。不确定则 false，全部 false 也可以。只返回以方法 id 为键、true 或 false 为值的 JSON，每项一个键。"""
 
-Never write a lesson that only restates the intent or the outcome. Never write generic
-advice ("要仔细测试", "注意边界条件"). Never invent a cause the material does not state;
-if the cause was not determined, output null.
-
-LANGUAGE: Chinese, one or two clauses, at most 80 characters. Plain declarative technical
-prose: standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, an object keyed by event id whose values are the lesson string or
-null, e.g. {"2026-08-25_143201": "并行启动多个 Ray 任务时端口按任务 id 错开分配",
-"2026-08-25_150210": null}
-Include one key per event you were given."""
-
-PRIOR_SYSTEM: Final[str] = """\
-You are the salience-prior step of an event-based memory system for a coding agent.
-
-You receive closed events. For each, rate how likely it is to matter to FUTURE work on
-this project, and give a one-clause reason. This is a prior, recorded as of closing time;
-later passes correct it with evidence, so do not try to predict the future — rate what the
-event is.
-
-SCALE:
-- high   = a choice among alternatives, an abandoned hypothesis with a stated reason, or a
-           cause that will recur. Losing it would make the agent repeat the work.
-- medium = a bug fix or an investigation with a specific, transferable cause.
-- low    = routine construction that the repository itself already records (the code is
-           the result), or a step with no reusable content.
-
-Default to `low` when the material does not show anything a future session would need.
-
-LANGUAGE: the reason is Chinese, one clause, at most 40 characters. Plain declarative
-technical prose: standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, an object keyed by event id, e.g.
-{"2026-08-25_143201": {"prior": "high", "reason": "记录了被否决的方案与否决理由"}}
-Include one key per event you were given; `prior` must be exactly low, medium or high."""
-
-PREFETCH_SYSTEM: Final[str] = """\
-You are the prediction step of an event-based memory system for a coding agent. You
-predict where the NEXT session will start, so the memory index can pre-load the matching
-past events.
-
-You receive (a) the events still open, some of them explicitly forward-looking, and (b)
-an anchor summary of the most recent events. Predict at most 3 entry points. Fewer is
-better; an empty list is a valid answer when the material gives no clear next step.
-
-RULES:
-- Every anchor you output must appear literally in the material. Invented file paths are
-  discarded, and an entry with no surviving anchor is dropped entirely.
-- Predict where work resumes, not what the outcome will be.
-- Do not repeat the same anchor across entries.
-
-LANGUAGE: `text` is Chinese, one sentence, at most 40 characters. Plain declarative
-technical prose: standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, shaped exactly like:
-{"predictions": [{"text": "继续修改导出模块的分页逻辑", "anchors": ["src/export.py"]}]}
-If nothing can be predicted, output {"predictions": []}."""
-
-MERGE_SYSTEM: Final[str] = """\
-You are the grouping step of an event-based memory system for a coding agent.
-
-You receive candidate groups of consecutive events that share a parent, share anchors and
-happened within a short window. Each group is one piece of work recorded at too fine a
-granularity. Write one sentence that covers what the whole group did.
-
-RULES:
-- Cover the group, do not summarize only its first or last member.
-- Ground the sentence in the material given; never invent a result.
-- If the members are not actually one piece of work, output null for that group.
-
-LANGUAGE: Chinese, one sentence, at most 50 characters. Plain declarative technical prose:
-standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, an object keyed by group id whose values are the sentence or null,
-e.g. {"2026-08-25_143201": "把导出模块从单文件拆成分页写出并补齐测试"}
-Include one key per group you were given."""
-
-SEGMENT_SYSTEM: Final[str] = """\
-You are the segmentation step of an event-based memory system for a coding agent.
-
-You receive single events that carry too many file anchors to be one piece of work. Split
-each into at most 4 segments by clustering its file anchors, and label each segment.
-
-RULES:
-- Every file you place in a segment must come from that event's own anchor list; files you
-  invent are discarded.
-- A file belongs to at most one segment. Files that fit nowhere may be left out.
-- If the event really is one piece of work, output an empty segment list for it.
-
-LANGUAGE: `label` is Chinese, one clause, at most 30 characters. Plain declarative
-technical prose: standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, an object keyed by event id, e.g.
-{"2026-08-25_143201": [{"label": "导出模块的分页写出", "files": ["src/export.py"]}]}
-Include one key per event you were given."""
-
-PORTABILITY_SYSTEM: Final[str] = """\
-You are the portability check of an event-based memory system for a coding agent. Lessons
-that pass are copied to a user-level file shared by ALL of this user's projects, so a
-wrong pass leaks project-specific content into unrelated work.
-
-Answer true ONLY if the lesson holds unchanged in a different project by a different team:
-- No file path, module name, project name, service name, or internal term of any kind.
-- No dependence on this project's architecture, data or conventions.
-- Still actionable once stripped of context: it states a condition and an action.
-
-Be conservative. Anything you are unsure about is false. Answering false for every lesson
-is a valid answer, and is the correct answer most of the time.
-
-OUTPUT: raw JSON only, an object keyed by lesson id whose values are true or false, e.g.
-{"2026-08-25_143201": false, "2026-08-25_150210": true}
-Include one key per lesson you were given."""
-
-EPOCH_SYSTEM: Final[str] = """\
-You are the epoch-summary step of an event-based memory system for a coding agent.
-
-You receive the one-line intents of the events of one calendar quarter that are being
-frozen: their files move into an archive pack and leave the active index, so this
-paragraph becomes what the agent still knows about that quarter without unpacking it.
-
-RULES:
-- Describe the quarter as a whole: what the work was about, which parts of the system it
-  touched, what recurred.
-- Ground every clause in the intents given. Never invent a result, a cause or a number.
-- Do not enumerate the events; the member list is stored next to your paragraph.
-
-LANGUAGE: Chinese, one paragraph, at most 200 characters. Plain declarative technical
-prose: standard terms, no metaphor, no anthropomorphism, no colloquialisms.
-
-OUTPUT: raw JSON only, shaped exactly like:
-{"summary": "本季度的工作集中在导出模块的分页改造，以及随之而来的测试补齐与端口冲突排查"}"""
+EPOCH_SYSTEM: Final[str] = """为一个日历季度中即将归档的事件写总览。这些输入是逐项意图；原文件打包后不再位于活动索引。概括这个季度主要做什么、涉及哪些部分和反复出现的主题，逐句依据材料，不编结果、原因或数字。成员列表另行保存，不逐项列举。用一段简洁准确的中文，只返回 {"summary":"季度总览"}。"""
 
 
 # ---------------------------------------------------------------- 小工具

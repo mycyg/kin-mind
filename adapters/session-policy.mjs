@@ -57,6 +57,7 @@ export function safeReadOnlyPreparation({runtime,tasks=[],inputs=[],notices=[],c
 export function checkpointBudget(checkpoint,budget) {
   const plan=checkpoint?.budgetPlan;
   if(plan?.reason==='recent-dialogue'&&plan.requested===budget&&Number.isInteger(plan.effective)&&plan.effective>=budget&&plan.effective<=8000&&plan.limit===8000)return plan.effective;
+  if(plan?.reason==='native-window'&&plan.requested===budget&&Number.isSafeInteger(plan.limit)&&Number.isSafeInteger(plan.effective)&&plan.effective>=budget&&plan.effective<=plan.limit)return plan.effective;
   return budget;
 }
 

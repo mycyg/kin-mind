@@ -188,3 +188,15 @@ test('confirmed owner force bypasses stale coordinator processing, fences late o
   await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=>assert.fail('the original ID can never be resubmitted'));
   assert.equal(f.router.currentTask().id,taskId);
 });
+
+test('quiet main assessment retains the actual manual profile and never classifies or notifies',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'}});
+  f.router.state.mode='manual';f.router.state.manualProfile={model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'};
+  let submitted=0;
+  const result=await f.router.dispatch({id:'assessment:one',text:'空闲时想想最近的心情，也可以什么都不做。',kind:'assessment'},async()=>{submitted++;return 'new-turn';});
+  assert.equal(result.route,'new-turn');assert.equal(submitted,1);
+  assert.equal(f.switches.length,0);assert.equal(f.classifications.length,0);
+  assert.equal(Object.keys(f.router.state.notices).length,0);assert.equal(f.router.tasks().length,0);
+  f.runtime.active=true;
+  assert.equal((await f.router.dispatch({id:'assessment:two',text:'下一次',kind:'assessment'},async()=>assert.fail('must yield'))).route,'deferred');
+});

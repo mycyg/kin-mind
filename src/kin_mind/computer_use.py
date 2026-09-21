@@ -911,72 +911,52 @@ def create_server(config):
 
     @server.tool()
     async def open_browser_page(url: str, ctx: Context) -> dict:
-        """Open one validated URL in a new controlled tab and return fresh AX/DOM text."""
+        """在受控新标签页中打开已核验 URL，返回当前 AX/DOM 文本。"""
         return await controller(ctx).open_browser_page(url)
 
     @server.tool()
     async def read_browser_page(tab_id: str, ctx: Context) -> dict:
-        """Read fresh AX/DOM text from a tab created by this exploration only."""
+        """读取本次探索创建的标签页的当前 AX/DOM 文本。"""
         return await controller(ctx).read_browser_page(tab_id)
 
     @server.tool()
     async def navigate_browser_page(tab_id: str, url: str, ctx: Context) -> dict:
-        """Navigate a controlled tab to a validated public or explicitly allowed URL."""
+        """把受控标签页导航到经过校验的公开或明确允许的 URL。"""
         return await controller(ctx).navigate_browser_page(tab_id, url)
 
     @server.tool()
     async def click_browser_element(tab_id: str, element_index: int, expected_text: str,
                                     effect: str, ctx: Context) -> dict:
-        """Review, revalidate and click one fresh AX element in a run-owned tab.
-
-        Copy ``expected_text`` exactly from the freshest AX line after its numeric
-        index; a shorter semantic label is intentionally rejected as stale or
-        ambiguous.
-        """
+        """复核并点击本次探索标签页中的当前 AX 元素。expected_text 原样复制最新 AX 行中数字编号后的完整文字，缩短文字会因目标陈旧或含糊而被拒绝。"""
         return await controller(ctx).click_browser_element(tab_id, element_index, expected_text, effect)
 
     @server.tool()
     async def type_browser_text(tab_id: str, element_index: int, expected_text: str,
                                 text: str, effect: str, ctx: Context) -> dict:
-        """Set bounded non-sensitive text when the host explicitly enabled text entry.
-
-        Copy ``expected_text`` exactly from the freshest AX line after its numeric
-        index; a shorter semantic label is intentionally rejected as stale or
-        ambiguous.
-        """
+        """宿主已允许文字输入时，填写非敏感文本。expected_text 原样复制最新 AX 行中数字编号后的完整文字，避免操作陈旧或含糊的目标。"""
         return await controller(ctx).type_browser_text(tab_id, element_index, expected_text, text, effect)
 
     @server.tool()
     async def close_browser_page(tab_id: str, ctx: Context) -> dict:
-        """Close a tab created by this exploration."""
+        """关闭本次探索创建的标签页。"""
         return await controller(ctx).close_browser_page(tab_id)
 
     @server.tool()
     async def observe_native_app(app_id: str, ctx: Context) -> dict:
-        """Read accessibility text from an exact host-allowlisted native app."""
+        """读取宿主明确允许的原生应用的辅助功能文本。"""
         return await controller(ctx).observe_native_app(app_id)
 
     @server.tool()
     async def click_native_element(app_id: str, element_index: int, expected_text: str,
                                    effect: str, ctx: Context) -> dict:
-        """Review, revalidate and click one fresh control in an allowlisted app.
-
-        Copy ``expected_text`` exactly from the freshest AX line after its numeric
-        index; a shorter semantic label is intentionally rejected as stale or
-        ambiguous.
-        """
+        """复核并点击已允许应用中的当前控件。expected_text 原样复制最新 AX 行中数字编号后的完整文字，避免操作陈旧或含糊的目标。"""
         return await controller(ctx).click_native_element(app_id, element_index, expected_text, effect)
 
     @server.tool()
     async def scroll_native_app(app_id: str, element_index: int, expected_text: str,
                                 effect: str, ctx: Context, direction: str = "down",
                                 pages: int = 1) -> dict:
-        """Scroll one allowlisted app view by one to three pages, then return fresh AX text.
-
-        Copy ``expected_text`` exactly from the freshest AX line after its numeric
-        index; a shorter semantic label is intentionally rejected as stale or
-        ambiguous.
-        """
+        """在已允许的应用视图中滚动一至三页，再返回当前 AX 文本。expected_text 原样复制最新 AX 行中数字编号后的完整文字。"""
         return await controller(ctx).scroll_native_app(
             app_id, element_index, expected_text, effect, direction, pages
         )

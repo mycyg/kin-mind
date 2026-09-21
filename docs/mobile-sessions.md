@@ -79,3 +79,12 @@ The router integration supplies a live non-secret model catalog and resolves a r
 Synthetic tests cover pressure calculation, compression before rotation, fifty prior compactions without automatic rotation, protected work, input races, candidate profile checks, stale sources, process leases, crash recovery and out-of-order compaction receipts. Python tests cover bounded checkpoints, pending journals, source deletion and maintenance-only appraisal commits. An isolated native probe should additionally verify create → inject → restart/resume → internal check → short user continuation, followed by ACP load → compact → restore → continuation.
 
 Keep private replay results, message bodies and native identifiers outside the public repository. A compatibility probe proves the tested path and version; it does not guarantee perfect conversational recall. Current-token measurements are distinct from cumulative usage, and a post-compaction input measurement may remain unknown until the next native turn. The system preserves uncertainty instead of treating a model's confidence as a successful operation or delivery receipt.
+
+
+## Quiet assessment in the current session
+
+With `main_session_review` enabled, action and emotion assessments enter the existing idle native session using its actual model, effort and Fast preference. The host uses the existing appraisal row, attempt, input queue and final-turn receipt. Owner input cancels the matching internal turn; cancellation keeps the appraisal pending and preserves unknown usage. No model switch or phone delivery is implied by assessment.
+
+The local minute timer only checks state. The session decides its next review and may recall, write a sourced personal reflection, plan an authorized activity or leave these fields empty. Exploration remains an independent executor; its final observations and open questions feed the same main-session appraisal. Persona defaults, inferred traits, public experiences and private reflections retain their different evidence classes.
+
+`native_window_context` replaces fixed per-injection and accumulated token quotas with actual native capacity, output/tool reserves, native compaction and explicit recall. Delivery identity, source revisions, epoch and accepted native receipts remain authoritative; removing a quota does not mark prepared context as read. Restoration expands to available native room and stays incomplete when required facts cannot fit.

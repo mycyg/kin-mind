@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import nullcontext, contextmanager
 from pathlib import Path
 
 from eventmem.core.db import Conflict, dumps
@@ -589,6 +589,8 @@ class Evaluation:
         """Inside the commit: a result that outlived its model lease stays on the row as a
         proposal with its receipt, and is never applied."""
         lease = self.lease
+        if self.row_lost:
+            raise Conflict("Appraisal attempt was superseded", kind="runtime", code="model-lease-lost", target=self.row_id)
         if lease is None or lease.lane == "foreground":
             return
         if lease.lost or not conn.execute("SELECT 1 FROM mind_model_leases WHERE id=?", (lease.id,)).fetchone():
@@ -602,7 +604,7 @@ def evaluation_slot(provider, engine, row_id, token):
 
     run_one closes this in a `finally`, so nothing is raised on the way out: a lease lost
     under the attempt is refused where its result would commit, by verify()."""
-    with slot(provider, "appraisal:" + row_id, late="flag") as lease:
+    with (nullcontext(None) if getattr(provider, "native_review", False) else slot(provider, "appraisal:" + row_id, late="flag")) as lease:
         guard = Evaluation(lease, engine, row_id, token)
         with engine.db.connect() as conn:
             active = enabled(conn)

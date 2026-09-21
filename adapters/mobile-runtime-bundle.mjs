@@ -13,7 +13,7 @@ export const MOBILE_RUNTIME_PROOF_SCHEMA='kin.mobile-runtime.proof/v1';
 export const MOBILE_RUNTIME_RECEIPT_SCHEMA='kin.mobile-runtime.compatibility/v1';
 export const MOBILE_RUNTIME_ACTIVATION_SCHEMA='kin.mobile-runtime.activation/v1';
 export const MOBILE_RUNTIME_CANDIDATE_KINDS=Object.freeze(['mobile-main-maintenance','isolated-exploration','isolated-creation']);
-export const REQUIRED_OWNED_ACP_MARKERS=Object.freeze(['// KIN_MODEL_ROUTING_V2','// KIN_MEMORY_COMPACTION_V1','// KIN_SESSION_CONTINUITY_V1']);
+export const REQUIRED_OWNED_ACP_MARKERS=Object.freeze(['// KIN_MODEL_ROUTING_V3','// KIN_MEMORY_COMPACTION_V1','// KIN_SESSION_CONTINUITY_V1']);
 const TRUSTED_PROOF_RUNNER=fileURLToPath(new URL('./mobile-runtime-proof-runner.mjs',import.meta.url));
 
 const sha256=value=>createHash('sha256').update(value).digest('hex');

@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
  scope TEXT NOT NULL,name TEXT NOT NULL,cursor INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,name));
 """
 
-DEFAULTS = {"records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
+DEFAULTS = {"native_window_context": False, "records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
             "sharing": False, "graph": False, "associations": False, "graph_recall": False,
             "event_lifecycle": False, "adaptive_recall": False, "auto_volumes": False,
@@ -237,7 +237,7 @@ class MemoryContinuity:
     def configure(self, values):
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
-        for key in ("records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
+        for key in ("native_window_context", "records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
                     "chunked_reply_review", "recall_purpose_policy",

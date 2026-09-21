@@ -182,11 +182,9 @@ class RecallRequest(RecallQuery):
     # memory-context). `history` keeps its status and expiry meaning only.
     recall_purpose: RecallPurpose = Field(
         default="experience_recall",
-        description="What the read is for. Omit it for the default: a server that predates "
-        "this field rejects it. experience_recall returns lived experience only. "
-        "self_knowledge_view also returns role configuration, its examples and self-claims, "
-        "each labelled with its class. audit returns everything, labelled. history only "
-        "lifts the status and expiry checks.",
+        description="本次读取的用途。省略时使用默认值；旧版服务器可能不接受此字段。"
+        "experience_recall 只返回真实经历；self_knowledge_view 还返回角色配置、合成示例与自我陈述，并逐项标明性质；"
+        "audit 返回带分类标记的全部资料。history 只放开状态与有效期检查。",
     )
 
 

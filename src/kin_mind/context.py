@@ -69,7 +69,7 @@ def _lane_from_purpose(purpose=None):
 
 class CompressedEntry(Model):
     item_ids: list[str] = Field(min_length=1, max_length=80)
-    summary: str = Field(min_length=1, max_length=16000)
+    summary: str = Field(min_length=1)
 
 
 class Compression(Model):
@@ -174,9 +174,9 @@ class Contexts:
                 return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None):
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None):
         """A cache entry covers exact input revisions and query purpose, not DB age."""
-        if not 0 <= budget <= 32000:
+        if not isinstance(budget, int) or budget < 0:
             raise ValueError("Invalid context budget")
         if not 1 <= work_seconds <= 600:
             raise ValueError("Invalid compression work deadline")
@@ -221,8 +221,20 @@ class Contexts:
                     for paragraph in paragraphs:
                         size = tokens(paragraph)
                         if size > 12000:
-                            unprocessed.append(item["id"])
-                            continue
+                            # Split by Unicode characters, then measure actual tokens. No
+                            # paragraph is discarded merely because it is one long field.
+                            if part:
+                                parts.append("".join(part)); part, cost = [], 0
+                            while tokens(paragraph) > 12000:
+                                low, high = 1, len(paragraph)
+                                while low < high:
+                                    mid = (low + high + 1) // 2
+                                    if tokens(paragraph[:mid]) <= 12000:
+                                        low = mid
+                                    else:
+                                        high = mid - 1
+                                parts.append(paragraph[:low]); paragraph = paragraph[low:]
+                            size = tokens(paragraph)
                         if part and cost + size > 12000:
                             parts.append("\n".join(part)); part, cost = [], 0
                         part.append(paragraph); cost += size
@@ -243,7 +255,7 @@ class Contexts:
                 def compress(payload):
                     nonlocal model_requests
                     ids = {item["id"] for item in payload["items"]}
-                    payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "Every input must be represented in a summary. Merge related or duplicate material while retaining each input ID; this evidence review cannot finish with omitted inputs."} if require_all else {})}
+                    payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "每项输入都必须有摘要覆盖。合并相关或重复内容时保留各项编号；本轮证据评估不能遗漏输入。"} if require_all else {})}
                     part_key = digest(["compression-part", self.mind.scope.key(), PROMPT_VERSION, getattr(provider,"model",None), payload])
                     with self.engine.db.connect() as connection:
                         cached = None if strict else connection.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (part_key,self.mind.scope.key())).fetchone()
@@ -272,6 +284,8 @@ class Contexts:
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
                             with self.engine.db.connect(write=True) as connection:
                                 connection.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (part_key,self.mind.scope.key(),dumps({"value":value.model_dump(),"receipt":receipt}),self.mind.clock()))
+                            if on_progress is not None:
+                                on_progress(part_key)
                             return value, receipt
                         repair_receipts.append(receipt)
                         # Reuse only the structured proposal, never reasoning.
@@ -282,7 +296,9 @@ class Contexts:
                             "overlapping_ids": sorted(covered & omitted_ids)}}
                     raise RuntimeError("deepseek-compression-invalid-coverage")
                 provenance_cost = sum(tokens(dumps({"id": i["id"], "revision": i.get("revision"), "basis": i.get("basis", "inferred"), **i.get("facts", {})})) for i in items) + 20
-                summary_budget = max(32, budget - provenance_cost)
+                summary_budget = budget - provenance_cost
+                if summary_budget < 32:
+                    raise RuntimeError("deepseek-compression-provenance-budget")
                 selected_batches = batches if require_all else batches[:3]
                 for batch in selected_batches:
                     value, receipt = compress({"query": query, "budget_tokens": max(32, summary_budget // max(1, len(selected_batches))), "items": batch})
@@ -561,7 +577,7 @@ class Contexts:
         content = [{**i, "facts": {}} for i in items]
         provider = provider or self._provider()
         provider.background = True
-        result = self.pack(content, "Summarize source text only; current delivery/status/identity metadata is added separately by the host. Reusable overview: one entry per input item, do not merge different items. Aim for 80 tokens per summary. Retain chronology, conditions, negation, outcomes and what was already shared.", 1200, provider=provider, policy=policy)
+        result = self.pack(content, "只概括来源正文，当前投递、状态与身份信息由宿主另行添加。每项输入分别生成可复用的精简摘要，不归并不同项；保留时序、条件、否定、结果和已经分享的内容。", 1200, provider=provider, policy=policy)
         if result["state"] == "compressed":
             original = {i["id"]: i for i in items}
             with self.engine.db.connect(write=True) as conn:
@@ -727,8 +743,10 @@ class Contexts:
             allow_model = False
         if purpose not in BUDGETS or not 0 <= int(cursor):
             raise ValueError("Unknown context purpose")
-        budget = BUDGETS[purpose] if budget is None else budget
         settings = self.memory.settings()
+        native_window = settings["native_window_context"]
+        automatic_budget = budget is None and native_window
+        budget = BUDGETS[purpose] if budget is None else budget
         if settings["event_lifecycle"] and purpose in {"chat", "work", "read"} and access_origin == "user_query":
             from .lifecycle import foreground_lease
             foreground_lease(self.engine, self.mind.scope.key(), "read:" + session)
@@ -745,7 +763,7 @@ class Contexts:
         window = self.window(session) if session else {"used": 0, "epoch": "", "seen": {}, "receipts": {}}
         if event_id and self._receipt_current(window["receipts"].get(event_id), policy):
             return window["receipts"][event_id]
-        if session and not explicit:
+        if session and not explicit and not native_window:
             if window["used"] == 0 and purpose == "chat":
                 budget = BUDGETS["startup"]
             budget = min(budget, max(0, 12000 - window["used"]))
@@ -757,6 +775,7 @@ class Contexts:
             items.append({"id": "current-intent", "revision": digest(selected_intent), "text": dumps(selected_intent), "basis": "inferred"})
         view = self.mind.read(query=query)
         dynamic = {"dimensions": {k: round(v["value"]) for k, v in view["dimensions"].items() if not v.get("needs_review")},
+                   "understanding": (view.get("appraisal_summary") or {}).get("understanding"),
                    "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:3]],
                    "concerns": [{k: c.get(k) for k in ("id", "content", "status", "basis")} for c in view.get("selected_concerns", [])[:3]]}
         affect_item = {"id": "affect", "revision": digest(dynamic), "text": dumps(dynamic), "basis": "inferred"}
@@ -831,6 +850,12 @@ class Contexts:
         if not 0 <= host_overhead <= 500:
             raise ValueError("Invalid host envelope allowance")
         overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n") + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected, recall_info)
+        if automatic_budget:
+            # Relevance and paging select material; token accounting is not a lifetime
+            # allowance. The native session owns pressure and compaction.
+            needed = tokens("\n".join(self._line(item) for item in selected)) + overhead
+            available = (runtime or {}).get("contextAvailableTokens")
+            budget = min(needed, max(0, available)) if isinstance(available, int) else needed
         remaining = 150 - (time.monotonic() - started)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider,
                            allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining), policy=policy)
@@ -880,7 +905,7 @@ class Contexts:
                 if prepared["state"] != "incomplete":
                     packed["tokens"] = prepared["tokens"]
             packed.update(session_used=window["used"], window_epoch=window["epoch"],
-                          compact_requested=False, delivery_state="prepared", automatic_background_exhausted=window["used"] >= 12000)
+                          compact_requested=False, delivery_state="prepared", automatic_background_exhausted=not native_window and window["used"] >= 12000)
             return packed
         if session and not explicit:
             with self.engine.db.connect(write=True) as conn:
@@ -891,13 +916,13 @@ class Contexts:
                 # A replaced receipt gives its budget back before the new one takes its own:
                 # one event was injected once, however many times its content was invalidated.
                 refund = (stored or {}).get("tokens", 0)
-                if current["epoch"] != window["epoch"] or current["used"] - refund + packed["tokens"] > 12000:
+                if current["epoch"] != window["epoch"] or (not native_window and current["used"] - refund + packed["tokens"] > 12000):
                     raise Conflict("Context window changed; rebuild before injection")
                 current["used"] += packed["tokens"] - refund
                 for i in selected:
                     if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]:
                         current["seen"][i["id"]] = i["revision"]
-                packed.update(session_used=current["used"], compact_requested=current["used"] >= 10000 and not native_pressure_managed, window_epoch=current["epoch"], automatic_background_exhausted=current["used"] >= 12000)
+                packed.update(session_used=current["used"], compact_requested=current["used"] >= 10000 and not native_pressure_managed, window_epoch=current["epoch"], automatic_background_exhausted=not native_window and current["used"] >= 12000)
                 if event_id:
                     current["receipts"][event_id] = packed
                 self._save_window(conn, session, current)
@@ -956,7 +981,7 @@ class Contexts:
         return {"state": "applied", "epoch": epoch}
 
     def injection_ack(self, session, epoch, id, tokens):
-        if not isinstance(tokens, int) or not 0 <= tokens <= 8000:
+        if not isinstance(tokens, int) or tokens < 0 or (not self.memory.settings()["native_window_context"] and tokens > 8000):
             raise ValueError("Invalid recovery token receipt")
         with self.engine.db.connect(write=True) as conn:
             window = self.window(session, conn)
@@ -964,7 +989,7 @@ class Contexts:
                 raise Conflict("Recovery belongs to a different native window")
             if id in window["receipts"]:
                 return window["receipts"][id]
-            if window["used"] + tokens > 12000:
+            if not self.memory.settings(conn)["native_window_context"] and window["used"] + tokens > 12000:
                 raise Conflict("Recovery exceeds the automatic background budget")
             window["used"] += tokens
             receipt = {"state": "recorded", "id": id, "tokens": tokens, "epoch": epoch}

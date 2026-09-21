@@ -8,7 +8,7 @@ from eventmem.core.models import Model
 
 class RecallNeed(Model):
     query: str = Field(min_length=1, max_length=4000)
-    reason: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(min_length=1)
     mode: Literal["light", "deep"] = "deep"
     identifiers: list[str] = Field(default_factory=list, max_length=8)
 
@@ -16,10 +16,10 @@ class RecallNeed(Model):
 class PlanStep(Model):
     id: str = Field(min_length=1, max_length=100)
     actor: Literal["explore", "create", "contact", "owner"]
-    goal: str = Field(min_length=1, max_length=3000)
-    completion: str = Field(min_length=1, max_length=1600)
+    goal: str = Field(min_length=1)
+    completion: str = Field(min_length=1)
     depends_on: list[str] = Field(default_factory=list, max_length=24)
-    preconditions: list[str] = Field(default_factory=list, max_length=12)
+    preconditions: list[str] = Field(default_factory=list)
     not_before: str | None = None
     not_after: str | None = None
     owner_request_id: str | None = None
@@ -31,12 +31,12 @@ class PlanChange(Model):
     id: str | None = None
     key: str | None = Field(default=None, max_length=160)
     expected_revision: int | None = Field(default=None, ge=1)
-    goal: str | None = Field(default=None, min_length=1, max_length=3000)
-    motivation: str | None = Field(default=None, min_length=1, max_length=1600)
-    reason: str = Field(min_length=1, max_length=1600)
+    goal: str | None = Field(default=None, min_length=1)
+    motivation: str | None = Field(default=None, min_length=1)
+    reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1, max_length=24)
     next_review_at: str | None = None
-    steps: list[PlanStep] | None = Field(default=None, max_length=32)
+    steps: list[PlanStep] | None = Field(default=None)
     desire_id: str | None = None
 
     @model_validator(mode="after")
@@ -67,7 +67,7 @@ class ActionDecision(Model):
     step_id: str = Field(min_length=1, max_length=100)
     expected_revision: int = Field(ge=1)
     action: Literal["execute", "wait", "abandon", "owner_accepted", "owner_completed", "owner_declined"]
-    reason: str = Field(min_length=1, max_length=1600)
+    reason: str = Field(min_length=1)
     strength: StrictInt | None = Field(default=None, ge=0, le=100)
     evidence_ids: list[str] = Field(min_length=1, max_length=24)
     next_review_at: str | None = None
@@ -80,13 +80,13 @@ class ProcedureCandidate(Model):
     key: str = Field(min_length=1, max_length=160)
     id: str | None = None
     expected_revision: int | None = Field(default=None, ge=1)
-    title: str = Field(min_length=1, max_length=300)
-    applicable_when: str = Field(min_length=1, max_length=2000)
-    steps: list[str] = Field(min_length=1, max_length=24)
+    title: str = Field(min_length=1)
+    applicable_when: str = Field(min_length=1)
+    steps: list[str] = Field(min_length=1)
     tools: list[str] = Field(default_factory=list, max_length=24)
     environment: dict[str, str] = Field(default_factory=dict, max_length=24)
-    success_criteria: str = Field(min_length=1, max_length=2000)
+    success_criteria: str = Field(min_length=1)
     counterexamples: list[str] = Field(default_factory=list, max_length=16)
     evidence_ids: list[str] = Field(min_length=1, max_length=24)
     result_ids: list[str] = Field(min_length=1, max_length=16)
-    reason: str = Field(min_length=1, max_length=1600)
+    reason: str = Field(min_length=1)

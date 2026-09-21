@@ -251,7 +251,7 @@ export class MobileRouter {
     let task=this.currentTask();
     if(!task) {
       const id='work-'+digest(input.id).slice(0,24);
-      task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text.slice(0,1200),tools:{},deliveries:{},createdAt:this.now()};
+      task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive','assessment'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text,tools:{},deliveries:{},createdAt:this.now()};
       this.state.tasks[id]=task;
     }
     if(!task.inputIds.includes(input.id)) {task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
@@ -275,7 +275,7 @@ export class MobileRouter {
       const intents=this.classifyIntents&&owner;
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
-      if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
+      if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
       let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null,profile=null,force=false;
       // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
       const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
@@ -291,7 +291,8 @@ export class MobileRouter {
       // intents on it is classified like any other, with the attachment metadata in view.
       } else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
         decision='work';reason='work-input';
-      } else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
+      } else if(input.kind==='assessment') {decision='chat';reason='silent-main-assessment';}
+      else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
       else {
         // An interrupted reply with nothing unknown about it rides on this call. With none,
         // the classifier is asked exactly what it was always asked.
@@ -319,7 +320,7 @@ export class MobileRouter {
       if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
       if(semanticFailure) {
         const current=this.currentTask();
-        this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text.slice(0,4000),
+        this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
           attachments:intents?attachmentMetadata(input.attachments):[],occurredAt:input.occurredAt??null,receivedAt:input.receivedAt??null,
           conversationId:this.state.conversationId??null,generation:this.state.generation??null,
           taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])),
@@ -392,7 +393,7 @@ export class MobileRouter {
     return {decision,reason,task};
   }
   rememberOwner(input) {
-    this.state.recent.push({role:'user',text:input.text.slice(0,4000),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
+    this.state.recent.push({role:'user',text:input.text,at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
     this.state.recent=this.state.recent.slice(-16);
   }
   dispatch(input,submit) {
@@ -415,7 +416,7 @@ export class MobileRouter {
         if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         const runtime=await this.reconcileTransition(await this.inspect());
-        if(input.kind==='proactive'&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
+        if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
         if(record.route==='control') {
           const request=await this.acceptControl(record,runtime);
           const applied=request?await this.applyModeRequest(request,runtime):{runtime};
@@ -423,7 +424,8 @@ export class MobileRouter {
           this.save('control-accepted',{id:input.id,command:record.command});return{route:'host-control',model:(applied.runtime??runtime).model,state:request?.state};
         }
         if(record.route==='maintenance'&&this.busy(runtime))return null;
-        let targetProfile=record.route==='maintenance'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+        let targetProfile=record.route==='maintenance'||input.kind==='assessment'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+        if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {route:'deferred',reason:'native-profile-unconfirmed'};
         if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
         if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
         targetProfile=await this.resolvedProfile(targetProfile);

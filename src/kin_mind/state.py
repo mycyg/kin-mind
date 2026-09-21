@@ -70,7 +70,7 @@ class Motivation(Model):
     # A short-term drive, in minutes: ten for a passing impulse, twelve hours for a slow one.
     # Anything outside the range is refused by the schema, like every other bound here.
     half_life_minutes: StrictInt = Field(ge=10, le=720)
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
 
 
 class AffectiveEvent(Model):
@@ -80,7 +80,7 @@ class AffectiveEvent(Model):
     evidence_ids: list[str] = Field(min_length=1, max_length=50)
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     origin: Literal["interaction", "exploration", "reflection"] = "interaction"
     evolution: Evolution | None = None
     understanding: Understanding | None = None
@@ -111,16 +111,16 @@ class DesireChange(Model):
     ]
     desire_id: str | None = None
     evidence_ids: list[str] = Field(min_length=1, max_length=50)
-    content: str | None = Field(default=None, min_length=1, max_length=2000)
-    topic: str | None = Field(default=None, max_length=500)
+    content: str | None = Field(default=None, min_length=1)
+    topic: str | None = Field(default=None)
     kind: Literal["contact", "explore", "create"] | None = None
     strength: StrictInt | None = Field(default=None, ge=0, le=100)
     expires_at: str | None = None
-    completion: str | None = Field(default=None, min_length=1, max_length=1000)
+    completion: str | None = Field(default=None, min_length=1)
     concern_ids: list[str] | None = Field(default=None, max_length=10)
     exploration_target: Literal["knowledge", "computer"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
 
@@ -156,7 +156,7 @@ class DesireChange(Model):
 
 class ContactDecision(Model):
     action: Literal["wait", "abandon"]
-    reason: str = Field(min_length=1, max_length=1200)
+    reason: str = Field(min_length=1)
     condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
     retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
 
