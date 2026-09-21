@@ -200,3 +200,35 @@ test('quiet main assessment retains the actual manual profile and never classifi
   f.runtime.active=true;
   assert.equal((await f.router.dispatch({id:'assessment:two',text:'下一次',kind:'assessment'},async()=>assert.fail('must yield'))).route,'deferred');
 });
+
+test('a mixed work and explicit model request switches first and submits the work exactly once',async t=>{
+ const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'owner selected model and commissioned a document'})});
+ f.router.state.mode='manual';f.router.state.manualProfile={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'};
+ let submissions=0;
+ const input={id:'mixed-work',kind:'owner',text:'Switch to ASTRA medium and finish the document'};
+ const result=await f.router.dispatch(input,async decision=>{submissions++;assert.equal(f.runtime.model,'gpt-6-astra');assert.equal(decision.profile.reasoningEffort,'medium');assert.ok(decision.taskId);return 'new-turn';});
+ assert.equal(result.route,'new-turn');assert.equal(f.router.state.requests['owner-mode:mixed-work'].state,'applied');
+ assert.equal(f.router.currentTask().inputVersion,1);assert.equal(f.router.state.mode,'manual');
+ const again=await f.router.dispatch(input,()=>assert.fail('duplicate work'));assert.equal(again.route,'deduplicated');assert.equal(submissions,1);
+});
+
+test('mixed owner control interrupts active work but preserves task identity and old side effects',async t=>{
+ let f,forces=0;
+ f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit owner choice'}),forceSwitch:async()=>{forces++;Object.assign(f.runtime,{active:false,nativeStatus:'idle',backgroundTasks:0});return {state:'interrupted'};}});
+ const task=f.router.addTask({id:'old',text:'previous work'});task.deliveries.old={state:'accepted',messageId:'already-delivered'};
+ Object.assign(f.runtime,{active:true,nativeStatus:'active',backgroundTasks:1,pendingDeliveries:1});
+ await f.router.dispatch({id:'mixed-force',kind:'owner',text:'Switch and add figures'},async()=>{assert.equal(f.runtime.model,'gpt-6-astra');return 'new-turn';});
+ assert.equal(forces,1);assert.equal(f.router.currentTask().id,task.id);assert.equal(task.deliveries.old.messageId,'already-delivered');assert.equal(task.inputVersion,2);
+});
+
+test('failed mixed control never runs work under the previous model',async t=>{
+ const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'__unsupported__',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'unsupported exact choice'})});
+ const result=await f.router.dispatch({id:'unsupported-work',kind:'owner',text:'Use unavailable model to work'},()=>assert.fail('must not submit on old model'));
+ assert.equal(result.route,'control-failed');assert.equal(f.runtime.model,'deepseek-flash');assert.equal(f.router.state.inputs['unsupported-work'].failureStage,'model-control');
+});
+
+test('explicit deferred mixed control without prior work does not wait on its own new task',async t=>{
+ const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:false,reason:'switch at idle then work'})});
+ await f.router.dispatch({id:'deferred-new-work',kind:'owner',text:'After old work ends, switch and start the next document'},async()=> 'new-turn');
+ assert.equal(f.router.state.requests['owner-mode:deferred-new-work'].state,'applied');assert.equal(f.router.tasks().length,1);
+});

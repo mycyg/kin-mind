@@ -279,3 +279,9 @@ Verify an active turn and a background terminal both reject provider changes.
 Preserve the existing work provider if native continuation or tool compatibility
 cannot be established. Host rollout must wait for active user work and delivery
 to settle before replacing the process.
+
+### Owner controls and message bursts
+
+The owner's explicit model, effort or tier selection is independent of the content route. A mixed request retains `route=work` and its `control=manual` profile together. The router verifies the selected profile before submitting that work; failure does not run it under the old profile. A confirmed interruption preserves the original task and delivery receipts. A control-only switch resumes interrupted work through the existing handoff, unless cancellation was requested.
+
+The private mobile host groups consecutive messages from the same bound owner and channel when their reception gap is less than twenty seconds. It waits twenty seconds after the last message, then routes the combined text and attachments once. Each original input and platform receipt stays identifiable. Frozen batch membership is stored on the first existing inbox job so restart or late arrivals cannot change a submitted request. An explicit stop bypasses the wait. A waiting dispatch does not prevent later model controls from reaching the router; the existing coordinator still serializes native execution.
