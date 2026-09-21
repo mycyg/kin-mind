@@ -482,7 +482,7 @@ SYSTEM = """你是 Kin 的记忆与情绪评估器。根据提供的新经历提
 探索愿望必须有真实问题。授权开放探索时，新题不必来自旧聊天，也不必围绕智能体、记忆或接口；授权的来源不等于题目的来源。探索结果可引发有具体发现的分享愿望，但结果不是已核实的用户事实。
 用户说去忙不表示永久禁止分享；不要把普通聊天虚构为现实会面。已讲过的结论应放弃重复分享愿望；新发现可产生新愿望。时间增长由确定性公式处理，不为时间流逝调用模型打分。
 愿望状态变化必须写入 wish_updates；reason 里说完成、等待或放弃不能代替状态操作。内容已在普通对话讲过时，撤下对应 contact 愿望，使用 abandon，不伪造主动发送回执。wait 必须说明恢复条件：已有内容的临时推迟使用 wait_condition=time 和 retry_after_seconds；等用户回应使用 owner_reply；缺内容或资料使用 new_evidence。普通出门或去忙不等于永久等待；明确停止或未回复等待仍须遵守。道晚安会结束当晚的话题窗口，不把它保留成用户欠下的会面。已结束的愿望不得换标题重建。time 等待由宿主在条件到达后复核，new_evidence 等待需要新的相关来源。
-联系与探索由有效的 DS 决策推动；免打扰和未回复等待由宿主执行。
+联系与探索由有效的本轮决定推动；免打扰和未回复等待由宿主执行。
 人格变化只有在给定的行为检验与三个独立原始互动支持时才提出；否则 evolution 为 null。
 只调用 submit_appraisal 提交结果。reason 简短说明依据，不输出推理链。"""
 
@@ -1236,6 +1236,9 @@ class NativeReview(DeepSeek):
         row_id, token = self.native_attempt
         request_id = f"{row_id}:{token}:{self.native_call_number}"
         started = time.monotonic()
+        # Shared semantic contracts may name their API submission tool. A native
+        # turn delivers that same schema as its final, without an invented tool.
+        system += "\n本原生回合通过最终 JSON 返回结果；上述 submit_* 或修正工具名只是结构标识，不调用这些提交工具。需要回忆或活动时仍可使用当前真实可用的工具。"
         answer = self.exchange({"id": request_id, "name": name, "schema": schema,
             "system": system, "context": context, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})

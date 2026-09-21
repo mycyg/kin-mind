@@ -32,6 +32,8 @@ def test_main_session_appraisal_commits_once_without_contact_or_diary(setup):
     assert mind.read()['desires']==[]
     assert len(calls)==1 and calls[0]['profile']==p.profile
     assert '不重复增加成长依据' in calls[0]['system']
+    assert '不调用这些提交工具' in calls[0]['system']
+    assert '有效的 DS 决策' not in calls[0]['system']
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE mind_appraisals SET state='running',lease=0 WHERE id=?",(job['id'],))
     assert jobs.run_one(p)['state']=='complete'
