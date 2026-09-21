@@ -13,6 +13,11 @@ const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 const SAFE_PROVIDER=/^[A-Za-z0-9_-]{1,120}$/;
 
+export function ownerSessionWork(session,tasks,assessmentToken) {
+  const ownAssessment=assessmentToken&&session?.activeMessage?.contextToken===assessmentToken;
+  return Boolean((session?.processing&&!ownAssessment)||session?.queue?.length||tasks.length);
+}
+
 /** The maintenance process receives the exact non-secret profile already
  * verified by the router. A missing provider or preference is a reason to wait,
  * never a cue to infer an OpenAI/native default from the model name. */
@@ -113,7 +118,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
     const state=router.snapshot(),inputs=Object.values(state.inputs),tasks=router.tasks();
     const session=bridge.sessionManager.getSession(bridge.ownerId);
-    const foreground=Boolean(session?.processing||session?.queue?.length||tasks.length);
+    const foreground=ownerSessionWork(session,tasks,bridge.mainAssessment?.token);
     const snapshot=await mindCall('session-snapshot',{pending,tasks,foreground});
     const outstanding=inputs.filter(i=>['selected','submitting','unconfirmed'].includes(i.state));
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));

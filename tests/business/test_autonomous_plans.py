@@ -267,3 +267,20 @@ def test_disabling_plans_revokes_linked_contact_without_losing_history(env):
         desire=next(d for d in mind._load(conn)['desires'].values() if d.get('plan_id')==p['id'])
         assert not plans.linked_ready(conn,desire)
     assert plans.read(identifier=p['id'],history=True)['plans'][0]['history']
+
+@pytest.mark.parametrize('model,reasoning', [('gpt-6-astra','medium'),('deepseek-flash','high')])
+def test_native_main_profile_authorizes_plan_and_contact_without_ds_label(env,model,reasoning):
+    mind,plans,source,clock,initial=env
+    plan=create(env,actor='contact')
+    native={'model':model,'provider':'custom-gateway','reasoning':reasoning,
+            'native_turn_id':'original-turn','native_session_id':'same-main','verified_at':mind.clock()}
+    receipt={**native,'native_receipt':native,'agent_version':'planning-v1'}
+    proposal={'plan_id':plan['id'],'step_id':'make','expected_revision':plan['revision'],'action':'execute',
+              'reason':'当前主会话决定联系','evidence_ids':[initial]}
+    with mind.engine.db.connect(write=True) as conn:
+        bad={**receipt,'model':'different-model'}
+        with pytest.raises(Conflict,match='verified assessment'):
+            plans.decide(conn,proposal,'invalid',bad,mind._evidence(conn,[initial]))
+        plans.decide(conn,proposal,'native',receipt,mind._evidence(conn,[initial]))
+    plans.sync_wishes()
+    assert mind.contact_candidate()['eligible'] is True

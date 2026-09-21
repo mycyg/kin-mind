@@ -38,7 +38,10 @@ export function nativeInstructionRequestIdentity(headers,body) {
 export function developerInstructionEvidence(body) {
   return (Array.isArray(body?.input)?body.input:[]).filter(item=>item?.role==='developer')
     .flatMap(item=>Array.isArray(item.content)?item.content:[]).filter(c=>typeof c?.text==='string')
-    .map(c=>instructionTextEvidence(c.text));
+    // Native collaboration mode wraps developer instructions without changing
+    // their body. Recognize that exact envelope, not arbitrary substrings.
+    .map(c=>instructionTextEvidence(c.text.startsWith('<collaboration_mode>')&&c.text.endsWith('</collaboration_mode>')
+      ?c.text.slice('<collaboration_mode>'.length,-'</collaboration_mode>'.length):c.text));
 }
 
 /** Callback failures are observational failures. They cannot change provider
