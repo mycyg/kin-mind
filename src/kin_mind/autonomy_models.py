@@ -71,7 +71,7 @@ class ActionDecision(Model):
     strength: StrictInt | None = Field(default=None, ge=0, le=100)
     evidence_ids: list[str] = Field(min_length=1, max_length=24)
     next_review_at: str | None = None
-    conditions_met: list[str] = Field(default_factory=list, max_length=12)
+    conditions_met: list[str] = Field(default_factory=list)
     procedure_ids: list[str] = Field(default_factory=list, max_length=8)
     artifact_hashes: list[str] = Field(default_factory=list, max_length=24)
 
