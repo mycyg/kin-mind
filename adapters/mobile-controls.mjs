@@ -6,7 +6,7 @@ export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
   const actual={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,fastMode:runtime.fastMode,
     serviceTier:profile.serviceTier,serviceTierVerified:profile.serviceTierVerified,serviceTierPreference:profile.serviceTierPreference,
     verified:Boolean(runtime.known&&runtime.profileReady!==false&&canonical),loaded,canonicalMatch:canonical,
-    checkedAt:runtime.checkedAt,active:runtime.active,backgroundTasks:runtime.backgroundTasks,handoffTasks:runtime.handoffTasks};
+    checkedAt:runtime.checkedAt,nativeStatus:runtime.nativeStatus,active:runtime.active,backgroundTasks:runtime.backgroundTasks,handoffTasks:runtime.handoffTasks};
   const lastTransition=state.transition?{...state.transition,recordKind:'historical-transition',
     matchesCurrentModel:Boolean(actual.verified&&state.transition.to===actual.model),runtimeCheckedAt:actual.checkedAt}:null;
   return {mode:state.mode,requestedMode:state.requestedMode??null,exitRequested:state.exitRequested,actual,sessionId,conversationId:state.conversationId,generation:state.generation,executionEpoch:state.executionEpoch??0,nativeSessionId:state.nativeSessionId??sessionId,lastTransition,

@@ -1246,7 +1246,7 @@ class NativeReview(DeepSeek):
             if answer.get("model_invoked"):
                 attempts.record_call(self, name, outcome="owner-preempted", model=None, usage=None,
                                      elapsed_ms=round((time.monotonic()-started)*1000))
-            raise ModelAdmissionWait("foreground-active")
+            raise ModelAdmissionWait(answer.get("reason") or "foreground-active")
         receipt = answer.get("receipt") or {}
         if answer.get("state") != "complete" or not receipt.get("native_turn_id") or receipt.get("model") != self.model:
             self.failure_receipt = {**receipt, **attempts.usage_entry(receipt.get("usage")), "outcome": "native-review-unconfirmed"}

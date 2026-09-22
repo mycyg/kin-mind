@@ -342,3 +342,18 @@ test('profile resolution failure settles the input before any native submission'
   assert.equal(input.reason,'Canonical model provider unavailable');assert.equal(f.router.inflight.size,0);
   assert.equal(new MobileRouter(f.args).state.inputs['profile-failed'].state,'failed-before-submit');
 });
+
+test('a terminal native error allows a fresh same-profile assessment, preserving all execution locks',async t=>{
+  const f=fixture(t);f.runtime.nativeStatus='systemError';
+  assert.equal(f.router.busy(f.runtime),true,'general work/switch boundary is unchanged');
+  let submissions=0;
+  const result=await f.router.dispatch({id:'assessment:recovery',kind:'assessment',text:'internal review'},async detail=>{submissions++;assert.equal(detail.model,f.runtime.model);return 'new-turn';});
+  assert.equal(result.route,'new-turn');assert.equal(submissions,1);assert.equal(f.switched.length,0);
+  for(const key of ['active','backgroundTasks','queued','pendingDeliveries']) {
+    f.runtime[key]=1;
+    assert.equal((await f.router.dispatch({id:'assessment:'+key,kind:'assessment',text:'wait'},()=>assert.fail('held'))).route,'deferred');
+    f.runtime[key]=0;
+  }
+  f.runtime.nativeStatus='unknown';
+  assert.equal((await f.router.dispatch({id:'assessment:unknown',kind:'assessment',text:'wait'},()=>assert.fail('unknown'))).route,'deferred');
+});
