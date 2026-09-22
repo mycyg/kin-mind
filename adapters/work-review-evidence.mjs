@@ -50,14 +50,18 @@ export function workEvidence({sessionId,inputDirectory,outboxDirectory,deferredD
       .map(d=>messageById(d.messageId)).filter(r=>r?.artifact);
     const inputs=ids.map(id=>{
       if(!/^[\w:-]+$/.test(id))throw Error('Invalid host input id');
-      let source=read(path.join(inputDirectory,id+'.json'));
       const route=snapshot.inputs.find(x=>x.id===id);
+      const context={id,classification:route?.reason,kind:route?.kind,workRequirement:route?.state==='accepted'&&route?.kind!=='handoff'&&snapshot.task.inputIds.includes(id),submissionState:route?.state};
+      // Internal continuations are already part of the task. Unsubmitted chat
+      // is not a new work requirement and has no accepted handset source.
+      if(route?.kind==='handoff'||!snapshot.task.inputIds.includes(id)&&route?.state!=='accepted')return {...context,workRequirement:false};
+      let source=read(path.join(inputDirectory,id+'.json'));
       if(!source&&failedInputDirectory&&route?.state==='failed-before-submit') {
         const failed=read(path.join(failedInputDirectory,id+'.json'));
         try{source=typeof failed?.raw==='string'?JSON.parse(failed.raw):failed?.raw;}catch{}
       }
-      if(!source||source.id!==id||source.canonicalSessionId!==sessionId||!source.senderId||typeof source.text!=='string')throw Error('Authenticated input missing');
-      return{id,text:source.text,createdAt:source.createdAt,sourceHash:digest(source),classification:route?.reason,kind:route?.kind,workRequirement:snapshot.task.inputIds.includes(id),submissionState:route?.state};
+      if(!source||source.id!==id||source.canonicalSessionId!==sessionId||!(source.senderId||source.wechatMessage?.from_user_id)||typeof source.text!=='string')throw Error('Authenticated input missing');
+      return{...context,text:source.text,createdAt:source.createdAt,sourceHash:digest(source)};
     });
     const receipts={},outputs=[],cancellableDeferred=[],deferredProofs={},deferredGroups={};
     for(const [id,delivery] of Object.entries(snapshot.task.deliveries??{})) {

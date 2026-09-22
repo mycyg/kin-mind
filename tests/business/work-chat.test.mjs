@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {MobileRouter} from '../../adapters/mobile-router.mjs';
+import {workEvidence} from '../../adapters/work-review-evidence.mjs';
 import {WorkLockReview,mergeDecisions} from '../../adapters/work-lock-review.mjs';
 
 async function fixture(t,{disposition='resume',waiting=false}={}) {
@@ -95,4 +96,56 @@ test('a changed delivery receipt prevents resuming on a stale work review',async
   const result=await f.review.tick();
   assert.equal(result.state,'superseded');assert.equal(result.reason,'evidence-changed-during-review');
   assert.equal(f.task.handoff,undefined);
+});
+
+
+test('collector separates host continuation and unsent chat from accepted owner requirements',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-evidence-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  for(const source of [{id:'owner',senderId:'bound-owner'},{id:'wechat',wechatMessage:{from_user_id:'bound-owner'}}])
+    fs.writeFileSync(path.join(root,source.id+'.json'),JSON.stringify({...source,canonicalSessionId:'synthetic',text:'deliver work'}));
+  const inputs=[{id:'owner',kind:'owner',state:'accepted'},{id:'wechat',kind:'owner',state:'accepted'},
+    {id:'handoff:resume',kind:'handoff',state:'accepted'},{id:'chat',kind:'owner',intent:'chat',state:'failed-before-submit'}];
+  const evidence=workEvidence({sessionId:'synthetic',inputDirectory:root,outboxDirectory:path.join(root,'outbox'),deferredDirectory:root,lastReply:async()=>null});
+  const snapshot={task:{inputIds:['owner','wechat','handoff:resume'],contextInputIds:['chat'],deliveries:{},tools:{}},inputs};
+  const result=await evidence.collect(snapshot);
+  assert.deepEqual(result.input.inputs.filter(i=>i.workRequirement).map(i=>i.id),['owner','wechat']);
+  assert.equal(result.input.inputs.find(i=>i.id==='handoff:resume').text,undefined);
+  assert.equal(result.input.inputs.find(i=>i.id==='chat').text,undefined);
+  fs.rmSync(path.join(root,'owner.json'));
+  await assert.rejects(evidence.collect(snapshot),/Authenticated input missing/);
+});
+
+test('collection failure persists its real cause and waits for the existing retry time',async t=>{
+  const f=await fixture(t);let reads=0;
+  f.runtime.active=true;await f.review.tick();f.runtime.active=false;
+  f.review.collect=async()=>{reads++;throw Error('Authenticated input missing');};
+  const failed=await f.review.tick();assert.equal(failed.state,'failed');
+  assert.equal(f.review.view().reason,'Authenticated input missing');assert.ok(failed.retryAt>failed.checkedAt);
+  const restarted=new WorkLockReview({...f.args,collect:f.review.collect});
+  await restarted.tick();assert.equal(reads,1);assert.equal(f.reviewCalls(),0);
+});
+
+test('minute review expires only orphaned unsubmitted inputs, even without a task',async t=>{
+  const f=await fixture(t);f.task.status='completed';
+  for(const [id,state] of [['orphan','selected'],['live','selected'],['uncertain','unconfirmed'],['submitted','selected'],['fresh','selected']])
+    f.router.state.inputs[id]={id,kind:'owner',state,at:id==='fresh'?f.router.now():-21*60000,...(id==='submitted'?{submissionStartedAt:1}:{})};
+  f.router.save('test-orphans');
+  const restarted=new MobileRouter({...f.router, file:f.router.file});restarted.inflight.set('live',Promise.resolve());
+  const review=new WorkLockReview({...f.args,router:restarted});
+  assert.equal((await review.tick()).state,'not-needed');
+  assert.equal(restarted.state.inputs.orphan.state,'failed-before-submit');
+  assert.equal(restarted.state.inputs.orphan.reason,'input-preparation-timeout');
+  assert.equal(restarted.state.inputs.live.state,'selected');
+  assert.equal(restarted.state.inputs.uncertain.state,'unconfirmed');
+  assert.equal(restarted.state.inputs.submitted.state,'selected');
+  assert.equal(restarted.state.inputs.fresh.state,'selected');assert.equal(f.reviewCalls(),0);
+});
+
+test('completion covers owner requirements without promoting a host handoff to owner work',async t=>{
+  const f=await fixture(t);f.task.contextInputIds=[];
+  f.task.inputIds.push('handoff:resume');f.router.state.inputs['handoff:resume']={id:'handoff:resume',kind:'handoff',state:'accepted'};
+  f.task.deliveries.result={state:'accepted',messageId:'platform-result'};
+  f.review.collect=async()=>({input:{inputs:[{id:'original',workRequirement:true},{id:'handoff:resume',workRequirement:false}]},receipts:{result:{state:'accepted',messageId:'platform-result'}}});
+  f.review.review=async()=>({decision:{disposition:'complete',reason:'delivered',evidenceIds:['original'],remaining:[],discardDraftIds:[]},receipt:{provider:'deepseek',model:'deepseek-flash',reasoning:'high',requestId:'isolated-review'}});
+  assert.equal((await f.review.tick()).state,'applied');assert.equal(f.task.status,'completed');
 });

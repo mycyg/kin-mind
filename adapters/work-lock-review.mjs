@@ -5,7 +5,7 @@ import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
 
 const hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy=value=>structuredClone(value);
-const fingerprint=(router,task)=>hash({reviewPolicyVersion:6,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,
+const fingerprint=(router,task)=>hash({reviewPolicyVersion:7,task,inputs:task.inputIds.map(id=>router.state.inputs[id]),configRevision:router.state.configRevision,
   routing:{mode:router.state.mode,requestedMode:router.state.requestedMode,executionEpoch:router.state.executionEpoch,manualProfile:router.state.manualProfile,autoReturnProfile:router.state.autoReturnProfile},exitRequested:router.state.exitRequested});
 
 export const REVIEW_LIMITS=Object.freeze({bytes:64000,items:128,chunkItems:48,maxChunks:8,excerpt:4000,minExcerpt:250});
@@ -129,6 +129,7 @@ export class WorkLockReview {
     this.running=true;this.state.lastCheckAt=this.now();let attempt;
     try {
       const snapshot=await this.router.locked(async()=>{
+        this.router.expireUnsubmittedInputs();
         const task=this.router.currentTask();
         if(!task||task.requiresDelivery===false)return null;
         const runtime=await this.router.inspect(),reason=this.blocked(task,runtime);
@@ -142,6 +143,7 @@ export class WorkLockReview {
         return this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,state:'waiting',reason:snapshot.reason,checkedAt:this.now()});
       }
       if(previous&&(previous.state==='applied'||previous.retryAt>this.now()))return previous;
+      attempt={id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,checkedAt:this.now(),attempts:(previous?.attempts??0)+1};
       const evidence=await this.collect(snapshot);
       const chatInput=workChatInput(this.router,snapshot.task);
       if(chatInput)evidence.input.workChatInputId=chatInput;
@@ -154,7 +156,7 @@ export class WorkLockReview {
       if(oversized&&!chunks)return this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,state:'waiting',reason:'review-context-needs-summary',checkedAt:this.now()});
       // The reserved user-work lane is recorded with the attempt: this verdict is
       // about the owner's own work and is never reused for any other question.
-      attempt=this.save({id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,lane:REVIEWER_LANES.reviewWork,purpose:REVIEWER_PURPOSES.reviewWork,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',checkedAt:this.now(),attempts:(previous?.attempts??0)+1,...(chunks?{chunks:chunks.length}:{})});
+      attempt=this.save({...attempt,lane:REVIEWER_LANES.reviewWork,purpose:REVIEWER_PURPOSES.reviewWork,evidenceHash:hash(evidence),evidenceIndex:{inputs:(evidence.input.inputs??[]).map(x=>({id:x.id,sourceHash:x.sourceHash})),receipts:evidence.receipts},state:'reviewing',...(chunks?{chunks:chunks.length}:{})});
       const result=await this.judge(evidence.input,chunks),d=result.decision;
       const inputIds=new Set([...snapshot.task.inputIds,...(snapshot.task.contextInputIds??[])]),discardable=new Set((evidence.input.cancellableDeferred??[]).map(x=>x.id));
       // Retain the structured proposal even when its references fail validation.
@@ -189,7 +191,8 @@ export class WorkLockReview {
           this.router.save('work-chat-continuation',{taskId:task.id,inputId:chatInput});
           return this.save({...attempt,state:'applied',appliedAt:this.now()});
         }
-        if(d.remaining.length||!d.evidenceIds.includes(task.inputIds[0])||!d.evidenceIds.includes(task.inputIds.at(-1)))throw Error('Work review does not cover original and current inputs');
+        const requirements=evidence.input.inputs.filter(i=>task.inputIds.includes(i.id)&&i.workRequirement!==false);
+        if(d.remaining.length||!requirements.length||!d.evidenceIds.includes(requirements[0].id)||!d.evidenceIds.includes(requirements.at(-1).id))throw Error('Work review does not cover original and current inputs');
         const canceled=[],replacements=[],retired=[],undelivered=[];
         for(const [deliveryId,delivery] of Object.entries(task.deliveries??{})) {
           const proof=fresh.receipts?.[deliveryId];
