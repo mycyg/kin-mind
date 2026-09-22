@@ -166,11 +166,12 @@ export class MobileRouter {
     this.sessionId=binding.threadId;this.state.sessionId=binding.threadId;this.state.nativeSessionId=binding.nativeSessionId;this.state.generation=binding.generation;this.state.actual=actual;
     this.save('session-promoted',{generation:binding.generation,threadId:binding.threadId});
   }
-  busy(runtime) {
+  busy(runtime,{assessment=false}={}) {
     if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
     if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
     return !runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
-      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) || runtime.nativeStatus!=='idle' || runtime.active ||
+      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) ||
+      (runtime.nativeStatus!=='idle'&&!(assessment&&runtime.nativeStatus==='systemError')) || runtime.active ||
       runtime.queued>0 || runtime.backgroundTasks>0 || runtime.pendingDeliveries>0 || runtime.handoffTasks>0;
   }
   nativeBusy(runtime,{confirmedForce=false}={}) {
@@ -275,7 +276,9 @@ export class MobileRouter {
       const intents=this.classifyIntents&&owner;
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
-      if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
+      // A failed native turn is terminal, not active work. Only a new assessment
+      // on the current profile may proceed; switching and other busy checks stay unchanged.
+      if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
       let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null,profile=null,force=false;
       // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
       const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
@@ -438,7 +441,7 @@ export class MobileRouter {
         if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         let runtime=await this.reconcileTransition(await this.inspect());
-        if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime)||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
+        if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
         if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
           const request=await this.acceptControl(record,runtime);
           const applied=request?await this.applyModeRequest(request,runtime):{runtime};
