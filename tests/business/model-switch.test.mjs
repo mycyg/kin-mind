@@ -332,3 +332,13 @@ test('new independent work can retry after a prior task was canceled',async t=>{
   assert.notEqual(f.router.state.inputs['new-work'].taskId,old.id);
   assert.equal(old.status,'canceled');assert.equal(old.cancelRequested,true);
 });
+
+
+test('profile resolution failure settles the input before any native submission',async t=>{
+  const f=fixture(t,{resolveProfile:async()=>{throw Error('Canonical model provider unavailable');}});
+  await assert.rejects(f.router.dispatch({id:'profile-failed',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async()=>assert.fail('no submission')),/Canonical model provider unavailable/);
+  const input=f.router.state.inputs['profile-failed'];
+  assert.equal(input.state,'failed-before-submit');assert.equal(input.submissionStartedAt,undefined);
+  assert.equal(input.reason,'Canonical model provider unavailable');assert.equal(f.router.inflight.size,0);
+  assert.equal(new MobileRouter(f.args).state.inputs['profile-failed'].state,'failed-before-submit');
+});

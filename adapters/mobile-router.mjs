@@ -401,8 +401,27 @@ export class MobileRouter {
   }
   dispatch(input,submit) {
     if(this.inflight.has(input.id))return this.inflight.get(input.id);
-    const pending=this.dispatchOnce(input,submit).finally(()=>this.inflight.delete(input.id));
+    const pending=this.dispatchOnce(input,submit).catch(async error=>{
+      await this.locked(()=>{
+        const record=this.state.inputs[input.id];
+        if(record&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt){
+          record.state='failed-before-submit';record.failureStage='preparation';record.reason=error.message;
+          this.save('input-failed-before-submit',{id:input.id});
+        }
+      });
+      throw error;
+    }).finally(()=>this.inflight.delete(input.id));
     this.inflight.set(input.id,pending);return pending;
+  }
+  /** Called under the router mutex by the existing minute review. A live dispatch
+   * owns its wait; a submitted input owns its original reconciliation identity. */
+  expireUnsubmittedInputs() {
+    const cutoff=this.now()-(this.state.config.workReviewIntervalMinutes??20)*60000;
+    for(const record of Object.values(this.state.inputs)) {
+      if(!['selected','preparing'].includes(record.state)||record.submissionStartedAt||this.inflight.has(record.id)||!(record.at<=cutoff))continue;
+      record.state='failed-before-submit';record.failureStage='preparation';record.reason='input-preparation-timeout';
+      this.save('input-failed-before-submit',{id:record.id,reason:record.reason});
+    }
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
