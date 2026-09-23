@@ -681,15 +681,34 @@ export class MobileRouter {
   async applyPendingMode() {
     return this.locked(async()=>{
       const runtime=await this.reconcileTransition(await this.inspect());
+      const unfenced=this.unfencedForce();
+      if(unfenced&&!this.nativeBusy(runtime)) {
+        const boundary=await this.forceBoundary(unfenced,runtime);
+        if(boundary&&unfenced.result){unfenced.result.forceBoundaryId=boundary.id;this.save('applied-force-fenced',{commandId:unfenced.commandId,boundaryId:boundary.id});}
+      }
       const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode));
       if(!request)return{state:'pending'};
       await this.applyModeRequest(request,runtime);return clone(request);
     });
   }
+  unfencedForce() {
+    const boundaryAt=this.state.forceBoundaries.at(-1)?.at??-Infinity;
+    return Object.values(this.state.requests).findLast(request=>{
+      if(request.force!==true||request.forceState!=='unconfirmed'||request.forceBoundary||
+        !Number.isFinite(request.forceStartedAt)||request.forceStartedAt<=boundaryAt||
+        (request.state==='applied'&&request.result?.sessionId!==this.sessionId)||
+        request.result?.sessionId&&request.result.sessionId!==this.sessionId)return false;
+      const source=this.state.inputs[request.sourceInputId];
+      return source?.kind==='owner'&&source.hash===request.sourceHash&&source.nativeThreadId===this.sessionId&&
+        (!this.state.conversationId||source.conversationId===this.state.conversationId)&&
+        (!this.state.generation||source.generation===this.state.generation);
+    })??null;
+  }
   async forceBoundary(request,runtime) {
     if(!request.force)return null;
     if(request.forceBoundary)return request.forceBoundary;
     if(request.forceState==='unconfirmed'&&!this.nativeBusy(runtime)) {
+      if(this.unfencedForce()!==request)return null;
       return this.applyForceFence(request,{state:'idle',reconciled:true,checkedAt:runtime.checkedAt});
     }
     if(request.forceState==='unconfirmed')return null;
@@ -752,15 +771,24 @@ export class MobileRouter {
       this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持这组模型设置。');
       this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-profile'});return {runtime};
     }
+    // A prior owner force can suppress the current epoch before a newer mode
+    // choice supersedes it. Settle that interruption, never its old mode choice.
+    const prior=this.unfencedForce();
+    if(prior&&prior!==request&&!this.nativeBusy(runtime)) {
+      const boundary=await this.forceBoundary(prior,runtime);
+      if(boundary&&prior.result){prior.result.forceBoundaryId=boundary.id;this.save('earlier-force-fenced',{commandId:prior.commandId,boundaryId:boundary.id});}
+    }
+    const priorNeedsFence=Boolean(prior&&prior!==request&&!prior.forceBoundary);
+    if(priorNeedsFence&&!request.force){request.waitingReason='prior-force-native-idle-pending';this.pendingModeNotice(request);return {runtime};}
     // Retaining an already active manual profile is not an interruption or a
     // model transition. Keep task/tools/delivery ownership exactly as it is.
     const unchanged=request.mode==='manual'&&this.state.mode==='manual'&&
       this.state.manualProfile&&this.verified(runtime,this.state.manualProfile)&&this.verified(runtime,target)&&
-      !request.forceState&&this.state.transition?.state!=='unconfirmed';
+      !request.forceState&&!priorNeedsFence&&this.state.transition?.state!=='unconfirmed';
     if(!unchanged&&request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
     if(request.mode==='work'&&!this.state.autoReturnProfile)this.captureAutomaticReturn(runtime);
     let forced=Boolean(request.forceBoundary);
-    if(!unchanged&&this.busy(runtime)) {
+    if(!unchanged&&(this.busy(runtime)||request.forceState==='unconfirmed'||priorNeedsFence)) {
       if(!request.force){request.waitingReason='coordinator-busy';return {runtime};}
       const boundary=await this.forceBoundary(request,runtime);if(!boundary)return {runtime};forced=true;
       runtime=await this.inspect();

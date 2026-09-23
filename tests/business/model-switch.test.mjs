@@ -6,6 +6,7 @@ import path from 'node:path';
 import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,noticeReceiptClass} from '../../adapters/mobile-router.mjs';
 import {compactPrompt,publicMobileRuntime} from '../../adapters/mobile-controls.mjs';
 import {TransportManifests} from '../../adapters/transport-manifest.mjs';
+import {ReplyGuard} from '../../adapters/reply-guard.mjs';
 import {createFakeTransport} from './helpers/fake-transport.mjs';
 
 function fixture(t, options={}) {
@@ -187,6 +188,133 @@ test('confirmed owner force bypasses stale coordinator processing, fences late o
   assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.id==='old-delivery'&&delivery.messageId==='already-sent'&&delivery.lateAfterForce),true,'an already-sent platform receipt remains independent evidence at its old fence');
   await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=>assert.fail('the original ID can never be resubmitted'));
   assert.equal(f.router.currentTask().id,taskId);
+});
+
+test('an unconfirmed force request completes its original fence when the same native session becomes idle',async t=>{
+  let forceCalls=0;
+  const f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'},force:true,reason:'owner model change'}),
+    forceSwitch:async()=>{forceCalls++;return {state:'unconfirmed',reason:'native-not-idle'};}});
+  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';
+  const first=await f.router.dispatch({id:'force-after-system-error',kind:'owner',text:'切到 Sol medium'},async()=>assert.fail('control does not submit'));
+  const request=f.router.state.requests['owner-mode:force-after-system-error'];
+  assert.deepEqual([first.state,request.forceState,f.router.state.executionEpoch,forceCalls],['pending','unconfirmed',4,1]);
+  await f.router.applyPendingMode();
+  assert.equal(f.router.state.forceBoundaries.length,0,'an unknown native turn cannot be fenced');
+  f.runtime.nativeStatus='idle';
+  await f.router.applyPendingMode();
+  assert.deepEqual([request.state,request.forceState,f.router.state.executionEpoch,forceCalls],['applied','confirmed',5,1]);
+  assert.equal(request.forceBoundary.receipt.state,'idle');
+  assert.equal(request.forceBoundary.receipt.reconciled,true);
+  assert.equal(f.switches.length,1);
+  await f.router.applyPendingMode();
+  assert.equal(f.router.state.forceBoundaries.length,1,'repeated pumps do not create another boundary');
+  assert.equal(f.switches.length,1);
+});
+
+test('an already applied unconfirmed force is fenced once only while its original mode remains current',async t=>{
+  const f=profileFixture(t,{initial:{model:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
+    forceSwitch:async()=>assert.fail('an applied request must not interrupt again')});
+  f.router.state.executionEpoch=4;f.router.state.mode='manual';
+  f.router.state.manualProfile={provider:'custom-gateway',providerKind:'native',model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'};
+  f.router.state.inputs.original={id:'original',kind:'owner',hash:'source-hash',nativeThreadId:'synthetic'};
+  const request={commandId:'owner-mode:original',sourceInputId:'original',sourceHash:'source-hash',mode:'manual',force:true,state:'applied',forceState:'unconfirmed',forceStartedAt:f.now(),
+    result:{mode:'manual',sessionId:'synthetic',provider:'custom-gateway',model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}};
+  f.router.state.requests[request.commandId]=request;f.router.save('fixture-applied-without-force-fence');
+  const restored=new MobileRouter(f.args);
+  f.runtime.nativeStatus='systemError';await restored.applyPendingMode();assert.equal(restored.state.executionEpoch,4);
+  restored.state.requests['owner-mode:later']={commandId:'owner-mode:later',mode:'manual',state:'failed'};
+  assert.equal(restored.unfencedForce()?.commandId,request.commandId,'a failed later choice does not erase the old interruption');
+  restored.state.requests[request.commandId].result.sessionId='other-session';
+  assert.equal(restored.unfencedForce(),null,'a different native session cannot release the old epoch');
+  restored.state.requests[request.commandId].result.sessionId='synthetic';
+  f.runtime.nativeStatus='idle';await restored.applyPendingMode();
+  assert.equal(restored.state.executionEpoch,5);
+  assert.equal(restored.state.requests[request.commandId].result.forceBoundaryId,restored.state.forceBoundaries[0].id);
+  await restored.applyPendingMode();assert.equal(restored.state.forceBoundaries.length,1);
+  delete restored.state.requests[request.commandId].forceBoundary;
+  restored.state.requests[request.commandId].forceState='unconfirmed';
+  assert.equal(restored.unfencedForce(),null,'a later boundary prevents duplicate advancement');
+});
+
+test('a later deferred mode uses the earlier confirmed interruption fence without reviving the old mode',async t=>{
+  let forces=0;
+  const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:input.text==='first'?'gpt-6-sol':'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:input.text==='first'?'fast':'default'},force:input.text==='first',reason:'owner model choice'}),
+    forceSwitch:async()=>{forces++;return {state:'unconfirmed',reason:'native-not-idle'};}});
+  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';
+  await f.router.dispatch({id:'first',kind:'owner',text:'first'},async()=>assert.fail('control'));
+  await f.router.dispatch({id:'second',kind:'owner',text:'second'},async()=>assert.fail('control'));
+  const first=f.router.state.requests['owner-mode:first'],second=f.router.state.requests['owner-mode:second'];
+  assert.deepEqual([first.state,second.state,f.router.state.executionEpoch,forces],['superseded','pending',4,1]);
+  f.runtime.nativeStatus='idle';await f.router.applyPendingMode();
+  assert.equal(first.state,'superseded');assert.equal(first.forceState,'confirmed');
+  assert.equal(f.router.state.forceBoundaries[0].commandId,first.commandId);
+  assert.deepEqual([second.state,f.runtime.model,f.router.state.executionEpoch],['applied','gpt-6-astra',5]);
+  assert.deepEqual(f.switches.map(item=>item.model),['gpt-6-astra'],'the older Sol choice is never switched or announced');
+});
+
+test('a turn fenced before transport submission retires its manifest without replaying, while an unknown send stays blocked',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-switch-receipt-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const emitted=[],canceled=[];
+  const manifests=new TransportManifests({directory:path.join(root,'manifests'),clock:()=>Date.parse('2026-09-23T10:00:00Z'),sleep:async()=>{},lease:{heartbeat:false},
+    receipt:async()=>null,emit:async event=>emitted.push(event),cancelShare:async id=>canceled.push(id)});
+  const make=id=>manifests.createDraft({ownerEpoch:'epoch',entries:[{request:{draft_id:'draft-'+id,reply_id:'input-'+id,text:'旧回复'},
+    delivery:{id:'bubble-'+id,memoryBatchId:'group-'+id,text:'旧回复',turnFence:4}}]});
+  const ready=async()=>({state:'ready',checked:[{}]});
+  make('fenced');let refused=0;
+  const stopped=await manifests.run('group-fenced',{review:ready,transport:{receipt:async()=>null,send:async()=>{refused++;return {state:'not-submitted',submissionStarted:false,reason:'turn-superseded-before-send'};}}});
+  assert.equal(stopped.manifest.state,'retired');
+  assert.deepEqual([stopped.manifest.bubbles[0].state,stopped.manifest.bubbles[0].fragments[0].state],['canceled','canceled']);
+  assert.equal(stopped.manifest.bubbles[0].fragments[0].receipt.state,'not-submitted');
+  assert.equal(emitted[0].state,'canceled');assert.deepEqual(canceled,['draft-fenced']);
+  await manifests.run('group-fenced',{transport:async()=>assert.fail('old epoch must not retry')});
+  assert.equal(refused,1);
+  make('unknown');
+  const unknown=await manifests.run('group-unknown',{review:ready,transport:{receipt:async()=>null,send:async()=>({state:'blocked',reason:'transport-outcome-unknown'})}});
+  assert.equal(unknown.manifest.state,'blocked-unknown');
+  assert.equal(unknown.manifest.bubbles[0].fragments[0].state,'unknown');
+  assert.equal(emitted.at(-1).state,'unconfirmed','an unknown send is never reported as canceled');
+});
+
+test('operator can retire only a proven before-send refusal with no external receipt or accepted fragment',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-switch-operator-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  let external=null;const emitted=[],canceled=[];
+  const manifests=new TransportManifests({directory:path.join(root,'manifests'),clock:()=>Date.parse('2026-09-23T10:00:00Z'),sleep:async()=>{},lease:{heartbeat:false},
+    receipt:async()=>external,emit:async event=>emitted.push(event),cancelShare:async id=>canceled.push(id)});
+  manifests.createDraft({ownerEpoch:'epoch',entries:[{request:{draft_id:'draft-old',reply_id:'input-old',text:'原回复'},
+    delivery:{id:'bubble-old',memoryBatchId:'group-old',text:'原回复',turnFence:4}}]});
+  const first=await manifests.run('group-old',{review:async()=>({state:'ready',checked:[{}]}),transport:async()=>({state:'blocked',reason:'turn-superseded-before-send'})});
+  const fragmentId=first.manifest.bubbles[0].fragments[0].transport_id;
+  assert.equal(first.manifest.state,'blocked-unknown');
+  external={state:'unconfirmed'};
+  await assert.rejects(manifests.resolve('group-old',fragmentId,{outcome:'not-submitted'}),/External receipt/);
+  assert.equal(manifests.read('group-old').state,'blocked-unknown');
+  external=null;
+  const settled=await manifests.resolve('group-old',fragmentId,{outcome:'not-submitted'});
+  assert.equal(settled.manifest.state,'retired');
+  assert.equal(settled.manifest.bubbles[0].fragments[0].receipt.source,'operator');
+  assert.deepEqual([emitted.at(-1).state,canceled[0]],['canceled','draft-old']);
+  assert.equal(manifests.isLive('group-old'),false);
+});
+
+test('service resume finishes CLI-retired before-send refusal without sending or failure notice',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-switch-cli-resume-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const directory=path.join(root,'manifests'),clock=()=>Date.parse('2026-09-23T10:00:00Z');
+  const cli=new TransportManifests({directory,clock,role:'cli',receipt:async()=>null,lease:{heartbeat:false}});
+  cli.createDraft({ownerEpoch:'epoch',entries:[{request:{draft_id:'draft-old',reply_id:'input-old',text:'原回复'},
+    delivery:{id:'bubble-old',memoryBatchId:'group-old',text:'原回复',turnFence:4}}]});
+  const first=await cli.run('group-old',{review:async()=>({state:'ready',checked:[{}]}),transport:async()=>({state:'blocked',reason:'turn-superseded-before-send'})});
+  const fragmentId=first.manifest.bubbles[0].fragments[0].transport_id;
+  await cli.resolve('group-old',fragmentId,{outcome:'not-submitted'});
+  assert.equal(cli.isLive('group-old'),true,'the CLI has no memory or share cancellation sink');
+  const events=[],shares=[];
+  const guard=new ReplyGuard({directory:root,manifestDirectory:directory,clock,role:'service',lease:{heartbeat:false},replyTailDecision:false,
+    receipt:async()=>null,emit:async event=>events.push(event),call:async(action,input)=>{if(action==='share-cancel')shares.push(input.draft_id);},
+    notifyFailure:async()=>assert.fail('a canceled reply has no failure notice')});
+  const resume=()=>guard.resumeDue({guard:async()=>assert.fail('no guard decision'),send:async()=>assert.fail('no transport send')});
+  assert.equal((await resume()).checked,1);
+  assert.deepEqual([events.map(event=>event.state),shares],[['canceled'],['draft-old']]);
+  assert.equal(guard.manifests.isLive('group-old'),false);
+  assert.equal((await resume()).checked,0,'repeated pumps do not duplicate side effects');
 });
 
 test('quiet main assessment retains the actual manual profile and never classifies or notifies',async t=>{

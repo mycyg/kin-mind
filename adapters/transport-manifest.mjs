@@ -36,6 +36,8 @@ const iso=ms=>new Date(ms).toISOString();
 const terminal=manifest=>TERMINAL_GROUP_STATES.includes(manifest.state);
 const started=bubble=>bubble.fragments.some(f=>f.state!=='unsent');
 const open=bubble=>!TERMINAL_BUBBLES.includes(bubble.state);
+const supersededBeforeSend=receipt=>receipt?.state==='not-submitted'&&receipt.submissionStarted===false&&
+  receipt.reason==='turn-superseded-before-send';
 const executionNumber=value=>Number.isSafeInteger(value)&&value>=0;
 const routingBasis=value=>JSON.stringify([
   [Object.hasOwn(value,'taskId'),value.taskId],
@@ -418,6 +420,20 @@ export class TransportManifests {
     return fragment.kind==='file'?{...base,media:{type:'file',name:fragment.name,data:Buffer.from(body,'utf8')}}:{...base,text:body};
   }
 
+  /** The old turn was refused before transport submission. Cancel its unsent
+   * remainder while keeping any earlier accepted fragment as partial evidence. */
+  async cancelSuperseded(manifest,bubble,fragment,receipt,context) {
+    if(bubble.fragments.some(f=>f!==fragment&&['submitting','unknown'].includes(f.state)))throw Error('Another fragment still needs reconciliation');
+    const at=this.clock(),reason='turn-superseded-before-send',state_at=iso(at);
+    Object.assign(fragment,{state:'canceled',receipt});
+    for(const rest of bubble.fragments)if(rest.state==='unsent')rest.state='canceled';
+    Object.assign(bubble,{state:'canceled',reason,state_at});
+    for(const rest of manifest.bubbles.filter(b=>open(b)&&!started(b)))Object.assign(rest,{state:'canceled',reason,state_at});
+    if(manifest.bubbles.some(open)){await this.touch(manifest,context);return;}
+    if(!manifest.bubbles.some(b=>b.fragments.some(f=>f.state==='accepted')))manifest.retired={reason,at};
+    await this.finish(manifest,context);
+  }
+
   /** 'sent' when the bubble reached a final state, 'stop' when the group must wait. */
   async sendBubble(manifest,bubble,context) {
     const contract=this.contract(manifest);
@@ -425,6 +441,7 @@ export class TransportManifests {
       if(fragment.state!=='unsent')continue;
       // What the transport wrote down outranks what this manifest remembers.
       let receipt=await context.receipt(fragment.transport_id),kind=classifyReceipt(receipt);
+      if(supersededBeforeSend(receipt)){await this.cancelSuperseded(manifest,bubble,fragment,receipt,context);return 'stop';}
       if(kind==='absent'||kind==='never-started') {
         const gap=contract.maxSendsPerSecond?Math.ceil(1000/contract.maxSendsPerSecond):0,wait=this.lastSubmitAt===null?0:this.lastSubmitAt+gap-this.clock();
         if(wait>0)await this.sleep(wait);
@@ -440,6 +457,7 @@ export class TransportManifests {
         // The transport holds a receipt this layer cannot see: never mistake that for "nothing was sent".
         if(refused&&kind==='absent'){receipt={state:'unreadable'};kind='unknown';}
       }
+      if(supersededBeforeSend(receipt)){await this.cancelSuperseded(manifest,bubble,fragment,receipt,context);return 'stop';}
       if(kind==='accepted'){Object.assign(fragment,{state:'accepted',receipt});manifest.failures=0;}
       else if(kind==='rejected')Object.assign(fragment,{state:'rejected',receipt});
       else if(kind==='unknown')Object.assign(fragment,{state:'unknown',receipt});
@@ -558,10 +576,22 @@ export class TransportManifests {
   async reconcileGroup(id,{receipt}={}){return this.run(id,{transport:receipt?{receipt}:null});}
   /** An operator states what really happened to one unknown fragment. */
   async resolve(id,fragmentId,{outcome,messageId,at}={}) {
-    if(!['accepted','rejected'].includes(outcome)||(outcome==='accepted'&&!messageId))throw Error('An operator outcome is accepted with a platform message ID, or rejected');
+    if(!['accepted','rejected','not-submitted'].includes(outcome)||(outcome==='accepted'&&!messageId))throw Error('An operator outcome is accepted with a platform message ID, rejected, or proven not-submitted');
     return this.run(id,{operator:async(manifest,context)=>{
       const fragment=manifest.bubbles.flatMap(b=>b.fragments).find(f=>f.transport_id===fragmentId);
       if(!fragment||!['unknown','submitting'].includes(fragment.state))throw Error('Only a fragment with an unknown outcome can be resolved');
+      if(outcome==='not-submitted') {
+        const prior=normalizeReceipt(fragment.receipt),bubble=manifest.bubbles.find(b=>b.fragments.includes(fragment));
+        if(!this.receipt||prior?.state!=='blocked'||prior.reason!=='turn-superseded-before-send'||prior.submissionStarted===true)
+          throw Error('A stored before-send refusal and an external receipt reader are required');
+        if(manifest.bubbles.length!==1||bubble.fragments.length!==1||tailOpen(manifest)||manifest.continues?.length||manifest.continuation)
+          throw Error('Only an isolated single-fragment refusal can be retired as not-submitted');
+        if(manifest.bubbles.some(b=>b.fragments.some(f=>f.state==='accepted')))throw Error('Accepted fragments must retain their partial delivery history');
+        const external=classifyReceipt(await context.receipt(fragmentId));
+        if(!['absent','never-started'].includes(external))throw Error('External receipt does not prove no submission');
+        await this.cancelSuperseded(manifest,bubble,fragment,{state:'not-submitted',submissionStarted:false,reason:prior.reason,source:'operator'},context);
+        return;
+      }
       const stamp=at??iso(this.clock());
       Object.assign(fragment,{state:outcome,receipt:{state:outcome,source:'operator',...(outcome==='accepted'?{messageId:String(messageId),acceptedAt:stamp}:{checkedAt:stamp})}});
       this.refresh(manifest);await this.touch(manifest,context);
@@ -698,7 +728,7 @@ export class TransportManifests {
 export async function operatorMain(argv,{clock=()=>Date.now(),print=console.log}={}) {
   const [command,...rest]=argv,option=name=>{const index=rest.indexOf('--'+name);return index<0?undefined:rest[index+1];};
   const directory=option('dir');
-  if(!directory||!['status','reconcile','resolve','retry','continue','retire'].includes(command))throw Error('Usage: status|reconcile|resolve|retry|continue|retire --dir <reply-manifests> [--receipts <dir,dir>] [--group <id>] [--fragment <transport id> --outcome accepted|rejected --message-id <id>] [--reason <token>]');
+  if(!directory||!['status','reconcile','resolve','retry','continue','retire'].includes(command))throw Error('Usage: status|reconcile|resolve|retry|continue|retire --dir <reply-manifests> [--receipts <dir,dir>] [--group <id>] [--fragment <transport id> --outcome accepted|rejected|not-submitted --message-id <id>] [--reason <token>]');
   const receipts=option('receipts')?fileReceipts(option('receipts').split(',')):undefined;
   const manifests=new TransportManifests({directory,clock,role:'cli',receipt:receipts,lease:{heartbeat:false}});
   const show=result=>result.busy?{state:'busy'}:result.lost?{state:'lease-lost'}:result.missing?{state:'missing'}:manifestSummary(result.manifest);
