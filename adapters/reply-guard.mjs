@@ -181,7 +181,11 @@ export class ReplyGuard {
       for(const id of this.manifests.live()) {
         if(handled>=limit)break;
         const manifest=this.manifests.read(id);
-        if(!manifest||['retired','accepted','interrupted'].includes(manifest.state)||manifest.retryAt>this.clock())continue;
+        if(!manifest||manifest.state==='interrupted'||manifest.retryAt>this.clock())continue;
+        if(['retired','accepted'].includes(manifest.state)) {
+          if(this.manifests.owes(manifest)){await this.manifests.reconcileGroup(id);handled++;}
+          continue;
+        }
         if(manifest.state==='held'&&manifest.parked)await this.manifests.unpark(id);
         const result=await this.run(id,{guard,send});
         if(!['busy','lease-lost','unconfirmed'].includes(result.state))handled++;
