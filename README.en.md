@@ -24,7 +24,7 @@ I keep the latest four complete exchanges and their original timestamps while co
 
 New messages are saved before memory ingestion and proceed independently of failed older file records. Recovered input keeps its original time and historical status. Sent bubbles and their exact aggregate appear only once in the conversation background.
 
-Events can grow through sourced additions, links and corrections. Digests follow member and source versions, and retrieval can expand from clues to original evidence. Event organization, deep recall, automatic volumes and thermal observation have separate switches; cooling requires seven days of actual observation and replay validation. See [event memory lifecycle](docs/memory-lifecycle.md) for interfaces, migration and undo.
+Events can grow through sourced additions, links and corrections. Digests follow member and source versions, and retrieval can expand from clues to original evidence. Once a newer source version finishes processing, ordinary recall excludes single-source records from older versions; inferences citing multiple sources await review. Conflict relations check the target revision before commit, and a new sourced, inferred counterexample calls for procedure review rather than counting as a verified failure. Event organization, deep recall, automatic volumes and thermal observation have separate switches; cooling requires seven days of actual observation and replay validation. See [event memory lifecycle](docs/memory-lifecycle.md) for interfaces, migration and undo.
 
 Web exploration returns versioned text pages with continuation and delivered-range receipts. Controlled HTTP access does not relax browser address restrictions. See [web reads and evidence](docs/exploration-web-evidence.md).
 
@@ -135,6 +135,8 @@ uv run python examples/mind_demo.py
 ```
 
 The example uses a temporary database without accessing personal memory. A production host needs an existing database, a dedicated scope, a configuration version, an environment variable for DeepSeek credentials and a codex CLI exploration executor. Enable `main_session_review` and connect an existing native session for main-session assessment; the memory setting `native_window_context` selects native capacity management. These are host integration options; installing the library alone does not attach to a session.
+
+Deleting a source from the general memory store also removes its text copies from related job-recovery history. A backup includes only attachments referenced by its database snapshot; restore validates the database in staging before publishing the target. Invalid maintenance settings are rejected before storage.
 
 Some useful affect and wish interfaces:
 

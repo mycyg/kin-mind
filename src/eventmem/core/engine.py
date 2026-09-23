@@ -127,8 +127,7 @@ class Engine:
                     | ({STAMP: origin} if origin else {}),
                 )
                 self._insert(conn, record)
-                if source.kind in {"knowledge", "checkpoint"}:
-                    self.supersede_source_versions(conn, sid)
+                self.supersede_source_versions(conn, sid)
                 conn.execute(
                     "UPDATE sources SET mechanical='complete' WHERE id=?", (sid,)
                 )
@@ -161,12 +160,11 @@ class Engine:
         # Checkpoints replace only the same session's state. Document versions
         # follow their declared effective time, independent of delivery order.
         rows = conn.execute(
-            "SELECT r.id,s.id source_id,s.occurred_at,s.received_at FROM records r JOIN evidence e ON e.record_id=r.id JOIN sources s ON s.id=e.source_id WHERE s.namespace=? AND s.scope=? AND r.kind=? AND r.status='active' AND "
-            + ("s.session=?" if checkpoint else "s.source_key=?"),
+            "SELECT r.id,s.id source_id,s.occurred_at,s.received_at FROM records r JOIN evidence e ON e.record_id=r.id JOIN sources s ON s.id=e.source_id WHERE s.namespace=? AND s.scope=? AND r.status='active' AND "
+            + ("s.session=? AND r.kind='checkpoint'" if checkpoint else "s.source_key=? AND r.kind!='checkpoint'"),
             (
                 source["namespace"],
                 source["scope"],
-                "checkpoint" if checkpoint else "knowledge",
                 source["session"] if checkpoint else source["source_key"],
             ),
         ).fetchall()
@@ -178,7 +176,14 @@ class Engine:
         for row in rows:
             if row["source_id"] != newest:
                 data = self._get(conn, row["id"])
-                data["status"] = "superseded"
+                if data["status"] != "active":
+                    continue
+                if len(data["source_ids"]) > 1:
+                    if not data["generated"]:
+                        continue
+                    data["status"] = "unverified"
+                else:
+                    data["status"] = "superseded"
                 data["attributes"]["new_source_id"] = newest
                 self._save_revision(
                     conn,
@@ -186,6 +191,29 @@ class Engine:
                     "checkpoint" if checkpoint else "document_version",
                     "Updated current source",
                 )
+                self._invalidate_dependents(conn, data["id"], "Updated current source")
+
+    def _invalidate_dependents(self, conn, rid, reason):
+        # Invalidate generated conclusions, never silently promote a stale summary.
+        pending = [rid]
+        visited = {rid}
+        while pending:
+            parent = pending.pop()
+            for dep in conn.execute(
+                "SELECT record_id FROM dependencies WHERE evidence_id=?",
+                (parent,),
+            ).fetchall():
+                if dep[0] in visited:
+                    continue
+                visited.add(dep[0])
+                pending.append(dep[0])
+                child = self._get(conn, dep[0])
+                if child["generated"] and child["status"] == "active":
+                    child["status"] = "unverified"
+                    child["attributes"]["stale_evidence"] = rid
+                    self._save_revision(
+                        conn, child, "evidence_changed", reason
+                    )
 
     @staticmethod
     def _source(row):
@@ -526,26 +554,7 @@ class Engine:
                         {"reason": change.reason},
                     )
                 self._save_revision(conn, data, change.action, change.reason)
-                # Invalidate generated conclusions, never silently promote a stale summary.
-                pending = [rid]
-                visited = {rid}
-                while pending:
-                    parent = pending.pop()
-                    for dep in conn.execute(
-                        "SELECT record_id FROM dependencies WHERE evidence_id=?",
-                        (parent,),
-                    ).fetchall():
-                        if dep[0] in visited:
-                            continue
-                        visited.add(dep[0])
-                        pending.append(dep[0])
-                        child = self._get(conn, dep[0])
-                        if child["generated"] and child["status"] == "active":
-                            child["status"] = "unverified"
-                            child["attributes"]["stale_evidence"] = rid
-                            self._save_revision(
-                                conn, child, "evidence_changed", change.reason
-                            )
+                self._invalidate_dependents(conn, rid, change.reason)
                 if data["status"] != "active" or data["attributes"].get("completed"):
                     # The scheduler's one cancel rule: a delivery whose request may be
                     # on the network is never called canceled.
@@ -828,6 +837,10 @@ class Engine:
                     or payload.get("source_id") in source_ids
                 ):
                     conn.execute(
+                        "UPDATE job_recovery SET target='[deleted]',prev_error=NULL WHERE job_id=?",
+                        (job["id"],),
+                    )
+                    conn.execute(
                         "UPDATE jobs SET state='canceled',payload='{}',error=NULL WHERE id=?",
                         (job["id"],),
                     )
@@ -897,6 +910,17 @@ class Engine:
         return jid
 
     def settings(self, key, value=None):
+        if key == "maintenance" and value is not None:
+            if not isinstance(value, dict):
+                raise ValueError("Maintenance settings must be an object")
+            interval = value.get("interval_seconds", 60)
+            batch = value.get("organize_batch", 20)
+            if type(interval) not in (int, float) or not 30 <= interval <= 86400:
+                raise ValueError("Maintenance interval must be between 30 and 86400 seconds")
+            if type(batch) is not int or batch < 2:
+                raise ValueError("Organize batch must be an integer of at least 2")
+            if type(value.get("narratives", False)) is not bool:
+                raise ValueError("Narratives must be a boolean")
         with self.db.connect(write=value is not None) as conn:
             if value is not None:
                 conn.execute(

@@ -400,13 +400,19 @@ class Worker:
             )
 
             def apply(conn):
+                if engine._get(conn, data["id"])["revision"] != data["revision"]:
+                    raise Conflict("Conflict evidence changed during execution")
+                seen = {item["id"]: item for item in hits["items"]}
                 for relation in result.get("relations", [])[:20]:
                     if (
-                        relation.get("id") in {r["id"] for r in hits["items"]}
+                        relation.get("id") in seen
                         and relation["id"] != data["id"]
                         and relation.get("relation")
                         in {"coexists", "refutes", "supports"}
                     ):
+                        target = seen[relation["id"]]
+                        if engine._get(conn, target["id"])["revision"] != target["revision"]:
+                            raise Conflict("Conflict evidence changed during execution")
                         engine._relation(
                             conn,
                             data["id"],

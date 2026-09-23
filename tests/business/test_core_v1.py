@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 
 import subprocess
 
@@ -220,3 +222,133 @@ def test_backup_restore_keeps_history_and_archive(engine, tmp_path):
     assert len(other.history(rid)) == 2
     assert not other.recall(RecallRequest(query="Back"))["items"]
     assert other.recall(RecallRequest(query="Back", history=True))["items"]
+
+
+def test_backup_keeps_referenced_blobs_but_excludes_orphans(engine, tmp_path):
+    from eventmem.core.transfer import backup, restore
+
+    kept = engine.receive(
+        SourceInput(namespace="test", key="attachment", media_type="application/octet-stream"),
+        b"referenced attachment",
+    )
+    with engine.db.connect() as conn:
+        blob = conn.execute("SELECT blob FROM sources WHERE id=?", (kept["id"],)).fetchone()[0]
+    historical = engine.db.blob(b"historical attachment")
+    record = engine.add_record(
+        RecordInput(kind="observation", content="historical media", locator={"blob": historical}),
+        "historical-media",
+    )
+    with engine.db.connect(write=True) as conn:
+        conn.execute(
+            "UPDATE records SET data=json_remove(data,'$.locator.blob') WHERE id=?",
+            (record["id"],),
+        )
+    orphan = engine.db.blob(b"orphan attachment")
+    archive = tmp_path / "backup.tar.gz"
+    backup(engine, archive)
+    with tarfile.open(archive) as saved:
+        names = set(saved.getnames())
+    assert "blobs/" + blob in names
+    assert "blobs/" + historical in names
+    assert "blobs/" + orphan not in names
+    restore(archive, tmp_path / "restored")
+    assert (tmp_path / "restored" / "blobs" / blob).read_bytes() == b"referenced attachment"
+    assert (tmp_path / "restored" / "blobs" / historical).read_bytes() == b"historical attachment"
+
+    # Earlier backups copied all blobs, including ones no record ever referenced.
+    with tarfile.open(archive) as saved:
+        files = {member.name: saved.extractfile(member).read() for member in saved if member.isfile()}
+    files["blobs/" + orphan] = b"orphan attachment"
+    manifest = json.loads(files["manifest.json"])
+    manifest["files"]["blobs/" + orphan] = orphan
+    files["manifest.json"] = json.dumps(manifest).encode()
+    older = tmp_path / "older-backup.tar.gz"
+    with tarfile.open(older, "w:gz") as saved:
+        for name, data in files.items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            saved.addfile(entry, io.BytesIO(data))
+    restore(older, tmp_path / "older-restored")
+    assert not (tmp_path / "older-restored" / "blobs" / orphan).exists()
+
+
+def test_restore_requires_database_and_publishes_only_after_recovery(engine, tmp_path, monkeypatch):
+    from eventmem.core.transfer import backup, restore
+
+    missing = tmp_path / "missing-db.tar.gz"
+    payload = b'{"format":"memorypalace-1","files":{}}'
+    with tarfile.open(missing, "w:gz") as archive:
+        entry = tarfile.TarInfo("manifest.json")
+        entry.size = len(payload)
+        archive.addfile(entry, io.BytesIO(payload))
+    target = tmp_path / "restored"
+    with pytest.raises(ValueError, match="no database"):
+        restore(missing, target)
+    assert not target.exists()
+
+    job_id = engine.enqueue("rebuild", {}, "unfinished")
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET state='running' WHERE id=?", (job_id,))
+        conn.execute(
+            "INSERT INTO outbox(id,schedule_id,state,available,data) VALUES(?,?,?,?,?)",
+            ("outbox_1", "schedule_1", "sending", 0, "{}"),
+        )
+    archive = tmp_path / "valid.tar.gz"
+    backup(engine, archive)
+    target.mkdir()
+    original = Engine.enqueue
+
+    def interrupted(self, kind, payload, key, *args, **kwargs):
+        if key == "restore-rebuild":
+            raise RuntimeError("interrupted before publication")
+        return original(self, kind, payload, key, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Engine, "enqueue", interrupted)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            restore(archive, target)
+    assert list(target.iterdir()) == []
+    restore(archive, target)
+    with Engine(target).db.connect() as conn:
+        assert conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()[0] == "pending"
+        assert conn.execute("SELECT state FROM outbox WHERE id='outbox_1'").fetchone()[0] == "uncertain"
+        assert conn.execute("SELECT state FROM jobs WHERE unique_key='restore-rebuild'").fetchone()[0] == "pending"
+
+
+def test_migrate_prefers_thawed_event_over_retained_archive_copy(tmp_path):
+    from eventmem.core.transfer import migrate
+    from eventmem.schema import make_event, to_markdown
+
+    legacy = tmp_path / "project" / ".memory"
+    (legacy / "events").mkdir(parents=True)
+    (legacy / "archive").mkdir()
+    event_id = "2026-09-23_120000"
+    old = to_markdown(make_event(event_id, "build", "done", "old frozen text"))
+    live = to_markdown(make_event(event_id, "build", "open", "current thawed text"))
+    with tarfile.open(legacy / "archive" / "epoch-2026-Q3.tar.gz", "w:gz") as archive:
+        data = old.encode()
+        entry = tarfile.TarInfo(event_id + ".md")
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+    (legacy / "events" / (event_id + ".md")).write_text(live)
+    target = tmp_path / "migrated"
+    migrate(legacy, target, Scope())
+    record = Engine(target).get(event_id)
+    assert record["status"] == "active"
+    assert "current thawed text" in record["content"]
+    assert "old frozen text" not in record["content"]
+
+
+def test_delete_redacts_recovered_job_history(engine):
+    marker = "deleted recovery secret"
+    rid = remember(engine, marker)
+    job_id = engine.enqueue("summary_part", {"record_id": rid, "content": marker}, "failed-secret")
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET state='failed',error=? WHERE id=?", (marker, job_id))
+    Worker(engine).recover([job_id], command_id="recover-secret")
+    engine.delete(rid)
+    with engine.db.connect() as conn:
+        row = conn.execute("SELECT target,prev_error FROM job_recovery WHERE job_id=?", (job_id,)).fetchone()
+        job = conn.execute("SELECT state,payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+    assert row["target"] == "[deleted]" and row["prev_error"] is None
+    assert job["state"] == "canceled" and job["payload"] == "{}"

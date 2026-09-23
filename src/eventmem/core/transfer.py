@@ -53,7 +53,7 @@ def migrate(legacy: Path, target: Path, scope: Scope):
                 (sid,),
             )
         candidates = (
-            [(relative, raw)] if path.suffix == ".md" and "events" in path.parts else []
+            [(relative, raw)] if path.suffix == ".md" and path.parent == legacy / "events" else []
         )
         if tarfile.is_tarfile(path):
             with tarfile.open(path) as archive:
@@ -72,7 +72,10 @@ def migrate(legacy: Path, target: Path, scope: Scope):
         for location, content in candidates:
             try:
                 event = from_markdown(content.decode())
-                events.setdefault(event.id, (event, sid, location))
+                # A thawed live file supersedes its copy retained in a frozen pack.
+                live = location == relative and path.parent == legacy / "events"
+                if event.id not in events or live:
+                    events[event.id] = (event, sid, location)
             except Exception:
                 unknown.append(location)
     status_map = {"superseded": "superseded", "abandoned": "archived"}
@@ -164,6 +167,27 @@ def migrate(legacy: Path, target: Path, scope: Scope):
     return report
 
 
+def _referenced_blobs(conn):
+    blobs = {
+        row[0]
+        for row in conn.execute(
+            "SELECT blob FROM sources WHERE deleted=0 AND blob IS NOT NULL "
+            "UNION SELECT json_extract(data,'$.locator.blob') FROM records WHERE deleted=0 "
+            "UNION SELECT json_extract(v.data,'$.locator.blob') FROM revisions v "
+            "JOIN records r ON r.id=v.record_id WHERE r.deleted=0"
+        )
+        if row[0] is not None
+    }
+    if any(
+        not isinstance(key, str)
+        or len(key) != 64
+        or any(c not in "0123456789abcdef" for c in key)
+        for key in blobs
+    ):
+        raise ValueError("Stored attachment has an invalid digest")
+    return blobs
+
+
 def backup(engine, output: Path):
     output = output.expanduser().resolve()
     if output.exists():
@@ -176,13 +200,23 @@ def backup(engine, output: Path):
             target = sqlite3.connect(snapshot / "memory.sqlite3")
             source.backup(target)
             source.close()
-            target.close()
-            shutil.copytree(engine.db.blobs, snapshot / "blobs")
+            try:
+                blobs = _referenced_blobs(target)
+            finally:
+                target.close()
+        (snapshot / "blobs").mkdir()
+        for key in blobs:
+            blob = engine.db.blobs / key
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError(f"Missing stored attachment {key}")
+            shutil.copyfile(blob, snapshot / "blobs" / key)
         manifest = {
             p.relative_to(snapshot).as_posix(): digest(p.read_bytes())
             for p in snapshot.rglob("*")
             if p.is_file()
         }
+        if any(manifest["blobs/" + key] != key for key in blobs):
+            raise ValueError("Stored attachment checksum mismatch")
         (snapshot / "manifest.json").write_text(
             dumps({"format": "memorypalace-1", "files": manifest})
         )
@@ -199,11 +233,15 @@ def backup(engine, output: Path):
 
 
 def restore(archive_path: Path, target: Path):
-    target = target.expanduser().resolve()
-    if target.exists() and any(target.iterdir()):
+    target = target.expanduser()
+    if target.is_symlink():
+        raise ValueError("Restore target must not be a symlink")
+    target = target.resolve()
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise Conflict("Restore requires an empty isolated target")
-    with tempfile.TemporaryDirectory(prefix="memorypalace-restore-") as temp:
-        root = Path(temp)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".memorypalace-restore-", dir=target.parent))
+    try:
         with tarfile.open(archive_path) as archive:
             for member in archive.getmembers():
                 path = PurePosixPath(member.name)
@@ -216,13 +254,19 @@ def restore(archive_path: Path, target: Path):
                 ):
                     raise ValueError("Unsafe archive entry")
                 if member.isfile():
-                    output = root / path
+                    output = stage / path
                     output.parent.mkdir(parents=True, exist_ok=True)
                     with archive.extractfile(member) as src, output.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
-        manifest = json.loads((root / "manifest.json").read_text())
-        if manifest["format"] != "memorypalace-1":
+        manifest = json.loads((stage / "manifest.json").read_text())
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("format") != "memorypalace-1"
+            or not isinstance(manifest.get("files"), dict)
+        ):
             raise ValueError("Unknown backup format")
+        if "memory.sqlite3" not in manifest["files"]:
+            raise ValueError("Backup has no database")
         for name, expected in manifest["files"].items():
             relative = PurePosixPath(name)
             if (
@@ -239,33 +283,60 @@ def restore(archive_path: Path, target: Path):
                 )
             ):
                 raise ValueError("Unexpected backup content")
-            path = (root / name).resolve()
+            path = (stage / name).resolve()
             if (
-                not path.is_relative_to(root.resolve())
+                not path.is_relative_to(stage.resolve())
                 or digest(path.read_bytes()) != expected
             ):
                 raise ValueError("Backup checksum mismatch")
         actual = {
-            p.relative_to(root).as_posix()
-            for p in root.rglob("*")
+            p.relative_to(stage).as_posix()
+            for p in stage.rglob("*")
             if p.is_file() and p.name != "manifest.json"
         }
         if actual != set(manifest["files"]):
             raise ValueError("Backup contains unverified files")
-        with sqlite3.connect(root / "memory.sqlite3") as conn:
+        with sqlite3.connect((stage / "memory.sqlite3").as_uri() + "?mode=ro", uri=True) as conn:
             if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("Backup database is corrupt")
-        shutil.copytree(root, target, dirs_exist_ok=True)
-    engine = Engine(target)
-    with engine.db.connect(write=True) as conn:
-        conn.execute(
-            "UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL WHERE state='running'"
-        )
-        conn.execute("UPDATE outbox SET state='uncertain' WHERE state='sending'")
-        conn.execute(
-            "UPDATE vector_indexes SET data=json_set(data,'$.state','pending')"
-        )
-    engine.enqueue("rebuild", {}, "restore-rebuild")
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if not {"meta", "sources", "records", "revisions", "jobs", "outbox"} <= tables:
+                raise ValueError("Unrecognized backup database schema")
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            if not version or version[0] != 1:
+                raise ValueError("Unsupported backup database schema")
+            referenced = _referenced_blobs(conn)
+            for key in referenced:
+                if manifest["files"].get("blobs/" + key) != key:
+                    raise ValueError(f"Backup is missing attachment {key}")
+        # Old valid backups may contain orphan blobs; leave the archive intact.
+        for name in manifest["files"]:
+            if name.startswith("blobs/") and name[6:] not in referenced:
+                (stage / name).unlink()
+        (stage / "manifest.json").unlink()
+        engine = Engine(stage)
+        with engine.db.connect(write=True) as conn:
+            conn.execute(
+                "UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL WHERE state='running'"
+            )
+            conn.execute("UPDATE outbox SET state='uncertain' WHERE state='sending'")
+            conn.execute(
+                "UPDATE vector_indexes SET data=json_set(data,'$.state','pending')"
+            )
+        engine.enqueue("rebuild", {}, "restore-rebuild")
+        if target.exists():
+            if not target.is_dir() or any(target.iterdir()):
+                raise Conflict("Restore target became nonempty")
+            target.rmdir()
+        stage.rename(target)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
     return {
         "path": str(target),
         "status": "restored",

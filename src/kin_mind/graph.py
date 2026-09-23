@@ -324,10 +324,16 @@ class EventGraph:
         except Missing:
             old = {}
         evidence = {r["record_id"]: r for r in [*old.get("evidence", []), *refs]}
-        return self._put(conn, {**old, "id": identifier, "kind": "edge", "subject": left["id"], "object": right["id"], "predicate": predicate,
+        edge = self._put(conn, {**old, "id": identifier, "kind": "edge", "subject": left["id"], "object": right["id"], "predicate": predicate,
             "layer": layer, "basis": basis, "confidence": confidence, "reason": reason, "role": role,
             "source_ids": sorted({r["source_id"] for r in evidence.values()}), "evidence": list(evidence.values()),
             "valid_from": valid_from, "valid_until": valid_until, "assessment_event": event_id, "state": "active"}, edge=True)
+        prior_proof = {(r["record_id"], r["revision"]) for r in old.get("evidence", [])}
+        new_proof = any((r["record_id"], r["revision"]) not in prior_proof for r in refs)
+        if predicate == "refutes" and layer == "evidence" and (not old or old.get("state") != "active" or new_proof):
+            from .procedures import invalidate_relation
+            invalidate_relation(self.engine, conn, self.scope.key(), (left["id"], right["id"]), edge["id"])
+        return edge
 
     def runtime(self, conn, event, receipt, event_id):
         refs = self.proof(conn, [receipt["source_id"]])

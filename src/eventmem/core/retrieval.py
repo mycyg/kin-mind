@@ -104,6 +104,7 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
     ranks: dict[str, float] = defaultdict(float)
     docs: dict[str, dict] = {}
     loaded: dict[str, dict | None] = {}
+    superseded_sources = set()
     vector_revisions = {}
     scenario_policy = SCENARIOS.get(request.scenario, {}) | engine.settings(
         "scenarios"
@@ -143,6 +144,19 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
                     loaded[row["id"]] = docs.get(row["id"]) or json.loads(row["data"])
                 for rid in page:
                     loaded.setdefault(rid, None)
+                if not request.history:
+                    # Older stores may still label prior source versions active.
+                    # Check only this candidate page, without rewriting history.
+                    superseded_sources.update(r[0] for r in conn.execute(
+                        f"SELECT DISTINCT e.record_id FROM evidence e JOIN records r ON r.id=e.record_id "
+                        "AND r.kind!='checkpoint' JOIN sources s ON s.id=e.source_id "
+                        "JOIN sources newer ON newer.namespace=s.namespace AND newer.source_key=s.source_key "
+                        "AND newer.scope=s.scope AND newer.deleted=0 AND newer.mechanical='complete' "
+                        "AND json_extract(newer.data,'$.kind')!='checkpoint' "
+                        "AND (newer.occurred_at,newer.received_at)>(s.occurred_at,s.received_at) "
+                        f"WHERE e.record_id IN ({marks}) AND NOT EXISTS "
+                        "(SELECT 1 FROM evidence other WHERE other.record_id=e.record_id AND other.source_id<>s.id)", page,
+                    ))
 
         if request.known_at:
             # Historical evaluation uses revisions available at the cutoff, not a
@@ -361,7 +375,7 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
                 )
                 del ranks[rid]
                 continue
-            reason = valid(data, request, policy)
+            reason = "source_superseded" if rid in superseded_sources else valid(data, request, policy)
             if reason:
                 trace["filtered"].append({"id": rid, "reason": reason})
                 del ranks[rid]

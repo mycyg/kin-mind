@@ -1,3 +1,4 @@
+import json
 import math
 
 import threading
@@ -12,7 +13,13 @@ import pytest
 
 from eventmem.core.db import Conflict
 
-from eventmem.core.models import RevisionInput
+from eventmem.core.jobs import Worker
+
+from eventmem.core.models import RevisionInput, Scope, SourceInput
+
+from eventmem.core.providers import Providers
+
+from kin_mind.graph import GraphAssessment, GraphEdge
 
 from kin_mind.memory import MemoryContinuity
 
@@ -102,6 +109,76 @@ def test_queued_method_replay_and_source_correction_are_fenced(env):
     assert not methods.read(identifier=p["id"])["procedures"][0]["executable"]
     with mind.engine.db.connect(write=True) as conn, pytest.raises(Conflict):
         apply(conn)
+
+def test_conflict_job_rechecks_model_seen_target_at_commit(tmp_path, monkeypatch):
+    from eventmem.core import Engine
+    engine = Engine(tmp_path / "conflict")
+    scope = Scope(project="synthetic-conflict")
+    def source(key, text):
+        sid = engine.receive(SourceInput(namespace="conflict-test", key=key, text=text, scope=scope))["id"]
+        return engine.source(sid)["record_ids"][0]
+    target = source("target", "Launch status pending")
+    candidate = source("candidate", "Launch status complete")
+    def model(_provider, role, _instruction, payload):
+        assert role == "conflict" and target in {item["id"] for item in payload["existing"]}
+        return {"relations": [{"id": target, "relation": "refutes", "reason": "Model saw pending"}]}
+    monkeypatch.setattr(Providers, "json", model)
+    job = {"kind": "conflict", "payload": json.dumps({"record_id": candidate})}
+    stale_apply = Worker(engine).prepare(job)
+    engine.revise(target, RevisionInput(expected_revision=1, command_id="correct-target", action="correct", content="Launch status complete"))
+    with engine.db.connect(write=True) as conn:
+        with pytest.raises(Conflict, match="evidence changed"):
+            stale_apply(conn)
+        assert not conn.execute("SELECT 1 FROM relations WHERE subject=? AND object=?", (candidate, target)).fetchone()
+    current_apply = Worker(engine).prepare(job)
+    with engine.db.connect(write=True) as conn:
+        current_apply(conn)
+        assert conn.execute("SELECT predicate FROM relations WHERE subject=? AND object=?", (candidate, target)).fetchone()[0] == "refutes"
+
+def test_inferred_graph_refutation_reviews_method_once(env):
+    mind, _, source, _, _ = env
+    methods, method, outcomes = propose(env)
+    graph = MemoryContinuity(mind).graph
+    class Reviewer:
+        def structured(self, name, schema, system, context, **kwargs):
+            return schema.model_validate({"cases": [{"result_id": case["result_id"], "passed": True,
+                "reason": "Earlier outcome passed"} for case in context["cases"]]}), {"provider": "synthetic"}
+    for index, result_id in enumerate(outcomes):
+        methods.record_trial(identifier=method["id"], revision=method["revision"], trial_id=f"initial-{index}",
+            result_id=result_id, passed=True, isolated=True, environment=method["environment"], verification="Host verified independent case")
+    assert methods.read(identifier=method["id"])["procedures"][0]["executable"]
+    queued_apply = prepare_replay(mind.engine, {"scope": mind.scope.model_dump(), "id": method["id"],
+        "revision": method["revision"]}, Reviewer())
+    contrary_source = source("new-method-counterexample")
+    with mind.engine.db.connect(write=True) as conn:
+        rid = conn.execute("SELECT id FROM records WHERE json_extract(data,'$.attributes.procedure_id')=?", (method["id"],)).fetchone()[0]
+        refuter = mind._evidence(conn, [contrary_source])[0]["record_id"]
+        refs = mind._evidence(conn, [contrary_source])
+        proposal = GraphAssessment(edges=[GraphEdge(subject=refuter, object=rid, relation="refutes",
+            evidence_ids=[contrary_source], reason="Model proposes a possible counterexample")])
+        thought = GraphAssessment(edges=[proposal.edges[0].model_copy(update={"basis": "internal_thought"})])
+        graph.apply(conn, thought, refs, "unverified-thought", {})
+        assert methods.get(conn, method["id"])["status"] == "active"
+        graph.apply(conn, proposal, refs, "assessment-1", {})
+        first = mind.engine._get(conn, rid)
+        assert first["status"] == "unverified"
+        with pytest.raises(Conflict, match="needs review"):
+            queued_apply(conn)
+    pending = methods.read(identifier=method["id"])["procedures"][0]
+    assert pending["status"] == "needs_review" and not pending["executable"]
+    reviewed = MemoryContinuity(mind).ingest({"id": "reviewed-case", "kind": "task-result", "task_id": "reviewed-case",
+        "at": mind.clock(), "text": "Host replayed the counterexample conditions", "verified": True})
+    methods.record_trial(identifier=method["id"], revision=method["revision"], trial_id="reviewed-counterexample",
+        result_id=reviewed["id"], passed=True, isolated=True, environment=method["environment"],
+        verification="Host checked the new conditions")
+    with mind.engine.db.connect(write=True) as conn:
+        with pytest.raises(Conflict, match="Procedure changed during replay"):
+            queued_apply(conn)
+        before = mind.engine._get(conn, rid)["revision"]
+        repeated = GraphAssessment(edges=[proposal.edges[0].model_copy(update={"reason": "Same source, paraphrased model claim"})])
+        graph.apply(conn, repeated, refs, "assessment-2", {})
+        assert mind.engine._get(conn, rid)["revision"] == before
+    assert methods.read(identifier=method["id"])["procedures"][0]["executable"]
 
 def test_background_model_slots_are_shared_and_foreground_bypasses(env):
     mind, _, _, _, _ = env
