@@ -198,6 +198,8 @@ def prepare_replay(engine, payload, provider=None):
         if p["revision"] != payload["revision"] or not mind._fresh(conn, p["evidence"]):
             raise Conflict("Procedure evidence changed before replay", target=payload["id"],
                            expected=payload["revision"], actual=p["revision"])
+        if p["status"] == "needs_review":
+            raise Conflict("Procedure needs review before replay", target=p["id"])
         outcomes = {i: methods.outcome(conn, i) for i in p["result_ids"]}
         if len({o["case_id"] for o in outcomes.values()}) < 2:
             raise Conflict("Need independent result cases")
@@ -217,11 +219,13 @@ def prepare_replay(engine, payload, provider=None):
         raise Conflict("Procedure replay omitted or duplicated an outcome")
     def apply(conn):
         current = methods.get(conn, p["id"])
-        if current["revision"] != p["revision"] or not mind._fresh(conn, p["evidence"]):
+        if current["status"] == "needs_review":
+            raise Conflict("Procedure needs review before replay", target=p["id"])
+        if current != p or not mind._fresh(conn, p["evidence"]):
             raise Conflict("Procedure changed during replay", target=p["id"],
                            expected=p["revision"], actual=current["revision"])
-        # Second phase. This site validates twice, and only the commit-time look at the
-        # revision and the evidence decides; a verdict rejected there never becomes servable.
+        # A review transition can change status without changing method content.
+        # Reject any verdict prepared before that transition.
         from . import judgment_cache
         judgment_cache.accept(engine, receipt, conn=conn)
         for c in verdict.cases:
@@ -243,3 +247,26 @@ def invalidate_source(engine, conn, record):
             derived = json.loads(row[0])
             derived["status"] = "unverified"
             engine._save_revision(conn, derived, "procedure-invalidated", "Underlying evidence changed")
+
+
+def invalidate_relation(engine, conn, scope, record_ids, relation_id):
+    """A new inferred counterexample requires review, not a failed trial."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_procedures'").fetchone():
+        return
+    for rid in set(record_ids):
+        row = conn.execute("SELECT json_extract(data,'$.attributes.procedure_id') AS method, "
+                           "json_extract(data,'$.attributes.procedure_revision') AS revision "
+                           "FROM records WHERE id=? AND scope=? AND kind='procedure' "
+                           "AND status IN ('active','unverified') AND deleted=0", (rid, scope)).fetchone()
+        if not row or not row["method"]:
+            continue
+        changed = conn.execute("UPDATE mind_procedures SET status='needs_review', "
+            "data=json_set(data,'$.status','needs_review','$.invalidation','inferred-refutes','$.review_relation_id',?) "
+            "WHERE scope=? AND id=? AND revision=? AND status IN ('candidate','active') RETURNING id",
+            (relation_id, scope, row["method"], row["revision"])).fetchone()
+        if not changed:
+            continue
+        for active in conn.execute("SELECT data FROM records WHERE id=? AND status='active' AND deleted=0", (rid,)).fetchall():
+            derived = json.loads(active[0])
+            derived["status"] = "unverified"
+            engine._save_revision(conn, derived, "procedure-invalidated", "Inferred counterexample needs review")
