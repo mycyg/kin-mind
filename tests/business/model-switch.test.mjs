@@ -7,6 +7,7 @@ import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIE
 import {compactPrompt,publicMobileRuntime} from '../../adapters/mobile-controls.mjs';
 import {TransportManifests} from '../../adapters/transport-manifest.mjs';
 import {ReplyGuard} from '../../adapters/reply-guard.mjs';
+import {replyProgress} from '../../adapters/reply-progress.mjs';
 import {createFakeTransport} from './helpers/fake-transport.mjs';
 
 function fixture(t, options={}) {
@@ -315,6 +316,25 @@ test('service resume finishes CLI-retired before-send refusal without sending or
   assert.deepEqual([events.map(event=>event.state),shares],[['canceled'],['draft-old']]);
   assert.equal(guard.manifests.isLive('group-old'),false);
   assert.equal((await resume()).checked,0,'repeated pumps do not duplicate side effects');
+});
+
+test('approved cancellation resolves only the matching input without claiming a sent or silent reply',()=>{
+  const at='2026-09-23T11:20:00Z',previous={awaitingReplyInputId:'old-input',awaitingReplySince:'2026-09-23T10:15:00Z',
+    replyDisposition:'unconfirmed',replyWaitingReason:'delivery-outcome-unknown',lastResolvedInputId:'earlier-input',lastReplyAt:'earlier-reply'};
+  const detail={inputId:'old-input',groupId:'old-group',groupState:'retired',state:'canceled',
+    reason:'turn-superseded-before-send',approvalSource:'KIN-ITER-20260923-02-v1'};
+  const canceled={...previous,...replyProgress(previous,'reply-canceled',detail,at)};
+  assert.deepEqual([canceled.replyDisposition,canceled.replyWaitingReason,canceled.awaitingReplySince,canceled.lastResolvedInputId,canceled.lastResolvedAt],
+    ['canceled','turn-superseded-before-send',null,'old-input',at]);
+  assert.equal(canceled.replyGroups['old-group'].approvalSource,detail.approvalSource);
+  assert.equal(canceled.lastReplyAt,previous.lastReplyAt,'cancellation is not a sent reply');
+  const newer={...previous,awaitingReplyInputId:'new-input'};
+  const late={...newer,...replyProgress(newer,'reply-canceled',detail,at)};
+  assert.deepEqual([late.awaitingReplyInputId,late.awaitingReplySince,late.replyDisposition,late.lastResolvedInputId],
+    ['new-input',newer.awaitingReplySince,'unconfirmed','earlier-input']);
+  assert.equal(late.replyGroups['old-group'].state,'retired','the old group outcome remains visible');
+  const unapproved={...previous,...replyProgress(previous,'reply-canceled',{...detail,approvalSource:null},at)};
+  assert.equal(unapproved.awaitingReplySince,previous.awaitingReplySince,'a cancellation needs its approval source');
 });
 
 test('quiet main assessment retains the actual manual profile and never classifies or notifies',async t=>{
