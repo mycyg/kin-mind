@@ -16,7 +16,8 @@ function tailProgress(previous,tail,at) {
 function groupProgress(previous,event,detail,at) {
  if(!detail.groupId)return null;
  const before=previous.replyGroups?.[detail.groupId],tail=tailProgress(before?.tail,detail.tail,at);
- const groups={...previous.replyGroups,[detail.groupId]:{state:detail.groupState??detail.state,reason:detail.reason??null,inputId:detail.inputId??null,event,at,...(tail?{tail}:{})}};
+ const groups={...previous.replyGroups,[detail.groupId]:{state:detail.groupState??detail.state,reason:detail.reason??null,inputId:detail.inputId??null,event,at,
+  ...(event==='reply-canceled'&&detail.approvalSource?{approvalSource:detail.approvalSource}:{}),...(tail?{tail}:{})}};
  const ids=Object.keys(groups).sort((a,b)=>groups[a].at.localeCompare(groups[b].at));
  for(const id of ids.slice(0,Math.max(0,ids.length-GROUPS_KEPT)))delete groups[id];
  return {replyGroups:groups};
@@ -28,6 +29,9 @@ export function replyProgress(previous,event,detail={},at=new Date().toISOString
  // What became of an older group's remainder is a fact about that group. It never answers for the input awaited now.
  if(event==='reply-tail'||detail.tail)return group;
  if(!detail.inputId||detail.inputId!==previous.awaitingReplyInputId)return group;
+ if(event==='reply-canceled'&&detail.groupId&&detail.groupState==='retired'&&detail.state==='canceled'&&detail.reason&&detail.approvalSource)
+  return {awaitingReplySince:null,replyDisposition:'canceled',replyWaitingReason:detail.reason,
+  lastResolvedInputId:detail.inputId,lastResolvedAt:at,...group};
  if(event==='share-held'||event==='reply-review'){
   const resolved=['silent','merged'].includes(detail.state);
   const complete=detail.state==='accepted';
