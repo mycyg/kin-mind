@@ -22,7 +22,7 @@ export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
 export function runtimeReply(view,{pending=false,switched=false}={}) {
   const actual=view.actual;
   if(!actual.verified)return '我还在核对当前模型，连接确认后再告诉你。';
-  const model=actual.model==='deepseek-flash'?'DeepSeek Flash':actual.model==='gpt-6-astra'?'GPT‑6 Astra':actual.model==='gpt-5.6-sol'?'GPT‑5.6 Sol':actual.model;
+  const model=actual.model==='deepseek-flash'?'DeepSeek Flash':actual.model==='gpt-6-astra'?'GPT‑6 Astra':actual.model==='gpt-6-sol'?'GPT‑6 Sol':actual.model==='gpt-5.6-sol'?'GPT‑5.6 Sol':actual.model;
   const mode=view.mode==='manual'?'手动模式':'自动模式';
   if(pending)return '切换正在处理。当前仍是 '+model+(actual.reasoningEffort?'（'+actual.reasoningEffort+'）':'')+'。';
   if(switched)return '已切换到 '+model+(actual.reasoningEffort?' · '+actual.reasoningEffort:'')+(actual.serviceTierPreference==='fast'?' · Fast 配置已开启':'')+'（'+mode+'）。';

@@ -2,7 +2,7 @@
 
 The mobile host keeps one native conversation across channels and model providers.
 DeepSeek Flash handles conversation and lightweight tool use. The default work
-profile is GPT-5.6 Sol / medium with Fast preference, for substantive creative
+profile is GPT-6 Sol / medium with Fast preference, for substantive creative
 work, research, documents, code and computer tasks. Routing selects a conversation mode, not an
 independent model for every message. Deployment-specific identities, credentials,
 state files and personas remain private.
@@ -178,7 +178,9 @@ identity, model, provider and reasoning settings. `codex-runtime-patch.mjs` adds
 bounded runtime query and rejects provider changes while native execution or
 background terminals remain active. An unsupported adapter version fails closed.
 
-The mobile process uses its own combined model catalogue. Global desktop model
+At startup the private host retrieves the current provider catalogue through Codex `model/list` and its native metadata cache, then combines it with the explicit DeepSeek gateway contract. The last successful mobile catalogue remains usable when discovery is unavailable. `read_mobile_runtime` returns the available models and default profiles; a refresh does not change the current manual profile. The pinned executable and companion instructions remain independent of model catalogue updates.
+
+Global desktop model
 configuration and account credentials are not rewritten. Work uses the selected
 profile's Fast preference; an actual service tier remains a separate receipt.
 DeepSeek conversation uses the reasoning effort the host

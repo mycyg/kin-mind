@@ -26,7 +26,7 @@ test('isolated worker uses configured model and returns native and artifact rece
  const result=await creator.run({plan:{id:'p',goal:'Create a text'},step:{id:'s'},run:{id:'r'},brief:{known_evidence:[]}});
  assert.equal(result.state,'produced');assert.equal(result.receipt.thread_id,'isolated-only');assert.equal(result.artifacts.length,1);
  assert.equal(captured.options.env.FEISHU_APP_SECRET,undefined);assert.ok(captured.args.includes('--ignore-user-config'));assert.ok(captured.args.includes('features.apps=false'));assert.ok(captured.args.includes('sandbox_workspace_write.network_access=false'));assert.ok(!captured.args.includes('resume'));
- assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-5.6-sol');assert.ok(captured.args.includes('model_reasoning_effort="medium"'));
+ assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-6-sol');assert.ok(captured.args.includes('model_reasoning_effort="medium"'));
  assert.equal(captured.args.includes('service_tier="fast"'),false,'the default creator never opts into paid Fast');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });

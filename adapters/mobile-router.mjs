@@ -14,7 +14,7 @@ const SHA256=/^[a-f0-9]{64}$/i;
 const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conversationId','generation','id','ownerBindingSha256','sourceSha256','version'];
 export const ROUTER_PROFILES = Object.freeze({
   chat:Object.freeze({model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}),
-  work:Object.freeze({model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
+  work:Object.freeze({model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
 });
 export const ROUTER_MODELS = Object.freeze({chat:ROUTER_PROFILES.chat.model,work:ROUTER_PROFILES.work.model});
 const LEDGER_TAIL_BYTES=1024*1024;
@@ -186,8 +186,8 @@ export class MobileRouter {
     return runtime.known&&runtime.profileReady!==false&&profileMatches(runtime,profile)&&
       runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===(this.state.nativeSessionId??this.sessionId);
   }
-  async availableModels() {
-    try{return normalizeModelCatalog(await this.modelCatalog?.()??[]);}catch{return [];}
+  async availableModels(runtime=null) {
+    try{return normalizeModelCatalog(await this.modelCatalog?.(runtime)??[]);}catch{return [];}
   }
   async resolvedProfile(profile) {
     if(!profile||profile.model==='__unsupported__'||profile.reasoningEffort==='__unsupported__'||profile.serviceTierPreference==='__unsupported__')throw Error('Unsupported model profile');
@@ -850,7 +850,8 @@ export class MobileRouter {
     this.state.actual=runtime;
   }
   async readRuntime(loaded=true) {
-    return this.locked(async()=>{const runtime=await this.inspect();this.observeRuntime(runtime);return publicMobileRuntime(this.state,runtime,this.sessionId,loaded);});
+    return this.locked(async()=>{const runtime=await this.inspect();this.observeRuntime(runtime);
+      return {...publicMobileRuntime(this.state,runtime,this.sessionId,loaded),models:await this.availableModels(runtime),defaults:ROUTER_PROFILES};});
   }
   async restoreRoutingProfile() {
     return this.locked(async()=>{

@@ -23,7 +23,7 @@ export function artifactManifest(directory,artifacts){
 /** Independent creation process. No phone binding, channel credentials, MCP,
  * hooks or direct network tools. Only its workspace is writable. */
 export class AutonomousCreator {
-  constructor({command,root,model='gpt-5.6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env}){
+  constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env}){
     Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env});this.child=null;
   }
   stop(){
