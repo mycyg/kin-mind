@@ -106,7 +106,7 @@ export async function switchCodexModel({connection,sessionId,profile=null,model=
   let target;
   if(profile)target=modelCatalog?resolveModelProfile(profile,modelCatalog):{...profile};
   else {
-    if(!['deepseek-flash','gpt-5.6-sol','gpt-6-astra'].includes(model))throw Error('Unsupported mobile model');
+    if(!['deepseek-flash','gpt-6-sol','gpt-5.6-sol','gpt-6-astra'].includes(model))throw Error('Unsupported mobile model');
     target={provider:model==='deepseek-flash'?(before.providerOverride?before.modelProvider:null):before.providerOverride?null:before.modelProvider,
       providerKind:model==='deepseek-flash'?'gateway':'native',model,
       reasoningEffort:model==='deepseek-flash'?(gateway.reasoningEffort??'high'):'medium',
