@@ -44,6 +44,35 @@ APPRAISAL_INPUT_BUDGET = 64000
 # A fork assessment that cannot run yet: the main thread has no finished turn to fork from, or the
 # session is not loaded. Asked again later, never counted as a failure (PROBE).
 FORK_UNAVAILABLE = re.compile(r"no-completed-turn|session-not-loaded|no-rollout|rollout|native-runtime")
+FORK_STAGES = {"not-started", "started", "unknown"}
+# The host's word for a fork that did not complete (boundaries.runForkAssessment, WS4).
+FORK_ANSWER = re.compile(r"fork-(?:failed|timeout|interrupted)")
+
+
+def fork_stage(answer):
+    """How far an assessment fork got (CR2-INT-06): `not-started` (no fork was made and no model
+    ran: the session is not loaded, or no turn has completed yet to fork from), `started` or
+    `unknown`. The owned ACP says so (`stage`, WS1) and the host passes it on unchanged (WS4), with
+    the ACP's own reason as `fork_reason` and its error code as `detail`; the host's own deadline
+    is `unknown`. When the ACP named neither its stage nor its turn, the host claims nothing and
+    the older signs decide: a fork whose reasons say none could be made, and that names no fork
+    turn or thread, has not started; one a host says started, has; any other fork that failed,
+    timed out or was interrupted cannot be placed and is `unknown`, so it still counts. An answer
+    that is not a fork's (a freeze, the owner's turn, an ACP that could not be asked) gets None."""
+    stage = answer.get("stage")
+    if stage in FORK_STAGES:
+        return stage
+    spent = answer.get("receipt") or {}
+    reason = str(answer.get("reason") or "")
+    said = " ".join(str(answer.get(key) or "") for key in ("reason", "fork_reason", "detail"))
+    if ((answer.get("state") == "failed" or reason.startswith("fork-")) and FORK_UNAVAILABLE.search(said)
+            and not spent.get("native_turn_id") and not spent.get("fork_thread_id")):
+        return "not-started"
+    if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
+        return "started"
+    if answer.get("state") == "waiting" and FORK_ANSWER.fullmatch(reason) and answer.get("started") is not False:
+        return "unknown"
+    return None
 # How far ahead the next quiet review may be asked for. The request states the range in the
 # prompt and in the schema, and the host clamps to the same numbers; there is no separate night
 # ceiling any more (K1-03).
@@ -1308,28 +1337,30 @@ class NativeReview(DeepSeek):
         answer = self.exchange({"id": request_id, "name": name, "contract": system, "system": system,
             "context": context, "schema": schema, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
+        stage = fork_stage(answer) if answer.get("state") in {"waiting", "failed"} else None
+        if stage == "not-started":
+            # CR2-INT-06, one branch for every fork that was never made (the session is not
+            # loaded, no turn has completed to fork from): no model ran, so the assessment is only
+            # asked again later. Not a failure, never charged, never counted towards setting the
+            # row aside, and never sent into the main thread instead (PROBE).
+            raise ModelAdmissionWait("fork-unavailable")
         if answer.get("state") == "waiting":
             spent = answer.get("receipt") or {}
             reason = str(answer.get("reason") or "")
-            if answer.get("model_invoked"):
+            if answer.get("model_invoked") or stage:
                 # A fork that failed, timed out or was interrupted is deferred, not failed (WS4);
                 # what it used is kept from its receipt (PROBE).
                 attempts.record_call(self, name, outcome=reason if spent else "owner-preempted",
                                      model=spent.get("model"), request_id=spent.get("native_turn_id"),
                                      usage=spent.get("usage"), elapsed_ms=round((time.monotonic()-started)*1000),
                                      detail=({"fork_thread_id": spent["fork_thread_id"]} if spent.get("fork_thread_id") else None))
-            if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
-                # CR-MIND-07: this fork ran. It stays deferred and never goes to the main thread, but
-                # it is not "not admitted": it spends the transient-failure budget and its backoff,
-                # and the budget running out sets the row aside like any other outage.
+            if stage in {"started", "unknown"}:
+                # CR-MIND-07: this fork ran, or may have. It stays deferred and never goes to the
+                # main thread, but it is not "not admitted": it spends the transient-failure budget
+                # and its backoff, and the budget running out sets the row aside like any outage.
                 self.failure_receipt = {**spent, **attempts.usage_entry(spent.get("usage")), "outcome": reason or "fork-deferred"}
                 raise RuntimeError("native-review-" + (reason if re.fullmatch(r"fork-[a-z-]{1,40}", reason) else "fork-deferred"))
             raise ModelAdmissionWait(reason or "foreground-active")
-        if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
-            # No finished turn to fork from yet (or the session is not loaded): the assessment
-            # cannot run now and is asked again later. Not Kin's failure, never charged, and never
-            # sent into the main thread instead (PROBE).
-            raise ModelAdmissionWait("fork-unavailable")
         receipt = answer.get("receipt") or {}
         if answer.get("state") != "complete" or not receipt.get("native_turn_id") or receipt.get("model") != self.model:
             self.failure_receipt = {**receipt, **attempts.usage_entry(receipt.get("usage")), "outcome": "native-review-unconfirmed"}
@@ -1870,6 +1901,8 @@ class Appraisals:
         calls = slots.enter_context(attempts.collect(provider))
         admission_wait = False
         uncharged_wait = False
+        # This attempt only finished the row from another attempt's durable receipt (CR2-MIND-03).
+        recovered = False
         model_admitted = False
         provider.compression_parts = set()
         # Everything up to the provider call is host-side assembly: a conflict raised
@@ -1884,7 +1917,13 @@ class Appraisals:
             # If a process died after commit, use the durable command receipt.
             done = self._committed_receipt(key)
             if done:
-                data["result"] = done
+                # CR2-MIND-03: the attempt that committed made and paid for the call, then died before
+                # the row was finished. This one only finishes it from the receipt, with no model call:
+                # already-committed, the count its claim took is given back, and the ledger records it
+                # uncharged and discarded, with no calls. The committing attempt's evidence stays: its
+                # receipt and usage in the result, its own charge in the ledger.
+                data["result"], data["completed_from"] = done, "already-committed"
+                recovered = True
             else:
                 if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
                     with self.engine.db.connect() as conn:
@@ -2736,8 +2775,8 @@ class Appraisals:
             delay = COMPRESSION_RETRY_SECONDS
         else:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
-        # A light attempt is never a charged one, whether it committed or not.
-        uncharged = bool(admission_wait or uncharged_wait or lighting)
+        # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
+        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered)
         with self.engine.db.connect(write=True) as conn:
             changed = conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",

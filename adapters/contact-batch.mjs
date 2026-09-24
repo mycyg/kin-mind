@@ -114,7 +114,27 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       &&checked.draft_id===reviewed[index].draftId&&typeof checked.text==='string'&&Boolean(checked.text.trim())
       &&Array.isArray(checked.references)&&(checked.state===undefined||checked.state==='ready'));
   }
-  async function run({id,text,bubbles,files=[],references=[],channel,guard=()=>true,superseded=false}) {
+  /** CR2-INT-01: the router's gate for one physical send. `gate({kind:'contact', id, channel})`
+   * (the host's send gate, router.beginActivity) answers {ok:true, release()} or {ok:false,
+   * reason}, at once or as a promise. Admitted, the send is in flight with the router until it
+   * returns; a batch run without a gate sends as it always did. */
+  async function admit(gate,item,batch) {
+    if(typeof gate!=='function')return {ok:true,release(){}};
+    let slot;
+    try {slot=await gate({kind:'contact',id:item.id,channel:batch.channel??null});}
+    catch {return {ok:false,reason:'gate-unavailable'};}
+    if(!slot?.ok)return {ok:false,reason:staticToken(slot?.reason,'gate-refused')};
+    let released=false;
+    return {ok:true,release(){if(released)return;released=true;try{slot.release?.();}catch{/* the router's own bookkeeping */}}};
+  }
+  /** Refused before it was submitted (a release freeze): the bubble stays in its group, unsent
+   * and marked not submitted; nothing is counted against it, and a later pass sends it. */
+  async function heldAtGate(batch,id,item,reason) {
+    item.submission='not-submitted';
+    batch.state='pending';batch.reason=reason==='frozen'?'dispatch-frozen':reason;batch.heldAtGate=true;
+    await write(id,batch);return result(batch);
+  }
+  async function run({id,text,bubbles,files=[],references=[],channel,guard=()=>true,superseded=false,gate=null}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
     const contentDigest=parts?digest(JSON.stringify(files.length?{parts,files}:parts)):null;
@@ -210,19 +230,28 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(item.state==='unsent') {
         // A new owner input can arrive while the semantic review is running.
         if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
-        item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
+        // In flight with the router from before the bubble is marked begun until its send
+        // returns, so a freeze can never report idle between the two (CR2-INT-01).
+        const activity=await admit(gate,item,batch);
+        if(!activity.ok)return heldAtGate(batch,id,item,activity.reason);
         try {
-          const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,
-            // Unsplittable: the whole body as one file, with no words of the host's own.
-            // A sender that understands `media` delivers the file INSTEAD of the text, never both;
-            // `text` rides along only so that a sender that does not still has a body.
-            ...(item.oversize?{media:{type:'file',name:item.oversize.name,data:Buffer.from(item.text,'utf8')}}:{})});
-          if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
-          Object.assign(item,{state:'accepted',messageId:sent.messageId});
-        } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}
+          if(batch.heldAtGate){delete batch.heldAtGate;delete batch.reason;}
+          item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
+          try {
+            const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,
+              // Unsplittable: the whole body as one file, with no words of the host's own.
+              // A sender that understands `media` delivers the file INSTEAD of the text, never both;
+              // `text` rides along only so that a sender that does not still has a body.
+              ...(item.oversize?{media:{type:'file',name:item.oversize.name,data:Buffer.from(item.text,'utf8')}}:{})});
+            if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
+            Object.assign(item,{state:'accepted',messageId:sent.messageId});
+          } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}
+        } finally {activity.release();}
       }
       await write(id,batch);
     }
+    // Every bubble is settled now: a hold at the gate earlier is no longer the group's reason.
+    if(batch.heldAtGate){delete batch.heldAtGate;delete batch.reason;}
     const allNeverStarted=batch.items.length>0&&batch.items.every(item=>item.state==='canceled'&&item.submission==='never-started');
     if(!superseded&&allNeverStarted&&batch.items.some(item=>item.reason==='transport-never-started')) {
       batch.state='needs-review';batch.safeToRelease=true;

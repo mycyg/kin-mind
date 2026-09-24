@@ -19,12 +19,18 @@ export const DEFER_MAX_MS=30*24*3600000;
 /** How old an owner input may be and still authorize a desktop hand-off (H3-20). */
 export const HANDOFF_SOURCE_MAX_HOURS=24;
 /** What starts beside the owner's conversation and must stop for a freeze and be waited
- * for by a drain: sends (a reply, a system notice, a reminder, a desktop hand-off result)
- * and the mind's own runs. Other kinds are accepted as named (CR-LIFE-08, CR-MIND-01). */
-export const ACTIVITY_KINDS=Object.freeze(['reply','notice','reminder','handoff','assessment','contact-draft','creation','exploration']);
+ * for by a drain: sends (a reply, a system notice, a reminder, a desktop hand-off result,
+ * a proactive contact) and the mind's own runs. Other kinds are accepted as named
+ * (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01). */
+export const ACTIVITY_KINDS=Object.freeze(['reply','notice','reminder','handoff','contact','assessment','contact-draft','creation','exploration',
+  'appraisal','enrichment','memory-prep']);
 /** The mind orders its own runs itself; a run in its own process never holds the owner's dispatch. */
 const MIND_ACTIVITIES=new Set(['assessment','contact-draft','creation','exploration']);
 const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
+/** The mind's own model work on its store, each in a process of its own and never in the
+ * session: an appraisal, a memory enrichment, a memory warm-up. A freeze refuses it and a
+ * drain waits for it, and that is all: it holds no turn, no switch and no dispatch (CR2-MIND-01). */
+const STORE_ACTIVITIES=new Set(['appraisal','enrichment','memory-prep']);
 /** A notice round that used its attempts rests this long before its identity is tried
  * or looked up again; it is never given up (CR-LIFE-05). */
 export const NOTICE_ROUND_REST_MS=Object.freeze([30*60000,2*3600000,6*3600000]);
@@ -428,9 +434,9 @@ export class MobileRouter {
   activityList() {return [...this.activities.values()].map(activity=>({...activity}));}
   /** Anything in flight. `owner` asks for the owner's own dispatch, which a run in its own
    * process never holds; `internal` asks for the mind's own turn, which orders the mind's
-   * runs itself. A send in flight holds both. */
+   * runs itself. A send in flight holds both; the mind's store work holds nothing here. */
   busy(runtime,{assessment=false,owner=false,internal=false}={}) {
-    for(const activity of this.activities.values())if(!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
+    for(const activity of this.activities.values())if(!STORE_ACTIVITIES.has(activity.kind)&&!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
     if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
     if(Object.values(this.state.inputs).some(record=>record.ownerNotice?.state==='sending'))return true;
     if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
