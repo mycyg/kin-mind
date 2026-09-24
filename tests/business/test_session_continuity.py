@@ -117,3 +117,23 @@ def test_each_review_attempt_is_its_own_job_and_its_answer_names_it(setup):
     assert (carried["snapshotId"], carried["requestId"]) == ("snapshot-8", "review:snapshot-8:2")
     # Without an attempt (an older host) the snapshot alone is the key, as it was.
     assert jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"] == jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"]
+
+
+def test_the_tasks_a_migration_puts_into_its_snapshot_reach_the_restore_payload(setup):
+    # CR-RT-07: the snapshot action uses the tasks it is given to choose linked material but
+    # returns none, so a caller that does not put them back builds a checkpoint without them.
+    # The migration puts them back the way the host's collector does, and the payload the new
+    # thread is given carries every one of them.
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    tasks = [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张', 'private': 'not carried'}]
+    binding = {'conversationId': 'c', 'generation': 1}
+    snapshot = checkpoints.snapshot([], tasks=tasks)
+    assert 'tasks' not in snapshot
+    snapshot['items'] = [{'id': 'owner-1', 'revision': 'r1', 'role': 'user', 'text': '照片整理到哪了？', 'at': '2026-09-24T01:00:00Z',
+                          'basis': 'owner-statement', 'delivery': 'not-confirmed-by-this-record'}]
+    assert checkpoints.build(dict(snapshot), binding, budget=4000, allow_model=False, adaptive_budget=True)['payload']['tasks'] == []
+    snapshot['tasks'] = tasks
+    built = checkpoints.build(snapshot, binding, budget=4000, allow_model=False, adaptive_budget=True)
+    assert built['complete']
+    assert built['payload']['tasks'] == [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张'}]
