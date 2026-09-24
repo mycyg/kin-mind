@@ -1303,8 +1303,13 @@ class NativeReview(DeepSeek):
             "timeout_ms": max(1, int(timeout * 1000))})
         if answer.get("state") == "waiting":
             if answer.get("model_invoked"):
-                attempts.record_call(self, name, outcome="owner-preempted", model=None, usage=None,
-                                     elapsed_ms=round((time.monotonic()-started)*1000))
+                # A fork that failed, timed out or was interrupted is deferred, not failed (WS4);
+                # what it used is kept from its receipt (PROBE).
+                spent = answer.get("receipt") or {}
+                attempts.record_call(self, name, outcome=answer.get("reason") if spent else "owner-preempted",
+                                     model=spent.get("model"), request_id=spent.get("native_turn_id"),
+                                     usage=spent.get("usage"), elapsed_ms=round((time.monotonic()-started)*1000),
+                                     detail=({"fork_thread_id": spent["fork_thread_id"]} if spent.get("fork_thread_id") else None))
             raise ModelAdmissionWait(answer.get("reason") or "foreground-active")
         if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
             # No finished turn to fork from yet (or the session is not loaded): the assessment

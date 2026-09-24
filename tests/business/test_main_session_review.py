@@ -48,6 +48,18 @@ def test_preemption_records_unknown_usage_without_exhausting_repairs(setup):
     assert calls[0]['outcome']=='owner-preempted'
 
 
+def test_a_deferred_fork_is_a_wait_that_keeps_what_it_used(setup):
+    """WS4: a fork that timed out is deferred, never failed or retried in the main thread; its
+    receipt's usage and fork thread are recorded (PROBE)."""
+    mind,_,_=setup
+    spent={'model':'gpt-6-sol','native_turn_id':'turn-9','fork_thread_id':'fork-3','usage':{'input_tokens':1200,'output_tokens':40}}
+    p=native_provider(mind,lambda request:{'state':'waiting','reason':'fork-timeout','model_invoked':True,'receipt':spent})
+    with attempts.collect(p) as calls:
+        with pytest.raises(ModelAdmissionWait,match='fork-timeout'):p._native('submit_appraisal',{},'',{},10)
+    assert calls[0]['outcome']=='fork-timeout' and calls[0]['request_id']=='turn-9'
+    assert calls[0]['usage_status']!='unknown' and calls[0]['detail']=={'fork_thread_id':'fork-3'}
+
+
 def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
     from kin_mind.continuity import ContinuityConfig
     from kin_mind.memory import MemoryContinuity
