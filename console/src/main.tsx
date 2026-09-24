@@ -100,7 +100,8 @@ const statuses: any = {
   queued: "已入队",
   suggested: "待发建议",
   ready: "待发送",
-  sent: "已发送",
+  // A delivery the host answered 2xx is in the host's queue, not yet with anybody (CR2-INT-07).
+  sent: "已交给宿主",
   acknowledged: "已确认",
   uncertain: "投递不确定",
   paused: "已暂停",
@@ -1003,7 +1004,7 @@ function App() {
                 </div>
                 {recallMode === "deep" && (
                   <p className="form-help">
-                    深度路径会调用已配置的检索与重排模型，按模型计费。
+                    这里的召回不带会话，只读不记：深度路径不调用模型、不计费，只用已有缓存或原文；需要模型处理的部分会注明需要会话。
                   </p>
                 )}
               </form>

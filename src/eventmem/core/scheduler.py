@@ -25,20 +25,19 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS outbox_channel_contracts(
 
 CLAIM_LEASE = 30  # seconds a claim holds a 'ready'/'retry' row; nothing is sent yet
 DISPATCH_LEASE = 30  # seconds a 'sending' row may wait for its receipt
-# Attempts a possibly-sent row gets when no delivery window can be read off it (rows an older
-# build queued). Every other row is bounded by its window.
-MAX_ATTEMPTS = 5
 # How long after this occurrence was due a delivery is still worth making: 30 minutes (F4,
-# CR-MEM-10). Within it, a row nothing can have been sent for — every attempt refused, or the
-# connection never made — is tried again however often that takes, and so is one on a declared
-# and verified idempotent channel, whose receiver keys its effect by the delivery id. Every
-# dispatch checks it first: past it, a row proven unsent is settled as not sent, and one whose
-# outcome is unknown stays under its id for reconciliation, never sent late (E2-01, E3-12).
+# CR-MEM-10). Every row is bounded by it, a row an older build queued too: its due time is found
+# from its schedule, or the row is held unsent (CR2-MEM-04). Within it, a row nothing can have
+# been sent for — every attempt refused, or the connection never made — is tried again however
+# often that takes, and so is one on a declared and verified idempotent channel, whose receiver
+# keys its effect by the delivery id. Every dispatch checks it first: past it, a row proven
+# unsent is settled as not sent, and one whose outcome is unknown stays under its id for
+# reconciliation, never sent late (E2-01, E3-12).
 DELIVERY_WINDOW = 30 * 60
 RETRY_CAP = 300  # the longest wait between two attempts
 HTTP_TIMEOUT = 5
 # Bookkeeping, never part of a body: the body the host receives is what it always was.
-UNSENT_KEYS = ("attempts", "claim", "dispatch", "gave_up", "due_at")
+UNSENT_KEYS = ("attempts", "claim", "dispatch", "gave_up", "due_at", "hold")
 # What each delivery state means to a reader that decides whether to say it was done or to
 # ask again. Static text: the model reads it through the task tools (E3-13).
 MEANINGS = {
@@ -46,7 +45,8 @@ MEANINGS = {
     "ready": "已排队，尚未发送",
     "retry": "尚未确认送达，稍后会自动重试",
     "sending": "正在发送，请求可能已在网络上",
-    "sent": "渠道已接收",
+    # A 2xx says the host took the delivery into its own queue, not that anybody received it.
+    "sent": "已交给宿主，尚未确认送达",
     "acknowledged": "已确认送达",
     "uncertain": "可能已经发出，结果未知；再次发送前需要核对",
     "canceled": "没有发出",
@@ -160,27 +160,54 @@ def describe(row):
                             if data["gave_up"].get("reason") == "past-deadline"
                             else "没有发出：投递时段内渠道一直拒收或连接不上，已停止重试")
         found["gave_up_at"] = data["gave_up"].get("at")
+    elif held(data) == "due-time-unknown" and row["state"] in ("suggested", "uncertain"):
+        found["meaning"] = ("没有发出：确认不了这次提醒的到期时间，不会自动发送，等待核对" if never_sent
+                            else "可能已经发出；确认不了这次提醒的到期时间，不会再发送，需按原编号核对")
     elif row["state"] == "uncertain" and never_sent:
         found["meaning"] = "没有发出（每次都被拒收），已停止自动重试"
     return found
 
 
+def deadline_moment(data):
+    """The last moment this occurrence is still worth delivering: its due time plus the window,
+    in UTC, to the millisecond (CR-MEM-10). None when the row names no due time it can be read
+    from: a row an older build queued names none, and its creation is not one — an overdue
+    schedule is queued late — so the scheduler finds it from the schedule first, or holds the row
+    (`Scheduler._due`, CR2-MEM-04).
+
+    The one deadline there is: the dispatcher judges expiry by it, and the host is handed it as
+    `deadlineAt` to check before each send of its own (CR2-INT-07). Milliseconds, because that is
+    what the host's clock reads, so the two can never disagree about a moment."""
+    try:
+        moment = (datetime.fromisoformat(data["due_at"]) + timedelta(seconds=DELIVERY_WINDOW)).astimezone(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return moment.replace(microsecond=moment.microsecond - moment.microsecond % 1000)
+
+
 def deadline(data):
-    """The last moment this occurrence is still worth delivering: its due time plus the window.
-    A row an older build queued names no due time; it was queued when it fell due, so its
-    creation stands in. None when neither can be read (CR-MEM-10)."""
-    for key in ("due_at", "created_at"):
-        try:
-            return datetime.fromisoformat(data[key]).timestamp() + DELIVERY_WINDOW
-        except (KeyError, TypeError, ValueError):
-            continue
-    return None
+    """The deadline as a POSIX time, for the clock to be compared with."""
+    moment = deadline_moment(data)
+    return None if moment is None else moment.timestamp()
 
 
-def window_open(data, now, attempts):
-    """Whether a delivery is still inside the window in which it is worth making."""
+def deadline_at(data):
+    """The deadline as the host receives it: ISO 8601, UTC, milliseconds and a `Z`, the form
+    JavaScript's Date writes and reads without loss."""
+    moment = deadline_moment(data)
+    return None if moment is None else moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def window_open(data, now):
+    """Whether a delivery is still inside the window in which it is worth making. Without a
+    deadline it is not: nothing extends the time a reminder may be sent in (CR2-MEM-04)."""
     until = deadline(data)
-    return attempts < MAX_ATTEMPTS if until is None else now < until
+    return until is not None and now < until
+
+
+def held(data):
+    """Why a delivery waits for someone rather than for the dispatcher, if it does."""
+    return (data.get("hold") or {}).get("reason")
 
 
 class Scheduler:
@@ -197,6 +224,26 @@ class Scheduler:
         return datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(
             timespec="microseconds"
         )
+
+    @staticmethod
+    def _due(conn, delivery_id, schedule_id, data):
+        """This occurrence's due time, written into `data` when it had to be found. A row this
+        build queued carries it. One an older build queued does not, and its creation time is not
+        it: an overdue schedule is queued late, and 09:00 queued at 09:25 would otherwise be sent
+        until 09:55. It is the due time the row's own id was made from, which the schedule still
+        holds, under the same generation, while this occurrence is its current one. Anything else
+        is not confirmed and answers None: the row is held, not given a deadline of its own
+        (CR2-MEM-04)."""
+        if data.get("due_at"):
+            return data["due_at"]
+        schedule = conn.execute("SELECT due_at,data FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        if schedule is None:
+            return None
+        generation = json.loads(schedule["data"]).get("generation", 0)
+        if delivery_id != "delivery_" + digest([schedule_id, schedule["due_at"], generation])[:32]:
+            return None
+        data["due_at"] = schedule["due_at"]
+        return data["due_at"]
 
     def _policy(self, conn, policy_id):
         row = conn.execute(
@@ -401,16 +448,21 @@ class Scheduler:
             ).fetchall()
             for row in stale:
                 policy = self._policy(conn, row["policy_id"])
+                data = json.loads(row["data"])
+                known = self._due(conn, row["id"], row["schedule_id"], data)
                 retry = (
                     policy
                     and policy.channel
                     and policy.idempotent_channel
-                    and window_open(json.loads(row["data"]), self.clock(), row["attempts"])
+                    and known
+                    and window_open(data, self.clock())
                     and self._verified(conn, policy.channel)
                 )
+                if not known:
+                    data["hold"] = {"at": stamp, "reason": "due-time-unknown"}
                 changed = conn.execute(
-                    "UPDATE outbox SET state=?,lease_until=NULL WHERE id=? AND state='sending'",
-                    ("retry" if retry else "uncertain", row["id"]),
+                    "UPDATE outbox SET state=?,lease_until=NULL,data=? WHERE id=? AND state='sending'",
+                    ("retry" if retry else "uncertain", dumps(data), row["id"]),
                 ).rowcount
                 if changed and not retry and policy:
                     # Possibly sent and not to be sent again: this occurrence is over, and a
@@ -568,7 +620,13 @@ class Scheduler:
                     ),
                 )
 
-            if not window_open(data, self.clock(), row["attempts"]):
+            if not self._due(conn, row["id"], row["schedule_id"], data):
+                # No due time this row can be held to: nothing is sent and nothing is decided on
+                # its behalf. Proven unsent it waits, unsent, for someone to confirm; possibly sent
+                # it stays under its id to be reconciled (CR2-MEM-04).
+                data["hold"] = {"at": stamp, "reason": "due-time-unknown"}
+                return release("suggested" if clean else "uncertain")
+            if not window_open(data, self.clock()):
                 # Past this occurrence's deadline nothing is sent (CR-MEM-10). Proven unsent, it
                 # is settled as not sent; possibly sent, it stays under its id to be reconciled.
                 # Either way the occurrence is over, and a recurring reminder moves on.
@@ -643,6 +701,12 @@ class Scheduler:
                 # repeats these bytes under the same Idempotency-Key, whatever the
                 # record has become since.
                 data.update(text=record["content"], record_revision=record["revision"])
+                # The deadline travels with the body it bounds, under the signature: the host
+                # holds a delivery it took in its own queue and sends it later, so it has to know
+                # when this occurrence stops being worth sending (CR2-INT-07).
+                until = deadline_at(data)
+                if until:
+                    data["deadlineAt"] = until
                 body = dumps({k: v for k, v in data.items() if k not in UNSENT_KEYS})
             raw = body.encode()
             data["dispatch"] = dispatch | {
@@ -752,7 +816,10 @@ class Scheduler:
                 )
                 if not wanted:
                     state = "canceled" if clean else "uncertain"
-                elif resend and window_open(data, self.clock(), attempts):
+                elif not self._due(conn, row["id"], row["schedule_id"], data):
+                    data["hold"] = {"at": stamp, "reason": "due-time-unknown"}
+                    state = "suggested" if clean else "uncertain"
+                elif resend and window_open(data, self.clock()):
                     state = "retry"
                 elif clean:
                     # Never sent, and its window has closed: given up on, and saying so,

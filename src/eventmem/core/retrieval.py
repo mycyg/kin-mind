@@ -211,7 +211,14 @@ def deep_inputs(engine, request, trace, scenario_policy):
     found = {"vector": None, "visual": None, "followups": []}
     if request.mode != "deep" or not request.query or request.known_at:
         return found
+    from .db import recording
     from .providers import NotConfigured, Providers
+
+    if not recording():
+        # A look pays for nothing: no embedding, expansion or rerank. The stored channels
+        # answer, and the trace says why the others are missing (CR2-MEM-02).
+        degrade(trace, "session_required")
+        return found
 
     if request.vector is None or not request.index:
         try:
@@ -503,7 +510,9 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
             rid,
         ),
     )
-    if request.mode == "deep" and ordered:
+    from .db import recording
+
+    if request.mode == "deep" and ordered and recording():
         from .providers import NotConfigured, Providers
 
         try:
@@ -527,7 +536,9 @@ def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_
     for; "maintenance" is a look that must not count as one.
     `allow_model` narrows when the kin context may call a model; left out, a search or read may.
     `record=False` is a look that leaves the store as it found it, however often it is repeated:
-    no access, no use, no memory telemetry, no lease (S1-02; the console's recall lab)."""
+    no access, no use, no memory telemetry, no lease (S1-02; the console's recall lab), and no
+    model call, so no cost and no admission either. It answers from existing caches and the
+    originals; what would need a model says `session-required` (CR2-MEM-02)."""
     if not record:
         from .db import unrecorded
 
@@ -567,7 +578,10 @@ def _recall(engine, request, *, access_origin, allow_model, record):
     )
     key = dumps(request.model_dump(exclude={"session", "explain"}))
     generation = engine.db.generation()
-    cache_key = (generation, key)
+    from .db import recording
+
+    # A look's candidates are found without models: never handed to a recall that may use them.
+    cache_key = (generation, key, recording())
     with engine.cache_lock:
         cached = engine.cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < 30:

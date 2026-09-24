@@ -204,11 +204,15 @@ class Contexts:
     def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None, persist=None):
         """A cache entry covers exact input revisions and query purpose, not DB age.
 
-        `persist=False` is a look (S1-02): it reads the cache and may compress, and keeps
-        nothing it computed (CR-MEM-07). Left out, it follows the ambient `unrecorded()`."""
+        `persist=False` is a look (S1-02): it reads the cache, keeps nothing (CR-MEM-07) and
+        asks no model. What only a model could compress stays the originals that fit, with
+        `reason: "session-required"`: paid work takes a recall that records it (CR2-MEM-02).
+        Left out, it follows the ambient `unrecorded()`."""
         if persist is None:
             from eventmem.core.db import recording
             persist = recording()
+        refused = "session-required" if allow_model and not persist else None
+        allow_model = allow_model and persist
         if not isinstance(budget, int) or budget < 0:
             raise ValueError("Invalid context budget")
         if not 1 <= work_seconds <= 600:
@@ -381,7 +385,7 @@ class Contexts:
             except Exception as error:  # noqa: BLE001 - worker boundary, redacted failure type only
                 failure = str(error) if isinstance(error, RuntimeError) and re.fullmatch(r"deepseek-[a-z0-9-]+", str(error)) else type(error).__name__
         else:
-            failure = "deferred" if not allow_model else "budget"
+            failure = refused or ("deferred" if not allow_model else "budget")
         lines, covered = [], []
         for item in items:
             line = self._line(item)
@@ -820,7 +824,7 @@ class Contexts:
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
             recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
-                allow_model=allow_model, deadline=started + 150, policy=policy, owner_words=owner_words)
+                allow_model=allow_model and record, deadline=started + 150, policy=policy, owner_words=owner_words)
             items.extend(recalled)
         elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
             graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),
