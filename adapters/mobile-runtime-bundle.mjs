@@ -281,6 +281,8 @@ export function validateMobileRuntimeCandidateDescriptor(descriptor,{bundle,mani
   const config=validateLocalArtifact(descriptor.runtime?.config,privateRoot,'Runtime config',{json:true,maxBytes:1024*1024});
   const schema=validateLocalArtifact(descriptor.runtime?.schema,privateRoot,'Native schema',{json:true,maxBytes:16*1024*1024});
   const catalog=validateLocalArtifact(descriptor.runtime?.catalog,privateRoot,'Model catalog',{json:true,maxBytes:16*1024*1024});
+  // Optional in older descriptors: the Codex home settings the proof runs on.
+  const home=descriptor.runtime?.home?validateLocalArtifact(descriptor.runtime.home,privateRoot,'Codex home settings',{text:true,maxBytes:256*1024}):null;
   if(descriptor.runtime?.codex_bin?.sha256!==bundle.manifest.files.find(file=>file.path===bundle.manifest.runtime.codex.path)?.sha256||descriptor.runtime?.codex_bin?.version!==bundle.manifest.runtime.codex.version)throw Error('Candidate Codex identity changed');
   if(descriptor.runtime?.acp?.entry_sha256!==bundle.manifest.runtime.acp.entry_sha256||descriptor.runtime?.acp?.version!==bundle.manifest.runtime.acp.version||descriptor.runtime?.acp?.package_json_sha256!==bundle.manifest.runtime.acp.package_json_sha256)throw Error('Candidate ACP identity changed');
   if(descriptor.candidate_kind==='mobile-main-maintenance'){
@@ -295,9 +297,13 @@ export function validateMobileRuntimeCandidateDescriptor(descriptor,{bundle,mani
   }
   const requirements=requiredScenarioRequirements(descriptor),profiles=Array.isArray(descriptor.expected_profiles)?descriptor.expected_profiles:[];
   for(const requirement of requirements){if(!candidateId(requirement.scenario_id)||!['native_loaded','request_verified'].includes(requirement.phase)||!['accepted','rejected'].includes(requirement.outcome))throw Error('Invalid runtime scenario requirement');}
-  for(const profile of profiles){if(!candidateId(profile.scenario_id)||typeof profile.checkpoint!=='string'||!profile.checkpoint||typeof profile.model!=='string'||typeof profile.provider!=='string'||typeof profile.reasoning_effort!=='string'||!['on','off','unknown'].includes(profile.fast_mode)||typeof profile.canonical_id!=='string'||typeof profile.canonical_match!=='boolean'||!profile.service_tier_expectation||!Object.hasOwn(profile.service_tier_expectation,'preference')||!Object.hasOwn(profile.service_tier_expectation,'actual'))throw Error('Invalid expected runtime profile');}
+  // canonical_id, canonical_match and an expected actual tier are optional: a
+  // profile expects only what a request can show.
+  for(const profile of profiles){if(!candidateId(profile.scenario_id)||typeof profile.checkpoint!=='string'||!profile.checkpoint||typeof profile.model!=='string'||typeof profile.provider!=='string'||typeof profile.reasoning_effort!=='string'||!['on','off','unknown'].includes(profile.fast_mode)||
+    (profile.canonical_id!==undefined&&typeof profile.canonical_id!=='string')||(profile.canonical_match!==undefined&&typeof profile.canonical_match!=='boolean')||
+    !profile.service_tier_expectation||!['fast','default'].includes(profile.service_tier_expectation.preference))throw Error('Invalid expected runtime profile');}
   if(descriptor.candidate_kind==='mobile-main-maintenance')for(const requirement of requirements.filter(item=>item.phase==='request_verified'&&item.outcome==='accepted'))if(!profiles.some(profile=>profile.scenario_id===requirement.scenario_id))throw Error('A main-session request scenario lacks an expected runtime profile');
-  return {privateRoot,base,developer,launcher,config,schema,catalog,requirements,profiles};
+  return {privateRoot,base,developer,launcher,config,schema,catalog,home,requirements,profiles};
 }
 
 function observedRuntimeDigests(observation,descriptor,bundle){
@@ -306,7 +312,7 @@ function observedRuntimeDigests(observation,descriptor,bundle){
   const expected={codex_sha256:descriptor.runtime.codex_bin.sha256,acp_entry_sha256:descriptor.runtime.acp.entry_sha256,
     acp_package_json_sha256:descriptor.runtime.acp.package_json_sha256,base_sha256:descriptor.base.sha256,developer_sha256:descriptor.developer.sha256,
     config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
-    bundle_manifest_sha256:bundle.manifestSha256};
+    bundle_manifest_sha256:bundle.manifestSha256,...(descriptor.runtime.home?{home_sha256:descriptor.runtime.home.sha256}:{})};
   for(const [key,value] of Object.entries(expected))if(native[key]!==value)throw Error('Native runtime loaded different '+key);
 }
 
@@ -315,7 +321,7 @@ function validateProfile(expected,observed){
   for(const [expectedKey,observedKey] of [['model','model'],['provider','provider'],['reasoning_effort','reasoning_effort'],['fast_mode','fast_mode'],['canonical_id','canonical_id']])if(expected[expectedKey]!==undefined&&observed[observedKey]!==expected[expectedKey])throw Error('Runtime profile '+expectedKey+' changed');
   const tier=expected.service_tier_expectation;
   if(tier&&observed.service_tier_preference!==tier.preference)throw Error('Configured service-tier preference changed');
-  if(tier&&observed.actual_service_tier!==tier.actual)throw Error('Actual service tier changed');
+  if(tier&&Object.hasOwn(tier,'actual')&&observed.actual_service_tier!==tier.actual)throw Error('Actual service tier changed');
   if(expected.canonical_match!==undefined&&observed.canonical_match!==expected.canonical_match)throw Error('Canonical runtime identity changed');
 }
 
@@ -354,11 +360,12 @@ function scenarioReceipt(observation,requirement,descriptor,validated,bundle){
       turn_sha256:request.turn_sha256,rpc_receipt_sha256:request.rpc_receipt_sha256,thread_id_sha256:sha256(request.thread_id),session_id_sha256:sha256(request.session_id),
       instruction_sources_sha256:sha256(canonicalJson(request.instruction_sources??[])),tool_definitions:request.tools?.definitions??null,tool_calls:request.tools?.calls??null,tool_executions:request.tools?.executions??null,
       supplemental_developer_count:request.capture.supplemental_developer_count??0,
-      supplemental_developer_layers:(request.capture.supplemental_developer_layers??[]).map(layer=>({sha256:layer.sha256,bytes:layer.bytes,preview:layer.preview})),
+      supplemental_developer_kinds:request.capture.supplemental_developer_kinds??null,
+      supplemental_developer_layers:(request.capture.supplemental_developer_layers??[]).map(layer=>({...(layer.kind?{kind:layer.kind}:{}),sha256:layer.sha256,bytes:layer.bytes,preview:layer.preview})),
       ...(request.tools?.output_sha256?{tool_output_sha256:request.tools.output_sha256,tool_call_id_sha256:request.tools.call_id_sha256}:{})})),
     ...(observation.compaction?{compaction:{raw_request_sha256:observation.compaction.raw_request_sha256,compact_prompt_sha256:observation.compaction.compact_prompt_sha256,provider_requests:observation.compaction.provider_requests}}:{}),
     profiles:(observation.profiles??[]).map(profile=>({checkpoint:profile.checkpoint,model:profile.model,provider:profile.provider,reasoning_effort:profile.reasoning_effort,
-      fast_mode:profile.fast_mode,service_tier_preference:profile.service_tier_preference,actual_service_tier:profile.actual_service_tier,canonical_id:profile.canonical_id,canonical_match:profile.canonical_match}))};
+      fast_mode:profile.fast_mode,service_tier_preference:profile.service_tier_preference}))};
 }
 
 function runnerFailureDetail(error){
@@ -402,12 +409,18 @@ export function verifyMobileRuntimeBundle({rootDir,bundleId,descriptorPath,runne
     for(const requirement of validated.requirements){const observation=proof.observations.find(item=>item?.scenario_id===requirement.scenario_id);scenarios.push(scenarioReceipt(observation,requirement,descriptor,validated,bundle));}
     const runtimeSignature={bundle_manifest_sha256:bundle.manifestSha256,codex_sha256:descriptor.runtime.codex_bin.sha256,acp_entry_sha256:descriptor.runtime.acp.entry_sha256,
       acp_package_json_sha256:descriptor.runtime.acp.package_json_sha256,base_sha256:descriptor.base.sha256,developer_sha256:descriptor.developer.sha256,
-      launcher_sha256:descriptor.runtime.launcher.sha256,config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256};
-    const artifacts=Object.fromEntries(Object.entries({base:descriptor.base,developer:descriptor.developer,launcher:descriptor.runtime.launcher,config:descriptor.runtime.config,schema:descriptor.runtime.schema,catalog:descriptor.runtime.catalog}).map(([name,value])=>[name,{path:value.realpath,relative_path:path.relative(validated.privateRoot,value.realpath),sha256:value.sha256,bytes:value.bytes}]));
+      launcher_sha256:descriptor.runtime.launcher.sha256,config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
+      ...(descriptor.runtime.home?{home_sha256:descriptor.runtime.home.sha256}:{})};
+    const artifacts=Object.fromEntries(Object.entries({base:descriptor.base,developer:descriptor.developer,launcher:descriptor.runtime.launcher,config:descriptor.runtime.config,schema:descriptor.runtime.schema,catalog:descriptor.runtime.catalog,
+      ...(descriptor.runtime.home?{home:descriptor.runtime.home}:{})}).map(([name,value])=>[name,{path:value.realpath,relative_path:path.relative(validated.privateRoot,value.realpath),sha256:value.sha256,bytes:value.bytes}]));
     const receipt={schema_version:MOBILE_RUNTIME_RECEIPT_SCHEMA,candidate_id:descriptor.candidate_id,candidate_kind:descriptor.candidate_kind,bundle_id:bundleId,state:'verified',compatible:true,verified_at:verifiedAt,
       stages:{declared:true,prepared:true,native_loaded:true,request_verified:true},bundle:{manifest_sha256:bundle.manifestSha256},
       evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runner_sha256:proof.producer.runner_sha256,actual_exec_receipt_sha256:proof.producer.actual_exec_receipt_sha256,runtime_signature_sha256:sha256(canonicalJson(runtimeSignature))},private_root:validated.privateRoot,artifacts,runtime_signature:runtimeSignature,
-      auxiliary_provider_requests:auxiliary,scenarios,reasons:[]};
+      auxiliary_provider_requests:auxiliary,
+      // What the proof is: a protocol proof on a loopback provider, and what it cannot show.
+      proof_scope:typeof proof.scope==='string'?proof.scope:'protocol',not_covered:Array.isArray(proof.not_covered)?proof.not_covered.filter(item=>typeof item==='string'):[],
+      home_shape:typeof proof.home_shape==='string'?proof.home_shape:'isolated-fixture-home',
+      scenarios,reasons:[]};
     return {...receipt,...writeReceipt(root,receipt)};
   }catch(error){
     const failureDetail=runnerFailureDetail(error);
