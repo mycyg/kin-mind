@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kin-mind"
-version = "0.1.0"
+version = "0.1.1"
 description = "Kin Mind: source-backed memory, affect, desires and personality"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,11 +23,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.25", "ruff>=0.12", "psutil>=6", "reportlab>=4"]
-local-embedding = ["sentence-transformers>=3,<6", "transformers>=4.51,<6"]
+local-embedding = ["sentence-transformers>=3,<6", "transformers>=4.51,<6", "typer>=0.27.2"]
 vector = ["lancedb>=0.25,<1", "numpy>=2", "pyarrow>=18"]
 graph = ["igraph>=0.11,<2"]
 media = ["docling>=2.50,<3", "imageio-ffmpeg>=0.6", "pillow>=11"]
 all = ["kin-mind[vector,graph,media]"]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "local-embedding" }, { extra = "media" }],
+    [{ extra = "local-embedding" }, { extra = "all" }],
+]
 
 [project.scripts]
 eventmem = "eventmem.cli:main"
