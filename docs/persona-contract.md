@@ -21,13 +21,21 @@ from being read. See [reading purpose and evidence classes](architecture.md#read
 The host installs the approved core before SOUL in its instruction projections.
 The file's own hashes and `requires_owner_confirmation` only catch accidental
 damage: whoever rewrites the text can rewrite them too. The owner's approval is a
-record the host keeps outside the file: `{version, core_sha256}`, plus
-`voice_sha256` and `maintenance_sha256` when recorded.
-`readPersonaContract(file, approved)` checks the file's fields, markers and
-hashes, and refuses a file that differs from that record; synchronization passes
-it. The Python consumers load the same scope-bound contract before model
-requests; they check the file's fields and hashes but do not read the host's
-record. Their structured output schemas and evaluator roles remain intact.
+record the host keeps outside the file (mind-config `persona_contract`):
+`{version, core_sha256, voice_sha256, maintenance_sha256}`, all four. A record
+that leaves any of them out approves nothing, not even the text it does name,
+because the part it leaves out could change unseen; readers refuse it as
+`approval-record-incomplete`, the code the deployment rehearsal reports.
+`readPersonaContract(file, approved)` checks the record, then the file's fields,
+markers and hashes, and refuses a file that differs from the record;
+synchronization requires the record and projects nothing without it. The Python
+consumers load the same scope-bound contract before model requests and check the
+file's fields and hashes. The one Python path that puts a canon in place is a
+restore from backup — the library call, `eventmem restore --persona-approval` and
+the service's restore endpoint — and it holds the backup's canon against the
+host's record first (`approve_canon`): with no record, an incomplete one or a
+canon that differs from it, nothing is restored and the canon is left for host
+review. Their structured output schemas and evaluator roles remain intact.
 Quotations remain verbatim, and historical assistant wording is evidence rather
 than a template for the current voice. Metadata exposes the loaded version and
 hashes.
@@ -52,4 +60,8 @@ boundary in their configuration workflow and instructions.
 
 `tests/business/persona-contract.test.mjs` uses only synthetic roles. It covers
 the file's field, marker and hash checks and the rule that instructions begin
-with the approved core ahead of SOUL.
+with the approved core ahead of SOUL. `persona-approval.test.mjs` and
+`test_persona_approval.py` cover the record: an edit of any part is refused under
+the record of the text before it, a record with only the core hash is refused
+outright, and only a complete record issued for the new text lets it in, on the
+host's reader and on each restore entry.

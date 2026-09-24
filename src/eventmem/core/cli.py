@@ -96,6 +96,14 @@ def parser():
             p.add_argument("--port", type=int, default=8319)
         elif command in {"backup", "restore", "export"}:
             p.add_argument("path", type=Path)
+            if command == "restore":
+                p.add_argument(
+                    "--persona-approval",
+                    type=Path,
+                    help="JSON holding the owner's persona approval record under persona_contract "
+                    "(the host's mind-config.json); a backup that carries a persona canon is "
+                    "restored only as that record names it",
+                )
         elif command == "api":
             p.add_argument("method", choices=["GET", "POST", "PUT", "DELETE"])
             p.add_argument("path")
@@ -140,7 +148,11 @@ def main(argv=None):
     elif args.command == "restore":
         from .transfer import restore
 
-        result = restore(args.path, args.root)
+        approval = None
+        if args.persona_approval:
+            given = json.loads(args.persona_approval.read_text())
+            approval = given.get("persona_contract") if isinstance(given, dict) else None
+        result = restore(args.path, args.root, persona_approval=approval)
     elif args.command in {"evaluate", "benchmark"}:
         from .evaluation import benchmark, evaluate
 
