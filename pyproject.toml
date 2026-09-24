@@ -31,7 +31,6 @@ all = ["kin-mind[vector,graph,media]"]
 
 [project.scripts]
 eventmem = "eventmem.cli:main"
-kin-mind = "kin_mind.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/eventmem", "src/kin_mind"]

@@ -192,3 +192,11 @@ test('the minute loop runs one contact tick a minute (AD2-15)',async t=>{
  assert.equal(events.filter(action=>action==='candidate').length,1);
  loop.close();
 });
+test('a group the local check does not release goes back to Kin at once, with no semantic hold (AD2-16)',async()=>{
+ const journal=new Map();let transports=0,checks=0;
+ const send=createContactBatch({read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),
+   preflight:async()=>{checks++;return {state:'pending',reason:'repair'};},send:async()=>{transports++;}});
+ const result=await send({id:'group-1',text:'One\n\nTwo',channel:'wechat'});
+ assert.equal(result.state,'needs-review');assert.equal(checks,1);assert.equal(transports,0);
+ assert.equal(journal.get('group-1').failure.category,'contract');assert.equal(journal.get('group-1').reviewNotBefore,undefined);
+});

@@ -9,15 +9,16 @@ const REFUSED=['duplicate','silent','merged'];
 const BEGUN=['pending','accepted','unconfirmed'];
 const REVIEW_STATES=new Set(['ready','pending','needs-review',...REFUSED]);
 const HOLD_BASE_MS=60000,HOLD_MAX_MS=15*60000;
-const FAILURE_CATEGORIES=new Set(['contract','model-unavailable','source-changed','semantic-hold','model-output','unknown']);
+const FAILURE_CATEGORIES=new Set(['contract','model-unavailable','source-changed','model-output','unknown']);
 const RETRY_CONDITIONS=new Set(['repair-input','backoff','source-change','deepseek-decision','reconcile','none']);
 /** A platform's own refusal code travels as a code and never as a message. */
 const platformCode=record=>{const value=String(record?.platformCode??record?.code??'');return /^[A-Za-z0-9_.:-]{1,64}$/.test(value)?value:undefined;};
 const staticToken=(value,fallback)=>{value=String(value??'');return /^[A-Za-z0-9_.:-]{1,96}$/.test(value)?value:fallback;};
 
 /** Only provider/accounting facts cross the contact receipt. Prompts, provider
- * bodies and exception prose are deliberately not part of this projection. */
-function modelReceipt(record,depth=0) {
+ * bodies and exception prose are deliberately not part of this projection. The host's
+ * contact diagnostics use this same projection (H2b-25). */
+export function modelReceipt(record,depth=0) {
   if(!record||typeof record!=='object'||Array.isArray(record)||depth>2)return undefined;
   const value={};
   for(const key of ['provider','model','reasoning','purpose','request_id','outcome','usage_status','verified_at']) {
@@ -42,11 +43,13 @@ function modelReceipt(record,depth=0) {
 
 function reviewFailure(verdict={},fallback={}) {
   const supplied=verdict.failure&&typeof verdict.failure==='object'?verdict.failure:{};
-  const category=FAILURE_CATEGORIES.has(supplied.category)?supplied.category:(fallback.category??(verdict.transient===true?'unknown':'semantic-hold'));
-  const stage=staticToken(supplied.stage,fallback.stage??(category==='semantic-hold'?'contact-review-semantic':'contact-review-model'));
+  // There is no semantic reviewer any more: a group the local check does not release is a
+  // contract fault that goes back to Kin, never a hold to wait out (AD2-16).
+  const category=FAILURE_CATEGORIES.has(supplied.category)?supplied.category:(fallback.category??(verdict.transient===true?'unknown':'contract'));
+  const stage=staticToken(supplied.stage,fallback.stage??(category==='contract'?'contact-review-contract':'contact-review-model'));
   const code=staticToken(supplied.code,staticToken(verdict.reason,fallback.code??'contact-review-unclassified'));
   const wanted=supplied.retry_condition??supplied.retryCondition??fallback.retry_condition??({
-    contract:'repair-input','model-unavailable':'backoff','source-changed':'source-change','semantic-hold':'deepseek-decision','model-output':'backoff',unknown:'backoff',
+    contract:'repair-input','model-unavailable':'backoff','source-changed':'source-change','model-output':'backoff',unknown:'backoff',
   }[category]);
   const retry_condition=RETRY_CONDITIONS.has(wanted)?wanted:'backoff';
   const receipt=modelReceipt(supplied.model_receipt??supplied.modelReceipt??verdict.receipt);
@@ -57,7 +60,7 @@ function reviewFailure(verdict={},fallback={}) {
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
 export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,
   preflight=async request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))}),
-  verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxHolds=6,maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
+  verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
   const active=new Map();
   const digest=value=>createHash('sha256').update(value).digest('hex');
   // Proactive contact leaves through the Feishu bridge; a channel with no
@@ -167,7 +170,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     // group that is already reviewed is never charged for a second one.
     if(!batch.review&&batch.items.some(x=>x.state==='unsent')) {
       if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
-      const legacyFailures=batch.reviewFailures??(!batch.holds?(batch.backoffs??0):0);
+      const legacyFailures=batch.reviewFailures??0;
       if(legacyFailures>=maxReviewFailures)return needsReview(batch,id,reviewFailure({},
         {category:'unknown',stage:'contact-review-model',code:'legacy-review-failures-exhausted',retry_condition:'deepseek-decision'}));
       if(batch.reviewNotBefore&&now()<batch.reviewNotBefore){batch.state='pending';return result(batch);}
@@ -227,19 +230,16 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     else if(batch.state==='canceled'&&!batch.deliveryStarted&&!batch.items.some(x=>BEGUN.includes(x.state)))batch.safeToRelease=true;
     await write(id,batch);return result(batch);
   }
-  /** Held as a whole: semantic holds and operational failures have independent
-   * finite budgets. Exhaustion parks a wholly unsent group for DS/operator review
-   * instead of pretending the content was rejected or retrying it forever. */
-  async function hold(batch,id,verdict,paid) {
+  /** Not released as a whole. The preflight is a local check now, so a group it does not
+   * release goes back to Kin at once instead of waiting out a semantic hold (AD2-16). Only a
+   * file whose check is not ready yet waits and is asked again, within a finite budget. */
+  async function hold(batch,id,verdict,preflighted) {
     const failure=reviewFailure(verdict);
     batch.failure=failure;batch.lastFailure=failure;
-    if(['contract','source-changed'].includes(failure.category)||verdict.state==='needs-review')return needsReview(batch,id,failure,verdict.reason);
-    const judged=paid&&failure.category==='semantic-hold';
-    if(judged&&(batch.holds=(batch.holds??0)+1)>=maxHolds)return needsReview(batch,id,{...failure,code:'contact-review-held-too-long',retry_condition:'deepseek-decision'},'contact-review-held-too-long');
-    if(paid&&!judged&&(batch.reviewFailures=(batch.reviewFailures??0)+1)>=maxReviewFailures)
+    if(preflighted||['contract','source-changed'].includes(failure.category)||verdict.state==='needs-review')return needsReview(batch,id,failure,verdict.reason);
+    if((batch.reviewFailures=(batch.reviewFailures??0)+1)>=maxReviewFailures)
       return needsReview(batch,id,{...failure,code:'contact-review-failures-exhausted',retry_condition:'deepseek-decision'},'contact-review-failures-exhausted');
-    if(paid)batch.backoffs=(batch.backoffs??0)+1;
-    batch.reviewNotBefore=verdict.retryAt??now()+(verdict.retryAfterMs??Math.min(HOLD_MAX_MS,HOLD_BASE_MS*2**Math.max(0,(batch.backoffs??1)-1)));
+    batch.reviewNotBefore=verdict.retryAt??now()+(verdict.retryAfterMs??Math.min(HOLD_MAX_MS,HOLD_BASE_MS*2**Math.max(0,batch.reviewFailures-1)));
     batch.reason=verdict.reason;batch.state='pending';await write(id,batch);return result(batch);
   }
   async function needsReview(batch,id,failure,reason) {
