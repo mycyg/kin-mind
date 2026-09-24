@@ -1760,8 +1760,6 @@ export class MobileRouter {
     this.state.turn={startedAt:at,inputIds:ids,taskId:data.taskId??null,turnFence:data.turnFence??this.state.executionEpoch};
     for(const id of ids) {
       const record=this.state.inputs[id];if(!record)continue;
-      // Merged into one prompt before it began: one reply answers them all (CR2-LIFE-04).
-      if(ids.length>1)record.promptInputIds=ids;
       if(record.state==='queued'){record.state='accepted';record.acceptedAt=at;}
       if(['accepted','submitting'].includes(record.state)){record.turnStartedAt=at;delete record.turnEndedAt;delete record.stopReason;this.progress.set(id,at);}
       this.settleAcceptance(id,{state:record.state});
@@ -1801,22 +1799,22 @@ export class MobileRouter {
     return false;
   }
   /** The whole reply to an owner input reached the platform, or Kin chose not to
-   * reply. It answers the input it names, the inputs its reply group says it was formed
-   * for (`answeredInputIds`) and the inputs merged into the same native prompt before it
-   * began. Sharing the turn is no evidence: an input steered in after the reply formed is
-   * still owed its own answer (CR-LIFE-06, CR2-LIFE-04). Returns the ids it settled. */
+   * reply. It settles the input its reply group belongs to and the inputs the group
+   * says it answered when the reply was formed (`answeredInputIds`: those merged into its
+   * turn before it began, or steered in before the reply formed); nothing else. Sharing
+   * the turn, or its start time, is no evidence: an input steered in after the reply
+   * formed is still owed its own answer (CR-LIFE-06, CR2-LIFE-04). A group from before
+   * the list existed answers only its own input. Returns the ids it settled. */
   inputAnswered(kind,data) {
     const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
     if(!record)return null;
     const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return null;
     const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
     const settled=[record.id];
-    if(state==='accepted'&&ownerInput(record)) {
-      const named=new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'));
-      for(const id of new Set([...named,...(record.promptInputIds??[])])) {
-        const other=id===record.id?null:this.state.inputs[id];
-        if(other&&ownerInput(other)&&other.state==='accepted'&&!answered(other)){other.answer={state:'covered',by:record.id,basis:named.has(id)?'answered-input-ids':'same-prompt',at};other.settledAt??=at;settled.push(id);}
-      }
+    if(ownerInput(record))for(const id of new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'))) {
+      const other=id===record.id?null:this.state.inputs[id];
+      if(!other||!ownerInput(other)||other.state!=='accepted'||answered(other))continue;
+      other.answer={state:state==='accepted'?'covered':state,by:record.id,basis:'answered-input-ids',at};other.settledAt??=at;settled.push(id);
     }
     return settled;
   }

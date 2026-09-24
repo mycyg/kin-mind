@@ -426,6 +426,11 @@ test('a reply settles the inputs it was formed for, never a later one steered in
   await f.router.dispatch({id:'c',kind:'owner',text:'再补一句'},async()=> 'steered');
   assert.deepEqual(await f.router.observe('reply-complete',{inputId:'b',answeredInputIds:['b','c','a']}),['b','c'],'what the reply group names, and only what is still open');
   assert.deepEqual([f.router.state.inputs.c.answer.state,f.router.state.inputs.c.answer.basis],['covered','answered-input-ids']);
+  // Merged into one prompt is not settled by the start time either: only what the group names.
+  await chat(f,'d','一');await chat(f,'e','二');
+  await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['d','e']});
+  assert.deepEqual(await f.router.observe('reply-complete',{inputId:'e'}),['e'],'a group from before the list answers only its own input');
+  assert.deepEqual(await f.router.observe('reply-choice',{inputId:'d',state:'silent',answeredInputIds:['d']}),['d']);
 });
 
 test('the requeue budget counts across every attempt, taken before the requeue is handed out (CR2-LIFE-05)',async t=>{
