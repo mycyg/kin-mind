@@ -509,7 +509,7 @@ export class MobileRouter {
         } else this.state.actual=runtime;
         if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
         if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-        if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
+        // A proactive contact goes out on the current tier's model, as any turn does (AD1-16).
         record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;this.save('input-preparing',{id:input.id});
         const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
         if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
