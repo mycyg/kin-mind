@@ -146,6 +146,24 @@ def links_fresh(conn, mind, desire):
     return True
 
 
+def current_revisions(conn, mind, revisions):
+    """The traits this map names as they stand now: their current revision where still in force,
+    and without those that are gone or no longer effective (K1-19)."""
+    from .traits import EFFECTIVE, Traits
+    from .traits import installed as ledger_installed
+    if not revisions or not ledger_installed(conn):
+        return {}
+    ledger, current = Traits(mind), {}
+    for identifier in revisions:
+        try:
+            trait = ledger.get(conn, identifier)
+        except Missing:
+            continue
+        if trait["status"] in EFFECTIVE:
+            current[identifier] = trait["revision"]
+    return current
+
+
 def decision_needs_review(conn, scope, plan_id, step, decision):
     """Whether the trait this step's current decision was taken on has moved since.
 

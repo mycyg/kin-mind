@@ -138,6 +138,14 @@ class ActionEvents:
                 queued.append(self.emit(conn, "motivation-review", [name, entry["motivation"].get("episode_id"), until], {
                     "dimension": name, "ended_at": until, "reason": "This short-term drive has run its course",
                     "evidence_ids": [r["record_id"] for r in entry["evidence"]], "agent_version": state["agent_version"]}))
+        from .trait_refs import links_fresh
+        for desire in state["desires"].values():
+            # K1-19: a wish that rested on a trait which has since moved is not ready; Kin is asked
+            # once per trait revision set whether it still holds.
+            if desire.get("trait_revisions") and desire["status"] in {"wanted", "waiting"} and not links_fresh(conn, self.mind, desire):
+                queued.append(self.emit(conn, "wish-review", [desire["id"], "trait", sorted(desire["trait_revisions"].items())], {
+                    "desire_id": desire["id"], "reason": "A trait this wish rested on was revised",
+                    "evidence_ids": [r["record_id"] for r in desire.get("evidence", [])], "agent_version": state["agent_version"]}))
         expired = sorted(d["id"] for d in state["desires"].values()
                          if d["status"] in {"wanted", "waiting", "in_progress"} and timestamp(d["expires_at"]) <= timestamp(now))
         if expired:

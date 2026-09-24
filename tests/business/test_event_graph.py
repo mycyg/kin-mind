@@ -125,3 +125,23 @@ def test_conversation_changes_habits_and_silence_is_per_input(system):
         memory.habits.update({**request,"command_id":"inferred","expected_revision":1,"evidence_ids":[assistant["source_id"]]})
     with pytest.raises(Conflict):
         memory.habits.update({**request,"command_id":"bad-revision","preferences":{"exploration_paused":True}})
+
+
+def test_a_preference_keeps_its_value_while_its_source_needs_review(system):
+    """K1-18: a revised or superseded source marks the preference for review instead of silently
+    restoring the default; a deleted source takes the preference with it."""
+    import json as _json
+    mind, memory, _, _ = system
+    first = memory.ingest({"id": "owner-pause", "kind": "owner-message", "at": mind.clock(), "text": "Please pause your explorations for now."})
+    memory.habits.update({"command_id": "pause", "expected_revision": 0, "evidence_ids": [first["source_id"]],
+                          "reason": "Explicit owner request", "preferences": {"exploration_paused": True}})
+    with mind.engine.db.connect(write=True) as conn:
+        rid = mind._evidence(conn, [first["source_id"]])[0]["record_id"]
+        row = mind.engine._get(conn, rid)
+        row["status"] = "superseded"
+        conn.execute("UPDATE records SET status='superseded',data=? WHERE id=?", (_json.dumps(row), rid))
+    read = memory.habits.read()
+    assert read["preferences"]["exploration_paused"] is True and read["entries"]["exploration_paused"]["needs_review"]
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE sources SET deleted=1 WHERE id=?", (first["source_id"],))
+    assert memory.habits.read()["preferences"]["exploration_paused"] is False

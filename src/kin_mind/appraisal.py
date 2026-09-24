@@ -2309,7 +2309,14 @@ class Appraisals:
 
                     def apply_concerns():
                         for change in proposal.concerns:
-                            self.mind._apply_concern(conn, state, change, eid, effective_version, fallback=roots, allowed=allowed)
+                            result = self.mind._apply_concern(conn, state, change, eid, effective_version, fallback=roots, allowed=allowed)
+                            if (result or {}).get("replayed"):
+                                # A concern decision that changed nothing is recorded as such, never dropped
+                                # without a trace (K3-18).
+                                rejected.append({"section": "concerns", "code": "concern-unchanged-without-new-evidence",
+                                                 "message": "The concern already stands this way and no new source was cited",
+                                                 "concern_id": result.get("concern_id"), "action": change.action})
+                                data["rejected_sections"] = rejected
                     if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery" and proposal.concerns:
                         section("concerns", apply_concerns)
                     wishes = hold("wishes", [] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes,

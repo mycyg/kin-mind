@@ -342,3 +342,44 @@ def test_an_expired_wish_is_shown_for_settlement_and_can_be_settled(setup):
         WishUpdate(desire_id=desire["id"], action="abandon", reason="The moment for it passed")]))
     assert jobs.run_one(reviewer)["state"] == "complete"
     assert mind.read()["desires"][0]["status"] == "abandoned"
+
+
+def test_easing_a_concern_takes_effect_without_a_new_source(setup):
+    """K3-18: easing or archiving is Kin's own judgment and needs no new evidence; a change that
+    alters nothing is a replay."""
+    from kin_mind.continuity import ConcernChange, ContinuityConfig
+    mind, source, _ = setup
+    mind.configure_continuity(ContinuityConfig(command_id="continuity", agent_version="synthetic-v1",
+        expected_revision=mind.read()["revision"], evidence_ids=[source("continuity")], features={"concerns": True}, reason="test"))
+    worry = source("worry")
+    created = mind.manage_concern(ConcernChange(command_id="c1", agent_version="synthetic-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[worry], action="create", key="exam", kind="care", content="Her exam", topic="exam", intensity=60,
+        basis="explicit", confidence=0.9, reason="She is worried"))
+    cid = created["concern_id"]
+    eased = mind.manage_concern(ConcernChange(command_id="c2", agent_version="synthetic-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[worry], action="ease", concern_id=cid, reason="It has faded for me"))
+    assert not eased.get("replayed")
+    again = mind.manage_concern(ConcernChange(command_id="c3", agent_version="synthetic-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[worry], action="ease", concern_id=cid, reason="Still faded"))
+    assert again.get("replayed")
+
+
+def test_a_wish_on_a_moved_trait_asks_again_and_a_confirmation_readies_it(setup):
+    """K1-19: a trait revision no longer strands the wish that rested on it: Kin is asked, and
+    looking at it again rests it on the traits as they stand now."""
+    from kin_mind.actions import ActionEvents
+    from kin_mind.trait_refs import links_fresh
+    mind, source, _ = setup
+    wish(mind, source, "trait-wish", content="Tease her about the tea")
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        did = next(iter(state["desires"]))
+        state["desires"][did]["trait_revisions"] = {"trait_playful": 1}
+        mind._save(conn, state)
+    ActionEvents(mind).crossings()
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='wish-review'").fetchone()[0] == 1
+    mind.manage_desire(DesireChange(command_id="confirm", agent_version="synthetic-v1", expected_revision=mind.read()["revision"],
+                                    evidence_ids=[source("confirm")], action="resume", desire_id=did, reason="Still want to"))
+    with mind.engine.db.connect() as conn:
+        assert links_fresh(conn, mind, mind._load(conn)["desires"][did])

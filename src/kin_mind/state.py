@@ -959,6 +959,14 @@ class Mind(Continuity):
             # An explicit wish reassessment also acknowledges current concern revisions.
             links = self._resolve_concern_links(conn, state, desire["concern_ids"])
             desire["concern_revisions"] = links
+        if desire.get("trait_revisions") and request.action in {"start", "resume", "update", "wait"}:
+            # K1-19: Kin looked at this wish again after a trait it rested on moved. It now rests on
+            # the traits as they stand, so it is ready again when she says so.
+            from .trait_refs import current_revisions, record
+            desire["trait_revisions"] = current_revisions(conn, self, desire["trait_revisions"])
+            if desire["trait_revisions"]:
+                record(conn, self.scope.key(), "desire", did, desire["trait_revisions"],
+                       dependent_revision=desire["revision"], at=at)
         desire.update(
             evidence=desire["evidence"] if link_only else refs,
             reason=desire["reason"] if link_only else request.reason,

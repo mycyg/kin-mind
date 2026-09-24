@@ -311,7 +311,10 @@ class Continuity:
                 (self.scope.key(), cid, evidence_key(r)),
             ).fetchone()
         ]
-        if current and not new_refs:
+        settles = {"ease": "easing", "archive": "archived"}.get(change.action)
+        if current and not new_refs and (not settles or current["status"] == settles):
+            # Easing or archiving is Kin's own judgment about a concern and needs no new source
+            # (K3-18); it is a replay only when the concern already stands that way.
             return {
                 "concern_id": cid,
                 "concern_revision": current["revision"],
