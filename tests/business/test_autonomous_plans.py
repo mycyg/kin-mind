@@ -275,7 +275,7 @@ def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
     assert plans.defer_owner_task(request) == created
     # CR-MIND-03: a source not in memory yet is the router's to retry; a time already past is due now.
     unknown = plans.defer_owner_task({**request, "task_id": "task-2", "input_ids": ["wechat:never-seen"]})
-    assert unknown == {"state": "waiting", "reason": "owner-source-unavailable", "retry": True}
+    assert unknown == {"state": "retry", "reason": "owner-source-unavailable"}
     past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
     assert past["state"] == "created" and past["due"] == "now"
     late = plans.read(past["planId"])["plans"][0]
@@ -517,24 +517,29 @@ def test_a_deployment_leaves_decided_steps_ready_and_wakes_no_plan(env):
     assert reasons[first["id"]] is None and reasons[second["id"]] is None
 
 
-def test_a_deferral_that_can_never_become_a_plan_is_handed_to_kin(env):
-    """CR-MIND-03: a permanent failure is kept as a durable event, one per task, and reaches Kin's
-    next assessment as evidence of its own; the router's last try settles the missing-source case."""
-    from kin_mind.appraisal import Appraisals
+def test_a_deferral_answers_whether_it_can_ever_be_a_plan(env):
+    """CR-MIND-03 with WS3's router: a passing failure answers `retry`; one that can never be a
+    plan answers `needs-kin` with a stable reason and `permanent`, which the router keeps and tells
+    Kin once. The mind tells her nothing itself; a plan already made answers `created` again even
+    after its time has passed."""
     mind, plans, source, clock, initial = env
     later = (clock[0] + timedelta(hours=3)).isoformat()
-    handed = plans.defer_owner_task({"task_id": "task-9", "goal": "Book the tickets", "not_before": later,
-                                     "input_ids": ["wechat:never-seen"], "final": True})
-    assert handed["state"] == "needs-kin" and handed["reason"] == "owner-source-unavailable" and handed["handed"]
-    assert plans.defer_owner_task({"task_id": "task-9", "goal": "Book the tickets", "not_before": later,
-                                   "input_ids": ["wechat:never-seen"], "final": True})["handed"] == handed["handed"]
-    jobs = Appraisals(mind)
-    actions = ActionEvents(mind)
-    actions.drain(jobs)
-    with mind.engine.db.connect() as conn:
-        event = json.loads(conn.execute("SELECT data FROM mind_action_events WHERE id=?", (handed["handed"],)).fetchone()[0])
-        job = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (event["job_id"],)).fetchone()[0])
-        refs = mind._evidence(conn, [event["source_id"]])
-        text = mind.engine._get(conn, refs[0]["record_id"])["content"]
-    assert job["stimulus"] == "deferral-failed" and event["source_id"] in job["evidence_ids"]
-    assert "Book the tickets" in text and "owner-source-unavailable" in text
+
+    def events():
+        with mind.engine.db.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM mind_action_events").fetchone()[0]
+    before = events()
+    request = {"task_id": "task-9", "request": "Book the tickets", "not_before": later, "evidence_ids": ["wechat:task-9"]}
+    assert plans.defer_owner_task(request) == {"state": "retry", "reason": "owner-source-unavailable"}
+    MemoryContinuity(mind).ingest({"id": "wechat:task-9", "kind": "owner-message", "text": "Book the tickets", "at": mind.clock()})
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    clock[0] += timedelta(hours=4)
+    again = plans.defer_owner_task(request)
+    assert again["state"] == "created" and again["planId"] == created["planId"]
+    MemoryContinuity(mind).configure({"autonomous_plans": False})
+    refused = plans.defer_owner_task({**request, "task_id": "task-10"})
+    assert refused == {"state": "needs-kin", "reason": "autonomous-plans-disabled", "permanent": True}
+    assert events() == before
+
+

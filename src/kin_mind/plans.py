@@ -230,8 +230,13 @@ class AutonomousPlans:
         has released the work lock, and at her `not_before` the plan comes up for her review, where
         she decides whether and how to return to it. Its source is 小光's own message.
 
-        Returns {"state": "created", "planId"} or, when the plan cannot be written here,
-        {"state": "needs-kin", "reason"}: Kin then keeps it herself (manage_autonomous_plan)."""
+        Answers, each distinguishable by the router (WS3, CR-MIND-03):
+        - {"state": "created", "planId"}, with "due": "now" when its time has already passed;
+        - {"state": "retry", "reason"}: a passing failure (the owner's input not yet in memory);
+          the router tries again on its own schedule and alone decides when to stop;
+        - {"state": "needs-kin", "reason", "permanent": true}: this deferral can never be a plan
+          here. The router keeps that and tells Kin once, in her next turn; nothing here tells
+          her a second time."""
         task_id = str(request.get("task_id") or "").strip()
         # The router names the task by what was asked (`request`); `goal` is the same field.
         goal = str(request.get("goal") or request.get("request") or "").strip()
@@ -250,7 +255,14 @@ class AutonomousPlans:
         evidence = []
         with self.engine.db.connect() as conn:
             if not enabled(conn, self.scope, "autonomous_plans"):
-                return self._return_to_kin(task_id, goal, "autonomous-plans-disabled", [])
+                return self._refused("autonomous-plans-disabled")
+            # Asked again after the plan was made (the router lost its receipt): the same plan,
+            # even when its time has passed in between and the change would read differently.
+            made = conn.execute("SELECT data FROM mind_plans WHERE id=? AND scope=?",
+                                ("plan_" + digest([self.scope, "deferred-task:" + task_id])[:32], self.scope)).fetchone()
+            if made:
+                plan = json.loads(made[0])
+                return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"]}
             inputs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone())
             for identifier in named:
                 row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
@@ -261,11 +273,8 @@ class AutonomousPlans:
                     evidence.append(identifier)
         evidence = list(dict.fromkeys(evidence))[:24]
         if not evidence:
-            # The owner's input may not have reached memory yet: the router tries again. Only its
-            # last try (`final`) makes this a fact for Kin.
-            if not request.get("final"):
-                return {"state": "waiting", "reason": "owner-source-unavailable", "retry": True}
-            return self._return_to_kin(task_id, goal, "owner-source-unavailable", [])
+            # The owner's input may not have reached memory yet: it passes with time.
+            return {"state": "retry", "reason": "owner-source-unavailable"}
         try:
             plan = self.manage({
                 "command_id": "defer-task:" + task_id, "action": "create", "key": "deferred-task:" + task_id,
@@ -274,21 +283,20 @@ class AutonomousPlans:
                 "steps": [{"id": "return", "actor": "contact", "goal": "回到小光交给我的事：" + goal,
                            "completion": "我已回到这件事，并如实说明做到哪一步",
                            **({"not_before": not_before} if future else {}), "owner_request_id": task_id}]})
-        except (Conflict, Missing, ValueError) as error:
-            return self._return_to_kin(task_id, goal, ("plan-refused:" + str(error))[:160], evidence)
+        except Conflict as error:
+            return self._refused("plan-refused:conflict", error)
+        except Missing as error:
+            return self._refused("plan-refused:missing", error)
+        except ValueError as error:
+            return self._refused("plan-refused:invalid", error)
         return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"],
                 **({} if future else {"due": "now"})}
 
-    def _return_to_kin(self, task_id, goal, reason, evidence):
-        """CR-MIND-03: a deferral that can never become a plan is kept, and handed to Kin: a durable
-        internal event, one per task, whose appraisal puts the fact into her next assessment."""
-        from .actions import ActionEvents
-        with self.engine.db.connect(write=True) as conn:
-            version = self.mind._load(conn)["agent_version"]
-            event_id = ActionEvents(self.mind).emit(conn, "deferral-failed", ["deferral-failed", task_id], {
-                "evidence_ids": evidence, "agent_version": version, "task_id": task_id, "goal": goal[:500],
-                "failure": reason, "reason": "小光交给我、我决定晚点再做的事没能记成计划（" + reason + "），需要我自己决定怎么接上"})
-        return {"state": "needs-kin", "reason": reason, "handed": event_id}
+    @staticmethod
+    def _refused(reason, error=None):
+        """A deferral that can never become a plan here: a stable code, never retried."""
+        return {"state": "needs-kin", "reason": reason, "permanent": True,
+                **({"detail": str(error)[:160]} if error is not None else {})}
 
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
