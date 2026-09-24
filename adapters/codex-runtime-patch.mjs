@@ -73,8 +73,11 @@ const runtimeMethods = `
     const turn = state.kinTurn, reply = state.kinReply;
     if (turn?.status === "inProgress" && reply?.turnId !== turn.turnId) return { known: true, source: "acp", turnId: turn.turnId, status: "inProgress", text: "", inputText: "" };
     if (reply) return { known: true, source: "acp", turnId: reply.turnId, status: reply.status, text: reply.final ?? reply.last ?? "", inputText: reply.inputs.join("\\n") };
-    // A restarted ACP has seen no turn yet: read the newest native turn, one only.
-    const page = await this.codexAcpClient.appServerClient.threadTurnsList({threadId: sessionId, limit: 1, sortDirection: "desc", itemsView: "full"});
+    // A restarted ACP has seen no turn yet: read the newest native turn, one only. A
+    // thread with no persisted turn yet (a fresh session) has no history to read.
+    let page;
+    try { page = await this.codexAcpClient.appServerClient.threadTurnsList({threadId: sessionId, limit: 1, sortDirection: "desc", itemsView: "full"}); }
+    catch { return { known: false, reason: "native-history-unavailable" }; }
     const last = page.data[0];
     const messages = (last?.items ?? []).filter(item => item.type === "agentMessage");
     const item = messages.findLast(item => item.phase === "final_answer") ?? messages.at(-1);
