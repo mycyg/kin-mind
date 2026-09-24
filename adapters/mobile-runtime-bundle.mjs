@@ -21,6 +21,20 @@ const hex64=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
 const candidateId=value=>typeof value==='string'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
 export const canonicalJson=value=>JSON.stringify(canonical(value));
+const releaseParts=value=>/(\d+)\.(\d+)\.(\d+)/.exec(String(value??''))?.slice(1).map(Number)??null;
+/** -1, 0 or 1 comparing two release versions ("codex-cli 0.156.1" or "0.156.1"); null when either is not one. */
+export function compareReleases(left,right){
+  const a=releaseParts(left),b=releaseParts(right);if(!a||!b)return null;
+  for(let i=0;i<3;i++)if(a[i]!==b[i])return a[i]<b[i]?-1:1;return 0;
+}
+/** Whether a version satisfies a caret range such as ^0.153.4 (true / false), or null
+ * for a range of another form. */
+export function caretRangeSatisfied(range,version){
+  const floor=/^\^(\d+\.\d+\.\d+)$/.exec(String(range??'').trim())?.[1],v=releaseParts(version);if(!floor||!v)return null;
+  const [major,minor,patch]=releaseParts(floor);
+  if(compareReleases(v.join('.'),floor)<0)return false;
+  return major>0?v[0]===major:minor>0?v[0]===0&&v[1]===minor:v[0]===0&&v[1]===0&&v[2]===patch;
+}
 export const mobileRuntimeDigest=value=>sha256(Buffer.isBuffer(value)||typeof value==='string'?value:canonicalJson(value));
 
 function syncDirectory(directory){let fd;try{fd=fs.openSync(directory,'r');fs.fsyncSync(fd);}catch(error){if(!['EINVAL','ENOTSUP','EISDIR','EBADF'].includes(error.code))throw error;}finally{if(fd!==undefined)fs.closeSync(fd);}}
@@ -144,7 +158,27 @@ function copyOwnedAcpEntry(descriptor,vendorEntry,ownedEntry){
   return {source_vendor_sha256:sha256(vendor),generated_sha256:sha256(owned),descriptor_sha256:sha256(Buffer.from(canonicalJson({sha256:descriptor.sha256,bytes:descriptor.bytes,source_vendor_sha256:descriptor.source_vendor_sha256,required_markers:descriptor.required_markers}))),markers};
 }
 
-function listRegularFiles(root,{exclude=[]}={}){
+// Large bundle files are hashed in full when a bundle is prepared, verified and
+// activated. Activation also records their file identity (device, inode, size,
+// modification and change times) as a seal; resolving the active runtime (every
+// app-server start, service start and health check) hashes the small files and
+// compares a sealed file's identity instead of reading it (N1-12). Writing a file
+// in place changes its ctime, so a seal cannot hide an edit; without a matching
+// seal every file is hashed as before.
+const SEAL_MIN_BYTES=1024*1024;
+const fileIdentity=stat=>({dev:stat.dev,ino:stat.ino,bytes:stat.size,mtime_ms:stat.mtimeMs,ctime_ms:stat.ctimeMs});
+function sealFile(root,bundleId){return path.join(root,'seals',bundleId+'.json');}
+// The identities come from the full validation itself (taken before each read), so a
+// file that changed after it was hashed does not match its seal.
+function writeBundleSeal(root,bundle){
+  writeJsonStrict(sealFile(root,bundle.manifest.bundle_id),{schema:1,manifest_sha256:bundle.manifestSha256,files:bundle.hashedIdentities});
+}
+function readBundleSeal(root,pointer){
+  try{const seal=JSON.parse(fs.readFileSync(sealFile(root,pointer.bundle_id),'utf8'));
+    return seal?.schema===1&&seal.manifest_sha256===pointer.manifest_sha256&&seal.files&&typeof seal.files==='object'?seal.files:null;}catch{return null;}
+}
+
+function listRegularFiles(root,{exclude=[],seal=null,identities=null}={}){
   const excluded=new Set(exclude),files=[];
   const walk=relative=>{
     const absolute=path.join(root,relative),stat=fs.lstatSync(absolute);
@@ -152,7 +186,11 @@ function listRegularFiles(root,{exclude=[]}={}){
     if(stat.isDirectory()){for(const name of fs.readdirSync(absolute).sort())walk(path.join(relative,name));return;}
     if(!stat.isFile())throw Error('Runtime bundle contains a special file');
     const portable=relative.split(path.sep).join('/');if(excluded.has(portable))return;
-    const bytes=fs.readFileSync(absolute);files.push({path:portable,bytes:bytes.length,mode:modeOf(stat),sha256:sha256(bytes)});
+    const sealed=seal?.[portable];
+    if(sealed&&hex64(sealed.sha256)&&canonicalJson(fileIdentity(stat))===canonicalJson({dev:sealed.dev,ino:sealed.ino,bytes:sealed.bytes,mtime_ms:sealed.mtime_ms,ctime_ms:sealed.ctime_ms})){
+      files.push({path:portable,bytes:stat.size,mode:modeOf(stat),sha256:sealed.sha256});return;}
+    const bytes=fs.readFileSync(absolute),digest=sha256(bytes);files.push({path:portable,bytes:bytes.length,mode:modeOf(stat),sha256:digest});
+    if(identities&&stat.size>=SEAL_MIN_BYTES)identities[portable]={sha256:digest,...fileIdentity(stat)};
   };
   for(const name of fs.readdirSync(root).sort())walk(name);
   return files.sort((a,b)=>a.path.localeCompare(b.path));
@@ -212,14 +250,17 @@ function validateBundledClosure(bundle,manifest){
   if(canonicalJson(compact(observed))!==canonicalJson(compact(manifest.packages)))throw Error('Bundled ACP dependency closure changed');
 }
 
-export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
+export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false,seal=null}={}){
   const lstat=fs.lstatSync(bundleDir);if(lstat.isSymbolicLink()||!lstat.isDirectory())throw Error('Runtime bundle must be a real directory');
   const bundle=fs.realpathSync(bundleDir),manifestFile=path.join(bundle,'manifest.json'),manifestBytes=fs.readFileSync(manifestFile),manifest=JSON.parse(manifestBytes);
   validateManifestShape(manifest);if(path.basename(bundle)!==manifest.bundle_id)throw Error('Runtime bundle directory does not match its manifest');
-  const observed=listRegularFiles(bundle,{exclude:['manifest.json']});if(!exactFiles(observed,manifest.files))throw Error('Runtime bundle bytes differ from manifest');
+  const hashedIdentities={},observed=listRegularFiles(bundle,{exclude:['manifest.json'],seal,identities:hashedIdentities});if(!exactFiles(observed,manifest.files))throw Error('Runtime bundle bytes differ from manifest');
   const entry=path.join(bundle,safeRelative(manifest.runtime.acp.entry_path,'ACP entry'));ensureInside(bundle,entry,'ACP entry');
   const vendorEntry=path.join(bundle,safeRelative(manifest.runtime.acp.vendor_entry_path,'ACP vendor entry'));ensureInside(bundle,vendorEntry,'ACP vendor entry');
-  const source=fs.readFileSync(entry,'utf8');for(const marker of REQUIRED_OWNED_ACP_MARKERS)if(count(source,marker)!==1)throw Error('Bundled ACP owned patch is missing or duplicated');
+  // Every marker recorded when the entry was built must still be present once.
+  const source=fs.readFileSync(entry,'utf8'),recorded=manifest.runtime.acp.owned_entry?.markers??[];
+  if(!Array.isArray(recorded))throw Error('Bundled ACP marker record is invalid');
+  for(const marker of new Set([...REQUIRED_OWNED_ACP_MARKERS,...recorded]))if(typeof marker!=='string'||!marker||count(source,marker)!==1)throw Error('Bundled ACP owned patch is missing or duplicated');
   if(sha256(fs.readFileSync(entry))!==manifest.runtime.acp.entry_sha256)throw Error('Bundled ACP entry digest changed');
   if(sha256(fs.readFileSync(vendorEntry))!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.source_vendor_sha256!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.generated_sha256!==manifest.runtime.acp.entry_sha256)throw Error('Vendor and owned ACP bytes are not independently bound');
   validateBundledClosure(bundle,manifest);
@@ -231,7 +272,7 @@ export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
     fs.accessSync(helper,fs.constants.X_OK);
   }
   if(executeBinary&&codexVersion(binary)!==manifest.runtime.codex.version)throw Error('Bundled Codex version changed');
-  return {bundleDir:bundle,manifestPath:manifestFile,manifest,manifestSha256:sha256(manifestBytes),state:'prepared'};
+  return {bundleDir:bundle,manifestPath:manifestFile,manifest,manifestSha256:sha256(manifestBytes),state:'prepared',hashedIdentities};
 }
 
 function validateUtf8(bytes,label,{maxBytes=1024*1024,lf=false}={}){
@@ -278,6 +319,8 @@ export function validateMobileRuntimeCandidateDescriptor(descriptor,{bundle,mani
   const config=validateLocalArtifact(descriptor.runtime?.config,privateRoot,'Runtime config',{json:true,maxBytes:1024*1024});
   const schema=validateLocalArtifact(descriptor.runtime?.schema,privateRoot,'Native schema',{json:true,maxBytes:16*1024*1024});
   const catalog=validateLocalArtifact(descriptor.runtime?.catalog,privateRoot,'Model catalog',{json:true,maxBytes:16*1024*1024});
+  // Optional in older descriptors: the Codex home settings the proof runs on.
+  const home=descriptor.runtime?.home?validateLocalArtifact(descriptor.runtime.home,privateRoot,'Codex home settings',{text:true,maxBytes:256*1024}):null;
   if(descriptor.runtime?.codex_bin?.sha256!==bundle.manifest.files.find(file=>file.path===bundle.manifest.runtime.codex.path)?.sha256||descriptor.runtime?.codex_bin?.version!==bundle.manifest.runtime.codex.version)throw Error('Candidate Codex identity changed');
   if(descriptor.runtime?.acp?.entry_sha256!==bundle.manifest.runtime.acp.entry_sha256||descriptor.runtime?.acp?.version!==bundle.manifest.runtime.acp.version||descriptor.runtime?.acp?.package_json_sha256!==bundle.manifest.runtime.acp.package_json_sha256)throw Error('Candidate ACP identity changed');
   if(descriptor.candidate_kind==='mobile-main-maintenance'){
@@ -292,9 +335,13 @@ export function validateMobileRuntimeCandidateDescriptor(descriptor,{bundle,mani
   }
   const requirements=requiredScenarioRequirements(descriptor),profiles=Array.isArray(descriptor.expected_profiles)?descriptor.expected_profiles:[];
   for(const requirement of requirements){if(!candidateId(requirement.scenario_id)||!['native_loaded','request_verified'].includes(requirement.phase)||!['accepted','rejected'].includes(requirement.outcome))throw Error('Invalid runtime scenario requirement');}
-  for(const profile of profiles){if(!candidateId(profile.scenario_id)||typeof profile.checkpoint!=='string'||!profile.checkpoint||typeof profile.model!=='string'||typeof profile.provider!=='string'||typeof profile.reasoning_effort!=='string'||!['on','off','unknown'].includes(profile.fast_mode)||typeof profile.canonical_id!=='string'||typeof profile.canonical_match!=='boolean'||!profile.service_tier_expectation||!Object.hasOwn(profile.service_tier_expectation,'preference')||!Object.hasOwn(profile.service_tier_expectation,'actual'))throw Error('Invalid expected runtime profile');}
+  // canonical_id, canonical_match and an expected actual tier are optional: a
+  // profile expects only what a request can show.
+  for(const profile of profiles){if(!candidateId(profile.scenario_id)||typeof profile.checkpoint!=='string'||!profile.checkpoint||typeof profile.model!=='string'||typeof profile.provider!=='string'||typeof profile.reasoning_effort!=='string'||!['on','off','unknown'].includes(profile.fast_mode)||
+    (profile.canonical_id!==undefined&&typeof profile.canonical_id!=='string')||(profile.canonical_match!==undefined&&typeof profile.canonical_match!=='boolean')||
+    !profile.service_tier_expectation||!['fast','default'].includes(profile.service_tier_expectation.preference))throw Error('Invalid expected runtime profile');}
   if(descriptor.candidate_kind==='mobile-main-maintenance')for(const requirement of requirements.filter(item=>item.phase==='request_verified'&&item.outcome==='accepted'))if(!profiles.some(profile=>profile.scenario_id===requirement.scenario_id))throw Error('A main-session request scenario lacks an expected runtime profile');
-  return {privateRoot,base,developer,launcher,config,schema,catalog,requirements,profiles};
+  return {privateRoot,base,developer,launcher,config,schema,catalog,home,requirements,profiles};
 }
 
 function observedRuntimeDigests(observation,descriptor,bundle){
@@ -303,7 +350,7 @@ function observedRuntimeDigests(observation,descriptor,bundle){
   const expected={codex_sha256:descriptor.runtime.codex_bin.sha256,acp_entry_sha256:descriptor.runtime.acp.entry_sha256,
     acp_package_json_sha256:descriptor.runtime.acp.package_json_sha256,base_sha256:descriptor.base.sha256,developer_sha256:descriptor.developer.sha256,
     config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
-    bundle_manifest_sha256:bundle.manifestSha256};
+    bundle_manifest_sha256:bundle.manifestSha256,...(descriptor.runtime.home?{home_sha256:descriptor.runtime.home.sha256}:{})};
   for(const [key,value] of Object.entries(expected))if(native[key]!==value)throw Error('Native runtime loaded different '+key);
 }
 
@@ -312,7 +359,7 @@ function validateProfile(expected,observed){
   for(const [expectedKey,observedKey] of [['model','model'],['provider','provider'],['reasoning_effort','reasoning_effort'],['fast_mode','fast_mode'],['canonical_id','canonical_id']])if(expected[expectedKey]!==undefined&&observed[observedKey]!==expected[expectedKey])throw Error('Runtime profile '+expectedKey+' changed');
   const tier=expected.service_tier_expectation;
   if(tier&&observed.service_tier_preference!==tier.preference)throw Error('Configured service-tier preference changed');
-  if(tier&&observed.actual_service_tier!==tier.actual)throw Error('Actual service tier changed');
+  if(tier&&Object.hasOwn(tier,'actual')&&observed.actual_service_tier!==tier.actual)throw Error('Actual service tier changed');
   if(expected.canonical_match!==undefined&&observed.canonical_match!==expected.canonical_match)throw Error('Canonical runtime identity changed');
 }
 
@@ -351,11 +398,12 @@ function scenarioReceipt(observation,requirement,descriptor,validated,bundle){
       turn_sha256:request.turn_sha256,rpc_receipt_sha256:request.rpc_receipt_sha256,thread_id_sha256:sha256(request.thread_id),session_id_sha256:sha256(request.session_id),
       instruction_sources_sha256:sha256(canonicalJson(request.instruction_sources??[])),tool_definitions:request.tools?.definitions??null,tool_calls:request.tools?.calls??null,tool_executions:request.tools?.executions??null,
       supplemental_developer_count:request.capture.supplemental_developer_count??0,
-      supplemental_developer_layers:(request.capture.supplemental_developer_layers??[]).map(layer=>({sha256:layer.sha256,bytes:layer.bytes,preview:layer.preview})),
+      supplemental_developer_kinds:request.capture.supplemental_developer_kinds??null,
+      supplemental_developer_layers:(request.capture.supplemental_developer_layers??[]).map(layer=>({...(layer.kind?{kind:layer.kind}:{}),sha256:layer.sha256,bytes:layer.bytes,preview:layer.preview})),
       ...(request.tools?.output_sha256?{tool_output_sha256:request.tools.output_sha256,tool_call_id_sha256:request.tools.call_id_sha256}:{})})),
     ...(observation.compaction?{compaction:{raw_request_sha256:observation.compaction.raw_request_sha256,compact_prompt_sha256:observation.compaction.compact_prompt_sha256,provider_requests:observation.compaction.provider_requests}}:{}),
     profiles:(observation.profiles??[]).map(profile=>({checkpoint:profile.checkpoint,model:profile.model,provider:profile.provider,reasoning_effort:profile.reasoning_effort,
-      fast_mode:profile.fast_mode,service_tier_preference:profile.service_tier_preference,actual_service_tier:profile.actual_service_tier,canonical_id:profile.canonical_id,canonical_match:profile.canonical_match}))};
+      fast_mode:profile.fast_mode,service_tier_preference:profile.service_tier_preference}))};
 }
 
 function runnerFailureDetail(error){
@@ -399,12 +447,22 @@ export function verifyMobileRuntimeBundle({rootDir,bundleId,descriptorPath,runne
     for(const requirement of validated.requirements){const observation=proof.observations.find(item=>item?.scenario_id===requirement.scenario_id);scenarios.push(scenarioReceipt(observation,requirement,descriptor,validated,bundle));}
     const runtimeSignature={bundle_manifest_sha256:bundle.manifestSha256,codex_sha256:descriptor.runtime.codex_bin.sha256,acp_entry_sha256:descriptor.runtime.acp.entry_sha256,
       acp_package_json_sha256:descriptor.runtime.acp.package_json_sha256,base_sha256:descriptor.base.sha256,developer_sha256:descriptor.developer.sha256,
-      launcher_sha256:descriptor.runtime.launcher.sha256,config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256};
-    const artifacts=Object.fromEntries(Object.entries({base:descriptor.base,developer:descriptor.developer,launcher:descriptor.runtime.launcher,config:descriptor.runtime.config,schema:descriptor.runtime.schema,catalog:descriptor.runtime.catalog}).map(([name,value])=>[name,{path:value.realpath,relative_path:path.relative(validated.privateRoot,value.realpath),sha256:value.sha256,bytes:value.bytes}]));
+      launcher_sha256:descriptor.runtime.launcher.sha256,config_sha256:descriptor.runtime.config.sha256,schema_sha256:descriptor.runtime.schema.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
+      ...(descriptor.runtime.home?{home_sha256:descriptor.runtime.home.sha256}:{})};
+    const artifacts=Object.fromEntries(Object.entries({base:descriptor.base,developer:descriptor.developer,launcher:descriptor.runtime.launcher,config:descriptor.runtime.config,schema:descriptor.runtime.schema,catalog:descriptor.runtime.catalog,
+      ...(descriptor.runtime.home?{home:descriptor.runtime.home}:{})}).map(([name,value])=>[name,{path:value.realpath,relative_path:path.relative(validated.privateRoot,value.realpath),sha256:value.sha256,bytes:value.bytes}]));
     const receipt={schema_version:MOBILE_RUNTIME_RECEIPT_SCHEMA,candidate_id:descriptor.candidate_id,candidate_kind:descriptor.candidate_kind,bundle_id:bundleId,state:'verified',compatible:true,verified_at:verifiedAt,
       stages:{declared:true,prepared:true,native_loaded:true,request_verified:true},bundle:{manifest_sha256:bundle.manifestSha256},
       evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runner_sha256:proof.producer.runner_sha256,actual_exec_receipt_sha256:proof.producer.actual_exec_receipt_sha256,runtime_signature_sha256:sha256(canonicalJson(runtimeSignature))},private_root:validated.privateRoot,artifacts,runtime_signature:runtimeSignature,
-      auxiliary_provider_requests:auxiliary,scenarios,reasons:[]};
+      auxiliary_provider_requests:auxiliary,
+      // What the proof is: a protocol proof on a loopback provider, and what it cannot show.
+      proof_scope:typeof proof.scope==='string'?proof.scope:'protocol',not_covered:Array.isArray(proof.not_covered)?proof.not_covered.filter(item=>typeof item==='string'):[],
+      home_shape:typeof proof.home_shape==='string'?proof.home_shape:'isolated-fixture-home',
+      // The ACP package declares the Codex releases it was built for; a bundle outside
+      // that range runs on the strength of this native proof, and says so (N1-09).
+      compatibility_range:{acp_declared:bundle.manifest.runtime.acp.declared_codex_range??null,codex:bundle.manifest.runtime.codex.version,
+        satisfied:caretRangeSatisfied(bundle.manifest.runtime.acp.declared_codex_range,bundle.manifest.runtime.codex.version),accepted_by:'native-proof'},
+      scenarios,reasons:[]};
     return {...receipt,...writeReceipt(root,receipt)};
   }catch(error){
     const failureDetail=runnerFailureDetail(error);
@@ -435,7 +493,7 @@ function validateReceiptArtifacts(receipt){
 export function resolveActiveMobileRuntime({rootDir,allowPreviousIndex=false}={}){
   const root=mobileRuntimeRoot(rootDir),indexFile=activationFile(root),loaded=allowPreviousIndex?loadJson(indexFile,{validate:validActivationIndex}):{...readJsonFile(indexFile),source:'current'};
   const index=loaded.value??(loaded.state==='ok'?loaded.value:null);if(!validActivationIndex(index))throw Error('No verified mobile runtime is active');
-  const bundle=validateMobileRuntimeBundle(path.join(root,'versions',index.current.bundle_id));if(bundle.manifestSha256!==index.current.manifest_sha256)throw Error('Active runtime manifest changed');
+  const bundle=validateMobileRuntimeBundle(path.join(root,'versions',index.current.bundle_id),{seal:readBundleSeal(root,index.current)});if(bundle.manifestSha256!==index.current.manifest_sha256)throw Error('Active runtime manifest changed');
   const receipt=readReceiptBound(root,index.current),privateRoot=validateReceiptArtifacts(receipt.receipt),artifact=name=>receipt.receipt.artifacts[name].path;
   return {root,indexPath:indexFile,indexSource:loaded.source??'current',index,bundleDir:bundle.bundleDir,manifest:bundle.manifest,receipt:receipt.receipt,privateRoot,
     codexRelativePath:bundle.manifest.runtime.codex.path,acpEntryRelativePath:bundle.manifest.runtime.acp.entry_path,catalogRelativePath:receipt.receipt.artifacts.catalog.relative_path,
@@ -457,14 +515,23 @@ export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,
     if(expectedRevision!==null&&(current?.revision??0)!==expectedRevision)throw Error('Activation revision changed');
     if(current&&canonicalJson(current.current)===canonicalJson(pointer))return {index:current,changed:false};
     const index={schema_version:MOBILE_RUNTIME_ACTIVATION_SCHEMA,revision:(current?.revision??0)+1,activated_at:activatedAt,current:pointer,previous:current?.current??null};
-    writeIndex(activationFile(root),index,{previous:true,pretty:true,mode:0o600});return {index,changed:true};
+    writeIndex(activationFile(root),index,{pretty:true,mode:0o600});return {index,changed:true};
   },reconcile:async()=>({state:'needs-retry',reason:'interrupted-activation-kept-existing-index'})});
+  // The bundle was hashed in full above; its seal lets later resolves skip that.
+  if(result.state==='ran')writeBundleSeal(root,bundle);
   if(result.state!=='ran')return {state:result.state,...result.value};return {state:result.value.changed?'activated':'already-active',index:result.value.index};
 }
 
-export async function rollbackMobileRuntimeBundle({rootDir,expectedRevision=null,activatedAt=new Date().toISOString()}){
+/** Back to the previous verified runtime. A previous runtime with an older Codex is
+ * refused unless `allowDowngrade`: the current one has written the main thread, and an
+ * older binary reading it is unproven (N1-09). Prove it on the thread first. */
+export async function rollbackMobileRuntimeBundle({rootDir,expectedRevision=null,activatedAt=new Date().toISOString(),allowDowngrade=false}){
   const active=resolveActiveMobileRuntime({rootDir});if(!active.index.previous)throw Error('No previous verified mobile runtime is recorded');
   const previous=active.index.previous,receipt=readReceiptBound(active.root,previous);
+  const from=active.manifest.runtime.codex.version,to=readJsonStrict(path.join(active.root,'versions',previous.bundle_id,'manifest.json'),'Previous runtime manifest').runtime?.codex?.version;
+  const order=compareReleases(to,from);
+  if(order!==0&&order!==1&&!allowDowngrade)throw Error(order===null?`Cannot compare Codex ${to} with ${from}; check, then roll back with --allow-downgrade`
+    :`Rollback would run ${to} on a thread ${from} has written; prove ${to} on this thread first, then roll back with --allow-downgrade`);
   return activateMobileRuntimeBundle({rootDir,bundleId:previous.bundle_id,receiptPath:receipt.file,expectedRevision:expectedRevision??active.index.revision,activatedAt});
 }
 
@@ -483,7 +550,8 @@ export async function mobileRuntimeBundleCli(argv=process.argv.slice(2)){
   if(command==='prepare')result=prepareMobileRuntimeBundle(readJsonStrict(requiredArg(args,'spec'),'Bundle specification'));
   else if(command==='verify')result=verifyMobileRuntimeBundle({rootDir:requiredArg(args,'root'),bundleId:requiredArg(args,'bundle'),descriptorPath:requiredArg(args,'descriptor'),runnerInputPath:requiredArg(args,'runner-input')});
   else if(command==='activate')result=await activateMobileRuntimeBundle({rootDir:requiredArg(args,'root'),bundleId:requiredArg(args,'bundle'),receiptPath:requiredArg(args,'receipt'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision'])});
-  else if(command==='rollback')result=await rollbackMobileRuntimeBundle({rootDir:requiredArg(args,'root'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision'])});
+  else if(command==='rollback')result=await rollbackMobileRuntimeBundle({rootDir:requiredArg(args,'root'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision']),
+    allowDowngrade:args['allow-downgrade']===true});
   else if(command==='status')result=readMobileRuntimeBundleState({rootDir:requiredArg(args,'root')});
   else if(command==='resolve'){const active=resolveActiveMobileRuntime({rootDir:requiredArg(args,'root')});result={state:'verified',bundle_dir:active.bundleDir,codex_path:active.codexPath,acp_entry_path:active.acpEntryPath,index:active.index};}
   else throw Error('Usage: mobile-runtime-bundle.mjs prepare|verify|activate|rollback|status|resolve');

@@ -1,7 +1,10 @@
 /** Real, isolated compatibility execution. Caller input selects no evidence,
  * code, endpoint, command or success flag. The owned runner launches the exact
  * bundled ACP and launcher, observes their native RPC, and captures loopback
- * provider requests itself. This is a protocol test, not a live-provider test. */
+ * provider requests itself. It runs in the phone's shape: the candidate's own
+ * Codex home settings (without tool servers or credentials), the phone's features,
+ * full agent access and the phone session mark on the app-server. This is a
+ * protocol test, not a live-provider test; NOT_COVERED says what it cannot show. */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +22,19 @@ const write=(p,v)=>fs.writeFileSync(p,v,{mode:0o600});
 const requireFact=(value,message)=>{if(!value)throw Error(message);};
 const INPUT_SCHEMA='kin.mobile-runtime.runner-input/v2';
 const RPC_TIMEOUT=25000;
+export const PROOF_SCOPE='protocol';
+export const NOT_COVERED=Object.freeze(['live-provider-requests','provider-side-remote-compaction','tool-servers',
+  'account-credentials','host-launch-script']);
+// Every developer layer beyond the companion base and developer instructions is
+// named; only the kinds listed as allowed may reach the phone's requests.
+const LAYER_KINDS=[['permissions',/^<permissions instructions>/],['model-switch',/^<model_switch>/],['skills',/^<skills_instructions>/],
+  ['multi-agent-role',/^(?:<multi_agent_role>)?\s*You are `\/root`/],['multi-agent-mode',/^<multi_agent_mode>/],
+  ['collaboration-mode',/^<collaboration_mode>|# Collaboration Mode/],['persistent-mode',/^<persistent_mode>/]];
+// The sandbox description and Codex's short notice after a model switch (the phone
+// switches models by design) are allowed; skills, agent-team, collaboration and
+// persistent-mode layers are not.
+export const ALLOWED_SUPPLEMENTAL_LAYERS=Object.freeze(['permissions','model-switch']);
+export const layerKind=text=>LAYER_KINDS.find(([,pattern])=>pattern.test(text))?.[0]??'unknown';
 
 export function validateRunnerInput(input,descriptor,manifestDigest,descriptorDigest){
   requireFact(input?.schema_version===INPUT_SCHEMA,'Caller-provided proof is not executable runner input');
@@ -113,7 +129,7 @@ async function provider(cwd){
 // Its child is the frozen launcher, not a caller-supplied command from input.
 function proxySource(){return `#!/usr/bin/env node
 const fs=require('node:fs'),{spawn}=require('node:child_process'),{createInterface}=require('node:readline');
-const child=spawn(process.env.KIN_PROBE_LAUNCHER,process.argv.slice(2),{env:process.env,stdio:['pipe','pipe','pipe']});
+const child=spawn(process.env.KIN_PROBE_LAUNCHER,process.argv.slice(2),{env:{...process.env,KIN_PHONE_SESSION:'1'},stdio:['pipe','pipe','pipe']});
 const record=(direction,value)=>fs.appendFileSync(process.env.KIN_PROBE_TRACE,JSON.stringify({direction,value})+'\\n',{mode:0o600});
 createInterface({input:process.stdin}).on('line',line=>{try{record('in',JSON.parse(line));}catch{}child.stdin.write(line+'\\n');}).on('close',()=>child.stdin.end());
 createInterface({input:child.stdout}).on('line',line=>{try{record('out',JSON.parse(line));}catch{}process.stdout.write(line+'\\n');});
@@ -150,6 +166,11 @@ function requestEvidence(capture,records,method,descriptor,{toolCaptures=null,to
     'Native request reintroduced a catalog coding or collaboration template');
   requireFact(!capture.raw.includes(Buffer.from('# Collaboration Mode')),'Native request reintroduced built-in collaboration instructions');
   requireFact(!capture.raw.includes(Buffer.from('KIN_COMPAT_PROJECT_DOC_SENTINEL')),'Native request loaded a project AGENTS.md despite project_doc_max_bytes=0');
+  requireFact(!capture.raw.includes(Buffer.from('AGENTS.md instructions')),'Native request carried AGENTS.md instructions from a Codex home or project');
+  const kinds={};for(const value of supplemental)kinds[layerKind(value)]=(kinds[layerKind(value)]??0)+1;
+  requireFact(Object.keys(kinds).every(kind=>ALLOWED_SUPPLEMENTAL_LAYERS.includes(kind)),
+    'Native request carried developer layers outside the companion set: '+JSON.stringify({kinds,
+      outside:supplemental.filter(value=>!ALLOWED_SUPPLEMENTAL_LAYERS.includes(layerKind(value))).map(value=>value.slice(0,80))}));
   const native=lastPair(records,method==='turn/start'?'thread/resume':method)??lastPair(records,'thread/start');
   const turn=completedTurn(records),identity=native?.response?.result;
   requireFact(identity?.thread?.id&&identity.thread.sessionId&&turn?.params?.turn?.status==='completed','Native identity or completed turn missing');
@@ -174,21 +195,22 @@ function requestEvidence(capture,records,method,descriptor,{toolCaptures=null,to
     extraction_receipt_sha256:sha(JSON.stringify({base:baseBasis,base_index:baseIndex,developer:'$.input['+index+'].content',turnId})),
     base:{sha256:sha(base),bytes:Buffer.byteLength(base),basis:baseBasis},
     developer:{sha256:sha(developer),bytes:Buffer.byteLength(developer),basis:'request.input.developer'},
-    supplemental_developer_layers:supplemental.slice(0,4).map(value=>({sha256:sha(value),bytes:Buffer.byteLength(value),preview:value.slice(0,64)})),
-    supplemental_developer_count:supplemental.length},
+    supplemental_developer_layers:supplemental.map(value=>({kind:layerKind(value),sha256:sha(value),bytes:Buffer.byteLength(value),preview:value.slice(0,64)})),
+    supplemental_developer_count:supplemental.length,supplemental_developer_kinds:kinds},
     config_sha256:descriptor.runtime.config.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
     thread_id:identity.thread.id,session_id:identity.thread.sessionId,instruction_sources:source,instruction_sources_provenance:'app-server-native',
     turn_sha256:sha(JSON.stringify(turn)),rpc_receipt_sha256:sha(JSON.stringify(lastPair(records,method))),
     tools:toolEvidence};
 }
 
+// Only what the request itself shows: the provider answered no service tier, so
+// none is recorded.
 function observedProfile(records,expected,capture){
   const pair=lastPair(records,'thread/resume')??lastPair(records,'thread/start'),actual=pair?.response?.result;
   const request=capture?.body;requireFact(actual?.modelProvider&&request?.model&&request.reasoning?.effort,'Native profile missing');
   const fast=['fast','priority'].includes(request.service_tier);
   return {checkpoint:expected.checkpoint,model:request.model,provider:actual.modelProvider,reasoning_effort:request.reasoning.effort,
-    fast_mode:fast?'on':'off',canonical_id:request.model,canonical_match:true,
-    service_tier_preference:fast?'fast':'default',actual_service_tier:null};
+    fast_mode:fast?'on':'off',service_tier_preference:fast?'fast':'default'};
 }
 
 export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputPath}){
@@ -198,9 +220,14 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
   const home=path.join(scratch,'home'),cwd=path.join(scratch,'workspace'),traceFile=path.join(scratch,'native.jsonl'),proxy=path.join(scratch,'proxy.cjs');
   fs.mkdirSync(home,{mode:0o700});fs.mkdirSync(cwd,{mode:0o700});write(proxy,proxySource());fs.chmodSync(proxy,0o700);
   const codex=path.join(bundleDir,manifest.runtime.codex.path),acp=path.join(bundleDir,manifest.runtime.acp.entry_path),baseConfig=read(descriptor.runtime.config.realpath);
+  // The candidate's own home settings; older descriptors have none and keep the
+  // isolated fixture home.
+  const homeConfig=descriptor.runtime.home?bytes(descriptor.runtime.home.realpath):null;
+  requireFact(!homeConfig||sha(homeConfig)===descriptor.runtime.home.sha256,'Candidate Codex home settings changed');
   const env=Object.fromEntries(['PATH','TMPDIR','LANG','LC_ALL','SHELL'].filter(k=>process.env[k]).map(k=>[k,process.env[k]]));
   Object.assign(env,{CODEX_HOME:home,HOME:home,CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG:'1',CODEX_PATH:proxy,
-    KIN_PROBE_LAUNCHER:descriptor.runtime.launcher.realpath,KIN_PROBE_TRACE:traceFile,INITIAL_AGENT_MODE:'read-only',NO_BROWSER:'1',RUST_LOG:'warn'});
+    KIN_PROBE_LAUNCHER:descriptor.runtime.launcher.realpath,KIN_PROBE_TRACE:traceFile,INITIAL_AGENT_MODE:homeConfig?'agent-full-access':'read-only',
+    NO_BROWSER:'1',WECHAT_ACP_TELEMETRY:'0',RUST_LOG:'warn'});
   write(path.join(cwd,'AGENTS.md'),'KIN_COMPAT_PROJECT_DOC_SENTINEL\n');
   const server=await provider(cwd);let client;const observations=[];
   try{
@@ -209,16 +236,27 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
     const profileDefaults={model:'deepseek-flash',provider:'kin-compat',reasoning_effort:'high',fast_mode:'off',checkpoint:'final'};
     const profiles=descriptor.expected_profiles??[];
     const current=p=>({...profileDefaults,...p});
-    const config=p=>({...baseConfig,model:p.model,model_provider:p.provider,model_reasoning_effort:p.reasoning_effort,
+    // The phone's configuration plus the loopback provider. A legacy descriptor
+    // without home settings keeps the old, fully closed fixture configuration.
+    const loopbackProvider=p=>({[p.provider]:{name:'Isolated compatibility provider',base_url:server.url,wire_api:'responses',request_max_retries:0,stream_max_retries:0,requires_openai_auth:false}});
+    const config=p=>homeConfig?{...baseConfig,model:p.model,model_provider:p.provider,model_reasoning_effort:p.reasoning_effort,
+      service_tier:p.fast_mode==='on'?'fast':null,'features.fast_mode':p.fast_mode==='on',check_for_update_on_startup:false,model_providers:loopbackProvider(p)}:
+      {...baseConfig,model:p.model,model_provider:p.provider,model_reasoning_effort:p.reasoning_effort,
       service_tier:p.fast_mode==='on'?'fast':null,'features.fast_mode':p.fast_mode==='on',approval_policy:'never',sandbox_mode:'read-only',
       check_for_update_on_startup:false,disable_response_storage:false,'analytics.enabled':false,
-      mcp_servers:{},plugins:{},model_providers:{[p.provider]:{name:'Isolated compatibility provider',base_url:server.url,wire_api:'responses',request_max_retries:0,stream_max_retries:0,requires_openai_auth:false}},
-      ...Object.fromEntries(['apps','browser_use','computer_use','hooks','image_generation','multi_agent','plugins','shell_snapshot','shell_tool','skill_search','sleep_tool','tool_suggest','unified_exec','unified_exec_tty','view_image','web_search_request','workspace_dependencies'].map(k=>['features.'+k,false]))});
+      mcp_servers:{},plugins:{},model_providers:loopbackProvider(p),
+      ...Object.fromEntries(['apps','browser_use','computer_use','hooks','image_generation','multi_agent','plugins','shell_snapshot','shell_tool','skill_search','sleep_tool','tool_suggest','unified_exec','unified_exec_tty','view_image','web_search_request','workspace_dependencies'].map(k=>['features.'+k,false]))};
     const launch=async(p,overrides={})=>{
       if(client)await client.close();write(traceFile,'');
       // An empty home prevents account credentials or configured MCP servers
       // from the interactive desktop leaking into the candidate process.
-      write(path.join(home,'config.toml'),'check_for_update_on_startup = false\nweb_search = "disabled"\nmodel_provider = '+JSON.stringify(p.provider)+'\n[model_providers.'+p.provider+']\nname = "Isolated compatibility fixture"\nbase_url = '+JSON.stringify(server.url)+'\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n[mcp_servers.computer-use]\ncommand = "/usr/bin/false"\nenabled = false\n[mcp_servers.node_repl]\ncommand = "/usr/bin/false"\nenabled = false\n');
+      // The candidate's home with the loopback provider as its default provider: the
+      // one line and table a proof cannot share with the phone (no account, no network).
+      if(homeConfig){const text=homeConfig.toString('utf8');requireFact(/^model_provider = ".*"$/m.test(text),'Candidate Codex home names no model provider');
+        write(path.join(home,'config.toml'),text.replace(/^model_provider = ".*"$/m,'model_provider = '+JSON.stringify(p.provider))+
+          '\n[model_providers.'+p.provider+']\nname = "Isolated compatibility fixture"\nbase_url = '+JSON.stringify(server.url)+
+          '\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n');}
+      else write(path.join(home,'config.toml'),'check_for_update_on_startup = false\nweb_search = "disabled"\nmodel_provider = '+JSON.stringify(p.provider)+'\n[model_providers.'+p.provider+']\nname = "Isolated compatibility fixture"\nbase_url = '+JSON.stringify(server.url)+'\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n[mcp_servers.computer-use]\ncommand = "/usr/bin/false"\nenabled = false\n[mcp_servers.node_repl]\ncommand = "/usr/bin/false"\nenabled = false\n');
       client=new Rpc(process.execPath,[acp],{...env,CODEX_CONFIG:JSON.stringify({...config(p),...overrides})},cwd);
       const init=await client.request('initialize',{protocolVersion:1,clientInfo:{name:'kin_runtime_compatibility',version:'2'},clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}});
       requireFact(init.agentInfo?.version===manifest.runtime.acp.version,'ACP did not initialize with the bundled version');return init;
@@ -233,8 +271,9 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
     const signature=()=>({exit_code:0,acp_initialized:true,receipt_sha256:sha(JSON.stringify(client.transcript)),
       codex_sha256:sha(bytes(codex)),acp_entry_sha256:sha(bytes(acp)),acp_package_json_sha256:sha(bytes(path.join(bundleDir,manifest.runtime.acp.package_path,'package.json'))),
       base_sha256:sha(bytes(descriptor.base.realpath)),developer_sha256:sha(bytes(descriptor.developer.realpath)),
-      config_sha256:sha(bytes(descriptor.runtime.config.realpath)),schema_sha256:sha(bytes(descriptor.runtime.schema.realpath)),catalog_sha256:sha(bytes(descriptor.runtime.catalog.realpath)),bundle_manifest_sha256:sha(manifestBytes)});
-    let p=current(profiles.find(x=>x.scenario_id==='new_session'));await launch(p,{'features.shell_tool':true,'features.unified_exec':true});let id=await sessionNew();
+      config_sha256:sha(bytes(descriptor.runtime.config.realpath)),schema_sha256:sha(bytes(descriptor.runtime.schema.realpath)),catalog_sha256:sha(bytes(descriptor.runtime.catalog.realpath)),bundle_manifest_sha256:sha(manifestBytes),
+      ...(homeConfig?{home_sha256:sha(homeConfig)}:{})});
+    let p=current(profiles.find(x=>x.scenario_id==='new_session'));await launch(p,homeConfig?{}:{'features.shell_tool':true,'features.unified_exec':true});let id=await sessionNew();
     let capture=await prompt(id),records=trace(traceFile);
     const add=(name,requests,observed=records,extra={})=>observations.push({scenario_id:name,outcome:'accepted',native:signature(),requests,
       profiles:profiles.filter(x=>x.scenario_id===name).map(x=>observedProfile(observed,x,capture)),...extra});
@@ -267,6 +306,9 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
       requireFact(direct.events.some(e=>e.method==='turn/completed'&&e.params?.turn?.id===turn.turn.id&&e.params.turn.status==='completed'),'Maintenance candidate did not persist a completed turn');
     }finally{await direct.close();}
     await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);add('maintenance_promotion_resume',[requestEvidence(capture,records,'thread/resume',descriptor)]);
+    // A second request of the promoted session is its own evidence.
+    p=current(profiles.find(x=>x.scenario_id==='post_promotion_request'));
+    capture=await prompt(id,'Isolated post-promotion fixture. Return KIN_COMPAT_OK without any tool calls.');records=trace(traceFile);
     add('post_promotion_request',[requestEvidence(capture,records,'turn/start',descriptor)]);
 
     // Compact the isolated thread, then prove the same identity survives an
@@ -278,6 +320,8 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
     p=current(profiles.find(x=>x.scenario_id==='isolated_compaction_resume'));await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);
     add('isolated_compaction_resume',[requestEvidence(capture,records,'thread/resume',descriptor),requestEvidence(capture,records,'turn/start',descriptor)],records,
       {compaction:{raw_request_sha256:sha(compactWire.raw),compact_prompt_sha256:sha(baseConfig.compact_prompt),provider_requests:compactRequests.length}});
+    // A process restart is proved by its own restart, not by the compaction's.
+    p=current(profiles.find(x=>x.scenario_id==='process_restart'));await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);
     add('process_restart',[requestEvidence(capture,records,'thread/resume',descriptor)]);
 
     // Model changes use a persistent native identity and real request receipts.
@@ -297,9 +341,16 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
     return {schema_version:'kin.mobile-runtime.proof/v1',candidate_id:descriptor.candidate_id,bundle_manifest_sha256:sha(manifestBytes),descriptor_sha256:sha(descriptorBytes),runner_input_sha256:sha(inputBytes),
       producer:{runner_sha256:sha(bytes(fileURLToPath(import.meta.url))),node:process.version,codex_sha256:sha(bytes(codex)),codex_version:codexVersion,acp_entry_sha256:sha(bytes(acp)),acp_version:acpVersion,
         actual_exec_receipt_sha256:sha(JSON.stringify(observations)),basis:'owned-runner-real-acp-native-rpc-and-loopback-provider'},
+      scope:PROOF_SCOPE,not_covered:[...NOT_COVERED],home_shape:homeConfig?'candidate-codex-home':'isolated-fixture-home',
       isolation:{private_temporary_home:true,provider:'loopback-fixture',real_provider_calls:0,external_credentials_supplied:false,os_level_egress_monitor:false},
       auxiliary_provider_requests:{purpose:'native-conversation-title',count:titleModels.reduce((sum,item)=>sum+item.count,0),models:titleModels},observations};
-  }finally{if(client)await client.close();await server.close();fs.rmSync(scratch,{recursive:true,force:true});}
+  }finally{
+    // Cleanup never replaces the proof's own error: a native child may still be
+    // flushing its home for a moment after the ACP closed.
+    if(client)await client.close();await server.close();
+    try{fs.rmSync(scratch,{recursive:true,force:true,maxRetries:10,retryDelay:200});}
+    catch(error){console.error('Proof scratch left behind: '+scratch+' ('+(error.code??error.message)+')');}
+  }
 }
 
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
