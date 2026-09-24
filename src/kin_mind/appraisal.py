@@ -1302,15 +1302,22 @@ class NativeReview(DeepSeek):
             "context": context, "schema": schema, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
         if answer.get("state") == "waiting":
+            spent = answer.get("receipt") or {}
+            reason = str(answer.get("reason") or "")
             if answer.get("model_invoked"):
                 # A fork that failed, timed out or was interrupted is deferred, not failed (WS4);
                 # what it used is kept from its receipt (PROBE).
-                spent = answer.get("receipt") or {}
-                attempts.record_call(self, name, outcome=answer.get("reason") if spent else "owner-preempted",
+                attempts.record_call(self, name, outcome=reason if spent else "owner-preempted",
                                      model=spent.get("model"), request_id=spent.get("native_turn_id"),
                                      usage=spent.get("usage"), elapsed_ms=round((time.monotonic()-started)*1000),
                                      detail=({"fork_thread_id": spent["fork_thread_id"]} if spent.get("fork_thread_id") else None))
-            raise ModelAdmissionWait(answer.get("reason") or "foreground-active")
+            if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
+                # CR-MIND-07: this fork ran. It stays deferred and never goes to the main thread, but
+                # it is not "not admitted": it spends the transient-failure budget and its backoff,
+                # and the budget running out sets the row aside like any other outage.
+                self.failure_receipt = {**spent, **attempts.usage_entry(spent.get("usage")), "outcome": reason or "fork-deferred"}
+                raise RuntimeError("native-review-" + (reason if re.fullmatch(r"fork-[a-z-]{1,40}", reason) else "fork-deferred"))
+            raise ModelAdmissionWait(reason or "foreground-active")
         if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
             # No finished turn to fork from yet (or the session is not loaded): the assessment
             # cannot run now and is asked again later. Not Kin's failure, never charged, and never
@@ -1641,12 +1648,16 @@ class Appraisals:
 
     def _tool_fetched(self, proposal, receipt, supplied, started):
         """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
-        cites that this request did not supply is accepted when the turn's tool receipts show a
-        completed tool read, and the id resolves to a current record of this scope that already
-        existed when the attempt began. Anything else is still refused by the section's own check."""
+        cites that this request did not supply is accepted only when a completed tool call of this
+        turn returned that very source (its receipt's `ids`, CR-MIND-08), and the id resolves to a
+        current record of this scope that already existed when the attempt began. A tool that
+        succeeded at something else vouches for nothing; a receipt without ids admits nothing."""
         native = receipt.get("native_receipt") or {}
         calls = native.get("tool_calls") or receipt.get("tool_calls") or []
-        if not any(isinstance(call, dict) and call.get("ok") is True for call in calls):
+        returned = {str(i.get("id") if isinstance(i, dict) else i) for call in calls
+                    if isinstance(call, dict) and call.get("ok") is True and isinstance(call.get("ids"), list)
+                    for i in call["ids"] if isinstance(i, (str, dict))}
+        if not returned:
             return {}
         known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
         cited = set()
@@ -1669,7 +1680,9 @@ class Appraisals:
                     refs = self.mind._evidence(conn, [identifier])
                 except (Conflict, Missing):
                     continue
-                if refs and self.mind._fresh(conn, refs) and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs):
+                read_back = identifier in returned or all({r["source_id"], r["record_id"]} & returned for r in refs)
+                if (refs and read_back and self.mind._fresh(conn, refs)
+                        and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs)):
                     fetched.update({r["record_id"]: r for r in refs})
         return fetched
 
