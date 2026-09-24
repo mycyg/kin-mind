@@ -492,3 +492,27 @@ def test_a_200_that_is_not_json_is_recorded_as_a_paid_failed_call(monkeypatch):
     assert provider.attempt_calls[-1]["outcome"] == "invalid-response-body"
     assert provider.attempt_calls[-1]["usage_status"] == "unknown"
     assert re.search(TRANSIENT_PATTERN, str(failed.value))
+
+
+def test_a_session_review_is_asked_about_its_snapshot_and_writes_no_memory_source(setup, monkeypatch):
+    """Item 7: the observed snapshot id is the stimulus; no kin-session-maintenance source is
+    received, one job per snapshot, and the judgment still reaches the carrier."""
+    from kin_mind import session_advice
+    from kin_mind.session_advice import SessionAdvice
+    mind, source, _ = setup
+    carried = []
+    monkeypatch.setattr(session_advice, "submit", lambda conn, scope, record, at: carried.append(record) or record, raising=False)
+    monkeypatch.setattr(session_advice, "latest", lambda conn, scope, state=None: carried[-1] if carried else None, raising=False)
+    context = {"id": "snapshot-7", "binding": {"generation": 4}, "evidence": [], "recent": []}
+    jobs = Appraisals(mind, session_context=context)
+    first = jobs.enqueue_maintenance("snapshot-7", "synthetic-v1")
+    assert jobs.enqueue_maintenance("snapshot-7", "synthetic-v1")["id"] == first["id"]
+    class SnapshotReviewer(FakeReviewer):
+        def appraise(self, context):
+            assert context["new_evidence"] == [] and context["session_context"]["id"] == "snapshot-7"
+            return self.proposal, {"provider": "deepseek", "model": "synthetic"}
+    reviewer = SnapshotReviewer(Appraisal(reason="Keep the session", session_advice=SessionAdvice(action="keep", reason="Fine")))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert carried and carried[0]["snapshotId"] == "snapshot-7"
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-session-maintenance'").fetchone()

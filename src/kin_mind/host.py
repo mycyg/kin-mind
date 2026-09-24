@@ -168,11 +168,8 @@ def dispatch(config, action, request):
     if action == "session-review":
         if not config.get("adaptive_sessions") or not session_context:
             return {"state": "disabled"}
-        source = engine.receive(SourceInput(namespace="kin-session-maintenance", key=request["id"],
-            session=config["session_id"], scope=mind.scope, authority="operation", kind="observation", extract=False,
-            text="宿主请求检查当前原生会话。依据 session_context 判断压缩与接续；此事件不是用户消息，也不改变情绪和愿望。",
-            metadata={"session_snapshot_id": session_context["id"], "maintenance_only": True}))
-        return jobs.enqueue([source["id"]], config["agent_version"], origin="reflection", stimulus="session-maintenance")
+        # The observed snapshot is the stimulus; nothing is written into memory for a review.
+        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"])
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":

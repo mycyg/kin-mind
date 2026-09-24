@@ -1426,6 +1426,20 @@ class Appraisals:
             )
         return {"id": job_id, "state": self.status(job_id)["state"]}
 
+    def enqueue_maintenance(self, snapshot_id, agent_version):
+        """A session review. Its stimulus is the session snapshot the host observed, named by its
+        id; nothing is received into memory for it, so no maintenance source accumulates (item 7).
+        One job per snapshot."""
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise ValueError("A session review needs the observed snapshot id")
+        job_id = "appraise_" + digest([self.mind.scope.key(), "session-maintenance", snapshot_id])[:32]
+        data = {"evidence_ids": [], "agent_version": agent_version, "origin": "reflection",
+                "stimulus": "session-maintenance", "session_snapshot_id": snapshot_id}
+        with self.engine.db.connect(write=True) as conn:
+            conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                         (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data)))
+        return {"id": job_id, "state": self.status(job_id)["state"]}
+
     def migrate_continuity(self, evidence_ids, agent_version):
         """One durable migration; include original evidence of live wishes only."""
         with self.engine.db.connect() as conn:
@@ -2118,6 +2132,8 @@ class Appraisals:
                 # Keep the structured judgment for auditing a failed atomic
                 # commit; model reasoning is never part of this record.
                 data["proposed_result"] = proposal_record(proposal)
+                # A session review is asked about the session snapshot, not about anything written into
+                # memory: it carries no evidence of its own and changes no score (item 7).
                 event = AffectiveEvent(
                     command_id=row["id"],
                     agent_version=effective_version,
@@ -2129,7 +2145,9 @@ class Appraisals:
                     origin=data["origin"],
                     understanding=proposal.understanding,
                     rhythm=proposal.rhythm if data.get("stimulus") != "delivery" else None,
-                )
+                ) if data["evidence_ids"] or not maintenance else {
+                    "command_id": row["id"], "agent_version": effective_version, "expected_revision": view["revision"],
+                    "reason": proposal.reason, "session_snapshot_id": data.get("session_snapshot_id")}
 
                 def apply(conn, state, eid):
                     from . import behavior_chain, next_move
