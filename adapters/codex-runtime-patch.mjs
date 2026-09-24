@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V1';
+const assessmentMarker = '// KIN_ASSESS_V2';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -444,7 +444,15 @@ function kinSteerAccepted(state, params) {
  * be read in its documented shape, no fork is made: `no-completed-turn`, with the
  * reason. Each tool call is reported as `{name, ok, ids}` (CR-MIND-08): `ids` are the
  * record and source ids the call's structured result actually returned, each with its
- * revision where the result gave one, at most 100; `[]` when nothing can be read. */
+ * revision where the result gave one, at most 100; `[]` when nothing can be read.
+ *
+ * Every answer says how far it got, as `stage` (CR2-INT-06), beside the state and the
+ * reason it already gave: `not-started` -- no turn was asked for, so no model was
+ * called (the session is not loaded here, the request is invalid, no completed turn
+ * can end the fork, or the fork was refused, failed or ran out of time before it
+ * existed); `started` -- the fork exists and its turn began; `unknown` -- the turn was
+ * asked for but its start was never confirmed (it ran out of time or the request
+ * failed), so a model call cannot be ruled out. */
 export function patchKinAssessment(source) {
   if (source.includes(assessmentMarker)) throw Error(`Codex ACP source already carries ${assessmentMarker}`);
   if (!source.includes('function kinHistoryPage(')) throw Error('ACP assessment needs the input status history check');
@@ -508,7 +516,9 @@ function kinToolResultIds(item) {
     const started = Date.now();
     const requestId = typeof params?.requestId === "string" ? params.requestId : "";
     const result = { requestId, forkThreadId: null, turnId: null, model: null, reasoningEffort: null, usage: null, output: null, rawText: "", toolCalls: [] };
-    const end = (state, extra = {}) => ({ ...result, state, ...extra, durationMs: Date.now() - started });
+    // How far it got (CR2-INT-06): no turn asked for, a turn asked for but unconfirmed, a turn begun.
+    let stage = "not-started";
+    const end = (state, extra = {}) => ({ ...result, state, stage, ...extra, durationMs: Date.now() - started });
     const state = this.sessions.get(params?.sessionId);
     if (!state) return end("failed", { error: "session-not-loaded" });
     const input = typeof params.input === "string" && params.input ? [{ type: "text", text: params.input, text_elements: [] }] : Array.isArray(params.input) && params.input.length ? params.input : null;
@@ -552,8 +562,10 @@ function kinToolResultIds(item) {
         if (notification.method === "item/completed") seen.push(notification.params.item);
       });
       const forkThreadId = result.forkThreadId;
+      stage = "unknown";
       const outcome = await kinWithin(api.runTurn({ threadId: forkThreadId, input, cwd: state.cwd, approvalPolicy: "never", sandboxPolicy: { type: "readOnly", networkAccess: false }, summary: "none", model: modelId.model, effort: modelId.effort, outputSchema: params.outputSchema }, (id) => {
         turnId = id;
+        stage = "started";
         if (stopped) void interrupt(forkThreadId, id);
       }), deadline, "timeout");
       turnDone = true;
