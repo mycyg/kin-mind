@@ -227,36 +227,54 @@ export function spoolHostEvent(root,record) {
   createJsonExclusive(file,record);
   return file;
 }
-const CALLS_KEPT=256;
-const keepBounded=(map,key,value)=>{map.delete(key);map.set(key,value);while(map.size>CALLS_KEPT)map.delete(map.keys().next().value);};
-
+/** Files up to this size are copied whole as the proof of their bytes; a larger
+ * one is recorded by its streamed fingerprint only, and one beyond the second
+ * bound not at all (AD2-12). */
+export const ARTIFACT_SNAPSHOT_BYTES=8*1024*1024;
+export const ARTIFACT_FINGERPRINT_BYTES=512*1024*1024;
+/** A tool call that never reports completed or failed is forgotten after this
+ * long, and at most this many are remembered at once. */
+export const ARTIFACT_PENDING_MS=30*60000;
+export const ARTIFACT_PENDING_MAX=200;
+function streamedSha256(file) {
+  const digest=createHash('sha256'),buffer=Buffer.allocUnsafe(1024*1024),fd=fs.openSync(file,'r');
+  try {for(let read;(read=fs.readSync(fd,buffer,0,buffer.length,null))>0;)digest.update(buffer.subarray(0,read));}
+  finally {fs.closeSync(fd);}
+  return digest.digest('hex');
+}
 /** Only an observed edit effect establishes creator provenance. With
  * `experiences`, what Kin does with a tool in an owner turn is also kept as her
  * tool activity (replacing the native hook, which is gone). Calls that never
- * finish are forgotten after `CALLS_KEPT` newer ones (AD2-12). */
+ * finish are forgotten after ARTIFACT_PENDING_MS, and at most
+ * ARTIFACT_PENDING_MAX of each kind are remembered (AD2-12). */
 export class ToolArtifactObserver {
-  constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),experiences=null}) {
-    Object.assign(this,{journal,task,clock,experiences});this.before=new Map();this.calls=new Map();
+  constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),now=()=>Date.now(),experiences=null}) {
+    Object.assign(this,{journal,task,clock,now,experiences});this.before=new Map();this.calls=new Map();
   }
   update(update) {
     if(!update.toolCallId)return;
     const id=update.toolCallId;
+    this.prune();
     this.remember(update);
     const paths=[...(update.locations??[]).map(l=>l.path),update.rawInput?.path,update.rawInput?.file_path].filter(p=>typeof p==='string'&&path.isAbsolute(p));
     if(update.status==='failed'){this.before.delete(id);return;}
     if(update.status!=='completed') {
-      const previous=this.before.get(id)??new Map();
+      const previous=this.before.get(id)??Object.assign(new Map(),{since:this.now()});
       previous.kind=update.kind??previous.kind;
       for(const file of paths)if(!previous.has(file))previous.set(file,this.stat(file));
-      keepBounded(this.before,id,previous);return;
+      this.before.set(id,previous);return;
     }
     const before=this.before.get(id);this.before.delete(id);
     for(const file of new Set([...paths,...(before?.keys()??[])])) {
       const after=this.stat(file),prior=before?.get(file);
       if(!after||after===prior)continue;
       const created=(update.kind??before?.kind)==='edit'&&before?.has(file);
+      // One file that cannot be read is not a reason to lose the others, nor
+      // to throw into the session's update stream.
+      let artifact;try{artifact=this.capture(file);}catch{continue;}
+      if(!artifact)continue;
       this.journal.append({id:`tool-artifact:${id}:${hash(file)}`,kind:created?'artifact-created':'artifact-observed',
-        at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact:snapshotArtifact(file,path.join(this.journal.directory,'artifacts'))});
+        at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact});
     }
   }
   /** A call is Kin's own when its turn answered the owner; that is decided when the call is first seen. */
@@ -265,14 +283,28 @@ export class ToolArtifactObserver {
     const id=update.toolCallId,known=this.calls.get(id);
     let owner=known?.owner;
     if(owner===undefined)try{owner=Boolean(this.experiences.owner?.());}catch{owner=false;}
-    const call={...known,id,owner,...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
-    if(!['completed','failed'].includes(update.status)){keepBounded(this.calls,id,call);return;}
+    const call={...known,id,owner,since:known?.since??this.now(),...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
+    if(!['completed','failed'].includes(update.status)){this.calls.set(id,call);return;}
     this.calls.delete(id);
     if(!owner)return;
     try {
       const record=toolExperience(call,{session:this.experiences.session?.(),scope:this.experiences.scope,scenario:this.experiences.scenario});
       if(record)spoolHostEvent(this.experiences.root,record);
     } catch{/* Tool activity is an observation; it never decides the turn. */}
+  }
+  capture(file) {
+    const size=fs.statSync(file).size;
+    if(size<=ARTIFACT_SNAPSHOT_BYTES)return snapshotArtifact(file,path.join(this.journal.directory,'artifacts'));
+    if(size>ARTIFACT_FINGERPRINT_BYTES)return null;
+    return {observed_path:file,name:path.basename(file),bytes:size,sha256:streamedSha256(file),snapshot:false};
+  }
+  prune() {
+    const cutoff=this.now()-ARTIFACT_PENDING_MS;
+    for(const pending of [this.before,this.calls]) {
+      for(const [id,entry] of pending)if(!(entry.since>=cutoff))pending.delete(id);
+      // Oldest first: a Map keeps insertion order.
+      while(pending.size>=ARTIFACT_PENDING_MAX)pending.delete(pending.keys().next().value);
+    }
   }
   stat(file) {try {const s=fs.statSync(file);return s.isFile()?`${s.size}:${s.mtimeMs}`:null;}catch{return null;}}
 }
