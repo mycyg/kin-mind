@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import zipfile
 from datetime import timedelta
 from pathlib import Path
@@ -218,11 +219,81 @@ def fingerprint_file(path):
     return result
 
 
+# Set in `meta` once the memory index shares its rowids with `mind_memory_nodes` (see graph.py).
+SEARCH_ALIGNED = "mind_memory_search_rowid"
+# The states in which a queued appraisal is still going to run. Every other state, and a job
+# that is not there at all, has ended, whether it organised anything or not (K3-01, K4-02).
+RUNNING_JOB_STATES = frozenset({"pending", "running", "batched"})
+# How many ended-but-not-complete job ids a replay keeps; counts by state are kept whole.
+DEFERRED_KEPT = 100
+
+
+def job_ended(jobs, job_id):
+    """The state a tracked appraisal ended in ("missing" when it is not there), or None while
+    it is still going to run."""
+    status = jobs.status(job_id) if job_id else None
+    state = status["state"] if status else "missing"
+    return None if state in RUNNING_JOB_STATES else state
+
+
+def note_ended(data, job_id, state):
+    """What a replay keeps of a job that ended without completing: the latest ids, bounded,
+    and a count per state. The replay itself moves on (K4-06)."""
+    if state != "complete":
+        data["deferred_repairs"] = [*data.get("deferred_repairs", []), job_id][-DEFERRED_KEPT:]
+        counts = data.setdefault("ended", {})
+        counts[state] = counts.get(state, 0) + 1
+    return data
+_ready = set()
+
+
+def _store_key(path):
+    """This store file, as opposed to whatever file is at its path later: a restore that puts
+    another database in its place gets its schema checked again."""
+    try:
+        return (str(path), os.stat(path).st_ino)
+    except OSError:
+        return (str(path), None)
+
+
+def search_text(node):
+    text = " ".join(str(node.get(k, "")) for k in ("title", "topic", "summary", "name", "task_ids", "about_ids"))
+    return text + " " + " ".join(b.get("text", "") for b in (node.get("bubbles") or {}).values() if isinstance(b, dict))
+
+
+def index_node(conn, rowid, node):
+    """The node's index row, removed by rowid once the index is aligned, by a scan before."""
+    aligned = bool(conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone())
+    if aligned:
+        conn.execute("DELETE FROM mind_memory_search WHERE rowid=?", (rowid,))
+        conn.execute("INSERT INTO mind_memory_search(rowid,id,tokens) VALUES(?,?,?)", (rowid, node["id"], tokenize(search_text(node))))
+    else:
+        conn.execute("DELETE FROM mind_memory_search WHERE id=?", (node["id"],))
+        conn.execute("INSERT INTO mind_memory_search(id,tokens) VALUES(?,?)", (node["id"], tokenize(search_text(node))))
+
+
+def align_search(conn):
+    """Rebuild the memory index with the nodes' own rowids, once."""
+    conn.execute("DELETE FROM mind_memory_search")
+    rows = conn.execute("SELECT rowid,id,data FROM mind_memory_nodes").fetchall()
+    conn.executemany("INSERT INTO mind_memory_search(rowid,id,tokens) VALUES(?,?,?)",
+                     [(row[0], row[1], tokenize(search_text(json.loads(row[2])))) for row in rows])
+    conn.execute("INSERT OR IGNORE INTO meta VALUES(?,1)", (SEARCH_ALIGNED,))
+    return len(rows)
+
+
 class MemoryContinuity:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
-        with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + memory_items.SCHEMA)
+        key = _store_key(self.engine.db.path)
+        if key not in _ready:
+            with self.engine.db.connect() as conn:
+                conn.executescript(SCHEMA + memory_items.SCHEMA)
+            with self.engine.db.connect(write=True) as conn:
+                if not conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone() \
+                        and not conn.execute("SELECT 1 FROM mind_memory_nodes LIMIT 1").fetchone():
+                    align_search(conn)
+            _ready.add(key)
         self.graph = EventGraph(mind)
         self.sharing = ShareLedger(mind)
         self.habits = ConversationHabits(mind)
@@ -313,13 +384,11 @@ class MemoryContinuity:
         if previous and compare == {k: v for k, v in previous.items() if k not in {"revision", "updated_at"}}:
             return previous
         node = {**node, "revision": (row["revision"] if row else 0) + 1, "updated_at": self.mind.clock()}
-        conn.execute("INSERT OR REPLACE INTO mind_memory_nodes VALUES(?,?,?,?,?,?)",
+        conn.execute("INSERT INTO mind_memory_nodes VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                     "scope=excluded.scope,kind=excluded.kind,revision=excluded.revision,updated_at=excluded.updated_at,data=excluded.data",
                      (node["id"], self.scope.key(), node["kind"], node["revision"], node["updated_at"], dumps(node)))
         conn.execute("INSERT INTO mind_memory_revisions VALUES(?,?,?)", (node["id"], node["revision"], dumps(node)))
-        conn.execute("DELETE FROM mind_memory_search WHERE id=?", (node["id"],))
-        search_text = " ".join(str(node.get(k, "")) for k in ("title", "topic", "summary", "name", "task_ids", "about_ids"))
-        search_text += " " + " ".join(b.get("text", "") for b in node.get("bubbles", {}).values())
-        conn.execute("INSERT INTO mind_memory_search VALUES(?,?)", (node["id"], tokenize(search_text)))
+        index_node(conn, conn.execute("SELECT rowid FROM mind_memory_nodes WHERE id=?", (node["id"],)).fetchone()[0], node)
         if self.settings(conn)["graph"] or self.settings(conn)["sharing"]:
             self.graph.project_memory(conn, node)
         return node
@@ -609,9 +678,8 @@ class MemoryContinuity:
             return {"state": "idle"}
         ended = {}
         for job_id in dict.fromkeys(r["data"].get("job_id") for r in rows if r["state"] == "queued"):
-            status = jobs.status(job_id) if job_id else None
-            state = status["state"] if status else "missing"
-            if state in {"pending", "running", "batched"}:
+            state = job_ended(jobs, job_id)
+            if state is None:
                 return {"state": "pending", "job_id": job_id}
             ended[job_id] = state
         ready, unavailable = [], []
@@ -653,21 +721,40 @@ class MemoryContinuity:
             row = conn.execute("SELECT * FROM mind_memory_migrations WHERE scope=? AND name='semantic'", (self.scope.key(),)).fetchone()
             cursor, data = (row["cursor"], json.loads(row["data"])) if row else (0, {})
         if data.get("job_id"):
-            job = jobs.status(data["job_id"])
-            if job["state"] not in {"complete", "needs-repair"}:
+            # Any end moves the replay on: a job superseded, quarantined or gone is noted, never
+            # waited for (K3-01).
+            state = job_ended(jobs, data["job_id"])
+            if state is None:
                 return {"state": "pending", "job_id": data["job_id"]}
-            if job["state"] == "needs-repair":
-                data.setdefault("deferred_repairs", []).append(data["job_id"])
+            note_ended(data, data["job_id"], state)
             cursor = data["through_seq"]
         with self.engine.db.connect() as conn:
             rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND json_extract(data,'$.historical')=1 ORDER BY seq LIMIT 16", (self.scope.key(), cursor)).fetchall()
+            sources, unavailable = [], 0
+            for source_id in dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows):
+                # A source deleted since it was recorded is passed over; asking for it would
+                # fail the review on every run.
+                try:
+                    current = self.mind._fresh(conn, self.mind._evidence(conn, [source_id]))
+                except (Missing, Conflict):
+                    current = False
+                if current:
+                    sources.append(source_id)
+                else:
+                    unavailable += 1
         if not rows:
             return {"state": "complete", "cursor": cursor}
-        sources = list(dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows))
-        receipt = jobs.enqueue(sources, agent_version, origin="reflection", stimulus="memory-backfill")
-        data = {"job_id": receipt["id"], "through_seq": rows[-1]["seq"], "deferred_repairs": data.get("deferred_repairs", [])}
+        receipt = None
+        if sources:
+            try:
+                receipt = jobs.enqueue(sources, agent_version, origin="reflection", stimulus="memory-backfill")
+            except (Missing, Conflict):
+                return {"state": "pending", "job_id": None}  # a source moved just now; look again
+        data = {**data, "job_id": receipt["id"] if receipt else None, "through_seq": rows[-1]["seq"],
+                "unavailable_sources": data.get("unavailable_sources", 0) + unavailable}
         with self.engine.db.connect(write=True) as conn:
-            conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)", (self.scope.key(), "semantic", cursor, dumps(data)))
+            conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)",
+                         (self.scope.key(), "semantic", rows[-1]["seq"] if not receipt else cursor, dumps(data)))
         return {"state": "pending", **data}
 
     def due(self):
@@ -717,13 +804,21 @@ class MemoryContinuity:
         with self.engine.db.connect() as conn:
             event = conn.execute("SELECT occurred_at FROM mind_events WHERE id=? AND scope=?",
                                  (result.get("event_id"), self.scope.key())).fetchone()
+            # A reflection kept under the earlier wording stays as it was received: its text is
+            # the source's immutable part, so a replay returns it instead of conflicting with it.
+            kept = conn.execute("SELECT * FROM sources WHERE namespace='kin-reflection' AND source_key=? AND scope=?",
+                                (result.get("event_id"), self.scope.key())).fetchone()
         if not event:
             return None
+        if kept:
+            return self.engine._source(kept)
+        # Neutral words for who thought it and whose words it is not: the core names no owner and
+        # no role; `basis: internal_thought` is what tells the two apart (K1-21, K3-03).
         return self.engine.receive(SourceInput(
             namespace="kin-reflection", key=result["event_id"],
             scope=self.scope, occurred_at=event["occurred_at"], authority="model",
-            kind="episode", title="小Kin自己琢磨的：日记与感想",
-            text="小Kin自己琢磨的（日记与感想，不是小光的原话或已确认事实）：\n" + understanding["meaning"],
+            kind="episode", title="Kin 自己的想法：日记与感想",
+            text="Kin 自己的想法（日记与感想，不是主人的原话或已确认事实）：\n" + understanding["meaning"],
             metadata={"role": "assistant", "basis": "internal_thought", "internal": True,
                       "host_event": "diary", "topic": understanding.get("topic"), "appraisal_event_id": result["event_id"],
                       "evidence_ids": understanding.get("evidence_ids", []),
@@ -838,6 +933,10 @@ class MemoryContinuity:
                 share = self._get(conn, proposal.share_id)
                 if share["kind"] != "share" or not self._fresh(conn, share):
                     raise Conflict("Disclosure needs current delivery evidence")
+                # The bound a coverage mapping has: only a share this assessment's own sources
+                # reach may be summarised, so no assessment rewrites an unrelated old share (K3-02).
+                if not any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, share["source_ids"])):
+                    raise Conflict("Disclosure concerns a share outside the evaluated source set", target=share["id"])
                 for identifier in proposal.about_ids + proposal.previous_share_ids:
                     self._record_ids(conn, identifier)
                 topic_id = self._id("topic", proposal.topic.strip().casefold())

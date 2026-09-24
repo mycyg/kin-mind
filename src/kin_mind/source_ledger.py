@@ -302,10 +302,11 @@ def legitimize(ledger, url):
             if entry["state"] == LAYER_HISTORICAL and entry["locator"] == url:
                 return entry
         return None
-    for entry in reversed(ledger):
-        if entry["state"] in CITABLE and entry["locator"] == url:
-            return entry
-    return None
+    # What this run read itself comes before a receipt carried in from a checkpoint or an earlier
+    # exploration: a page read again now is the version the result was written from (K4-17).
+    matches = [entry for entry in ledger if entry["state"] in CITABLE and entry["locator"] == url]
+    observed = [entry for entry in matches if entry["state"] == LAYER_OBSERVED]
+    return (observed or matches or [None])[-1]
 
 
 def verify_citations(findings, ledger):

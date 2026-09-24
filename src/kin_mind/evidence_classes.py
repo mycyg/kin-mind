@@ -23,11 +23,12 @@ Pure functions over what the caller already holds: nothing here reads or writes 
 from __future__ import annotations
 
 from eventmem.core.db import digest
-from eventmem.core.read_policy import NON_EXPERIENCE, REQUEST_LABEL, host_envelope
+from eventmem.core.read_policy import NON_EXPERIENCE, ORIGIN_LABELS, REQUEST_LABEL, host_envelope, host_maintenance
 
 from .rhythm import stamp
 
-# Sources the host writes back for its own events, with model authority.
+# Sources the host writes back for its own events, with model authority. One of the namespaces
+# the origin table (`eventmem/core/source-origins.json`) calls host maintenance.
 INTERNAL_NAMESPACE = "mind-internal-event"
 # What the host can resolve into proof that something was actually done, and the field of each
 # that says it finished. An artifact on its own is not here: its task result is what verifies it.
@@ -35,11 +36,10 @@ EXECUTION_RECEIPTS = ("plan-run", "task-result", "delivery", "exploration")
 
 
 def never_evidence(source):
-    """An internal event: Kin's own bookkeeping, written back as a source. Never evidence."""
-    if not isinstance(source, dict):
-        return True
-    namespace = source.get("namespace") or ""
-    return namespace == INTERNAL_NAMESPACE or namespace.startswith(INTERNAL_NAMESPACE + ":")
+    """An internal event: the host's own bookkeeping written back as a source — internal mind
+    events, session maintenance requests, receipts. Never evidence. The same definition the read
+    policy uses to keep them out of experience recall, so the two can no longer disagree."""
+    return host_maintenance(source)
 
 
 def owner_statement(record, policy=None, *, sources=()):
@@ -56,7 +56,7 @@ def owner_statement(record, policy=None, *, sources=()):
         # Plain experience only: a configuration request is an experience with a label.
         if found.kind != "experience" or found.label is not None:
             return False
-    elif attributes.get("origin_kind") in NON_EXPERIENCE | {REQUEST_LABEL}:
+    elif attributes.get("origin_kind") in NON_EXPERIENCE | ORIGIN_LABELS | {REQUEST_LABEL}:
         # The stamp the engine wrote when the source arrived, which is all there is to read here.
         return False
     return (attributes.get("role") == "user" and not record.get("generated")

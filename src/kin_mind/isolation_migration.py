@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from itertools import pairwise
 from pathlib import Path
 
@@ -57,7 +58,9 @@ CLASS_ARCHIVE = "evidence_class"
 REGISTRY_ARCHIVE = "registry"
 # Where a mixed node keeps the references this migration took out of its evidence.
 CONFIGURATION_KEY = "configuration_evidence"
-# The mark that says a node has been through this migration, so a rerun leaves it alone.
+# The mark that says a node has been through this migration. A marked node that cites
+# configuration again — written before the graph's writer kept it out (K4-13) — is taken apart
+# again on the next run; the mark alone never exempts it.
 MARK = "evidence_isolation"
 # The classes whose references move. A self-claim is evidence about the agent rather than a
 # configuration the host installed, so a node citing one is reported and left as it is.
@@ -77,6 +80,68 @@ def _refusal(error):
 
     found = classify(error)
     return {"code": found.code or "refused", "kind": found.kind, "handling": found.handling}
+
+
+# A migration an operator started and that stopped on a refusal is tried again by the worker's
+# maintenance tick (K4-14): at most once an hour, and not more than this many times.
+AUTO_RETRY_SECONDS = 3600
+AUTO_RETRY_LIMIT = 24
+
+
+def status(conn, scope_key):
+    """The migration as the operational status shows it: its state, whether reads are strict
+    because of it, what the last run refused, and how often it was retried on its own."""
+    try:
+        row = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?",
+                           (scope_key, MIGRATION)).fetchone()
+    except sqlite3.OperationalError:
+        return {"state": "not-started", "strict": False}
+    if not row:
+        return {"state": "not-started", "strict": False}
+    try:
+        data = json.loads(row[0])
+    except ValueError:
+        data = {}
+    state = str(data.get("state") or "pending")
+    return {"state": state, "strict": state not in ("complete", UNDONE),
+            "refused": len(data.get("mixed_nodes_refused") or ()) + len(data.get("supersessions_refused") or ()),
+            "auto_retries": data.get("auto_retries", 0), "updated_at": data.get("updated_at")}
+
+
+def resume_stalled(engine, *, now=None):
+    """Finish, on the worker's maintenance tick, a migration an operator applied and that stopped
+    short. A refusal means another writer moved an object between the plan and the write; the
+    run is idempotent and plans again against what is stored now, which is what a second
+    `--apply` by hand would do. Until it settles every read stays strict, so waiting for a person
+    to notice cost every context build its summaries and caches. Returns the scopes it ran."""
+    from eventmem.core.models import Scope
+
+    from .state import Mind
+
+    now = time.time() if now is None else now
+    try:
+        with engine.db.connect() as conn:
+            rows = conn.execute("SELECT scope,data FROM mind_memory_migrations WHERE name=?", (MIGRATION,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    ran = []
+    for row in rows:
+        try:
+            data = json.loads(row["data"])
+        except ValueError:
+            continue
+        if data.get("state") not in STATES or data.get("state") == "complete":
+            continue
+        retries = int(data.get("auto_retries") or 0)
+        if retries >= AUTO_RETRY_LIMIT or now - float(data.get("auto_retry_at") or 0) < AUTO_RETRY_SECONDS:
+            continue
+        with engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_memory_migrations SET data=json_set(data,'$.auto_retries',?,'$.auto_retry_at',?)"
+                         " WHERE scope=? AND name=?", (retries + 1, now, row["scope"], MIGRATION))
+        migration = IsolationMigration(Mind(engine, Scope.model_validate_json(row["scope"])))
+        migration.run(apply=True)
+        ran.append(row["scope"])
+    return ran
 
 
 def _load_registry(path):
@@ -292,24 +357,25 @@ class IsolationMigration:
                 if any(policy.classify(records[rid]).kind == "self_knowledge"
                        for rid in node.get("record_ids", []) if rid in records):
                     projections += 1
-                if node.get(MARK) == RULES_VERSION:
-                    # Already isolated: the references it mixed are in the configuration key.
-                    mixed.append({"id": node["id"], "references_moved": len(node.get(CONFIGURATION_KEY) or ())})
-                    continue
                 moved, kept = self._node_moves(policy, node)
                 if not moved:
+                    if node.get(MARK) == RULES_VERSION:
+                        # Already isolated: the references it mixed are in the configuration key.
+                        mixed.append({"id": node["id"], "references_moved": len(node.get(CONFIGURATION_KEY) or ())})
                     continue
                 mixed.append({"id": node["id"], "references_moved": len(moved)})
                 pending.append({"id": node["id"], "revision": node["revision"], "keeps": len(kept)})
-        edges = 0
-        for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active'", (self.scope.key(),)):
+        edges = []
+        for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' ORDER BY id",
+                                (self.scope.key(),)):
             edge = json.loads(row[0])
             moved, kept = self._node_moves(policy, edge)
-            edges += bool(moved and kept)
-        return {"pending": pending, "configuration_only": hidden, "impact": {
+            if moved and kept:
+                edges.append({"id": edge["id"], "revision": edge["revision"], "keeps": len(kept), "edge": True})
+        return {"pending": pending + edges, "configuration_only": hidden, "impact": {
             "mixed_nodes": sorted(mixed, key=lambda node: node["id"]),
             "configuration_only_nodes": {"count": len(hidden), "node_ids": hidden},
-            "self_knowledge_projections": projections, "mixed_edges_left_unchanged": edges}}
+            "self_knowledge_projections": projections, "mixed_edges": len(edges)}}
 
     def _rebuilds(self, conn, policy, superseded, node_ids):
         """Event summaries a model will have to write again: the ones the policy trims, plus the
@@ -417,10 +483,8 @@ class IsolationMigration:
             self._advance(conn, "chains", supersessions=linked, supersessions_refused=skipped)
         return {"linked": linked, "refused": skipped}
 
-    def _rewrite_node(self, conn, policy, node_id, expected_revision):
+    def _rewrite_node(self, conn, policy, node_id, expected_revision, *, edge=False):
         node = self.graph.get(conn, node_id)
-        if node.get(MARK) == RULES_VERSION:
-            return None
         if node["revision"] != expected_revision:
             raise Conflict("Graph node changed after evaluation", target=node_id,
                            expected=expected_revision, actual=node["revision"])
@@ -435,6 +499,10 @@ class IsolationMigration:
         value = {**node, "evidence": kept, "source_ids": sorted({ref["source_id"] for ref in kept}),
                  CONFIGURATION_KEY: [*node.get(CONFIGURATION_KEY, []), *moved], "basis": basis,
                  MARK: RULES_VERSION, "revision_reason": NODE_REASON}
+        if edge:
+            # An edge keeps its reason: the relation stands on the evidence that remains, and
+            # the archived version holds what it cited before.
+            return self.graph._put(conn, value, edge=True)
         # The derived text was written from both sides of the evidence, so it is not this node's
         # text any more. Clearing it puts the node back on the enrichment lane the new revision
         # already marked dirty, and the archived version holds what was there.
@@ -448,7 +516,8 @@ class IsolationMigration:
             with self.engine.db.connect(write=True) as conn:
                 policy = ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
                 try:
-                    rewritten += bool(self._rewrite_node(conn, policy, node["id"], node["revision"]))
+                    rewritten += bool(self._rewrite_node(conn, policy, node["id"], node["revision"],
+                                                         edge=bool(node.get("edge"))))
                 except (Conflict, Missing) as error:
                     refused.append({"id": node["id"], **_refusal(error)})
         from .judgment_cache import invalidate
@@ -515,7 +584,8 @@ class IsolationMigration:
         for node in work["nodes"]:
             with self.engine.db.connect(write=True) as conn:
                 # A new revision carrying the archived content; the migration's own is kept.
-                self.graph._put(conn, {**node["archived"], "revision_reason": UNDO_REASON})
+                self.graph._put(conn, {**node["archived"], "revision_reason": UNDO_REASON},
+                                edge=node["archived"].get("kind") == "edge", isolate=False)
         for start in range(0, len(work["classes"]), self.chunk):
             with self.engine.db.connect(write=True) as conn:
                 for entry in work["classes"][start:start + self.chunk]:

@@ -1,5 +1,6 @@
 """Read progress separately from liveness, without loading private messages."""
 import json
+import time
 
 from eventmem.core.integrity import verify_interpreter, verify_source_root
 
@@ -30,6 +31,30 @@ def operational_status(mind, config=None):
             autonomy["effective_use_events"] = conn.execute("SELECT COUNT(*) FROM mind_reinforcement WHERE scope=?", (scope,)).fetchone()[0]
         if "mind_strength_observations" in tables:
             autonomy["strength_observation_days"] = {r[0]: r[1] for r in conn.execute("SELECT version,COUNT(*) FROM mind_strength_observations WHERE scope=? GROUP BY version", (scope,))}
+        # A running row whose lease ran out, or whose worker cannot be shown alive, is stuck, not
+        # running: counted apart so a health check sees it (K2-19).
+        if "mind_plan_runs" in tables:
+            autonomy["expired_running_executions"] = conn.execute(
+                "SELECT COUNT(*) FROM mind_plan_runs WHERE scope=? AND state='running' AND lease_until<?",
+                (scope, time.time())).fetchone()[0]
+        if "mind_explorations" in tables:
+            from .liveness import live_explorations
+            running = [r[0] for r in conn.execute("SELECT id FROM mind_explorations WHERE scope=? AND state='running'", (scope,))]
+            alive = set(live_explorations(conn, scope)) if running else set()
+            autonomy["stale_running_explorations"] = sum(1 for identifier in running if identifier not in alive)
+        from .isolation_migration import status as isolation_status
+        from .erasure import status as erasure_status
+        memory = {"evidence_isolation": isolation_status(conn, scope), "history_erase": erasure_status(conn, scope)}
+        # Quarantined appraisals have no automatic way out: how many, since when, and why, as
+        # static labels, so an operator can retire or resume them (K4-06, DB1-05).
+        from .model_lanes import label
+        count, oldest = conn.execute("SELECT COUNT(*),MIN(available) FROM mind_appraisals WHERE scope=? AND state='needs-repair'",
+                                     (scope,)).fetchone()
+        reasons = {}
+        for reason, n in conn.execute("SELECT json_extract(data,'$.repair_reason'),COUNT(*) FROM mind_appraisals "
+                                      "WHERE scope=? AND state='needs-repair' GROUP BY 1", (scope,)):
+            reasons[label(reason) if reason else "unknown"] = reasons.get(label(reason) if reason else "unknown", 0) + n
+        memory["quarantined"] = {"count": count, "oldest_available_unix": oldest, "reasons": reasons}
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
     # Which copy of the source answered this call, and which other copies are still
@@ -51,4 +76,5 @@ def operational_status(mind, config=None):
                            "last_success": enriched["at"] if enriched else None, "last_job": enriched["id"] if enriched else None},
             "last_completed_review": {"id": last["id"], "model": latest.get("receipt", {}).get("model")} if last else None,
             "exploration": dict(exploration) if exploration else None,
-            "contact": {"id": contact["id"], "state": contact["state"], "at": json.loads(contact["data"]).get("updated_at")} if contact else None}
+            "contact": {"id": contact["id"], "state": contact["state"], "at": json.loads(contact["data"]).get("updated_at")} if contact else None,
+            "memory": memory}

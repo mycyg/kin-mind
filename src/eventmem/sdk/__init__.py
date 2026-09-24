@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
 
@@ -109,13 +110,15 @@ class DeliveryInbox:
 
     def __init__(self, path):
         self.path = str(path)
-        with sqlite3.connect(self.path) as conn:
+        # A connection's own `with` ends its transaction but leaves it open; closing() closes
+        # it, so an inbox that accepts for months holds no connections behind it (E3-21).
+        with closing(sqlite3.connect(self.path)) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,body TEXT NOT NULL)"
             )
 
     def accept(self, delivery, handler):
-        with sqlite3.connect(self.path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.path, timeout=30)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT body FROM deliveries WHERE id=?", (delivery["id"],)

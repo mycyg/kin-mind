@@ -175,6 +175,9 @@ class RecallQuery(Model):
 
 
 RecallPurpose = Literal["experience_recall", "self_knowledge_view", "audit"]
+# What a chat model may ask for through its tools. Rebuilding the text index and building or
+# purging vectors are an operator's commands: they work across the store (E3-15).
+ModelMaintenance = Literal["organize", "diary", "summary", "portrait", "self_narrative", "prediction"]
 
 
 class RecallRequest(RecallQuery):

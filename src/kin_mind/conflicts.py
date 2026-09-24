@@ -24,7 +24,7 @@ KINDS = ("semantic", "runtime", "unknown")
 HANDLINGS = ("reuse", "block", "terminal", "section")
 
 # Modules the appraisal commit path runs through. A new Conflict/Missing literal in any of
-# them must be registered below, or test_conflict_taxonomy fails.
+# them must be registered below, or tests/business/test_conflict_registry.py fails (K4-07).
 COMMIT_PATH_MODULES = (
     "kin_mind.appraisal", "kin_mind.state", "kin_mind.graph", "kin_mind.memory",
     "kin_mind.lifecycle", "kin_mind.continuity", "kin_mind.plans", "kin_mind.habits",
@@ -132,6 +132,7 @@ REGISTRY = {
     "Memory note keys must be unique in an assessment": ("semantic", "duplicate-keys", "block"),
     "Memory and graph keys must be unique in an assessment": ("semantic", "duplicate-keys", "block"),
     "Disclosure needs current delivery evidence": ("runtime", "reference-needs-review", "reuse"),
+    "Disclosure concerns a share outside the evaluated source set": ("semantic", "evidence-out-of-bounds", "block"),
     "Graph reference needs review": ("runtime", "reference-needs-review", "reuse"),
     "Linked source needs review": ("runtime", "reference-needs-review", "reuse"),
     "Cross-scope reference": ("semantic", "reference-cross-scope", "block"),
@@ -173,7 +174,7 @@ REGISTRY = {
     "Executed or reserved steps cannot be overwritten": ("semantic", "step-executed", "section"),
     "Keep executed steps in plan history": ("semantic", "step-executed", "section"),
     "A command ID cannot be reused for a different change": ("runtime", "payload-changed", "block"),
-    "Autonomous action requires a verified DeepSeek high decision": ("semantic", "insufficient-authority", "block"),
+    "Autonomous action requires a verified assessment decision": ("semantic", "insufficient-authority", "block"),
     "Decision plan revision is no longer active": ("runtime", "plan-revision-changed", "reuse"),
     "Step is not available for this decision": ("runtime", "step-unavailable", "reuse"),
     "Delivery selection requires host-verified artifacts from completed steps": ("semantic", "insufficient-authority", "block"),
@@ -215,6 +216,7 @@ REGISTRY = {
     "Procedure learning is disabled": ("runtime", "feature-disabled", "block"),
     "Procedure needs review": ("runtime", "procedure-needs-review", "reuse"),
     "Procedure environment needs review": ("runtime", "procedure-needs-review", "reuse"),
+    "Procedure needs review before replay": ("runtime", "procedure-needs-review", "block"),
     "Procedure dependency version changed": ("runtime", "procedure-dependency-changed", "reuse"),
     "Procedure has a failed counterexample": ("semantic", "procedure-counterexample", "block"),
     "Trial ran a different method revision": ("runtime", "trial-revision-mismatch", "block"),

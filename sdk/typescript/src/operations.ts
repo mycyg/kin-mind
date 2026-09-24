@@ -571,21 +571,6 @@ export const operations = {
       "required": true
     }
   },
-  "record_feedback": {
-    "method": "POST",
-    "path": "/v1/feedback",
-    "parameters": [],
-    "body": {
-      "content": {
-        "application/json": {
-          "schema": {
-            "$ref": "#/components/schemas/FeedbackRequest"
-          }
-        }
-      },
-      "required": true
-    }
-  },
   "session_boundary": {
     "method": "POST",
     "path": "/v1/sessions/boundary",
@@ -728,6 +713,20 @@ export const operations = {
           "minimum": 1,
           "default": 50,
           "title": "Limit"
+        }
+      },
+      {
+        "name": "order",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "enum": [
+            "id",
+            "recent"
+          ],
+          "type": "string",
+          "default": "id",
+          "title": "Order"
         }
       }
     ],
@@ -1650,6 +1649,20 @@ export const operations = {
           "minimum": 1,
           "default": 50,
           "title": "Limit"
+        }
+      },
+      {
+        "name": "order",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "enum": [
+            "id",
+            "recent"
+          ],
+          "type": "string",
+          "default": "id",
+          "title": "Order"
         }
       }
     ],

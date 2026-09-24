@@ -209,6 +209,10 @@ def _set_marker(db, active):
                          (history.COMPACTION_MARKER,))
         else:
             conn.execute("DELETE FROM meta WHERE key=?", (history.COMPACTION_MARKER,))
+            # What the marker alone refused goes back to its queue with it (K3-14).
+            from eventmem.core.models import now
+            from .recovery import resume_compaction_waits
+            resume_compaction_waits(conn, now())
 
 
 # --- the archive ----------------------------------------------------------------------------------
@@ -949,11 +953,15 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
             identity, head = {"rows": 0, "first": 0, "head": 0, "history_sha256": ""}, 0
     path = _archive_file(db, stored, at)
     if resuming and not backup:
-        backup_path = archive_dir(db) / stored["backup"]
+        # The backup the run started against, wherever the operator put it. A resumed run never
+        # takes a new one: the store is half its own work by now, and a copy of that is not a
+        # fallback — it is 1.7 GB of the wrong thing, refused only after it was written.
+        backup_path = Path(stored.get("backup_path") or archive_dir(db) / stored["backup"])
     else:
         backup_path = _backup_file(db, identity, at, backup)
     checks = preconditions(mind, config, scope=scope, backup=backup_path,
-                           take_backup=backup is None, archive_bytes=remaining, identity=identity)
+                           take_backup=backup is None and not resuming, archive_bytes=remaining,
+                           identity=identity)
     if resuming:
         checks.append({"check": "history", "ready": not moved,
                        "reason": "history-moved-since-the-run-started" if moved
@@ -969,12 +977,15 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
     if not resuming:
         manifest = _freeze_manifest(survey, scope, stored["through"], at=at)
     if not backup_path.exists():
+        if resuming:
+            _refuse("backup-absent", backup=backup_path.name)
         _take_backup(db, backup_path)
     # Whether it was just taken, was already there, or was named by the operator, the backup is
     # opened and proven against the frozen manifest before the run starts — and what was trusted
     # is written into the run's own record, so the basis it stood on is reviewable afterwards.
     verification = _backup_verify(scope, backup_path, manifest, at=at)
     settled = {"archive": path.name, "backup": backup_path.name,
+               "backup_path": str(backup_path.expanduser().resolve()),
                "started_at": stored.get("started_at") or at, "updated_at": at,
                "manifest": manifest, "backup_verified": verification}
     with db.connect(write=True) as conn:
@@ -1154,10 +1165,13 @@ def compact_verify(mind, *, limit=SAMPLE, deep=False, archive=None):
     rebuild per revision. `deep` rebuilds each revision from its own nearest whole document instead:
     the same answer reached without carrying anything between rows, much slower, and worth running
     once on a copy before a release."""
+    from . import erasure
+
     scope, limit = mind.scope.key(), max(1, min(200, int(limit)))
     db = mind.engine.db
     with db.connect() as conn:
         stored = progress(conn, scope)
+        erased = erasure.erased_ids(conn)
     path = _named(db, archive) if archive else _archive_file(db, stored, mind.clock())
     counts = {"checked": 0, "rebuilt": 0, "differs": 0, "unrebuildable": 0, "archive_corrupt": 0,
               "patch_originals": 0}
@@ -1181,6 +1195,11 @@ def compact_verify(mind, *, limit=SAMPLE, deep=False, archive=None):
                 continue
             archived = _parse(row["data"])
             want = history.snapshot_of(archived) if archived else None
+            if want is not None and erased:
+                # An explicit delete since the archive was taken took words out of the store's
+                # rows and hashed them again. What the store must rebuild is the original with
+                # exactly those words taken out — the same scrub, so anything else still differs.
+                want = erasure.scrub(want, erased)
             state, previous = (_materialize(conn, scope, revision), revision) if deep \
                 else _step(conn, scope, revision, state, previous)
             if want is None:
@@ -1239,42 +1258,57 @@ def restore(mind, config=None, *, apply=False, batch=BATCH, archive=None):
 
     The way out of a compaction that should not have happened, or one that stopped somewhere nobody
     wants to resume from. Every row the archive holds for this scope is compared with the row in the
-    store, and where they differ the archived bytes go back exactly as they were. The columns beside
-    `data` are compared and never written: if one of them has moved, something other than compaction
-    has been here, and that is a thing to stop for rather than to paper over.
+    store, and where they differ the archived row goes back. The columns beside `data` are compared
+    and never written: if one of them has moved, something other than compaction has been here, and
+    that is a thing to stop for rather than to paper over.
+
+    Two things stand between an archived row and the store. Its bytes are checked against the
+    digest taken when it was archived, and a row that does not match stops the restore before
+    anything is written. And an archive is a copy from before: it may hold words an explicit delete
+    has taken out of the store since. Those do not come back. Each archived row goes through the
+    same scrub the delete's own history rewrite uses, with every tombstone the store holds, and the
+    hashes are taken again from the scrubbed states — forward, carried from the row before, so
+    what comes back is a history that rebuilds and verifies, with the erase still in force. A row
+    with nothing erased in it goes back byte for byte.
 
     Quiet is required here too. The marker stops the mind writing revisions, but this writes the
     same rows compaction does and must not race anything that might still be reading them.
 
     The archive is not touched, on success or on failure. It is the only copy of what those rows
     said, and nothing in this package deletes it."""
+    from . import erasure
+
     scope, at = mind.scope.key(), mind.clock()
     db, batch = mind.engine.db, max(1, min(200, int(batch)))
     with db.connect() as conn:
         stored = progress(conn, scope)
+        erased = erasure.erased_ids(conn)
     path = _named(db, archive) if archive else _archive_file(db, stored, at)
     if not path.exists():
         _refuse("archive-missing", archive=path.name)
-    source = _archive_connection(path)
-    try:
-        held = source.execute(
-            "SELECT revision,id,kind,occurred_at,data FROM mind_events_v1 WHERE scope=?"
-            " ORDER BY revision", (scope,)).fetchall()
-    finally:
-        source.close()
     checks = [_quiet_check(mind, config)]
     if not apply:
+        differing, scrubbed, held = [], 0, 0
         with db.connect() as conn:
-            differing = [row["revision"] for row in held if _differs(conn, scope, row)]
+            for chunk in _restoring(db, scope, path, erased, batch):
+                for row, text, changed in chunk:
+                    held += 1
+                    scrubbed += 1 if changed else 0
+                    if _differs(conn, scope, {"revision": row["revision"], "data": text}):
+                        differing.append(row["revision"])
         return {"state": "dry-run", "scope": scope, "archive": path.name,
                 "ready": all(check["ready"] for check in checks), "preconditions": checks,
-                "archived": len(held), "would_restore": len(differing),
+                "archived": held, "would_restore": len(differing), "erased_rows": scrubbed,
                 "revisions": differing[:SAMPLE], "cursor": stored["through"]}
     _require(checks)
-    restored = unchanged = 0
-    for start in range(0, len(held), batch):
+    restored = unchanged = scrubbed = held = 0
+    last = None
+    for chunk in _restoring(db, scope, path, erased, batch):
         with db.connect(write=True) as conn:
-            for row in held[start:start + batch]:
+            for row, text, changed in chunk:
+                held += 1
+                scrubbed += 1 if changed else 0
+                last = row["revision"]
                 current = conn.execute(
                     "SELECT id,kind,occurred_at,data FROM mind_events WHERE scope=? AND revision=?",
                     (scope, row["revision"])).fetchone()
@@ -1283,20 +1317,79 @@ def restore(mind, config=None, *, apply=False, batch=BATCH, archive=None):
                 for column in ("id", "kind", "occurred_at"):
                     if current[column] != row[column]:
                         _refuse("row-column-has-moved", revision=row["revision"], column=column)
-                if current["data"] == row["data"]:
+                if current["data"] == text:
                     unchanged += 1
                     continue
                 conn.execute("UPDATE mind_events SET data=? WHERE scope=? AND revision=?",
-                             (row["data"], scope, row["revision"]))
+                             (text, scope, row["revision"]))
                 restored += 1
+    # The rows after the archive were written against the rows it replaced. Where those came
+    # back with other hashes, the chain after them is carried forward until it agrees again.
+    carried = 0
+    while last is not None:
+        with db.connect(write=True) as conn:
+            result = erasure.rewrite_history(conn, scope, erased, after=last, trusted=True, rows=batch * 8)
+        carried += result["rewritten"]
+        if result["state"] == "complete":
+            break
+        last = result["after"]
     with db.connect(write=True) as conn:
-        _record(conn, scope, 0, {**{key: stored[key] for key in ("archive", "backup", "started_at")
-                                    if key in stored},
-                                 "archive": path.name, "restored_at": at, "restored": restored})
-    # The history is what it was, so the store is open again. The archive stays where it is.
+        _record(conn, scope, 0, {**{key: stored[key] for key in ("archive", "backup", "backup_path",
+                                                                    "started_at") if key in stored},
+                                 "archive": path.name, "restored_at": at, "restored": restored,
+                                 "erased_rows": scrubbed})
+    # The history is what it was, less what was erased since, so the store is open again. The
+    # archive stays where it is.
     _set_marker(db, False)
     return {"state": "restored", "scope": scope, "archive": path.name, "restored": restored,
-            "unchanged": unchanged, "archived": len(held), "cursor": 0}
+            "unchanged": unchanged, "archived": held, "erased_rows": scrubbed,
+            "carried_forward": carried, "cursor": 0}
+
+
+def _restoring(db, scope, path, erased, batch):
+    """The archived rows of this scope in order, a batch at a time, each with the text it goes
+    back as and whether that differs from the archived bytes.
+
+    Read a batch at a time rather than all at once: an archive holds the whole pre-compaction
+    history, hundreds of megabytes of it. Every row's bytes are checked against the digest the
+    archive took before anything is made of them. The walk that scrubs them starts from the
+    state the store holds just before the first archived row, which a restore does not touch."""
+    from . import erasure
+
+    source = _archive_connection(path)
+    try:
+        revisions = [row[0] for row in source.execute(
+            "SELECT revision FROM mind_events_v1 WHERE scope=? ORDER BY revision", (scope,))]
+        if not revisions:
+            return
+        with db.connect() as conn:
+            prior = conn.execute(
+                "SELECT revision FROM mind_events WHERE scope=? AND revision<? ORDER BY revision DESC LIMIT 1",
+                (scope, revisions[0])).fetchone()
+            walk = erasure.Walk.before(conn, scope, prior[0] if prior else None, erased, trusted=True)
+        for start in range(0, len(revisions), batch):
+            chunk = []
+            for row in source.execute(
+                    "SELECT revision,id,kind,occurred_at,data,data_sha256 FROM mind_events_v1"
+                    " WHERE scope=? AND revision>=? AND revision<=? ORDER BY revision",
+                    (scope, revisions[start], revisions[min(start + batch, len(revisions)) - 1])):
+                if digest(row["data"].encode()) != row["data_sha256"]:
+                    _refuse("archive-row-differs-from-its-digest", revision=row["revision"])
+                data = _parse(row["data"])
+                if data is None:
+                    if erased.intersection(erasure.IDENTIFIER.findall(row["data"])):
+                        # Nothing can be taken out of a row that will not parse, and it may not
+                        # go back with erased words in it.
+                        _refuse("archive-row-unreadable-and-names-erased-material", revision=row["revision"])
+                    walk.state = walk.known = walk.orig = walk.orig_whole = None
+                    walk.previous = row["revision"]
+                    chunk.append((row, row["data"], False))
+                    continue
+                out, changed = walk.step(row["revision"], data)
+                chunk.append((row, history.canonical(out) if changed else row["data"], changed))
+            yield chunk
+    finally:
+        source.close()
 
 
 def _differs(conn, scope, row):
