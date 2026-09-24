@@ -43,6 +43,9 @@ export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
 /** How long a freeze nobody lifts holds new dispatch. */
 export const FREEZE_TTL_MS=2*3600000;
+/** Hot state keeps what is unsettled plus a bounded recent tail; the rest moves to
+ * `archive/router-YYYY-MM.jsonl` beside the state file, never deleted (AD1-08). */
+export const HOT_LIMITS=Object.freeze({inputs:200,internal:24,tasks:32,requests:64,notices:64,history:64,journalBytes:8*1024*1024});
 const frozenError=reason=>Object.assign(Error('Dispatch is frozen: '+reason),{code:'dispatch-frozen',retryable:true});
 /** Why a classification attempt failed. The class is recorded, never collapsed
  * into one anonymous catch: timeout / http / parse / unavailable. */
@@ -93,7 +96,8 @@ export function modeCommand(text) {
 /** Every durable adapter state file is written through here: a temporary name no
  * other writer can share, fsync before the rename, and — for the files that must
  * survive a corrupt revision — the replaced one kept as `<file>.prev`. */
-export function atomicJson(file,value,{previous=false}={}) {writeJsonAtomic(file,value,{previous,pretty:true});}
+export function atomicJson(file,value,{previous=false,pretty=true}={}) {writeJsonAtomic(file,value,{previous,pretty});}
+const month=at=>new Date(Number.isFinite(at)?at:0).toISOString().slice(0,7);
 
 export const STATE_RECOVERY=Object.freeze({previous:'restored-from-previous-revision',none:'state-file-unreadable'});
 /** Load one durable state file: the file itself, else the `.prev` copy the writer
@@ -119,9 +123,11 @@ export class MobileRouter {
    * whether to stop the running task, whether a file was asked for, what they call themselves
    * — and lets an owner message with attachments be classified instead of assumed to be work.
    * Left off, every request and every record is what it was before intents existed.
-   * `profiles` are the host's configured chat and work routing profiles. */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,profiles=null}) {
+   * `profiles` are the host's configured chat and work routing profiles; `hotLimits`
+   * narrows what the state file keeps (see HOT_LIMITS). */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,profiles=null,hotLimits=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
+    this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
     this.profiles=Object.freeze({chat:Object.freeze({...ROUTER_PROFILES.chat,...profiles?.chat}),work:Object.freeze({...ROUTER_PROFILES.work,...profiles?.work})});
     this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
@@ -175,15 +181,78 @@ export class MobileRouter {
       }
       this.state.ledgerVersion=2;
     }
+    this.archivedIds=this.loadArchivedIds();
     this.save('startup');
   }
   save(kind,detail={}) {
     this.state.revision++;
     const event={at:this.now(),kind,...detail,revision:this.state.revision};
     this.state.history.push(event);
-    this.state.history=this.state.history.slice(-200);
-    atomicJson(this.file,this.state,{previous:true});
-    fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify(event)+'\n',{mode:0o600});
+    this.state.history=this.state.history.slice(-this.hotLimits.history);
+    // Compact on disk; the journal keeps every event (AD1-08).
+    writeJsonAtomic(this.file,this.state,{previous:true,pretty:false});
+    const journal=this.file+'.events.jsonl';
+    fs.appendFileSync(journal,JSON.stringify(event)+'\n',{mode:0o600});
+    if(this.state.revision%256===0)this.rotateJournal(journal);
+  }
+  archiveDirectory(){return path.join(path.dirname(this.file),'archive');}
+  /** The journal is read only for its tail; past its size the older part moves to the archive. */
+  rotateJournal(journal) {
+    try {
+      if(fs.statSync(journal).size<this.hotLimits.journalBytes)return;
+      fs.mkdirSync(this.archiveDirectory(),{recursive:true,mode:0o700});
+      const target=path.join(this.archiveDirectory(),path.basename(this.file)+'.events-'+new Date(this.now()).toISOString().replace(/[:.]/g,'-')+'.jsonl');
+      if(!fs.existsSync(target))fs.renameSync(journal,target);
+    } catch {/* The journal stays where it is and is tried again later. */}
+  }
+  /** Ids of archived inputs: a replay of one is refused, never re-run. The id index
+   * is read when present; the monthly files are scanned only without it. */
+  loadArchivedIds() {
+    const ids=new Set(),directory=this.archiveDirectory(),index=path.join(directory,'router-input-ids.txt');
+    try {
+      if(fs.existsSync(index)){for(const line of fs.readFileSync(index,'utf8').split('\n'))if(line)ids.add(line);return ids;}
+      for(const name of fs.readdirSync(directory).filter(name=>/^router-\d{4}-\d{2}\.jsonl$/.test(name)))
+        for(const line of fs.readFileSync(path.join(directory,name),'utf8').split('\n'))
+          try {const entry=JSON.parse(line);if(entry.kind==='input'&&typeof entry.id==='string')ids.add(entry.id);} catch {}
+    } catch {/* No archive yet. */}
+    return ids;
+  }
+  /** Settled records beyond the hot tail move out of the state file, oldest first,
+   * into the month they settled in. What is open, pending or still referenced stays. */
+  prune() {
+    const at=this.now(),byMonth=new Map(),movedIds=[];
+    const move=(kind,id,record)=>{const key=month(record.settledAt??record.acceptedAt??record.at??record.createdAt??at);
+      const list=byMonth.get(key)??[];list.push({kind,id,archivedAt:at,record});byMonth.set(key,list);};
+    const inputs=Object.values(this.state.inputs),owner=inputs.filter(r=>ownerInput(r)&&inputSettled(r)),internal=inputs.filter(r=>!ownerInput(r)&&inputSettled(r));
+    const limits=this.hotLimits,excess=[...owner.slice(0,Math.max(0,owner.length-limits.inputs)),...internal.slice(0,Math.max(0,internal.length-limits.internal))];
+    const referenced=new Set(Object.values(this.state.tasks).filter(open).flatMap(t=>[...t.inputIds,...(t.contextInputIds??[])]));
+    for(const record of excess)if(!referenced.has(record.id)&&!this.inflight.has(record.id)){
+      move('input',record.id,record);delete this.state.inputs[record.id];delete this.state.semanticPending[record.id];this.archivedIds.add(record.id);movedIds.push(record.id);
+    }
+    const closed=Object.values(this.state.tasks).filter(t=>!open(t));
+    for(const task of closed.slice(0,Math.max(0,closed.length-limits.tasks))){move('task',task.id,task);delete this.state.tasks[task.id];}
+    const settledNotice=n=>['accepted','rejected','failed','superseded','suppressed','unresolved'].includes(n.state);
+    const kept=new Set([...Object.values(this.state.tasks).flatMap(t=>[t.handoff?.id,t.completion?.commandId,t.acceptedBy]),
+      ...Object.values(this.state.notices).filter(n=>!settledNotice(n)).map(n=>n.requestId),...Object.values(this.state.reclassifications??{}).map(r=>r.requestId)].filter(Boolean));
+    const requests=Object.values(this.state.requests).filter(r=>r.state!=='pending');
+    for(const request of requests.slice(0,Math.max(0,requests.length-limits.requests))){
+      const id=request.commandId??Object.keys(this.state.requests).find(key=>this.state.requests[key]===request);
+      if(id&&!kept.has(id)){move('request',id,request);delete this.state.requests[id];}
+    }
+    const lastTold=Object.values(this.state.notices).filter(n=>n.state==='accepted').sort((a,b)=>(a.acceptedAt??0)-(b.acceptedAt??0)).at(-1)?.id;
+    const notices=Object.values(this.state.notices).filter(n=>settledNotice(n)&&n.id!==lastTold);
+    for(const notice of notices.slice(0,Math.max(0,notices.length-limits.notices))){move('notice',notice.id,notice);delete this.state.notices[notice.id];}
+    if(!byMonth.size)return 0;
+    fs.mkdirSync(this.archiveDirectory(),{recursive:true,mode:0o700});
+    let moved=0;
+    for(const [key,list] of byMonth){fs.appendFileSync(path.join(this.archiveDirectory(),'router-'+key+'.jsonl'),list.map(entry=>JSON.stringify(entry)).join('\n')+'\n',{mode:0o600});moved+=list.length;}
+    if(movedIds.length){
+      const index=path.join(this.archiveDirectory(),'router-input-ids.txt');
+      // An index that is missing while archives exist is rebuilt from them first.
+      if(!fs.existsSync(index))fs.writeFileSync(index,[...this.archivedIds].filter(id=>!movedIds.includes(id)).map(id=>id+'\n').join(''),{mode:0o600});
+      fs.appendFileSync(index,movedIds.map(id=>id+'\n').join(''),{mode:0o600});
+    }
+    return moved;
   }
   /** With no revision left to restore, the append-only journal still names every
    * input this router accepted. They come back unconfirmed, so a replayed input is
@@ -239,7 +308,7 @@ export class MobileRouter {
    * the router has not seen yet are named by the host through `received`. */
   unsettledInputs({received=[]}={}) {
     const now=this.now(),list=Object.values(this.state.inputs).filter(record=>!inputSettled(record)).map(record=>unsettledView(record,now));
-    for(const job of received)if(!this.state.inputs[job.id])
+    for(const job of received)if(!this.state.inputs[job.id]&&!this.archivedIds.has(job.id))
       list.push({id:job.id,kind:job.kind??'owner',state:'received',summary:'received',inFlight:job.processing===true,at:job.at??null,ageMs:Number.isFinite(job.at)?Math.max(0,now-job.at):null});
     return list;
   }
@@ -252,8 +321,8 @@ export class MobileRouter {
       if(state==='historical'){historical++;continue;}
       (ownerInput(record)?owner:internal)[state]++;
     }
-    for(const job of received)if(!this.state.inputs[job.id])owner.received++;
-    return {...owner,historical,internal,frozen:this.frozen()?clone(this.state.freeze):null};
+    for(const job of received)if(!this.state.inputs[job.id]&&!this.archivedIds.has(job.id))owner.received++;
+    return {...owner,historical,internal,archived:this.archivedIds.size,frozen:this.frozen()?clone(this.state.freeze):null};
   }
   frozen() {
     const freeze=this.state.freeze;
@@ -402,6 +471,8 @@ export class MobileRouter {
     // no model. The classification itself never holds the mutex (AD1-06).
     const first=await this.locked(async()=>{
       const previous=this.state.inputs[input.id];
+      // An archived input was settled long ago: a replay of it is never re-run (AD1-08).
+      if(!previous&&this.archivedIds.has(input.id))return {record:{id:input.id,state:'accepted',archived:true}};
       if(previous) {
         if(previous.recovered)throw Error('Input acceptance requires reconciliation');
         if(previous.hash!==hash)throw Error('Input id reused with different content');
@@ -1369,10 +1440,10 @@ export class MobileRouter {
     }
   }
   // ---- Facts for the ledger: which inputs a native prompt carries, when it ends, and
-  // what of the reply reached the owner.
+  // what of the reply reached the owner. Turns without a task are ordinary, not late (AD1-07).
   turnStarted(data) {
-    const ids=[...new Set(Array.isArray(data.inputIds)?data.inputIds:[])],at=this.now();
-    this.state.turn={startedAt:at,inputIds:ids};
+    const ids=[...new Set(Array.isArray(data.inputIds)?data.inputIds:data.sourceInputId?[data.sourceInputId]:[])],at=this.now();
+    this.state.turn={startedAt:at,inputIds:ids,taskId:data.taskId??null,turnFence:data.turnFence??this.state.executionEpoch};
     for(const id of ids) {
       const record=this.state.inputs[id];if(!record)continue;
       if(record.state==='queued'){record.state='accepted';record.acceptedAt=at;}
@@ -1395,6 +1466,12 @@ export class MobileRouter {
       task.status='unclaimed';task.lapsedAt=at;task.outcome='not-accepted';this.state.autoRestoreDue=true;
     }
     return true;
+  }
+  /** Progress of the active turn, in memory only: streaming text and tool calls show
+   * the input is being worked on. It is never written for its own sake. */
+  touchTurn() {
+    const turn=this.state.turn;if(!turn)return;
+    const at=this.now();for(const id of turn.inputIds)this.progress.set(id,at);
   }
   /** A bubble answering an input reached the platform, or was refused. */
   inputDelivery(data) {
@@ -1419,9 +1496,10 @@ export class MobileRouter {
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
-      if(kind==='prompt-start')this.turnStarted(data);
-      if(kind==='prompt-end')this.turnEnded(data);
-      if(kind==='delivery'&&data.sourceInputId)this.inputDelivery(data);
+      let dirty=false;
+      if(kind==='prompt-start')dirty=this.turnStarted(data)||dirty;
+      if(kind==='prompt-end')dirty=this.turnEnded(data)||dirty;
+      if(kind==='delivery'&&data.sourceInputId)dirty=this.inputDelivery(data)||dirty;
       if(kind==='reply-complete'||kind==='reply-choice'){if(this.inputAnswered(kind,data))this.save(kind,{inputId:data.inputId});return;}
       if(kind==='input-dropped') {
         // The session let a queued prompt go before it began: provably never submitted.
@@ -1429,12 +1507,16 @@ export class MobileRouter {
         if(record?.state==='queued'){this.notSubmitted(record,'session-dropped-before-prompt',{restart:true});this.save('input-failed-before-submit',{id:record.id,reason:record.reason});}
         this.settleAcceptance(data.inputId,{state:record?.state??'missing'});return;
       }
-      if(kind==='tool'&&this.state.turn)for(const id of this.state.turn.inputIds)this.progress.set(id,this.now());
+      if(kind==='tool')this.touchTurn();
       // An explicit null belongs to a no-task/chat turn. It must not be rebound to
       // whichever task happens to be current when a delayed callback arrives.
+      const noTask=Object.hasOwn(data,'taskId')&&!data.taskId;
       const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
       const turnFence=data.turnFence??data.executionEpoch;
       const taskEvent=['prompt-start','prompt-end','tool','delivery'].includes(kind);
+      // A chat or an internal turn is an ordinary turn: never a late event, and saved
+      // only when the ledger learned something from it (AD1-07).
+      if(noTask&&taskEvent){if(dirty)this.save(kind);return;}
       const storeHistorical=(reason,{authoritative=false}={})=>{
         const at=this.now();
         const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
@@ -1452,24 +1534,26 @@ export class MobileRouter {
           task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,sourceInputId:data.sourceInputId,
             submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence:turnFence??null,lateAfterForce:true,
             authority:authoritative?'historical-fence':'evidence-only',reason,at};
+          trim(task,'deliveryHistory');
         }
         if(task&&kind==='tool') {
           task.toolHistory??={};
           const key='tool-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
           task.toolHistory[key]={id:data.id,status:data.status??'pending',inputVersion:data.inputVersion,turnFence:turnFence??null,
             lateAfterForce:true,authority:authoritative?'historical-fence':'evidence-only',reason,...(data.reason?{detailReason:data.reason}:{}),at};
+          trim(task,'toolHistory');
         }
         this.save('late-'+kind,{taskId:task?.id,reason,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch});
       };
       let historicalReason=null;
-      if(taskEvent) {
+      if(taskEvent&&task) {
         if((data.turnFence!==undefined||data.executionEpoch!==undefined)&&!Number.isInteger(turnFence))historicalReason='invalid-turn-fence';
-        else if(data.inputVersion!==undefined&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
+        else if(data.inputVersion!==undefined&&data.inputVersion!==null&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
         else if(this.state.executionEpoch>0&&(turnFence===undefined||data.inputVersion===undefined))historicalReason='unversioned-after-force';
         else if(Number.isInteger(turnFence)&&turnFence<this.state.executionEpoch)historicalReason='older-fence';
         else if(Number.isInteger(turnFence)&&turnFence>this.state.executionEpoch)historicalReason='future-fence';
-        else if(task&&data.inputVersion!==undefined&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
-        else if(task&&kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
+        else if(data.inputVersion!==undefined&&data.inputVersion!==null&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
+        else if(kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
       }
       if(historicalReason) {
         storeHistorical(historicalReason,{authoritative:historicalReason==='older-fence'&&Number.isInteger(turnFence)&&Number.isSafeInteger(data.inputVersion)});
@@ -1494,7 +1578,7 @@ export class MobileRouter {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
           if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
             task.toolHistory??={};const key='tool-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
-            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};trim(task,'toolHistory');
           }
           task.tools[data.id]={status:data.status??previous?.status??'pending',inputVersion,turnFence:fence,...(data.reason?{reason:data.reason}: {})};
         }
@@ -1502,13 +1586,14 @@ export class MobileRouter {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.deliveries[data.id];
           if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
             task.deliveryHistory??={};const key='delivery-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
-            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};trim(task,'deliveryHistory');
           }
           task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,
             sourceInputId:data.sourceInputId,inputVersion,turnFence:fence,at:this.now()};
         }
+        dirty=true;
       }
-      this.save(kind);
+      if(dirty||kind==='reply'&&data.final)this.save(kind);
     });
   }
   completeInternal(taskId,inputVersion,receipt) {
@@ -1631,6 +1716,7 @@ export class MobileRouter {
         const target=request.mode==='manual'?request.profile:request.mode==='work'?this.profiles.work:!this.tasks().length?this.automaticIdleProfile():null;
         if(target&&this.verified(runtime,target)) {await this.applyModeRequest(request,runtime);changed=true;}
       }
+      if(this.prune())changed=true;
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });
   }
@@ -1720,4 +1806,9 @@ export class MobileRouter {
     }
     return results;
   }
+}
+/** A task keeps a bounded history of replaced and late entries (AD1-08). */
+function trim(task,key,limit=64) {
+  const entries=Object.entries(task[key]??{});
+  if(entries.length>limit)task[key]=Object.fromEntries(entries.slice(-limit));
 }
