@@ -20,6 +20,22 @@ class HandoffConflict(ValueError):
     pass
 
 
+class HandoffSourceUsed(HandoffConflict):
+    """One owner input authorizes one hand-off (H3-20). The refusal names the hand-off
+    that input already authorized, so the caller follows that one instead."""
+
+    def __init__(self, source_input_id, command_id, task_id):
+        super().__init__(
+            f"Source input {source_input_id} already authorized hand-off "
+            f"{command_id or task_id}"
+        )
+        self.source_input_id, self.command_id, self.task_id = (
+            source_input_id,
+            command_id,
+            task_id,
+        )
+
+
 def packed(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -161,8 +177,39 @@ class TaskHandoffs:
             )
         return task
 
+    def source_use(self, c, source_input_id):
+        """The hand-off an owner input already authorized, as (command_id, task_id):
+        by the id kept on a task, or by the source text tasks carried before that."""
+        row = c.execute(
+            """SELECT id, json_extract(data,'$.command_id') FROM handoffs WHERE scope=?
+            AND (json_extract(data,'$.source_input_id')=? OR json_extract(data,'$.source')=?)
+            ORDER BY rowid LIMIT 1""",
+            (self.scope, source_input_id, "bound-owner-input:" + source_input_id),
+        ).fetchone()
+        if not row:
+            return None
+        task_id, command_id = row[0], row[1]
+        if command_id is None:
+            # Saved before tasks kept their command id: the submit receipt names it.
+            found = c.execute(
+                "SELECT json_extract(id,'$[2]') FROM handoff_commands"
+                " WHERE json_extract(receipt,'$.id')=? AND json_extract(receipt,'$.revision')=1",
+                (task_id,),
+            ).fetchone()
+            command_id = found[0] if found else None
+        return command_id, task_id
+
     def submit(
-        self, *, command_id, recipient, session_id, title, goal, source, acceptance
+        self,
+        *,
+        command_id,
+        recipient,
+        session_id,
+        title,
+        goal,
+        source,
+        acceptance,
+        source_input_id=None,
     ):
         if (
             self.actor == "transport"
@@ -178,8 +225,14 @@ class TaskHandoffs:
             "source": text(source, 2000),
             "acceptance": text(acceptance, 3000),
         }
+        if source_input_id is not None:
+            args["source_input_id"] = identifier(source_input_id)
 
         def apply(c):
+            if source_input_id is not None:
+                used = self.source_use(c, source_input_id)
+                if used:
+                    raise HandoffSourceUsed(source_input_id, *used)
             task_id = (
                 "task_"
                 + hashlib.sha256(
@@ -196,6 +249,7 @@ class TaskHandoffs:
                 "cancel_requested": False,
                 "executor": None,
                 "run_id": None,
+                "command_id": command_id,
                 **args,
             }
             return self.event(

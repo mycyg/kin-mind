@@ -16,6 +16,8 @@ export const TASK_OUTCOMES=Object.freeze(['completed','partial','declined','defe
 export {TASK_CLOSED,openTask};
 /** A deferral names a moment within this long. */
 export const DEFER_MAX_MS=30*24*3600000;
+/** How old an owner input may be and still authorize a desktop hand-off (H3-20). */
+export const HANDOFF_SOURCE_MAX_HOURS=24;
 /** A delivery that will not change by waiting. A held draft is a fact Kin is told
  * about, never something the host waits on or withdraws (N3). */
 const settledDelivery = delivery => delivery.state==='accepted'?Boolean(delivery.messageId):
@@ -323,6 +325,20 @@ export class MobileRouter {
     }
     for(const job of received)if(!this.state.inputs[job.id]&&!this.archivedIds.has(job.id))owner.received++;
     return {...owner,historical,internal,archived:this.archivedIds.size,frozen:this.frozen()?clone(this.state.freeze):null};
+  }
+  /** H3-20: the ledger's answer on an owner input cited as the authority for a desktop
+   * hand-off, read from memory, so an input accepted a moment ago is already here. It
+   * qualifies when the owner's own message reached Kin within handoffSourceMaxHours
+   * (default 24). Whether it already authorized another hand-off is the exchange's to
+   * check, and whether it asks for this task is Kin's. */
+  handoffSource(id) {
+    const maxAgeMs=(this.state.config.handoffSourceMaxHours??HANDOFF_SOURCE_MAX_HOURS)*3600000;
+    const record=typeof id==='string'?this.state.inputs[id]:null;
+    if(!record)return {state:'refused',reason:typeof id==='string'&&this.archivedIds.has(id)?'source-too-old':'source-not-found',sourceInputId:id??null,maxAgeMs};
+    const ageMs=Number.isFinite(record.at)?Math.max(0,this.now()-record.at):null;
+    const facts={sourceInputId:record.id,kind:record.kind??'owner',inputState:record.state,at:record.at??null,acceptedAt:record.acceptedAt??null,ageMs,maxAgeMs};
+    const reason=!ownerInput(record)?'source-not-owner':record.state!=='accepted'?'source-not-accepted':ageMs===null||ageMs>maxAgeMs?'source-too-old':null;
+    return reason?{state:'refused',reason,...facts}:{state:'eligible',...facts};
   }
   frozen() {
     const freeze=this.state.freeze;
