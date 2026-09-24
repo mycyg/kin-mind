@@ -660,6 +660,9 @@ export class MobileRouter {
         const task=this.state.tasks[request.completedTaskId];
         if(this.currentTask()?.id!==task.id||!task.turnStartedAt||task.turnEndedAt||task.executionEpoch!==this.state.executionEpoch)throw Error('Decline must belong to the current native task turn');
       }
+      const sourceInputId=taskOutcome==='declined'?request.sourceInputId:
+        request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
+      if(taskOutcome==='declined'&&!sourceInputId)throw Error('Decline requires the current source input');
       if(request.handoff) {
         const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
         task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
@@ -671,10 +674,9 @@ export class MobileRouter {
         if(request.completedTaskId) {
           const task=this.state.tasks[request.completedTaskId];
           task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,
-            ...(taskOutcome==='declined'?{commandId:request.commandId,turnStartedAt:task.turnStartedAt}:{})};
+            ...(taskOutcome==='declined'?{commandId:request.commandId,turnStartedAt:task.turnStartedAt,sourceInputId}:{})};
         }
       }
-      const sourceInputId=request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
       const source=sourceInputId?this.state.inputs[sourceInputId]:null;
       const reclassification=request.reclassificationId?this.state.reclassifications[request.reclassificationId]:null;
       const reclassificationAuthorized=Boolean(reclassification?.state==='recorded'&&reclassification.commandId===request.commandId&&
@@ -1063,7 +1065,8 @@ export class MobileRouter {
       const storeHistorical=(reason,{authoritative=false}={})=>{
         const at=this.now();
         const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
-          id:data.id,state:data.state,status:data.status,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,stopReason:data.stopReason};
+          id:data.id,state:data.state,status:data.status,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,
+          sourceInputId:data.sourceInputId,stopReason:data.stopReason};
         this.state.lateEvents??=[];
         this.state.lateEvents.push(event);this.state.lateEvents=this.state.lateEvents.slice(-512);
         // External-effect evidence is retained under a fence/version-specific
@@ -1073,7 +1076,7 @@ export class MobileRouter {
         if(task&&kind==='delivery') {
           task.deliveryHistory??={};
           const key='delivery-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
-          task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,
+          task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,sourceInputId:data.sourceInputId,
             submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence:turnFence??null,lateAfterForce:true,
             authority:authoritative?'historical-fence':'evidence-only',reason,at};
         }
@@ -1129,7 +1132,8 @@ export class MobileRouter {
             task.deliveryHistory??={};const key='delivery-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
             task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
           }
-          task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,inputVersion,turnFence:fence,at:this.now()};
+          task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,
+            sourceInputId:data.sourceInputId,inputVersion,turnFence:fence,at:this.now()};
         }
       }
       this.save(kind);
@@ -1169,7 +1173,7 @@ export class MobileRouter {
     const tools=[...Object.values(task.tools??{}),...Object.values(task.toolHistory??{}).filter(t=>t.authority==='historical-fence'&&t.turnFence===fence&&t.inputVersion===version)];
     if(!tools.every(tool=>['completed','failed'].includes(tool.status)))return false;
     const deliveries=[...Object.values(task.deliveries??{}),...Object.values(task.deliveryHistory??{}).filter(d=>d.authority==='historical-fence'&&d.turnFence===fence&&d.inputVersion===version)];
-    return deliveries.every(settledDelivery)&&deliveries.some(d=>d.inputVersion===version&&d.turnFence===fence&&d.state==='accepted'&&d.messageId&&d.at>=proposal.at);
+    return deliveries.every(settledDelivery)&&deliveries.some(d=>d.sourceInputId===proposal.sourceInputId&&d.inputVersion===version&&d.turnFence===fence&&d.state==='accepted'&&d.messageId&&d.at>=proposal.at);
   }
   async reconcile() {
     return this.locked(async()=>{

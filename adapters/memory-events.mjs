@@ -124,6 +124,7 @@ export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,a
     ...(Object.hasOwn(record,'taskId')?{task_id:record.taskId}:{}),
     ...(Number.isSafeInteger(record.inputVersion)?{input_version:record.inputVersion}:{}),
     ...(Number.isSafeInteger(record.turnFence)?{turn_fence:record.turnFence}:{}),
+    ...(record.replyInputId?{reply_input_id:record.replyInputId}:{}),
     ...(record.memoryHistorical?{historical:true}:{}),
     ...(record.references?.length?{references:record.references}:{}),...(record.draftId?{draft_id:record.draftId}:{}),origin:record.kind??'direct'};
 }

@@ -507,7 +507,7 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
       ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
       ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
-      references:bubble.references,draftId:bubble.draft_id,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
+      references:bubble.references,draftId:bubble.draft_id,replyInputId:manifest.reply_id,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
       ...(kind==='accepted'?{messageId:receipts[0]?.messageId}:{})},{channel:manifest.channel});
     return kind==='accepted'&&receipts.length>1?{...event,message_ids:receipts.map(r=>r.messageId)}:event;
   }
