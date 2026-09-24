@@ -18,7 +18,7 @@
  * file of its own is `<manifests>/tail/stops.json`, the owner's literal stops. */
 import path from 'node:path';
 import {readJsonFile,writeJsonAtomic} from './atomic-json.mjs';
-import {TERMINAL_GROUP_STATES,OWED_MAX_AGE_MS,legacyState,owedRemainder} from './transport-manifest.mjs';
+import {TERMINAL_GROUP_STATES,legacyState,owedRemainder} from './transport-manifest.mjs';
 
 export const TAIL_DEFAULTS=Object.freeze({stopsKept:8,stopsKeptMs:7*86400000,interruptWaitMs:3000});
 /** Routes under which the prompt that carried the owed words reached the native session. */
@@ -31,6 +31,23 @@ const itemId=bubble=>bubble.draft_id??bubble.bubble_id;
 const unknownIn=manifest=>manifest.bubbles.some(b=>b.fragments.some(f=>['unknown','submitting'].includes(f.state)));
 const midway=manifest=>manifest.bubbles.some(b=>open(b)&&begun(b));
 const actionOf=answer=>typeof answer==='string'?answer:answer?.action;
+/** CR-LIFE-12: what of one bubble the owner has, has not, and may have, cut where
+ * its fragments were cut. An accepted fragment reached the platform; an unknown or
+ * submitting one may have; every other part (refused, failed, withdrawn, never cut)
+ * did not. Adjacent parts of one kind are one piece. */
+export function bubblePieces(bubble) {
+  const pieces={sent:[],unsent:[],unknown:[]};
+  if(!bubble.fragments?.length){if(bubble.text)pieces.unsent.push(bubble.text);return pieces;}
+  let last=null;
+  for(const fragment of [...bubble.fragments].sort((a,b)=>a.start-b.start)) {
+    const kind=fragment.state==='accepted'?'sent':['unknown','submitting'].includes(fragment.state)?'unknown':'unsent';
+    const text=bubble.text.slice(fragment.start,fragment.end);
+    if(!text)continue;
+    if(last===kind)pieces[kind][pieces[kind].length-1]+=text;else pieces[kind].push(text);
+    last=kind;
+  }
+  return pieces;
+}
 const within=(work,ms)=>{let timer;return Promise.race([work,new Promise(resolve=>{timer=setTimeout(resolve,ms);timer.unref?.();})]).finally(()=>clearTimeout(timer));};
 
 export class ReplyTail {
@@ -49,13 +66,24 @@ export class ReplyTail {
       .filter(m=>m&&m.kind==='reply').sort((a,b)=>a.created_at-b.created_at||a.group_id.localeCompare(b.group_id));
   }
   idle(manifest){return !['held','claiming'].includes(this.manifests.leaseState(manifest.group_id).state);}
-  /** For the next owner turn: what the owner never received, oldest first. It
-   * carries reply text, so it is for the owner's own session, never for status or logs. */
+  /** For the next owner turn: what the owner never received, oldest first, piece
+   * by piece (CR-LIFE-12): `unsent` is only what provably did not reach the
+   * platform, `unknown` what may have, and `sent` what did, a partly delivered
+   * bubble's delivered part included. It carries reply text, so it is for the
+   * owner's own session, never for status or logs. */
   owed() {
     return this.groups().filter(m=>m.tail_owed?.items?.length).map(m=>{
-      const ids=new Set(m.tail_owed.items),unsent=m.bubbles.filter(b=>ids.has(itemId(b)));
-      return {group_id:m.group_id,reply_id:m.reply_id,reason:m.tail_owed.reason??m.reason??null,words:m.tail_owed.words!==false,
-        sent:m.bubbles.filter(b=>b.state==='accepted').map(b=>b.text),unsent:m.tail_owed.words===false?[]:unsent.map(b=>b.text),count:unsent.length};
+      const ids=new Set(m.tail_owed.items),words=m.tail_owed.words!==false,sent=[],unsent=[],unknown=[];
+      let count=0;
+      for(const bubble of m.bubbles) {
+        if(bubble.state==='accepted'){sent.push(bubble.text);continue;}
+        if(!ids.has(itemId(bubble)))continue;
+        count++;
+        const pieces=bubblePieces(bubble);
+        sent.push(...pieces.sent);
+        if(words){unsent.push(...pieces.unsent);unknown.push(...pieces.unknown);}
+      }
+      return {group_id:m.group_id,reply_id:m.reply_id,reason:m.tail_owed.reason??m.reason??null,words,sent,unsent,unknown,count};
     });
   }
   /** Text-free. */
@@ -183,9 +211,9 @@ export class ReplyTail {
       }
       for(const link of current.continues??[])link.done=true;
       if(current.review?.covers_remainder?.length)current.review.coverage_applied=true;
-      // What an old intent had not yet withdrawn is withdrawn by the next pass like any interrupted group.
-      const fresh=this.clock()-current.created_at<=OWED_MAX_AGE_MS;
-      const withdrawn=fresh?current.bubbles.filter(b=>items.has(itemId(b))&&!open(b)).map(itemId):[];
+      // What an old intent had not yet withdrawn is withdrawn by the next pass like any
+      // interrupted group. However old, what it promised is owed (CR-LIFE-14).
+      const withdrawn=current.bubbles.filter(b=>items.has(itemId(b))&&!open(b)).map(itemId);
       if(withdrawn.length)current.tail_owed={items:withdrawn,since:current.tail_owed?.since??this.clock(),reason:current.reason??null,words:true};
       else delete current.tail_owed;
       if(current.state==='interrupted'||(intent&&!terminal(current)&&current.bubbles.some(b=>open(b)&&!begun(b))))

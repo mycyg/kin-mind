@@ -135,3 +135,35 @@ test('the router hands the owner\'s literal stop to the reply tail and asks its 
   assert.deepEqual(router.state.inputs['stop-1'].tail,{carrier:'owner-stop',state:'recorded'});
   assert.equal(asked.length,1);assert.equal('interruptedReply' in asked[0],false);assert.equal(router.state.inputs['chat-1'].tail,undefined);
 });
+
+test('CR-LIFE-14: words that did not go out are owed however old they are',async t=>{
+  const h=chat(t);
+  const draft=h.entries(['昨天写好、今天才没能发出的一句。'],{batch:'a-day-old'});
+  h.guard.draft(draft,'epoch','feishu');
+  h.time.ms+=25*3600000;
+  await h.guard.deliver(draft,'epoch',{send:async()=>({state:'rejected'})});
+  assert.deepEqual(h.guard.tail.owed().map(o=>o.unsent),[['昨天写好、今天才没能发出的一句。']]);
+  // An older tail's promise is kept the same way, whatever its age.
+  h.guard.draft(h.entries(['两天前的未发正文'],{batch:'older'}),'epoch','feishu');
+  await h.guard.manifests.mutate('older',m=>{
+    m.created_at-=48*3600000;m.state='interrupted';m.reason='new-owner-input';
+    m.tail_intent={id:'tail-y',decision:'rewrite_remainder',carrier:'classify',state:'recorded',items:['older-draft-0'],round:1,at:h.time.ms};
+  },{operatorOnly:true});
+  await h.guard.tail.recover();
+  assert.deepEqual(h.guard.tail.owed().map(o=>o.unsent),[['两天前的未发正文'],['昨天写好、今天才没能发出的一句。']]);
+});
+
+test('CR-LIFE-12: a bubble delivered in part owes only its undelivered part, and an unknown part is told apart',async t=>{
+  const h=chat(t,{contracts:{feishu:{text:{limit:12,measure:'utf16'}}}});
+  const text='第一段已经送到了。第二段被平台拒收。';
+  let n=0;
+  const result=await h.guard.deliver(h.entries(text,{batch:'split'}),'epoch',{send:async delivery=>++n===1?h.send(delivery):{state:'rejected'}});
+  assert.equal(result.groupState,'partial');
+  assert.equal(h.guard.manifests.read('split').bubbles[0].fragments.length,2);
+  const [owed]=h.guard.tail.owed();
+  assert.deepEqual([owed.sent,owed.unsent,owed.unknown],[['第一段已经送到了。'],['第二段被平台拒收。'],[]]);
+  await h.guard.manifests.mutate('split',m=>{m.bubbles[0].fragments[1].state='unknown';},{operatorOnly:true});
+  const [again]=h.guard.tail.owed();
+  assert.deepEqual([again.unsent,again.unknown],[[],['第二段被平台拒收。']],'what may have arrived is never listed as not received');
+});
+

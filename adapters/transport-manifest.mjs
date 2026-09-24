@@ -99,14 +99,14 @@ export function tailOpen(manifest) {
 
 /** Kin chose these herself: nothing about them is owed back to her. */
 const OWN_CHOICES=['silent','merged'];
-/** Words older than this are history, not something to hand to the next turn. */
-export const OWED_MAX_AGE_MS=24*3600000;
 /** What of a finished reply group the owner never received, owed to Kin's next
  * owner turn (N4): every withdrawn, refused or undeliverable bubble that she did
  * not withdraw herself and that was not handed to her before. A group whose
- * words could not go out as written (`withheld`) is owed as a fact only. */
+ * words could not go out as written (`withheld`) is owed as a fact only. Age
+ * never ends the obligation: it lasts until a turn carrying it reaches her
+ * (CR-LIFE-14). */
 export function owedRemainder(manifest,now) {
-  if(manifest.kind!=='reply'||OWN_CHOICES.includes(manifest.reason)||!(now-manifest.created_at<=OWED_MAX_AGE_MS))return null;
+  if(manifest.kind!=='reply'||OWN_CHOICES.includes(manifest.reason))return null;
   const handed=new Set(manifest.tail_handed?.items??[]),items=new Set(manifest.tail_owed?.items??[]);
   for(const bubble of manifest.bubbles)
     if(['canceled','rejected','undeliverable'].includes(bubble.state)&&!OWN_CHOICES.includes(bubble.reason)&&bubble.reason!=='empty-body'&&!handed.has(bubble.draft_id??bubble.bubble_id))
