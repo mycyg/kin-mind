@@ -86,3 +86,22 @@ test('a busy completion review is asked again with the same result; a refusal na
  assert.equal(seen.at(-1)[0],'plan-interrupt');assert.equal(seen.at(-1)[1].reason,'creation-artifact-invalid');
  await worker.close();await refusing.close();
 });
+test('render dependencies are recorded with their versions; a browser that cannot start withdraws rendering (AD2-23)',async()=>{
+ const {CreationVerifier}=await import('../../adapters/creation-verifier.mjs');
+ const root=temporary();
+ try{
+  const module=path.join(root,'node_modules','playwright','index.mjs');fs.mkdirSync(path.dirname(module),{recursive:true});fs.writeFileSync(module,'');
+  fs.writeFileSync(path.join(root,'node_modules','playwright','package.json'),JSON.stringify({name:'playwright',version:'1.99.0'}));
+  const chrome=path.join(root,'Google Chrome.app','Contents','MacOS','Google Chrome');fs.mkdirSync(path.dirname(chrome),{recursive:true});fs.writeFileSync(chrome,'');
+  fs.writeFileSync(path.join(root,'Google Chrome.app','Contents','Info.plist'),'<plist><dict><key>CFBundleShortVersionString</key>\n<string>150.0.1</string></dict></plist>');
+  const spawnImpl=()=>{const child=new EventEmitter();Object.assign(child,{pid:99999997,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
+   child.stdin.on('finish',()=>{child.stdout.end(JSON.stringify({state:'unavailable',reason:'browser-launch-failed'}));setImmediate(()=>child.emit('close',0));});return child;};
+  const verifier=new CreationVerifier({playwrightModule:module,executablePath:chrome,spawnImpl});
+  assert.deepEqual({playwright:verifier.runtime().playwright.version,browser:verifier.runtime().browser.version},{playwright:'1.99.0',browser:'150.0.1'});
+  assert.equal(verifier.capabilities().static_html_render,true);
+  const page=path.join(root,'index.html');fs.writeFileSync(page,'<p>hi</p>');
+  const checked=await verifier.verify({state:'produced',receipt:{workspace:root},artifacts:[{path:page,sha256:'x'}]});
+  assert.equal(checked.host_verification[0].reason,'browser-launch-failed');
+  assert.equal(verifier.capabilities().static_html_render,false);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

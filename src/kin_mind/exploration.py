@@ -415,8 +415,12 @@ class Explorations:
                     action=action, desire_id=desire["id"], reason="Exploration awaits a reported condition" if needs_condition else "Exploration execution: "+state)
                 self.mind._apply_desire(conn, current, update, event_id)
                 from .plans import AutonomousPlans
+                # A finished run is not yet a finished step: with questions still open the step waits,
+                # and the next review, which reads them, is where Kin decides whether to go on (K2-10).
+                open_questions = list((data.get("result") or {}).get("open_questions") or [])[:8]
                 AutonomousPlans(self.mind).settle_linked(conn, active, {"id": eid, "kind": "exploration-result",
-                    "complete": action == "complete", "source_id": source["id"], "state": state})
+                    "complete": action == "complete" and not open_questions, "source_id": source["id"], "state": state,
+                    **({"open_questions": open_questions} if open_questions else {})})
                 current["revision"] += 1
                 current["updated_at"] = self.mind.clock()
                 self.mind._save(conn, current)

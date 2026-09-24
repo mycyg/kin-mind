@@ -437,3 +437,22 @@ def test_a_revised_step_keeps_its_wish_and_the_cursor_counts_the_real_page(env):
     assert len(page["plans"]) == 4 and page["next_cursor"] is None
     first = plans.read(limit=2)
     assert first["next_cursor"] == 2 and len(plans.read(cursor=2, limit=2)["plans"]) == 2
+
+
+@pytest.mark.parametrize("open_questions,step_state", [([], "completed"), (["Which year was it built?"], "waiting")])
+def test_an_exploration_with_open_questions_leaves_its_step_to_kin(env, tmp_path, open_questions, step_state):
+    """K2-10: a finished run completes its step only when nothing is left open; otherwise the
+    step waits with the questions in its receipt and Kin decides at the next review."""
+    from kin_mind.exploration import Explorations
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+    def runner(executable, topic, directory, **kwargs):
+        return {"state": "complete", "partial": False, "attempt": 1,
+                "result": {"summary": "Found the clock's maker", "findings": ["A sourced finding"],
+                           "sources": [{"url": "memory://" + initial, "title": "Owner note"}],
+                           "open_questions": open_questions, "suggested_share": None}}
+    result = Explorations(mind).run("codex", str(tmp_path / "explore"), "planning-v1", runner=runner)
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == step_state
+    assert step["receipts"][-1].get("open_questions", []) == open_questions

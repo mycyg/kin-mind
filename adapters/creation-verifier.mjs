@@ -3,12 +3,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-/** Bounded optional host capability; failure preserves the produced artifact. */
+/** The version a package declares, read from the nearest package.json above a module file. */
+function packageVersion(file){
+ for(let dir=path.dirname(file??'');dir&&dir!==path.dirname(dir);dir=path.dirname(dir)){
+  try{const pkg=JSON.parse(fs.readFileSync(path.join(dir,'package.json'),'utf8'));if(pkg.name&&pkg.version)return pkg.version;}catch{}
+ }
+ return null;
+}
+/** A macOS app's own version, from the bundle that holds its executable. Read, never run. */
+function bundleVersion(executable){
+ const match=String(executable??'').match(/^(.*?\.app)\//);if(!match)return null;
+ try{const plist=fs.readFileSync(path.join(match[1],'Contents','Info.plist'),'utf8');
+  return plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/)?.[1]??null;}catch{return null;}
+}
+
+/** Bounded optional host capability; failure preserves the produced artifact. Both external
+ * dependencies (Playwright from a desktop runtime cache, a self-updating Chrome) are recorded
+ * with the path and version they resolved to, for the operator's check; a renderer that could
+ * not start withdraws the capability until the host restarts, so the creator is not promised a
+ * render the host cannot make (AD2-23). */
 export class CreationVerifier {
  constructor({playwrightModule,executablePath,node=process.execPath,timeoutMs=45000,spawnImpl=spawn}){
   Object.assign(this,{playwrightModule,executablePath,node,timeoutMs,spawnImpl});
+  this.environmentFailure=null;
  }
- capabilities(){return {static_html_render:!!this.playwrightModule&&fs.existsSync(this.playwrightModule)&&(!this.executablePath||fs.existsSync(this.executablePath)),
+ runtime(){return {playwright:{path:this.playwrightModule??null,present:!!this.playwrightModule&&fs.existsSync(this.playwrightModule),version:packageVersion(this.playwrightModule)},
+  browser:{path:this.executablePath??null,present:!this.executablePath||fs.existsSync(this.executablePath),version:bundleVersion(this.executablePath)},
+  withdrawn:this.environmentFailure};}
+ capabilities(){return {static_html_render:!this.environmentFailure&&!!this.playwrightModule&&fs.existsSync(this.playwrightModule)&&(!this.executablePath||fs.existsSync(this.executablePath)),
   network:false,scripts:false,visual_quality:'requires-review'};}
  async verify(result,{signal}={}){
   if(result.state!=='produced')return result;
@@ -16,7 +38,9 @@ export class CreationVerifier {
   for(const artifact of result.artifacts.filter(a=>path.extname(a.path).toLowerCase()==='.html').slice(0,2)){
    if(signal?.aborted)break;
    if(!this.capabilities().static_html_render){checks.push({state:'unavailable',source_sha256:artifact.sha256,reason:'static-browser-unavailable'});continue;}
-   checks.push(await this.render(result.receipt.workspace,artifact,signal));
+   const check=await this.render(result.receipt.workspace,artifact,signal);
+   if(['renderer-start-failed','browser-launch-failed'].includes(check.reason))this.environmentFailure=check.reason;
+   checks.push(check);
   }
   return {...result,host_verification:checks};
  }

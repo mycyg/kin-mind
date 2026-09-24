@@ -477,3 +477,18 @@ def test_a_fresh_intent_replaces_the_score_band_table():
               "continue_topics": [{"topic": "她的论文"}], "avoid": [], "evidence_ids": ["src_d"]}
     guided = compile_expression(dimensions, intent=intent)["guidance"]
     assert [item["id"] for item in guided] == ["intent-stance", "intent-continue"]
+
+
+def test_a_200_that_is_not_json_is_recorded_as_a_paid_failed_call(monkeypatch):
+    """K1-10: the call leaves its record with unknown usage and fails as a transient provider fault."""
+    import re
+    from kin_mind.appraisal import TRANSIENT_PATTERN, Wish
+    monkeypatch.setenv("KIN_TEST_KEY", "synthetic")
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="<html>gateway hiccup</html>"))
+    provider = DeepSeek("https://api.deepseek.com", "deepseek-flash", "KIN_TEST_KEY", timeout=5, transport=transport)
+    provider.attempt_calls = []
+    with pytest.raises(RuntimeError, match="deepseek-http-200-invalid-body") as failed:
+        provider.structured("probe_tool", Wish, "system", {"x": 1})
+    assert provider.attempt_calls[-1]["outcome"] == "invalid-response-body"
+    assert provider.attempt_calls[-1]["usage_status"] == "unknown"
+    assert re.search(TRANSIENT_PATTERN, str(failed.value))
