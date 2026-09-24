@@ -71,6 +71,11 @@ DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker"
 CACHES = ("mind_context_cache", "mind_semantic_cache")
 # The history rewrite's own progress, in the table every resumable migration of the mind uses.
 HISTORY_MIGRATION = "history-erase"
+# And what it has finished: every identifier whose rows no history holds words of any more — a
+# pass with it completed, or no row named it — in one row that belongs to no scope, so a rerun
+# of the same erase queues only what is still owed (CR-MEM-06).
+HISTORY_CLEARED = "history-erase-cleared"
+ALL_SCOPES = "*"
 # One batch of the rewrite: this many rows at most, and about this many bytes of stored rows —
 # a write transaction of a few hundred milliseconds, even for rows that are whole documents.
 HISTORY_ROWS = 100
@@ -93,7 +98,9 @@ def cites(value, ids):
 
 def _blank(value):
     if isinstance(value, str):
-        return ERASED if value else value
+        # What an earlier erase left is left as it is, the same object, so a second run of the
+        # same erase changes nothing and can say so (CR-MEM-06).
+        return value if not value or value == ERASED else ERASED
     if isinstance(value, list):
         return [] if value else value
     if isinstance(value, dict):
@@ -123,7 +130,7 @@ def scrub(value, ids, *, erase=False):
     for key, item in value.items():
         if erase and key in TEXT_KEYS:
             new = _blank(item)
-        elif erase and key == "action" and isinstance(item, str) and not ENUM.fullmatch(item):
+        elif erase and key == "action" and isinstance(item, str) and item != ERASED and not ENUM.fullmatch(item):
             new = ERASED
         elif key in REF_LISTS and isinstance(item, list):
             new = [_tombstone(ref, ids) for ref in item]
@@ -175,31 +182,46 @@ def _table(conn, name):
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
 
 
-def erase(conn, records, sources, at):
+def erase(conn, records, sources, at, *, write=True, again=False):
     """Every layer except the state history, inside the caller's transaction; the history is
-    `queue_history`'s. Returns what was changed, by layer, as counts."""
+    `queue_history`'s. Returns what was changed, by layer, as counts.
+
+    Idempotent: what an earlier run of the same erase already took out is found and left alone —
+    no new revision, no fresh timestamp, no cache dropped a second time — so a rerun changes
+    nothing and returns nothing (CR-MEM-06). `again` is such a rerun, the repair's: when it
+    changes nothing it records nothing either, where a delete always counts itself. `write=False`
+    changes nothing at all, and returns what a run would change: the repair's dry run reads its
+    plan from it."""
     ids = frozenset(records) | frozenset(sources)
     if not ids or not _table(conn, "mind_state"):
         return {}
-    graph, touched = _graph(conn, ids, frozenset(records), at)
+    graph, touched = _graph(conn, ids, frozenset(records), at, write=write)
     counts, nodes = {"graph": graph}, set()
     for table in _tables(conn):
-        counts[table] = _plain(conn, table, ids, nodes if table == "mind_memory_nodes" else None)
+        counts[table] = _plain(conn, table, ids, nodes if table == "mind_memory_nodes" else None, write=write)
     # A cache that summarised a graph item the erase took words from holds those words too.
     for table in CACHES:
-        counts[table] = _drop_cache(conn, table, ids | touched)
+        counts[table] = _drop_cache(conn, table, ids | touched, write=write)
     # So does everything rendered for a native window from any of them (CR-MEM-02).
-    counts["context_receipts"] = _context_receipts(conn, ids | touched | frozenset(nodes), at)
+    counts["context_receipts"] = _context_receipts(conn, ids | touched | frozenset(nodes), at, write=write)
     if _table(conn, "mind_judgment_cache_deps"):
-        from .judgment_cache import invalidate
-        counts["judgment_cache"] = invalidate(conn, sorted(ids | touched))
+        wanted = sorted(ids | touched)
+        if write:
+            from .judgment_cache import invalidate
+            counts["judgment_cache"] = invalidate(conn, wanted)
+        else:
+            counts["judgment_cache"] = sum(conn.execute(
+                "SELECT COUNT(DISTINCT token) FROM mind_judgment_cache_deps WHERE dependency IN ("
+                + ",".join("?" * len(page)) + ")", page).fetchone()[0]
+                for page in (wanted[start:start + 200] for start in range(0, len(wanted), 200)))
     counts = {key: value for key, value in counts.items() if value}
-    conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('memory_erased',1,?,?)",
-                 (at, dumps(counts)))
+    if write and (counts or not again):
+        conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('memory_erased',1,?,?)",
+                     (at, dumps(counts)))
     return counts
 
 
-def _plain(conn, table, ids, changed_ids=None):
+def _plain(conn, table, ids, changed_ids=None, *, write=True):
     changed = 0
     for row in mentions(conn, table, ids):
         try:
@@ -209,10 +231,12 @@ def _plain(conn, table, ids, changed_ids=None):
         new = scrub(data, ids)
         if new is data:
             continue
-        conn.execute(f"UPDATE {table} SET data=? WHERE rowid=?", (dumps(new), row["key"]))
         changed += 1
         if changed_ids is not None and isinstance(data.get("id"), str):
             changed_ids.add(data["id"])
+        if not write:
+            continue
+        conn.execute(f"UPDATE {table} SET data=? WHERE rowid=?", (dumps(new), row["key"]))
         if table == "mind_memory_nodes":
             from .memory import index_node
             index_node(conn, row["key"], new)
@@ -236,7 +260,7 @@ def erased_receipt(value, at):
     return {**new, "erased_at": value.get("erased_at") or at}
 
 
-def _context_receipts(conn, doomed, at):
+def _context_receipts(conn, doomed, at, *, write=True):
     """Every delivery and stored window receipt that names erased material anywhere in what it
     rests on, by its real structure: `items[].id`, `items[].dependencies[].id`, a graph item's
     dependencies, a receipt's `index[].id`. Found by text, so no shape of reference is missed."""
@@ -248,8 +272,9 @@ def _context_receipts(conn, doomed, at):
             value = json.loads(row["data"])
             if value.get("erased_at") and value.get("text") == ERASED:
                 continue
-            conn.execute("UPDATE mind_context_deliveries SET data=? WHERE rowid=?",
-                         (dumps(erased_delivery(value, at)), row["key"]))
+            if write:
+                conn.execute("UPDATE mind_context_deliveries SET data=? WHERE rowid=?",
+                             (dumps(erased_delivery(value, at)), row["key"]))
             changed += 1
     if _table(conn, "mind_context_windows"):
         marks = sorted(doomed)
@@ -260,27 +285,33 @@ def _context_receipts(conn, doomed, at):
                          and any(mark in dumps(receipt) for mark in marks) else receipt)
                    for key, receipt in receipts.items()}
             if any(new[key] is not receipts[key] for key in receipts):
-                conn.execute("UPDATE mind_context_windows SET data=? WHERE rowid=?",
-                             (dumps({**value, "receipts": new}), row["key"]))
+                if write:
+                    conn.execute("UPDATE mind_context_windows SET data=? WHERE rowid=?",
+                                 (dumps({**value, "receipts": new}), row["key"]))
                 changed += sum(new[key] is not receipts[key] for key in receipts)
     return changed
 
 
-def _drop_cache(conn, table, ids):
+def _drop_cache(conn, table, ids, *, write=True):
     """Compressed context and cached semantic answers are the same words in a model's
     phrasing, and derived: the rows that name what the erase touched go, whatever the sweep
     setting of the scope says."""
     if not ids or not _table(conn, table):
         return 0
     doomed = [row["key"] for row in mentions(conn, table, ids, "rowid AS key")]
-    for key in doomed:
+    for key in doomed if write else ():
         conn.execute(f"DELETE FROM {table} WHERE rowid=?", (key,))
     return len(doomed)
 
 
-def _graph(conn, ids, records, at):
+def _graph(conn, ids, records, at, *, write=True):
     """The graph's own nodes and edges, every stored revision of them and every command that
-    kept a `before` copy. Returns how many items changed and their identifiers."""
+    kept a `before` copy. Returns how many items changed and their identifiers.
+
+    An item an earlier erase already took the words out of still names the identifiers, in the
+    tombstone references it keeps, so it is found again; it is changed only if its content or
+    state would really change. Otherwise it keeps its revision, its time and its history, and it
+    is not counted as touched, so nothing downstream of it is dropped or summarised again."""
     if not _table(conn, "mind_graph_nodes"):
         return 0, frozenset()
     from .graph import index_node
@@ -295,7 +326,12 @@ def _graph(conn, ids, records, at):
                     or (edge and bool(value.get("reason"))))
             new = scrub(value, ids) if gone else drop_refs(value, ids)
             if gone:
-                new = {**new, "state": "deleted", "erased_at": at}
+                new = {**new, "state": "deleted", "erased_at": value.get("erased_at") or at}
+            if new == value and row["state"] == new.get("state", row["state"]):
+                continue
+            touched[row["id"]] = (row["scope"], gone)
+            if not write:
+                continue
             revision = row["revision"] + 1
             new = {**new, "revision": revision, "updated_at": at}
             if edge:
@@ -309,7 +345,8 @@ def _graph(conn, ids, records, at):
                     conn.execute("DELETE FROM mind_graph_identity WHERE node_id=?", (row["id"],))
             conn.execute("INSERT OR REPLACE INTO mind_graph_revisions VALUES(?,?,?,?)",
                          (row["id"], revision, "edge" if edge else "node", dumps(new)))
-            touched[row["id"]] = (row["scope"], gone)
+    if not write:
+        return len(touched), frozenset(touched)
     # Every earlier revision, and every command's `before`, holds the same words.
     for row in mentions(conn, "mind_graph_revisions", ids, "rowid AS key,id,data"):
         value = json.loads(row["data"])
@@ -361,14 +398,61 @@ def erased_ids(conn):
     return frozenset(row[0] for row in conn.execute("SELECT key FROM tombstones"))
 
 
-def queue_history(engine, conn, ids):
+def queue_history(engine, conn, ids, *, reuse=False):
     """Inside the delete's transaction: hand the history to the worker. Identifiers only — the
     job carries no words — and no scan here: which scopes and rows name them is looked up by the
-    job on a read connection, so the delete does not hold the write lock across the history."""
+    job on a read connection, so the delete does not hold the write lock across the history.
+
+    `reuse`: a step for exactly these identifiers that is still to run is the one returned,
+    rather than a second (the repair's rerun, CR-MEM-06). A step that failed is not reused."""
     if not ids or not _table(conn, "mind_events"):
         return None
-    return engine.enqueue("erase_history", {"ids": sorted(ids)}, f"erase-history:{uuid.uuid4().hex}",
+    payload = {"ids": sorted(ids)}
+    if reuse:
+        row = conn.execute("SELECT id FROM jobs WHERE kind='erase_history' AND state IN ('pending','retry','running')"
+                           " AND payload=? LIMIT 1", (dumps(payload),)).fetchone()
+        if row:
+            return row["id"]
+    return engine.enqueue("erase_history", payload, f"erase-history:{uuid.uuid4().hex}",
                           conn=conn, priority=90)
+
+
+def history_covered(conn):
+    """The identifiers the history rewrite has finished with or still owes a pass for. What is
+    not in here is all a rerun of an erase has left to queue (CR-MEM-06)."""
+    if not _table(conn, "mind_memory_migrations"):
+        return frozenset()
+    covered = set()
+    for row in conn.execute("SELECT name,data FROM mind_memory_migrations WHERE name IN (?,?)",
+                            (HISTORY_MIGRATION, HISTORY_CLEARED)):
+        data = json.loads(row["data"])
+        if row["name"] == HISTORY_CLEARED:
+            covered.update(data.get("ids") or ())
+        else:
+            for owed in data.get("passes") or ():
+                covered.update(owed.get("ids") or ())
+    return frozenset(covered)
+
+
+def history_owed(conn):
+    """How many passes of the rewrite are still owed, over every scope."""
+    if not _table(conn, "mind_memory_migrations"):
+        return 0
+    return sum(len(json.loads(data).get("passes") or ()) for (data,) in conn.execute(
+        "SELECT data FROM mind_memory_migrations WHERE name=?", (HISTORY_MIGRATION,)))
+
+
+def _clear(conn, ids):
+    """Record that no history holds words resting on `ids` any more. Written only when that
+    changes, so a rerun that finds them cleared writes nothing."""
+    row = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?",
+                       (ALL_SCOPES, HISTORY_CLEARED)).fetchone()
+    known = set(json.loads(row["data"]).get("ids") or ()) if row else set()
+    if set(ids) <= known:
+        return
+    known |= set(ids)
+    conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)",
+                 (ALL_SCOPES, HISTORY_CLEARED, len(known), dumps({"ids": sorted(known)})))
 
 
 def history_step(engine, payload):
@@ -377,9 +461,10 @@ def history_step(engine, payload):
     the oldest pass still owed and wakes the next. The progress lives in the store, so runs that
     overlap, fail or are retried only ever read where the last one got to."""
     if payload.get("ids"):
-        ids = frozenset(payload["ids"])
         with engine.db.connect() as conn:
-            spans = _spans(conn, ids) if _table(conn, "mind_events") else {}
+            # What is already rewritten, or owed by a pass, is not walked again (CR-MEM-06).
+            ids = frozenset(payload["ids"]) - history_covered(conn)
+            spans = _spans(conn, ids) if ids and _table(conn, "mind_events") else {}
 
         def plan(conn):
             _ready(conn)
@@ -387,6 +472,10 @@ def history_step(engine, payload):
                 _add_pass(conn, scope, ids, first, last)
             if spans:
                 _wake(engine, conn)
+            elif ids:
+                # No row of any history names them: there is nothing to rewrite, now or later,
+                # because nothing can cite a deleted source again.
+                _clear(conn, ids)
         return plan
 
     def run(conn):
@@ -417,6 +506,7 @@ def history_step(engine, payload):
         if result["state"] == "complete":
             data["passes"] = data["passes"][1:]
             data["completed"] = data.get("completed", 0) + 1
+            _clear(conn, ids)
         else:
             data["passes"][0] = {**current, "after": result["after"], "orig_hash": result["orig_hash"]}
         _save(conn, scope, result["after"], data)

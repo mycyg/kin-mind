@@ -45,7 +45,9 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
 - `reerase`   Opt-in. Deletes made before this release left their words in the mind's derived
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). It rewrites history rows, so it
-              is named explicitly.
+              is named explicitly. What an earlier run already erased is left alone, and the
+              history is queued only for identifiers it has neither finished nor still owes a
+              pass for, so a second run changes nothing (CR-MEM-06).
 - `quarantine` Opt-in. Quarantined appraisals whose evidence is gone are retired (state
               `superseded`, reason kept, no model call); the others are listed by reason for a
               decision, never resumed here, because a resume pays for a model call (K4-06, DB1-05).
@@ -378,31 +380,48 @@ def apply_spool(engine):
 
 # --- reerase ---------------------------------------------------------------------------------
 
+def _split(ids):
+    return frozenset(i for i in ids if i.startswith("mem_")), frozenset(i for i in ids if i.startswith("src_"))
+
+
 def plan_reerase(conn):
-    from kin_mind.erasure import erased_ids, mentions
+    """What a run would change, not what merely names a tombstone: an earlier run leaves
+    tombstone references behind on purpose, and a second run finds nothing left (CR-MEM-06)."""
+    from kin_mind.erasure import erase, erased_ids, history_covered, history_owed, mentions
+
+    from .models import now
 
     ids = erased_ids(conn)
     if not ids or not _table(conn, "mind_state"):
-        return {"tombstones": len(ids), "history_rows": 0, "derived_rows": 0}
-    history = len(mentions(conn, "mind_events", ids, "rowid AS key")) if _table(conn, "mind_events") else 0
-    derived = sum(len(mentions(conn, table, ids, "rowid AS key")) for table in
-                  ("mind_state", "mind_graph_nodes", "mind_graph_edges", "mind_context_cache")
-                  if _table(conn, table))
-    return {"tombstones": len(ids), "history_rows": history, "derived_rows": derived}
+        return {"tombstones": len(ids), "layers": {}, "derived_rows": 0, "history_ids": 0, "history_rows": 0,
+                "history_passes_owed": 0}
+    layers = erase(conn, *_split(ids), now(), write=False)
+    waiting = ids - history_covered(conn)
+    rows = len(mentions(conn, "mind_events", waiting, "rowid AS key")) if waiting and _table(conn, "mind_events") else 0
+    return {"tombstones": len(ids), "layers": layers, "derived_rows": sum(layers.values()),
+            "history_ids": len(waiting), "history_rows": rows, "history_passes_owed": history_owed(conn)}
 
 
 def apply_reerase(engine):
-    from kin_mind.erasure import erase, erased_ids, queue_history
+    """The same erase for every tombstone, and the history rewrite for what it has not finished
+    and does not owe: a rerun after a success writes nothing, and one after a failure takes up
+    only what is left, reusing the passes already under way (CR-MEM-06)."""
+    from kin_mind.erasure import erase, erased_ids, history_covered, queue_history
 
     from .models import now
 
     with engine.db.connect(write=True) as conn:
         ids = erased_ids(conn)
-        records = frozenset(i for i in ids if i.startswith("mem_"))
-        sources = frozenset(i for i in ids if i.startswith("src_"))
-        counts = erase(conn, records, sources, now())
-        job = queue_history(engine, conn, ids)
-    return {"layers": counts, "history_job": job}
+        counts = erase(conn, *_split(ids), now(), again=True)
+        if counts:
+            # As after a delete: an FTS5 delete leaves the words in the index's segments until
+            # they are merged, and the node indexes were just rewritten.
+            from .jobs import purge_text_indexes
+
+            purge_text_indexes(conn)
+        waiting = ids - history_covered(conn)
+        job = queue_history(engine, conn, waiting, reuse=True) if waiting else None
+    return {"layers": counts, "history_ids": len(waiting), "history_job": job}
 
 
 # --- evidence --------------------------------------------------------------------------------
