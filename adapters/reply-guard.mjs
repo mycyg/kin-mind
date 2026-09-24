@@ -37,13 +37,14 @@ export function outboxEvidence(directories) {
  * owner hears about an input the host could not finish from the router's
  * watchdog, as the system (`notifyOwner`). */
 export class ReplyGuard {
-  constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),onOutcome=()=>{},
+  /** `onAnswered` hears once per group that its input was answered (CR-LIFE-13). */
+  constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),onOutcome=()=>{},onAnswered=null,
     manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry,
     ownerEpoch=null,onTail=null,tailLimits,tailHooks,tailWaitMs=5000}) {
     Object.assign(this,{call,directory,outbox,clock,onOutcome,channel,tailWaitMs});
     this.active=new Map();
     this.manifests=new TransportManifests({directory:manifestDirectory??path.join(directory,'reply-manifests'),
-      clock,contracts,emit,lease,role,hooks,sleep,retry,
+      clock,contracts,emit,lease,role,hooks,sleep,retry,onAnswered,
       receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
       cancelShare:draftId=>this.call?.('share-cancel',{draft_id:draftId}),
       review:requests=>this.checkGroup(requests),onOutcome});

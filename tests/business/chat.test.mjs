@@ -167,3 +167,47 @@ test('CR-LIFE-12: a bubble delivered in part owes only its undelivered part, and
   assert.deepEqual([again.unsent,again.unknown],[[],['第二段被平台拒收。']],'what may have arrived is never listed as not received');
 });
 
+test('CR-LIFE-13: a group finished by a later pass tells its input once, again after a restart until it was heard',async t=>{
+  const answered=[];let fail=true;
+  const h=chat(t,{onAnswered:async detail=>{if(fail){fail=false;throw Error('router busy');}answered.push(detail);}});
+  const draft=h.entries('稍后续发的一句。',{batch:'later',input:'in-9'});
+  const first=await h.guard.deliver(draft,'epoch',{send:async()=>({state:'not-submitted',submissionStarted:false})});
+  assert.notEqual(first.groupState,'accepted');
+  h.time.ms+=10*60000;
+  await h.guard.resumeDue({guard:async()=>'send',send:h.send});
+  assert.deepEqual(h.sent,['稍后续发的一句。']);
+  assert.deepEqual(answered,[],'the answer could not be told yet');
+  assert.equal(h.guard.manifests.isLive('later'),true,'the group stays live while its answer is owed');
+  const restarted=new ReplyGuard({directory:h.directory,receipt:async id=>h.receipts.get(id),lease:{heartbeat:false},clock:()=>h.time.ms,
+    onAnswered:async detail=>{answered.push(detail);}});
+  await restarted.resumeDue({guard:async()=>'send',send:h.send});
+  assert.deepEqual(answered,[{groupId:'later',inputId:'in-9',state:'accepted'}]);
+  assert.equal(restarted.manifests.isLive('later'),false,'filed once told');
+  await restarted.resumeDue({guard:async()=>'send',send:h.send});
+  assert.equal(answered.length,1,'never twice');
+});
+
+test('CR-LIFE-13: Kin\'s own choice is told the same way, once',async t=>{
+  const answered=[];
+  const h=chat(t,{call:async action=>action==='reply-status'?{action:'merged',merged_into:'in-2'}:undefined,onAnswered:async detail=>{answered.push(detail);}});
+  assert.equal((await h.guard.deliver(h.entries('并进下一条了。',{batch:'merged',input:'in-1'}),'epoch',{send:h.send})).state,'merged');
+  assert.deepEqual(answered,[{groupId:'merged',inputId:'in-1',state:'merged',mergedInto:'in-2'}]);
+  assert.deepEqual(h.sent,[]);
+});
+
+test('CR-LIFE-08: a fragment the activity gate held back waits unsent, counts no failure, and goes out after the thaw',async t=>{
+  const h=chat(t);
+  let frozen=true,refused=0;
+  const send=async delivery=>{if(frozen){refused++;return {state:'not-submitted',submissionStarted:false,reason:'dispatch-frozen'};}return h.send(delivery);};
+  const draft=h.entries('冻结时写好的一句。',{batch:'frozen'});
+  for(let i=0;i<8;i++){await h.guard.deliver(draft,'epoch',{send});h.time.ms+=20*60000;}
+  const held=h.guard.manifests.read('frozen');
+  assert.equal(refused,8);
+  assert.equal(held.failures,0,'a freeze is not a transport failure');
+  assert.equal(held.bubbles[0].fragments[0].state,'unsent');
+  assert.equal(held.bubbles[0].fragments[0].attempts,undefined);
+  assert.equal(held.bubbles[0].fragments[0].firstSubmitAt,undefined,'nothing was submitted, so no resend window began');
+  frozen=false;
+  assert.equal((await h.guard.deliver(draft,'epoch',{send})).state,'accepted');
+  assert.deepEqual(h.sent,['冻结时写好的一句。']);
+});
