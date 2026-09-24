@@ -190,3 +190,20 @@ def test_generated_internal_envelopes_do_not_become_public_memory():
     assert not is_public_dialogue({"kind": "assistant-message", "text": "</｜｜DSML｜｜ invoke>"})
     assert is_public_dialogue({"kind": "owner-message", "text": body})
     assert is_public_dialogue({"kind": "assistant-message", "text": "解释 `kin-context:context:id` 是什么。"})
+
+
+def test_kin_chooses_when_to_think_again_within_a_day(setup):
+    """N8: the quiet review is Kin's choice, ten minutes to a day; one past either end is taken
+    to that end, never a failed assessment, and the stored 20..120 range no longer narrows it."""
+    from datetime import timedelta
+    from kin_mind.appraisal import SYSTEM
+    from kin_mind.memory import MemoryContinuity
+    from kin_mind.state import timestamp
+    mind, _, _ = setup
+    assert [Appraisal(reason='r', next_review_minutes=m).next_review_minutes for m in (5, 600, 3000)] == [10, 600, 1440]
+    assert '10到1440' in SYSTEM
+    memory = MemoryContinuity(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        memory.commit_action(conn, [], 'event-n8', 600, {})
+        row = conn.execute('SELECT next_review FROM mind_action_schedule WHERE scope=?', (mind.scope.key(),)).fetchone()
+    assert timestamp(row['next_review']) - timestamp(mind.clock()) >= timedelta(minutes=599)

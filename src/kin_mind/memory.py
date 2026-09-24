@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
  scope TEXT NOT NULL,name TEXT NOT NULL,cursor INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,name));
 """
 
+# The quiet-review interval Kin may choose (N8, set by kin_mind.appraisal). The stored
+# review_min/max_minutes keys stay readable for older configurations and bound nothing now.
+REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
+
 DEFAULTS = {"native_window_context": False, "records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
             "sharing": False, "graph": False, "associations": False, "graph_recall": False,
@@ -695,10 +699,9 @@ class MemoryContinuity:
     def commit_action(self, conn, refs, event_id, next_minutes, receipt, *, max_minutes=None):
         """The action clock progresses even when historical enrichment cannot.
 
-        `max_minutes`: the ceiling the request allowed, which is the resting one while the owner
-        is asleep. Unset means the ordinary ceiling, exactly as before."""
-        config = self.settings(conn)
-        minutes = max(config["review_min_minutes"], min(max_minutes or config["review_max_minutes"], next_minutes))
+        `next_minutes` is Kin's own choice, ten minutes to a day (N8); the stored review range
+        no longer narrows it."""
+        minutes = max(REVIEW_FLOOR_MINUTES, min(max_minutes or REVIEW_CEILING_MINUTES, next_minutes))
         next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
         conn.execute("INSERT INTO mind_action_schedule VALUES(?,?,1,?) ON CONFLICT(scope) DO UPDATE SET next_review=excluded.next_review,revision=revision+1,data=excluded.data",
                      (self.scope.key(), next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes, "last_success": self.mind.clock()})))
@@ -747,8 +750,7 @@ class MemoryContinuity:
         if schedule:
             # The cursor follows the events this evaluation was given and scored, withheld or not:
             # held back, it would hand an already scored event to a full appraisal a second time.
-            config = self.settings(conn)
-            minutes = max(config["review_min_minutes"], min(max_minutes or config["review_max_minutes"], next_minutes))
+            minutes = max(REVIEW_FLOOR_MINUTES, min(max_minutes or REVIEW_CEILING_MINUTES, next_minutes))
             next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
             conn.execute("INSERT INTO mind_semantic_cursor(scope,seq,next_review,revision,data) VALUES(?,?,?,1,?) ON CONFLICT(scope) DO UPDATE SET seq=MAX(seq,excluded.seq),next_review=excluded.next_review,revision=revision+1,data=excluded.data",
                          (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))

@@ -44,8 +44,10 @@ APPRAISAL_INPUT_BUDGET = 64000
 # role is up; the resting one applies only while the rhythm rests or the owner's quiet hours run,
 # so a night is one review rather than one every two hours. The request always states the ceiling
 # it allows, in the prompt and in the schema, and the host clamps to the same number.
-REVIEW_MAX_MINUTES = 120
-REVIEW_REST_MAX_MINUTES = 480
+# When Kin thinks again is hers to choose, from ten minutes to a day (N8). A new event still
+# wakes her earlier: the queue runs it on its own, so the earlier of the two applies.
+REVIEW_MIN_MINUTES = 10
+REVIEW_MAX_MINUTES = 1440
 # Every lane is bounded: a charged attempt is a real appraisal call, and an
 # identical failure twice in a row is quarantined instead of paid for again.
 MAX_CHARGED_ATTEMPTS = 4
@@ -247,7 +249,7 @@ class Appraisal(Model):
     rhythm: RhythmProposal | None = None
     sharing: list[SharingDecision] = Field(default_factory=list, max_length=4)
     memory: MemoryAssessment = Field(default_factory=MemoryAssessment)
-    next_review_minutes: StrictInt = Field(default=20, ge=20, le=REVIEW_REST_MAX_MINUTES)
+    next_review_minutes: StrictInt = Field(default=20, ge=REVIEW_MIN_MINUTES, le=REVIEW_MAX_MINUTES)
     habits: HabitProposal | None = None
     session_advice: SessionAdvice | None = None
     recall_needs: list[RecallNeed] = Field(default_factory=list, max_length=3)
@@ -261,6 +263,14 @@ class Appraisal(Model):
     prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
     expression_intent: ExpressionIntent | None = None
     next_move: NextMove | None = None
+
+    @field_validator("next_review_minutes", mode="before")
+    @classmethod
+    def review_within_range(cls, v):
+        # Kin's choice stands; one past either end is taken to that end, never a failed assessment.
+        if type(v) is int:
+            return max(REVIEW_MIN_MINUTES, min(REVIEW_MAX_MINUTES, v))
+        return v
 
     @field_validator("motivations")
     @classmethod
@@ -526,7 +536,7 @@ mode为new/development/reflection/reminiscence/duplicate；新进展、新感想
 批次可能包含较早的消息。以recent_interaction里的最新上下文检查旧问题是否已经回应，已回应的内容不再新建未来回复愿望。
 memory.notes中的evidence_ids来自本轮new_evidence；关于已有作品与分享的链接可以使用memory_context中的id。只记录公开结论，不记录推理过程。
 idle-review是非对话时自主起念，允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整；它不是用户新消息。
-next_review_minutes由你在20到120之间选择，决定下一次安静时重新想一想的时间，不是发消息时刻。新事件仍可更早触发。
+next_review_minutes由你在10到1440之间选择（十分钟到一天），决定下一次安静时重新想一想的时间，不是发消息时刻。新事件仍会更早唤醒你，实际取两者中较早的。
 delivery仅结算回执；发送状态由宿主保存，memory.disclosures可以整理已发内容，不能靠回执创造新话题。
 memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新情绪、不新建或恢复愿望；它不是新经历。
 """
@@ -572,15 +582,6 @@ HISTORY_SYSTEM = """你是 Kin 的历史记忆整理器。只调用 submit_appra
 图谱 basis 取 explicit/documented/inferred/internal_thought；时间顺序不等于因果，发送不等于已读。只提交结构化判断，不输出推理轨迹。"""
 
 HISTORY_SYSTEM += PREVIOUS_ATTEMPT_PROMPT
-
-
-def review_ceiling(conn, scope, view, at, settings):
-    """How far ahead this request may put the next quiet review. The resting ceiling applies while
-    the rhythm rests or the owner's quiet hours run; everywhere else the ordinary one still does."""
-    if not optimized(conn, scope, "rest_review_window"):
-        return settings["review_max_minutes"]
-    from .rhythm import at_rest
-    return settings["review_rest_max_minutes"] if at_rest(view, at) else settings["review_max_minutes"]
 
 
 def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES):
@@ -630,14 +631,6 @@ plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计�
 procedure_learning=true 时，从实际任务结果提出 procedure_candidates。result_ids 只能引用三种已核验的结果：回执显示 state=completed 且 verified=true 的计划步骤 run_id、已接收(accepted)的交付、或 verified=true 的任务结果。被打断或未核验的运行、只有产物没有核验的任务、以及聊天里对做过什么的描述都不算；没有这样的结果就把 procedure_candidates 留空。方法保存条件、步骤、工具环境、成功标准、失败反例；候选不等于当前可执行方法，独立验证由宿主完成。已有方法先读适用条件，再在行动中选择 procedure_ids；不能修改人设或新增权限。
 这些字段在功能未启用、历史整理或纯会话维护时留空；无需每次都安排事情。reason 只写简短公开结论，不输出推理轨迹。宿主不使用分数阈值，行动依据当前有效决定、明确授权与真实情境；你判断联系时机，宿主保证新输入优先和执行不冲突。
 """
-
-# The one sentence that states the review ceiling. The request rewrites it when the resting
-# ceiling applies, so the prompt and the schema always name the same number. Pinned at import:
-# whoever edits the sentence has to keep it substitutable.
-REVIEW_WINDOW_PROMPT = "next_review_minutes由你在20到{cap}之间选择，决定下一次安静时重新想一想的时间，不是发消息时刻。"
-if REVIEW_WINDOW_PROMPT.format(cap=REVIEW_MAX_MINUTES) not in SYSTEM:
-    raise RuntimeError("The review window sentence no longer matches REVIEW_WINDOW_PROMPT")
-
 
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
@@ -1184,12 +1177,7 @@ class DeepSeek:
 
     def _system(self, context, policy):
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
-        review_max = self._review_max()
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
-        if not historical and review_max != REVIEW_MAX_MINUTES:
-            # Say the ceiling that actually applies, so the model can use the whole of it.
-            system = system.replace(REVIEW_WINDOW_PROMPT.format(cap=REVIEW_MAX_MINUTES),
-                                    REVIEW_WINDOW_PROMPT.format(cap=review_max))
         return (system + persona_prompt(policy)
                 + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
@@ -1822,9 +1810,8 @@ class Appraisals:
                     # An audited section must never fail a whole appraisal, and without per-section
                     # isolation there is nothing that could refuse one alone: then none is offered.
                     audited = audit_switches(conn, self.mind.scope.key()) if isolation else set()
-                    # One reading for the whole attempt, like every other switch: the prompt, the
-                    # schema and the clamp below all use this number.
-                    review_max = review_ceiling(conn, self.mind.scope.key(), view, self.mind.clock(), settings)
+                    # Kin's own range, the same for the prompt, the schema and the clamp below.
+                    review_max = REVIEW_MAX_MINUTES
                     flags = manifests.switches(conn, self.mind.scope.key())
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
@@ -2265,7 +2252,7 @@ class Appraisals:
                     if updates:
                         section("wish_updates", apply_wish_updates)
                     if operational:
-                        self.memory.commit_action(conn, roots, eid, 20 if new_interaction else proposal.next_review_minutes, receipt, max_minutes=review_max)
+                        self.memory.commit_action(conn, roots, eid, proposal.next_review_minutes, receipt, max_minutes=review_max)
                         # Enrichment uses the same original sources but a separate
                         # id/lease. Its durable job is atomic with the action result.
                         enrichment_id = "enrich_" + digest([row["id"], "memory-v1"])[:32]
@@ -2281,7 +2268,7 @@ class Appraisals:
                         # records and affect can commit without redoing the call.
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
                         dropped = self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
-                            memory_context["through_seq"], 20 if new_interaction else proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots, max_minutes=review_max)
+                            memory_context["through_seq"], proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots, max_minutes=review_max)
                         if dropped:
                             # Memory items the host dropped one by one (memory_items): recorded beside the refused sections.
                             rejected.extend(dropped)
