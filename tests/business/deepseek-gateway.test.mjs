@@ -27,9 +27,19 @@ test('a name that could break the contract text is refused at start', async () =
     /invalid-owner-name/);
 });
 
+test('the retired computer-action reviewer has no gateway, profile or contract left (N6, N7)', async () => {
+  const gateway = await import('../../adapters/deepseek-gateway.mjs');
+  assert.equal(gateway.startComputerActionReviewGateway, undefined);
+  assert.equal(gateway.computerActionReviewSchema, undefined);
+  assert.equal(gateway.GATEWAY_PROFILES['computer-action-review'], undefined);
+  assert.throws(() => gateway.gatewayProfile('computer-action-review'), /unknown-gateway-profile/);
+  assert.equal('computer-action-review' in gatewayContracts(), false);
+  assert.doesNotMatch(source, /computer-action-review|computer_action_review/);
+});
+
 test('every Kin request to DeepSeek runs at high: sessions, assessments, drafts and background profiles (CR-MIND-11)', () => {
   const body = effort => ({model: 'deepseek-flash', input: [user('在吗')], ...(effort === undefined ? {} : {reasoning: {effort}})});
-  for (const profile of [null, 'chat', 'assessment', 'contact-draft', 'exploration', 'computer-action-review'])
+  for (const profile of [null, 'chat', 'assessment', 'contact-draft', 'exploration'])
     for (const effort of ['max', 'low', 'none', undefined, 'ultra'])
       assert.equal(deepseekRequest(body(effort), 'high', profile).reasoning.effort, 'high', `${profile} ${effort}`);
   assert.equal(deepseekRequest(body('low'), 'max').reasoning.effort, 'high', 'an instance option does not move it either');
