@@ -57,17 +57,56 @@ function sse(id){return [
   {type:'response.completed',response:{id,usage:{input_tokens:1,input_tokens_details:null,output_tokens:1,output_tokens_details:null,total_tokens:2}}},
 ].map(e=>'event: '+e.type+'\ndata: '+JSON.stringify(e)+'\n\n').join('');}
 
-async function provider(){
-  const captures=[];const server=createServer((req,res)=>{
+function toolSse(id,name,args,callId){return [
+  {type:'response.created',response:{id}},
+  {type:'response.output_item.done',output_index:0,item:{type:'function_call',id:'fc-'+id,call_id:callId,name,arguments:JSON.stringify(args),status:'completed'}},
+  {type:'response.completed',response:{id,usage:{input_tokens:1,input_tokens_details:null,output_tokens:1,output_tokens_details:null,total_tokens:2}}},
+].map(e=>'event: '+e.type+'\ndata: '+JSON.stringify(e)+'\n\n').join('');}
+
+const TOOL_MARKER='KIN_COMPAT_LOCAL_TOOL_OK';
+const TOOL_PROMPT='Isolated local command fixture. Run the advertised local command tool once to print KIN_COMPAT_LOCAL_TOOL_OK, then return KIN_COMPAT_OK.';
+const TITLE_PROMPT='Your task is to generate a very short title for a conversation based on the user\'s first message.';
+function fixtureTool(body,cwd){
+  const tool=(body.tools??[]).find(item=>['exec_command','shell_command'].includes(item.name??item.function?.name));
+  requireFact(tool,'Native target request did not advertise a local command tool: '+JSON.stringify({model:body.model,
+    tools:(body.tools??[]).slice(0,12).map(item=>({type:item.type,name:item.name??item.function?.name??null}))}));
+  const name=tool.name??tool.function.name,properties=tool.parameters?.properties??tool.function?.parameters?.properties??{};
+  const key=Object.hasOwn(properties,'cmd')?'cmd':Object.hasOwn(properties,'command')?'command':null;
+  requireFact(key,'Native command tool has no supported command argument');
+  const args={[key]:'printf '+TOOL_MARKER};
+  if(Object.hasOwn(properties,'workdir'))args.workdir=cwd;
+  if(Object.hasOwn(properties,'max_output_tokens'))args.max_output_tokens=1000;
+  return {name,args};
+}
+
+async function provider(cwd){
+  const captures=[],fixture={phase:'idle',error:null,callId:null,sessionId:null,requestCapture:null,outputCapture:null};const server=createServer((req,res)=>{
     const parts=[];req.on('data',b=>parts.push(b));req.on('end',()=>{
       if(req.method!=='POST'||!req.url?.endsWith('/responses')){res.writeHead(404).end();return;}
       const raw=Buffer.concat(parts);let body;try{body=JSON.parse(raw);}catch{res.writeHead(400).end();return;}
-      captures.push({raw,body,url:req.url,remoteAddress:req.socket.remoteAddress,headers:req.headers,at:Date.now()});
-      const text=sse('kin-compat-'+captures.length);res.writeHead(200,{'content-type':'text/event-stream',connection:'close'});res.end(text);
+      const capture={raw,body,url:req.url,remoteAddress:req.socket.remoteAddress,headers:req.headers,at:Date.now()};captures.push(capture);
+      const id='kin-compat-'+captures.length;let response;
+      try{
+        if(fixture.phase==='request-tool'&&body.client_metadata?.thread_id===fixture.sessionId&&JSON.stringify(body.input??[]).includes(TOOL_PROMPT)){
+          const {name,args}=fixtureTool(body,cwd);fixture.callId='kin-compat-local-'+randomUUID();fixture.phase='await-output';
+          fixture.requestCapture=capture;
+          response=toolSse(id,name,args,fixture.callId);
+        }else if(fixture.phase==='await-output'){
+          const output=(body.input??[]).find(item=>item.type==='function_call_output'&&item.call_id===fixture.callId);
+          if(output){
+            const first=fixture.requestCapture.body.client_metadata??{},current=body.client_metadata??{};
+            requireFact((!first.thread_id||first.thread_id===current.thread_id)&&(!first.turn_id||first.turn_id===current.turn_id)&&
+              JSON.stringify(output.output).includes(TOOL_MARKER),'Native local tool result did not return to the same provider turn');
+            fixture.phase='complete';fixture.outputCapture=capture;
+          }
+          response=sse(id);
+        }else response=sse(id);
+      }catch(error){fixture.error=String(error?.message??error);res.writeHead(422).end();return;}
+      res.writeHead(200,{'content-type':'text/event-stream',connection:'close'});res.end(response);
     });
   });
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
-  return {url:'http://127.0.0.1:'+server.address().port+'/v1',captures,close:async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));}};
+  return {url:'http://127.0.0.1:'+server.address().port+'/v1',captures,fixture,close:async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));}};
 }
 
 // The proxy observes the real native protocol without changing a single RPC.
@@ -90,7 +129,7 @@ function rpcPairs(records){const requests=new Map(),pairs=[];for(const row of re
 function lastPair(records,method){return rpcPairs(records).findLast(p=>p.request.method===method&&!p.response.error);}
 function completedTurn(records){return records.findLast(r=>r.direction==='out'&&r.value.method==='turn/completed')?.value;}
 
-function requestEvidence(capture,records,method,descriptor){
+function requestEvidence(capture,records,method,descriptor,{toolCaptures=null,toolCallId=null}={}){
   requireFact(capture&&['127.0.0.1','::ffff:127.0.0.1'].includes(capture.remoteAddress),'No observed native loopback request');
   const body=capture.body,developer=fs.readFileSync(descriptor.developer.realpath,'utf8');
   const expectedWire=fs.readFileSync(descriptor.base.realpath,'utf8').trim();
@@ -103,22 +142,44 @@ function requestEvidence(capture,records,method,descriptor){
     model:body.model,keys:Object.keys(body),input:(body.input??[]).map(x=>({type:x.type,role:x.role,contents:(x.content??[]).filter(c=>typeof c?.text==='string').map(c=>({bytes:Buffer.byteLength(c.text),sha256:sha(c.text),hasBase:c.text.includes(expectedWire)}))}))}));
   const index=(body.input??[]).findIndex(item=>item.role==='developer'&&Array.isArray(item.content)&&item.content.some(c=>c.text===developer));
   requireFact(index>=0,'Native request did not retain the explicit developer layer');
+  const developerTexts=(body.input??[]).filter(item=>item.role==='developer').flatMap(item=>item.content??[]).map(item=>item.text).filter(value=>typeof value==='string');
+  const supplemental=developerTexts.filter(value=>value!==developer&&value!==expectedWire);
+  const catalog=read(descriptor.runtime.catalog.realpath),builtInTemplates=(catalog.models??[]).flatMap(model=>[
+    model.model_messages?.instructions_template,...Object.values(model.model_messages?.collaboration_modes??{})]).filter(value=>typeof value==='string'&&value.length>80);
+  requireFact(!supplemental.some(value=>builtInTemplates.some(template=>value.includes(template.slice(0,80)))),
+    'Native request reintroduced a catalog coding or collaboration template');
+  requireFact(!capture.raw.includes(Buffer.from('# Collaboration Mode')),'Native request reintroduced built-in collaboration instructions');
+  requireFact(!capture.raw.includes(Buffer.from('KIN_COMPAT_PROJECT_DOC_SENTINEL')),'Native request loaded a project AGENTS.md despite project_doc_max_bytes=0');
   const native=lastPair(records,method==='turn/start'?'thread/resume':method)??lastPair(records,'thread/start');
   const turn=completedTurn(records),identity=native?.response?.result;
   requireFact(identity?.thread?.id&&identity.thread.sessionId&&turn?.params?.turn?.status==='completed','Native identity or completed turn missing');
   const turnId=turn.params.turn.id;
   requireFact(lastPair(records,'turn/start')?.response?.result?.turn?.id===turnId,'Turn completion belongs to another turn');
   const calls=records.filter(r=>r.direction==='out'&&r.value.method==='item/started'&&/tool|command|terminal/i.test(r.value.params?.item?.type??''));
-  requireFact(calls.length===0,'Loopback compatibility probe unexpectedly invoked a tool');
+  let toolEvidence={definitions:Array.isArray(body.tools)?body.tools.length:0,calls:0,executions:0};
+  if(toolCaptures){
+    requireFact(toolCaptures.length===2&&toolCaptures[1]===capture&&calls.length===1,'Native local tool turn did not complete exactly one tool call');
+    const completedCommands=records.filter(r=>r.direction==='out'&&r.value.method==='item/completed'&&r.value.params?.item?.type==='commandExecution');
+    requireFact(completedCommands.length===1&&completedCommands[0].value.params.item.exitCode===0&&
+      completedCommands[0].value.params.item.aggregatedOutput?.includes(TOOL_MARKER),'Native local command did not exit successfully with its expected output');
+    const functionCall=(body.input??[]).find(item=>item.type==='function_call'&&item.call_id===toolCallId);
+    const output=(body.input??[]).find(item=>item.type==='function_call_output'&&item.call_id===toolCallId);
+    requireFact(functionCall&&output&&JSON.stringify(output.output).includes(TOOL_MARKER),'Native local tool call and output did not round trip');
+    requireFact(toolCaptures[0].body.input.every(item=>item.type!=='function_call_output'),'Native tool output was present before execution');
+    toolEvidence={definitions:Array.isArray(toolCaptures[0].body.tools)?toolCaptures[0].body.tools.length:0,calls:1,executions:1,
+      output_sha256:sha(JSON.stringify(output.output)),call_id_sha256:sha(toolCallId)};
+  }else requireFact(calls.length===0,'Loopback compatibility probe unexpectedly invoked a tool');
   const source=identity.instructionSources;requireFact(Array.isArray(source),'Native instructionSources field unavailable');
   return {rpc_method:method,turn_status:'completed',capture:{raw_request_sha256:sha(capture.raw),
     extraction_receipt_sha256:sha(JSON.stringify({base:baseBasis,base_index:baseIndex,developer:'$.input['+index+'].content',turnId})),
     base:{sha256:sha(base),bytes:Buffer.byteLength(base),basis:baseBasis},
-    developer:{sha256:sha(developer),bytes:Buffer.byteLength(developer),basis:'request.input.developer'}},
+    developer:{sha256:sha(developer),bytes:Buffer.byteLength(developer),basis:'request.input.developer'},
+    supplemental_developer_layers:supplemental.slice(0,4).map(value=>({sha256:sha(value),bytes:Buffer.byteLength(value),preview:value.slice(0,64)})),
+    supplemental_developer_count:supplemental.length},
     config_sha256:descriptor.runtime.config.sha256,catalog_sha256:descriptor.runtime.catalog.sha256,
     thread_id:identity.thread.id,session_id:identity.thread.sessionId,instruction_sources:source,instruction_sources_provenance:'app-server-native',
     turn_sha256:sha(JSON.stringify(turn)),rpc_receipt_sha256:sha(JSON.stringify(lastPair(records,method))),
-    tools:{definitions:Array.isArray(body.tools)?body.tools.length:0,calls:0,executions:0}};
+    tools:toolEvidence};
 }
 
 function observedProfile(records,expected,capture){
@@ -140,7 +201,8 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
   const env=Object.fromEntries(['PATH','TMPDIR','LANG','LC_ALL','SHELL'].filter(k=>process.env[k]).map(k=>[k,process.env[k]]));
   Object.assign(env,{CODEX_HOME:home,HOME:home,CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG:'1',CODEX_PATH:proxy,
     KIN_PROBE_LAUNCHER:descriptor.runtime.launcher.realpath,KIN_PROBE_TRACE:traceFile,INITIAL_AGENT_MODE:'read-only',NO_BROWSER:'1',RUST_LOG:'warn'});
-  const server=await provider();let client;const observations=[];
+  write(path.join(cwd,'AGENTS.md'),'KIN_COMPAT_PROJECT_DOC_SENTINEL\n');
+  const server=await provider(cwd);let client;const observations=[];
   try{
     const codexVersion=execFileSync(codex,['--version'],{encoding:'utf8',timeout:15000,env}).trim();
     const acpVersion=execFileSync(process.execPath,[acp,'--version'],{encoding:'utf8',timeout:15000,env}).trim();
@@ -163,17 +225,28 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
     };
     const sessionNew=async()=>{const result=await client.request('session/new',{cwd,mcpServers:[]});requireFact(result.sessionId,'ACP new session missing');return result.sessionId;};
     const sessionLoad=async id=>{await client.request('session/load',{sessionId:id,cwd,mcpServers:[]});};
-    const prompt=async id=>{const before=server.captures.length;const result=await client.request('session/prompt',{sessionId:id,prompt:[{type:'text',text:'Isolated protocol fixture. Return KIN_COMPAT_OK without any tool calls.'}]});
-      requireFact(result.stopReason==='end_turn'&&server.captures.length>before,'ACP did not complete an actual provider round trip');return server.captures.at(-1);};
+    const prompt=async(id,message='Isolated protocol fixture. Return KIN_COMPAT_OK without any tool calls.')=>{const before=server.captures.length;const result=await client.request('session/prompt',{sessionId:id,prompt:[{type:'text',text:message}]});
+      const turnId=lastPair(trace(traceFile),'turn/start')?.response?.result?.turn?.id;
+      const native=server.captures.slice(before).filter(item=>item.body.client_metadata?.thread_id===id&&item.body.client_metadata?.turn_id===turnId&&
+        JSON.stringify(item.body.input??[]).includes(message)).at(-1);
+      requireFact(result.stopReason==='end_turn'&&turnId&&native,'ACP did not complete a provider round trip for its native thread and turn');return native;};
     const signature=()=>({exit_code:0,acp_initialized:true,receipt_sha256:sha(JSON.stringify(client.transcript)),
       codex_sha256:sha(bytes(codex)),acp_entry_sha256:sha(bytes(acp)),acp_package_json_sha256:sha(bytes(path.join(bundleDir,manifest.runtime.acp.package_path,'package.json'))),
       base_sha256:sha(bytes(descriptor.base.realpath)),developer_sha256:sha(bytes(descriptor.developer.realpath)),
       config_sha256:sha(bytes(descriptor.runtime.config.realpath)),schema_sha256:sha(bytes(descriptor.runtime.schema.realpath)),catalog_sha256:sha(bytes(descriptor.runtime.catalog.realpath)),bundle_manifest_sha256:sha(manifestBytes)});
-    let p=current(profiles.find(x=>x.scenario_id==='new_session'));await launch(p);let id=await sessionNew();
+    let p=current(profiles.find(x=>x.scenario_id==='new_session'));await launch(p,{'features.shell_tool':true,'features.unified_exec':true});let id=await sessionNew();
     let capture=await prompt(id),records=trace(traceFile);
-    const add=(name,requests,observed=records)=>observations.push({scenario_id:name,outcome:'accepted',native:signature(),requests,
-      profiles:profiles.filter(x=>x.scenario_id===name).map(x=>observedProfile(observed,x,capture))});
-    add('native_config_load',[]);add('new_session',[requestEvidence(capture,records,'thread/start',descriptor)]);
+    const add=(name,requests,observed=records,extra={})=>observations.push({scenario_id:name,outcome:'accepted',native:signature(),requests,
+      profiles:profiles.filter(x=>x.scenario_id===name).map(x=>observedProfile(observed,x,capture)),...extra});
+    add('native_config_load',[]);
+    const startEvidence=requestEvidence(capture,records,'thread/start',descriptor);
+    server.fixture.phase='request-tool';server.fixture.sessionId=id;
+    capture=await prompt(id,TOOL_PROMPT);
+    requireFact(server.fixture.phase==='complete'&&!server.fixture.error,'Native local tool fixture failed: '+server.fixture.error);
+    requireFact(capture===server.fixture.outputCapture,'Native tool output capture belonged to another turn');
+    records=trace(traceFile);
+    const toolEvidence=requestEvidence(capture,records,'turn/start',descriptor,{toolCaptures:[server.fixture.requestCapture,capture],toolCallId:server.fixture.callId});
+    add('new_session',[startEvidence,toolEvidence]);
 
     // Store a genuinely different base in native history, then restart and
     // resume it with the candidate configuration and verify the new request.
@@ -198,9 +271,13 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
 
     // Compact the isolated thread, then prove the same identity survives an
     // ACP process restart and the next provider request retains both layers.
+    const compactStart=server.captures.length;
     const compact=await client.request('_kin/compact',{sessionId:id,operationId:'compat-'+randomUUID()});requireFact(compact.completed===true,'Native isolated compaction did not complete');
+    const compactRequests=server.captures.slice(compactStart),compactWire=compactRequests.find(item=>item.raw.includes(Buffer.from(baseConfig.compact_prompt)));
+    requireFact(compactWire,'Native compaction did not use the candidate compact_prompt');
     p=current(profiles.find(x=>x.scenario_id==='isolated_compaction_resume'));await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);
-    add('isolated_compaction_resume',[requestEvidence(capture,records,'thread/resume',descriptor),requestEvidence(capture,records,'turn/start',descriptor)]);
+    add('isolated_compaction_resume',[requestEvidence(capture,records,'thread/resume',descriptor),requestEvidence(capture,records,'turn/start',descriptor)],records,
+      {compaction:{raw_request_sha256:sha(compactWire.raw),compact_prompt_sha256:sha(baseConfig.compact_prompt),provider_requests:compactRequests.length}});
     add('process_restart',[requestEvidence(capture,records,'thread/resume',descriptor)]);
 
     // Model changes use a persistent native identity and real request receipts.
@@ -214,10 +291,14 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
       observations.push({scenario_id:name,outcome:'accepted',native:signature(),requests,profiles:observed});
     }
     await client.close();client=null;
+    const titleCounts=new Map();for(const item of server.captures)if(JSON.stringify(item.body.input??[]).includes(TITLE_PROMPT))
+      titleCounts.set(item.body.model,(titleCounts.get(item.body.model)??0)+1);
+    const titleModels=[...titleCounts].map(([model,count])=>({model,count}));
     return {schema_version:'kin.mobile-runtime.proof/v1',candidate_id:descriptor.candidate_id,bundle_manifest_sha256:sha(manifestBytes),descriptor_sha256:sha(descriptorBytes),runner_input_sha256:sha(inputBytes),
       producer:{runner_sha256:sha(bytes(fileURLToPath(import.meta.url))),node:process.version,codex_sha256:sha(bytes(codex)),codex_version:codexVersion,acp_entry_sha256:sha(bytes(acp)),acp_version:acpVersion,
         actual_exec_receipt_sha256:sha(JSON.stringify(observations)),basis:'owned-runner-real-acp-native-rpc-and-loopback-provider'},
-      isolation:{private_temporary_home:true,provider:'loopback-fixture',real_provider_calls:0,external_credentials_supplied:false,os_level_egress_monitor:false},observations};
+      isolation:{private_temporary_home:true,provider:'loopback-fixture',real_provider_calls:0,external_credentials_supplied:false,os_level_egress_monitor:false},
+      auxiliary_provider_requests:{purpose:'native-conversation-title',count:titleModels.reduce((sum,item)=>sum+item.count,0),models:titleModels},observations};
   }finally{if(client)await client.close();await server.close();fs.rmSync(scratch,{recursive:true,force:true});}
 }
 
