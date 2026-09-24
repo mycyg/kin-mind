@@ -323,3 +323,40 @@ def test_delete_leaves_receipts_sessions_and_metrics_that_name_nothing_erased(sy
     assert "unrelated-command" in commands and "secret-command" not in commands
     assert sessions == {"unrelated-session"}
     assert "unrelated_metric" in metrics and "memory_erased" in metrics
+
+
+def test_a_context_rendered_from_erased_words_keeps_its_identity_and_is_never_sent(system):
+    """CR-MEM-02: a delivery names what it rests on as items[].id and dependencies[].id, and a
+    window keeps receipts with index[].id and rendered_text. The erase finds them by what they
+    really name, takes the words out, and leaves id, hash and state for reconciliation."""
+    from kin_mind.context_delivery import ContextDelivery
+
+    mind, memory, source, clock = system
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk.")
+    contexts = Contexts(mind)
+    packed = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-2", receipt_mode=True)
+    contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1")
+    injection = packed["injection"]
+    assert injection["state"] == "prepared" and MARKER in injection["text"]
+    tables = {table for table, _ in texts_everywhere(mind.engine, MARKER)}
+    assert {"mind_context_deliveries", "mind_context_windows"} <= tables
+
+    mind.engine.delete(secret)
+    settle(mind.engine)
+
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect() as conn:
+        stored = json.loads(conn.execute("SELECT data FROM mind_context_deliveries WHERE id=?",
+                                         (injection["id"],)).fetchone()[0])
+        window = json.loads(conn.execute("SELECT data FROM mind_context_windows WHERE session='thread-1'").fetchone()[0])
+    assert (stored["id"], stored["marker"], stored["text_hash"], stored["state"]) == \
+        (injection["id"], injection["marker"], injection["text_hash"], "prepared")
+    assert stored["text"] == erasure.ERASED and stored["erased_at"] and all("text" not in i for i in stored["items"])
+    begun = ContextDelivery(contexts).begin("thread-1", injection["epoch"], injection["id"])
+    assert begun["state"] == "erased" and not begun.get("acquired")
+    receipt = window["receipts"]["turn-1"]
+    assert receipt["erased_at"] and receipt["rendered_text"] == erasure.ERASED
+    assert not contexts._receipt_current(receipt, None)
+    # The same turn asked again is rendered afresh, from what is left.
+    again = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1")
+    assert MARKER not in json.dumps(again, ensure_ascii=False)

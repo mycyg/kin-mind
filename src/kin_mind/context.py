@@ -942,7 +942,8 @@ class Contexts:
         """A stored window receipt is replayed only while everything it rendered is still
         something this read may see. A receipt written before the classification existed names
         its evidence, so it is checked against the records and nodes themselves, not a stamp."""
-        if not isinstance(receipt, dict):
+        if not isinstance(receipt, dict) or receipt.get("erased_at"):
+            # An erased receipt is never replayed (CR-MEM-02).
             return False
         index = receipt.get("index")
         if not policy.enabled or index is None:

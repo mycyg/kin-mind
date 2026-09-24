@@ -55,7 +55,17 @@ CLAIM_KINDS = frozenset({"finding", "association"})
 # with a `data` column gets the plain scrub.
 SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "mind_graph_revisions",
                      "mind_graph_commands", "mind_context_cache", "mind_judgment_cache",
-                     "mind_semantic_cache", "mind_memory_config", "mind_memory_migrations"})
+                     "mind_semantic_cache", "mind_memory_config", "mind_memory_migrations",
+                     "mind_context_deliveries", "mind_context_windows"})
+# What was, or was about to be, put into a native window: a delivery (its body `text` and its
+# `items`, which name what they rest on as `id`, `dependencies[].id` and the like) and a window's
+# stored receipts (`text`, `rendered_text`, `index[].id`). Handled by name below (CR-MEM-02).
+CONTEXT_TABLES = ("mind_context_deliveries", "mind_context_windows")
+# What an erased delivery keeps: its identity, the hash of what it carried, where it was going and
+# how far it got, so it can still be reconciled with the native history by marker and hash.
+DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker", "text_hash", "tokens",
+                 "content_tokens", "overhead", "manifest_id", "prepared_at", "accepted_at", "native_at",
+                 "historical", "needs_review", "evidence", "stale_reason")
 # Derived caches: a row that names erased material, or a graph item the erase took words from,
 # goes whole. Rebuilding one costs a model call; keeping one keeps the words.
 CACHES = ("mind_context_cache", "mind_semantic_cache")
@@ -172,12 +182,14 @@ def erase(conn, records, sources, at):
     if not ids or not _table(conn, "mind_state"):
         return {}
     graph, touched = _graph(conn, ids, frozenset(records), at)
-    counts = {"graph": graph}
+    counts, nodes = {"graph": graph}, set()
     for table in _tables(conn):
-        counts[table] = _plain(conn, table, ids)
+        counts[table] = _plain(conn, table, ids, nodes if table == "mind_memory_nodes" else None)
     # A cache that summarised a graph item the erase took words from holds those words too.
     for table in CACHES:
         counts[table] = _drop_cache(conn, table, ids | touched)
+    # So does everything rendered for a native window from any of them (CR-MEM-02).
+    counts["context_receipts"] = _context_receipts(conn, ids | touched | frozenset(nodes), at)
     if _table(conn, "mind_judgment_cache_deps"):
         from .judgment_cache import invalidate
         counts["judgment_cache"] = invalidate(conn, sorted(ids | touched))
@@ -187,7 +199,7 @@ def erase(conn, records, sources, at):
     return counts
 
 
-def _plain(conn, table, ids):
+def _plain(conn, table, ids, changed_ids=None):
     changed = 0
     for row in mentions(conn, table, ids):
         try:
@@ -199,9 +211,58 @@ def _plain(conn, table, ids):
             continue
         conn.execute(f"UPDATE {table} SET data=? WHERE rowid=?", (dumps(new), row["key"]))
         changed += 1
+        if changed_ids is not None and isinstance(data.get("id"), str):
+            changed_ids.add(data["id"])
         if table == "mind_memory_nodes":
             from .memory import index_node
             index_node(conn, row["key"], new)
+    return changed
+
+
+def erased_delivery(value, at):
+    """A delivery that rendered erased words: they go, from its body and from every item it
+    carried; its identity, hash and state stay for reconciliation, and it is never sent again."""
+    kept = {key: value[key] for key in DELIVERY_KEPT if key in value}
+    items = [{key: item[key] for key in ("id", "revision", "depth") if key in item}
+             for item in value.get("items") or [] if isinstance(item, dict)]
+    return {**kept, "text": ERASED, "items": items, "erased_at": value.get("erased_at") or at}
+
+
+def erased_receipt(value, at):
+    """A window's stored receipt of the same kind: its rendered words go, its ids stay."""
+    new = scrub(value, (), erase=True)
+    if isinstance(value.get("rendered_text"), str) and value["rendered_text"]:
+        new = {**new, "rendered_text": ERASED}
+    return {**new, "erased_at": value.get("erased_at") or at}
+
+
+def _context_receipts(conn, doomed, at):
+    """Every delivery and stored window receipt that names erased material anywhere in what it
+    rests on, by its real structure: `items[].id`, `items[].dependencies[].id`, a graph item's
+    dependencies, a receipt's `index[].id`. Found by text, so no shape of reference is missed."""
+    changed = 0
+    if not doomed:
+        return changed
+    if _table(conn, "mind_context_deliveries"):
+        for row in mentions(conn, "mind_context_deliveries", doomed, "rowid AS key,data"):
+            value = json.loads(row["data"])
+            if value.get("erased_at") and value.get("text") == ERASED:
+                continue
+            conn.execute("UPDATE mind_context_deliveries SET data=? WHERE rowid=?",
+                         (dumps(erased_delivery(value, at)), row["key"]))
+            changed += 1
+    if _table(conn, "mind_context_windows"):
+        marks = sorted(doomed)
+        for row in mentions(conn, "mind_context_windows", doomed, "rowid AS key,data"):
+            value = json.loads(row["data"])
+            receipts = value.get("receipts") or {}
+            new = {key: (erased_receipt(receipt, at) if isinstance(receipt, dict) and not receipt.get("erased_at")
+                         and any(mark in dumps(receipt) for mark in marks) else receipt)
+                   for key, receipt in receipts.items()}
+            if any(new[key] is not receipts[key] for key in receipts):
+                conn.execute("UPDATE mind_context_windows SET data=? WHERE rowid=?",
+                             (dumps({**value, "receipts": new}), row["key"]))
+                changed += sum(new[key] is not receipts[key] for key in receipts)
     return changed
 
 
