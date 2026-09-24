@@ -6,7 +6,7 @@ import path from 'node:path';
 import {SessionManager,commitRegistryMigration} from '../../adapters/session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
-import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
+import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateCatalogFile,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
 import {sha256} from '../../adapters/instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
@@ -101,6 +101,10 @@ test('maintenance candidates keep the verified companion base and developer laye
  assert.throws(()=>candidateConfigForRuntime(profile,{catalogFile:'/catalog.json',companionInstructions:{enabled:true}}),/incomplete/);
 });
 
+test('a maintenance candidate starts on the frozen catalogue the host names, never the refreshed root one (CR-RT-06)',()=>{
+ assert.equal(candidateCatalogFile({model_catalog_file:'/state/mobile-runtime/candidates/c/mobile-models.json'}),'/state/mobile-runtime/candidates/c/mobile-models.json');
+ for(const config of [{},{model_catalog_file:'mobile-models.json'},null])assert.throws(()=>candidateCatalogFile(config),/frozen model catalogue/);
+});
 test('enabled companion maintenance fails before touching the live router when its instruction contract is incomplete',async()=>{
  let touched=false;const bridge={get mobileRouting(){touched=true;throw Error('router must not be touched');}};
  await assert.rejects(startMobileSessions({bridge,root:'/synthetic',config:{adaptive_sessions:true,companion_instructions:{enabled:true}},
