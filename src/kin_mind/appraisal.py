@@ -27,7 +27,7 @@ from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from . import attempts, judgment_cache, revalidation
 from . import manifest as manifests
-from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate, RecallNeed
+from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
 from .conflicts import classify, static_message
 from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
@@ -282,7 +282,6 @@ class Appraisal(Model):
     next_review_minutes: StrictInt = Field(default=20, ge=REVIEW_MIN_MINUTES, le=REVIEW_MAX_MINUTES)
     habits: HabitProposal | None = None
     session_advice: SessionAdvice | None = None
-    recall_needs: list[RecallNeed] = Field(default_factory=list, max_length=3)
     plan_changes: list[PlanChange] = Field(default_factory=list, max_length=8)
     action_decisions: list[ActionDecision] = Field(default_factory=list, max_length=12)
     procedure_candidates: list[ProcedureCandidate] = Field(default_factory=list, max_length=4)
@@ -293,6 +292,15 @@ class Appraisal(Model):
     prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
     expression_intent: ExpressionIntent | None = None
     next_move: NextMove | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_recall_needs(cls, value):
+        # The host-run recall extension is gone: the fork reads memory with its own read-only
+        # tools (PROBE.md). A stored proposal from before still loads.
+        if isinstance(value, dict) and "recall_needs" in value:
+            value = {k: v for k, v in value.items() if k != "recall_needs"}
+        return value
 
     @field_validator("next_review_minutes", mode="before")
     @classmethod
@@ -342,7 +350,7 @@ SECTION_UPSTREAM = {
     # The event itself: affect, the sharing decision an exploration result requires, memory and the host's cursors.
     "reason": {}, "understanding": {}, "rhythm": {}, "sharing": {}, "memory": {}, "next_review_minutes": {},
     # Not applied by this commit: daily review only, and consumed before the commit.
-    "evolution": {}, "recall_needs": {},
+    "evolution": {},
     # Audited (AUDIT_SECTIONS below), and registered here like every other field so that what rests
     # on what stays in one place.
     "trait_observations": {},
@@ -654,7 +662,7 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
 
 
 SYSTEM += """
-自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料缺口用 recall_needs 请求补读，不用关键词或分数替代判断。补读用完仍不确定时选择等待。
+自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时用只读记忆工具补读，本回合读到的记录可以作为证据引用；不用关键词或分数替代判断。补读后仍不确定时选择等待。
 plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。
 到期只触发复核。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
 同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
@@ -1260,9 +1268,13 @@ class NativeReview(DeepSeek):
         started = time.monotonic()
         # Shared semantic contracts may name their API submission tool. A native
         # turn delivers that same schema as its final, without an invented tool.
-        system += "\n本原生回合通过最终 JSON 返回结果；上述 submit_* 或修正工具名只是结构标识，不调用这些提交工具。需要回忆或活动时仍可使用当前真实可用的工具。"
-        answer = self.exchange({"id": request_id, "name": name, "schema": schema,
-            "system": system, "context": context, "profile": self.profile,
+        system += "\n本回合通过最终 JSON 返回结果；上述 submit_* 或修正工具名只是结构标识，不调用这些提交工具。需要回忆时可以用只读记忆工具补读，本回合读到的记录可以作为证据引用。"
+        # Three parts for `_kin/assess` (WS4): the standing contract (instructions and fixed
+        # definitions), the dynamic context, and the schema object, which travels only as
+        # outputSchema and is never pasted into the input. `system` repeats the contract for the
+        # legacy in-session channel.
+        answer = self.exchange({"id": request_id, "name": name, "contract": system, "system": system,
+            "context": context, "schema": schema, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
         if answer.get("state") == "waiting":
             if answer.get("model_invoked"):
@@ -1282,7 +1294,12 @@ class NativeReview(DeepSeek):
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
         schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max())
-        result, receipt = self._native("submit_appraisal", schema, self._system(context, policy), json.loads(rendered), timeout)
+        # The fixed dimension definitions belong to the contract, ahead of the dynamic context, so the
+        # standing prefix of every assessment stays the same.
+        dynamic = json.loads(rendered)
+        definitions = dynamic.pop("definitions", None)
+        contract = self._system(context, policy) + ("\n维度定义（固定，不随本轮变化）：" + dumps(definitions) if definitions else "")
+        result, receipt = self._native("submit_appraisal", schema, contract, dynamic, timeout)
         return {"model": receipt["model"], "id": receipt["native_turn_id"], "usage": receipt.get("usage"),
                 "stop_reason": "end_turn", "native_receipt": receipt,
                 "content": [{"type": "tool_use", "name": "submit_appraisal", "input": result}]}
@@ -1569,6 +1586,40 @@ class Appraisals:
         if failures > MAX_TRANSIENT_FAILURES:
             return self._quarantine(data, "transient-failures-exhausted:" + str(failures))
         return "pending"
+
+    def _tool_fetched(self, proposal, receipt, supplied, started):
+        """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
+        cites that this request did not supply is accepted when the turn's tool receipts show a
+        completed tool read, and the id resolves to a current record of this scope that already
+        existed when the attempt began. Anything else is still refused by the section's own check."""
+        native = receipt.get("native_receipt") or {}
+        calls = native.get("tool_calls") or receipt.get("tool_calls") or []
+        if not any(isinstance(call, dict) and call.get("ok") is True for call in calls):
+            return {}
+        known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
+        cited = set()
+
+        def walk(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"evidence_ids", "result_ids"} and isinstance(item, list):
+                        cited.update(x for x in item if isinstance(x, str))
+                    else:
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        walk(proposal.model_dump())
+        fetched = {}
+        with self.engine.db.connect() as conn:
+            for identifier in sorted(cited - known)[:24]:
+                try:
+                    refs = self.mind._evidence(conn, [identifier])
+                except (Conflict, Missing):
+                    continue
+                if refs and self.mind._fresh(conn, refs) and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs):
+                    fetched.update({r["record_id"]: r for r in refs})
+        return fetched
 
     def _reschedule_idle(self, data, settings):
         """K1-01: however an idle review ends, the next one is scheduled. A commit already moved the
@@ -1925,7 +1976,7 @@ class Appraisals:
                 # A stored proposal is another source of the proposal, at the seam the historical seed
                 # always used: the context above was rebuilt as usual and everything below is unchanged.
                 # Its sources that are still current are merged back, so the moving dialogue window and
-                # what expand() had recalled can neither remove nor authorize different evidence.
+                # what the fork read with its tools can neither remove nor authorize different evidence.
                 stored = revalidation.candidate(data, historical)
                 if stored:
                     lighting = stored.origin == "reuse"
@@ -1936,9 +1987,12 @@ class Appraisals:
                     proposal, receipt = light.proposal, light.receipt
                 else:
                     proposal, receipt = provider.appraise(model_context)
-                    if settings["semantic_actions"] and not historical and not maintenance and proposal.recall_needs:
-                        from .decision_context import expand
-                        proposal, receipt = expand(self.mind, model_context, proposal, receipt, provider, semantic_refs)
+                    # K1-16: what the fork read with its own read-only tools this turn may be cited.
+                    fetched = self._tool_fetched(proposal, receipt, semantic_refs, data["attempt_started_at"])
+                    if fetched:
+                        semantic_refs.update(fetched)
+                        continuity_refs.update(fetched)
+                        receipt = {**receipt, "tool_fetched_evidence": sorted(fetched)}
                 # One place decides what an audited section may carry on this lane; a proposal that
                 # came back from storage is held to it exactly like one this attempt asked for.
                 proposal = blank_sections(proposal, offered)
@@ -1980,7 +2034,7 @@ class Appraisals:
                                 "usage": None, "usage_status": "unknown", "outcome": "failed"}
                         receipt = {**receipt, "advice_repair": repair_receipt}
                 if historical:
-                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": [], "recall_needs": []})
+                    proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": []})
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal_record(proposal), receipt=receipt,

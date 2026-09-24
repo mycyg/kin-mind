@@ -288,3 +288,41 @@ def test_the_assessment_budget_leaves_out_what_the_main_session_holds(setup):
     full = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r)
     held = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r, used_tokens=60000)
     assert full.input_budget == 104000 and held.input_budget == 44000
+
+
+def test_the_assessment_frame_keeps_contract_context_and_schema_apart(setup):
+    """The request for `_kin/assess`: the standing contract (instructions and fixed definitions),
+    the dynamic context, and the schema object, which is never pasted into the input."""
+    mind, source, _ = setup
+    frames = []
+    def exchange(request):
+        frames.append(request)
+        return {'state':'complete','result':{'reason':'Nothing new.'},
+                'receipt':{'native_turn_id':'turn-1','native_session_id':'same-main','model':'gpt-6-astra','provider':'custom','reasoning':'medium','usage':{}}}
+    jobs = Appraisals(mind)
+    jobs.enqueue([source('frame')], 'synthetic-v1')
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
+    frame = frames[0]
+    assert isinstance(frame['schema'], dict) and frame['schema'].get('properties')
+    assert '维度定义' in frame['contract'] and 'definitions' not in frame['context']
+    assert 'next_review_minutes' not in frame['contract'].split('维度定义')[1]
+    assert frame['system'] == frame['contract']
+
+
+def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
+    """K1-16: an id the request did not supply is accepted when the turn's tool receipts show a
+    completed read and the record already existed; without a tool read it is not."""
+    mind, source, _ = setup
+    earlier = source('read-by-tool')
+    jobs = Appraisals(mind)
+    class Proposal:
+        def model_dump(self):
+            return {'understanding': {'evidence_ids': [earlier]}}
+    from datetime import datetime, timedelta, timezone
+    started = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    with_tools = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True}]}}
+    fetched = jobs._tool_fetched(Proposal(), with_tools, {}, started)
+    assert any(ref['source_id'] == earlier for ref in fetched.values())
+    assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': []}}, {}, started) == {}
+    before = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    assert jobs._tool_fetched(Proposal(), with_tools, {}, before) == {}

@@ -713,7 +713,7 @@ def resume(jobs, provider, row, data, context, stored, *, manifest, semantic_ref
     """The stored proposal as this attempt's proposal, or None for a full rerun.
 
     The context was rebuilt as for any attempt. Evidence the stored proposal was given and that is
-    still current is merged back, so what `expand()` had recalled does not fall out of bounds.
+    still current is merged back, so what the fork had read with its tools does not fall out of bounds.
     """
     from .appraisal import Appraisal, appraisal_context
     mind, scope = jobs.mind, jobs.mind.scope.key()

@@ -149,6 +149,9 @@ test('a contact wait of up to three days is kept; one past either end is taken t
  const wait=seconds=>parseContactDraft(JSON.stringify({action:'wait',condition:'time',retry_after_seconds:seconds,reason:'Later'})).retry_after_seconds;
  assert.deepEqual([wait(60),wait(172800),wait(432000)],[300,172800,259200]);
  assert.throws(()=>parseContactDraft(JSON.stringify({text:'An object without an action'})),/contact-draft-invalid-result/);
+ // A strict output schema always carries desire_ids; empty means every offered wish.
+ assert.equal(parseContactDraft(JSON.stringify({action:'send',bubbles:[{text:'Hi',references:[]}],desire_ids:[],reason:null,condition:null,retry_after_seconds:null})).desire_ids,undefined);
+ assert.deepEqual(parseContactDraft(JSON.stringify({action:'send',bubbles:['Hi'],desire_ids:['d-1']})).desire_ids,['d-1']);
 });
 test('Kin names the wishes her draft is for; check and pending carry them with the text (N11)',async()=>{
  const{loop,events}=fixture({draft:async()=>({action:'send',text:'The tea was lovely',desire_ids:['d-tea']})});

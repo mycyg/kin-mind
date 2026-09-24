@@ -26,12 +26,13 @@ export const CONTACT_WAIT_SECONDS={min:300,max:259200};
  * content the channel cannot carry in one message is fragmented downstream. A decision names its
  * action: an object with text and no action is not a send (AD2-17). */
 function decide(result) {
-  // Which of the offered wishes this decision acts on (N11). Unnamed means all of them.
+  // Which of the offered wishes this decision acts on (N11). Unnamed, null or empty (a strict
+  // output schema always carries the field) means all of them.
   let chosen={};
-  if(result.desire_ids!==undefined) {
+  if(result.desire_ids!==undefined&&result.desire_ids!==null) {
     const ids=result.desire_ids;
-    if(!Array.isArray(ids)||!ids.length||ids.length>12||!ids.every(x=>typeof x==='string'&&x.trim()))return null;
-    chosen={desire_ids:[...new Set(ids.map(x=>x.trim()))]};
+    if(!Array.isArray(ids)||ids.length>12||!ids.every(x=>typeof x==='string'&&x.trim()))return null;
+    if(ids.length)chosen={desire_ids:[...new Set(ids.map(x=>x.trim()))]};
   }
   if(result.action==='send'&&Array.isArray(result.bubbles)) {
     if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {

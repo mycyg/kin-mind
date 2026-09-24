@@ -6,13 +6,6 @@ from pydantic import Field, StrictInt, model_validator
 from eventmem.core.models import Model
 
 
-class RecallNeed(Model):
-    query: str = Field(min_length=1, max_length=4000)
-    reason: str = Field(min_length=1)
-    mode: Literal["light", "deep"] = "deep"
-    identifiers: list[str] = Field(default_factory=list, max_length=8)
-
-
 class PlanStep(Model):
     id: str = Field(min_length=1, max_length=100)
     actor: Literal["explore", "create", "contact", "owner"]
