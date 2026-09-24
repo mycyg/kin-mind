@@ -117,6 +117,35 @@ test('the first release hands over the inputs that raced the old host\'s stop, a
   assert.equal(new MobileRouter(f.args).state.inputs.cut.historical,undefined,'the hand-over is read once, by the upgrade');
 });
 
+test('a release renews its freeze beside the state file before each start: taken up, extended, never shortened, never over another holder (WS7, CR2-OPS-04)',async t=>{
+  const f=fixture(t);
+  await f.router.freezeDispatch('kin-deploy r2',{ttlMs:10*60000,by:'control'});
+  const handover=until=>fs.writeFileSync(path.join(f.root,'release-carryover.json'),JSON.stringify({schema:1,releaseId:'k',id:'r2',inputs:[],freeze:{reason:'kin-deploy r2',at:1000,until}}));
+  // The freeze ran out while the host was down; the release renewed it before this start.
+  f.clock.now+=3*3600000;
+  const renewed=f.clock.now+90*60000;
+  handover(renewed);
+  let router=new MobileRouter(f.args);
+  assert.deepEqual([router.frozen(),router.state.freeze.reason,router.state.freeze.until],[true,'kin-deploy r2',renewed],'taken up at a start, ledger or not');
+  const until=router.state.freeze.until;
+  handover(until-60000);
+  assert.equal(new MobileRouter(f.args).state.freeze.until,until,'never shortened');
+  // Lifted by the release: the same hand-over does not freeze a restarted host again; a renewed one does.
+  router=new MobileRouter(f.args);await router.thawDispatch('verified');
+  assert.equal(new MobileRouter(f.args).frozen(),false);
+  handover(until+60000);
+  assert.equal(new MobileRouter(f.args).frozen(),true);
+  // Another holder's freeze is not taken over.
+  router=new MobileRouter(f.args);await router.thawDispatch('done');
+  await router.freezeDispatch('migration m1',{ttlMs:60*60000,migrationId:'m1'});
+  handover(f.clock.now+5*3600000);
+  assert.equal(new MobileRouter(f.args).state.freeze.reason,'migration m1');
+  // An expired hand-over is nothing.
+  router=new MobileRouter(f.args);await router.thawDispatch('done');
+  handover(f.clock.now-1);
+  assert.equal(new MobileRouter(f.args).frozen(),false);
+});
+
 test('a freeze holds new dispatch, survives a restart and lifts itself, but never the owner\'s stop',async t=>{
   const f=fixture(t);
   const freeze=await f.router.freezeDispatch('release',{ttlMs:10*60000,by:'kin-deploy'});
