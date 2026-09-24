@@ -564,3 +564,23 @@ def test_a_delivered_bubble_counts_for_its_own_reply_not_the_newest_with_the_sam
 
     assert deliver("to-old", reply_input_id="reply-old") == "reply-old"
     assert deliver("unlinked") == "unlinked"
+
+
+def test_no_more_than_four_background_calls_whatever_is_configured(setup):
+    """CR-MIND-10: the entry, the admission read and the older lane all hold four as the ceiling;
+    a stored eight from before is read as four."""
+    from kin_mind import model_lanes
+    mind, _source, _clock = setup
+    engine = mind.engine
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (model_lanes.CAPACITY_KEY, 8))
+        assert model_lanes.capacity(conn) == (4, "configured")
+    ledger = model_lanes.Ledger(engine.db.path)
+    answers = [ledger.acquire("background", "synthetic-" + str(i), holder="test") for i in range(5)]
+    assert [a["state"] for a in answers] == ["admitted"] * 4 + ["wait"]
+    stored = model_lanes.configure(engine, 8)
+    assert stored["background_model_limit"] == 4 and stored["requested"] == 8
+    assert model_lanes.sync_capacity(engine, {"background_model_limit": 8}, startup=True) is None
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT value FROM meta WHERE key=?", (model_lanes.CAPACITY_KEY,)).fetchone()[0] == 4
