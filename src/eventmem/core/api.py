@@ -469,8 +469,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     def recall(request: RecallRequest) -> dict:
         # A recall without a session is somebody looking, from the console or a client: it is
         # not a use of the memory by Kin. It writes nothing — no access, no use, no memory
-        # telemetry, no lease — however often it is retried, and calls a model only when deep
-        # mode was asked for (S1-02). A caller that names its session is accounted to that
+        # telemetry, no lease, no cache of a compression or a model answer — however often it is
+        # retried, and calls a model only when deep mode was asked for (S1-02, CR-MEM-07). Such
+        # a call is admitted and paid for like any other, so its admission in the model ledger
+        # and its cost are recorded. A caller that names its session is accounted to that
         # session's window as before.
         return engine.recall(request, access_origin="user_query" if request.session else "maintenance",
                              allow_model=request.mode == "deep", record=bool(request.session))

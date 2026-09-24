@@ -155,17 +155,26 @@ class Deleted(Conflict):
 
 # Set inside a look that must leave the store as it found it (S1-02).
 _UNRECORDED = contextvars.ContextVar("eventmem_unrecorded", default=False)
+# What a model call cost, under the names the structured provider records it by. A look that
+# asks a model is not free, and leaving its cost out would make it look so (CR-MEM-07).
+BILLED_METRICS = frozenset({"structured_model_usage", "structured_rejected"})
 
 
 @contextmanager
 def unrecorded():
-    """A read that records nothing about itself: no telemetry of the memory it looked at is
-    written inside (S1-02). What a model call costs is recorded all the same (`model_*`)."""
+    """A read that records nothing about itself: no telemetry of the memory it looked at, no
+    cache of what it computed (S1-02, CR-MEM-07). What a model call costs is recorded all the
+    same — `model_*` and `BILLED_METRICS` — and so is its admission in the model ledger."""
     token = _UNRECORDED.set(True)
     try:
         yield
     finally:
         _UNRECORDED.reset(token)
+
+
+def recording():
+    """False inside `unrecorded()`: a look, whose results are not kept."""
+    return not _UNRECORDED.get()
 
 
 class Database:
@@ -237,7 +246,7 @@ class Database:
         return key
 
     def metric(self, name, value, data=None):
-        if _UNRECORDED.get() and not name.startswith("model_"):
+        if _UNRECORDED.get() and not (name.startswith("model_") or name in BILLED_METRICS):
             return
         from kin_mind.maintenance import trim_metrics
 

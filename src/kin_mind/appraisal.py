@@ -905,7 +905,10 @@ class DeepSeek:
     def _cache_put(self, state, name, context, judgment, depends_on, valid_for, result, receipt):
         """Store the answer. Under v2 the row is **pending**: only the caller that
         validated the result makes it servable, so a rejected result is never replayed."""
-        if not state or time.monotonic() > getattr(self, "absolute_deadline", float("inf")):
+        from eventmem.core.db import recording
+
+        # A look keeps no answer it paid for; the payment itself is recorded (CR-MEM-07).
+        if not state or not recording() or time.monotonic() > getattr(self, "absolute_deadline", float("inf")):
             return None
         value = {"result": result.model_dump(), "receipt": receipt}
         if state["v2"]:
