@@ -68,7 +68,7 @@ MAX_TRANSIENT_FAILURES = 8
 INTERACTION_STIMULI = {None, "assistant-result", "runtime-result", "delivery"}
 MERGEABLE_STIMULI = INTERACTION_STIMULI | {"idle-review", "wish-review", "trait-wish-review", "drive-crossing",
                                            "plan-review", "exploration-result", "motivation-review",
-                                           "rhythm-review", "expired-wish-review"}
+                                           "rhythm-review", "expired-wish-review", "deferral-failed"}
 
 
 def batch_stimulus(stimuli):

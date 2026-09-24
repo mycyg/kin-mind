@@ -242,14 +242,15 @@ class AutonomousPlans:
             not_before = None
         if not task_id or not goal:
             raise ValueError("A deferred task needs its task_id and goal")
-        if not not_before or timestamp(not_before) <= timestamp(self.mind.clock()):
-            return {"state": "needs-kin", "reason": "not-before-not-in-future"}
+        # A time already past (the hand-over came late) or none at all is due now: the plan is made
+        # and reviewed at once rather than refused (CR-MIND-03).
+        future = bool(not_before and timestamp(not_before) > timestamp(self.mind.clock()))
         # The router passes its own input ids; a source id passes as it is.
         named = [str(i) for i in [*(request.get("evidence_ids") or []), *(request.get("input_ids") or [])]]
         evidence = []
         with self.engine.db.connect() as conn:
             if not enabled(conn, self.scope, "autonomous_plans"):
-                return {"state": "needs-kin", "reason": "autonomous-plans-disabled"}
+                return self._return_to_kin(task_id, goal, "autonomous-plans-disabled", [])
             inputs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone())
             for identifier in named:
                 row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
@@ -260,18 +261,34 @@ class AutonomousPlans:
                     evidence.append(identifier)
         evidence = list(dict.fromkeys(evidence))[:24]
         if not evidence:
-            return {"state": "needs-kin", "reason": "owner-source-unavailable"}
+            # The owner's input may not have reached memory yet: the router tries again. Only its
+            # last try (`final`) makes this a fact for Kin.
+            if not request.get("final"):
+                return {"state": "waiting", "reason": "owner-source-unavailable", "retry": True}
+            return self._return_to_kin(task_id, goal, "owner-source-unavailable", [])
         try:
             plan = self.manage({
                 "command_id": "defer-task:" + task_id, "action": "create", "key": "deferred-task:" + task_id,
                 "goal": goal, "motivation": "小光交给我的事，我决定晚点再做", "reason": reason,
-                "evidence_ids": evidence, "next_review_at": not_before,
+                "evidence_ids": evidence, "next_review_at": not_before if future else None,
                 "steps": [{"id": "return", "actor": "contact", "goal": "回到小光交给我的事：" + goal,
-                           "completion": "我已回到这件事，并如实说明做到哪一步", "not_before": not_before,
-                           "owner_request_id": task_id}]})
+                           "completion": "我已回到这件事，并如实说明做到哪一步",
+                           **({"not_before": not_before} if future else {}), "owner_request_id": task_id}]})
         except (Conflict, Missing, ValueError) as error:
-            return {"state": "needs-kin", "reason": ("plan-refused:" + str(error))[:160]}
-        return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"]}
+            return self._return_to_kin(task_id, goal, ("plan-refused:" + str(error))[:160], evidence)
+        return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"],
+                **({} if future else {"due": "now"})}
+
+    def _return_to_kin(self, task_id, goal, reason, evidence):
+        """CR-MIND-03: a deferral that can never become a plan is kept, and handed to Kin: a durable
+        internal event, one per task, whose appraisal puts the fact into her next assessment."""
+        from .actions import ActionEvents
+        with self.engine.db.connect(write=True) as conn:
+            version = self.mind._load(conn)["agent_version"]
+            event_id = ActionEvents(self.mind).emit(conn, "deferral-failed", ["deferral-failed", task_id], {
+                "evidence_ids": evidence, "agent_version": version, "task_id": task_id, "goal": goal[:500],
+                "failure": reason, "reason": "小光交给我、我决定晚点再做的事没能记成计划（" + reason + "），需要我自己决定怎么接上"})
+        return {"state": "needs-kin", "reason": reason, "handed": event_id}
 
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
