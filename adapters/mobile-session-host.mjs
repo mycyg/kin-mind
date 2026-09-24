@@ -115,7 +115,12 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   await router.restoreRoutingProfile();
   const initial=await routing.inspect();
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
-  let reader,readerId,initialScan=true,closed=false,running=false;
+  let reader,readerId,initialScan=true,closed=false,running=false,writtenObservation=null;
+  // The observation a review reads, written when it changes rather than every minute.
+  const writeObservation=(observation=manager.state.observation)=>{
+    const written=observation&&digest(observation);
+    if(written&&written!==writtenObservation){atomicJson(observationFile,observation);writtenObservation=written;}
+  };
   const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
     configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:path.join(root,'mobile-models.json'),gateway:routing.gateway,companionInstructions}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
@@ -156,7 +161,8 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       manager.save('restore-checkpoint-pending');
       return result;
     },
-    reviewRequested:async event=>{atomicJson(observationFile,event.observation);return mindCall('session-review',{id:event.id});},
+    reconcileCompact:async operationId=>{const session=await routing.ensureSession('kin-host:compact-status');return session.agentInfo.connection.extMethod('_kin/compact',{sessionId:manager.fence().threadId,operationId,checkOnly:true});},
+    reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id});},
     createCandidate:request=>native.create(request),injectCandidate:request=>native.inject(request),verifyCandidate:request=>native.verify(request),
     closeCandidate:()=>native.close(),
     reconcileCandidate:async candidate=>candidate.native.path&&fs.existsSync(candidate.native.path)&&(await checkpointMarker(candidate.native.path,'kin-checkpoint:'+candidate.injectionId)).found,
@@ -178,8 +184,17 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       if(previous.threadId!==binding.threadId){try{await connection.extMethod('_kin/retire-session',{sessionId:previous.threadId});}catch{recordStatus({sessionRetirement:{threadId:previous.threadId,state:'pending'}});}}
       return {verified:true,threadId:actual.threadId,nativeSessionId:actual.nativeSessionId,model:actual.model,at:new Date().toISOString()};
     }});
+  // AD1-19: each assessment turn the host sees complete is recorded where the judgment it
+  // produced is reconciled with it, whichever path the assessment itself takes.
+  const runAssessment=typeof bridge.runMainAssessment==='function'?bridge.runMainAssessment:null,ownAssessment=Object.hasOwn(bridge,'runMainAssessment');
+  if(runAssessment)bridge.runMainAssessment=async function(request,options){
+    const result=await runAssessment.call(this,request,options),receipt=result?.receipt;
+    if(result?.state==='complete'&&receipt?.native_turn_id)
+      try{manager.recordAssessment({requestId:request?.id??null,turnId:receipt.native_turn_id,forkThreadId:receipt.fork_thread_id??null});}catch{/* The judgment then waits for a review of its own. */}
+    return result;
+  };
   router.state.conversationId=manager.fence().conversationId;router.state.generation=manager.fence().generation;router.state.nativeSessionId=manager.fence().nativeSessionId;router.save('logical-conversation-bound');
-  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1);return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,pressure:s.observation?.pressure,advice:s.advice,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
+  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
     deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
@@ -198,17 +213,17 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         await inspect();
         const events=reader?.state.events??[];
         if(initialScan){
-          if(!manager.state.nativeBootstrapped){for(const event of events)if(!manager.state.compactions.some(c=>c.nativeEventId===event.id))manager.state.compactions.push({id:event.id,nativeEventId:event.id,state:'complete',generation:manager.fence().generation,completedAt:Date.parse(event.at),origin:'history-bootstrap'});manager.state.nativeBootstrapped=true;manager.save('native-history-bootstrapped');}
+          if(!manager.state.nativeBootstrapped){for(const event of events)if(!manager.nativeSeen(event))manager.state.compactions.push({id:event.id,nativeEventId:event.id,nativeAt:Date.parse(event.at),state:'complete',generation:manager.fence().generation,completedAt:Date.parse(event.at),origin:'history-bootstrap'});manager.state.nativeBootstrapped=true;manager.prune();manager.save('native-history-bootstrapped');}
           initialScan=false;
         }
-        for(const event of events)if(!manager.state.compactions.some(c=>c.nativeEventId===event.id))await manager.nativeCompaction(event);
+        for(const event of events)if(!manager.nativeSeen(event))await manager.nativeCompaction(event);
         const snapshot=await collect(),runtime=await inspect();
         // Read-only roster preparation may proceed on a versioned snapshot while
         // owner notifications are unconfirmed; the prepared artifacts carry the
         // annotation. Compaction, injection and promotion keep the strict boundary.
         const preparation=safeReadOnlyPreparation({...snapshot,runtime});
         if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe){
-          const cp=await manager.checkpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
+          const {checkpoint:cp}=await manager.preparedCheckpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
           if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
         }
         if(snapshot.manifestVersion&&preparation.safe){
@@ -218,13 +233,12 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
           }
         }
-        await manager.observe(runtime,snapshot);if(manager.state.observation)atomicJson(observationFile,manager.state.observation);
-        const {state}=await mindCall('read');const advice=state?.session_advice;
-        if(advice&&manager.state.observation&&advice.eventId!==manager.state.lastAdviceEvent){
-          manager.state.lastAdviceEvent=advice.eventId;
-          if(advice.snapshotId===manager.state.observation.id)manager.advise(advice.decision,advice.receipt,advice.snapshotId,runtime);
-        }
-        const result=await manager.tick();manager.state.lastTick={...result,checkedAt:new Date().toISOString()};manager.save('tick');recordStatus({sessionManagement:api.view()});
+        // The judgment arrives with the snapshot the tick reads anyway (K3-04, DB1-03).
+        const result=await manager.tick({runtime,context:snapshot}),{checkedAt,...previous}=manager.state.lastTick??{};
+        writeObservation();
+        manager.state.lastTick={...result,checkedAt:new Date().toISOString()};
+        if(digest(previous)!==digest(result))manager.save('tick');
+        recordStatus({sessionManagement:api.view()});
       }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.name,checkedAt:new Date().toISOString()}});}
       finally{running=false;}
     },
@@ -233,7 +247,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       // A native auto-compaction can finish between minute ticks and inputs.
       // Reconcile its lifecycle before consulting the current window ledger.
       await inspect();
-      if(!initialScan)for(const event of reader?.state.events??[])if(!manager.state.compactions.some(c=>c.nativeEventId===event.id))await manager.nativeCompaction(event);
+      if(!initialScan)for(const event of reader?.state.events??[])if(!manager.nativeSeen(event))await manager.nativeCompaction(event);
       if(!manager.state.restoreRequired&&!manager.state.restorePending)return;
       let cp=manager.state.restoreCheckpoint;
       if(!manager.state.restorePending||!cp||!(await mindCall('session-validate',{checkpoint:cp})).valid){
@@ -269,7 +283,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       await mindCall('memory-injection-ack',{session:runtime.threadId,epoch:manager.state.restoreEpoch,id:operationId,tokens:cp.tokens});
       manager.state.restoration={id:operationId,state:'complete',checkpointId:cp.id,receipt:proof};manager.state.restorePending=false;manager.state.restoreRequired=false;manager.save('restore-complete');
     },
-    async close(){closed=true;clearInterval(timer);await native.close();manager.close();}};
+    async close(){closed=true;clearInterval(timer);if(runAssessment){if(ownAssessment)bridge.runMainAssessment=runAssessment;else delete bridge.runMainAssessment;}await native.close();manager.close();}};
   bridge.mobileSessions=api;
   const timer=setInterval(()=>{void api.tick();},60000);timer.unref();void api.tick();return api;
 }
