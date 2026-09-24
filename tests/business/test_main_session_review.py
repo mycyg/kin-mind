@@ -616,6 +616,57 @@ def test_sixty_quiet_minutes_hold_as_many_assessments_as_kin_asked_for(setup):
     assert max(sizes) < 40000
 
 
+def test_a_result_committed_before_its_process_died_is_recovered_uncharged(setup, monkeypatch):
+    """CR2-MIND-03, the whole path: an attempt makes its call and commits, and its process dies
+    before the queue row is finished. While its lease holds nobody takes the row over; once the
+    lease has expired the next claim finishes it from the durable command receipt with no model
+    call. That attempt is already-committed: the count its claim took is given back and the ledger
+    records it uncharged, discarded and with no calls. The committing attempt's evidence stays: its
+    receipt and usage in the result, and its own charge (the abandoned attempt back-filled for it)."""
+    import time
+    from kin_mind.memory import MemoryContinuity
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('committed-then-died')], 'synthetic-v1')
+    usage = {'input_tokens': 900, 'output_tokens': 40}
+
+    class Reviewer:
+        calls = 0
+
+        def appraise(self, context):
+            Reviewer.calls += 1
+            attempts.record_call(self, 'submit_appraisal', outcome='ok', model='synthetic', request_id='req-1', usage=usage)
+            return (Appraisal(reason='Worth keeping', values={'curiosity': 71}),
+                    {'provider': 'deepseek', 'model': 'synthetic', 'request_id': 'req-1', 'usage': usage})
+
+    def died(self, result):
+        raise SystemExit('the process died right after its commit')
+    monkeypatch.setattr(MemoryContinuity, 'remember_reflection', died)
+    with pytest.raises(SystemExit):
+        jobs.run_one(Reviewer())
+    monkeypatch.undo()
+    committed = mind.read()
+    assert committed['dimensions']['curiosity']['value'] == 71, 'the judgment was committed'
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,attempts,lease FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    assert (row['state'], row['attempts']) == ('running', 1) and row['lease'] > time.time()
+    assert jobs.run_one(Reviewer())['state'] in {'idle', 'busy'}, 'nobody takes it over while its lease holds'
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET lease=? WHERE id=?", (time.time() - 1, job['id']))
+
+    class NoCall:
+        def appraise(self, context):
+            raise AssertionError('a committed judgment is never asked for again')
+    out = jobs.run_one(NoCall())
+    assert out['state'] == 'complete' and out['completed_from'] == 'already-committed'
+    assert out['attempts'] == 1, 'only the attempt that made the call is counted'
+    assert (out['result']['provider']['request_id'], out['result']['provider']['usage']) == ('req-1', usage)
+    assert Reviewer.calls == 1 and mind.read()['revision'] == committed['revision']
+    ledger = sorted(attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts'], key=lambda a: a['ordinal'])
+    assert [(a['outcome'], a['charged'], a['calls']) for a in ledger] == [('abandoned', True, []), ('discarded', False, [])]
+    assert ledger[1]['attempts'] == 1
+
+
 def test_evidence_already_integrated_ends_the_attempt_with_no_call_no_slot_and_no_charge(setup, monkeypatch):
     """WS8 docs pass: an appraisal whose sources the mind has already integrated makes no model
     call, so it takes no model slot and is charged nothing: the claim's attempt count is given

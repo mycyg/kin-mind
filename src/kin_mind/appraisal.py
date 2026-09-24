@@ -1897,6 +1897,8 @@ class Appraisals:
         calls = slots.enter_context(attempts.collect(provider))
         admission_wait = False
         uncharged_wait = False
+        # This attempt only finished the row from another attempt's durable receipt (CR2-MIND-03).
+        recovered = False
         model_admitted = False
         provider.compression_parts = set()
         # Everything up to the provider call is host-side assembly: a conflict raised
@@ -1911,7 +1913,13 @@ class Appraisals:
             # If a process died after commit, use the durable command receipt.
             done = self._committed_receipt(key)
             if done:
-                data["result"] = done
+                # CR2-MIND-03: the attempt that committed made and paid for the call, then died before
+                # the row was finished. This one only finishes it from the receipt, with no model call:
+                # already-committed, the count its claim took is given back, and the ledger records it
+                # uncharged and discarded, with no calls. The committing attempt's evidence stays: its
+                # receipt and usage in the result, its own charge in the ledger.
+                data["result"], data["completed_from"] = done, "already-committed"
+                recovered = True
             else:
                 if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
                     with self.engine.db.connect() as conn:
@@ -2763,8 +2771,8 @@ class Appraisals:
             delay = COMPRESSION_RETRY_SECONDS
         else:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
-        # A light attempt is never a charged one, whether it committed or not.
-        uncharged = bool(admission_wait or uncharged_wait or lighting)
+        # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
+        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered)
         with self.engine.db.connect(write=True) as conn:
             changed = conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
