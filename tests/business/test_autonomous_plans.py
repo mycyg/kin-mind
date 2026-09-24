@@ -491,3 +491,23 @@ def test_a_pass_over_many_steps_loads_the_mind_state_once(env, monkeypatch):
     monkeypatch.setattr(type(mind), "_load", lambda self, conn: loads.append(1) or original(self, conn))
     assert plans.claim("explore", "worker")["state"] == "waiting"
     assert len(loads) <= 1
+
+
+def test_a_deployment_leaves_decided_steps_ready_and_wakes_no_plan(env):
+    """T-03 (K1-13, K2-04): moving agent_version keeps a decided step claimable and queues no
+    per-plan review; only a change of what decides behaviour asks again."""
+    mind, plans, source, clock, initial = env
+    actions = ActionEvents(mind)
+    first = decide(env, create(env, actor="explore", key="deploy-a"))
+    second = decide(env, create(env, actor="explore", key="deploy-b"))
+    plans.tick(actions)
+    with mind.engine.db.connect(write=True) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0]
+        state = mind._load(conn)
+        state["agent_version"] = "planning-v2"
+        mind._save(conn, state)
+    assert plans.tick(actions) == []
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0] == before
+    reasons = {p["id"]: p["steps"][0]["waiting_reason"] for p in plans.read()["plans"]}
+    assert reasons[first["id"]] is None and reasons[second["id"]] is None

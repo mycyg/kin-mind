@@ -426,3 +426,27 @@ def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):
                               (mind.scope.key(),)).fetchall()
     assert mind.read()["decision_runtime"]["model"] == "schedule-marker"
     assert "mind_action_event_recent" in " ".join(str(r[-1]) for r in recent)
+
+
+def test_sixty_quiet_minutes_hold_as_many_assessments_as_kin_asked_for(setup):
+    """T-02: an hour of ticks with no owner message assesses only when Kin's own next review comes
+    due (never more often than the ten-minute floor), each with a bounded input."""
+    from datetime import timedelta
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    sizes = []
+
+    class Measuring(FakeReviewer):
+        def appraise(self, context):
+            sizes.append(len(json.dumps(context, ensure_ascii=False, default=str)))
+            return super().appraise(context)
+
+    reviewer = Measuring(Appraisal(reason="Nothing new; look again in a while", next_review_minutes=10))
+    for _minute in range(60):
+        memory.queue_idle(actions)
+        actions.drain(jobs)
+        jobs.run_one(reviewer, lane="action")
+        clock[0] += timedelta(minutes=1)
+    assert 1 <= reviewer.calls <= 7
+    assert max(sizes) < 40000
