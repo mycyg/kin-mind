@@ -460,16 +460,58 @@ test('a historical canceled task cannot discard another task input after a class
   assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
 });
 
-test('a real stop of the captured task still retires late work classification',async t=>{
+test('late work never extends a task the owner is stopping: it opens work of its own and is answered (AD1-01)',async t=>{
   let calls=0;
   const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
   const task=f.router.addTask({id:'current-work',text:'edit current article'});
   await f.router.select({id:'pending',text:'append a conclusion'});
   task.cancelRequested=true;
   await f.router.reviewSemanticPending();
-  assert.equal(f.router.state.inputs.pending.state,'semantic-canceled');
-  assert.equal(f.router.state.inputs.pending.reason,'superseded-by-cancel');
-  assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+  const record=f.router.state.inputs.pending;
+  assert.equal(record.state,'selected','the message is dispatched, never retired unanswered');
+  assert.notEqual(record.taskId,task.id);assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+  assert.ok(f.router.state.tasks[record.taskId],'it has work of its own');
+});
+
+test('a stop classified late is recorded on its own input and applied only then (AD1-01)',async t=>{
+  let calls=0;
+  const f=fixture(t,{classifyIntents:true,classify:async()=>{if(++calls===1)throw SyntaxError('unreadable');return{route:'work',reason:'owner wants it stopped',stop:'current_task'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'stop-late',text:'别做了'});
+  assert.equal(task.cancelRequested,undefined,'a failed classification decides nothing');
+  await f.router.reviewSemanticPending();
+  const record=f.router.state.inputs['stop-late'];
+  assert.deepEqual([record.state,record.stop?.requested,record.taskId],['selected','current_task',task.id]);
+  assert.equal(task.cancelRequested,true);assert.equal(task.inputVersion,1,'the stop never becomes new work on the task');
+  let submitted=0;
+  await f.router.dispatch({id:'stop-late',text:'别做了'},async()=>{submitted++;return 'steered';});
+  assert.equal(submitted,1,'Kin reads the stop and answers it');
+  await f.router.reconcile();
+  assert.equal(task.status,'canceled');
+});
+
+test('an invalid classification answer can never leave a stop behind (AD1-01)',async t=>{
+  const f=fixture(t,{classifyIntents:true,classify:async()=>({route:'nonsense',stop:'current_task'})});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'garbled',text:'hmm'});
+  assert.equal(task.cancelRequested,undefined);assert.equal(f.router.state.inputs.garbled.state,'semantic-pending');
+});
+
+test('classification and host preparation run outside the router mutex, on a checked basis (AD1-06)',async t=>{
+  let release;const gate=new Promise(resolve=>{release=resolve;});
+  const f=fixture(t,{classify:async()=>{await gate;return {route:'chat',reason:'slow'};},waitForIdle:async()=>{}});
+  const dispatching=f.router.dispatch({id:'slow',text:'hello'},async()=> 'new-turn');
+  await new Promise(resolve=>setTimeout(resolve,10));
+  await f.router.observe('tool',{id:'bookkeeping',status:'completed'});
+  assert.equal((await f.router.readRuntime()).actual.model,'gpt-6-sol','bookkeeping and reads go on while the classifier thinks');
+  release();assert.equal((await dispatching).route,'new-turn');
+  let prepared=0,sent=0;
+  const result=await f.router.dispatch({id:'prepared',text:'again',submissionProtocol:'host-boundary-v1'},async(decision,started)=>{
+    // A fence lands while the host prepares its prompt: nothing is sent on the old basis.
+    if(++prepared===1)f.router.state.executionEpoch++;
+    await started();sent++;return 'new-turn';});
+  assert.deepEqual([result.route,prepared,sent],['new-turn',2,1]);
+  assert.equal(f.router.state.inputs.prepared.executionEpoch,f.router.state.executionEpoch);
 });
 
 test('new independent work can retry after a prior task was canceled',async t=>{

@@ -110,7 +110,7 @@ export class MobileRouter {
    * Left off, every request and every record is what it was before intents existed. */
   constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
-    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
@@ -323,7 +323,7 @@ export class MobileRouter {
     } catch {this.save('switch-recovery-unconfirmed');return runtime;}
   }
   addTask(input) {
-    let task=this.currentTask();
+    let task=this.tasks().filter(item=>!item.cancelRequested).at(-1);
     if(!task) {
       const id='work-'+digest(input.id).slice(0,24);
       task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive','assessment'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text,tools:{},deliveries:{},createdAt:this.now()};
@@ -343,9 +343,21 @@ export class MobileRouter {
     }
     delete task.completion;
   }
+  /** The owner's stop, from the literal command or from a classifier that actually
+   * answered: recorded on the stop input itself, applied to the tasks it names. */
+  applyStop(inputId,stop) {
+    for(const task of this.tasks())if(!stop.taskIds||stop.taskIds.includes(task.id)){task.cancelRequested=true;task.cancelSourceInputId=inputId;}
+  }
+  /** The mind's own turns wait for the owner's work and for a coordinator that is busy. */
+  internalHeld(runtime,kind) {
+    return this.busy(runtime,{assessment:kind==='assessment'})||this.tasks().length>0||this.state.mode==='work';
+  }
   async select(input) {
-    return this.locked(async()=>{
-      const hash=digest([input.text,input.attachments??[]]);
+    const hash=digest([input.text,input.attachments??[]]);
+    const owner=!input.kind||input.kind==='owner',intents=this.classifyIntents&&owner;
+    // Phase one, under the mutex: identity, literal commands and everything that needs
+    // no model. The classification itself never holds the mutex (AD1-06).
+    const first=await this.locked(async()=>{
       const previous=this.state.inputs[input.id];
       if(previous) {
         if(previous.recovered)throw Error('Input acceptance requires reconciliation');
@@ -359,13 +371,11 @@ export class MobileRouter {
           delete previous.reason;delete previous.failureStage;delete previous.ownerNotice;
           this.save('input-preparation-retry',{id:input.id,attempt:previous.retry.attempts});
         }
-        return clone(previous);
+        return {record:clone(previous)};
       }
       // The literal stop is read before any model is asked, and answers on its own when none can be.
       const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
-      const owner=!input.kind||input.kind==='owner';
-      const intents=this.classifyIntents&&owner;
-      let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      const command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
       const priorTask=this.currentTask();
@@ -374,72 +384,92 @@ export class MobileRouter {
       }
       // A failed native turn is terminal, not active work. Only a new assessment
       // on the current profile may proceed; switching and other busy checks stay unchanged.
-      if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null,profile=null,force=false;
-      // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
-      const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
-      let tail=null,offered=null,classified=false,semanticFailure=null;
-      if(stop) {
-        for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';
-        // A literal stop needs no model: whatever is still unsent is retired by the host itself.
-        if(owner&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
-      }
-      else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;force=['work','auto'].includes(command);
-      } else if(command==='compact') {decision='maintenance';reason='native-compact';
+      if(['proactive','assessment'].includes(input.kind)&&this.internalHeld(runtime,input.kind))return {deferred:{state:'deferred',reason:'owner-work-held'}};
+      let decision=null,reason;
+      if(stop){decision=this.tasks().length?'work':'chat';reason='owner-stop-command';}
+      else if(['work','auto','status','watch'].includes(command)){decision='control';reason='owner-runtime-'+command;}
+      else if(command==='compact'){decision='maintenance';reason='native-compact';}
       // An owner message with attachments used to be work without anyone reading it. With
       // intents on it is classified like any other, with the attachment metadata in view.
-      } else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
-        decision='work';reason='work-input';
-      } else if(input.kind==='assessment') {decision='chat';reason='silent-main-assessment';}
-      else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
-      else {
-        // An interrupted reply with nothing unknown about it rides on this call. With none,
-        // the classifier is asked exactly what it was always asked.
-        classified=true;
-        offered=owner?await port('pending',{id:input.id,text:input.text}):null;
-        if(!offered?.reply)offered=null;
-        const files=intents?attachmentMetadata(input.attachments):[];
-        try {
-          const result=await this.askClassification(input,{files,intents,offered,runtime,wait:this.state.config.classifierTimeoutMs});
-          ({decision,reason,command,recall,fileSend,stopIntent,profile,force}=this.readClassification(result,{owner,intents,allowStop:true}));
-          if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
-            :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
-        } catch(error) {
-          // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
-          // anomaly always became work: the catch manufactured a provisional task and
-          // a GPT switch out of a chat nobody had read. A failure now decides
-          // nothing — no task, no provider switch, no execution grant — and the
-          // input waits as itself for the bounded review, failure class on record.
-          semanticFailure=classificationFailure(error);
-          // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
-          if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
-        }
+      else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)){decision='work';reason='work-input';}
+      else if(input.kind==='assessment'){decision='chat';reason='silent-main-assessment';}
+      else if(input.kind==='proactive'){decision='chat';reason='casual-outreach';}
+      if(decision===null)return {classify:{runtime,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))}};
+      const recall={mode:'light',reason:'no-semantic-recall-decision'};
+      if(stop) {
+        const stopIntent={requested:'current_task',decisionSource:'literal-owner-command',taskIds:this.tasks().map(t=>t.id)};
+        this.applyStop(input.id,stopIntent);
+        return {decided:{decision,reason,command,recall,stopIntent,runtime}};
       }
+      return {decided:{decision,reason,command,recall,force:['work','auto'].includes(command),runtime}};
+    });
+    if(first.record)return first.record;
+    if(first.deferred)return first.deferred;
+    // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
+    const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
+    let tail=null,offered=null,classified=false,semanticFailure=null,read=null;
+    if(first.decided) {
+      // A literal stop needs no model: whatever is still unsent is retired by the host itself.
+      if(owner&&first.decided.command==='stop'&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
       // Attachments and commands are never classified, so they cannot carry a tail decision either.
-      if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
+      else if(owner)await port('missed',{inputId:input.id,reason:'not-classified'});
+    } else {
+      // An interrupted reply with nothing unknown about it rides on this call. With none,
+      // the classifier is asked exactly what it was always asked.
+      classified=true;
+      offered=owner?await port('pending',{id:input.id,text:input.text}):null;
+      if(!offered?.reply)offered=null;
+      const files=intents?attachmentMetadata(input.attachments):[];
+      try {
+        const result=await this.askClassification(input,{files,intents,offered,runtime:first.classify.runtime,wait:this.state.config.classifierTimeoutMs});
+        read=this.readClassification(result,{owner,intents,allowStop:true});
+        if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
+          :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
+      } catch(error) {
+        // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
+        // anomaly always became work: the catch manufactured a provisional task and
+        // a GPT switch out of a chat nobody had read. A failure now decides
+        // nothing — no task, no provider switch, no execution grant — and the
+        // input waits as itself for the bounded review, failure class on record.
+        semanticFailure=classificationFailure(error);
+        // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
+        if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
+      }
+    }
+    // Phase two, under the mutex: the answer applies only against the basis it was read from.
+    return this.locked(async()=>{
+      if(this.state.inputs[input.id])return clone(this.state.inputs[input.id]);
+      const base={id:input.id,hash,kind:input.kind??'owner',at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
       if(semanticFailure) {
-        const current=this.currentTask();
+        const current=this.currentTask(),runtime=first.classify.runtime;
         this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
           attachments:intents?attachmentMetadata(input.attachments):[],occurredAt:input.occurredAt??null,receivedAt:input.receivedAt??null,
           conversationId:this.state.conversationId??null,generation:this.state.generation??null,
-          taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])),
+          taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:first.classify.taskVersions,
           model:runtime.model??null,mode:this.state.mode,failure:{class:semanticFailure,at:this.now()},
           attempts:1,maxAttempts:SEMANTIC_RETRY_BUDGET,nextAttemptAt:this.now(),state:'pending',createdAt:this.now(),updatedAt:this.now()};
-        const record={id:input.id,hash,kind:input.kind??'owner',state:'semantic-pending',route:null,intent:null,reason:'classification-'+semanticFailure,recall,command:null,taskId:null,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
+        const record={...base,state:'semantic-pending',route:null,intent:null,reason:'classification-'+semanticFailure,recall:{mode:'light',reason:'no-semantic-recall-decision'},command:null,taskId:null};
         this.state.inputs[input.id]=record;
-        if(!input.kind||input.kind==='owner')this.rememberOwner(input);
+        if(owner)this.rememberOwner(input);
         this.save('input-semantic-pending',{id:input.id,failure:semanticFailure});
         return clone(record);
       }
-      const intent=decision;
-      const locked=this.applyRouteLock(input,{decision,reason,intent,command,runtime});
-      ({decision,reason}=locked);
-      const task=locked.task;
+      let decided=first.decided;
+      if(read) {
+        // A stop read from a classification applies only to the tasks it was read against.
+        const basisSame=JSON.stringify(Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])))===JSON.stringify(first.classify.taskVersions);
+        const stopIntent=basisSame?read.stopIntent:null;
+        if(stopIntent)this.applyStop(input.id,stopIntent);
+        decided={...read,stopIntent};
+      }
+      const {decision,reason:why,command,recall,fileSend,stopIntent,profile,force}=decided;
+      const locked=this.applyRouteLock(input,{decision,reason:why,intent:decision,command,stop:stopIntent});
       const modeControl=['manual','auto','work'].includes(command);
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}: {})};
+      const record={...base,state:'selected',route:locked.decision,intent:decision,reason:locked.reason,recall,command,taskId:locked.task?.id,
+        ...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}:{})};
       this.state.inputs[input.id]=record;
-      if(!input.kind||input.kind==='owner')this.rememberOwner(input);
-      this.save('input-selected',{id:input.id,route:decision,reason});return clone(record);
+      if(owner)this.rememberOwner(input);
+      this.save('input-selected',{id:input.id,route:locked.decision,reason:locked.reason,...(classified?{classified}:{})});return clone(record);
     });
   }
   /** One bounded ask of the classifier, with its own clock. The longest the call
@@ -454,8 +484,9 @@ export class MobileRouter {
     try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
-  /** A classification answer, validated and read within its bounds. Never owns the
-   * execution lock, and only ever exists when the classifier actually answered. */
+  /** A classification answer, validated and read within its bounds. It never owns
+   * the execution lock and never changes state; it exists only when the classifier
+   * actually answered. */
   readClassification(result,{owner,intents,allowStop=false}={}) {
     if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
     let command=null;
@@ -473,13 +504,10 @@ export class MobileRouter {
     }
     if(asked.fileSend)fileSend={...asked.fileSend,decisionSource:CLASSIFIER_DECISION,at:this.now()};
     // A natural-language stop is the literal command's equal, and only that: the owner,
-    // an open task, and a classifier that actually answered. It is never inferred here,
-    // and a late answer applies only against the task basis it was read from.
-    if(allowStop&&asked.stop==='current_task'&&this.tasks().length) {
-      const taskIds=this.tasks().map(task=>task.id);
-      for(const task of this.tasks())task.cancelRequested=true;
-      stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
-    }
+    // an open task, and a classifier that actually answered. Reading it changes
+    // nothing: the caller applies it against the task basis it was read from (AD1-01).
+    if(allowStop&&asked.stop==='current_task'&&this.tasks().length)
+      stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds:this.tasks().map(task=>task.id)};
     const profile=command==='manual'?clone(result.profile):null;
     if(command==='manual'&&(!profile?.model||!profile.reasoningEffort||!profile.serviceTierPreference))throw Error('Invalid model profile');
     if(result.force!==undefined&&typeof result.force!=='boolean')throw Error('Invalid force decision');
@@ -490,10 +518,14 @@ export class MobileRouter {
   }
   /** DeepSeek judges meaning; its answer never owns the execution lock. Real work
    * keeps its model, tools and delivery lock; a chat that arrives while work is
-   * open rides as context on the existing task, never as a new one. */
-  applyRouteLock(input,{decision,reason,intent,command,runtime}) {
-    if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
-    const task=decision==='work'&&!command?(intent==='work'?this.addTask(input):this.currentTask()):command?null:this.currentTask();
+   * open rides as context on the existing task, never as a new one. Only open work
+   * the owner is not stopping holds the lock, never the model that happens to run. */
+  applyRouteLock(input,{decision,reason,intent,command,stop=null}) {
+    const current=this.tasks().filter(task=>!task.cancelRequested).at(-1)??null;
+    if(!command&&(current||this.state.mode==='work')){decision='work';reason='work-lock: '+reason;}
+    // The owner's stop is read by the task it stops; it never opens or extends work (AD1-01).
+    const task=stop?this.tasks().filter(item=>stop.taskIds?.includes(item.id)).at(-1)??current:
+      decision==='work'&&!command?(intent==='work'?this.addTask(input):current):command?null:current;
     if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
     return {decision,reason,task};
   }
@@ -525,7 +557,7 @@ export class MobileRouter {
       // The caller learns that the same id may be tried again, and when.
       if(retry&&!error.code)Object.assign(error,{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
       throw error;
-    }).finally(()=>this.inflight.delete(input.id));
+    }).finally(()=>{this.inflight.delete(input.id);this.reservations.delete(input.id);});
     this.inflight.set(input.id,pending);return pending;
   }
   /** Called under the router mutex by the existing minute review. A live dispatch
@@ -550,105 +582,137 @@ export class MobileRouter {
       // A semantic wait is settled by its own bounded review — driven here while
       // the caller is still alive, and by the host's pump when it is not.
       if(this.state.inputs[input.id]?.state==='semantic-pending')await this.reviewSemanticPending();
-      const outcome=await this.locked(async()=>{
-        const record=this.state.inputs[input.id];
-        if(record.state==='semantic-pending')return null;
-        if(['accepted','queued','superseded'].includes(record.state))return {route:'deduplicated',model:record.model};
-        if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
-        let runtime=await this.reconcileTransition(await this.inspect());
-        if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
-        if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
-          const request=await this.acceptControl(record,runtime);
-          const applied=request?await this.applyModeRequest(request,runtime):{runtime};
-          runtime=applied.runtime??runtime;
-          if(record.route==='control') {
-            record.state='accepted';record.acceptedAt=this.now();
-            this.save('control-accepted',{id:input.id,command:record.command});
-            return{route:'host-control',model:runtime.model,state:request?.state};
-          }
-          // Mixed requests execute their work only after the exact requested
-          // profile is verified. Failure never silently runs it on the old model.
-          if(request?.state==='pending')return null;
-          if(request?.state!=='applied') {
-            // The owner's own control failed and was reported; the work is not re-run on another model.
-            this.notSubmitted(record,'model-control-'+(request?.state??'failed'),{stage:'model-control'});record.retry.exhausted=true;delete record.retry.nextAt;
-            this.save('input-failed-before-submit',{id:input.id});
-            return {route:'control-failed',state:request?.state,model:runtime.model};
-          }
-        }
-        if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input).id;
-        if(record.route==='maintenance'&&this.busy(runtime))return null;
-        let targetProfile=record.route==='maintenance'||input.kind==='assessment'||record.unlabeled?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
-        if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {route:'deferred',reason:'native-profile-unconfirmed'};
-        // A native runtime that cannot be read, or a switch still being reconciled, is a
-        // wait: nothing has been submitted, and nothing is failed for it (AD1-02).
-        if(!runtime.known||this.state.transition?.state==='unconfirmed'){this.noteWait(record,!runtime.known?'native-runtime-unknown':'switch-unconfirmed');return null;}
-        if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
-        if(record.route!=='maintenance'&&!record.unlabeled&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
-        try {targetProfile=await this.resolvedProfile(targetProfile);}
-        catch(error) {if(/Canonical model provider unavailable|catalog/i.test(String(error?.message))){this.noteWait(record,'model-catalog-unavailable');return null;}throw error;}
-        let target=targetProfile.model;
-        // A queued work request must not change the provider mid-DeepSeek turn.
-        if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&this.busy(runtime))return null;
-        if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
-          this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
-          try {
-            const switched=await this.switchTo(targetProfile),actual=switched.actual;targetProfile=switched.target;target=targetProfile.model;
-            if(!this.verified(actual,targetProfile))throw Error('Provider verification failed');
-            this.finishTransition(actual);this.save('switch-applied',{model:target});
-          } catch {
-            // No owner input has been submitted. Restore the exact profile observed
-            // before this attempt; ambiguous restoration remains held.
-            try {
-              const current=await this.inspect();if(this.busy(current))throw Error('busy');
-              const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
-              if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
-              this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
-              // Only work opens work: a chat that ran on the restored profile stays a chat (AD1-04).
-              if(!record.taskId&&!record.command&&record.route==='work')record.taskId=this.addTask(input).id;
-              this.save('switch-failed-restored');
-            } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
-          }
-        } else this.state.actual=runtime;
-        if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
-        if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
-        record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
-        const markSubmitted=()=>{
-          record.state='submitting';record.submissionStartedAt=this.now();
-          // A native command exists from its submission, never before it (AD1-03).
-          if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-          this.save('input-submitting',{id:input.id});
-        };
-        if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
-        try {
-          const outcome=await submit({model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
-          const route=typeof outcome==='string'?outcome:outcome?.route;
-          if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';record.settledAt=this.now();this.save('input-superseded',{id:input.id});return{route,model:target};}
-          // Handed only to the session's in-memory queue is not yet native acceptance:
-          // the input is accepted when its prompt begins (H2a-02).
-          if(outcome?.queued===true&&!record.turnStartedAt){record.state='queued';record.queuedAt=this.now();this.save('input-queued',{id:input.id});return {route,model:target,queued:true};}
-          record.state='accepted';record.acceptedAt??=this.now();
-          if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
-          this.save('input-accepted',{id:input.id,route});
-          return{route,model:target};
-        } catch(error) {
-          const operation=this.state.operations[record.id];
-          if(record.submissionStartedAt) {
-            record.state='unconfirmed';record.failureStage='native-submit';
-            // The command's own outcome is unknown; it is closed, never left running (AD1-03).
-            if(operation?.state==='submitted')Object.assign(operation,{state:'failed',stopReason:'submit-outcome-unknown',updatedAt:this.now()});
-            this.save('input-unconfirmed',{id:input.id});
-            throw Error('Input acceptance requires reconciliation',{cause:error});
-          }
-          const retry=this.notSubmitted(record,String(error?.message??error));
-          this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});
-          throw Object.assign(Error('Input preparation failed before native submission',{cause:error}),{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
-        }
-      });
-      if(outcome)return outcome;
+      const plan=await this.locked(async()=>this.planDispatch(input));
+      if(plan.outcome)return plan.outcome;
+      if(!plan.wait) {
+        const done=await this.submitPlanned(input,plan,submit);
+        if(!done.retry)return done;
+      }
       if(this.now()>=deadline)throw Error('dispatch-wait-exceeded:'+(this.state.inputs[input.id]?.waitingReason??'coordinator-busy'));
       await this.waitForIdle();
     }
+  }
+  /** Phase one of a dispatch, under the mutex: controls, the provider switch and a
+   * reservation that keeps any other dispatch from switching the provider until this
+   * one has been handed to the session. */
+  async planDispatch(input) {
+    const record=this.state.inputs[input.id];
+    if(record.state==='semantic-pending')return {wait:true};
+    if(['accepted','queued','superseded'].includes(record.state))return {outcome:{route:'deduplicated',model:record.model}};
+    if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
+    let runtime=await this.reconcileTransition(await this.inspect());
+    if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {outcome:{route:'deferred',reason:'owner-work-held'}};
+    if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
+      const request=await this.acceptControl(record,runtime);
+      const applied=request?await this.applyModeRequest(request,runtime):{runtime};
+      runtime=applied.runtime??runtime;
+      if(record.route==='control') {
+        record.state='accepted';record.acceptedAt=this.now();
+        this.save('control-accepted',{id:input.id,command:record.command});
+        return {outcome:{route:'host-control',model:runtime.model,state:request?.state}};
+      }
+      // Mixed requests execute their work only after the exact requested
+      // profile is verified. Failure never silently runs it on the old model.
+      if(request?.state==='pending')return {wait:true};
+      if(request?.state!=='applied') {
+        // The owner's own control failed and was reported; the work is not re-run on another model.
+        this.notSubmitted(record,'model-control-'+(request?.state??'failed'),{stage:'model-control'});record.retry.exhausted=true;delete record.retry.nextAt;
+        this.save('input-failed-before-submit',{id:input.id});
+        return {outcome:{route:'control-failed',state:request?.state,model:runtime.model}};
+      }
+    }
+    if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input).id;
+    if(record.route==='maintenance'&&this.busy(runtime))return {wait:true};
+    let targetProfile=record.route==='maintenance'||input.kind==='assessment'||record.unlabeled?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+    if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {outcome:{route:'deferred',reason:'native-profile-unconfirmed'}};
+    // A native runtime that cannot be read, or a switch still being reconciled, is a
+    // wait: nothing has been submitted, and nothing is failed for it (AD1-02).
+    if(!runtime.known||this.state.transition?.state==='unconfirmed'){this.noteWait(record,!runtime.known?'native-runtime-unknown':'switch-unconfirmed');return {wait:true};}
+    if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
+    if(record.route!=='maintenance'&&!record.unlabeled&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
+    try {targetProfile=await this.resolvedProfile(targetProfile);}
+    catch(error) {if(/Canonical model provider unavailable|catalog/i.test(String(error?.message))){this.noteWait(record,'model-catalog-unavailable');return {wait:true};}throw error;}
+    let target=targetProfile.model;
+    // A queued request must not change the provider mid-turn, nor under another
+    // dispatch that is planned but not yet handed to the session.
+    const otherReserved=[...this.reservations.keys()].some(id=>id!==input.id);
+    if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&(this.busy(runtime)||otherReserved))return {wait:true};
+    if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
+      this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
+      try {
+        const switched=await this.switchTo(targetProfile),actual=switched.actual;targetProfile=switched.target;target=targetProfile.model;
+        if(!this.verified(actual,targetProfile))throw Error('Provider verification failed');
+        this.finishTransition(actual);this.save('switch-applied',{model:target});
+      } catch {
+        // No owner input has been submitted. Restore the exact profile observed
+        // before this attempt; ambiguous restoration remains held.
+        try {
+          const current=await this.inspect();if(this.busy(current))throw Error('busy');
+          const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
+          if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
+          this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
+          // Only work opens work: a chat that ran on the restored profile stays a chat (AD1-04).
+          if(!record.taskId&&!record.command&&record.route==='work')record.taskId=this.addTask(input).id;
+          this.save('switch-failed-restored');
+        } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
+      }
+    } else this.state.actual=runtime;
+    if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
+    if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==ROUTER_MODELS.chat)return {outcome:{route:'deferred',reason:'deepseek-not-verified'}};
+    record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
+    record.plannedTransition=this.state.transition?.id??null;
+    this.reservations.set(input.id,{profile:targetProfile,at:this.now()});
+    return {decision:{model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,
+      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch}};
+  }
+  /** Phase two: the host prepares its prompt outside the mutex (AD1-06), then marks
+   * the submission under it, re-checking the basis the dispatch was planned on. */
+  async submitPlanned(input,plan,submit) {
+    let marking=null;
+    const markSubmitted=()=>marking??=this.locked(async()=>{
+      const record=this.state.inputs[input.id];
+      // Any provider change since the plan means planning again, never submitting on a stale basis.
+      if(record.state!=='preparing'||record.executionEpoch!==this.state.executionEpoch||(this.state.transition?.id??null)!==record.plannedTransition||this.state.transition?.state==='switching')
+        throw Object.assign(Error('dispatch-basis-changed'),{dispatchRetry:true});
+      record.state='submitting';record.submissionStartedAt=this.now();
+      // A native command exists from its submission, never before it (AD1-03).
+      if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
+      this.save('input-submitting',{id:input.id});
+    });
+    if(input.submissionProtocol!=='host-boundary-v1')await markSubmitted().catch(()=>{});
+    let outcome,failure=null;
+    if(!marking||await marking.then(()=>true,error=>{failure=error;return false;})) {
+      try {outcome=await submit(plan.decision,markSubmitted);} catch(error) {failure=error;}
+      if(marking)await marking.catch(error=>{failure??=error;});
+    }
+    return this.locked(async()=>{
+      this.reservations.delete(input.id);
+      const record=this.state.inputs[input.id],target=plan.decision.model;
+      if(failure) {
+        if(failure.dispatchRetry&&record.state==='preparing'){record.state='selected';this.save('input-dispatch-replanned',{id:input.id});return {retry:true};}
+        const operation=this.state.operations[record.id];
+        if(record.submissionStartedAt&&record.state==='submitting') {
+          record.state='unconfirmed';record.failureStage='native-submit';
+          // The command's own outcome is unknown; it is closed, never left running (AD1-03).
+          if(operation?.state==='submitted')Object.assign(operation,{state:'failed',stopReason:'submit-outcome-unknown',updatedAt:this.now()});
+          this.save('input-unconfirmed',{id:input.id});
+          throw Error('Input acceptance requires reconciliation',{cause:failure});
+        }
+        if(record.state!=='preparing')throw Error('Input acceptance requires reconciliation',{cause:failure});
+        const retry=this.notSubmitted(record,String(failure?.message??failure));
+        this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});
+        throw Object.assign(Error('Input preparation failed before native submission',{cause:failure}),{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
+      }
+      const route=typeof outcome==='string'?outcome:outcome?.route;
+      if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';record.settledAt=this.now();this.save('input-superseded',{id:input.id});return{route,model:target};}
+      // Handed only to the session's in-memory queue is not yet native acceptance:
+      // the input is accepted when its prompt begins (H2a-02).
+      if(outcome?.queued===true&&!record.turnStartedAt){record.state='queued';record.queuedAt=this.now();this.save('input-queued',{id:input.id});return {route,model:target,queued:true};}
+      record.state='accepted';record.acceptedAt??=this.now();
+      if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
+      this.save('input-accepted',{id:input.id,route});
+      return{route,model:target};
+    });
   }
   noteWait(record,reason) {
     if(record.waitingReason===reason)return;
@@ -723,18 +787,11 @@ export class MobileRouter {
         const basisSame=JSON.stringify(Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])))===JSON.stringify(e.taskVersions);
         let read;
         try{read=this.readClassification(result,{owner,intents,allowStop:basisSame});}catch(error){return fail(classificationFailure(error));}
-        // A stop that landed while the answer was in flight retires the input: a
-        // late work decision must never resurrect or extend what the owner canceled.
-        const canceled=Object.keys(e.taskVersions??{}).some(id=>{
-          const task=this.state.tasks[id];
-          return task?.cancelRequested||task?.status==='canceled'&&(task.canceledAt??0)>=e.createdAt;
-        });
-        if(canceled&&read.decision==='work') {
-          e.state='superseded';record.state='semantic-canceled';record.reason='superseded-by-cancel';
-          this.save('semantic-canceled',{id,reason:'superseded-by-cancel'});return;
-        }
-        const runtime=await this.inspect();
-        const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,runtime});
+        // The late answer takes the same path as a prompt one: its own stop is recorded on
+        // it and applied now, and late work never extends a task the owner is stopping —
+        // it opens work of its own instead. Nothing is retired unanswered (AD1-01).
+        if(read.stopIntent)this.applyStop(id,read.stopIntent);
+        const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,stop:read.stopIntent});
         Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
           taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
         if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
@@ -971,7 +1028,7 @@ export class MobileRouter {
     if(!unchanged&&request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
     if(request.mode==='work'&&!this.state.autoReturnProfile)this.captureAutomaticReturn(runtime);
     let forced=Boolean(request.forceBoundary);
-    if(!unchanged&&(this.busy(runtime)||request.forceState==='unconfirmed'||priorNeedsFence)) {
+    if(!unchanged&&(this.busy(runtime)||this.reservations.size>0&&!request.force||request.forceState==='unconfirmed'||priorNeedsFence)) {
       if(!request.force){request.waitingReason='coordinator-busy';return {runtime};}
       const boundary=await this.forceBoundary(request,runtime);if(!boundary)return {runtime};forced=true;
       runtime=await this.inspect();
@@ -1086,7 +1143,7 @@ export class MobileRouter {
   async prepareModel(model) {
     return this.locked(async()=>{
       const runtime=await this.inspect();
-      if(this.tasks().length||this.busy(runtime))throw Error('Work prevents model verification');
+      if(this.tasks().length||this.busy(runtime)||this.reservations.size)throw Error('Work prevents model verification');
       let profile=await this.resolvedProfile(typeof model==='string'?{model}:model);
       if(this.verified(runtime,profile)){this.observeRuntime(runtime);return runtime;}
       this.startTransition(runtime,profile,'Host model verification','probe');this.save('switch-requested');
