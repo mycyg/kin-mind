@@ -5,6 +5,9 @@
  * handed to Kin's next turn) stays visible after the owner has moved on to a
  * newer input. Tail facts carry states and IDs only, never message text. */
 const GROUPS_KEPT=32;
+/** H2a-11: only the owner's own messages are waited on; a host handoff never
+ * replaces the input the owner is waiting to hear about. */
+const OWNER_CHANNELS=new Set(['wechat','feishu']);
 const TAIL_FACTS=['event','reason','newInputId'];
 function tailProgress(previous,tail,at) {
  if(!tail||typeof tail!=='object')return previous??null;
@@ -20,7 +23,7 @@ function groupProgress(previous,event,detail,at) {
  return {replyGroups:groups};
 }
 export function replyProgress(previous,event,detail={},at=new Date().toISOString()) {
- if(event==='incoming')return {awaitingReplyInputId:detail.inputId??null,replyDisposition:'waiting',replyWaitingReason:null};
+ if(event==='incoming')return detail.channel&&!OWNER_CHANNELS.has(detail.channel)?{}:{awaitingReplyInputId:detail.inputId??null,replyDisposition:'waiting',replyWaitingReason:null};
  if(event==='control-reply')return {lastControlReplyAt:at,lastControlMessageId:detail.messageId};
  const group=groupProgress(previous,event,detail,at);
  // What became of an older group's remainder is a fact about that group. It never answers for the input awaited now.

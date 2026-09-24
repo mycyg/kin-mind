@@ -138,6 +138,38 @@ export async function reconcileLegacyInjections(window,markers,{maxBytes=Infinit
   return {state:'reconciled',found:found.map(r=>({markers:r.m,hash:r.h,offset:r.o,at:r.at})),unknown:wanted.filter(marker=>!settled.has(marker))};
 }
 
+/** AD1-10: whether a prompt whose submission is uncertain reached the native
+ * history, by the host-event ids it carried (`<kin-host-event>`). The receipt
+ * index answers first; otherwise one pass over at most `maxBytes` at the end of
+ * the history reads only lines that can carry an event. `not-found` needs that
+ * stretch to begin before the prompt was submitted (`submittedAt`, ms); short of
+ * that the answer is `unknown`, which is never read as absence. */
+export async function reconcileHostInput(file,events,{submittedAt=null,maxBytes=64*1024*1024}={}) {
+  const wanted=[...new Set((events??[]).filter(event=>typeof event==='string'&&/^[a-f0-9]{32}$/.test(event)))];
+  if(!wanted.length)return {state:'unknown',reason:'no-host-event'};
+  if(typeof file!=='string'||!fs.existsSync(file))return {state:'unknown',reason:'native-history-unavailable'};
+  const window=nativeWindowFor(file);
+  if(window) {
+    try{await window.poll();}catch{/* The pass below reads the file itself. */}
+    for(const event of wanted){const hit=window.receipts.input(event);if(hit)return {state:'found',at:hit.at,offset:hit.o};}
+  }
+  const size=fs.statSync(file).size,start=Number.isFinite(maxBytes)?Math.max(0,size-maxBytes):0;
+  let found=null,earliest=null,turnContext=null,partial=start>0;
+  await readLines(file,start,size,(line,at)=>{
+    // A pass that starts inside the file skips the line it starts in.
+    if(partial){partial=false;return;}
+    if(earliest===null){const stamp=/"timestamp":"([^"]+)"/.exec(line);if(stamp)earliest=Date.parse(stamp[1]);}
+    if(line.includes('"type":"turn_context"')){turnContext=at;return;}
+    if(!line.includes('<kin-host-event>'))return;
+    let item;try{item=JSON.parse(line);}catch{return;}
+    const hit=receiptsOf(item,at,turnContext).find(r=>r.e&&wanted.includes(r.e));
+    if(hit){found=hit;return false;}
+  });
+  if(found){if(window){window.index([found]);window.save();}return {state:'found',at:found.at,offset:found.o};}
+  const covered=start===0||Number.isFinite(earliest)&&Number.isFinite(submittedAt)&&earliest<submittedAt;
+  return covered?{state:'not-found'}:{state:'unknown',reason:'history-before-submission-unread'};
+}
+
 /** Injection receipt reconciliation reads only public message items and the
  * exact marker. An unknown operation is never retried on absence alone. With an
  * incremental reader for this file, an injection marker is answered from its
