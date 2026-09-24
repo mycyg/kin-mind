@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {createHash,randomUUID} from 'node:crypto';
-import {readJsonFile,createJsonExclusive} from './atomic-json.mjs';
+import {readJsonFile,claimPidLock,releasePidLock} from './atomic-json.mjs';
 import {atomicJson,loadState} from './mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validateCheckpoint} from './session-policy.mjs';
 import {runtimeProfile} from './codex-models.mjs';
@@ -122,20 +122,17 @@ export class SessionManager {
     return true;
   }
   async locked(fn){return this.coordinator.locked(async()=>{this.assertFence(this.state.binding);return fn();});}
+  /** The hosts' one process lock (AD1-20), held for this manager's lifetime and
+   * judged by pid and start time: a crashed host whose pid was handed on no longer
+   * blocks the next start, and a second live host cannot take it. A lease left by a
+   * crash is taken over; what that host left in flight the registry already marks
+   * unconfirmed, and nothing of it is replayed. */
   acquireLease() {
-    const file=this.file+'.lease';
-    this.leaseNonce=randomUUID();
-    const write=()=>createJsonExclusive(file,{pid:process.pid,nonce:this.leaseNonce});
-    if(!write()) {
-      // An unreadable lease is treated as held: a second live host is the dangerous case.
-      const owner=readJsonFile(file).value;let dead=false;
-      if(Number.isInteger(owner?.pid)){try{process.kill(owner.pid,0);}catch(e){dead=e.code==='ESRCH';}}
-      if(!dead)throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');
-      fs.unlinkSync(file);if(!write())throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');
-    }
-    this.leaseFile=file;
+    const file=this.file+'.lease',claimed=claimPidLock(file);
+    if(claimed.state!=='held')throw Error('KIN_SESSION_MANAGER_ALREADY_RUNNING');
+    this.leaseFile=file;this.leaseClaim=claimed.claim;
   }
-  close(){this.closed=true;if(this.leaseFile&&readJsonFile(this.leaseFile).value?.nonce===this.leaseNonce)fs.unlinkSync(this.leaseFile);}
+  close(){this.closed=true;if(this.leaseClaim)releasePidLock(this.leaseFile,this.leaseClaim);}
   evidence(event) {
     if(!event.id||!event.sourceId||!event.revision||!Number.isFinite(event.at))throw Error('Session evidence needs a source and time');
     const old=this.state.evidence[event.id];
