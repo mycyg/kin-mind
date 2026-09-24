@@ -392,7 +392,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Scopes */
+        /**
+         * List Scopes
+         * @description Every scope that holds a live record, a page at a time, in key order (E3-03).
+         *
+         *     One seek on the `record_scope` index per scope, never a DISTINCT over the whole table:
+         *     each step asks for the first key after the last one. The cursor is the last key shown.
+         */
         get: operations["list_scopes"];
         put?: never;
         post?: never;
@@ -1834,10 +1840,14 @@ export interface operations {
     list_memories: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 kind?: string | null;
                 status?: string | null;
                 cursor?: string | null;
@@ -2355,7 +2365,10 @@ export interface operations {
     };
     list_scopes: {
         parameters: {
-            query?: never;
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2371,6 +2384,15 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -2448,10 +2470,14 @@ export interface operations {
     list_families: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 cursor?: string;
                 limit?: number;
             };
@@ -2594,10 +2620,14 @@ export interface operations {
     read_graph: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 family_id?: string | null;
                 limit?: number;
                 focus?: string | null;
@@ -2640,10 +2670,14 @@ export interface operations {
     read_graph_object: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
             };
             header?: never;
             path: {
@@ -2678,10 +2712,14 @@ export interface operations {
     read_event_thread: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 query?: string;
                 cursor?: number;
                 budget?: number;
@@ -2791,10 +2829,14 @@ export interface operations {
     read_conversation_habits: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
             };
             header?: never;
             path?: never;
@@ -2897,10 +2939,14 @@ export interface operations {
     read_autonomous_plans: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 identifier?: string | null;
                 status?: string | null;
                 cursor?: number;
@@ -2973,10 +3019,14 @@ export interface operations {
     read_procedure_memory: {
         parameters: {
             query?: {
-                project?: string;
-                persona?: string;
-                collection?: string;
-                world?: string;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
                 query?: string;
                 identifier?: string | null;
                 limit?: number;

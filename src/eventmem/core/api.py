@@ -8,7 +8,7 @@ import secrets
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -219,7 +219,15 @@ def credential(root):
     return token
 
 
-def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=True):
+# One field of the scope a read is for. With none of the four given the read is of the
+# deployment's own scope (health reports it as `default_scope`); a field left out of a partial
+# scope takes the model default (E3-03).
+ScopePart = Annotated[str | None, Query(
+    description="作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；"
+                "只给出一部分时，其余字段取默认值。")]
+
+
+def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=True, default_scope=None):
     engine = engine or Engine(root or Path.home() / ".memorypalace")
     auth_token = token or credential(engine.db.root)
     if not auth_token or not auth_token.strip():
@@ -227,6 +235,17 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         raise RuntimeError("MemoryPalace needs a non-empty local credential")
     expected = auth_token.encode()
     worker = Worker(engine)
+    # What a read that names no scope reads: the deployment's own (the Kin service passes the
+    # scope its mind-config names), never an empty default one (E3-03). A read that names some of
+    # the four fields gets the model's defaults for the rest, exactly as before.
+    home = Scope.model_validate(default_scope) if default_scope is not None else Scope()
+
+    def scope_of(project, persona, collection, world):
+        given = {key: value for key, value in (("project", project), ("persona", persona),
+                                               ("collection", collection), ("world", world))
+                 if value is not None}
+        return Scope(**given) if given else home
+
     from .integrity import loaded_revision
 
     # What this process is running, fixed at start: a health check compares it with the revision
@@ -328,7 +347,8 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         """Ready means the background loop is going round as well: reminders, extraction,
         organising and host replay all run on it, so a service whose loop has stopped is not
         healthy however well it answers (E2-02, H3-09)."""
-        answer = {"status": "ready", "version": "1.0.0", "schema": schema, "source": source}
+        answer = {"status": "ready", "version": "1.0.0", "schema": schema, "source": source,
+                  "default_scope": home.model_dump()}
         if not workers:
             return answer | {"worker": {"enabled": False}}
         thread = app.state.worker_thread
@@ -424,10 +444,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.get("/v1/memories", operation_id="list_memories")
     def list_memories(
-        project: str = "personal",
-        persona: str = "default",
-        collection: str = "default",
-        world: str = "real",
+        project: ScopePart = None,
+        persona: ScopePart = None,
+        collection: ScopePart = None,
+        world: ScopePart = None,
         kind: str | None = None,
         status: str | None = None,
         cursor: str | None = None,
@@ -436,7 +456,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         query: str | None = Query(None, max_length=4000),
     ) -> dict:
         return engine.list_records(
-            Scope(project=project, persona=persona, collection=collection, world=world),
+            scope_of(project, persona, collection, world),
             kind,
             status,
             cursor,
@@ -582,17 +602,23 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
             return await asyncio.to_thread(restore, path, target)
 
     @app.get("/v1/scopes", operation_id="list_scopes")
-    def list_scopes() -> dict:
+    def list_scopes(cursor: str = "", limit: int = Query(100, ge=1, le=200)) -> dict:
+        """Every scope that holds a live record, a page at a time, in key order (E3-03).
+
+        One seek on the `record_scope` index per scope, never a DISTINCT over the whole table:
+        each step asks for the first key after the last one. The cursor is the last key shown."""
+        found, after = [], cursor
         with engine.db.connect() as conn:
-            return {
-                "items": [
-                    json.loads(r[0])
-                    for r in conn.execute(
-                        "SELECT DISTINCT scope FROM records WHERE deleted=0 LIMIT 200"
-                    )
-                ],
-                "cursor": None,
-            }
+            while len(found) <= limit:
+                row = conn.execute("SELECT scope FROM records WHERE scope>? AND deleted=0 ORDER BY scope LIMIT 1",
+                                   (after,)).fetchone()
+                if not row:
+                    break
+                found.append(row[0])
+                after = row[0]
+        return {"items": [json.loads(key) for key in found[:limit]],
+                "cursor": found[limit - 1] if len(found) > limit else None,
+                "default_scope": home.model_dump()}
 
     @app.get("/v1/jobs", operation_id="list_jobs")
     def list_jobs(
@@ -636,15 +662,15 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.get("/v1/families", operation_id="list_families")
     def list_families(
-        project: str = "personal",
-        persona: str = "default",
-        collection: str = "default",
-        world: str = "real",
+        project: ScopePart = None,
+        persona: ScopePart = None,
+        collection: ScopePart = None,
+        world: ScopePart = None,
         cursor: str = "",
         limit: int = Query(50, ge=1, le=100),
     ) -> dict:
         rows = Organizer(engine).list(
-            Scope(project=project, persona=persona, collection=collection, world=world),
+            scope_of(project, persona, collection, world),
             limit + 1,
             cursor,
         )
@@ -696,10 +722,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.get("/v1/graph", operation_id="read_graph")
     def read_graph(
-        project: str = "personal",
-        persona: str = "default",
-        collection: str = "default",
-        world: str = "real",
+        project: ScopePart = None,
+        persona: ScopePart = None,
+        collection: ScopePart = None,
+        world: ScopePart = None,
         family_id: str | None = None,
         limit: int = Query(150, ge=1, le=300),
         focus: str | None = None,
@@ -713,7 +739,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     ) -> dict:
         from kin_mind.memory import MemoryContinuity
         from kin_mind.state import Mind
-        scope = Scope(project=project, persona=persona, collection=collection, world=world)
+        scope = scope_of(project, persona, collection, world)
         memory = MemoryContinuity(Mind(engine, scope))
         if not family_id and memory.settings()["graph"]:
             result = memory.graph.read(focus=focus, query=query, since=since, until=until, layer=layer, kind=kind, cursor=cursor, limit=limit, hops=hops)
@@ -727,17 +753,17 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         )
 
     @app.get("/v1/graph/object/{identifier}", operation_id="read_graph_object")
-    def read_graph_object(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real") -> dict:
+    def read_graph_object(identifier: str, project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None) -> dict:
         from kin_mind.memory import MemoryContinuity
         from kin_mind.state import Mind
-        memory = MemoryContinuity(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world)))
+        memory = MemoryContinuity(Mind(engine, scope_of(project, persona, collection, world)))
         return memory.sharing.decorate(memory.graph.detail(identifier))
 
     @app.get("/v1/graph/thread/{identifier}", operation_id="read_event_thread")
-    def read_event_thread(identifier: str, project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", cursor: int = Query(0, ge=0), budget: int = Query(2000, ge=128, le=32000), detail: Literal["index", "summary", "original"] = "summary", expected_revision: int | None = None) -> dict:
+    def read_event_thread(identifier: str, project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None, query: str = "", cursor: int = Query(0, ge=0), budget: int = Query(2000, ge=128, le=32000), detail: Literal["index", "summary", "original"] = "summary", expected_revision: int | None = None) -> dict:
         from kin_mind.context import Contexts
         from kin_mind.state import Mind
-        return Contexts(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).event_thread(identifier, query=query, cursor=cursor, budget=budget, detail=detail, expected_revision=expected_revision)
+        return Contexts(Mind(engine, scope_of(project, persona, collection, world))).event_thread(identifier, query=query, cursor=cursor, budget=budget, detail=detail, expected_revision=expected_revision)
 
     @app.post("/v1/graph/revisions", operation_id="revise_graph")
     def revise_graph(request: GraphCommand) -> dict:
@@ -752,10 +778,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         return ShareLedger(Mind(engine, request.scope)).register(request.request)
 
     @app.get("/v1/conversation/habits", operation_id="read_conversation_habits")
-    def read_conversation_habits(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real") -> dict:
+    def read_conversation_habits(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None) -> dict:
         from kin_mind.habits import ConversationHabits
         from kin_mind.state import Mind
-        return ConversationHabits(Mind(engine, Scope(project=project,persona=persona,collection=collection,world=world))).read()
+        return ConversationHabits(Mind(engine, scope_of(project, persona, collection, world))).read()
 
     @app.post("/v1/conversation/habits", operation_id="update_conversation_habits")
     def update_conversation_habits(request: GraphCommand) -> dict:
@@ -770,10 +796,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         return ConversationHabits(Mind(engine, request.scope)).choose_reply(request.request)
 
     @app.get("/v1/autonomy/plans", operation_id="read_autonomous_plans")
-    def read_autonomous_plans(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", identifier: str | None = None, status: str | None = None, cursor: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=100), history: bool = False) -> dict:
+    def read_autonomous_plans(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None, identifier: str | None = None, status: str | None = None, cursor: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=100), history: bool = False) -> dict:
         from kin_mind.plans import AutonomousPlans
         from kin_mind.state import Mind
-        return AutonomousPlans(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).read(identifier, status=status, cursor=cursor, limit=limit, history=history)
+        return AutonomousPlans(Mind(engine, scope_of(project, persona, collection, world))).read(identifier, status=status, cursor=cursor, limit=limit, history=history)
 
     @app.post("/v1/autonomy/plans", operation_id="manage_autonomous_plan")
     def manage_autonomous_plan(request: GraphCommand) -> dict:
@@ -782,10 +808,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         return AutonomousPlans(Mind(engine, request.scope)).manage(request.request)
 
     @app.get("/v1/autonomy/procedures", operation_id="read_procedure_memory")
-    def read_procedure_memory(project: str = "personal", persona: str = "default", collection: str = "default", world: str = "real", query: str = "", identifier: str | None = None, limit: int = Query(12, ge=1, le=100)) -> dict:
+    def read_procedure_memory(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None, query: str = "", identifier: str | None = None, limit: int = Query(12, ge=1, le=100)) -> dict:
         from kin_mind.procedures import Procedures
         from kin_mind.state import Mind
-        return Procedures(Mind(engine, Scope(project=project, persona=persona, collection=collection, world=world))).read(query, identifier, limit=limit)
+        return Procedures(Mind(engine, scope_of(project, persona, collection, world))).read(query, identifier, limit=limit)
 
     @app.put("/v1/contact/policies", operation_id="configure_contact")
     def configure_contact(request: ContactPolicy) -> dict:

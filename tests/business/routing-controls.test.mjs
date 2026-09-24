@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {MobileRouter} from '../../adapters/mobile-router.mjs';
+import {MobileRouter,HANDOFF_SOURCE_MAX_HOURS} from '../../adapters/mobile-router.mjs';
 import {runtimeReply,displayName} from '../../adapters/mobile-controls.mjs';
 
 const sha=value=>createHash('sha256').update(String(value)).digest('hex');
@@ -100,4 +100,23 @@ test('a failed force leaves no force in progress, so nothing keeps its epoch sup
   assert.equal(router.state.requests['owner-mode:force-now'].state,'failed');
   assert.equal(router.forceInProgress(),false);
   assert.equal(router.state.executionEpoch,0,'the epoch never advanced');
+});
+
+test('a desktop hand-off is authorized by an accepted owner input, read from the live ledger, within a day (H3-20)',async t=>{
+  const f=fixture(t);
+  await f.router.dispatch({id:'owner-asks',kind:'owner',text:'让桌面整理一下报告'},async()=> 'new-turn');
+  const eligible=f.router.handoffSource('owner-asks');
+  assert.equal(eligible.state,'eligible','accepted a moment ago, it is already in the ledger');
+  assert.equal(eligible.maxAgeMs,HANDOFF_SOURCE_MAX_HOURS*3600000);
+  await f.router.dispatch({id:'owner-queued',kind:'owner',text:'还有这个'},async()=>({route:'new-turn',queued:true}));
+  assert.equal(f.router.handoffSource('owner-queued').reason,'source-not-accepted','queued is not yet delivered to Kin');
+  f.router.state.inputs.internal={id:'internal',kind:'work-result',state:'accepted',at:f.clock.now};
+  assert.equal(f.router.handoffSource('internal').reason,'source-not-owner');
+  assert.equal(f.router.handoffSource('never-seen').reason,'source-not-found');
+  f.router.archivedIds.add('long-ago');
+  assert.equal(f.router.handoffSource('long-ago').reason,'source-too-old');
+  f.clock.now+=25*3600000;
+  assert.equal(f.router.handoffSource('owner-asks').reason,'source-too-old');
+  f.router.state.config.handoffSourceMaxHours=48;
+  assert.equal(f.router.handoffSource('owner-asks').state,'eligible','the limit is the configured one');
 });
