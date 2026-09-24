@@ -804,13 +804,21 @@ class MemoryContinuity:
         with self.engine.db.connect() as conn:
             event = conn.execute("SELECT occurred_at FROM mind_events WHERE id=? AND scope=?",
                                  (result.get("event_id"), self.scope.key())).fetchone()
+            # A reflection kept under the earlier wording stays as it was received: its text is
+            # the source's immutable part, so a replay returns it instead of conflicting with it.
+            kept = conn.execute("SELECT * FROM sources WHERE namespace='kin-reflection' AND source_key=? AND scope=?",
+                                (result.get("event_id"), self.scope.key())).fetchone()
         if not event:
             return None
+        if kept:
+            return self.engine._source(kept)
+        # Neutral words for who thought it and whose words it is not: the core names no owner and
+        # no role; `basis: internal_thought` is what tells the two apart (K1-21, K3-03).
         return self.engine.receive(SourceInput(
             namespace="kin-reflection", key=result["event_id"],
             scope=self.scope, occurred_at=event["occurred_at"], authority="model",
-            kind="episode", title="小Kin自己琢磨的：日记与感想",
-            text="小Kin自己琢磨的（日记与感想，不是小光的原话或已确认事实）：\n" + understanding["meaning"],
+            kind="episode", title="Kin 自己的想法：日记与感想",
+            text="Kin 自己的想法（日记与感想，不是主人的原话或已确认事实）：\n" + understanding["meaning"],
             metadata={"role": "assistant", "basis": "internal_thought", "internal": True,
                       "host_event": "diary", "topic": understanding.get("topic"), "appraisal_event_id": result["event_id"],
                       "evidence_ids": understanding.get("evidence_ids", []),
@@ -925,6 +933,10 @@ class MemoryContinuity:
                 share = self._get(conn, proposal.share_id)
                 if share["kind"] != "share" or not self._fresh(conn, share):
                     raise Conflict("Disclosure needs current delivery evidence")
+                # The bound a coverage mapping has: only a share this assessment's own sources
+                # reach may be summarised, so no assessment rewrites an unrelated old share (K3-02).
+                if not any(r["source_id"] in allowed_sources for r in self.mind._evidence(conn, share["source_ids"])):
+                    raise Conflict("Disclosure concerns a share outside the evaluated source set", target=share["id"])
                 for identifier in proposal.about_ids + proposal.previous_share_ids:
                     self._record_ids(conn, identifier)
                 topic_id = self._id("topic", proposal.topic.strip().casefold())

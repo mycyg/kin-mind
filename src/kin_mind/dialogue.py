@@ -34,6 +34,20 @@ def utc_time(value):
     return stamp.astimezone(timezone.utc).isoformat()
 
 
+def contact_timezone(mind):
+    """The owner's timezone as the contact settings hold it, and the host's default without one:
+    the zone the quiet hours and the manifest's day already use (K3-16)."""
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT json_extract(data,'$.profile.contact.timezone') FROM mind_state WHERE scope=?",
+                           (mind.scope.key(),)).fetchone()
+    zone = row[0] if row and isinstance(row[0], str) and row[0] else TIMEZONE
+    try:
+        ZoneInfo(zone)
+    except (ValueError, KeyError):
+        return TIMEZONE
+    return zone
+
+
 def clock_context(now, zone=TIMEZONE):
     stamp = datetime.fromisoformat(utc_time(now))
     return {"current_time": stamp.isoformat(), "local_time": stamp.astimezone(ZoneInfo(zone)).isoformat(),

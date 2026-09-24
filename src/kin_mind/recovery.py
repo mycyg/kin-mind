@@ -140,6 +140,34 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
     return result
 
 
+def resume_compaction_waits(conn, at):
+    """Give back to the queue what history compaction alone set aside (K3-14).
+
+    While `history_compaction_active` is set no revision can be written, so an assessment that
+    reached its commit then was refused there, and the same refusal twice quarantined it; nothing
+    about the assessment was at fault. When the marker is lifted each such row is pending again,
+    judged afresh as after an operator's resume, with the refusal kept in recovery_history. Runs
+    inside the transaction that lifts the marker."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisals'").fetchone():
+        return []
+    from .history import COMPACTING
+    resumed = []
+    for row in conn.execute("SELECT id,attempts,data FROM mind_appraisals WHERE state='needs-repair' "
+                            "AND json_extract(data,'$.error_detail.code')=?", (COMPACTING,)).fetchall():
+        data = json.loads(row["data"])
+        data.setdefault("recovery_history", []).append({
+            "command_id": "history-compaction-finished", "source": "host", "at": at, "attempts": row["attempts"],
+            **{field: data.get(field) for field in ("error", "error_detail", "repair_reason")},
+            **{field: data[field] for field in RETRY_COUNTERS if field in data}})
+        for field in ("error", "error_detail", "repair_reason", "waiting_reason",
+                      "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
+            data.pop(field, None)
+        conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
+                     (time.time(), dumps(data), row["id"]))
+        resumed.append(row["id"])
+    return resumed
+
+
 def recover_quarantined(mind, *, job_ids, command_id, source, retire=False):
     """Resume quarantined appraisals of any lane. Each one is judged afresh.
 

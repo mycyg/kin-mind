@@ -1,7 +1,9 @@
 """Observed use frequency. Retrieval and maintenance cannot heat themselves."""
+import hashlib
 import json
 import math
 from datetime import timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, dumps
@@ -76,10 +78,42 @@ def validate_enable(conn, scope, config, at):
     if len(rows) < 7 or any((timestamp(rows[0][0] + "T00:00:00+08:00") - timestamp(r[0] + "T00:00:00+08:00")).days != i for i, r in enumerate(rows)):
         raise Conflict("Frequency ranking needs seven consecutive actual observation days")
     validation = config.get("reinforcement_validation") or {}
-    if validation.get("weight_version") != VERSION or validation.get("critical_hits") != 21 or validation.get("hit_at_8", 0) < 44 or validation.get("background_heating") != 0 or not validation.get("owner_approved"):
+    if validation.get("weight_version") != VERSION or not validation.get("owner_approved"):
         raise Conflict("Frequency ranking needs current replay and owner approval")
     if not validation.get("evaluated_at") or timestamp(validation["evaluated_at"]) < timestamp(started) + timedelta(days=7):
         raise Conflict("Frequency replay predates its observation window")
+    # The numbers come from the replay's own output and the store, never from a hand-copied
+    # summary: the file named here, unchanged since its digest was recorded (E3-10).
+    replay = replay_result(validation.get("replay_output"), validation.get("replay_sha256"))
+    heated = conn.execute("SELECT COUNT(*) FROM mind_reinforcement WHERE scope=? AND at>=? AND origin NOT IN (%s)"
+                          % ",".join("?" for _ in ORIGINS), (scope, started, *sorted(ORIGINS))).fetchone()[0]
+    if (replay["cases"] < REPLAY_CASES or replay["critical_cases"] != REPLAY_CRITICAL
+            or replay["critical_hits"] != REPLAY_CRITICAL or replay["hit_at_8"] < REPLAY_HITS or heated):
+        raise Conflict("Frequency ranking needs current replay and owner approval")
+
+
+# What the frozen replay must show before frequency may reorder anything: every one of its
+# critical cases found, and 44 of its 48 cases within the first eight.
+REPLAY_CASES, REPLAY_CRITICAL, REPLAY_HITS = 48, 21, 44
+
+
+def replay_result(path, sha256):
+    """The frozen replay's counts, read from the output file it wrote (scripts/lifecycle_replay.py)."""
+    if not path or not sha256:
+        raise Conflict("Frequency ranking needs current replay and owner approval")
+    try:
+        blob = Path(path).read_bytes()
+    except OSError:
+        raise Conflict("Frequency ranking needs current replay and owner approval") from None
+    if hashlib.sha256(blob).hexdigest() != sha256:
+        raise Conflict("Frequency replay output changed since it was recorded")
+    try:
+        outcomes = json.loads(blob)["outcomes"]
+        critical = [o for o in outcomes if o["critical"]]
+        return {"cases": len(outcomes), "hit_at_8": sum(o["hit_at_8"] is True for o in outcomes),
+                "critical_cases": len(critical), "critical_hits": sum(o["hit_at_8"] is True for o in critical)}
+    except (ValueError, KeyError, TypeError):
+        raise Conflict("Frequency ranking needs current replay and owner approval") from None
 
 
 def order(mind, items, *, explicit=False):

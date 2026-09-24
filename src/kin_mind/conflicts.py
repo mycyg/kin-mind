@@ -132,6 +132,7 @@ REGISTRY = {
     "Memory note keys must be unique in an assessment": ("semantic", "duplicate-keys", "block"),
     "Memory and graph keys must be unique in an assessment": ("semantic", "duplicate-keys", "block"),
     "Disclosure needs current delivery evidence": ("runtime", "reference-needs-review", "reuse"),
+    "Disclosure concerns a share outside the evaluated source set": ("semantic", "evidence-out-of-bounds", "block"),
     "Graph reference needs review": ("runtime", "reference-needs-review", "reuse"),
     "Linked source needs review": ("runtime", "reference-needs-review", "reuse"),
     "Cross-scope reference": ("semantic", "reference-cross-scope", "block"),

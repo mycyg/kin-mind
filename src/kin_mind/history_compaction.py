@@ -209,6 +209,10 @@ def _set_marker(db, active):
                          (history.COMPACTION_MARKER,))
         else:
             conn.execute("DELETE FROM meta WHERE key=?", (history.COMPACTION_MARKER,))
+            # What the marker alone refused goes back to its queue with it (K3-14).
+            from eventmem.core.models import now
+            from .recovery import resume_compaction_waits
+            resume_compaction_waits(conn, now())
 
 
 # --- the archive ----------------------------------------------------------------------------------

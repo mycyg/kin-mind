@@ -42,7 +42,7 @@ def persona_prompt(policy):
     if not policy:
         return ""
     # A stable prefix per approved version, never the changing memory snapshot.
-    return ("\n小光确认的人设参考（角色配置，不是观测证据）。保留当前评估/辅助职责及输出结构，不直接对小光说话。引文保持原样，新写的文字遵循当前声口。旧回复和推断画像不能覆盖这份约定。\n"
+    return ("\n主人确认的人设参考（角色配置，不是观测证据）。保留当前评估/辅助职责及输出结构，不直接对主人说话。引文保持原样，新写的文字遵循当前声口。旧回复和推断画像不能覆盖这份约定。\n"
             + policy["core"] + "\n" + policy["voice"] + "\n" + policy["maintenance"])
 
 

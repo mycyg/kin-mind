@@ -75,7 +75,7 @@ def create_mcp(engine):
 
     @server.tool()
     def record_self_claim(scope: Scope, claim: ClaimInput) -> dict:
-        """保存带版本的人格声明或尚未验证的行为假设，并保留 evidence_ids。人格声明需要小光明确来源；假设不会因重复或分数变为已验证。只替换相同 aspect、context、basis 的旧项，带上原 id、revision，使用稳定 command_id。"""
+        """保存带版本的人格声明或尚未验证的行为假设，并保留 evidence_ids。人格声明需要主人明确来源；假设不会因重复或分数变为已验证。只替换相同 aspect、context、basis 的旧项，带上原 id、revision，使用稳定 command_id。"""
         return SelfKnowledge(engine, scope).claim(claim)
 
     @server.tool()
@@ -150,7 +150,7 @@ def create_mcp(engine):
 
     @server.tool()
     def schedule_contact(request: ScheduleInput) -> dict:
-        """安排联系建议，实际发送使用另行配置的小光联系偏好与授权。"""
+        """安排联系建议，实际发送使用另行配置的主人联系偏好与授权。"""
         from .scheduler import Scheduler
 
         return Scheduler(engine).schedule(request)

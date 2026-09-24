@@ -1578,6 +1578,10 @@ class Appraisals:
         if lanes and lane:
             lane_filter = " AND COALESCE(json_extract(data,'$.stimulus'),'') " + ("IN" if lane == "enrichment" else "NOT IN") + " ('memory-backfill','memory-enrichment')"
         with self.engine.db.connect(write=True) as conn:
+            from .history import COMPACTING, compacting
+            if compacting(conn):
+                # Every commit would be refused until compaction ends: claim nothing, pay for nothing (K3-14).
+                return {"state": "paused", "reason": COMPACTING}
             row = conn.execute(
                 "SELECT * FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + (" AND id=?" if job_id else "") + " ORDER BY CASE WHEN json_extract(data,'$.stimulus') IN ('session-maintenance','idle-review','exploration-result') THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time(), *([job_id] if job_id else [])),

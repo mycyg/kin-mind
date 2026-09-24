@@ -75,7 +75,7 @@ def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
         record=json.loads(rows[0][0])
         refs=mind._evidence(conn,[record['id']])
     assert record['confirmation']=='inferred' and record['generated']
-    assert record['content'].startswith('小Kin自己琢磨的')
+    assert record['content'].startswith('Kin 自己的想法')
     assert record['attributes']['basis']=='internal_thought'
     assert not owner_statement(record,sources=refs)
     assert self_statement(record,sources=refs), 'a real reflection can support personality growth as Kin own thought'
