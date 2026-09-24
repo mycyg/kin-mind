@@ -7,7 +7,13 @@
  * @module
  */
 
-import type { FeedBashResult, FeedTodo } from './feed.js'
+/** todo 快照的一条。 */
+export interface FeedTodo {
+  /** 任务文本。 */
+  content: string
+  /** 生命周期状态。 */
+  status: string
+}
 
 /**
  * 收窄成普通对象。
@@ -36,24 +42,6 @@ export function asText(source: Record<string, unknown> | undefined, key: string)
 }
 
 /**
- * 按候选字段名依次尝试取第一个非空字符串。
- *
- * @param source - 对象。
- * @param keys - 候选字段名，按顺序尝试。
- * @returns `[字段名, 取值]`，全部落空时返回 undefined。
- */
-export function firstText(
-  source: Record<string, unknown> | undefined,
-  keys: readonly string[],
-): [string, string] | undefined {
-  for (const key of keys) {
-    const value = asText(source, key)
-    if (value !== undefined) return [key, value]
-  }
-  return undefined
-}
-
-/**
  * 取 todo 快照。
  *
  * @param todos - `todo/write` 事件的 `data.todos` 或 todo 工具的入参。
@@ -74,65 +62,6 @@ export function asTodos(todos: unknown): FeedTodo[] {
 }
 
 /**
- * 从 bash 工具的结构化结果里取退出码与两条流。
- *
- * 形态见 `packages/shell/tool-bash/src/index.ts:158-181`：
- * `{ exitCode, signal, timedOut, aborted, timeoutMs, stdout: { text, truncated }, stderr: {…} }`。
- *
- * @param value - `ToolExecutionSuccess.value`。
- * @returns 规约后的结果；形态不符时返回 undefined。
- */
-export function asBashResult(value: unknown): FeedBashResult | undefined {
-  const source = asObject(value)
-  if (source === undefined) return undefined
-  const stdout = asObject(source['stdout'])
-  const stderr = asObject(source['stderr'])
-  if (stdout === undefined && stderr === undefined) return undefined
-  const exitCode = typeof source['exitCode'] === 'number' ? source['exitCode'] : null
-  return {
-    exitCode,
-    stdout: typeof stdout?.['text'] === 'string' ? stdout['text'] : '',
-    stderr: typeof stderr?.['text'] === 'string' ? stderr['text'] : '',
-    interrupted: source['timedOut'] === true || source['aborted'] === true,
-  }
-}
-
-const ERROR_MARKERS = [
-  'traceback (most recent call last)',
-  'error:',
-  'exception:',
-  'fatal:',
-  'command failed',
-] as const
-
-/**
- * 粗粒度失败迹象判定，口径与 `extract.py` 的 `_looks_like_error` 一致。
- *
- * @param text - 待判定文本。
- * @returns 前 400 字符内命中任一关键词即为真。
- */
-export function looksLikeError(text: string): boolean {
-  const head = text.slice(0, 400).toLowerCase()
-  return ERROR_MARKERS.some(marker => head.includes(marker))
-}
-
-/**
- * 从 bash 结果里取失败信号原文；无失败迹象返回空串。
- *
- * 取值顺序与 `post_tool_use.py` 的 `_bash_error_text` 一致：非空 stderr 最直接，
- * 被中断次之，stdout 命中常见报错关键词兜底。dsh 侧多了 `exitCode`，由调用方先行判定。
- *
- * @param result - 规约后的 bash 结果。
- * @returns 错误原文或空串。
- */
-export function bashErrorText(result: FeedBashResult): string {
-  if (result.stderr.trim().length > 0) return result.stderr
-  if (result.interrupted) return result.stdout.trim().length > 0 ? result.stdout : 'command interrupted'
-  if (looksLikeError(result.stdout)) return result.stdout
-  return ''
-}
-
-/**
  * 把 dsh 的内容块拍平成纯文本，只保留 `type === 'text'` 的块
  * （口径同 `hooks-claude-code/src/index.ts:318-320` 的 `blocksToText`）。
  *
@@ -147,18 +76,4 @@ export function blocksToText(blocks: readonly unknown[]): string {
     if (block['type'] === 'text' && typeof block['text'] === 'string') parts.push(block['text'])
   }
   return parts.join('\n')
-}
-
-/**
- * 把会话 id 规约成安全的文件名片段，口径同 `extract.py` 的 `_safe_name`。
- *
- * TS 侧用它命名 feed 与 seen 文件，并把同一个规约后的值作为 `--session` 传给
- * Python，两侧的水位文件因此落在同一个名字上。
- *
- * @param text - 原始会话 id。
- * @returns 安全文件名片段。
- */
-export function safeName(text: string): string {
-  const replaced = text.replace(/[^A-Za-z0-9._-]+/gu, '_').slice(0, 80)
-  return replaced.length > 0 ? replaced : 'unknown'
 }

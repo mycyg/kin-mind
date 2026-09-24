@@ -1,3 +1,4 @@
+import {holdsSession} from './input-ledger.mjs';
 /** Session health is measured per native window, never by rollout file size or
  * cumulative billing. Compression is the first pressure remedy. */
 export const SESSION_DEFAULTS=Object.freeze({version:'compact-first-v1',observe:true,compact:true,prepare:false,rotate:false,
@@ -33,7 +34,8 @@ export function rotationEligibility(state,advice,now=Date.now()) {
 
 export function safeBoundary({runtime,tasks=[],inputs=[],notices=[],contactRunning=false}) {
   if(!runtime?.known||runtime.active||runtime.nativeStatus!=='idle'||runtime.backgroundTasks||runtime.queued||runtime.pendingDeliveries||runtime.handoffTasks||contactRunning)return {safe:false,reason:'native-or-delivery-busy'};
-  if(inputs.some(i=>['submitting','unconfirmed','selected'].includes(i.state)))return {safe:false,reason:'input-awaiting-dispatch-or-reconciliation'};
+  // The router's ledger is the one definition of an input still in play (AD1-09).
+  if(inputs.some(holdsSession))return {safe:false,reason:'input-awaiting-dispatch-or-reconciliation'};
   if(notices.some(n=>['sending','unconfirmed'].includes(n.state)))return {safe:false,reason:'notification-unconfirmed'};
   if(tasks.some(t=>Object.values(t.tools??{}).some(tool=>!['completed','failed'].includes(tool.status))))return {safe:false,reason:'unfinished-tool'};
   return {safe:true};

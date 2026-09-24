@@ -1,37 +1,34 @@
 /** Completion is tied to the authenticated input, never a model notice or an
  * unrelated/partial outbound bubble. An intentional silence remains distinct.
  * Reply groups are tracked by their own ID beside that: what happens to an
- * older group (canceled, blocked, interrupted, continued, rewritten into the
- * next reply, superseded) stays visible after the owner has moved on to a
+ * older group (canceled, blocked, interrupted, its unsent words withdrawn and
+ * handed to Kin's next turn) stays visible after the owner has moved on to a
  * newer input. Tail facts carry states and IDs only, never message text. */
 const GROUPS_KEPT=32;
-const TAIL_FACTS=['event','decision','carrier','intentId','intentState','newInputId','round','linkedGroup','outcome','resurfaced','forced','reason','attempts'];
+/** H2a-11: only the owner's own messages are waited on; a host handoff never
+ * replaces the input the owner is waiting to hear about. */
+const OWNER_CHANNELS=new Set(['wechat','feishu']);
+const TAIL_FACTS=['event','reason','newInputId'];
 function tailProgress(previous,tail,at) {
  if(!tail||typeof tail!=='object')return previous??null;
- const facts=Object.fromEntries(TAIL_FACTS.filter(key=>tail[key]!==undefined&&tail[key]!==null).map(key=>[key,tail[key]]));
- // What was decided stays readable after later events that do not repeat it (a missed carrier, a settlement).
- const kept=previous&&!facts.decision?{decision:previous.decision,carrier:previous.carrier,intentId:previous.intentId}:{};
- return {...Object.fromEntries(Object.entries(kept).filter(([,value])=>value!==undefined)),...facts,at};
+ return {...Object.fromEntries(TAIL_FACTS.filter(key=>tail[key]!==undefined&&tail[key]!==null).map(key=>[key,tail[key]])),at};
 }
 function groupProgress(previous,event,detail,at) {
  if(!detail.groupId)return null;
  const before=previous.replyGroups?.[detail.groupId],tail=tailProgress(before?.tail,detail.tail,at);
  const groups={...previous.replyGroups,[detail.groupId]:{state:detail.groupState??detail.state,reason:detail.reason??null,inputId:detail.inputId??null,event,at,
-  ...(event==='reply-canceled'&&detail.approvalSource?{approvalSource:detail.approvalSource}:{}),...(tail?{tail}:{})}};
+  ...(tail?{tail}:{})}};
  const ids=Object.keys(groups).sort((a,b)=>groups[a].at.localeCompare(groups[b].at));
  for(const id of ids.slice(0,Math.max(0,ids.length-GROUPS_KEPT)))delete groups[id];
  return {replyGroups:groups};
 }
 export function replyProgress(previous,event,detail={},at=new Date().toISOString()) {
- if(event==='incoming')return {awaitingReplyInputId:detail.inputId??null,replyDisposition:'waiting',replyWaitingReason:null};
+ if(event==='incoming')return detail.channel&&!OWNER_CHANNELS.has(detail.channel)?{}:{awaitingReplyInputId:detail.inputId??null,replyDisposition:'waiting',replyWaitingReason:null};
  if(event==='control-reply')return {lastControlReplyAt:at,lastControlMessageId:detail.messageId};
  const group=groupProgress(previous,event,detail,at);
  // What became of an older group's remainder is a fact about that group. It never answers for the input awaited now.
  if(event==='reply-tail'||detail.tail)return group;
  if(!detail.inputId||detail.inputId!==previous.awaitingReplyInputId)return group;
- if(event==='reply-canceled'&&detail.groupId&&detail.groupState==='retired'&&detail.state==='canceled'&&detail.reason&&detail.approvalSource)
-  return {awaitingReplySince:null,replyDisposition:'canceled',replyWaitingReason:detail.reason,
-  lastResolvedInputId:detail.inputId,lastResolvedAt:at,...group};
  if(event==='share-held'||event==='reply-review'){
   const resolved=['silent','merged'].includes(detail.state);
   const complete=detail.state==='accepted';

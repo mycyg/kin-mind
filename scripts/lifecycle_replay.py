@@ -1,4 +1,8 @@
-"""Run a frozen private recall set against a snapshot, without sending messages."""
+"""Run a frozen private recall set against a snapshot, without sending messages.
+
+--root must be a copy: a root a service holds, or the host's live root, is refused before it is
+opened. What the replay changes (adaptive recall, a replay embedding credential) lives in this
+process only; nothing is written into the settings of the store under --root."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +20,7 @@ from eventmem.core.models import Scope
 from kin_mind.context import Contexts
 from kin_mind.memory import MemoryContinuity
 from kin_mind.state import Mind
+from live_root import refuse_live
 
 
 def evaluate(engine, scope, cases, *, mode="auto", legacy=False, models=False, progress=None):
@@ -92,6 +97,23 @@ def evaluate(engine, scope, cases, *, mode="auto", legacy=False, models=False, p
             "outcomes": outcomes}
 
 
+def replay_settings(engine, *, adaptive_recall, embedding_env=None):
+    """The configuration a replay runs under, applied to this process and never stored."""
+    stored = engine.settings
+
+    def settings(key, value=None):
+        current = stored(key, value)
+        if key == "models" and value is None and embedding_env:
+            current = {**current, "embedding": {**current.get("embedding", {}),
+                                                "local_embedding": False, "api_key_env": embedding_env}}
+        return current
+
+    engine.settings = settings
+    if adaptive_recall:
+        read = MemoryContinuity.settings
+        MemoryContinuity.settings = lambda self, conn=None: read(self, conn) | {"adaptive_recall": True}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
@@ -104,20 +126,18 @@ def main():
     parser.add_argument("--credentials-file", type=Path)
     parser.add_argument("--embedding-token-file", type=Path)
     args = parser.parse_args()
+    root = refuse_live(args.root)
     if args.credentials_file:
         for line in args.credentials_file.read_text().splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 key, value = line.removeprefix("export ").split("=", 1)
                 os.environ.setdefault(key.strip(), value.strip().strip("'\""))
-    engine = Engine(args.root)
+    engine = Engine(root)
     scope = Scope(**json.loads(args.scope))
     if args.embedding_token_file:
         os.environ["KIN_REPLAY_EMBEDDING_TOKEN"] = args.embedding_token_file.read_text().strip()
-        models = engine.settings("models")
-        models["embedding"] = {**models["embedding"], "local_embedding": False, "api_key_env": "KIN_REPLAY_EMBEDDING_TOKEN"}
-        engine.settings("models", models)
-    if not args.legacy:
-        MemoryContinuity(Mind(engine, scope)).configure({"adaptive_recall": True})
+    replay_settings(engine, adaptive_recall=not args.legacy,
+                    embedding_env="KIN_REPLAY_EMBEDDING_TOKEN" if args.embedding_token_file else None)
     frozen = json.loads(args.cases.read_text())
     if not frozen.get("frozen_before_retrieval") or len(frozen["cases"]) < 48:
         raise ValueError("A frozen set of at least 48 independently authored cases is required")

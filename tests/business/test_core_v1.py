@@ -4,42 +4,22 @@ import io
 import json
 import tarfile
 
-import subprocess
-
-import sys
-
-import threading
-
-import time
-
 from concurrent.futures import ThreadPoolExecutor
-
-from datetime import datetime, timedelta, timezone
-
-import httpx
 
 import pytest
 
-from fastapi.testclient import TestClient
-
 from eventmem.core import Engine, RecallRequest, SourceInput
 
-from eventmem.core.api import create_app
-
-from eventmem.core.db import Conflict, Deleted, Missing
+from eventmem.core.db import Conflict
 
 from eventmem.core.jobs import Worker
 
 from eventmem.core.models import (
-    ContactPolicy,
     RecordInput,
     RevisionInput,
-    ScheduleInput,
     Scope,
     now,
 )
-
-from eventmem.core.scheduler import Scheduler
 
 @pytest.fixture
 def engine(tmp_path):

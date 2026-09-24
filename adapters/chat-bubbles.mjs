@@ -1,10 +1,21 @@
+import {fences} from './text-fragments.mjs';
+
+/** Line starts with whether each line lies inside a code fence (CommonMark,
+ * shared with the fragment cutter). A fence's own marker lines count as inside. */
+function fencedLines(text) {
+  const ranges=fences(text),lines=[];let position=0;
+  for(const line of text.split('\n')) {
+    lines.push({line,start:position,fenced:ranges.some(([start,end])=>position>=start&&position<end)});
+    position+=line.length+1;
+  }
+  return lines;
+}
+
 /** Paragraphs are intentional bubbles. Words, fences and URLs are never cut. */
 export function splitChatText(text) {
-  const parts=[]; let block=[],fence=null;
-  for(const line of text.split('\n')) {
-    const marker=line.trimStart().match(/^(`{3,}|~{3,})/);
-    if(marker) {if(!fence)fence=marker[1][0];else if(marker[1][0]===fence)fence=null;}
-    if(!line.trim()&&!fence&&block.length){parts.push(block.join('\n').trim());block=[];}
+  const parts=[]; let block=[];
+  for(const {line,fenced} of fencedLines(text)) {
+    if(!line.trim()&&!fenced&&block.length){parts.push(block.join('\n').trim());block=[];}
     else block.push(line);
   }
   if(block.length)parts.push(block.join('\n').trim());
@@ -12,19 +23,14 @@ export function splitChatText(text) {
 }
 
 // These are wire-envelope openings, not private topic keywords or source IDs.
-export const privateReplyPrefixes = ['kin-context:context:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜'];
+export const privateReplyPrefixes = ['kin-context:context:', 'kin-effect:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜'];
 export function privateReplyBoundary(text) {
-  let offset=0,fence=null;
-  for(const line of text.split('\n')) {
-    const mark=line.trimStart().match(/^(`{3,}|~{3,})/);
-    if(mark){if(!fence)fence=mark[1][0];else if(fence===mark[1][0])fence=null;}
-    else if(!fence&&!line.trimStart().startsWith('>')) {
-      // Quoted code remains a useful explanation, including protocol examples.
-      const visible=line.replace(/(`+)(.*?)\1/g,m=>' '.repeat(m.length));
-      const match=/^\s*kin-context:context:|<\/?[｜]{1,2}DSML[｜]{1,2}/u.exec(visible);
-      if(match)return offset+match.index;
-    }
-    offset+=line.length+1;
+  for(const {line,start,fenced} of fencedLines(text)) {
+    // Quoted code remains a useful explanation, including protocol examples.
+    if(fenced||line.trimStart().startsWith('>'))continue;
+    const visible=line.replace(/(`+)(.*?)\1/g,m=>' '.repeat(m.length));
+    const match=/^\s*(?:kin-context:context:|kin-effect:)|<\/?[｜]{1,2}DSML[｜]{1,2}/u.exec(visible);
+    if(match)return start+match.index;
   }
   return null;
 }
@@ -76,7 +82,11 @@ export function chatEnvelope(text) {
   const boundary=privateReplyBoundary(text);
   if(boundary!==null) {
     const publicText=text.slice(0,boundary).trim();
-    return publicText?{state:'send',bubbles:splitChatText(publicText)}:{state:'invalid',reason:'private-reply-envelope'};
+    if(!publicText)return {state:'invalid',reason:'private-reply-envelope'};
+    // AD2-06: what comes before the boundary is read like any reply: an envelope
+    // there is converted or refused, never sent as its raw JSON.
+    const envelope=chatEnvelope(publicText);
+    return envelope??{state:'send',bubbles:splitChatText(publicText)};
   }
   const trimmed=text.trim();
   if(!trimmed.startsWith('{'))return null;

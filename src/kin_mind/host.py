@@ -145,10 +145,7 @@ def dispatch(config, action, request):
         # The checkpoint carries the user's session across a rotation, so somebody is waiting
         # for it unless the host says this one is maintenance.
         with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
-            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True, native_capacity=request.get("native_capacity") if memory.settings()["native_window_context"] else None)
-    if action == "continuity-manifest":
-        from .continuity_manifest import ContinuityManifest
-        return ContinuityManifest(mind).read(**request)
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
     if action.startswith("context-delivery-"):
         from .context_delivery import ContextDelivery
         deliveries = ContextDelivery(Contexts(mind))

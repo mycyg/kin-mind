@@ -145,12 +145,40 @@ def host_config(tmp_path, mind, **extra):
         **extra,
     }
 
-RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_ENCODING"}
+# Added by the child's own runtime rather than passed to it: the macOS toolchain shim, and
+# Python's C-locale coercion (PEP 538) when LANG is unset.
+RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
 
 ALLOWED_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE",
                "CODEX_HOME", "KIN_TEST_DS_KEY"}
 
 SRC = Path(__file__).resolve().parents[2] / "src"
+
+HOST_SECRETS = {"DEEPSEEK_API_KEY": "host-only", "OPENAI_API_KEY": "host-only",
+                "FEISHU_APP_SECRET": "host-only", "EVENTMEM_API_KEY": "host-only"}
+
+# The hermetic test runner carries its own guard into every child process; that is the runner's
+# doing, not the executor's, and only while the runner is active.
+GUARD_CARRIED = {"KIN_PROTECTED_ROOTS", "KIN_REMAP", "KIN_BLOCK_NETWORK", "KIN_BLOCKED_PORTS",
+                 "KIN_PROTECTED_PIDS", "PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "NODE_OPTIONS"}
+
+def test_the_exploration_child_sees_only_its_allowlisted_environment(tmp_path, monkeypatch):
+    """No channel or model credential of the host reaches the codex child: only the allow-list,
+    its own CODEX_HOME and the one provider key named for the run."""
+    for key, value in {**HOST_SECRETS, "KIN_TEST_DS_KEY": "provider-key"}.items():
+        monkeypatch.setenv(key, value)
+    child = codex_env(tmp_path / "codex-home", env_key="KIN_TEST_DS_KEY")
+    assert set(child) <= ALLOWED_ENV and child["KIN_TEST_DS_KEY"] == "provider-key"
+    assert child["CODEX_HOME"] == str(tmp_path / "codex-home")
+    with pytest.raises(CodexUnavailable):
+        codex_env(tmp_path / "codex-home", env_key="CODEX_HOME")
+    fake = fake_codex(tmp_path / "fake-observe", OBSERVE + COMPLETE)
+    run_codex(fake, TOPIC, tmp_path / "job-observe", **codex_kwargs())
+    observed = json.loads(next((tmp_path / "job-observe").rglob("observed.json")).read_text())
+    carried = GUARD_CARRIED if os.environ.get("KIN_PROTECTED_ROOTS") else set()
+    assert set(observed["env"]) - RUNTIME_ADDED - carried <= ALLOWED_ENV
+    assert not set(observed["env"]) & set(HOST_SECRETS)
+    assert observed["env"]["KIN_TEST_DS_KEY"] == "provider-key"
 
 def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path, monkeypatch):
     """C7-regression: the executor path never touches the shared-session registry."""
@@ -206,7 +234,16 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
     report = run_codex(fake, topic, tmp_path / "job-altered", **codex_kwargs())
     assert report["state"] == "failed" and report["reason"] == "unbacked-citation"
 
+def _codex_blocked_by_guard():
+    """The hermetic runner refuses native binaries under a protected root (~/.codex among them)."""
+    found = __import__("shutil").which("codex")
+    real = os.path.realpath(found) if found else ""
+    roots = [os.path.realpath(r) for r in os.environ.get("KIN_PROTECTED_ROOTS", "").split(":") if r]
+    return any(real == r or real.startswith(r + os.sep) for r in roots)
+
 @pytest.mark.skipif(__import__("shutil").which("codex") is None, reason="codex CLI not installed")
+@pytest.mark.skipif(_codex_blocked_by_guard(), reason="the hermetic guard refuses the installed codex "
+                    "binary under a protected root; run this file outside scripts/test-all.sh")
 def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
     """W1.6 real-tool case, fully isolated: a stub serves the model AND the web
     targets; no external network, no real DS call, no phone path."""
@@ -289,8 +326,8 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
     assert report["evidence_coverage"] == {"mapped_claims": 1, "covered_claims": 1}
     assert any(t.get("type") == "mcp_tool_call" and t.get("server") == "kin_web" for t in report["tool_results"])
     # This test points Codex directly at the stub, so its native MCP namespace
-    # wrapper is expected here.  The production gateway's flattening is covered
-    # independently in deepseek-gateway.test.mjs.  Code mode itself stays off.
+    # wrapper is expected here. Whether the production gateway flattens that
+    # namespace is not covered by this test. Code mode itself stays off.
     assert not any(tool.get("type") == "custom" and tool.get("name") == "exec"
                    for tool in requests[0].get("tools", []))
     # No phone path: the tool surface has no send/message tool.

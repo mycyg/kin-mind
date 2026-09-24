@@ -1,8 +1,8 @@
 import json
 
-import os
-
 from pathlib import Path
+
+import shutil
 
 import socket
 
@@ -50,7 +50,7 @@ def service(tmp_path):
     server.should_exit = True
     thread.join(10)
 
-def test_python_typescript_http_cli_share_contract(service):
+def test_python_http_cli_share_contract(service):
     engine, url = service
     with Client(url, token="test-protocol") as client:
         client.receive_source(
@@ -83,20 +83,28 @@ def test_python_typescript_http_cli_share_contract(service):
             check=True,
         )
         assert json.loads(cli.stdout)["items"] == http["items"]
-        module = Path(__file__).parents[2] / "sdk/typescript/dist/index.js"
-        if module.exists():
-            script = (
-                "import {Client} from "
-                + json.dumps(module.as_uri())
-                + "; const c=new Client(process.argv[1], 'test-protocol'); console.log(JSON.stringify(await c.call('recall',{body:{query:'shared'}})));"
-            )
-            node = subprocess.run(
-                ["node", "--input-type=module", "-e", script, url],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            assert json.loads(node.stdout)["items"] == http["items"]
+
+
+def test_typescript_client_shares_the_contract(service):
+    """The TypeScript SDK sends the same request and reads the same answer. It needs the built
+    SDK: CI's clients job builds it and runs this case; anywhere else it is reported as skipped."""
+    module = Path(__file__).parents[2] / "sdk/typescript/dist/index.js"
+    node = shutil.which("node")
+    if not module.exists() or not node:
+        pytest.skip("needs node and the built SDK: npm ci --prefix sdk/typescript && npm run build --prefix sdk/typescript")
+    engine, url = service
+    with Client(url, token="test-protocol") as client:
+        client.receive_source(SourceInput(namespace="sdk", key="1", text="One shared contract"))
+    http = httpx.post(url + "/v1/recall", json={"query": "shared"},
+                      headers={"Authorization": "Bearer test-protocol"}).json()
+    script = (
+        "import {Client} from "
+        + json.dumps(module.as_uri())
+        + "; const c=new Client(process.argv[1], 'test-protocol'); console.log(JSON.stringify(await c.call('recall',{body:{query:'shared'}})));"
+    )
+    answer = subprocess.run([node, "--input-type=module", "-e", script, url],
+                            capture_output=True, text=True, check=True)
+    assert http["items"] and json.loads(answer.stdout)["items"] == http["items"]
 
 def test_delivery_sdk_effect_is_transactional_and_deduplicated(tmp_path):
     inbox = DeliveryInbox(tmp_path / "inbox.sqlite3")

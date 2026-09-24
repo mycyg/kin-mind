@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS mind_context_compactions(
  PRIMARY KEY(scope,session,epoch));
 """
 BUDGETS = {"startup": 2000, "chat": 800, "proactive": 2500, "work": 4000, "read": 2000}
+# The most one automatic injection adds to a native window, whatever room is left in it:
+# background context and continuity checkpoints alike. Relevance selects within it and
+# the rest stays readable through the paged tools.
+INJECTION_CEILING = 8000
 # What a chat read is shown of a trait's counted facts: how many separate times, how many
 # counterexamples, when it was first and last seen, what is left of the support.
 FACTS = ("episodes", "counter_examples", "first_day", "last_day", "support_strength")
@@ -769,7 +773,10 @@ class Contexts:
             budget = min(budget, max(0, 12000 - window["used"]))
         items = []
         if runtime:
-            items.append({"id": "host-runtime", "revision": digest(runtime), "text": dumps(runtime), "basis": "observed"})
+            # The free room changes with every turn and this round's prompt states it anyway;
+            # as part of the revision it re-sent the same facts each time.
+            items.append({"id": "host-runtime", "revision": digest({k: v for k, v in runtime.items() if k != "contextAvailableTokens"}),
+                          "text": dumps(runtime), "basis": "observed"})
         if intent:
             selected_intent = {k: intent.get(k) for k in ("id", "content", "topic", "kind", "strength", "completion", "status", "concern_ids", "exploration_id")}
             items.append({"id": "current-intent", "revision": digest(selected_intent), "text": dumps(selected_intent), "basis": "inferred"})
@@ -855,7 +862,7 @@ class Contexts:
             # allowance. The native session owns pressure and compaction.
             needed = tokens("\n".join(self._line(item) for item in selected)) + overhead
             available = (runtime or {}).get("contextAvailableTokens")
-            budget = min(needed, max(0, available)) if isinstance(available, int) else needed
+            budget = min(needed, INJECTION_CEILING, max(0, available) if isinstance(available, int) else INJECTION_CEILING)
         remaining = 150 - (time.monotonic() - started)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider,
                            allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining), policy=policy)
