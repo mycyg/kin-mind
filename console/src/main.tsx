@@ -160,6 +160,7 @@ function App() {
     [revisionText, setRevisionText] = useState(""),
     [mobile, setMobile] = useState(false),
     [notice, setNotice] = useState("");
+  const scopeQuery = { ...scope };
   const run = useCallback(async (task: () => Promise<any>) => {
     setBusy(true);
     setError("");
@@ -295,6 +296,9 @@ function App() {
         setSource(null);
         const h = await api.call("read_revisions", { path: { record_id: id } });
         setRevisions(h.items);
+        await api.call("record_feedback", {
+          body: { record_id: id, type: "read", session: "console" },
+        });
       });
     },
     [run],
