@@ -42,6 +42,9 @@ const open=bubble=>!TERMINAL_BUBBLES.includes(bubble.state);
 const legacyRefusal=receipt=>receipt?.state==='blocked'&&receipt.reason==='turn-superseded-before-send'&&receipt.submissionStarted!==true;
 const supersededBeforeSend=receipt=>receipt?.state==='not-submitted'&&receipt.submissionStarted===false&&
   receipt.reason==='turn-superseded-before-send';
+/** CR-LIFE-08: the host's activity gate held this send back because dispatch is
+ * frozen. Nothing left, and nothing failed: the fragment waits, uncounted. */
+export const heldByFreeze=receipt=>receipt?.state==='not-submitted'&&receipt.submissionStarted===false&&receipt.reason==='dispatch-frozen';
 const executionNumber=value=>Number.isSafeInteger(value)&&value>=0;
 const routingBasis=value=>JSON.stringify([
   [Object.hasOwn(value,'taskId'),value.taskId],
@@ -99,14 +102,14 @@ export function tailOpen(manifest) {
 
 /** Kin chose these herself: nothing about them is owed back to her. */
 const OWN_CHOICES=['silent','merged'];
-/** Words older than this are history, not something to hand to the next turn. */
-export const OWED_MAX_AGE_MS=24*3600000;
 /** What of a finished reply group the owner never received, owed to Kin's next
  * owner turn (N4): every withdrawn, refused or undeliverable bubble that she did
  * not withdraw herself and that was not handed to her before. A group whose
- * words could not go out as written (`withheld`) is owed as a fact only. */
+ * words could not go out as written (`withheld`) is owed as a fact only. Age
+ * never ends the obligation: it lasts until a turn carrying it reaches her
+ * (CR-LIFE-14). */
 export function owedRemainder(manifest,now) {
-  if(manifest.kind!=='reply'||OWN_CHOICES.includes(manifest.reason)||!(now-manifest.created_at<=OWED_MAX_AGE_MS))return null;
+  if(manifest.kind!=='reply'||OWN_CHOICES.includes(manifest.reason))return null;
   const handed=new Set(manifest.tail_handed?.items??[]),items=new Set(manifest.tail_owed?.items??[]);
   for(const bubble of manifest.bubbles)
     if(['canceled','rejected','undeliverable'].includes(bubble.state)&&!OWN_CHOICES.includes(bubble.reason)&&bubble.reason!=='empty-body'&&!handed.has(bubble.draft_id??bubble.bubble_id))
@@ -129,9 +132,13 @@ export function manifestSummary(manifest) {
 }
 
 export class TransportManifests {
-  constructor({directory,clock=()=>Date.now(),contracts={},receipt,emit,cancelShare,review,onOutcome=()=>{},role='service',lease={},hooks={},
+  /** `onAnswered({groupId,inputId,state})` hears, once per reply group, that the
+   * input it answers was answered: every bubble accepted (`accepted`), or the group
+   * retired by Kin's own choice (`silent`, `merged`). It is a durable side effect:
+   * tried again by later passes, after a restart too, until it returned. */
+  constructor({directory,clock=()=>Date.now(),contracts={},receipt,emit,cancelShare,review,onOutcome=()=>{},onAnswered=null,role='service',lease={},hooks={},
     sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={}}) {
-    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,role,hooks,sleep});
+    Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,onAnswered,role,hooks,sleep});
     this.lease={...LEASE_DEFAULTS,heartbeat:true,...lease};
     this.retry={baseMs:60000,maxMs:15*60000,maxFailures:6,sideEffectAttempts:5,...retry};
     this.lastSubmitAt=null;this.notified=new Map();
@@ -384,6 +391,8 @@ export class TransportManifests {
       fragment.resentAt=this.clock();this.refresh(manifest);await this.touch(manifest,context);
       let returned=null;
       try{returned=normalizeReceipt(await context.transport.send({...this.delivery(manifest,bubble,fragment),resend:{firstSubmitAt:fragment.firstSubmitAt}}));}catch{/* The receipt decides. */}
+      // Held back by a freeze: the one resend it may have is still to come.
+      if(heldByFreeze(returned)){delete fragment.resentAt;changed=true;continue;}
       const receipt=classifyReceipt(returned)==='accepted'?returned:await context.receipt(fragment.transport_id);
       // Only an acceptance settles a resend: a refusal of a duplicate says nothing about the first attempt.
       if(classifyReceipt(receipt)==='accepted')Object.assign(fragment,{state:'accepted',receipt});
@@ -450,13 +459,19 @@ export class TransportManifests {
       if(kind==='absent'||kind==='never-started') {
         const gap=contract.maxSendsPerSecond?Math.ceil(1000/contract.maxSendsPerSecond):0,wait=this.lastSubmitAt===null?0:this.lastSubmitAt+gap-this.clock();
         if(wait>0)await this.sleep(wait);
-        const now=this.lastSubmitAt=this.clock();
+        const now=this.lastSubmitAt=this.clock(),before={firstSubmitAt:fragment.firstSubmitAt,attempts:fragment.attempts};
         Object.assign(fragment,{state:'submitting',firstSubmitAt:fragment.firstSubmitAt??now,attempts:(fragment.attempts??0)+1});
         Object.assign(manifest,{state:'sending',reason:null,retryAt:0});this.refresh(manifest);
         await this.touch(manifest,context);          // refused ⇒ nothing is sent
         let returned=null,refused=false;
         try{returned=normalizeReceipt(await context.transport.send(this.delivery(manifest,bubble,fragment)));}
         catch(error){refused=RECONCILE_FIRST_CODES.includes(error?.code);/* Otherwise the durable receipt decides. */}
+        // CR-LIFE-08: dispatch is frozen and the gate let nothing out. The fragment is as it
+        // was before this attempt, no failure is counted, and the group looks again later.
+        if(heldByFreeze(returned)) {
+          Object.assign(fragment,{state:'unsent',...before});if(before.firstSubmitAt===undefined)delete fragment.firstSubmitAt;if(before.attempts===undefined)delete fragment.attempts;
+          manifest.retryAt=this.clock()+this.retry.baseMs;this.refresh(manifest);await this.touch(manifest,context);return 'stop';
+        }
         await this.hooks.afterSend?.({manifest,bubble,fragment,receipt:returned});
         receipt=returned??await context.receipt(fragment.transport_id);kind=classifyReceipt(receipt);
         // The transport holds a receipt this layer cannot see: never mistake that for "nothing was sent".
@@ -538,12 +553,27 @@ export class TransportManifests {
         }
       } catch{bubble.side_effect_failures=tries+1;context.failedEffects.add(bubble.bubble_id);changed=true;}
     }
+    // CR-LIFE-13: the input this group answers is told once the group ended answered,
+    // after its bubbles were reported; a failure is tried again by a later pass.
+    const answer=this.answerDue(manifest);
+    if(answer&&!context.failedEffects.has(manifest.group_id)) {
+      try{await this.onAnswered(answer);manifest.answered={state:answer.state,at:this.clock()};}
+      catch{manifest.answer_failures=(manifest.answer_failures??0)+1;context.failedEffects.add(manifest.group_id);}
+      changed=true;
+    }
     // A side effect done (or tried) is work: the resume loop counts it against its limit.
     if(changed){context.worked=true;await this.save(manifest,context.lease);}
   }
-  /** Bubble-level side effects that are still due and still worth trying. */
+  /** The answer event a reply group still owes its input, if any (CR-LIFE-13). */
+  answerDue(manifest) {
+    if(!this.onAnswered||manifest.answered||manifest.kind!=='reply'||!manifest.reply_id||(manifest.answer_failures??0)>=this.retry.sideEffectAttempts)return null;
+    const state=manifest.state==='accepted'?'accepted':manifest.state==='retired'&&OWN_CHOICES.includes(manifest.reason)?manifest.reason:null;
+    if(!state)return null;
+    return {groupId:manifest.group_id,inputId:manifest.reply_id,state,...(state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
+  }
+  /** Side effects that are still due and still worth trying: each bubble's, and the group's answer. */
   owes(manifest) {
-    return manifest.bubbles.some(b=>{const kind=EVENT_FOR[b.state];
+    return Boolean(this.answerDue(manifest))||manifest.bubbles.some(b=>{const kind=EVENT_FOR[b.state];
       return kind&&(b.side_effect_failures??0)<this.retry.sideEffectAttempts&&((this.emit&&!b.emitted?.[kind])||(kind==='canceled'&&this.cancelShare&&b.draft_id&&!b.share_canceled));});
   }
   /** Nothing more will happen to a settled terminal group: move it out of the live set. */
