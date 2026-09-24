@@ -1,39 +1,64 @@
 # Mobile companion instructions and runtime upgrades
 
-The mobile main session can load a private companion base through Codex's
-`model_instructions_file`. The existing persona remains in `developer_instructions`.
-Both texts stay private. Exploration and creation executors retain their own
-contracts. Role instructions do not establish model identity, permissions or delivery.
+The private host loads a companion base through `model_instructions_file` and
+generates `developer_instructions` from the approved persona and speaking style.
+The private text and shared experiences are not part of this public repository.
+Kin has her own interests and feelings; she may disagree, defer, do less or
+decline work based on her actual mood and reasons, without a fixed score cutoff.
+A decline settles through the existing task and delivery records, never as a
+claim that unfinished work was completed.
 
-`adapters/mobile-runtime-bundle.mjs` implements `prepare`, `verify`, `activate`,
-`status`, `resolve` and `rollback`. Preparation copies the actual CLI and explicit
-ACP dependency closure into a versioned mobile directory. The host-owned adapter
-is separate from the pristine vendor package; desktop installations are untouched.
+## Instructions in the native session
 
-Verification runs the retained native CLI and ACP against a local synthetic
-provider, capturing native RPC and HTTP. It covers new and existing sessions,
-maintenance promotion, compaction recovery, restart and model/effort/Fast round
-trips. It proves instruction transport and compatibility, not real model answer
-quality, upstream service tier or operating-system isolation. Caller-authored
-observations are not accepted as native evidence.
+The host does not copy the full desktop AGENTS file. Mobile configuration sets
+`include_collaboration_mode_instructions=false` and `project_doc_max_bytes=0`
+to avoid repeating general collaboration or project instructions. Project rules
+and operational guides are read when needed. Native tools, skills and actual
+permissions still come from the CLI.
 
-Activation requires a verified main-session candidate and atomically records
-current and previous versions. Repeated activation is idempotent. Damaged files
-fail closed instead of selecting the global CLI. A failed future candidate leaves
-the active version running. The first migration separately retains its pre-bundle
-runtime and host rollback procedure. Rollback preserves new chats and receipts.
+The existing `compact_prompt` retains the current topic, relationship context,
+Kin's own interests and decisions, corrections, agreements and open tasks. The
+mobile model catalog uses standard Responses (`use_responses_lite=false`) for
+instruction transport. Complete model choices, reasoning settings and Fast
+preference are retained; an actual service tier needs a native or provider
+receipt. Exploration and creation executors retain their own contracts.
 
-Declared configuration, prepared files, native loading and verified requests are
-distinct. Codex 0.155 can return empty `instructionSources` despite correct request
-content. It trims base-file whitespace and places the base in `instructions` or a
-developer message depending on the model. The runner checks observed forms without
-inventing metadata. A private gateway observer can verify production adoption only
-for a completed request with matching native headers, metadata, current host session
-and base/developer pair. Drafts and failed or unbound requests remain unverified.
+## Candidate verification and activation
 
-File digests protect release and instruction boundaries. Ordinary state uses
-versions and transactions; a digest is not a semantic decision or delivery receipt.
-Complete changes first, then run affected checks without repeating unchanged matrices.
+Public `adapters/mobile-runtime-bundle.mjs` provides versioned preparation,
+verification, activation, status, resolution and rollback. It retains the
+actual CLI and explicit ACP dependencies, keeping the host-owned adapter
+separate from the original vendor package. The private host owns persona
+projection, candidate discovery and maintenance scheduling. Installing this
+library does not attach a mobile session or install every new CLI release.
 
+During its existing daily maintenance cycle, the private host checks the
+locally installed stable Codex version. It prepares a candidate when the
+installed version or relevant adapter source changes and does not repeatedly
+test an unchanged failed candidate. The public proof runner connects the
+candidate CLI and ACP to a local synthetic provider, capturing native RPC and
+HTTP. It checks instruction loading, new and resumed sessions, maintenance
+continuation, compaction recovery, restart, model and Fast-preference changes,
+and a local tool call. These checks establish protocol compatibility and
+instruction transport; real model behavior is evaluated separately.
 
-The owned ACP adapter now reapplies stable developer instructions on every ordinary native turn as well as profile changes. `_kin/last-reply` returns the complete final and original input text so internal assessment completion can bind the native turn to its existing attempt identifier. This does not add a second receipt ledger.
+Only a verified candidate is activated after the existing coordinator becomes
+idle. The session, messages, tasks, history, full model profile and delivery
+receipts remain intact. A failed candidate leaves the previous version in use;
+the same failure is recorded rather than fixed by an automatic patch. Current
+and previous bundles share one atomic index. The first migration also retains
+its pre-bundle rollback path, and rollback preserves later chats and receipts.
+Damaged bundle files do not silently select the global CLI or change desktop
+installations.
+
+## Evidence
+
+Declared configuration, prepared files, native loading and verified requests
+are distinct facts. Native `instructionSources` can be empty despite correct
+request content, and native loading may normalize trailing whitespace; proof
+checks the captured request rather than inventing metadata. A file digest
+protects release bytes, not a semantic decision or delivery receipt. The owned
+ACP adapter reapplies stable developer instructions on ordinary turns and
+profile changes. `_kin/last-reply` exposes the complete final and original
+input text for binding an internal assessment to its native turn without a
+second receipt ledger.
