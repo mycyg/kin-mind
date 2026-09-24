@@ -2,11 +2,13 @@
 
 ## Qwen3-Embedding-0.6B
 
-Install the optional local inference dependencies in the same Python environment as the memory service:
+Install the optional local inference dependencies in the same Python environment as the memory service. Production installs this combination, and `python -I scripts/python_env.py` checks an interpreter against it by default:
 
 ```sh
-uv sync --frozen --extra all --extra dev --extra local-embedding
+uv sync --frozen --extra vector --extra graph --extra local-embedding
 ```
+
+`local-embedding` cannot be installed with `media` or `all`: `uv.lock` declares them in conflict because docling, which `media` brings in, locks a typer older than the one `local-embedding` requires. `--extra dev` can be added for the tests.
 
 Add this role to the existing model configuration. Preserve other roles when writing `/v1/settings/models`, because that endpoint replaces the configuration map.
 
