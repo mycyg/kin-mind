@@ -291,9 +291,12 @@ export class MobileRouter {
     return moved;
   }
   /** With no revision left to restore, the append-only journal still names every
-   * input this router accepted. They come back unconfirmed, so a replayed input is
-   * refused until it is reconciled instead of being submitted a second time — and
-   * the restart profile waits rather than switching the provider under lost work. */
+   * input this router took, by id and nothing more. They come back `unconfirmed` and
+   * `recovered`: a replay is refused until the watchdog has looked the id up in the
+   * native session. Found, the input stands as accepted and a replay is a duplicate;
+   * proven never received, it is known by its id alone, and a replay under that id is
+   * routed afresh (WS8 #3). Like any unconfirmed input they never hold the restart
+   * profile (AD1-10). */
   restoreLedger() {
     let ids=[];
     try {
@@ -439,7 +442,9 @@ export class MobileRouter {
         toolsRunning:Object.values(task.tools??{}).filter(tool=>!terminalTool(tool)).length,
         unsentDrafts:deliveries.filter(([,d])=>['deferred','not-submitted'].includes(d.state)&&!d.fulfilledBy).map(([id])=>id).slice(0,16),
         unknownDeliveries:deliveries.filter(([,d])=>['unconfirmed','unknown'].includes(d.state)).map(([id])=>id).slice(0,16),
-        ...(task.workSummary?{workSummary:clone(task.workSummary)}:{}),...(task.deferral?{deferral:clone(task.deferral)}:{})};
+        ...(task.workSummary?{workSummary:clone(task.workSummary)}:{}),...(task.deferral?{deferral:clone(task.deferral)}:{}),
+        // Her handoff that has not reached the session yet, or failed to, is a fact for her too (WS8 #2).
+        ...(task.handoff&&task.handoff.state!=='accepted'?{handoff:{state:task.handoff.state,...(task.handoff.reason?{reason:task.handoff.reason}:{})}}:{})};
     });
   }
   async availableModels(runtime=null) {
@@ -586,7 +591,8 @@ export class MobileRouter {
       if(!previous&&this.archivedIds.has(input.id))return {record:{id:input.id,state:'accepted',archived:true}};
       if(previous) {
         if(previous.recovered)throw Error('Input acceptance requires reconciliation');
-        if(previous.hash!==hash)throw Error('Input id reused with different content');
+        // A record restored from the journal kept the id and not the content: there is nothing to compare.
+        if(!(previous.restored&&!previous.hash)&&previous.hash!==hash)throw Error('Input id reused with different content');
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
         // What predates the ledger keeps its reason and id and is never re-run.
         if(previous.historical)throw Object.assign(Error('Historical input is not re-run: '+previous.historical.reason),{code:'input-historical'});
@@ -1984,7 +1990,14 @@ export class MobileRouter {
       // At most one notice starts a send in a pass, and only past the gap since the last one that did.
       let starting=this.frozen()||now-(this.state.lastOwnerNoticeAt??-Infinity)<gapMs;
       for(const record of Object.values(this.state.inputs)) {
-        if(!ownerInput(record)||record.historical||this.inflight.has(record.id))continue;
+        if(record.historical||this.inflight.has(record.id))continue;
+        // An internal input whose submission is unknown (a handoff's continuation, the mind's
+        // turns) is looked up by its id like the owner's, and nobody is told (WS8 #2).
+        if(!ownerInput(record)) {
+          const reconciliation=record.reconciliation;
+          if(['unconfirmed','fenced-unconfirmed'].includes(record.state)&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
+          continue;
+        }
         const summary=inputSummary(record),notice=record.ownerNotice;
         if(['answered','superseded','canceled-by-owner','failed-notified'].includes(summary))continue;
         // A failed owner control is reported by its own mode notice.
@@ -2053,6 +2066,8 @@ export class MobileRouter {
           const record=this.state.inputs[action.id];if(!record||!['unconfirmed','fenced-unconfirmed'].includes(record.state))return;
           const state=['found','not-found'].includes(result?.state)?result.state:'unknown';
           record.reconciliation={state,at:this.now()};
+          // A record restored from the journal is settled by its lookup like any other (WS8 #3).
+          if(state!=='unknown'&&record.recovered){delete record.recovered;record.restored='journal';}
           if(state==='found'){record.state='accepted';record.acceptedAt??=this.now();}
           else if(state==='not-found') {
             // The submission it looked for is kept as history; proven not received, it no
@@ -2120,8 +2135,10 @@ export class MobileRouter {
     return changed;
   }
 }
-/** CR-LIFE-02: a record the host made on intake, before anything routed it. */
-function intakeOnly(record){return Boolean(record?.intake&&!record.route&&['preparing','failed-before-submit'].includes(record.state));}
+/** A record that names an input and nothing more, never routed: made by the host on intake
+ * (CR-LIFE-02), or restored from the journal and proven never received (WS8 #3). A replay
+ * routes it afresh and keeps the retries it already used. */
+function intakeOnly(record){return Boolean((record?.intake||record?.restored)&&!record.route&&['preparing','failed-before-submit'].includes(record.state));}
 /** A task keeps a bounded history of replaced and late entries (AD1-08). */
 function trim(task,key,limit=64) {
   const entries=Object.entries(task[key]??{});
