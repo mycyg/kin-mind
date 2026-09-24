@@ -99,12 +99,13 @@ class Providers:
         if local:
             if role != "embedding" or route != "embeddings":
                 raise ValueError("Local wake-up is only available for embeddings")
-            from .local_embedding import ensure_started
+            from .local_embedding import check_endpoint, check_preprocessing, ensure_started, token
 
-            headers = {
-                "Authorization": "Bearer "
-                + ensure_started(self.engine.db.root, config.endpoint, config.model)
-            }
+            # The credential is read from its file and the service is started only when a
+            # request could not connect: no lock, health call or new client per embedding (E2-13).
+            check_endpoint(config.endpoint, config.model)
+            check_preprocessing(config.preprocessing)
+            headers = {"Authorization": "Bearer " + token(self.engine.db.root)}
         from contextlib import nullcontext
 
         from kin_mind.attempts import cost_entry, token_counts
@@ -115,9 +116,11 @@ class Providers:
 
         def unknown_usage(outcome):
             """A request that produced no usable reply still made a call: it is recorded
-            as unknown rather than silently left out of the accounts or counted as zero."""
-            self.engine.db.metric("model_usage_unknown", 1, {"role": role, "model": config.model,
-                                                             "outcome": outcome, "usage_status": "unknown"})
+            as unknown rather than silently left out of the accounts or counted as zero.
+            A local embedding has no bill, so only its time is kept (DB1-11)."""
+            if not local:
+                self.engine.db.metric("model_usage_unknown", 1, {"role": role, "model": config.model,
+                                                                 "outcome": outcome, "usage_status": "unknown"})
             self.engine.db.metric("model_ms", (time.perf_counter() - start) * 1000, {"role": role})
         for attempt in range(2 if local else 1):
             try:
@@ -136,6 +139,10 @@ class Providers:
                     )
                 if response.status_code >= 400:
                     if local and attempt == 0 and response.status_code == 503:
+                        continue
+                    if local and attempt == 0 and response.status_code == 401:
+                        # The credential file changed since it was read: read it again, once.
+                        headers = {"Authorization": "Bearer " + token(self.engine.db.root)}
                         continue
                     unknown_usage("http-" + str(response.status_code))
                     raise ProviderError(

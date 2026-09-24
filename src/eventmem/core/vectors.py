@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 import threading
 
+from datetime import timedelta
+
 from .db import Missing, digest, dumps
 from .models import now
+
+# How long superseded versions of a vector table are kept after the daily compaction: long
+# enough for any search that opened one to have finished, short enough that the manifests,
+# one per write, never pile up (DB1-02).
+OPTIMIZE_KEEP = timedelta(hours=1)
 
 _locks: dict[str, threading.RLock] = {}
 _guard = threading.Lock()
@@ -154,3 +161,33 @@ class VectorIndex:
                 table.optimize(
                     cleanup_older_than=timedelta(seconds=0), delete_unverified=False
                 )
+
+
+def optimize_all(engine, *, keep=None):
+    """Compact every vector table and drop its versions older than `keep` (OPTIMIZE_KEEP when
+    left out). No row of the current data goes: the count before and after is part of the
+    answer, and a change is an error. The stored index state is brought up to date with what
+    the table holds (DB1-02)."""
+    keep = OPTIMIZE_KEEP if keep is None else keep
+    with engine.db.connect() as conn:
+        indexes = [row[0] for row in conn.execute("SELECT id FROM vector_indexes ORDER BY id")]
+    report = []
+    for index_id in indexes:
+        index = VectorIndex(engine, index_id)
+        with index.lock:
+            table = index.table()
+            versions, rows = len(table.list_versions()), table.count_rows()
+            table.optimize(cleanup_older_than=keep, delete_unverified=False)
+            after_versions, after_rows = len(table.list_versions()), table.count_rows()
+            if after_rows != rows:
+                raise RuntimeError("Vector compaction changed the row count")
+            try:
+                ann = bool(table.list_indices())
+            except Exception:  # noqa: BLE001 - the listing is informative only
+                ann = None
+            index.config.update(rows=after_rows, optimized_at=now(), ann_index=ann)
+            with engine.db.connect(write=True) as conn:
+                conn.execute("UPDATE vector_indexes SET data=? WHERE id=?", (dumps(index.config), index_id))
+        report.append({"index": index_id, "versions_before": versions, "versions_after": after_versions,
+                       "rows_before": rows, "rows_after": after_rows})
+    return report

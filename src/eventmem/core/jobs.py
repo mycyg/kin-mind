@@ -31,7 +31,7 @@ UNSENT_ERRORS = frozenset({"FileNotFoundError", "ConnectError", "ConnectTimeout"
 # Kinds that never call a paid model. They are also the only ones a worker takes while the
 # foreground holds its lease, because a paid background call would only be refused then.
 MODEL_FREE_KINDS = ("embed", "visual_embed", "parse", "media_complete", "extract_complete",
-                    "build_vectors", "purge_vectors", "rebuild", "erase_history")
+                    "build_vectors", "purge_vectors", "rebuild", "erase_history", "vector_optimize")
 # How long a kind whose environment just failed is left alone, and the longest wait between
 # retries of one job.
 ENVIRONMENT_PAUSE = 60
@@ -78,6 +78,8 @@ def purge_text_indexes(conn):
 
 # Records whose text index entry one rebuild step rewrites.
 REBUILD_BATCH = 500
+# The vector store is compacted once a day, when the store is quiet, at the end of the queue.
+VECTOR_OPTIMIZE_PRIORITY = 250
 
 
 def rebuild_step(engine, job, payload):
@@ -754,6 +756,26 @@ class Worker:
             if kind == "purge_vectors":
                 return purge_text_indexes
             return lambda conn: None
+        if kind == "vector_optimize":
+            # Only while nothing else is running and nobody is being answered: a quiet store
+            # is the condition this runs under, and waiting for it costs the job nothing.
+            with engine.db.connect() as conn:
+                busy = conn.execute("SELECT 1 FROM jobs WHERE state='running' AND id!=? AND lease_until>? LIMIT 1",
+                                    (job["id"], time.time())).fetchone()
+                foreground = conn.execute("SELECT 1 FROM mind_foreground_leases WHERE expires_at>? LIMIT 1",
+                                          (time.time(),)).fetchone()
+            if busy or foreground or engine.interactive_until > time.monotonic():
+                raise Wait("store-not-quiet")
+            from .vectors import optimize_all
+
+            report = optimize_all(engine)
+
+            def apply(conn):
+                self.engine_metric(conn, "vector_optimized", {
+                    "indexes": len(report), "versions_removed": sum(r["versions_before"] - r["versions_after"] for r in report),
+                    "rows_unchanged": all(r["rows_before"] == r["rows_after"] for r in report)})
+
+            return apply
         if kind == "erase_history":
             # What an explicit delete took out of the records, taken out of every revision of
             # the mind's state as well, a batch at a time; see kin_mind.erasure.
@@ -840,9 +862,10 @@ class Worker:
             ).fetchall()
             for scope, count, _ in scopes:
                 if count >= max(2, config.get("organize_batch", 20)):
+                    # The payload's scope is stored with sorted keys and is compared in that form.
                     active = conn.execute(
                         "SELECT 1 FROM jobs WHERE kind='organize' AND state IN ('pending','running','retry','waiting_config') AND json_extract(payload,'$.scope')=json(?) LIMIT 1",
-                        (scope,),
+                        (dumps(json.loads(scope)),),
                     ).fetchone()
                     if not active:
                         versions = conn.execute("SELECT d.record_id,d.revision FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND r.deleted=0 AND r.status='active' AND d.revision=r.revision ORDER BY d.record_id", (scope,)).fetchall()
@@ -865,6 +888,13 @@ class Worker:
                         f"auto-diary:{digest(scope)}:{date}",
                         conn=conn,
                     )
+            # Once a day the vector store is compacted and its old versions dropped: it keeps a
+            # manifest per write, and without this the manifests grow with the square of the
+            # rows (DB1-02, K4-22). The job waits for a quiet store.
+            if conn.execute("SELECT 1 FROM vector_indexes LIMIT 1").fetchone():
+                day = datetime.now(timezone.utc).date().isoformat()
+                self.engine.enqueue("vector_optimize", {"day": day}, f"vector-optimize:{day}",
+                                    conn=conn, priority=VECTOR_OPTIMIZE_PRIORITY)
         # An isolation migration that stopped on a refusal keeps every read strict until it is
         # finished; it is finished here rather than whenever somebody notices (K4-14).
         from kin_mind.isolation_migration import resume_stalled

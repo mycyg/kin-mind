@@ -27,6 +27,7 @@ from .models import (
     ScheduleInput,
     Scope,
     SourceInput,
+    now,
 )
 from .organize import Organizer
 from .responses import ContextRecallResult, RecallResult, RecordResult, SourceResult
@@ -225,6 +226,11 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         raise RuntimeError("MemoryPalace needs a non-empty local credential")
     expected = auth_token.encode()
     worker = Worker(engine)
+    from .integrity import loaded_revision
+
+    # What this process is running, fixed at start: a health check compares it with the revision
+    # the deployment names, and a service that outlived a deployment shows it (H3-05, E2-14).
+    source = {"root": str(Path(__file__).resolve().parents[2]), "revision": loaded_revision(), "started_at": now()}
     mcp_server = None
     if mcp_enabled:
         from .mcp import create_mcp
@@ -317,7 +323,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         """Ready means the background loop is going round as well: reminders, extraction,
         organising and host replay all run on it, so a service whose loop has stopped is not
         healthy however well it answers (E2-02, H3-09)."""
-        answer = {"status": "ready", "version": "1.0.0", "schema": 1}
+        answer = {"status": "ready", "version": "1.0.0", "schema": 1, "source": source}
         if not workers:
             return answer | {"worker": {"enabled": False}}
         thread = app.state.worker_thread
