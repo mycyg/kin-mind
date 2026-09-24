@@ -7,7 +7,8 @@ names no owner and no role, and one kept under the old wording is returned as it
 Nothing is claimed or paid for while history compaction holds the store, and what compaction alone
 set aside goes back to the queue with the marker (K3-14). Frequency ranking is gated on the
 replay's own output file (E3-10). A cached judgment is written in one transaction and keeps the
-validity it was given (K3-17). A context delivery from an earlier window ends (DB1-12)."""
+validity it was given (K3-17). A context delivery from an earlier window ends (DB1-12). Settings
+nothing reads any more are ignored where a stored configuration or a caller still has them."""
 import hashlib
 import json
 import sqlite3
@@ -263,3 +264,21 @@ def test_a_delivery_that_can_no_longer_arrive_ends(world):
             "SELECT id,state,data FROM mind_context_deliveries")}
     assert rows[old["id"]] == ("stale", "window-moved") and rows[abandoned["id"]] == ("stale", "window-moved")
     assert rows[first["id"]] == ("stale", "never-begun")
+
+
+def test_retired_settings_in_a_stored_configuration_are_ignored_not_refused(world):
+    engine, mind, memory = world
+    retired = {"chunked_reply_review": False, "rest_review_window": True, "review_rest_max_minutes": 480}
+    with engine.db.connect(write=True) as conn:
+        # What an earlier release wrote, and a host's configuration may still send.
+        conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)",
+                     (SCOPE.key(), dumps({**memory.settings(), **retired})))
+    settings = memory.settings()
+    assert not set(retired) & set(settings)
+    config = memory.configure({"records": True, **retired})
+    assert config["records"] is True and not set(retired) & set(config)
+    with engine.db.connect() as conn:
+        stored = json.loads(conn.execute("SELECT data FROM mind_memory_config WHERE scope=?", (SCOPE.key(),)).fetchone()[0])
+    assert not set(retired) & set(stored)
+    with pytest.raises(ValueError):
+        memory.configure({"not_a_setting": True})
