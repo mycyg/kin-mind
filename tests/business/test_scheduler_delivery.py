@@ -1,7 +1,10 @@
 """Reminder delivery when the host refuses for a while or restarts (T-11: E2-01, E3-12), what the
 task list says about each delivery (E3-13, CR-MEM-04), a schedule whose policy is gone (E2-02),
 and the deadline of each occurrence, its due time plus 30 minutes, checked before every dispatch
-(CR-MEM-10)."""
+(CR-MEM-10) and handed to the host, signed, as the very moment the dispatcher judges by
+(CR2-INT-07)."""
+import hashlib
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +14,7 @@ import pytest
 from eventmem.core import Engine
 from eventmem.core.contact_tasks import ContactTasks
 from eventmem.core.models import ContactPolicy, ScheduleInput, Scope, SourceInput
-from eventmem.core.scheduler import DELIVERY_WINDOW, MAX_ATTEMPTS, Scheduler
+from eventmem.core.scheduler import DELIVERY_WINDOW, MAX_ATTEMPTS, Scheduler, window_open
 
 SCOPE = Scope(persona="synthetic-reminders")
 START = datetime(2026, 9, 23, 1, tzinfo=timezone.utc)
@@ -203,3 +206,48 @@ def test_an_older_rows_unknown_outcome_is_not_reported_as_never_sent(world):
     delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
     assert delivery["state"] == "uncertain" and not delivery["never_sent"]
     assert delivery["meaning"] == "可能已经发出，结果未知；再次发送前需要核对"
+
+
+def test_the_host_is_handed_the_deadline_the_dispatcher_judges_by_under_the_signature(world, monkeypatch):
+    """The host answers 202 and sends later, from its own queue: the deadline goes with the body,
+    signed, as the same moment the dispatcher stops at, so a host held by a release freeze does not
+    send it after the occurrence has ended (CR2-INT-07)."""
+    engine, clock, scheduler, run = world
+    monkeypatch.setenv("EVENTMEM_WEBHOOK_SECRET", "synthetic-secret")
+    sent = []
+
+    class Recording(Channel):
+        def __call__(self, url, body, headers):
+            sent.append((body, dict(headers)))
+            return super().__call__(url, body, headers)
+
+    found, sid = scheduler(Recording(409, then=202))  # refused once, then taken into the host's queue
+    run(found, 180, step=60)
+    assert len(sent) == 2
+    expected = (START + timedelta(seconds=DELIVERY_WINDOW)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    assert expected == "2026-09-23T01:30:00.000Z"
+    bodies = [json.loads(body) for body, _ in sent]
+    assert all(body["deadlineAt"] == expected for body in bodies)
+    # The retry repeats the very bytes, and the signature covers the whole body, deadline included.
+    assert sent[0][0] == sent[1][0]
+    for body, headers in sent:
+        assert headers["X-MemoryPalace-Signature"] == hmac.new(b"synthetic-secret", body, hashlib.sha256).hexdigest()
+    # One moment, not two: the dispatcher's own check closes exactly at the deadline it handed over.
+    row = outbox(engine, sid)[0]
+    moment = datetime.fromisoformat(expected).timestamp()
+    assert window_open(row["data"], moment - 0.001, 1) and not window_open(row["data"], moment, 1)
+    # And a 2xx reads as what it is: handed to the host, not delivered.
+    assert row["state"] == "sent"
+    delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
+    assert delivery["meaning"] == "已交给宿主，尚未确认送达" and "已送达" not in delivery["meaning"]
+
+
+def test_a_deadline_is_the_due_time_plus_the_window_in_utc_to_the_millisecond():
+    from eventmem.core.scheduler import deadline, deadline_at
+
+    local = {"due_at": "2026-09-23T09:15:30.123456+08:00"}
+    assert deadline_at(local) == "2026-09-23T01:45:30.123Z"
+    assert deadline(local) == datetime(2026, 9, 23, 1, 45, 30, 123000, tzinfo=timezone.utc).timestamp()
+    # A row an older build queued names no due time: its creation stands in, as for the check.
+    assert deadline_at({"created_at": "2026-09-23T01:00:00+00:00"}) == "2026-09-23T01:30:00.000Z"
+    assert deadline_at({}) is None and deadline({"due_at": "not a time"}) is None

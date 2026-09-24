@@ -46,7 +46,8 @@ MEANINGS = {
     "ready": "已排队，尚未发送",
     "retry": "尚未确认送达，稍后会自动重试",
     "sending": "正在发送，请求可能已在网络上",
-    "sent": "渠道已接收",
+    # A 2xx says the host took the delivery into its own queue, not that anybody received it.
+    "sent": "已交给宿主，尚未确认送达",
     "acknowledged": "已确认送达",
     "uncertain": "可能已经发出，结果未知；再次发送前需要核对",
     "canceled": "没有发出",
@@ -165,16 +166,34 @@ def describe(row):
     return found
 
 
-def deadline(data):
-    """The last moment this occurrence is still worth delivering: its due time plus the window.
-    A row an older build queued names no due time; it was queued when it fell due, so its
-    creation stands in. None when neither can be read (CR-MEM-10)."""
+def deadline_moment(data):
+    """The last moment this occurrence is still worth delivering: its due time plus the window,
+    in UTC, to the millisecond. A row an older build queued names no due time; it was queued when
+    it fell due, so its creation stands in. None when neither can be read (CR-MEM-10).
+
+    The one deadline there is: the dispatcher judges expiry by it, and the host is handed it as
+    `deadlineAt` to check before each send of its own (CR2-INT-07). Milliseconds, because that is
+    what the host's clock reads, so the two can never disagree about a moment."""
     for key in ("due_at", "created_at"):
         try:
-            return datetime.fromisoformat(data[key]).timestamp() + DELIVERY_WINDOW
+            moment = (datetime.fromisoformat(data[key]) + timedelta(seconds=DELIVERY_WINDOW)).astimezone(timezone.utc)
         except (KeyError, TypeError, ValueError):
             continue
+        return moment.replace(microsecond=moment.microsecond - moment.microsecond % 1000)
     return None
+
+
+def deadline(data):
+    """The deadline as a POSIX time, for the clock to be compared with."""
+    moment = deadline_moment(data)
+    return None if moment is None else moment.timestamp()
+
+
+def deadline_at(data):
+    """The deadline as the host receives it: ISO 8601, UTC, milliseconds and a `Z`, the form
+    JavaScript's Date writes and reads without loss."""
+    moment = deadline_moment(data)
+    return None if moment is None else moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def window_open(data, now, attempts):
@@ -643,6 +662,12 @@ class Scheduler:
                 # repeats these bytes under the same Idempotency-Key, whatever the
                 # record has become since.
                 data.update(text=record["content"], record_revision=record["revision"])
+                # The deadline travels with the body it bounds, under the signature: the host
+                # holds a delivery it took in its own queue and sends it later, so it has to know
+                # when this occurrence stops being worth sending (CR2-INT-07).
+                until = deadline_at(data)
+                if until:
+                    data["deadlineAt"] = until
                 body = dumps({k: v for k, v in data.items() if k not in UNSENT_KEYS})
             raw = body.encode()
             data["dispatch"] = dispatch | {

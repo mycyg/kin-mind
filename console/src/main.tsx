@@ -100,7 +100,8 @@ const statuses: any = {
   queued: "已入队",
   suggested: "待发建议",
   ready: "待发送",
-  sent: "已发送",
+  // A delivery the host answered 2xx is in the host's queue, not yet with anybody (CR2-INT-07).
+  sent: "已交给宿主",
   acknowledged: "已确认",
   uncertain: "投递不确定",
   paused: "已暂停",

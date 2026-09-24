@@ -299,3 +299,13 @@ test('the scope picker lists every page of scopes and reads them again after a r
   await picker.focus();
   await expect.poll(()=>asked.length).toBe(4);
 });
+
+test('a reminder the host answered 2xx reads as handed to the host, not as delivered',async({page})=>{
+  // CR2-INT-07: a 202 means the host took it into its own queue; nobody has received it yet.
+  await page.route('**/v1/contact/outbox*',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
+    items:[{id:'delivery_'+'a'.repeat(32),state:'sent',data:{text:'该出门散步了'}}],cursor:null})}));
+  await page.locator('nav').getByRole('button',{name:'主动联系',exact:true}).click();
+  const row=page.locator('.outbox-row').filter({hasText:'该出门散步了'});
+  await expect(row.locator('.badge')).toHaveText('已交给宿主');
+  await expect(row).not.toContainText('已发送');
+});
