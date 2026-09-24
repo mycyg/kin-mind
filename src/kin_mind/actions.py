@@ -171,11 +171,14 @@ class ActionEvents:
                 )
                 data.update(job_id=job["id"], source_id=source["id"])
             status = jobs.status(data["job_id"])
+            # An event follows its appraisal to the end: a job set aside or superseded closes it
+            # too, instead of writing it back to `queued` where it held a drain slot for ever (K4-19).
+            ended = {"complete": "complete", "superseded": "superseded", "needs-repair": "needs-review"}
             with self.mind.engine.db.connect(write=True) as conn:
                 conn.execute(
                     "UPDATE mind_action_events SET state=?,data=? WHERE id=?",
                     (
-                        "complete" if status["state"] == "complete" else "queued",
+                        ended.get(status["state"], "queued"),
                         dumps(data),
                         row["id"],
                     ),

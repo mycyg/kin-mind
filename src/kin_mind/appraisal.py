@@ -54,9 +54,17 @@ REVIEW_MAX_MINUTES = 1440
 MAX_CHARGED_ATTEMPTS = 4
 REPEATED_FAILURE_LIMIT = 2
 # A provider outage produces no model output: it spends no repair budget and
-# must not quarantine a whole queue, but it cannot retry for ever either.
-TRANSIENT_PATTERN = r"deepseek-(?:network-error|http-(?:5\d\d|429))"
-MAX_TRANSIENT_FAILURES = 3
+# must not quarantine a whole queue, but it cannot retry for ever either. It is retried
+# for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
+# (K1-08). A main-session assessment that did not complete is one of these: it ran in an
+# ephemeral read-only fork, left nothing behind, and is tried again (K1-01).
+TRANSIENT_PATTERN = r"deepseek-(?:network-error|http-(?:5\d\d|429))|native-review-[a-z-]+"
+MAX_TRANSIENT_FAILURES = 8
+# The stimuli whose evidence is new material for memory enrichment (K1-07).
+MATERIAL_STIMULI = {None, "assistant-result", "runtime-result", "delivery", "interaction-batch", "exploration-result"}
+# A host error raised before any model call is the same on every retry (K4-06): it is set
+# aside at once for repair instead of spending attempts on it.
+DETERMINISTIC_ERRORS = (TypeError, KeyError, AttributeError, IndexError, ValueError, AssertionError)
 # A long context can time out deterministically, so a timeout is charged; it is
 # simply never the repeated signature that quarantines a row.
 NO_REPEAT_QUARANTINE = {"deepseek-timeout"}
@@ -1207,11 +1215,14 @@ class NativeReview(DeepSeek):
     native_review = True
 
     @classmethod
-    def from_engine(cls, engine, *, profile, exchange):
+    def from_engine(cls, engine, *, profile, exchange, used_tokens=0):
         provider = super().from_engine(engine)
         provider.profile, provider.exchange = profile, exchange
         provider.model = profile["model"]
-        provider.input_budget = max(0, profile["modelContextWindow"] - profile["outputReserve"] - profile["toolReserve"])
+        # The assessment runs on a fork of the main session and carries its context: what that
+        # context already holds is not room for this request.
+        used = used_tokens if isinstance(used_tokens, int) and used_tokens > 0 else 0
+        provider.input_budget = max(0, profile["modelContextWindow"] - profile["outputReserve"] - profile["toolReserve"] - used)
         provider.native_call_number = 0
         provider.absolute_deadline = time.monotonic() + provider.timeout
         return provider
@@ -1477,12 +1488,6 @@ class Appraisals:
         data.update(error_signature=signature, error_repeats=repeats)
         charged = row["attempts"] + 1
         limit = min(settings.get("max_charged_attempts") or MAX_CHARGED_ATTEMPTS, MAX_CHARGED_ATTEMPTS)
-        if data.get("error") == "native-review-unconfirmed":
-            # The native request already owns transport retries. Never rerun a
-            # possibly tool-bearing internal turn under a fresh attempt token.
-            return self._quarantine(data, "native-review-unconfirmed")
-        if settings["operational_lanes"] and historical and row["attempts"] >= 1:
-            return self._quarantine(data, data["error"])
         if repeats >= REPEATED_FAILURE_LIMIT and detail.get("code") not in NO_REPEAT_QUARANTINE:
             return self._quarantine(data, "repeated-failure:" + (detail.get("code") or detail.get("message") or detail["class"]))
         if charged >= limit:
@@ -1545,6 +1550,25 @@ class Appraisals:
         if failures > MAX_TRANSIENT_FAILURES:
             return self._quarantine(data, "transient-failures-exhausted:" + str(failures))
         return "pending"
+
+    def _reschedule_idle(self, data, settings):
+        """K1-01: however an idle review ends, the next one is scheduled. A commit already moved the
+        clock ahead; a review set aside or superseded leaves it where it was, and the queue would
+        never emit another. Kin's last chosen interval is kept, or an hour."""
+        if "idle-review" not in set(data.get("stimuli") or [data.get("stimulus")]):
+            return
+        table = "mind_action_schedule" if settings.get("operational_lanes") else "mind_semantic_cursor"
+        now = self.mind.clock()
+        with self.engine.db.connect(write=True) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                return
+            row = conn.execute(f"SELECT next_review,data FROM {table} WHERE scope=?", (self.mind.scope.key(),)).fetchone()
+            if not row or timestamp(row["next_review"]) > timestamp(now):
+                return
+            minutes = (json.loads(row["data"] or "{}") or {}).get("minutes") or 60
+            minutes = max(REVIEW_MIN_MINUTES, min(REVIEW_MAX_MINUTES, int(minutes)))
+            conn.execute(f"UPDATE {table} SET next_review=?,revision=revision+1 WHERE scope=?",
+                         ((timestamp(now) + timedelta(minutes=minutes)).isoformat(), self.mind.scope.key()))
 
     def _compression_wait(self, data, progress):
         """Preparation waits are continuations, not charged attempts. The frozen
@@ -2259,13 +2283,20 @@ class Appraisals:
                         self.memory.commit_action(conn, roots, eid, proposal.next_review_minutes, receipt, max_minutes=review_max)
                         # Enrichment uses the same original sources but a separate
                         # id/lease. Its durable job is atomic with the action result.
-                        enrichment_id = "enrich_" + digest([row["id"], "memory-v1"])[:32]
-                        enrichment_data = {"evidence_ids": data["evidence_ids"], "agent_version": effective_version,
-                            "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
-                            "seed_memory": deferred_memory if deferred_memory != MemoryAssessment().model_dump() else None, "seed_receipt": receipt,
-                            "seed_sources": list(semantic_refs.values())}
-                        conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                            (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
+                        # It is made only when there is something to organise: memory the
+                        # operational pass deferred, or new conversation and material. An
+                        # internal review (a timer, a wish or plan to look at again) carries
+                        # its evidence as reference, not as anything new (K1-07).
+                        seed = deferred_memory if deferred_memory != MemoryAssessment().model_dump() else None
+                        material = set(data.get("stimuli") or [data.get("stimulus")]) & MATERIAL_STIMULI
+                        if seed or material:
+                            enrichment_id = "enrich_" + digest([row["id"], "memory-v1"])[:32]
+                            enrichment_data = {"evidence_ids": data["evidence_ids"], "agent_version": effective_version,
+                                "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
+                                "seed_memory": seed, "seed_receipt": receipt,
+                                "seed_sources": list(semantic_refs.values())}
+                            conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                                (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
                     elif memory_context:
                         # A later bubble may extend the same share while DS runs.
                         # Keep that share pending for the next batch; independent
@@ -2424,6 +2455,9 @@ class Appraisals:
             elif preparing and isinstance(error, (Conflict, Missing)):
                 uncharged_wait = "preparation"
                 state = self._preparation_conflict(data, error)
+            elif preparing and isinstance(error, DETERMINISTIC_ERRORS):
+                data["error_detail"] = error_detail(error, str(data.get("error", "")))
+                state = self._quarantine(data, "deterministic-preparation-error:" + type(error).__name__)
             elif lighting:
                 # A charged attempt is one full appraisal call, and this attempt made none.
                 uncharged_wait = "light"
@@ -2463,6 +2497,8 @@ class Appraisals:
             ).rowcount
             if changed:
                 self._settle_children(conn, row["id"], data, state)
+        if changed and state != "pending":
+            self._reschedule_idle(data, settings)
         if changed and state == "needs-repair":
             # Quarantine is an operational event: no further model call is paid
             # for on this row until an operator resumes it.

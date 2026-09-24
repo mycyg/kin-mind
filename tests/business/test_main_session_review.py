@@ -140,22 +140,27 @@ def test_checkpoint_uses_native_room_and_waits_when_the_window_is_full(setup):
     assert not full['complete'] and full['budgetPlan']['limit']==300
 
 
-def test_native_failure_is_not_replayed_by_the_appraisal_queue(setup):
+def test_a_failed_native_assessment_waits_and_is_tried_again(setup):
+    """K1-01: a main-session assessment that did not complete ran in an ephemeral read-only fork.
+    It is retried after a backoff, not set aside at the first failure."""
     mind, source, _ = setup
     calls=[]
     def exchange(request):
         calls.append(request)
         return {'state':'failed','receipt':{}}
-    jobs=Appraisals(mind);jobs.enqueue([source('native-failure')],'synthetic-v1')
+    jobs=Appraisals(mind);job=jobs.enqueue([source('native-failure')],'synthetic-v1')
     result=jobs.run_one(native_provider(mind,exchange))
-    assert result['state']=='needs-repair' and len(calls)==1
+    assert result['state']=='pending' and result['transient_failures']==1 and len(calls)==1
     assert jobs.run_one(native_provider(mind,exchange))['state']=='idle'
-    assert len(calls)==1
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?",(job['id'],))
+    assert jobs.run_one(native_provider(mind,exchange))['state']=='pending' and len(calls)==2
 
 
-def test_provider_outage_gets_only_three_queue_retries(setup):
+def test_provider_outage_is_retried_for_about_two_hours(setup):
+    """K1-08: eight retries at 1, 2, 4, 8, 16, 30, 30 and 30 minutes, then the row is set aside."""
     mind,_,_=setup; jobs=Appraisals(mind); data={'error':'deepseek-http-503'}
-    assert [jobs._transient_failure(data) for _ in range(4)]==['pending','pending','pending','needs-repair']
+    assert [jobs._transient_failure(data) for _ in range(9)]==['pending']*8+['needs-repair']
 
 
 def test_distinct_reflections_can_support_growth_but_rereading_one_cannot(setup):
@@ -217,3 +222,69 @@ def test_contact_waits_reach_three_days_and_are_clamped_not_refused():
     update = lambda seconds: WishUpdate(desire_id='d', action='wait', reason='r', wait_condition='time',
                                         retry_after_seconds=seconds).retry_after_seconds
     assert [update(100), update(172800), update(10**7)] == [300, 172800, 259200]
+
+
+def idle_world(setup):
+    """Operational lanes with an action policy; the bootstrap review is taken as done."""
+    from datetime import timedelta
+    from kin_mind.actions import ActionEvents
+    from kin_mind.memory import MemoryContinuity
+    mind, source, clock = setup
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True, "semantic": True, "idle": True, "operational_lanes": True})
+    actions = ActionEvents(mind)
+    actions.configure({"command_id": "policy", "agent_version": "synthetic-v1", "expected_revision": mind.read()["revision"],
+                       "evidence_ids": [source("policy")], "reason": "The owner allowed autonomous review"})
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_action_events SET state='complete' WHERE kind='bootstrap'")
+    clock[0] += timedelta(minutes=30)
+    assert memory.queue_idle(actions)
+    return mind, memory, actions, clock
+
+
+def test_an_idle_review_set_aside_closes_its_event_and_schedules_the_next(setup):
+    """K4-19 and K1-01: a job that ends needs-repair closes its event instead of holding a drain
+    slot as `queued`, and the idle clock moves on however the idle review ended."""
+    from kin_mind.state import timestamp
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    with mind.engine.db.connect(write=True) as conn:
+        event = conn.execute("SELECT id,data FROM mind_action_events WHERE kind='idle-review'").fetchone()
+        job_id = json.loads(event["data"])["job_id"]
+        conn.execute("UPDATE mind_appraisals SET state='needs-repair' WHERE id=?", (job_id,))
+    actions.drain(jobs)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_action_events WHERE id=?", (event["id"],)).fetchone()[0] == "needs-review"
+        data = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (job_id,)).fetchone()[0])
+    jobs._reschedule_idle(data, memory.settings())
+    assert memory.due() is None
+    with mind.engine.db.connect() as conn:
+        after = conn.execute("SELECT next_review FROM mind_action_schedule WHERE scope=?", (mind.scope.key(),)).fetchone()[0]
+    assert timestamp(after) > timestamp(mind.clock())
+
+
+def test_a_timer_only_review_makes_no_enrichment_call(setup):
+    """K1-07: an idle review whose only evidence is the host's own timer event has nothing to
+    organise, so no enrichment appraisal is queued after it."""
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    reviewer = FakeReviewer(Appraisal(reason="Nothing new, rest a while", next_review_minutes=240))
+    assert jobs.run_one(reviewer, lane="action")["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_appraisals WHERE id LIKE 'enrich_%'").fetchone()[0] == 0
+    assert memory.due() is None
+
+
+def test_the_assessment_budget_leaves_out_what_the_main_session_holds(setup):
+    mind, _, _ = setup
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('models',?)",
+                     (json.dumps({"summary": {"endpoint": "https://api.deepseek.com", "api_key_env": "SYNTHETIC_KEY"}}),))
+    profile = {'model':'gpt-6-astra','modelProvider':'custom','reasoningEffort':'medium','fastMode':'off',
+               'modelContextWindow':128000,'outputReserve':16000,'toolReserve':8000}
+    full = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r)
+    held = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r, used_tokens=60000)
+    assert full.input_budget == 104000 and held.input_budget == 44000

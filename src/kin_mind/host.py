@@ -390,7 +390,8 @@ def dispatch(config, action, request):
                 return response
             if not request.get("native_review_profile"):
                 raise RuntimeError("main-session-required")
-            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange)
+            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange,
+                                            used_tokens=request.get("native_review_used_tokens") or 0)
         else:
             return DeepSeek.from_engine(engine)
 
