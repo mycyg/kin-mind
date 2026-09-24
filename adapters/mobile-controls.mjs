@@ -38,7 +38,10 @@ export function runtimeReply(view,{pending=false,switched=false,names=null}={}) 
   return '我现在用的是 '+model+(actual.reasoningEffort?'（'+actual.reasoningEffort+'，'+mode+'）':'（'+mode+'）')+'。'+(view.tasks.length?'当前任务会继续保留。':'');
 }
 
-// Keep the native command first: ACP parses only the first text block.
+/** The owner's literal `/compact` as the native session must receive it (WS8 #1). ACP
+ * reads only the first text block as a command and drops every other block, so the
+ * command goes alone: the host shapes it after every fact it adds, it is a turn of its
+ * own, and nothing joins its turn. */
 export function compactPrompt(pending) {
-  return {...pending,prompt:[{type:'text',text:'/compact'}]};
+  return {...pending,prompt:[{type:'text',text:'/compact'}],ownTurn:true,nativeCommand:'compact'};
 }

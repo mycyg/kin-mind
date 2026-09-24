@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS} from '../../adapters/mobile-router.mjs';
-import {inputSummary} from '../../adapters/input-ledger.mjs';
+import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 
 const MINUTE=60000,HOUR=3600000;
@@ -287,4 +287,47 @@ test('an input keeps when the host first received it and where from; a hand-off\
   assert.equal(f.router.handoffSource('old-in-inbox').reason,'source-too-old','classified just now, received thirty hours ago');
   await f.router.dispatch({id:'future',kind:'owner',text:'x',receivedAt:new Date(f.clock.now+HOUR).toISOString(),channel:'somewhere'},async()=> 'new-turn');
   assert.deepEqual([f.router.state.inputs.future.firstReceivedAt,f.router.state.inputs.future.channel],[f.clock.now,undefined],'never in the future; an unknown channel is not recorded');
+});
+
+// WS8 #3: the flag that refuses a replay used to outlive the lookup that settles it.
+test('an input restored from the journal is settled by its lookup: found stays answered once, proven unsent is routed afresh (WS8 #3)',async t=>{
+  const f=fixture(t);
+  for(const [id,text] of [['lost-a','在吗'],['lost-b','晚上吃什么'],['lost-c','明天呢']])await chat(f,id,text);
+  // Every revision is lost; only the journal names the inputs.
+  fs.writeFileSync(f.args.file,'{broken');fs.writeFileSync(f.args.file+'.prev','{broken');
+  const router=new MobileRouter(f.args);
+  assert.ok(router.state.recovery.restoredInputs>=3);
+  assert.deepEqual(['lost-a','lost-b','lost-c'].map(id=>[router.state.inputs[id].state,router.state.inputs[id].recovered]),
+    [['unconfirmed',true],['unconfirmed',true],['unconfirmed',true]]);
+  const submitted=[];const submit=async decision=>{submitted.push(decision.inputId);return 'new-turn';};
+  await assert.rejects(router.dispatch({id:'lost-b',kind:'owner',text:'晚上吃什么'},submit),/requires reconciliation/,'refused until it is looked up');
+  const lookups={'lost-a':'found','lost-b':'not-found','lost-c':'unknown'};
+  await router.watchOnce({reconcileInput:async id=>({state:lookups[id]??'unknown'}),notifyOwner:null,requeue:null,sessionBusy:false});
+  const [a,b,c]=['lost-a','lost-b','lost-c'].map(id=>router.state.inputs[id]);
+  assert.deepEqual([a.state,a.recovered,a.restored],['accepted',undefined,'journal'],'found: it stands as accepted');
+  assert.deepEqual([b.state,b.recovered,b.retry.evidence],['failed-before-submit',undefined,'reconciled-not-received'],'proven never received');
+  assert.equal(c.recovered,true,'a lookup that could not answer settles nothing');
+  assert.equal((await router.dispatch({id:'lost-a',kind:'owner',text:'在吗'},submit)).route,'deduplicated','found: a replay is a duplicate');
+  await assert.rejects(router.dispatch({id:'lost-c',kind:'owner',text:'明天呢'},submit),/requires reconciliation/);
+  // The inbox takes the proven-unsent one up again under its own id, and it is routed afresh.
+  assert.equal((await router.received({id:'lost-b',kind:'owner',channel:'feishu'})).record.state,'preparing');
+  assert.equal((await router.dispatch({id:'lost-b',kind:'owner',text:'晚上吃什么',channel:'feishu'},submit)).route,'new-turn');
+  const routed=router.state.inputs['lost-b'];
+  assert.deepEqual([routed.state,routed.route,typeof routed.hash,routed.restored,routed.retry.evidence],['accepted','chat','string',undefined,'reconciled-not-received']);
+  assert.deepEqual(submitted,['lost-b'],'submitted once, and only the one proven never received');
+});
+
+test('an internal input whose submission is unknown is looked up by its id, and nobody is told (WS8 #2)',async t=>{
+  const f=fixture(t);
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  for(const id of ['handoff:h1','handoff:h2'])
+    await assert.rejects(f.router.dispatch({id,kind:'handoff',text:'继续 '+id,submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  assert.equal(holdsSession(f.router.state.inputs['handoff:h1']),true,'an unknown submission holds a session boundary');
+  const notices=[];
+  await f.router.watch({reconcileInput:async id=>({state:id==='handoff:h1'?'found':'not-found'}),
+    notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'n'};}});
+  const [h1,h2]=['handoff:h1','handoff:h2'].map(id=>f.router.state.inputs[id]);
+  assert.deepEqual([h1.state,h2.state,h2.retry.evidence],['accepted','failed-before-submit','reconciled-not-received']);
+  assert.equal([h1,h2].some(holdsSession),false,'settled by the lookup, neither holds one any more');
+  assert.deepEqual(notices,[],'the owner is never told about Kin\'s own continuation');
 });
