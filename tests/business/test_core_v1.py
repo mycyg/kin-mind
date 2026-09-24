@@ -315,30 +315,6 @@ def test_restore_requires_database_and_publishes_only_after_recovery(engine, tmp
         assert conn.execute("SELECT state FROM jobs WHERE unique_key LIKE 'restore-rebuild:%'").fetchone()[0] == "pending"
 
 
-def test_migrate_prefers_thawed_event_over_retained_archive_copy(tmp_path):
-    from eventmem.core.transfer import migrate
-    from eventmem.schema import make_event, to_markdown
-
-    legacy = tmp_path / "project" / ".memory"
-    (legacy / "events").mkdir(parents=True)
-    (legacy / "archive").mkdir()
-    event_id = "2026-09-23_120000"
-    old = to_markdown(make_event(event_id, "build", "done", "old frozen text"))
-    live = to_markdown(make_event(event_id, "build", "open", "current thawed text"))
-    with tarfile.open(legacy / "archive" / "epoch-2026-Q3.tar.gz", "w:gz") as archive:
-        data = old.encode()
-        entry = tarfile.TarInfo(event_id + ".md")
-        entry.size = len(data)
-        archive.addfile(entry, io.BytesIO(data))
-    (legacy / "events" / (event_id + ".md")).write_text(live)
-    target = tmp_path / "migrated"
-    migrate(legacy, target, Scope())
-    record = Engine(target).get(event_id)
-    assert record["status"] == "active"
-    assert "current thawed text" in record["content"]
-    assert "old frozen text" not in record["content"]
-
-
 def test_delete_redacts_recovered_job_history(engine):
     marker = "deleted recovery secret"
     rid = remember(engine, marker)

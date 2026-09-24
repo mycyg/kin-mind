@@ -19,7 +19,6 @@ COMMANDS = {
     "memory",
     "correct",
     "worker",
-    "migrate",
     "backup",
     "restore",
     "export",
@@ -95,9 +94,6 @@ def parser():
                 "--transport", choices=["stdio", "streamable-http"], default="stdio"
             )
             p.add_argument("--port", type=int, default=8319)
-        elif command == "migrate":
-            p.add_argument("legacy", type=Path)
-            p.add_argument("--scope", default="{}")
         elif command in {"backup", "restore", "export"}:
             p.add_argument("path", type=Path)
         elif command == "api":
@@ -141,15 +137,10 @@ def main(argv=None):
             scenario=args.scenario,
             remove=args.action == "uninstall",
         )
-    elif args.command in {"migrate", "restore"}:
-        from .models import Scope
-        from .transfer import migrate, restore
+    elif args.command == "restore":
+        from .transfer import restore
 
-        result = (
-            migrate(args.legacy, args.root, Scope.model_validate_json(args.scope))
-            if args.command == "migrate"
-            else restore(args.path, args.root)
-        )
+        result = restore(args.path, args.root)
     elif args.command in {"evaluate", "benchmark"}:
         from .evaluation import benchmark, evaluate
 

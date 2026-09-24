@@ -107,6 +107,39 @@ def encoding():
     return tiktoken.get_encoding("cl100k_base")
 
 
+# BM25 over the recent lexical matches (k1=1.5, b=0.75). It moved here from the removed
+# `.memory` stack, where it was the one part the service still used (E1-05).
+BM25_K1, BM25_B = 1.5, 0.75
+
+
+def bm25(docs, query):
+    """Each document's BM25 score for `query`. The unique query terms are summed in sorted
+    order: float addition does not associate, and a set's order changes with the hash seed."""
+    from collections import Counter
+    import math
+
+    n = len(docs)
+    if n == 0:
+        return []
+    lengths = [len(d) for d in docs]
+    average = (sum(lengths) / n) or 1.0
+    frequencies = [Counter(d) for d in docs]
+    documents = Counter()
+    for found in frequencies:
+        documents.update(found.keys())
+    scores = [0.0] * n
+    for term in sorted(set(query)):
+        df = documents.get(term, 0)
+        if df == 0:
+            continue
+        idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+        for i, found in enumerate(frequencies):
+            freq = found.get(term, 0)
+            if freq:
+                scores[i] += idf * (freq * (BM25_K1 + 1)) / (freq + BM25_K1 * (1 - BM25_B + BM25_B * lengths[i] / average))
+    return scores
+
+
 def tokens(text):
     found = encoding()
     if found is None:
@@ -331,9 +364,7 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
                             f"SELECT search.id,search.tokens FROM search JOIN records r ON r.id=search.id WHERE search MATCH ? AND r.scope IN ({placeholders}) AND r.deleted=0 AND (? OR r.status='active') ORDER BY search.rowid DESC LIMIT 400",
                             [match] + scopes + [request.history],
                         ).fetchall()
-                        from eventmem.recall import _bm25
-
-                        scores = _bm25([r["tokens"].split() for r in rows], words)
+                        scores = bm25([r["tokens"].split() for r in rows], words)
                         rows = [
                             r for _, r in sorted(zip(scores, rows), key=lambda p: -p[0])
                         ][:240]
