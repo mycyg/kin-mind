@@ -563,6 +563,49 @@ class Mind(Continuity):
                 conn, self._key(payload["command_id"]), payload, run, stamp=stamp
             )
 
+    def _record_only(self, request, fn):
+        """A commit that changes nothing of the mind (CR-RT-10): the command identity, the
+        idempotency and the single transaction of _transact, and no revision, state row or history
+        snapshot. `fn` reads a copy of the current state; whatever it changes there is dropped."""
+        payload = request.model_dump() if hasattr(request, "model_dump") else request
+        with self.engine.db.connect(write=True) as conn:
+            from .autonomy_schema import optimized
+            stamp = fingerprint("mind-state", self.scope.key(), payload,
+                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
+
+            def run():
+                state = self._load(conn)
+                event_id = "mind_" + digest([self.scope.key(), payload["command_id"]])[:32]
+                result = fn(conn, deepcopy(state), event_id) or {}
+                return dict(event_id=event_id, revision=state["revision"], **result)
+
+            return self.engine.command(conn, self._key(payload["command_id"]), payload, run, stamp=stamp)
+
+    def retire_session_advice(self):
+        """CR-MIND-12: a judgment an older release kept in the versioned state moves to the registry
+        carrier; once the carrier holds it (or a newer one), the field leaves the current state.
+        Earlier revisions keep it as they were. Idempotent: nothing to move answers `unchanged`."""
+        from . import session_advice
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            legacy = state.get("session_advice")
+            if "session_advice" not in state:
+                return {"state": "unchanged"}
+            conn.execute(session_advice.CARRIER)
+            held = conn.execute("SELECT event_id FROM mind_session_advice WHERE scope=?", (self.scope.key(),)).fetchone()
+            if not held and isinstance(legacy, dict) and legacy.get("eventId") and legacy.get("snapshotId"):
+                session_advice.submit(conn, self.scope.key(), legacy, legacy.get("at") or self.clock())
+                held = conn.execute("SELECT event_id FROM mind_session_advice WHERE scope=?", (self.scope.key(),)).fetchone()
+            if legacy and not held:
+                # Nothing the carrier could take: the field is left where it is, and says so.
+                return {"state": "kept", "reason": "carrier-cannot-hold-legacy-advice"}
+            state.pop("session_advice")
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, "mind_" + digest([self.scope.key(), "session-advice-retired", state["revision"]])[:32],
+                          state, "session-advice-migration", {"carrier_event_id": held[0] if held else None})
+            return {"state": "moved", "revision": state["revision"], "carrier_event_id": held[0] if held else None}
+
     def configure_autonomy(self, request):
         """Explicit user policy; never an inferred emotion or personality update."""
         def apply(conn, state, event_id):

@@ -2250,11 +2250,8 @@ class Appraisals:
                         # mind state (DB1-03, §5.6). A core without that carrier keeps the old place.
                         record = advice_record(proposal.session_advice, self.session_context, receipt, eid)
                         from . import session_advice as advice_store
-                        submit = getattr(advice_store, "submit", None)
-                        if record and submit:
-                            submit(conn, self.mind.scope.key(), record, self.mind.clock())
-                        elif record:
-                            state["session_advice"] = record
+                        if record:
+                            advice_store.submit(conn, self.mind.scope.key(), record, self.mind.clock())
                         advice_written.append(record)
                     if data.get("stimulus") == "session-maintenance":
                         applied = section("session_advice", apply_advice)
@@ -2580,7 +2577,12 @@ class Appraisals:
                     return semantic_enabled
 
                 committing = True
-                data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+                if maintenance:
+                    # A session review changes nothing of the mind: its advice reaches the registry carrier
+                    # in one leased, idempotent transaction, and the mind keeps its revision and history (CR-RT-10).
+                    data["result"] = self.mind._record_only(event, apply)
+                else:
+                    data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             self.memory.remember_reflection(data["result"])
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
