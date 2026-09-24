@@ -90,10 +90,8 @@ def dispatch(config, action, request):
     observation_file = config.get("session_observation_file")
     if observation_file and Path(observation_file).exists():
         session_context = json.loads(Path(observation_file).read_text())
-    from .codex_executor import exploration_capabilities, resolve_computer_exploration
-    capability_computer = resolve_computer_exploration(config)
-    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(
-        config, computer_override=capability_computer),
+    from .codex_executor import exploration_capabilities
+    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(config),
                       session_context=session_context)
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)

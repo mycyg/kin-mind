@@ -95,6 +95,24 @@ def _blocked_address(host, allow_hosts):
     return False
 
 
+def public_host_refusal(host, allow_hosts, transport=None):
+    """Why `host` is not a public target, or False. With the public transport configured the
+    answer comes from its resolver: on a Fake-IP network every local answer is private, so the
+    local resolver would refuse every public site as well."""
+    if host in allow_hosts:
+        return False
+    if not (isinstance(transport, dict) and transport.get("enabled") is True):
+        return _blocked_address(host, allow_hosts)
+    from .http_transport import (PublicTransportError, _DohResolver, _literal_or_resolved_target,
+                                 _settings_from_config, _url_parts)
+    try:
+        url, hostname, port = _url_parts("https://" + ("[" + host + "]" if ":" in host else host) + "/")
+        _literal_or_resolved_target(url, hostname, port, _DohResolver(_settings_from_config(transport)))
+    except PublicTransportError as error:
+        return error.reason
+    return False
+
+
 class WebReader:
     """One run's web reads. The ledger file is written by this adapter only."""
 
@@ -191,7 +209,7 @@ class WebReader:
     def _valid_page_request(offset, limit):
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             return "invalid-page-offset"
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_TEXT:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             return "invalid-page-limit"
         return None
 
@@ -306,8 +324,12 @@ class WebReader:
             )
         return {**source, **page}
 
-    def _fetch(self, url, *, allow_redirects):
-        """Bounded streaming GET with explicit per-hop redirect policy."""
+    def _fetch(self, url, *, allow_redirects, courtesy=True):
+        """Bounded streaming GET with explicit per-hop redirect policy.
+
+        The per-host limit is a courtesy to the sites read: it counts the page each read ends
+        on, never a redirect hop on the way and never the host's own search entry
+        (`courtesy=False`), which every search of a run goes through."""
         chain = []
         current = url
         try:
@@ -326,8 +348,7 @@ class WebReader:
                         if blocked:
                             return None, chain, blocked
                     host = parsed.hostname
-                    self._host_requests[host] = self._host_requests.get(host, 0) + 1
-                    if self._host_requests[host] > PER_HOST_MAX_REQUESTS:
+                    if courtesy and self._host_requests.get(host, 0) >= PER_HOST_MAX_REQUESTS:
                         return None, chain, "host-courtesy-limit"
                     waited = time.monotonic() - self._last_request.get(host, 0)
                     if waited < PER_HOST_MIN_INTERVAL:
@@ -348,6 +369,8 @@ class WebReader:
                             chain.append(hop)
                             current = target
                             continue
+                        if courtesy:
+                            self._host_requests[host] = self._host_requests.get(host, 0) + 1
                         raw, over_limit = self._bounded_body(response)
                         return {
                             "status_code": response.status_code,
@@ -408,6 +431,8 @@ class WebReader:
                 url, invalid, evidence_id=evidence_id, expected_version=expected_version,
                 tool_call_id=tool_call_id,
             )
+        # A page larger than one delivery is read in parts: a larger request gets the largest part.
+        limit = min(limit, MAX_TEXT)
         if evidence_id is not None:
             return self._continue_page(
                 url, evidence_id=evidence_id, expected_version=expected_version,
@@ -483,7 +508,8 @@ class WebReader:
     def search(self, query, *, max_results=MAX_RESULTS, tool_call_id=None):
         """Search the configured no-key endpoint. Results prove visibility only."""
         endpoint = self.config.get("search_endpoint") or DEFAULT_SEARCH_ENDPOINT
-        response, chain, error = self._fetch(endpoint + "?q=" + quote_plus(query), allow_redirects=2)
+        response, chain, error = self._fetch(endpoint + "?q=" + quote_plus(query), allow_redirects=2,
+                                             courtesy=False)
         if error:
             return self._receipt(tool="web_search", status="failed", requested=endpoint,
                                  reason=error, tool_call_id=tool_call_id,
