@@ -10,6 +10,8 @@ import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile}
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
 const open = task => !['completed','canceled'].includes(task.status);
+const settledDelivery = delivery => delivery.state==='accepted'?Boolean(delivery.messageId):
+  ['rejected','undeliverable','retired','not-submitted','canceled-before-send'].includes(delivery.state);
 const SHA256=/^[a-f0-9]{64}$/i;
 const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conversationId','generation','id','ownerBindingSha256','sourceSha256','version'];
 export const ROUTER_PROFILES = Object.freeze({
@@ -255,9 +257,19 @@ export class MobileRouter {
       task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive','assessment'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text,tools:{},deliveries:{},createdAt:this.now()};
       this.state.tasks[id]=task;
     }
-    if(!task.inputIds.includes(input.id)) {task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
+    if(!task.inputIds.includes(input.id)) {this.supersedeDecline(task,'new-work-input:'+input.id);task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
     if(!input.kind||input.kind==='owner')task.requiresDelivery=true;
     return task;
+  }
+  supersedeDecline(task,reason) {
+    if(task.completion?.outcome!=='declined')return;
+    const request=this.state.requests[task.completion.commandId];
+    if(request?.state==='pending'){
+      request.state='superseded';request.supersededBy=reason;
+      const latest=Object.values(this.state.requests).findLast(item=>item.state==='pending'&&['work','auto','manual'].includes(item.mode));
+      this.state.requestedMode=latest?.mode??null;this.state.exitRequested=latest?.mode==='auto';
+    }
+    delete task.completion;
   }
   async select(input) {
     return this.locked(async()=>{
@@ -276,6 +288,10 @@ export class MobileRouter {
       const intents=this.classifyIntents&&owner;
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       const runtime=await this.inspect();
+      const priorTask=this.currentTask();
+      if(priorTask?.completion?.outcome==='declined'&&this.declineReady(priorTask,runtime)){
+        priorTask.status='canceled';priorTask.canceledAt=this.now();this.save('decline-settled-before-input',{taskId:priorTask.id});
+      }
       // A failed native turn is terminal, not active work. Only a new assessment
       // on the current profile may proceed; switching and other busy checks stay unchanged.
       if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
@@ -632,11 +648,18 @@ export class MobileRouter {
   }
   recordModeRequest(request) {
       if(!request.commandId||!['work','auto','manual'].includes(request.mode)||!request.reason?.trim()||(request.mode==='manual'&&!request.profile?.model))throw Error('Invalid mode request');
+      const taskOutcome=request.taskOutcome??'completed';
+      if(!['completed','declined'].includes(taskOutcome)||request.taskOutcome!==undefined&&!request.completedTaskId)throw Error('Invalid task outcome');
+      if(taskOutcome==='declined'&&(request.mode!=='auto'||!request.completedTaskId||!Number.isSafeInteger(request.completedInputVersion)||request.handoff))throw Error('Decline requires the current task and input version');
       const hash=digest(request), previous=this.state.requests[request.commandId];
       if(previous) {if(previous.hash!==hash)throw Error('Command id conflict');return clone(previous);}
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
       if(request.completedTaskId&&(!this.state.tasks[request.completedTaskId]||!open(this.state.tasks[request.completedTaskId])))throw Error('Task is not open');
       if(request.completedTaskId&&request.completedInputVersion!==this.state.tasks[request.completedTaskId].inputVersion)throw Error('Task input version changed; read current runtime');
+      if(taskOutcome==='declined'){
+        const task=this.state.tasks[request.completedTaskId];
+        if(this.currentTask()?.id!==task.id||!task.turnStartedAt||task.turnEndedAt||task.executionEpoch!==this.state.executionEpoch)throw Error('Decline must belong to the current native task turn');
+      }
       if(request.handoff) {
         const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
         task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
@@ -647,7 +670,7 @@ export class MobileRouter {
         this.state.exitRequested=true;
         if(request.completedTaskId) {
           const task=this.state.tasks[request.completedTaskId];
-          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason};
+          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,...(taskOutcome==='declined'?{commandId:request.commandId}:{})};
         }
       }
       const sourceInputId=request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
@@ -670,7 +693,7 @@ export class MobileRouter {
       const keepManual=request.mode==='auto'&&request.completedTaskId&&this.state.mode==='manual'&&this.state.manualProfile;
       this.state.configRevision++;
       const result={state:'pending',mode:keepManual?'manual':request.mode,commandId:request.commandId,hash,reason:request.reason,revision:this.state.configRevision,
-        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...((keepManual||request.profile)?{profile:clone(keepManual||request.profile)}:{}),at:this.now()};
+        sourceInputId,...(request.sourceHash?{sourceHash:request.sourceHash}:{}),notify:request.notify===true,force:forceAuthorized,deferUntilSettled:deferAuthorized,...(request.reclassificationId?{reclassificationId:request.reclassificationId}:{}),...((keepManual||request.profile)?{profile:clone(keepManual||request.profile)}:{}),...(request.completedTaskId?{taskId:request.completedTaskId,inputVersion:request.completedInputVersion,taskOutcome}:{}),at:this.now()};
       for(const prior of Object.values(this.state.requests))if(prior.state==='pending'&&['work','auto','manual'].includes(prior.mode)){
         if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
         prior.state='superseded';prior.supersededBy=request.commandId;
@@ -1077,7 +1100,13 @@ export class MobileRouter {
       }
       if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
-        if(kind==='prompt-start') {task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
+        if(kind==='prompt-start') {
+          if(task.completion?.outcome==='declined'){
+            if(this.declineReady(task,await this.inspect())){task.status='canceled';task.canceledAt=this.now();}
+            else this.supersedeDecline(task,'new-native-turn');
+          }
+          if(open(task)){task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
+        }
         if(kind==='prompt-end') {task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
         if(kind==='tool') {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
@@ -1125,6 +1154,16 @@ export class MobileRouter {
     }
     return changed;
   }
+  declineReady(task,runtime) {
+    const proposal=task.completion,fence=proposal?.turnFence,version=proposal?.inputVersion;
+    if(runtime?.pendingDeliveries!==0||proposal?.outcome!=='declined'||proposal.state==='historical-proposal'||version!==task.inputVersion||
+      fence!==task.executionEpoch||task.stopReason!=='end_turn'||!task.turnStartedAt||task.turnStartedAt>proposal.at||
+      task.turnEndedAt<proposal.at||task.turnEndedFence!==fence)return false;
+    const tools=[...Object.values(task.tools??{}),...Object.values(task.toolHistory??{}).filter(t=>t.authority==='historical-fence'&&t.turnFence===fence&&t.inputVersion===version)];
+    if(!tools.every(tool=>['completed','failed'].includes(tool.status)))return false;
+    const deliveries=[...Object.values(task.deliveries??{}),...Object.values(task.deliveryHistory??{}).filter(d=>d.authority==='historical-fence'&&d.turnFence===fence&&d.inputVersion===version)];
+    return deliveries.every(settledDelivery)&&deliveries.some(d=>d.inputVersion===version&&d.turnFence===fence&&d.state==='accepted'&&d.messageId&&d.at>=proposal.at);
+  }
   async reconcile() {
     return this.locked(async()=>{
       const runtime=await this.reconcileTransition(await this.inspect());this.observeRuntime(runtime);
@@ -1132,6 +1171,10 @@ export class MobileRouter {
       let changed=this.archiveInterruptedTools();
       for(const task of this.tasks()) {
         if(task.cancelRequested) {task.status='canceled';task.canceledAt=this.now();changed=true;continue;}
+        if(task.completion?.outcome==='declined'){
+          if(this.declineReady(task,runtime)){task.status='canceled';task.canceledAt=this.now();changed=true;}
+          continue;
+        }
         // With semantic review installed, assistant completion is a proposal.
         // Internal repairs retain their separate verified-result protocol.
         if(this.workReviewerEnabled&&task.requiresDelivery!==false)continue;

@@ -114,6 +114,7 @@ export class WorkLockReview {
     return {decision:mergeDecisions(decisions),receipt:{...(receipts.find(unverified)??receipts.at(-1)),chunks:receipts.length}};
   }
   blocked(task,runtime) {
+    if(task.completion?.outcome==='declined')return 'assistant-decline-awaiting-host-settlement';
     if(this.router.busy(runtime))return 'native-work-active-or-unknown';
     if(!this.router.verified(runtime,this.router.desiredProfile(runtime,{route:'work'})))return 'active-profile-unverified';
     if(task.stopReason!=='end_turn'||!task.turnEndedAt)return 'native-turn-not-finished';
