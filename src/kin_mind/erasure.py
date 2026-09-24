@@ -405,6 +405,16 @@ def _add_pass(conn, scope, ids, first, last):
     _save(conn, scope, cursor, data)
 
 
+def status(conn, scope_key):
+    """The history rewrite as the operational status shows it: passes still owed, rows rewritten,
+    rows that were already unreadable when the rewrite reached them."""
+    if not _table(conn, "mind_memory_migrations"):
+        return {"passes_owed": 0}
+    _, data = _load(conn, scope_key)
+    return {"passes_owed": len(data.get("passes") or ()), "completed": data.get("completed", 0),
+            "rewritten": data.get("rewritten", 0), "broken": data.get("broken", 0)}
+
+
 def resume_history(engine, conn):
     """For the maintenance tick: a pass still owed with no step queued to run it gets one, so a
     step that failed for good does not leave the words in the history until the next delete."""

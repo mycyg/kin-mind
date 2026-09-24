@@ -788,6 +788,10 @@ class Worker:
                         f"auto-diary:{digest(scope)}:{date}",
                         conn=conn,
                     )
+        # An isolation migration that stopped on a refusal keeps every read strict until it is
+        # finished; it is finished here rather than whenever somebody notices (K4-14).
+        from kin_mind.isolation_migration import resume_stalled
+        resume_stalled(self.engine)
 
     def replay_hosts(self):
         """Replay the receipts a hook could not deliver, oldest first.

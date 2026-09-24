@@ -101,9 +101,10 @@ class Engine:
             )
             # What a source is gets decided once, as it arrives. Its row and the root record's
             # stamp belong to the first revision, so no stored record is rewritten to mark it.
-            from .read_policy import STAMP, stamp_source
+            from .read_policy import STAMP, classify_receipt, indexed
 
-            origin = stamp_source(self, conn, sid, source, record_text)
+            found = classify_receipt(self, conn, sid, source, record_text)
+            origin = (found.label or found.kind) if found else None
             # Deterministic text imports can be committed with the receipt.
             if attachment is None and source.text and len(source.text) <= 1_000_000:
                 confirmation = {
@@ -126,7 +127,9 @@ class Engine:
                     attributes={k: v for k, v in source.metadata.items() if k != STAMP}
                     | ({STAMP: origin} if origin else {}),
                 )
-                self._insert(conn, record)
+                # The host's own bookkeeping is kept and classified, and never offered as a
+                # recall candidate: it stays out of the text index and the organise queue.
+                self._insert(conn, record, index=indexed(found))
                 self.supersede_source_versions(conn, sid)
                 conn.execute(
                     "UPDATE sources SET mechanical='complete' WHERE id=?", (sid,)
@@ -265,7 +268,7 @@ class Engine:
             result["cursor"] = rows[limit - 1] if len(rows) > limit else None
             return result
 
-    def _insert(self, conn, record: RecordInput):
+    def _insert(self, conn, record: RecordInput, *, index=True):
         rid = record.id or uid("mem")
         if conn.execute("SELECT 1 FROM tombstones WHERE key=?", (rid,)).fetchone():
             raise Deleted(rid, code="tombstoned")
@@ -338,8 +341,9 @@ class Engine:
             self._relation(
                 conn, rid, "part_of", record.parent_id, {"basis": "document structure"}
             )
-        self._index_text(conn, data)
-        self._dirty(conn, data)
+        if index:
+            self._index_text(conn, data)
+            self._dirty(conn, data)
         return data
 
     def add_record(self, record: RecordInput, command_id: str) -> dict:
@@ -477,8 +481,31 @@ class Engine:
                 dumps(data),
             ),
         )
-        self._index_text(conn, data)
-        self._dirty(conn, data)
+        if self._indexable(conn, data):
+            self._index_text(conn, data)
+            self._dirty(conn, data)
+            if data["status"] != "active":
+                # Organising reads active records only: a row for one that left active use
+                # would stay in the queue for ever (DB1-08).
+                conn.execute("DELETE FROM dirty WHERE record_id=?", (data["id"],))
+        else:
+            rowid = conn.execute("SELECT rowid FROM records WHERE id=?", (data["id"],)).fetchone()[0]
+            conn.execute("DELETE FROM search WHERE rowid=?", (rowid,))
+
+    @staticmethod
+    def _indexable(conn, data):
+        """Whether a record belongs in the text index: not when every source behind it is
+        classified as an origin nothing reads as memory (the host's own bookkeeping)."""
+        from .read_policy import UNINDEXED_ORIGINS, origin_of_rule
+
+        ids = sorted(set(data.get("source_ids") or ()))
+        if not ids:
+            return True
+        marks = ",".join("?" for _ in ids)
+        unindexed = {row[0] for row in conn.execute(
+            f"SELECT source_id,rule FROM source_evidence_class WHERE source_id IN ({marks})", ids)
+            if origin_of_rule(row[1]) in UNINDEXED_ORIGINS}
+        return not unindexed.issuperset(ids)
 
     def revise(self, rid, change: RevisionInput):
         with self.db.connect(write=True) as conn:

@@ -12,7 +12,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
-from eventmem.core.read_policy import ReadPolicy
+from eventmem.core.read_policy import ISOLATED, ReadPolicy, enabled_for, ref_classes
 
 from .autonomy_schema import optimized
 from .state import timestamp
@@ -42,6 +42,9 @@ RELATIONS = {"participates", "part_of", "continues", "responds_to", "produces", 
              "follows", "about", "related"}
 
 GET_MANY_PAGE_SIZE = 400
+# Where an item keeps the references it may not stand on (see `_unmixed`); the isolation
+# migration's name for the same thing.
+CONFIGURATION_EVIDENCE = "configuration_evidence"
 # Set in `meta` once the node index shares its rowids with `mind_graph_nodes`. From then on an
 # update removes its old index row by rowid; before, the only way was a scan of the whole index.
 SEARCH_ALIGNED = "mind_graph_search_rowid"
@@ -185,8 +188,36 @@ class EventGraph:
                     found.setdefault(row["id"], json.loads(row["data"]))
         return {i: found[i] if i in found else self.get(conn, i) for i in ordered}
 
-    def _put(self, conn, value, *, edge=False):
-        value = dict(value)
+    def _unmixed(self, conn, value):
+        """What a graph item may stand on (K4-13). Experience is never mixed with configuration,
+        synthetic examples or the host's own bookkeeping: when both are cited, the others move to
+        `configuration_evidence` — kept, never evidence — exactly as the isolation migration moves
+        them, so no writer can mix a node again after the migration separated it. An item that
+        cites nothing but those keeps them, and the read policy classifies it as what they are."""
+        refs = value.get("evidence") or []
+        if len(refs) < 2 or not enabled_for(conn, self.scope.key()):
+            return value
+        classes = ref_classes(self.engine, conn, self.scope, refs)
+        outside = [ref for ref, found in zip(refs, classes) if found.kind in ISOLATED]
+        if not outside or len(outside) == len(refs):
+            return value
+        kept = [ref for ref, found in zip(refs, classes) if found.kind not in ISOLATED]
+        dropped = {ref["source_id"] for ref in outside} - {ref["source_id"] for ref in kept}
+        held = list(value.get(CONFIGURATION_EVIDENCE) or [])
+        known = {(ref.get("record_id"), ref.get("revision")) for ref in held if isinstance(ref, dict)}
+        held.extend(ref for ref in outside if (ref.get("record_id"), ref.get("revision")) not in known)
+        out = {**value, "evidence": kept, CONFIGURATION_EVIDENCE: held,
+               "source_ids": sorted(set(value.get("source_ids") or ()) - dropped)
+               or sorted({ref["source_id"] for ref in kept})}
+        if out.get("basis") == "explicit" and not any(ref.get("authority") == "explicit" for ref in kept):
+            # The rule `apply()` uses whenever explicit evidence is lost.
+            out["basis"] = "inferred"
+        return out
+
+    def _put(self, conn, value, *, edge=False, isolate=True):
+        # `isolate=False` is for the isolation migration's own undo, which puts back exactly
+        # the archived version it took apart.
+        value = self._unmixed(conn, dict(value)) if isolate else dict(value)
         try:
             old = self.get(conn, value["id"])
         except Missing:
