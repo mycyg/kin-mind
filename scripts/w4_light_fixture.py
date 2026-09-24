@@ -8,6 +8,9 @@ the fixed topic vocabulary in this file. Rebuilding with the same --seed and
 
 Usage:
     uv run python scripts/w4_light_fixture.py --root <dir> [--scale 1.0]
+
+The corpus goes into the real scope's name, so --root must be a new directory: a root that
+already holds a store, or one a service holds, is refused before anything is written.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from kin_mind.continuity import ConcernChange
 from kin_mind.habits import ConversationHabits
 from kin_mind.memory import MemoryContinuity
 from kin_mind.state import AffectiveEvent, DesireChange, Mind
+from live_root import refuse_existing_store, refuse_live
 
 SCOPE = Scope(project="personal", persona="Kin", collection="default", world="real")
 # The feature set of the reference store the shapes were taken from. Read-path
@@ -185,6 +189,7 @@ def evidence_ref(conn, engine, sid):
 
 
 def build(root: Path, *, seed: int, anchor: datetime, scale: float = 1.0) -> dict:
+    root = refuse_existing_store(root)
     rng = random.Random(seed)
     engine = Engine(root)
     # End of the anchor day with explicit microseconds: every generated stamp
@@ -449,6 +454,7 @@ def main():
     args = parser.parse_args()
     anchor = datetime.fromisoformat(args.anchor_date).replace(tzinfo=timezone.utc)
     if args.queries_only:
+        refuse_live(args.root)
         manifest = json.loads((args.root / "w4-fixture-manifest.json").read_text())
         queries = build_queries(args.root, seed=args.seed, anchor=anchor, manifest=manifest)
         print(json.dumps({"queries": len(queries)}))

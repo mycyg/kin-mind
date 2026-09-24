@@ -145,12 +145,40 @@ def host_config(tmp_path, mind, **extra):
         **extra,
     }
 
-RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_ENCODING"}
+# Added by the child's own runtime rather than passed to it: the macOS toolchain shim, and
+# Python's C-locale coercion (PEP 538) when LANG is unset.
+RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
 
 ALLOWED_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE",
                "CODEX_HOME", "KIN_TEST_DS_KEY"}
 
 SRC = Path(__file__).resolve().parents[2] / "src"
+
+HOST_SECRETS = {"DEEPSEEK_API_KEY": "host-only", "OPENAI_API_KEY": "host-only",
+                "FEISHU_APP_SECRET": "host-only", "EVENTMEM_API_KEY": "host-only"}
+
+# The hermetic test runner carries its own guard into every child process; that is the runner's
+# doing, not the executor's, and only while the runner is active.
+GUARD_CARRIED = {"KIN_PROTECTED_ROOTS", "KIN_REMAP", "KIN_BLOCK_NETWORK", "KIN_BLOCKED_PORTS",
+                 "KIN_PROTECTED_PIDS", "PYTHONDONTWRITEBYTECODE", "PYTHONPATH", "NODE_OPTIONS"}
+
+def test_the_exploration_child_sees_only_its_allowlisted_environment(tmp_path, monkeypatch):
+    """No channel or model credential of the host reaches the codex child: only the allow-list,
+    its own CODEX_HOME and the one provider key named for the run."""
+    for key, value in {**HOST_SECRETS, "KIN_TEST_DS_KEY": "provider-key"}.items():
+        monkeypatch.setenv(key, value)
+    child = codex_env(tmp_path / "codex-home", env_key="KIN_TEST_DS_KEY")
+    assert set(child) <= ALLOWED_ENV and child["KIN_TEST_DS_KEY"] == "provider-key"
+    assert child["CODEX_HOME"] == str(tmp_path / "codex-home")
+    with pytest.raises(CodexUnavailable):
+        codex_env(tmp_path / "codex-home", env_key="CODEX_HOME")
+    fake = fake_codex(tmp_path / "fake-observe", OBSERVE + COMPLETE)
+    run_codex(fake, TOPIC, tmp_path / "job-observe", **codex_kwargs())
+    observed = json.loads(next((tmp_path / "job-observe").rglob("observed.json")).read_text())
+    carried = GUARD_CARRIED if os.environ.get("KIN_PROTECTED_ROOTS") else set()
+    assert set(observed["env"]) - RUNTIME_ADDED - carried <= ALLOWED_ENV
+    assert not set(observed["env"]) & set(HOST_SECRETS)
+    assert observed["env"]["KIN_TEST_DS_KEY"] == "provider-key"
 
 def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path, monkeypatch):
     """C7-regression: the executor path never touches the shared-session registry."""

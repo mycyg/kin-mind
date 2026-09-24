@@ -127,17 +127,51 @@ def test_exploration_text_repair_does_not_rerun_tools_and_citations_still_gate(t
     assert out['state']=='failed' and out['reason']=='unbacked-citation'
 
 
-def test_checkpoint_uses_native_room_and_waits_when_the_window_is_full(setup):
+def test_checkpoint_budget_is_fixed_and_does_not_shrink_with_the_window(setup):
+    # K3-05, T-22: the checkpoint is for the window after compaction. A full window
+    # used to leave it no room at all, so the compaction that needed it never started.
+    from kin_mind.context import Compression
     from kin_mind.session_checkpoint import SessionCheckpoint
     mind, _, _ = setup
     checkpoint = SessionCheckpoint(mind)
-    items = [{'id':str(i),'role':'user' if i%2==0 else 'assistant','text':'完整的聊天内容。'*300,'at':'2026-09-21T01:00:00Z','revision':1,'basis':'explicit','delivery':'accepted'} for i in range(8)]
+    binding = {'conversationId':'same','generation':1}
+    def snapshot(repeat):
+        items = [{'id':str(i),'role':'user' if i%2==0 else 'assistant','text':'完整的聊天内容。'*repeat,'at':'2026-09-21T01:00:0%dZ' % i,'revision':1,'basis':'explicit','delivery':'accepted'} for i in range(8)]
+        return {'configVersion':'synthetic-v1','cursors':{},'scope':mind.scope.model_dump(),'shared':{},'sourceRevisions':{},'items':items}
+    built = checkpoint.build(snapshot(40),binding,adaptive_budget=True,allow_model=False)
+    assert built['complete'] and 2000 < built['budgetPlan']['effective'] <= 8000 and built['budgetPlan']['limit'] == 8000
+    assert built['tokens'] <= built['budgetPlan']['effective'] and [i['id'] for i in built['items']] == [str(i) for i in range(8)]
+    # Four long exchanges exceed the ceiling: the latest keep their words, the rest wait
+    # for a sourced summary instead of pushing the checkpoint past its allowance.
+    long = checkpoint.build(snapshot(300),binding,adaptive_budget=True,allow_model=False)
+    assert not long['complete'] and long['tokens'] <= 8000 and long['items'][-1]['id'] == '7'
+    class Summaries:
+        model = 'synthetic-summary'
+        def structured(self, name, schema, system, payload, **kwargs):
+            entries = [{'item_ids':[i['id']], 'summary':'第%s条的要点。' % i['id']} for i in payload['items']]
+            return Compression.model_validate({'entries':entries,'omitted_ids':[]}), {'model':self.model}
+    summarized = checkpoint.build(snapshot(300),binding,adaptive_budget=True,provider=Summaries())
+    assert summarized['complete'] and summarized['tokens'] <= summarized['budgetPlan']['effective'] <= 8000
+    assert summarized['items'][0]['id'].startswith('summary:') and summarized['items'][-1]['text'] == '完整的聊天内容。'*300
+    with pytest.raises(TypeError):
+        checkpoint.build(snapshot(40),binding,native_capacity=300,adaptive_budget=True,allow_model=False)
+    with pytest.raises(ValueError):
+        checkpoint.build(snapshot(40),binding,budget=9000,adaptive_budget=True,allow_model=False)
+
+
+def test_checkpoint_identity_ignores_its_allowance(setup):
+    # K3-09: the same content is the same checkpoint, so a prepared candidate is not
+    # judged stale and rebuilt because a budget number moved.
+    from kin_mind.session_checkpoint import SessionCheckpoint
+    mind, _, _ = setup
+    checkpoint = SessionCheckpoint(mind)
+    items = [{'id':str(i),'role':'user' if i%2==0 else 'assistant','text':'短句。','at':'2026-09-21T01:00:00Z','revision':1,'basis':'explicit','delivery':'accepted'} for i in range(8)]
     snapshot = {'configVersion':'synthetic-v1','cursors':{},'scope':mind.scope.model_dump(),'shared':{},'sourceRevisions':{},'items':items}
     binding = {'conversationId':'same','generation':1}
-    ample = checkpoint.build(snapshot,binding,native_capacity=50000,adaptive_budget=True,allow_model=False)
-    assert ample['complete'] and ample['budgetPlan']['effective']>2000
-    full = checkpoint.build(snapshot,binding,native_capacity=300,adaptive_budget=True,allow_model=False)
-    assert not full['complete'] and full['budgetPlan']['limit']==300
+    small = checkpoint.build(snapshot,binding,budget=2000,adaptive_budget=True,allow_model=False)
+    large = checkpoint.build(snapshot,binding,budget=4000,adaptive_budget=True,allow_model=False)
+    assert small['budgetPlan'] != large['budgetPlan'] and small['id'] == large['id']
+    assert 'budgetPlan' not in small['payload'] and small['payload'] == large['payload']
 
 
 def test_a_failed_native_assessment_waits_and_is_tried_again(setup):

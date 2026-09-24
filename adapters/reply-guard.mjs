@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {TransportManifests,manifestView,groupIdFor} from './transport-manifest.mjs';
+import {TransportManifests,manifestView} from './transport-manifest.mjs';
 import {ReplyTail} from './reply-tail.mjs';
 import {privateReplyBoundary} from './chat-bubbles.mjs';
 
@@ -31,23 +31,24 @@ export function outboxEvidence(directories) {
   return values.sort((a,b)=>(b.at??'').localeCompare(a.at??''));
 }
 
-/** One sender. Old pending journals are imported, never dispatched by a second implementation. */
+/** One sender. Old pending journals are imported, never dispatched by a second
+ * implementation. Nobody rewrites Kin's words and nothing here speaks to the
+ * owner: what could not go out is owed to her next turn (`ReplyTail`), and the
+ * owner hears about an input the host could not finish from the router's
+ * watchdog, as the system (`notifyOwner`). */
 export class ReplyGuard {
   constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),onOutcome=()=>{},
     manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry,
-    replyTailDecision=true,decideTail=null,ownerEpoch=null,onTail=null,onWake=()=>{},
-    tailLimits,tailHooks,tailWaitMs=5000,regenerate=null,notifyFailure=null}) {
-    Object.assign(this,{call,directory,outbox,clock,onOutcome,channel,tailWaitMs,regenerate,notifyFailure});
+    ownerEpoch=null,onTail=null,tailLimits,tailHooks,tailWaitMs=5000}) {
+    Object.assign(this,{call,directory,outbox,clock,onOutcome,channel,tailWaitMs});
     this.active=new Map();
     this.manifests=new TransportManifests({directory:manifestDirectory??path.join(directory,'reply-manifests'),
       clock,contracts,emit,lease,role,hooks,sleep,retry,
       receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
       cancelShare:draftId=>this.call?.('share-cancel',{draft_id:draftId}),
-      review:requests=>this.checkGroup(requests),onOutcome,
-      keepLive:m=>['partial','undeliverable'].includes(m.state)&&!m.recovery?.notice});
-    this.tail=replyTailDecision?new ReplyTail({manifests:this.manifests,clock,decide:decideTail,
-      ownerEpoch,onWake,hooks:tailHooks,limits:tailLimits,
-      onEvent:detail=>(onTail??onOutcome)(detail)}):null;
+      review:requests=>this.checkGroup(requests),onOutcome});
+    this.tail=new ReplyTail({manifests:this.manifests,clock,ownerEpoch,hooks:tailHooks,limits:tailLimits,
+      onEvent:detail=>(onTail??onOutcome)(detail)});
   }
   async check(request) {
     const result=await this.checkGroup([request]);
@@ -62,17 +63,12 @@ export class ReplyGuard {
     }
     return directReply(entries);
   }
-  reviewGroup(requests){return this.checkGroup(requests);}
   report(result,groupId) {
-    if(result.busy||result.lost||!result.manifest)return {state:result.busy?'busy':result.lost?'lease-lost':'missing',groupId,entries:[]};
-    return manifestView(result.manifest);
+    if(result.busy||result.lost||!result.manifest)return {state:result.busy?'busy':result.lost?'lease-lost':'missing',groupId,entries:[],worked:false};
+    return {...manifestView(result.manifest),worked:Boolean(result.worked)};
   }
-  draft(entries,ownerEpoch,channel,hold=null) {
-    const continues=this.tail?.continuesFor(entries)??[];
-    return this.manifests.createDraft({entries,ownerEpoch,channel,hold,...(continues.length?{continues}:{})});
-  }
+  draft(entries,ownerEpoch,channel){return this.manifests.createDraft({entries,ownerEpoch,channel});}
   replyGroup(entries,ownerEpoch,options={}) {return this.deliver(entries,ownerEpoch,options);}
-  deliverGroup(entries,ownerEpoch,_review,options={}) {return this.deliver(entries,ownerEpoch,options);}
   async deliver(entries,ownerEpoch,options={}) {
     const draft=this.draft(entries,ownerEpoch,options.channel??this.channel);
     return this.run(draft.group_id,options);
@@ -83,115 +79,30 @@ export class ReplyGuard {
     this.active.set(groupId,work);return work;
   }
   async dispatch(groupId,options) {
-    const prior=this.manifests.read(groupId);
-    if(prior?.recovery)return this.recover(prior,options);
-    if(this.tail)await within(this.tail.linkNew(prior).catch(()=>{}),this.tailWaitMs);
-    const result=await this.manifests.run(groupId,{guard:this.tail?.guard(options.guard)??options.guard,transport:options.send});
+    const result=await this.manifests.run(groupId,{guard:this.tail.guard(options.guard),transport:options.send});
     if(!result.manifest||result.busy||result.lost)return this.report(result,groupId);
-    const current=result.manifest;
-    if(current.state==='held'&&directReply(current.bubbles.map(b=>b.request)).route==='repair')
-      return this.recover(current,options);
-    if(['partial','undeliverable'].includes(current.state))return this.failureNotice(current,options);
-    if(this.tail)await within(this.tail.after(result).catch(()=>{}),this.tailWaitMs);
+    // An interruption becomes an obligation to Kin's next turn at once.
+    if(result.manifest.state==='interrupted') {
+      await within(this.tail.after(result).catch(()=>{}),this.tailWaitMs);
+      return this.report({...result,manifest:this.manifests.read(groupId)??result.manifest},groupId);
+    }
     return this.report(result,groupId);
   }
-  async allowed(manifest,options) {
-    const answer=await options.guard?.(manifestView(manifest))??'send';
-    return typeof answer==='string'?answer:answer.action;
+  /** Before an owner message is submitted: what is still going out from before it
+   * stops at a bubble boundary, and what that leaves unsaid is owed (bounded wait). */
+  interruptFor({inputId=null,waitMs}={}) {
+    return this.tail.interruptFor({inputId,active:[...this.active.values()],...(waitMs!==undefined?{waitMs}:{})});
   }
-  /** A single text-only correction, persisted on the original delivery record before calling DS. */
-  async recover(manifest,options) {
-    const id=manifest.group_id;
-    if(manifest.recovery?.notice)return {state:'failed',reason:manifest.recovery.reason,groupId:id,
-      notified:manifest.recovery.notice.state==='accepted',entries:[]};
-    if(await this.allowed(manifest,options)!=='send')return manifestView(manifest);
-    if(manifest.recovery?.replacement)return this.run(manifest.recovery.replacement,options);
-    // Draft creation and linking can be separated by a restart. Its deterministic
-    // batch identity recovers that one replacement without a second model call.
-    const replacementId=groupIdFor([{delivery:{memoryBatchId:id+'-r1'}}]);
-    if(this.manifests.read(replacementId)) {
-      await this.manifests.retireRemainder(id,{reason:'reply-regenerated'});
-      return this.run(replacementId,options);
-    }
-    if(manifest.bubbles.some(b=>b.fragments.some(f=>['submitting','unknown'].includes(f.state))))
-      return this.failureNotice(manifest,options,'delivery-outcome-unknown');
-    let claimed=false;
-    const claim=await this.manifests.mutate(id,value=>{
-      if(value.recovery?.attempts)return false;
-      value.recovery={attempts:1,reason:value.reason??'invalid-reply',startedAt:this.clock()};claimed=true;
-    },{operatorOnly:true});
-    if(claim.busy||claim.lost)return this.report(claim,id);
-    manifest=claim.manifest??manifest;
-    if(!claimed) {
-      if(this.clock()-manifest.recovery.startedAt<150000)return {state:'busy',groupId:id,entries:[]};
-      return this.failureNotice(manifest,options,'reply-repair-interrupted');
-    }
-    try {
-      const unsent=manifest.bubbles.filter(b=>!['accepted','canceled'].includes(b.state)).map(b=>
-        b.fragments.some(f=>f.state==='accepted')?b.fragments.filter(f=>f.state==='unsent').map(f=>b.text.slice(f.start,f.end)).join(''):b.request.text??b.text);
-      const repaired=await this.regenerate?.({input_id:manifest.reply_id,reason:manifest.recovery.reason,
-        draft:unsent.join('\n\n'),
-        sent:manifest.bubbles.flatMap(b=>b.state==='accepted'?[b.text]:b.fragments.filter(f=>f.state==='accepted').map(f=>b.text.slice(f.start,f.end)))});
-      if(!Array.isArray(repaired?.bubbles)||directReply(repaired.bubbles.map(text=>({text}))).state!=='ready')
-        throw Error('reply-repair-unavailable');
-      if(await this.allowed(manifest,options)!=='send') {
-        await this.manifests.retireRemainder(id,{reason:'input-or-session-superseded'});
-        return {state:'canceled',groupId:id,entries:[]};
-      }
-      const basis=manifestView(manifest).entries[0];
-      const entries=repaired.bubbles.map((text,i)=>({
-        request:{...basis.request,draft_id:id+'-r1-'+i,text,repair_reason:null,references:[]},
-        delivery:{...basis.delivery,id:basis.delivery.id+'-r1-'+i,text,references:[],
-          memoryBatchId:id+'-r1',expectedBubbles:repaired.bubbles.length,draftId:id+'-r1-'+i}
-      }));
-      const next=this.draft(entries,manifest.ownerEpoch,manifest.channel);
-      await this.manifests.mutate(id,value=>{value.recovery.replacement=next.group_id;value.recovery.receipt=repaired.receipt??null;},{operatorOnly:true});
-      await this.manifests.retireRemainder(id,{reason:'reply-regenerated'});
-      return this.run(next.group_id,options);
-    }catch(error) {
-      await this.manifests.mutate(id,value=>{value.recovery.error=error.code??error.message??'reply-repair-failed';},{operatorOnly:true});
-      return this.failureNotice(this.manifests.read(id)??manifest,options,'reply-repair-failed');
-    }
-  }
-  async failureNotice(manifest,options,reason=manifest.reason??'reply-incomplete') {
-    if(await this.allowed(manifest,options)!=='send')return manifestView(manifest);
-    if(manifest.recovery?.notice?.state==='accepted')return {state:'failed',reason,groupId:manifest.group_id,notified:true,entries:[]};
-    let receipt;
-    try{receipt=await this.notifyFailure?.(manifestView(manifest),reason);}
-    catch{receipt={state:'unconfirmed'};}
-    await this.manifests.mutate(manifest.group_id,value=>{
-      value.recovery={...value.recovery,notice:receipt??{state:'failed'},reason};
-    });
-    if(!['partial','undeliverable','blocked-unknown'].includes(manifest.state))
-      await this.manifests.retireRemainder(manifest.group_id,{reason:'reply-repair-failed'});
-    this.onOutcome({state:'failed',reason,inputId:manifest.reply_id,groupId:manifest.group_id,notified:receipt?.state==='accepted'});
-    return {state:'failed',reason,groupId:manifest.group_id,notified:receipt?.state==='accepted',entries:[]};
-  }
-  deferGroup(entries,ownerEpoch){return this.park(entries,ownerEpoch,60000);}
-  defer(request,delivery,ownerEpoch){return this.park([{request,delivery}],ownerEpoch,60000);}
-  park(entries,ownerEpoch,delay) {
-    return manifestView(this.draft(entries,ownerEpoch,this.channel,{reason:'delivery-deferred',retryAt:this.clock()+delay}));
-  }
+  /** The periodic pass: legacy pending journals, then the one resume loop of
+   * the manifests (AD2-02), each group through this guard's own pass. */
   async resumeDue({guard,send,limit=2}) {
     if(this.resuming)return {state:'idle'};
-    this.resuming=true;let handled=0;
+    this.resuming=true;
     try {
       const imported=this.manifests.importLegacy(this.directory).imported.length;
-      if(this.tail)await this.tail.recover().catch(()=>{});
-      for(const id of this.manifests.live()) {
-        if(handled>=limit)break;
-        const manifest=this.manifests.read(id);
-        if(!manifest||manifest.state==='interrupted'||manifest.retryAt>this.clock())continue;
-        if(['retired','accepted'].includes(manifest.state)) {
-          if(this.manifests.owes(manifest)){await this.manifests.reconcileGroup(id);handled++;}
-          continue;
-        }
-        if(manifest.state==='held'&&manifest.parked)await this.manifests.unpark(id);
-        const result=await this.run(id,{guard,send});
-        if(!['busy','lease-lost','unconfirmed'].includes(result.state))handled++;
-      }
-      if(this.tail)await this.tail.tick({guard}).catch(()=>{});
-      return {state:handled?'checked':'idle',checked:handled,imported};
+      await this.tail.recover().catch(()=>{});
+      const result=await this.manifests.resumeDue({guard,transport:send,limit,run:id=>this.run(id,{guard,send})});
+      return {...result,imported};
     }finally{this.resuming=false;}
   }
 }

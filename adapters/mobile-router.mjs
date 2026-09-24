@@ -2,18 +2,28 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {writeJsonAtomic,readJsonFile,loadJson} from './atomic-json.mjs';
-import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
+import {publicMobileRuntime,runtimeReply,TASK_CLOSED,openTask} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {messageIntents} from './mobile-reviewer.mjs';
 import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile} from './codex-models.mjs';
+import {inputSettled,inputInFlight,inputSummary,unsettledView,emptySummary,ownerInput,answered,turnRunning,SUBMIT_RETRY_MS} from './input-ledger.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
-const open = task => !['completed','canceled'].includes(task.status);
+const open=openTask;
+/** What Kin may declare about a task. The host verifies facts, never the choice. */
+export const TASK_OUTCOMES=Object.freeze(['completed','partial','declined','deferred']);
+export {TASK_CLOSED,openTask};
+/** A deferral names a moment within this long. */
+export const DEFER_MAX_MS=30*24*3600000;
+/** A delivery that will not change by waiting. A held draft is a fact Kin is told
+ * about, never something the host waits on or withdraws (N3). */
 const settledDelivery = delivery => delivery.state==='accepted'?Boolean(delivery.messageId):
-  ['rejected','undeliverable','retired','not-submitted','canceled-before-send'].includes(delivery.state);
+  ['rejected','undeliverable','retired','not-submitted','canceled-before-send','deferred'].includes(delivery.state);
+const terminalTool = tool => ['completed','failed','canceled','cancelled'].includes(tool.status);
 const SHA256=/^[a-f0-9]{64}$/i;
 const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conversationId','generation','id','ownerBindingSha256','sourceSha256','version'];
+/** Built-in defaults. A host passes its configured profiles; nothing here decides them (AD1-15). */
 export const ROUTER_PROFILES = Object.freeze({
   chat:Object.freeze({model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}),
   work:Object.freeze({model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
@@ -31,6 +41,12 @@ export const SEMANTIC_RETRY_BUDGET=4;
  * unknown is looked up at most this many times before it stops polling. */
 export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
+/** How long a freeze nobody lifts holds new dispatch. */
+export const FREEZE_TTL_MS=2*3600000;
+/** Hot state keeps what is unsettled plus a bounded recent tail; the rest moves to
+ * `archive/router-YYYY-MM.jsonl` beside the state file, never deleted (AD1-08). */
+export const HOT_LIMITS=Object.freeze({inputs:200,internal:24,tasks:32,requests:64,notices:64,history:64,journalBytes:8*1024*1024});
+const frozenError=reason=>Object.assign(Error('Dispatch is frozen: '+reason),{code:'dispatch-frozen',retryable:true});
 /** Why a classification attempt failed. The class is recorded, never collapsed
  * into one anonymous catch: timeout / http / parse / unavailable. */
 export function classificationFailure(error) {
@@ -80,7 +96,8 @@ export function modeCommand(text) {
 /** Every durable adapter state file is written through here: a temporary name no
  * other writer can share, fsync before the rename, and — for the files that must
  * survive a corrupt revision — the replaced one kept as `<file>.prev`. */
-export function atomicJson(file,value,{previous=false}={}) {writeJsonAtomic(file,value,{previous,pretty:true});}
+export function atomicJson(file,value,{previous=false,pretty=true}={}) {writeJsonAtomic(file,value,{previous,pretty});}
+const month=at=>new Date(Number.isFinite(at)?at:0).toISOString().slice(0,7);
 
 export const STATE_RECOVERY=Object.freeze({previous:'restored-from-previous-revision',none:'state-file-unreadable'});
 /** Load one durable state file: the file itself, else the `.prev` copy the writer
@@ -99,18 +116,22 @@ export function loadState(file,{schema=1,validate=()=>true,now=()=>Date.now()}={
 /** One host owns this durable state; all provider changes and input acceptance
  * share its mutex. MCP requests only record intent and never wait for a turn. */
 export class MobileRouter {
-  /** `replyTail` is the host's reply-tail port (`pending`, `decided`, `missed`, `stopped`), all
-   * optional. It lets the unsent rest of an interrupted reply ride on the routing call this
-   * router makes anyway; without it nothing here changes.
+  /** `replyTail` is the host's reply-tail port. Its one method, `stopped`, hears the owner's
+   * literal stop, so what is still unsent of an earlier reply is withdrawn and owed to Kin's
+   * next turn (N4). No model is asked about it; without the port nothing here changes.
    * `classifyIntents` lets that same call carry what the owner wants done with the message —
    * whether to stop the running task, whether a file was asked for, what they call themselves
    * — and lets an owner message with attachments be classified instead of assumed to be work.
-   * Left off, every request and every record is what it was before intents existed. */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null}) {
+   * Left off, every request and every record is what it was before intents existed.
+   * `profiles` are the host's configured chat and work routing profiles; `hotLimits`
+   * narrows what the state file keeps (see HOT_LIMITS). */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,profiles=null,hotLimits=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
-    this.tail=Promise.resolve();this.inflight=new Map();
+    this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
+    this.profiles=Object.freeze({chat:Object.freeze({...ROUTER_PROFILES.chat,...profiles?.chat}),work:Object.freeze({...ROUTER_PROFILES.work,...profiles?.work})});
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
-    this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
+    this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
     // A quarantined revision is never a silent fresh start: what happened is recorded,
     // and with nothing left to restore the accepted inputs come back from the journal.
@@ -121,24 +142,117 @@ export class MobileRouter {
       this.state.conversationId=binding.conversationId;this.state.generation=binding.generation;this.state.nativeSessionId=binding.nativeSessionId;this.state.sessionId=sessionId;
     }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
     this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};this.state.reclassifications??={};
-    this.state.executionEpoch??=0;this.state.forceBoundaries??=[];this.state.autoIdleProfile??=clone(ROUTER_PROFILES.chat);
-    for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
+    this.state.executionEpoch??=0;this.state.forceBoundaries??=[];this.state.autoIdleProfile??=clone(this.profiles.chat);
+    const at=now();
+    // A native command cannot outlive the ACP process that ran it: it is interrupted,
+    // never left counting as running work (AD1-03).
+    for(const operation of Object.values(this.state.operations))if(['submitted','running','unconfirmed'].includes(operation.state)){operation.state='interrupted';operation.interruptedAt=at;}
     for(const request of Object.values(this.state.requests))if(request.forceState==='interrupting')request.forceState='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
     // A classification attempt interrupted mid-call is retried, never concluded.
     for(const entry of Object.values(this.state.semanticPending))if(entry.state==='classifying')entry.state='retry';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
-    for(const record of Object.values(this.state.inputs)){if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';}
+    for(const record of Object.values(this.state.inputs)){
+      // An interrupted acceptance cannot safely be replayed; an input that only
+      // reached the in-memory session queue provably never reached the native session.
+      if(record.state==='submitting')record.state='unconfirmed';
+      if(record.state==='preparing')this.notSubmitted(record,'restart-before-submission',{restart:true});
+      if(record.state==='queued')this.notSubmitted(record,'queued-prompt-never-started',{restart:true});
+      // A notice whose send was cut off is looked up by its own id, never sent anew.
+      if(record.ownerNotice?.state==='sending')record.ownerNotice.state='unknown';
+      // A native turn cannot outlive the process that ran it.
+      if(record.turnStartedAt&&!(record.turnEndedAt>=record.turnStartedAt)){record.turnEndedAt=at;record.stopReason='host-restart';}
+    }
+    delete this.state.turn;
     if(this.state.transition?.state==='switching')this.state.transition.state='unconfirmed';
+    // KIN-FIX-20260924: records written before the ledger existed have no reply facts.
+    // An accepted one is taken as answered; any other keeps its reason and id as
+    // history and is never acted on, or counted as unsettled, again.
+    if(this.state.ledgerVersion!==2) {
+      for(const record of Object.values(this.state.inputs)) {
+        if(record.state==='accepted')record.answer??={state:'legacy'};
+        else if(!inputInFlight(record)&&record.state!=='superseded')record.historical={at,reason:'pre-ledger:'+record.state};
+      }
+      // A stopped turn no longer fails its task (AD1-11), and a task that already held
+      // the lock was taken on under the old rules.
+      for(const task of Object.values(this.state.tasks))if(open(task)){
+        if(task.status==='failed')task.status='running';
+        task.acceptedAt??=task.createdAt??at;task.acceptance??='legacy';
+      }
+      this.state.ledgerVersion=2;
+    }
+    this.archivedIds=this.loadArchivedIds();
     this.save('startup');
   }
   save(kind,detail={}) {
     this.state.revision++;
     const event={at:this.now(),kind,...detail,revision:this.state.revision};
     this.state.history.push(event);
-    this.state.history=this.state.history.slice(-200);
-    atomicJson(this.file,this.state,{previous:true});
-    fs.appendFileSync(this.file+'.events.jsonl',JSON.stringify(event)+'\n',{mode:0o600});
+    this.state.history=this.state.history.slice(-this.hotLimits.history);
+    // Compact on disk; the journal keeps every event (AD1-08).
+    writeJsonAtomic(this.file,this.state,{previous:true,pretty:false});
+    const journal=this.file+'.events.jsonl';
+    fs.appendFileSync(journal,JSON.stringify(event)+'\n',{mode:0o600});
+    if(this.state.revision%256===0)this.rotateJournal(journal);
+  }
+  archiveDirectory(){return path.join(path.dirname(this.file),'archive');}
+  /** The journal is read only for its tail; past its size the older part moves to the archive. */
+  rotateJournal(journal) {
+    try {
+      if(fs.statSync(journal).size<this.hotLimits.journalBytes)return;
+      fs.mkdirSync(this.archiveDirectory(),{recursive:true,mode:0o700});
+      const target=path.join(this.archiveDirectory(),path.basename(this.file)+'.events-'+new Date(this.now()).toISOString().replace(/[:.]/g,'-')+'.jsonl');
+      if(!fs.existsSync(target))fs.renameSync(journal,target);
+    } catch {/* The journal stays where it is and is tried again later. */}
+  }
+  /** Ids of archived inputs: a replay of one is refused, never re-run. The id index
+   * is read when present; the monthly files are scanned only without it. */
+  loadArchivedIds() {
+    const ids=new Set(),directory=this.archiveDirectory(),index=path.join(directory,'router-input-ids.txt');
+    try {
+      if(fs.existsSync(index)){for(const line of fs.readFileSync(index,'utf8').split('\n'))if(line)ids.add(line);return ids;}
+      for(const name of fs.readdirSync(directory).filter(name=>/^router-\d{4}-\d{2}\.jsonl$/.test(name)))
+        for(const line of fs.readFileSync(path.join(directory,name),'utf8').split('\n'))
+          try {const entry=JSON.parse(line);if(entry.kind==='input'&&typeof entry.id==='string')ids.add(entry.id);} catch {}
+    } catch {/* No archive yet. */}
+    return ids;
+  }
+  /** Settled records beyond the hot tail move out of the state file, oldest first,
+   * into the month they settled in. What is open, pending or still referenced stays. */
+  prune() {
+    const at=this.now(),byMonth=new Map(),movedIds=[];
+    const move=(kind,id,record)=>{const key=month(record.settledAt??record.acceptedAt??record.at??record.createdAt??at);
+      const list=byMonth.get(key)??[];list.push({kind,id,archivedAt:at,record});byMonth.set(key,list);};
+    const inputs=Object.values(this.state.inputs),owner=inputs.filter(r=>ownerInput(r)&&inputSettled(r)),internal=inputs.filter(r=>!ownerInput(r)&&inputSettled(r));
+    const limits=this.hotLimits,excess=[...owner.slice(0,Math.max(0,owner.length-limits.inputs)),...internal.slice(0,Math.max(0,internal.length-limits.internal))];
+    const referenced=new Set(Object.values(this.state.tasks).filter(open).flatMap(t=>[...t.inputIds,...(t.contextInputIds??[])]));
+    for(const record of excess)if(!referenced.has(record.id)&&!this.inflight.has(record.id)){
+      move('input',record.id,record);delete this.state.inputs[record.id];delete this.state.semanticPending[record.id];this.archivedIds.add(record.id);movedIds.push(record.id);
+    }
+    const closed=Object.values(this.state.tasks).filter(t=>!open(t));
+    for(const task of closed.slice(0,Math.max(0,closed.length-limits.tasks))){move('task',task.id,task);delete this.state.tasks[task.id];}
+    const settledNotice=n=>['accepted','rejected','failed','superseded','suppressed','unresolved'].includes(n.state);
+    const kept=new Set([...Object.values(this.state.tasks).flatMap(t=>[t.handoff?.id,t.completion?.commandId,t.acceptedBy]),
+      ...Object.values(this.state.notices).filter(n=>!settledNotice(n)).map(n=>n.requestId),...Object.values(this.state.reclassifications??{}).map(r=>r.requestId)].filter(Boolean));
+    const requests=Object.values(this.state.requests).filter(r=>r.state!=='pending');
+    for(const request of requests.slice(0,Math.max(0,requests.length-limits.requests))){
+      const id=request.commandId??Object.keys(this.state.requests).find(key=>this.state.requests[key]===request);
+      if(id&&!kept.has(id)){move('request',id,request);delete this.state.requests[id];}
+    }
+    const lastTold=Object.values(this.state.notices).filter(n=>n.state==='accepted').sort((a,b)=>(a.acceptedAt??0)-(b.acceptedAt??0)).at(-1)?.id;
+    const notices=Object.values(this.state.notices).filter(n=>settledNotice(n)&&n.id!==lastTold);
+    for(const notice of notices.slice(0,Math.max(0,notices.length-limits.notices))){move('notice',notice.id,notice);delete this.state.notices[notice.id];}
+    if(!byMonth.size)return 0;
+    fs.mkdirSync(this.archiveDirectory(),{recursive:true,mode:0o700});
+    let moved=0;
+    for(const [key,list] of byMonth){fs.appendFileSync(path.join(this.archiveDirectory(),'router-'+key+'.jsonl'),list.map(entry=>JSON.stringify(entry)).join('\n')+'\n',{mode:0o600});moved+=list.length;}
+    if(movedIds.length){
+      const index=path.join(this.archiveDirectory(),'router-input-ids.txt');
+      // An index that is missing while archives exist is rebuilt from them first.
+      if(!fs.existsSync(index))fs.writeFileSync(index,[...this.archivedIds].filter(id=>!movedIds.includes(id)).map(id=>id+'\n').join(''),{mode:0o600});
+      fs.appendFileSync(index,movedIds.map(id=>id+'\n').join(''),{mode:0o600});
+    }
+    return moved;
   }
   /** With no revision left to restore, the append-only journal still names every
    * input this router accepted. They come back unconfirmed, so a replayed input is
@@ -188,8 +302,73 @@ export class MobileRouter {
     return runtime.known&&runtime.profileReady!==false&&profileMatches(runtime,profile)&&
       runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===(this.state.nativeSessionId??this.sessionId);
   }
+  // ---- The input ledger: the one definition of an unsettled input, its eight-state
+  // summary, and the freeze a release or a segment swap puts on new dispatch.
+  /** Every input with no outcome yet, by its original id and fact state. Inbox jobs
+   * the router has not seen yet are named by the host through `received`. */
+  unsettledInputs({received=[]}={}) {
+    const now=this.now(),list=Object.values(this.state.inputs).filter(record=>!inputSettled(record)).map(record=>unsettledView(record,now));
+    for(const job of received)if(!this.state.inputs[job.id]&&!this.archivedIds.has(job.id))
+      list.push({id:job.id,kind:job.kind??'owner',state:'received',summary:'received',inFlight:job.processing===true,at:job.at??null,ageMs:Number.isFinite(job.at)?Math.max(0,now-job.at):null});
+    return list;
+  }
+  /** Owner inputs in the eight summary states. Records older than the ledger are
+   * counted apart, and the host's own turns are summarised on their own. */
+  summary({received=[]}={}) {
+    const owner=emptySummary(),internal=emptySummary();let historical=0;
+    for(const record of Object.values(this.state.inputs)) {
+      const state=inputSummary(record);
+      if(state==='historical'){historical++;continue;}
+      (ownerInput(record)?owner:internal)[state]++;
+    }
+    for(const job of received)if(!this.state.inputs[job.id]&&!this.archivedIds.has(job.id))owner.received++;
+    return {...owner,historical,internal,archived:this.archivedIds.size,frozen:this.frozen()?clone(this.state.freeze):null};
+  }
+  frozen() {
+    const freeze=this.state.freeze;
+    return Boolean(freeze&&!(Number.isFinite(freeze.until)&&freeze.until<=this.now()));
+  }
+  /** Stop new dispatch — both channels, the mind's turns, handoffs and mode changes
+   * nobody forced — while in-flight work settles. The owner's literal stop and her
+   * own mode commands still act. It survives a restart and lifts itself at `until`
+   * (two hours unless asked otherwise), so a release or migration that is lost half
+   * way can never leave the owner unanswered for good. Asking again for the same
+   * migration changes nothing, so a caller may poll it while it drains. */
+  freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null}={}) {
+    return this.locked(async()=>{
+      if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
+      const current=this.frozen()?this.state.freeze:null,id=migrationId?String(migrationId).slice(0,120):null;
+      if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id)return clone(current);
+      const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:FREEZE_TTL_MS,60000),12*3600000);
+      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{})};
+      this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until,...(id?{migrationId:id}:{})});
+      return clone(this.state.freeze);
+    });
+  }
+  thawDispatch(reason='thawed',{migrationId=null}={}) {
+    return this.locked(async()=>{
+      const previous=this.state.freeze;if(!previous)return {state:'not-frozen'};
+      delete this.state.freeze;this.save('dispatch-thawed',{reason:String(reason).slice(0,200),frozenAt:previous.at,...(migrationId?{migrationId:String(migrationId).slice(0,120)}:{})});
+      return {state:'thawed',frozenAt:previous.at,...(previous.migrationId?{migrationId:previous.migrationId}:{})};
+    });
+  }
+  /** Facts about open work for Kin's next turn. States what is true; asks nothing. */
+  workFacts() {
+    return this.tasks().map(task=>{
+      const deliveries=Object.entries(task.deliveries??{});
+      return {id:task.id,status:task.status,request:String(task.summary??'').slice(0,200),inputVersion:task.inputVersion,
+        ...(task.status==='proposed'?{acceptance:'not-yet-accepted'}:{acceptedAt:task.acceptedAt??null}),
+        ...(task.completion?.outcome&&task.completion.state!=='historical-proposal'?{declared:{outcome:task.completion.outcome,at:task.completion.at}}:{}),
+        ...(task.interruptedBy?{interruptedBy:task.interruptedBy}:{}),...(task.cancelRequested?{cancelRequested:true}:{}),
+        turn:{startedAt:task.turnStartedAt??null,endedAt:task.turnEndedAt??null,stopReason:task.stopReason??null},
+        toolsRunning:Object.values(task.tools??{}).filter(tool=>!terminalTool(tool)).length,
+        unsentDrafts:deliveries.filter(([,d])=>['deferred','not-submitted'].includes(d.state)&&!d.fulfilledBy).map(([id])=>id).slice(0,16),
+        unknownDeliveries:deliveries.filter(([,d])=>['unconfirmed','unknown'].includes(d.state)).map(([id])=>id).slice(0,16),
+        ...(task.workSummary?{workSummary:clone(task.workSummary)}:{}),...(task.deferral?{deferral:clone(task.deferral)}:{})};
+    });
+  }
   async availableModels(runtime=null) {
-    try{return normalizeModelCatalog(await this.modelCatalog?.(runtime)??[]);}catch{return [];}
+    try{const models=normalizeModelCatalog(await this.modelCatalog?.(runtime)??[]);this.rememberModelNames(models);return models;}catch{return [];}
   }
   async resolvedProfile(profile) {
     if(!profile||profile.model==='__unsupported__'||profile.reasoningEffort==='__unsupported__'||profile.serviceTierPreference==='__unsupported__')throw Error('Unsupported model profile');
@@ -203,10 +382,10 @@ export class MobileRouter {
     actual.serviceTierPreference??=actual.fastMode==='on'||actual.fastMode===true?'fast':actual.fastMode==='off'||actual.fastMode===false?'default':null;
     return {actual,target};
   }
-  automaticIdleProfile() {return clone(this.state.autoReturnProfile??this.state.autoIdleProfile??ROUTER_PROFILES.chat);}
+  automaticIdleProfile() {return clone(this.state.autoReturnProfile??this.state.autoIdleProfile??this.profiles.chat);}
   desiredProfile(runtime,{route=null}={}) {
     if(this.state.mode==='manual'&&this.state.manualProfile)return clone(this.state.manualProfile);
-    if(this.tasks().length||this.state.mode==='work'||route==='work')return clone(ROUTER_PROFILES.work);
+    if(this.tasks().length||this.state.mode==='work'||route==='work')return clone(this.profiles.work);
     return this.automaticIdleProfile()??runtimeProfile(runtime);
   }
   captureAutomaticReturn(runtime) {
@@ -250,11 +429,16 @@ export class MobileRouter {
       this.finishTransition(actual);transition.state='failed-restored';this.save('switch-recovered');return actual;
     } catch {this.save('switch-recovery-unconfirmed');return runtime;}
   }
-  addTask(input) {
-    let task=this.currentTask();
+  /** Open work for this input. The classifier's `work` is only a label: an owner
+   * request becomes a proposal that keeps its own turn on the work profile and lapses
+   * when that turn ends unless Kin takes it on, declares an outcome for it, or declines
+   * it. Kin's own handoffs and the host's internal jobs are commitments (N5). */
+  addTask(input,{proposal=false}={}) {
+    let task=this.tasks().filter(item=>!item.cancelRequested).at(-1);
     if(!task) {
-      const id='work-'+digest(input.id).slice(0,24);
-      task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:'running',requiresDelivery:!['repair','exploration-plan','proactive','assessment'].includes(input.kind),inputVersion:0,inputIds:[],summary:input.text,tools:{},deliveries:{},createdAt:this.now()};
+      const id='work-'+digest(input.id).slice(0,24),internal=['repair','exploration-plan','proactive','assessment'].includes(input.kind);
+      task={id,conversationId:this.state.conversationId,generation:this.state.generation,executionEpoch:this.state.executionEpoch,status:proposal?'proposed':'running',requiresDelivery:!internal,inputVersion:0,inputIds:[],summary:input.text,tools:{},deliveries:{},createdAt:this.now(),
+        ...(proposal?{}:{acceptedAt:this.now(),acceptance:internal?'host-internal':'kin'})};
       this.state.tasks[id]=task;
     }
     if(!task.inputIds.includes(input.id)) {this.supersedeDecline(task,'new-work-input:'+input.id);task.inputIds.push(input.id);task.inputVersion++;delete task.completion;}
@@ -271,108 +455,142 @@ export class MobileRouter {
     }
     delete task.completion;
   }
+  /** The owner's stop, from the literal command or from a classifier that actually
+   * answered: recorded on the stop input itself, applied to the tasks it names. */
+  applyStop(inputId,stop) {
+    for(const task of this.tasks())if(!stop.taskIds||stop.taskIds.includes(task.id)){task.cancelRequested=true;task.cancelSourceInputId=inputId;}
+  }
+  /** The mind's own turns wait for the owner's work and for a coordinator that is busy. */
+  internalHeld(runtime,kind) {
+    return this.busy(runtime,{assessment:kind==='assessment'})||this.tasks().length>0||this.state.mode==='work';
+  }
   async select(input) {
-    return this.locked(async()=>{
-      const hash=digest([input.text,input.attachments??[]]);
+    const hash=digest([input.text,input.attachments??[]]);
+    const owner=!input.kind||input.kind==='owner',intents=this.classifyIntents&&owner;
+    // Phase one, under the mutex: identity, literal commands and everything that needs
+    // no model. The classification itself never holds the mutex (AD1-06).
+    const first=await this.locked(async()=>{
       const previous=this.state.inputs[input.id];
+      // An archived input was settled long ago: a replay of it is never re-run (AD1-08).
+      if(!previous&&this.archivedIds.has(input.id))return {record:{id:input.id,state:'accepted',archived:true}};
       if(previous) {
         if(previous.recovered)throw Error('Input acceptance requires reconciliation');
         if(previous.hash!==hash)throw Error('Input id reused with different content');
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
-        if(previous.state==='failed-before-submit'){previous.state='selected';this.save('input-preparation-retry',{id:input.id});}
-        return clone(previous);
+        // What predates the ledger keeps its reason and id and is never re-run.
+        if(previous.historical)throw Object.assign(Error('Historical input is not re-run: '+previous.historical.reason),{code:'input-historical'});
+        if(previous.state==='failed-before-submit'){
+          if(this.frozen())throw frozenError(this.state.freeze.reason);
+          previous.state='selected';previous.retry={...(previous.retry??{attempts:0}),lastAttemptAt:this.now()};
+          delete previous.reason;delete previous.failureStage;delete previous.ownerNotice;
+          this.save('input-preparation-retry',{id:input.id,attempt:previous.retry.attempts});
+        }
+        return {record:clone(previous)};
       }
       // The literal stop is read before any model is asked, and answers on its own when none can be.
       const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
-      const owner=!input.kind||input.kind==='owner';
-      const intents=this.classifyIntents&&owner;
-      let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      const command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
       const priorTask=this.currentTask();
-      if(priorTask?.completion?.outcome==='declined'&&this.declineReady(priorTask,runtime)){
-        priorTask.status='canceled';priorTask.canceledAt=this.now();this.save('decline-settled-before-input',{taskId:priorTask.id});
-      }
+      if(priorTask?.completion?.outcome==='declined'&&this.declarationReady(priorTask,runtime))this.closeTask(priorTask,{event:'decline-settled-before-input'});
       // A failed native turn is terminal, not active work. Only a new assessment
       // on the current profile may proceed; switching and other busy checks stay unchanged.
-      if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {state:'deferred',reason:'owner-work-held'};
-      let decision,reason,recall={mode:'light',reason:'no-semantic-recall-decision'},fileSend=null,stopIntent=null,profile=null,force=false;
-      // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
-      const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
-      let tail=null,offered=null,classified=false,semanticFailure=null;
-      if(stop) {
-        for(const task of this.tasks())task.cancelRequested=true;decision='work';reason='owner-stop-command';
-        // A literal stop needs no model: whatever is still unsent is retired by the host itself.
-        if(owner&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
-      }
-      else if(['work','auto','status','watch'].includes(command)) {decision='control';reason='owner-runtime-'+command;force=['work','auto'].includes(command);
-      } else if(command==='compact') {decision='maintenance';reason='native-compact';
+      if(['proactive','assessment'].includes(input.kind)&&this.internalHeld(runtime,input.kind))return {deferred:{state:'deferred',reason:'owner-work-held'}};
+      let decision=null,reason;
+      if(stop){decision=this.tasks().length?'work':'chat';reason='owner-stop-command';}
+      else if(['work','auto','status','watch'].includes(command)){decision='control';reason='owner-runtime-'+command;}
+      else if(command==='compact'){decision='maintenance';reason='native-compact';}
       // An owner message with attachments used to be work without anyone reading it. With
       // intents on it is classified like any other, with the attachment metadata in view.
-      } else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)) {
-        decision='work';reason='work-input';
-      } else if(input.kind==='assessment') {decision='chat';reason='silent-main-assessment';}
-      else if(input.kind==='proactive') {decision='chat';reason='casual-outreach';}
-      else {
-        // An interrupted reply with nothing unknown about it rides on this call. With none,
-        // the classifier is asked exactly what it was always asked.
-        classified=true;
-        offered=owner?await port('pending',{id:input.id,text:input.text}):null;
-        if(!offered?.reply)offered=null;
-        const files=intents?attachmentMetadata(input.attachments):[];
-        try {
-          const result=await this.askClassification(input,{files,intents,offered,runtime,wait:this.state.config.classifierTimeoutMs});
-          ({decision,reason,command,recall,fileSend,stopIntent,profile,force}=this.readClassification(result,{owner,intents,allowStop:true}));
-          if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
-            :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
-        } catch(error) {
-          // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
-          // anomaly always became work: the catch manufactured a provisional task and
-          // a GPT switch out of a chat nobody had read. A failure now decides
-          // nothing — no task, no provider switch, no execution grant — and the
-          // input waits as itself for the bounded review, failure class on record.
-          semanticFailure=classificationFailure(error);
-          // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
-          if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
-        }
+      else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)){decision='work';reason='work-input';}
+      else if(input.kind==='assessment'){decision='chat';reason='silent-main-assessment';}
+      else if(input.kind==='proactive'){decision='chat';reason='casual-outreach';}
+      // The host stating facts about open work is context for Kin, never a new requirement (N2).
+      else if(input.kind==='work-facts'){decision='chat';reason='host-work-facts';}
+      if(decision===null)return {classify:{runtime,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))}};
+      const recall={mode:'light',reason:'no-semantic-recall-decision'};
+      if(stop) {
+        const stopIntent={requested:'current_task',decisionSource:'literal-owner-command',taskIds:this.tasks().map(t=>t.id)};
+        this.applyStop(input.id,stopIntent);
+        return {decided:{decision,reason,command,recall,stopIntent,runtime}};
       }
-      // Attachments and commands are never classified, so they cannot carry a tail decision either.
-      if(owner&&!stop&&!classified)await port('missed',{inputId:input.id,reason:'not-classified'});
+      return {decided:{decision,reason,command,recall,force:['work','auto'].includes(command),runtime}};
+    });
+    if(first.record)return first.record;
+    if(first.deferred)return first.deferred;
+    // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
+    const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
+    let tail=null,classified=false,semanticFailure=null,read=null;
+    if(first.decided) {
+      // A literal stop needs no model: whatever is still unsent is withdrawn by the host itself.
+      if(owner&&first.decided.command==='stop'&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
+    } else {
+      classified=true;
+      const files=intents?attachmentMetadata(input.attachments):[];
+      try {
+        const result=await this.askClassification(input,{files,intents,runtime:first.classify.runtime,wait:this.state.config.classifierTimeoutMs});
+        read=this.readClassification(result,{owner,intents,allowStop:true});
+      } catch(error) {
+        // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
+        // anomaly always became work: the catch manufactured a provisional task and
+        // a GPT switch out of a chat nobody had read. A failure now decides
+        // nothing — no task, no provider switch, no execution grant — and the
+        // input waits as itself for the bounded review, failure class on record.
+        semanticFailure=classificationFailure(error);
+      }
+    }
+    // Phase two, under the mutex: the answer applies only against the basis it was read from.
+    return this.locked(async()=>{
+      if(this.state.inputs[input.id])return clone(this.state.inputs[input.id]);
+      const base={id:input.id,hash,kind:input.kind??'owner',at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
       if(semanticFailure) {
-        const current=this.currentTask();
+        const current=this.currentTask(),runtime=first.classify.runtime;
         this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
           attachments:intents?attachmentMetadata(input.attachments):[],occurredAt:input.occurredAt??null,receivedAt:input.receivedAt??null,
           conversationId:this.state.conversationId??null,generation:this.state.generation??null,
-          taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])),
+          taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:first.classify.taskVersions,
           model:runtime.model??null,mode:this.state.mode,failure:{class:semanticFailure,at:this.now()},
           attempts:1,maxAttempts:SEMANTIC_RETRY_BUDGET,nextAttemptAt:this.now(),state:'pending',createdAt:this.now(),updatedAt:this.now()};
-        const record={id:input.id,hash,kind:input.kind??'owner',state:'semantic-pending',route:null,intent:null,reason:'classification-'+semanticFailure,recall,command:null,taskId:null,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
+        const record={...base,state:'semantic-pending',route:null,intent:null,reason:'classification-'+semanticFailure,recall:{mode:'light',reason:'no-semantic-recall-decision'},command:null,taskId:null};
         this.state.inputs[input.id]=record;
-        if(!input.kind||input.kind==='owner')this.rememberOwner(input);
+        if(owner)this.rememberOwner(input);
         this.save('input-semantic-pending',{id:input.id,failure:semanticFailure});
         return clone(record);
       }
-      const intent=decision;
-      const locked=this.applyRouteLock(input,{decision,reason,intent,command,runtime});
-      ({decision,reason}=locked);
-      const task=locked.task;
+      let decided=first.decided;
+      if(read) {
+        // A stop read from a classification applies only to the tasks it was read against.
+        const basisSame=JSON.stringify(Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])))===JSON.stringify(first.classify.taskVersions);
+        const stopIntent=basisSame?read.stopIntent:null;
+        if(stopIntent)this.applyStop(input.id,stopIntent);
+        decided={...read,stopIntent};
+      }
+      const {decision,reason:why,command,recall,fileSend,stopIntent,profile,force}=decided;
+      const locked=this.applyRouteLock(input,{decision,reason:why,intent:decision,command,stop:stopIntent});
       const modeControl=['manual','auto','work'].includes(command);
-      const record={id:input.id,hash,kind:input.kind??'owner',state:'selected',route:decision,intent,reason,recall,command,taskId:task?.id,at:this.now(),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}: {})};
+      const record={...base,state:'selected',route:locked.decision,intent:decision,reason:locked.reason,recall,command,taskId:locked.task?.id,
+        ...(fileSend?{fileSend}:{}),...(stopIntent?{stop:stopIntent}:{}),...(profile?{profile}:{}),...(modeControl?{force}:{})};
       this.state.inputs[input.id]=record;
-      if(!input.kind||input.kind==='owner')this.rememberOwner(input);
-      this.save('input-selected',{id:input.id,route:decision,reason});return clone(record);
+      if(owner)this.rememberOwner(input);
+      this.save('input-selected',{id:input.id,route:locked.decision,reason:locked.reason,...(classified?{classified}:{})});return clone(record);
     });
   }
   /** One bounded ask of the classifier, with its own clock. The longest the call
    * may wait is the caller's; the answer is never rerouted by trigger words. */
-  async askClassification(input,{files=[],intents=false,offered=null,runtime=null,wait}) {
+  async askClassification(input,{files=[],intents=false,runtime=null,wait}) {
+    // The catalog is read before the clock starts, and the clock always has a
+    // listener: a slow catalog can never leave a rejection nobody handles (AD1-05).
+    const availableModels=await this.availableModels(runtime);
     let timer;
     const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
-    const availableModels=await this.availableModels();
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+    timeout.catch(()=>{});
+    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
-  /** A classification answer, validated and read within its bounds. Never owns the
-   * execution lock, and only ever exists when the classifier actually answered. */
+  /** A classification answer, validated and read within its bounds. It never owns
+   * the execution lock and never changes state; it exists only when the classifier
+   * actually answered. */
   readClassification(result,{owner,intents,allowStop=false}={}) {
     if(!['chat','work','control'].includes(result?.route))throw Error('Invalid classification');
     let command=null;
@@ -390,13 +608,10 @@ export class MobileRouter {
     }
     if(asked.fileSend)fileSend={...asked.fileSend,decisionSource:CLASSIFIER_DECISION,at:this.now()};
     // A natural-language stop is the literal command's equal, and only that: the owner,
-    // an open task, and a classifier that actually answered. It is never inferred here,
-    // and a late answer applies only against the task basis it was read from.
-    if(allowStop&&asked.stop==='current_task'&&this.tasks().length) {
-      const taskIds=this.tasks().map(task=>task.id);
-      for(const task of this.tasks())task.cancelRequested=true;
-      stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds};
-    }
+    // an open task, and a classifier that actually answered. Reading it changes
+    // nothing: the caller applies it against the task basis it was read from (AD1-01).
+    if(allowStop&&asked.stop==='current_task'&&this.tasks().length)
+      stopIntent={requested:'current_task',decisionSource:CLASSIFIER_DECISION,taskIds:this.tasks().map(task=>task.id)};
     const profile=command==='manual'?clone(result.profile):null;
     if(command==='manual'&&(!profile?.model||!profile.reasoningEffort||!profile.serviceTierPreference))throw Error('Invalid model profile');
     if(result.force!==undefined&&typeof result.force!=='boolean')throw Error('Invalid force decision');
@@ -407,10 +622,14 @@ export class MobileRouter {
   }
   /** DeepSeek judges meaning; its answer never owns the execution lock. Real work
    * keeps its model, tools and delivery lock; a chat that arrives while work is
-   * open rides as context on the existing task, never as a new one. */
-  applyRouteLock(input,{decision,reason,intent,command,runtime}) {
-    if(!command&&(this.tasks().length||this.state.mode==='work'||runtime.active&&runtime.model===ROUTER_MODELS.work)){decision='work';reason='work-lock: '+reason;}
-    const task=decision==='work'&&!command?(intent==='work'?this.addTask(input):this.currentTask()):command?null:this.currentTask();
+   * open rides as context on the existing task, never as a new one. Only open work
+   * the owner is not stopping holds the lock, never the model that happens to run. */
+  applyRouteLock(input,{decision,reason,intent,command,stop=null}) {
+    const current=this.tasks().filter(task=>!task.cancelRequested).at(-1)??null;
+    if(!command&&(current||this.state.mode==='work')){decision='work';reason='work-lock: '+reason;}
+    // The owner's stop is read by the task it stops; it never opens or extends work (AD1-01).
+    const task=stop?this.tasks().filter(item=>stop.taskIds?.includes(item.id)).at(-1)??current:
+      decision==='work'&&!command?(intent==='work'?(current?this.addTask(input):this.addTask(input,{proposal:ownerInput(input)})):current):command?null:current;
     if(task&&!task.inputIds.includes(input.id)){task.contextInputIds??=[];task.contextInputIds.push(input.id);}
     return {decision,reason,task};
   }
@@ -418,18 +637,31 @@ export class MobileRouter {
     this.state.recent.push({role:'user',text:input.text,at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
     this.state.recent=this.state.recent.slice(-16);
   }
+  /** Record that nothing of this input reached the native session, with that
+   * evidence and the moment the same id may be tried again (AD1-02, H2a-03). */
+  notSubmitted(record,reason,{restart=false,stage='preparation'}={}) {
+    // Handed only to the in-memory queue is not a submission: the fact is kept apart.
+    if(record.state==='queued'&&record.submissionStartedAt){record.queuedSubmissionAt=record.submissionStartedAt;delete record.submissionStartedAt;}
+    record.state='failed-before-submit';record.failureStage=stage;record.reason=reason;delete record.settledAt;
+    const attempts=(record.retry?.attempts??0)+(restart?0:1),delay=SUBMIT_RETRY_MS[Math.max(0,attempts-1)];
+    record.retry={attempts,evidence:'not-submitted',lastFailureAt:this.now(),...(delay===undefined?{exhausted:true}:{nextAt:this.now()+(restart?0:delay)})};
+    return record.retry;
+  }
   dispatch(input,submit) {
     if(this.inflight.has(input.id))return this.inflight.get(input.id);
     const pending=this.dispatchOnce(input,submit).catch(async error=>{
-      await this.locked(()=>{
+      const retry=await this.locked(()=>{
         const record=this.state.inputs[input.id];
         if(record&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt){
-          record.state='failed-before-submit';record.failureStage='preparation';record.reason=error.message;
-          this.save('input-failed-before-submit',{id:input.id});
+          const retry=this.notSubmitted(record,error.message);
+          this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});return retry;
         }
+        return record?.state==='failed-before-submit'?record.retry:null;
       });
+      // The caller learns that the same id may be tried again, and when.
+      if(retry&&!error.code)Object.assign(error,{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
       throw error;
-    }).finally(()=>this.inflight.delete(input.id));
+    }).finally(()=>{this.inflight.delete(input.id);this.reservations.delete(input.id);});
     this.inflight.set(input.id,pending);return pending;
   }
   /** Called under the router mutex by the existing minute review. A live dispatch
@@ -438,92 +670,172 @@ export class MobileRouter {
     const cutoff=this.now()-(this.state.config.workReviewIntervalMinutes??20)*60000;
     for(const record of Object.values(this.state.inputs)) {
       if(!['selected','preparing'].includes(record.state)||record.submissionStartedAt||this.inflight.has(record.id)||!(record.at<=cutoff))continue;
-      record.state='failed-before-submit';record.failureStage='preparation';record.reason='input-preparation-timeout';
+      this.notSubmitted(record,'input-preparation-timeout');
       this.save('input-failed-before-submit',{id:record.id,reason:record.reason});
     }
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
     if(selected.state==='deferred')return {route:'deferred',reason:selected.reason};
-    if(selected.state==='accepted')return {route:'deduplicated',model:selected.model};
-    if(['semantic-failed','semantic-canceled'].includes(selected.state))return {route:selected.state,reason:selected.reason};
+    if(['accepted','queued','superseded'].includes(selected.state))return {route:'deduplicated',model:selected.model};
+    // A dispatch waits for the coordinator, a switch or a classification, never for
+    // ever: past its deadline nothing has been submitted, and the same id is retried
+    // or reported like any other unsubmitted input.
+    const deadline=this.now()+(this.state.config.dispatchWaitMinutes??20)*60000;
     for(;;) {
       // A semantic wait is settled by its own bounded review — driven here while
       // the caller is still alive, and by the host's pump when it is not.
       if(this.state.inputs[input.id]?.state==='semantic-pending')await this.reviewSemanticPending();
-      const outcome=await this.locked(async()=>{
-        const record=this.state.inputs[input.id];
-        if(record.state==='semantic-pending')return null;
-        if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
-        if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
-        let runtime=await this.reconcileTransition(await this.inspect());
-        if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
-        if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
-          const request=await this.acceptControl(record,runtime);
-          const applied=request?await this.applyModeRequest(request,runtime):{runtime};
-          runtime=applied.runtime??runtime;
-          if(record.route==='control') {
-            record.state='accepted';record.acceptedAt=this.now();
-            this.save('control-accepted',{id:input.id,command:record.command});
-            return{route:'host-control',model:runtime.model,state:request?.state};
-          }
-          // Mixed requests execute their work only after the exact requested
-          // profile is verified. Failure never silently runs it on the old model.
-          if(request?.state==='pending')return null;
-          if(request?.state!=='applied') {
-            record.state='failed-before-submit';record.failureStage='model-control';
-            this.save('input-failed-before-submit',{id:input.id});
-            return {route:'control-failed',state:request?.state,model:runtime.model};
-          }
-        }
-        if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input).id;
-        if(record.route==='maintenance'&&this.busy(runtime))return null;
-        let targetProfile=record.route==='maintenance'||input.kind==='assessment'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
-        if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {route:'deferred',reason:'native-profile-unconfirmed'};
-        if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
-        if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
-        targetProfile=await this.resolvedProfile(targetProfile);
-        let target=targetProfile.model;
-        // A queued work request must not change the provider mid-DeepSeek turn.
-        if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&this.busy(runtime))return null;
-        if(!runtime.known)throw Error('Native runtime requires reconciliation');
-        if(this.state.transition?.state==='unconfirmed')throw Error('Provider switch requires reconciliation');
-        if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
-          this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
-          try {
-            const switched=await this.switchTo(targetProfile),actual=switched.actual;targetProfile=switched.target;target=targetProfile.model;
-            if(!this.verified(actual,targetProfile))throw Error('Provider verification failed');
-            this.finishTransition(actual);this.save('switch-applied',{model:target});
-          } catch {
-            // No owner input has been submitted. Restore the exact profile observed
-            // before this attempt; ambiguous restoration remains held.
-            try {
-              const current=await this.inspect();if(this.busy(current))throw Error('busy');
-              const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
-              if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
-              this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
-              if(!record.taskId&&!record.command)record.taskId=this.addTask(input).id;
-              this.save('switch-failed-restored');
-            } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
-          }
-        } else this.state.actual=runtime;
-        if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
-        if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-        // A proactive contact goes out on the current tier's model, as any turn does (AD1-16).
-        record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;this.save('input-preparing',{id:input.id});
-        const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
-        if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
-        try {
-          const route=await submit({model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
-          if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
-          record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
-          return{route,model:target};
-        } catch(error) {record.state=record.submissionStartedAt?'unconfirmed':'failed-before-submit';record.failureStage=record.submissionStartedAt?'native-submit':'preparation';this.save('input-'+record.state,{id:input.id});throw Error(record.submissionStartedAt?'Input acceptance requires reconciliation':'Input preparation failed before native submission',{cause:error});}
-      });
-      if(outcome)return outcome;
+      const plan=await this.locked(async()=>this.planDispatch(input));
+      if(plan.outcome)return plan.outcome;
+      if(!plan.wait) {
+        const done=await this.submitPlanned(input,plan,submit);
+        if(!done.retry)return done;
+      }
+      if(this.now()>=deadline)throw Error('dispatch-wait-exceeded:'+(this.state.inputs[input.id]?.waitingReason??'coordinator-busy'));
       await this.waitForIdle();
     }
   }
+  /** Phase one of a dispatch, under the mutex: controls, the provider switch and a
+   * reservation that keeps any other dispatch from switching the provider until this
+   * one has been handed to the session. */
+  async planDispatch(input) {
+    const record=this.state.inputs[input.id];
+    if(record.state==='semantic-pending')return {wait:true};
+    if(['accepted','queued','superseded'].includes(record.state))return {outcome:{route:'deduplicated',model:record.model}};
+    if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
+    let runtime=await this.reconcileTransition(await this.inspect());
+    if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {outcome:{route:'deferred',reason:'owner-work-held'}};
+    if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
+      const request=await this.acceptControl(record,runtime);
+      const applied=request?await this.applyModeRequest(request,runtime):{runtime};
+      runtime=applied.runtime??runtime;
+      if(record.route==='control') {
+        record.state='accepted';record.acceptedAt=this.now();
+        this.save('control-accepted',{id:input.id,command:record.command});
+        return {outcome:{route:'host-control',model:runtime.model,state:request?.state}};
+      }
+      // Mixed requests execute their work only after the exact requested
+      // profile is verified. Failure never silently runs it on the old model.
+      if(request?.state==='pending')return {wait:true};
+      if(request?.state!=='applied') {
+        // The owner's own control failed and was reported; the work is not re-run on another model.
+        this.notSubmitted(record,'model-control-'+(request?.state??'failed'),{stage:'model-control'});record.retry.exhausted=true;delete record.retry.nextAt;
+        this.save('input-failed-before-submit',{id:input.id});
+        return {outcome:{route:'control-failed',state:request?.state,model:runtime.model}};
+      }
+    }
+    if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input,{proposal:ownerInput(input)}).id;
+    if(record.route==='maintenance'&&this.busy(runtime))return {wait:true};
+    let targetProfile=record.route==='maintenance'||input.kind==='assessment'||record.unlabeled?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+    if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {outcome:{route:'deferred',reason:'native-profile-unconfirmed'}};
+    // A native runtime that cannot be read, or a switch still being reconciled, is a
+    // wait: nothing has been submitted, and nothing is failed for it (AD1-02).
+    if(!runtime.known||this.state.transition?.state==='unconfirmed'){this.noteWait(record,!runtime.known?'native-runtime-unknown':'switch-unconfirmed');return {wait:true};}
+    if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
+    if(record.route!=='maintenance'&&!record.unlabeled&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(this.profiles.work);
+    try {targetProfile=await this.resolvedProfile(targetProfile);}
+    catch(error) {if(/Canonical model provider unavailable|catalog/i.test(String(error?.message))){this.noteWait(record,'model-catalog-unavailable');return {wait:true};}throw error;}
+    let target=targetProfile.model;
+    // A queued request must not change the provider mid-turn, nor under another
+    // dispatch that is planned but not yet handed to the session.
+    const otherReserved=[...this.reservations.keys()].some(id=>id!==input.id);
+    if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&(this.busy(runtime)||otherReserved))return {wait:true};
+    if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
+      this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
+      try {
+        const switched=await this.switchTo(targetProfile),actual=switched.actual;targetProfile=switched.target;target=targetProfile.model;
+        if(!this.verified(actual,targetProfile))throw Error('Provider verification failed');
+        this.finishTransition(actual);this.save('switch-applied',{model:target});
+      } catch {
+        // No owner input has been submitted. Restore the exact profile observed
+        // before this attempt; ambiguous restoration remains held.
+        try {
+          const current=await this.inspect();if(this.busy(current))throw Error('busy');
+          const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
+          if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
+          this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
+          // Only work opens work: a chat that ran on the restored profile stays a chat (AD1-04).
+          if(!record.taskId&&!record.command&&record.route==='work')record.taskId=this.addTask(input,{proposal:ownerInput(input)}).id;
+          this.save('switch-failed-restored');
+        } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
+      }
+    } else this.state.actual=runtime;
+    if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
+    // A proactive contact goes out on the current tier's model, as any turn does (AD1-16).
+    record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
+    record.plannedTransition=this.state.transition?.id??null;
+    this.reservations.set(input.id,{profile:targetProfile,at:this.now()});
+    return {decision:{model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,
+      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch}};
+  }
+  /** Phase two: the host prepares its prompt outside the mutex (AD1-06), then marks
+   * the submission under it, re-checking the basis the dispatch was planned on. */
+  async submitPlanned(input,plan,submit) {
+    let marking=null;
+    const markSubmitted=()=>marking??=this.locked(async()=>{
+      const record=this.state.inputs[input.id];
+      // Any provider change since the plan means planning again, never submitting on a stale basis.
+      if(record.state!=='preparing'||record.executionEpoch!==this.state.executionEpoch||(this.state.transition?.id??null)!==record.plannedTransition||this.state.transition?.state==='switching')
+        throw Object.assign(Error('dispatch-basis-changed'),{dispatchRetry:true});
+      record.state='submitting';record.submissionStartedAt=this.now();
+      // A native command exists from its submission, never before it (AD1-03).
+      if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
+      this.save('input-submitting',{id:input.id});
+    });
+    if(input.submissionProtocol!=='host-boundary-v1')await markSubmitted().catch(()=>{});
+    let outcome,failure=null;
+    if(!marking||await marking.then(()=>true,error=>{failure=error;return false;})) {
+      try {outcome=await submit(plan.decision,markSubmitted);} catch(error) {failure=error;}
+      if(marking)await marking.catch(error=>{failure??=error;});
+    }
+    return this.locked(async()=>{
+      this.reservations.delete(input.id);
+      const record=this.state.inputs[input.id],target=plan.decision.model;
+      if(failure) {
+        if(failure.dispatchRetry&&record.state==='preparing'){record.state='selected';this.save('input-dispatch-replanned',{id:input.id});return {retry:true};}
+        const operation=this.state.operations[record.id];
+        if(record.submissionStartedAt&&record.state==='submitting') {
+          record.state='unconfirmed';record.failureStage='native-submit';
+          // The command's own outcome is unknown; it is closed, never left running (AD1-03).
+          if(operation?.state==='submitted')Object.assign(operation,{state:'failed',stopReason:'submit-outcome-unknown',updatedAt:this.now()});
+          this.save('input-unconfirmed',{id:input.id});
+          throw Error('Input acceptance requires reconciliation',{cause:failure});
+        }
+        if(record.state!=='preparing')throw Error('Input acceptance requires reconciliation',{cause:failure});
+        const retry=this.notSubmitted(record,String(failure?.message??failure));
+        this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});
+        throw Object.assign(Error('Input preparation failed before native submission',{cause:failure}),{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
+      }
+      const route=typeof outcome==='string'?outcome:outcome?.route;
+      if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';record.settledAt=this.now();this.save('input-superseded',{id:input.id});return{route,model:target};}
+      // Handed only to the session's in-memory queue is not yet native acceptance:
+      // the input is accepted when its prompt begins (H2a-02).
+      if(outcome?.queued===true&&!record.turnStartedAt){record.state='queued';record.queuedAt=this.now();this.save('input-queued',{id:input.id});return {route,model:target,queued:true};}
+      record.state='accepted';record.acceptedAt??=this.now();
+      if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
+      this.save('input-accepted',{id:input.id,route});
+      return{route,model:target};
+    });
+  }
+  noteWait(record,reason) {
+    if(record.waitingReason===reason)return;
+    record.waitingReason=reason;this.save('input-waiting',{id:record.id,reason});
+  }
+  /** Resolves when a queued input's prompt begins in the native session, or with its
+   * state when the session let it go first or the host is stopping. */
+  awaitAcceptance(inputId) {
+    const record=this.state.inputs[inputId];
+    if(record?.state!=='queued')return Promise.resolve({state:record?.state??'missing'});
+    let entry=this.acceptance.get(inputId);
+    if(!entry){let resolve;const promise=new Promise(r=>{resolve=r;});entry={promise,resolve};this.acceptance.set(inputId,entry);}
+    return entry.promise;
+  }
+  settleAcceptance(inputId,value) {
+    const entry=this.acceptance.get(inputId);if(!entry)return;
+    this.acceptance.delete(inputId);entry.resolve(value);
+  }
+  releaseAcceptance(reason='host-stopping') {for(const id of [...this.acceptance.keys()])this.settleAcceptance(id,{state:'released',reason});}
   /** KIN-ITER-20260918-02: the bounded review of inputs whose classification
    * failed. The SAME input is asked of DeepSeek again — never rescored by trigger
    * words — and a late answer routes only after its version basis, cancel state
@@ -536,31 +848,42 @@ export class MobileRouter {
         const e=this.state.semanticPending[id];
         if(!e||!['pending','retry'].includes(e.state)||e.nextAttemptAt>this.now())return null;
         const record=this.state.inputs[id];
-        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash||(record.conversationId??null)!==e.conversationId||(record.generation??null)!==e.generation) {
-          e.state='superseded';e.updatedAt=this.now();this.save('semantic-review-superseded',{id});return null;
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash) {
+          e.state='superseded';e.updatedAt=this.now();delete e.text;this.save('semantic-review-superseded',{id});return null;
         }
+        if(e.attempts>=e.maxAttempts)return clone({...e,exhausted:true});
         e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});
         return clone(e);
       });
       if(!entry)continue;
       let result=null,failure=null;
-      try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
-        {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
-      catch(error){failure=classificationFailure(error);}
+      if(!entry.exhausted) {
+        try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
+          {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
+        catch(error){failure=classificationFailure(error);}
+      }
       await this.locked(async()=>{
-        const e=this.state.semanticPending[id];if(!e||e.state!=='classifying')return;
+        const e=this.state.semanticPending[id];if(!e||!['classifying','pending','retry'].includes(e.state))return;
         const record=this.state.inputs[id];e.updatedAt=this.now();
+        // With the budget spent the owner's message is still hers: it goes to Kin
+        // unlabelled, on the current profile, instead of ending unanswered (AD1-02).
+        const unlabeled=()=>{
+          e.state='failed';delete e.text;
+          Object.assign(record,{state:'selected',route:'chat',intent:null,unlabeled:true,reason:'classification-unavailable',failureClass:e.failure.class,taskId:null,lateClassifiedAt:this.now()});
+          this.save('input-unlabeled',{id,failure:e.failure.class,attempts:e.attempts});
+        };
         const fail=cls=>{
           e.lastFailure={class:cls,at:this.now()};
-          if(e.attempts>=e.maxAttempts) {
-            e.state='failed';record.state='semantic-failed';record.reason='classification-exhausted';record.failureClass=e.failure.class;
-            this.save('input-semantic-failed',{id,failure:e.failure.class,attempts:e.attempts});
-          } else {e.state='retry';e.nextAttemptAt=this.now()+(e.attempts-1)*15000;this.save('semantic-retry-waiting',{id,attempt:e.attempts,failure:cls});}
+          if(e.attempts>=e.maxAttempts)return unlabeled();
+          e.state='retry';e.nextAttemptAt=this.now()+(e.attempts-1)*15000;this.save('semantic-retry-waiting',{id,attempt:e.attempts,failure:cls});
         };
-        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash){e.state='superseded';this.save('semantic-review-superseded',{id});return;}
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash){e.state='superseded';delete e.text;this.save('semantic-review-superseded',{id});return;}
+        if(entry.exhausted)return unlabeled();
         if((this.state.conversationId??null)!==e.conversationId||(this.state.generation??null)!==e.generation) {
-          e.state='superseded';record.state='semantic-canceled';record.reason='generation-changed';
-          this.save('semantic-canceled',{id,reason:'generation-changed'});return;
+          // The session moved on while this was read; the owner's message did not. It is read again in the new one.
+          e.conversationId=this.state.conversationId??null;e.generation=this.state.generation??null;
+          Object.assign(record,{conversationId:e.conversationId,generation:e.generation,nativeThreadId:this.sessionId});
+          e.state='retry';e.nextAttemptAt=this.now();this.save('semantic-rebased',{id,generation:e.generation});return;
         }
         if(failure)return fail(failure);
         const owner=e.kind==='owner',intents=this.classifyIntents&&owner;
@@ -568,35 +891,47 @@ export class MobileRouter {
         const basisSame=JSON.stringify(Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion])))===JSON.stringify(e.taskVersions);
         let read;
         try{read=this.readClassification(result,{owner,intents,allowStop:basisSame});}catch(error){return fail(classificationFailure(error));}
-        // A stop that landed while the answer was in flight retires the input: a
-        // late work decision must never resurrect or extend what the owner canceled.
-        const canceled=Object.keys(e.taskVersions??{}).some(id=>{
-          const task=this.state.tasks[id];
-          return task?.cancelRequested||task?.status==='canceled'&&(task.canceledAt??0)>=e.createdAt;
-        });
-        if(canceled&&read.decision==='work') {
-          e.state='superseded';record.state='semantic-canceled';record.reason='superseded-by-cancel';
-          this.save('semantic-canceled',{id,reason:'superseded-by-cancel'});return;
-        }
-        const runtime=await this.inspect();
-        const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,runtime});
+        // The late answer takes the same path as a prompt one: its own stop is recorded on
+        // it and applied now, and late work never extends a task the owner is stopping —
+        // it opens work of its own instead. Nothing is retired unanswered (AD1-01).
+        if(read.stopIntent)this.applyStop(id,read.stopIntent);
+        const locked=this.applyRouteLock({id:e.id,kind:e.kind,text:e.text},{decision:read.decision,reason:read.reason,intent:read.decision,command:read.command,stop:read.stopIntent});
         Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
           taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
         if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
-        e.state='classified';e.updatedAt=this.now();
+        e.state='classified';e.updatedAt=this.now();delete e.text;
         this.save('input-classified-late',{id,route:locked.decision,reason:locked.reason,attempts:e.attempts});
       });
     }
   }
   async requestMode(request) {
     return this.locked(async()=>{
+      if(request?.taskOutcome==='accepted')return this.acceptTask(request);
       return this.recordModeRequest(request);
     });
+  }
+  /** Kin takes on a task: the proposal becomes the work lock and the duty to deliver.
+   * A proposal that already lapsed may still be taken on while nothing else is open. */
+  acceptTask(request) {
+    if(!request.commandId||!request.completedTaskId||!Number.isSafeInteger(request.completedInputVersion))throw Error('Accepting work requires the task and its input version');
+    const hash=digest(request),previous=this.state.requests[request.commandId];
+    if(previous){if(previous.hash!==hash)throw Error('Command id conflict');return clone(previous);}
+    const task=this.state.tasks[request.completedTaskId];
+    if(!task||!(open(task)||task.status==='unclaimed'))throw Error('Task is not open');
+    if(request.completedInputVersion!==task.inputVersion)throw Error('Task input version changed; read current runtime');
+    if(task.status==='unclaimed'&&this.tasks().some(other=>other.id!==task.id))throw Error('Another task is open; settle it first');
+    task.status='running';task.acceptedAt=this.now();task.acceptance='kin';task.acceptedBy=request.commandId;delete task.lapsedAt;delete task.outcome;
+    const receipt={state:'applied',taskOutcome:'accepted',commandId:request.commandId,hash,taskId:task.id,inputVersion:task.inputVersion,
+      reason:String(request.reason??'').slice(0,500),sourceInputId:request.sourceInputId??null,at:this.now()};
+    this.state.requests[request.commandId]=receipt;this.save('task-accepted',{taskId:task.id,commandId:request.commandId});
+    return clone(receipt);
   }
   /** Recover one already accepted owner message whose original semantic route was
    * wrong. The private host authenticates the source and asks the current DS
    * classifier; this boundary validates and records only cryptographic evidence
-   * plus the bounded control decision. It never dispatches the old input again. */
+   * plus the bounded control decision. It never dispatches the old input again.
+   * The basis is the configuration revision and the owner inputs after the source,
+   * not every bookkeeping save (H1-07). */
   async reclassifyAcceptedControl({commandId,sourceInputId,sourceHash,expectedRevision,evidence,decision}) {
     return this.locked(async()=>{
       const exactId=(value,max=200)=>{const v=label(value,max);if(v!==value)throw Error('Invalid reclassification identifier');return v;};
@@ -616,9 +951,10 @@ export class MobileRouter {
         return {receipt:clone(collision),request:clone(this.state.requests[collision.requestId])};
       }
       if(this.state.requests[commandId])throw Error('Reclassification command id conflict');
-      if(expectedRevision!==this.state.revision)throw Error('Router revision changed; reauthenticate source evidence');
+      if(expectedRevision!==this.reclassificationBasis(sourceInputId))throw Error('Router revision changed; reauthenticate source evidence');
       const source=this.state.inputs[sourceInputId];
       if(!source||source.kind!=='owner'||source.state!=='accepted')throw Error('Reclassification source is not an accepted owner input');
+      this.assertReclassifiable(source);
       // `sourceHash` is the router's semantic input hash. `sourceSha256` names the
       // private host's authenticated source evidence and is deliberately a separate
       // digest: the public adapter can validate its shape without pretending both
@@ -646,11 +982,28 @@ export class MobileRouter {
       return {receipt:clone(receipt),request:clone(this.state.requests[commandId])};
     });
   }
+  /** The basis a reclassification is fenced on: configuration changes plus owner
+   * messages after the source. Tool and delivery bookkeeping do not move it (H1-07). */
+  reclassificationBasis(sourceInputId) {
+    const inputs=Object.values(this.state.inputs),index=inputs.findIndex(input=>input.id===sourceInputId);
+    return this.state.configRevision*1000+(index<0?0:inputs.slice(index+1).filter(input=>ownerInput(input)).length);
+  }
+  /** Only a recent owner message can still be read as a control (H1-07). */
+  assertReclassifiable(source) {
+    const maxAge=(this.state.config.reclassifyMaxHours??24)*3600000;
+    if(!Number.isFinite(source?.at)||this.now()-source.at>maxAge)throw Error('Reclassification source is too old');
+  }
   recordModeRequest(request) {
       if(!request.commandId||!['work','auto','manual'].includes(request.mode)||!request.reason?.trim()||(request.mode==='manual'&&!request.profile?.model))throw Error('Invalid mode request');
       const taskOutcome=request.taskOutcome??'completed';
-      if(!['completed','declined'].includes(taskOutcome)||request.taskOutcome!==undefined&&!request.completedTaskId)throw Error('Invalid task outcome');
-      if(taskOutcome==='declined'&&(request.mode!=='auto'||!request.completedTaskId||!Number.isSafeInteger(request.completedInputVersion)||request.handoff))throw Error('Decline requires the current task and input version');
+      if(!TASK_OUTCOMES.includes(taskOutcome)||request.taskOutcome!==undefined&&!request.completedTaskId)throw Error('Invalid task outcome');
+      if(taskOutcome!=='completed'&&(request.mode!=='auto'||!request.completedTaskId||!Number.isSafeInteger(request.completedInputVersion)||request.handoff))throw Error('A declared outcome requires the current task and input version');
+      // Later is Kin's own plan: a moment she names, within bounds (N10).
+      let notBefore=null;
+      if(taskOutcome==='deferred') {
+        notBefore=Date.parse(request.notBefore??'');
+        if(!Number.isFinite(notBefore)||notBefore<=this.now()||notBefore-this.now()>DEFER_MAX_MS)throw Error('Deferral requires a future not_before within 30 days');
+      }
       const hash=digest(request), previous=this.state.requests[request.commandId];
       if(previous) {if(previous.hash!==hash)throw Error('Command id conflict');return clone(previous);}
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
@@ -660,11 +1013,24 @@ export class MobileRouter {
         const task=this.state.tasks[request.completedTaskId];
         if(this.currentTask()?.id!==task.id||!task.turnStartedAt||task.turnEndedAt||task.executionEpoch!==this.state.executionEpoch)throw Error('Decline must belong to the current native task turn');
       }
-      const sourceInputId=taskOutcome==='declined'?request.sourceInputId:
-        request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
+      // The source is what the caller names: the host passes the input of the native turn
+      // the request came from. Nothing is credited to the latest owner message (H1-04).
+      const sourceInputId=request.sourceInputId??null;
       if(taskOutcome==='declined'&&!sourceInputId)throw Error('Decline requires the current source input');
+      const source=sourceInputId?this.state.inputs[sourceInputId]:null;
+      const reclassification=request.reclassificationId?this.state.reclassifications[request.reclassificationId]:null;
+      const reclassificationAuthorized=Boolean(reclassification?.state==='recorded'&&reclassification.commandId===request.commandId&&
+        reclassification.sourceInputId===sourceInputId&&reclassification.sourceHash===source?.hash&&reclassification.originalRoute===source?.route&&
+        reclassification.decision?.control===request.mode&&reclassification.requestHash===hash&&request.sourceHash===source?.hash);
+      // The owner's own control, as acceptControl assembles it from her message.
+      const ownerControl=Boolean(source?.kind==='owner'&&source.state==='selected'&&request.commandId==='owner-mode:'+source.id&&
+        request.mode===source.command&&request.sourceHash===source.hash);
+      // A manual profile is the owner's: a model or maintenance caller cannot pin one (H1-04).
+      if(request.mode==='manual'&&!ownerControl&&!reclassificationAuthorized)throw Error('Manual profiles come only from the owner');
       if(request.handoff) {
-        const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff});
+        // Kin handing her own work to her next turn is her commitment to it.
+        const task=this.addTask({id:'handoff:'+request.commandId,text:request.handoff,kind:'handoff'});
+        if(task.status==='proposed'){task.status='running';task.acceptedAt=this.now();task.acceptance='kin-handoff';}
         task.handoff={id:request.commandId,text:request.handoff,state:'pending'};
       }
       if(request.mode==='work') {
@@ -673,22 +1039,18 @@ export class MobileRouter {
         this.state.exitRequested=true;
         if(request.completedTaskId) {
           const task=this.state.tasks[request.completedTaskId];
-          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,
-            ...(taskOutcome==='declined'?{commandId:request.commandId,turnStartedAt:task.turnStartedAt,sourceInputId}:{})};
+          // Kin's declaration, kept as she made it. The host closes the task on it once the
+          // facts are in: the turn ended, tools finished, receipts arrived (N1).
+          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,commandId:request.commandId,
+            ...(sourceInputId?{sourceInputId}:{}),...(task.turnStartedAt&&!task.turnEndedAt?{turnStartedAt:task.turnStartedAt}:{}),
+            ...(notBefore?{notBefore:new Date(notBefore).toISOString()}:{})};
         }
       }
-      const source=sourceInputId?this.state.inputs[sourceInputId]:null;
-      const reclassification=request.reclassificationId?this.state.reclassifications[request.reclassificationId]:null;
-      const reclassificationAuthorized=Boolean(reclassification?.state==='recorded'&&reclassification.commandId===request.commandId&&
-        reclassification.sourceInputId===sourceInputId&&reclassification.sourceHash===source?.hash&&reclassification.originalRoute===source?.route&&
-        reclassification.decision?.control===request.mode&&reclassification.requestHash===hash&&request.sourceHash===source?.hash);
       // A classified owner control authorizes only the exact request assembled by
       // acceptControl: same owner source/hash, owner-mode command id, mode, force
       // choice and (for manual mode) catalog-resolved profile. An old `auto` source
       // can therefore never be repurposed as force authority for an arbitrary model.
-      const directAuthorized=Boolean(source?.kind==='owner'&&source.state==='selected'&&['chat','work','control'].includes(source.route)&&
-        request.commandId==='owner-mode:'+source.id&&request.mode===source.command&&request.sourceHash===source.hash&&
-        source.controlRequestHash===hash&&['manual','auto','work'].includes(source.command));
+      const directAuthorized=ownerControl&&['chat','work','control'].includes(source.route)&&source.controlRequestHash===hash&&['manual','auto','work'].includes(source.command);
       const directForce=directAuthorized&&source.force===true;
       const directDefer=directAuthorized&&source.force===false;
       const forceAuthorized=request.force===true&&(directForce||reclassificationAuthorized&&reclassification.decision.force===true);
@@ -701,7 +1063,7 @@ export class MobileRouter {
         if(prior.mode===request.mode&&prior.notify){result.notify=true;result.notificationOrigin=prior.notificationOrigin??prior.commandId;result.notificationSubscribers=[...new Set([...(prior.notificationSubscribers??[]),prior.commandId])];}
         prior.state='superseded';prior.supersededBy=request.commandId;
       }
-      this.state.requests[request.commandId]=result;this.state.requestedMode=result.mode;this.save('mode-request',{commandId:request.commandId,mode:result.mode,force:forceAuthorized});
+      this.state.requests[request.commandId]=result;this.state.requestedMode=result.mode;this.save('mode-request',{commandId:request.commandId,mode:result.mode,force:forceAuthorized,...(request.completedTaskId?{taskOutcome}:{})});
       return clone(result);
   }
   async applyPendingMode() {
@@ -714,8 +1076,14 @@ export class MobileRouter {
       }
       const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode));
       if(!request)return{state:'pending'};
+      if(this.frozen()&&!request.force)return clone(request);
       await this.applyModeRequest(request,runtime);return clone(request);
     });
+  }
+  /** A force for the current epoch that is still being carried out. While none is,
+   * nothing may keep that epoch's output suppressed (H1-01). */
+  forceInProgress() {
+    return Object.values(this.state.requests).some(request=>request.force===true&&request.forceState==='interrupting'&&!request.forceBoundary)||Boolean(this.unfencedForce());
   }
   unfencedForce() {
     const boundaryAt=this.state.forceBoundaries.at(-1)?.at??-Infinity;
@@ -758,16 +1126,17 @@ export class MobileRouter {
     this.state.executionEpoch=toEpoch;this.state.forceBoundaries.push(boundary);this.state.forceBoundaries=this.state.forceBoundaries.slice(-32);
     for(const operation of Object.values(this.state.operations))if(['submitted','running','unconfirmed'].includes(operation.state)){operation.state='fenced-unconfirmed';operation.fencedBy=boundary.id;operation.fencedAt=at;}
     for(const input of Object.values(this.state.inputs))if(['submitting','unconfirmed'].includes(input.state)){input.state='fenced-unconfirmed';input.fencedBy=boundary.id;input.fencedAt=at;}
+    if(this.state.turn){for(const id of this.state.turn.inputIds){const input=this.state.inputs[id];if(input?.turnStartedAt&&!(input.turnEndedAt>=input.turnStartedAt)){input.turnEndedAt=at;input.stopReason='owner-force-interrupt';}}delete this.state.turn;}
     if(interruptedTask) {
-      if(interruptedTask.completion) {
-        const historical={...clone(interruptedTask.completion),turnFence:interruptedTask.completion.turnFence??interruptedTask.executionEpoch,state:'historical-proposal',fencedBy:boundary.id,fencedAt:at};
-        interruptedTask.completionHistory??=[];interruptedTask.completionHistory.push(historical);interruptedTask.completionHistory=interruptedTask.completionHistory.slice(-16);interruptedTask.completion=historical;
-      }
+      // Kin's declaration survives the interruption: it was her decision, and the turn
+      // that made it is over. An owner's switch never turns a decline back into work (AD1-23).
+      if(interruptedTask.completion?.outcome&&interruptedTask.completion.state!=='historical-proposal')
+        interruptedTask.completion={...interruptedTask.completion,turnEndedAt:interruptedTask.completion.turnEndedAt??at,interruptedBy:boundary.id,turnFence:toEpoch};
       if(interruptedTask.turnStartedAt||interruptedTask.turnEndedAt||interruptedTask.stopReason) {
         interruptedTask.turnHistory??=[];interruptedTask.turnHistory.push({turnFence:interruptedTask.executionEpoch,turnStartedAt:interruptedTask.turnStartedAt,turnEndedAt:interruptedTask.turnEndedAt,stopReason:interruptedTask.stopReason,fencedBy:boundary.id});interruptedTask.turnHistory=interruptedTask.turnHistory.slice(-16);
       }
       interruptedTask.executionEpoch=toEpoch;interruptedTask.continuationRequired=true;interruptedTask.interruptedBy=boundary.id;
-      delete interruptedTask.turnStartedAt;delete interruptedTask.turnEndedAt;delete interruptedTask.turnEndedFence;delete interruptedTask.stopReason;
+      delete interruptedTask.turnStartedAt;delete interruptedTask.turnEndedFence;delete interruptedTask.stopReason;interruptedTask.turnEndedAt=at;
     }
     request.forceState='confirmed';request.forceBoundary=boundary;request.waitingReason=null;this.save('force-switch-fenced',{commandId:request.commandId,boundaryId:boundary.id,toEpoch});return boundary;
   }
@@ -782,13 +1151,13 @@ export class MobileRouter {
   }
   async applyModeRequest(request,runtime) {
     if(!request||request.state!=='pending')return {runtime};
-    let target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:
-      this.tasks().length?ROUTER_PROFILES.work:this.automaticIdleProfile();
+    let target=request.mode==='manual'?request.profile:request.mode==='work'?this.profiles.work:
+      this.tasks().length?this.profiles.work:this.automaticIdleProfile();
     if(request.mode==='auto'&&request.force){
-      try {request.plannedAutoReturnProfile=await this.resolvedProfile(ROUTER_PROFILES.chat);}catch(error){
+      try {request.plannedAutoReturnProfile=await this.resolvedProfile(this.profiles.chat);}catch(error){
         this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持自动聊天配置。');this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-auto-profile'});return {runtime};
       }
-      target=this.tasks().length?ROUTER_PROFILES.work:request.plannedAutoReturnProfile;
+      target=this.tasks().length?this.profiles.work:request.plannedAutoReturnProfile;
     }
     // Validate the exact model/effort/tier before interrupting anything. A
     // nonexistent or unsupported profile is a failed control request, not a
@@ -814,7 +1183,7 @@ export class MobileRouter {
     if(!unchanged&&request.deferUntilSettled&&(this.tasks().length||this.busy(runtime))){request.waitingReason='owner-requested-settlement';this.pendingModeNotice(request);return {runtime};}
     if(request.mode==='work'&&!this.state.autoReturnProfile)this.captureAutomaticReturn(runtime);
     let forced=Boolean(request.forceBoundary);
-    if(!unchanged&&(this.busy(runtime)||request.forceState==='unconfirmed'||priorNeedsFence)) {
+    if(!unchanged&&(this.busy(runtime)||this.reservations.size>0&&!request.force||request.forceState==='unconfirmed'||priorNeedsFence)) {
       if(!request.force){request.waitingReason='coordinator-busy';return {runtime};}
       const boundary=await this.forceBoundary(request,runtime);if(!boundary)return {runtime};forced=true;
       runtime=await this.inspect();
@@ -851,7 +1220,7 @@ export class MobileRouter {
     else {
       this.state.mode='auto';delete this.state.manualProfile;
       if(request.force) {
-        const returnProfile=clone(request.plannedAutoReturnProfile??ROUTER_PROFILES.chat);this.state.autoIdleProfile=returnProfile;
+        const returnProfile=clone(request.plannedAutoReturnProfile??this.profiles.chat);this.state.autoIdleProfile=returnProfile;
         if(this.tasks().length)this.state.autoReturnProfile=clone(returnProfile);else delete this.state.autoReturnProfile;
       } else if(!this.tasks().length){this.state.autoIdleProfile=applied;delete this.state.autoReturnProfile;}
     }
@@ -874,7 +1243,7 @@ export class MobileRouter {
       const silent=transition.source==='host-restart'&&actual.model===this.lastToldModel();
       const notice=this.queueNotice(transition.id,'model-switched',{transitionId:transition.id,sourceInputId:this.state.inputs[transition.sourceId]?transition.sourceId:this.state.requests[transition.sourceId]?.sourceInputId,
         target:actual.model,targetProfile:transition.targetProfile,from:transition.from,runtime:view.actual,mode:this.state.mode,
-        ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true})})});
+        ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true,names:this.modelNames})})});
       transition.noticeId=notice.id;
       // KIN-ITER-20260918-03: every real change records what became of its owner
       // notification. A suppressed notice is the record of a message deliberately
@@ -905,17 +1274,25 @@ export class MobileRouter {
   }
   async readRuntime(loaded=true) {
     return this.locked(async()=>{const runtime=await this.inspect();this.observeRuntime(runtime);
-      return {...publicMobileRuntime(this.state,runtime,this.sessionId,loaded),models:await this.availableModels(runtime),defaults:ROUTER_PROFILES};});
+      const models=await this.availableModels(runtime);
+      return {...publicMobileRuntime(this.state,runtime,this.sessionId,loaded),models,defaults:clone(this.profiles),workFacts:this.workFacts()};});
+  }
+  /** Display names come from the live catalog (AD1-15). */
+  rememberModelNames(models) {
+    const names={};for(const model of models??[])if(model?.id&&model.aliases?.[0])names[model.id]=model.aliases[0];
+    if(Object.keys(names).length)this.modelNames=names;
   }
   async restoreRoutingProfile() {
     return this.locked(async()=>{
       if(this.runtimeRestored)return {state:'restored'};
       let runtime=await this.inspect();
-      if(this.busy(runtime)||Object.values(this.state.inputs).some(i=>['selected','submitting','unconfirmed'].includes(i.state)))return {state:'waiting'};
       runtime=await this.reconcileTransition(runtime);
       if(this.state.transition?.state==='unconfirmed')return {state:'waiting'};
       let target=await this.resolvedProfile(this.desiredProfile(runtime));
       if(!this.verified(runtime,target)){
+        // Only an actual switch waits for work in flight. An unconfirmed input is
+        // reconciled by its own id and never holds the restart profile (AD1-10).
+        if(this.busy(runtime)||Object.values(this.state.inputs).some(inputInFlight))return {state:'waiting'};
         this.startTransition(runtime,target,'Restore persisted mobile routing mode','host-restart');this.save('restart-profile-requested');
         try {const switched=await this.switchTo(target);runtime=switched.actual;target=switched.target;if(!this.verified(runtime,target))throw Error('Restart profile unverified');this.finishTransition(runtime);}
         catch(error){this.state.transition.state='unconfirmed';this.save('restart-profile-unconfirmed');throw error;}
@@ -927,7 +1304,7 @@ export class MobileRouter {
   async prepareModel(model) {
     return this.locked(async()=>{
       const runtime=await this.inspect();
-      if(this.tasks().length||this.busy(runtime))throw Error('Work prevents model verification');
+      if(this.tasks().length||this.busy(runtime)||this.reservations.size)throw Error('Work prevents model verification');
       let profile=await this.resolvedProfile(typeof model==='string'?{model}:model);
       if(this.verified(runtime,profile)){this.observeRuntime(runtime);return runtime;}
       this.startTransition(runtime,profile,'Host model verification','probe');this.save('switch-requested');
@@ -947,9 +1324,8 @@ export class MobileRouter {
       mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
     request.waitingReason=null;
     if(unchanged)return;
-    const task=this.currentTask(),source=this.state.inputs[request.sourceInputId];
-    if(task?.continuationRequired&&source?.route==='control'&&!task.cancelRequested)
-      task.handoff={id:request.commandId,text:'模型已按小光要求切换。继续原任务，读取已有进度和交付回执，不重做已完成的动作；结果发飞书。',state:'pending'};
+    // The host no longer injects a "continue the task" turn after an owner switch (N2):
+    // the interrupted task stays open, and its facts reach Kin in her next turn.
     const transition=this.state.transition;
     const notice=transition?.sourceId===request.commandId&&this.state.notices[transition.noticeId];
     if(notice){notice.requestId=request.commandId;notice.subscriberIds=request.notificationSubscribers??[request.commandId];}
@@ -983,8 +1359,11 @@ export class MobileRouter {
   observeOperation(inputId,phase,result={}) {
     return this.locked(async()=>{
       const operation=this.state.operations[inputId];if(!operation)throw Error('Unknown native operation');
-      operation.state=phase==='start'?'running':result.stopReason==='end_turn'?'completed':'unconfirmed';
+      // A native command that did not end its turn normally is a terminal failure with
+      // its stop reason kept, never an operation left counting as running (AD1-03).
+      operation.state=phase==='start'?'running':result.stopReason==='end_turn'?'completed':'failed';
       operation.updatedAt=this.now();operation.stopReason=result.stopReason;
+      if(phase==='start')this.turnStarted({inputIds:[inputId]});else this.turnEnded({stopReason:result.stopReason});
       this.save('native-operation-'+phase,{inputId,state:operation.state});
     });
   }
@@ -1016,11 +1395,11 @@ export class MobileRouter {
         if(n.kind==='mode-pending'&&this.state.requests[n.requestId]?.state!=='pending'){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
         if(view.actual.verified&&n.kind==='mode-applied'&&(!profileMatches(runtime,n.targetProfile??{model:n.target}))){n.state='superseded';n.updatedAt=this.now();this.save('notice-superseded',{id});return null;}
         if(view.actual.verified&&n.kind==='model-switched'&&!profileMatches(runtime,n.targetProfile??{model:n.target})) {
-          const past=runtimeReply({actual:n.runtime,tasks:[],mode:n.mode},{switched:true}).replace('已切换到 ','此前已切换到 ');
-          n.text=past+' '+runtimeReply(view);
+          const past=runtimeReply({actual:n.runtime,tasks:[],mode:n.mode},{switched:true,names:this.modelNames}).replace('已切换到 ','此前已切换到 ');
+          n.text=past+' '+runtimeReply(view,{names:this.modelNames});
         }
         if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
-        n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied'});
+        n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied',names:this.modelNames});
         // Whatever else the message recalls, this is the model it names as the current one.
         if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
         this.save('notice-sending',{id});return {...clone(n),sendNow:true};
@@ -1037,7 +1416,9 @@ export class MobileRouter {
         const n=this.state.notices[id];
         const before=JSON.stringify([n.state,n.waitingReason,n.nextAction,n.attempts,n.lookups,n.messageId,n.stage]);
         const kind=noticeReceiptClass(receipt);
-        if(kind==='accepted'){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();n.replyRecorded=true;n.nextAction='none';n.stage='settled';}
+        if(kind==='accepted'){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();n.replyRecorded=true;n.nextAction='none';n.stage='settled';
+          const source=this.state.inputs[n.sourceInputId];
+          if(n.kind==='mode-failed'&&source?.state==='failed-before-submit'&&source.failureStage==='model-control')source.ownerNotice={kind:'stopped',id:n.id,state:'accepted',messageId:n.messageId,acceptedAt:n.acceptedAt};}
         else if(kind==='rejected'){n.firstFailure??={class:'receipt-rejected',at:this.now()};n.state='rejected';n.waitingReason='platform-rejected';n.nextAction='none';n.stage='settled';}
         else if(kind==='not-submitted') {
           n.firstFailure??={class:notice.sendNow?'send-not-submitted':'receipt-not-submitted',at:this.now()};
@@ -1055,13 +1436,84 @@ export class MobileRouter {
       });
     }
   }
+  // ---- Facts for the ledger: which inputs a native prompt carries, when it ends, and
+  // what of the reply reached the owner. Turns without a task are ordinary, not late (AD1-07).
+  turnStarted(data) {
+    const ids=[...new Set(Array.isArray(data.inputIds)?data.inputIds:data.sourceInputId?[data.sourceInputId]:[])],at=this.now();
+    this.state.turn={startedAt:at,inputIds:ids,taskId:data.taskId??null,turnFence:data.turnFence??this.state.executionEpoch};
+    for(const id of ids) {
+      const record=this.state.inputs[id];if(!record)continue;
+      if(record.state==='queued'){record.state='accepted';record.acceptedAt=at;}
+      if(['accepted','submitting'].includes(record.state)){record.turnStartedAt=at;delete record.turnEndedAt;delete record.stopReason;this.progress.set(id,at);}
+      this.settleAcceptance(id,{state:record.state});
+    }
+    return ids.length>0;
+  }
+  turnEnded(data) {
+    const turn=this.state.turn,at=this.now();if(!turn)return false;
+    for(const id of turn.inputIds) {
+      const record=this.state.inputs[id];if(!record?.turnStartedAt||record.turnEndedAt>=record.turnStartedAt)continue;
+      record.turnEndedAt=at;record.stopReason=data.stopReason??null;
+      if(!ownerInput(record))record.settledAt??=at;
+    }
+    delete this.state.turn;
+    // A proposal whose own turn has ended without Kin taking it on, declaring an outcome
+    // for it or declining it lapses, and the work lock with it (N5).
+    for(const task of Object.values(this.state.tasks))if(task.status==='proposed'&&!task.completion&&task.inputIds.every(id=>{const record=this.state.inputs[id];return !record||record.turnEndedAt||['superseded','failed-before-submit'].includes(record.state);})){
+      task.status='unclaimed';task.lapsedAt=at;task.outcome='not-accepted';this.state.autoRestoreDue=true;
+    }
+    return true;
+  }
+  /** Progress of the active turn, in memory only: streaming text and tool calls show
+   * the input is being worked on. It is never written for its own sake. */
+  touchTurn() {
+    const turn=this.state.turn;if(!turn)return;
+    const at=this.now();for(const id of turn.inputIds)this.progress.set(id,at);
+  }
+  /** A bubble answering an input reached the platform, or was refused. */
+  inputDelivery(data) {
+    const record=typeof data.sourceInputId==='string'?this.state.inputs[data.sourceInputId]:null;
+    if(!record)return false;
+    this.progress.set(record.id,this.now());
+    if(data.state==='accepted'&&data.messageId){record.delivered=(record.delivered??0)+1;record.lastDeliveredAt=this.now();return true;}
+    if(['rejected','undeliverable'].includes(data.state)){record.undelivered=(record.undelivered??0)+1;return true;}
+    return false;
+  }
+  /** The whole reply to an owner input reached the platform, or Kin chose not to
+   * reply. Earlier owner inputs already in the session when it came are answered by it. */
+  inputAnswered(kind,data) {
+    const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
+    if(!record)return false;
+    const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return false;
+    const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
+    const basis=record.acceptedAt??at;
+    if(ownerInput(record))for(const other of Object.values(this.state.inputs))
+      if(other!==record&&ownerInput(other)&&other.state==='accepted'&&!answered(other)&&(other.acceptedAt??Infinity)<=basis){other.answer={state:'covered',by:record.id,at};other.settledAt??=at;}
+    return true;
+  }
   observe(kind,data={}) {
     return this.locked(async()=>{
+      let dirty=false;
+      if(kind==='prompt-start')dirty=this.turnStarted(data)||dirty;
+      if(kind==='prompt-end')dirty=this.turnEnded(data)||dirty;
+      if(kind==='delivery'&&data.sourceInputId)dirty=this.inputDelivery(data)||dirty;
+      if(kind==='reply-complete'||kind==='reply-choice'){if(this.inputAnswered(kind,data))this.save(kind,{inputId:data.inputId});return;}
+      if(kind==='input-dropped') {
+        // The session let a queued prompt go before it began: provably never submitted.
+        const record=this.state.inputs[data.inputId];
+        if(record?.state==='queued'){this.notSubmitted(record,'session-dropped-before-prompt',{restart:true});this.save('input-failed-before-submit',{id:record.id,reason:record.reason});}
+        this.settleAcceptance(data.inputId,{state:record?.state??'missing'});return;
+      }
+      if(kind==='tool')this.touchTurn();
       // An explicit null belongs to a no-task/chat turn. It must not be rebound to
       // whichever task happens to be current when a delayed callback arrives.
+      const noTask=Object.hasOwn(data,'taskId')&&!data.taskId;
       const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
       const turnFence=data.turnFence??data.executionEpoch;
       const taskEvent=['prompt-start','prompt-end','tool','delivery'].includes(kind);
+      // A chat or an internal turn is an ordinary turn: never a late event, and saved
+      // only when the ledger learned something from it (AD1-07).
+      if(noTask&&taskEvent){if(dirty)this.save(kind);return;}
       const storeHistorical=(reason,{authoritative=false}={})=>{
         const at=this.now();
         const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
@@ -1079,24 +1531,26 @@ export class MobileRouter {
           task.deliveryHistory[key]={id:data.id,state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,sourceInputId:data.sourceInputId,
             submissionStarted:data.submissionStarted,inputVersion:data.inputVersion,turnFence:turnFence??null,lateAfterForce:true,
             authority:authoritative?'historical-fence':'evidence-only',reason,at};
+          trim(task,'deliveryHistory');
         }
         if(task&&kind==='tool') {
           task.toolHistory??={};
           const key='tool-'+digest([data.id,turnFence??null,data.inputVersion??null,reason]).slice(0,40);
           task.toolHistory[key]={id:data.id,status:data.status??'pending',inputVersion:data.inputVersion,turnFence:turnFence??null,
             lateAfterForce:true,authority:authoritative?'historical-fence':'evidence-only',reason,...(data.reason?{detailReason:data.reason}:{}),at};
+          trim(task,'toolHistory');
         }
         this.save('late-'+kind,{taskId:task?.id,reason,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch});
       };
       let historicalReason=null;
-      if(taskEvent) {
+      if(taskEvent&&task) {
         if((data.turnFence!==undefined||data.executionEpoch!==undefined)&&!Number.isInteger(turnFence))historicalReason='invalid-turn-fence';
-        else if(data.inputVersion!==undefined&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
+        else if(data.inputVersion!==undefined&&data.inputVersion!==null&&!Number.isSafeInteger(data.inputVersion))historicalReason='invalid-input-version';
         else if(this.state.executionEpoch>0&&(turnFence===undefined||data.inputVersion===undefined))historicalReason='unversioned-after-force';
         else if(Number.isInteger(turnFence)&&turnFence<this.state.executionEpoch)historicalReason='older-fence';
         else if(Number.isInteger(turnFence)&&turnFence>this.state.executionEpoch)historicalReason='future-fence';
-        else if(task&&data.inputVersion!==undefined&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
-        else if(task&&kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
+        else if(data.inputVersion!==undefined&&data.inputVersion!==null&&data.inputVersion!==task.inputVersion)historicalReason='input-version-mismatch';
+        else if(kind!=='prompt-start'&&Number.isInteger(turnFence)&&turnFence!==task.executionEpoch)historicalReason='task-fence-mismatch';
       }
       if(historicalReason) {
         storeHistorical(historicalReason,{authoritative:historicalReason==='older-fence'&&Number.isInteger(turnFence)&&Number.isSafeInteger(data.inputVersion)});
@@ -1105,24 +1559,23 @@ export class MobileRouter {
       if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
         if(kind==='prompt-start') {
-          if(task.completion?.outcome==='declined'){
-            if(this.declineReady(task,await this.inspect())){task.status='canceled';task.canceledAt=this.now();}
-          }
-          if(open(task)){task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
+          if(task.completion?.outcome==='declined'&&this.declarationReady(task,await this.inspect()))this.closeTask(task);
+          if(open(task)){if(task.status!=='proposed')task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
         }
         if(kind==='prompt-end') {
           task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;
+          // A declaration made in this turn now has its end. A turn that stopped for any
+          // reason has ended: the stop reason is a fact, never a lock that holds (AD1-11).
           const proposal=task.completion;
-          if(proposal?.outcome==='declined'&&!proposal.turnEndedAt&&proposal.turnStartedAt===task.turnStartedAt&&proposal.inputVersion===task.inputVersion&&proposal.turnFence===task.turnEndedFence){
+          if(proposal?.outcome&&!proposal.turnEndedAt&&(proposal.turnStartedAt===undefined||proposal.turnStartedAt===task.turnStartedAt)&&proposal.inputVersion===task.inputVersion&&proposal.turnFence===task.turnEndedFence){
             proposal.turnEndedAt=task.turnEndedAt;proposal.turnEndedFence=task.turnEndedFence;proposal.stopReason=data.stopReason;
           }
-          if(data.stopReason!=='end_turn')task.status='failed';
         }
         if(kind==='tool') {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
           if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
             task.toolHistory??={};const key='tool-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
-            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+            task.toolHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};trim(task,'toolHistory');
           }
           task.tools[data.id]={status:data.status??previous?.status??'pending',inputVersion,turnFence:fence,...(data.reason?{reason:data.reason}: {})};
         }
@@ -1130,13 +1583,14 @@ export class MobileRouter {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.deliveries[data.id];
           if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
             task.deliveryHistory??={};const key='delivery-'+digest([data.id,previous.turnFence??null,previous.inputVersion??null,'replaced-current-entry']).slice(0,40);
-            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};
+            task.deliveryHistory[key]={id:data.id,...clone(previous),authority:'historical-fence',reason:'replaced-current-entry'};trim(task,'deliveryHistory');
           }
           task.deliveries[data.id]={state:data.state,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,
             sourceInputId:data.sourceInputId,inputVersion,turnFence:fence,at:this.now()};
         }
+        dirty=true;
       }
-      this.save(kind);
+      if(dirty||kind==='reply'&&data.final)this.save(kind);
     });
   }
   completeInternal(taskId,inputVersion,receipt) {
@@ -1165,15 +1619,55 @@ export class MobileRouter {
     }
     return changed;
   }
-  declineReady(task,runtime) {
+  /** The host's facts about Kin's declared outcome: the declaring turn ended (for any
+   * stop reason, or by an owner interruption), the task's tools are terminal and its
+   * deliveries are no longer in flight, and the report to the owner reached the
+   * platform — or the report wait has passed, which is recorded as it is. The
+   * outcome itself is Kin's; nothing here judges it (N1). */
+  declarationReady(task,runtime) {
     const proposal=task.completion,fence=proposal?.turnFence,version=proposal?.inputVersion;
-    if(runtime?.pendingDeliveries!==0||proposal?.outcome!=='declined'||proposal.state==='historical-proposal'||version!==task.inputVersion||
-      fence!==task.executionEpoch||proposal.stopReason!=='end_turn'||!proposal.turnStartedAt||proposal.turnStartedAt>proposal.at||
-      proposal.turnEndedAt<proposal.at||proposal.turnEndedFence!==fence)return false;
+    if(!proposal?.outcome||proposal.state==='historical-proposal'||version!==task.inputVersion||(runtime&&runtime.pendingDeliveries!==0))return false;
+    if(fence!==task.executionEpoch&&!(proposal.interruptedBy&&fence===task.executionEpoch))return false;
+    const ended=proposal.interruptedBy||proposal.turnStartedAt===undefined&&(task.turnEndedAt??0)>=proposal.at||
+      proposal.turnStartedAt!==undefined&&proposal.turnStartedAt<=proposal.at&&proposal.turnEndedAt>=proposal.at;
+    if(!ended)return false;
     const tools=[...Object.values(task.tools??{}),...Object.values(task.toolHistory??{}).filter(t=>t.authority==='historical-fence'&&t.turnFence===fence&&t.inputVersion===version)];
-    if(!tools.every(tool=>['completed','failed'].includes(tool.status)))return false;
+    if(!tools.every(tool=>['completed','failed'].includes(tool.status)||proposal.interruptedBy&&terminalTool(tool)))return false;
     const deliveries=[...Object.values(task.deliveries??{}),...Object.values(task.deliveryHistory??{}).filter(d=>d.authority==='historical-fence'&&d.turnFence===fence&&d.inputVersion===version)];
-    return deliveries.every(settledDelivery)&&deliveries.some(d=>d.sourceInputId===proposal.sourceInputId&&d.inputVersion===version&&d.turnFence===fence&&d.state==='accepted'&&d.messageId&&d.at>=proposal.at);
+    const endedAt=proposal.turnEndedAt??task.turnEndedAt??proposal.at,waited=this.now()-endedAt>=(this.state.config.reportWaitMinutes??30)*60000;
+    if(!deliveries.every(d=>settledDelivery(d)||waited&&['unconfirmed','unknown'].includes(d.state)))return false;
+    if(task.requiresDelivery===false)return true;
+    const reported=deliveries.some(d=>(!proposal.sourceInputId||d.sourceInputId===proposal.sourceInputId)&&d.inputVersion===version&&(d.turnFence===fence||proposal.interruptedBy)&&d.state==='accepted'&&d.messageId&&d.at>=proposal.at);
+    return reported||waited;
+  }
+  /** Close a task on its declared outcome, keeping the facts it closed on. */
+  closeTask(task,{event='task-closed'}={}) {
+    const outcome=task.completion?.outcome??'completed',at=this.now();
+    const deliveries=Object.entries(task.deliveries??{});
+    task.closure={outcome,at,reported:deliveries.some(([,d])=>d.state==='accepted'&&d.messageId&&d.at>=(task.completion?.at??0)),
+      undelivered:deliveries.filter(([,d])=>['rejected','undeliverable'].includes(d.state)).map(([id])=>id),
+      unsent:deliveries.filter(([,d])=>['deferred','not-submitted'].includes(d.state)).map(([id])=>id),
+      unknown:deliveries.filter(([,d])=>['unconfirmed','unknown'].includes(d.state)).map(([id])=>id),stopReason:task.completion?.stopReason??task.stopReason??null};
+    task.outcome=outcome;
+    if(outcome==='declined'){task.status='canceled';task.canceledAt=at;}
+    else if(outcome==='partial'){task.status='partial';task.completedAt=at;}
+    else if(outcome==='deferred'){task.status='deferred';task.deferral={notBefore:task.completion.notBefore,reason:task.completion.summary,plan:{state:'pending'},at};}
+    else {task.status='completed';task.completedAt=at;}
+    this.save(event,{taskId:task.id,outcome});
+  }
+  /** Deferred tasks whose plan is still to be written, for the host's plan port. */
+  deferredPlans() {return Object.values(this.state.tasks).filter(t=>t.status==='deferred'&&t.deferral?.plan?.state==='pending').map(t=>clone(t));}
+  recordDeferralPlan(taskId,result) {
+    return this.locked(async()=>{
+      const task=this.state.tasks[taskId];if(!task?.deferral)return null;
+      task.deferral.plan={state:result?.state==='created'?'created':'needs-kin',...(result?.planId?{planId:result.planId}:{}),...(result?.reason?{reason:String(result.reason).slice(0,160)}:{}),at:this.now()};
+      this.save('deferral-plan',{taskId,state:task.deferral.plan.state});return clone(task.deferral);
+    });
+  }
+  /** Record the idle summary of a task Kin has not declared. It never moves the lock. */
+  recordWorkSummary(taskId,fingerprint,summary) {
+    const task=this.state.tasks[taskId];if(!task||!open(task))return false;
+    task.workSummary={...summary,fingerprint,at:this.now()};this.save('work-summary',{taskId});return true;
   }
   async reconcile() {
     return this.locked(async()=>{
@@ -1181,14 +1675,16 @@ export class MobileRouter {
       if(this.busy(runtime))return {state:'busy'};
       let changed=this.archiveInterruptedTools();
       for(const task of this.tasks()) {
-        if(task.cancelRequested) {task.status='canceled';task.canceledAt=this.now();changed=true;continue;}
-        if(task.completion?.outcome==='declined'){
-          if(this.declineReady(task,runtime)){task.status='canceled';task.canceledAt=this.now();changed=true;}
+        if(task.cancelRequested) {
+          task.status='canceled';task.canceledAt=this.now();task.outcome='owner-canceled';
+          for(const id of task.inputIds){const record=this.state.inputs[id];if(record&&ownerInput(record)&&!answered(record)&&task.cancelSourceInputId!==id){record.canceledBy=task.cancelSourceInputId??'owner-stop';record.settledAt??=this.now();}}
+          changed=true;continue;
+        }
+        // Kin's declared outcome closes the task once the host's facts are in (N1).
+        if(task.completion?.outcome&&task.completion.state!=='historical-proposal') {
+          if(this.declarationReady(task,runtime)){this.closeTask(task);changed=true;}
           continue;
         }
-        // With semantic review installed, assistant completion is a proposal.
-        // Internal repairs retain their separate verified-result protocol.
-        if(this.workReviewerEnabled&&task.requiresDelivery!==false)continue;
         const fence=task.completion?.turnFence;
         const deliveryMap=new Map(Object.entries(task.deliveries).filter(([,delivery])=>(delivery.inputVersion===undefined||delivery.inputVersion===task.completion?.inputVersion)&&(fence===undefined||delivery.turnFence===undefined||delivery.turnFence===fence)));
         if(fence!==undefined)for(const delivery of Object.values(task.deliveryHistory??{}))if(delivery.authority==='historical-fence'&&delivery.turnFence===fence&&delivery.inputVersion===task.completion?.inputVersion)deliveryMap.set(delivery.id,delivery);
@@ -1196,23 +1692,121 @@ export class MobileRouter {
         const toolMap=new Map(Object.entries(task.tools).filter(([,tool])=>(fence===undefined||tool.turnFence===undefined||tool.turnFence===fence)));
         if(fence!==undefined)for(const tool of Object.values(task.toolHistory??{}))if(tool.authority==='historical-fence'&&tool.turnFence===fence&&tool.inputVersion===task.completion?.inputVersion)toolMap.set(tool.id,tool);
         const tools=[...toolMap.values()];
-        if(task.completion?.state!=='historical-proposal'&&task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
+        // A completion without a declared outcome is the legacy and internal form.
+        if(task.completion&&task.completion?.state!=='historical-proposal'&&task.completion?.inputVersion===task.inputVersion && task.stopReason==='end_turn' && task.turnEndedAt>=task.completion.at &&
           (fence===undefined||task.turnEndedFence===undefined||task.turnEndedFence===fence) && tools.every(tool=>['completed','failed'].includes(tool.status)) &&
           (task.requiresDelivery===false?task.internalReceipt?.verified:
             deliveries.length && deliveries.every(d=>d.state==='accepted'&&d.messageId) && deliveries.some(d=>d.at>=task.completion.at))) {
-          task.status='completed';task.completedAt=this.now();changed=true;
+          task.status='completed';task.completedAt=this.now();task.outcome='completed';changed=true;
         }
       }
-      if(changed&&!this.tasks().length&&this.state.mode!=='manual'&&this.state.autoReturnProfile&&!Object.values(this.state.requests).some(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode))) {
-        const commandId='automatic-restore:'+digest([this.state.revision,this.state.autoReturnProfile]).slice(0,24);
-        this.recordModeRequest({commandId,mode:'auto',reason:'All automatic work tasks are settled',notify:true});
+      // Work that lapsed or closed outside this pass still owes the automatic return.
+      if((changed||this.state.autoRestoreDue)&&!this.frozen()) {
+        if(!this.tasks().length&&this.state.mode!=='manual'&&this.state.autoReturnProfile&&!Object.values(this.state.requests).some(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode))) {
+          const commandId='automatic-restore:'+digest([this.state.revision,this.state.autoReturnProfile]).slice(0,24);
+          this.recordModeRequest({commandId,mode:'auto',reason:'All automatic work tasks are settled',notify:true});
+        }
+        if(this.state.autoRestoreDue){delete this.state.autoRestoreDue;changed=true;}
       }
-      for(const request of Object.values(this.state.requests))if(request.state==='pending') {
+      if(!this.frozen())for(const request of Object.values(this.state.requests))if(request.state==='pending') {
         if(request.deferUntilSettled&&this.tasks().length)continue;
-        const target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:!this.tasks().length?this.automaticIdleProfile():null;
+        const target=request.mode==='manual'?request.profile:request.mode==='work'?this.profiles.work:!this.tasks().length?this.automaticIdleProfile():null;
         if(target&&this.verified(runtime,target)) {await this.applyModeRequest(request,runtime);changed=true;}
       }
+      if(this.prune())changed=true;
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });
   }
+  /** The watchdog. Every owner input gets an outcome: a retry only on evidence that
+   * the same id never arrived (not submitted, refused by the platform, reconciled as
+   * not received), a reconciliation of an uncertain submission by its original id,
+   * or a system notice to the owner. An input is `failed-notified` only once that
+   * notice itself has a platform receipt. The ports run outside the mutex:
+   * `requeue(id)` puts the durable inbox job back, `reconcileInput(id)` answers
+   * found / not-found / unknown, and `notifyOwner(kind,id)` sends — or, for an id it
+   * already tried, looks up — the one notice for that input. */
+  async watch({notifyOwner=null,reconcileInput=null,requeue=null,sessionBusy=false}={}) {
+    const now=this.now(),stuckMs=(this.state.config.inputStuckMinutes??10)*60000,gapMs=(this.state.config.noticeGapMinutes??10)*60000;
+    const actions=await this.locked(async()=>{
+      this.expireUnsubmittedInputs();
+      const list=[],due=[];let changed=false;
+      for(const record of Object.values(this.state.inputs)) {
+        if(!ownerInput(record)||record.historical||this.inflight.has(record.id))continue;
+        const summary=inputSummary(record),notice=record.ownerNotice;
+        if(['answered','superseded','canceled-by-owner','failed-notified'].includes(summary))continue;
+        // A failed owner control is reported by its own mode notice.
+        if(record.failureStage==='model-control'&&Object.values(this.state.notices).some(n=>n.sourceInputId===record.id&&!['failed','rejected','unresolved','superseded'].includes(n.state)))continue;
+        if(notice) {
+          if(!['sending','exhausted'].includes(notice.state)&&!(notice.nextAt>now)){notice.state='sending';list.push({kind:'notify',id:record.id,notice:notice.kind});changed=true;}
+          continue;
+        }
+        const last=Math.max(this.progress.get(record.id)??0,record.lastDeliveredAt??0,record.turnEndedAt??0,record.acceptedAt??0,record.retry?.lastFailureAt??0,record.at??0);
+        const idle=now-last>=stuckMs;
+        let verdict=null;
+        if(record.state==='failed-before-submit') {
+          if(record.retry&&!record.retry.exhausted&&requeue){if(record.retry.nextAt<=now&&!this.frozen())list.push({kind:'requeue',id:record.id});}
+          else verdict='stopped';
+        } else if(record.state==='queued') {
+          // Only the host's in-memory queue held it: with the session idle and its
+          // prompt never begun, it provably never reached the native session.
+          if(idle&&!sessionBusy){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});this.settleAcceptance(record.id,{state:record.state});changed=true;}
+        } else if(['unconfirmed','fenced-unconfirmed'].includes(record.state)) {
+          if(!record.reconciliation&&reconcileInput)list.push({kind:'reconcile',id:record.id});
+          else verdict='unknown';
+        } else if(record.state==='accepted'&&idle&&!sessionBusy&&!turnRunning(record))verdict=(record.delivered??0)>0?'partial':'unknown';
+        if(verdict)due.push({record,verdict});
+      }
+      // One notice at a time, never two within the gap: the oldest input first.
+      if(due.length&&!(now-this.state.lastOwnerNoticeAt<gapMs)) {
+        const {record,verdict}=due.sort((a,b)=>(a.record.at??0)-(b.record.at??0))[0];
+        // The notice's transport identity is the one the sender derives: the input and the kind.
+        record.ownerNotice={kind:verdict,id:'kin-input-notice-'+digest([record.id,verdict]).slice(0,32),state:'sending',attempts:0,at:now};
+        this.state.lastOwnerNoticeAt=now;list.push({kind:'notify',id:record.id,notice:verdict});changed=true;
+      }
+      if(changed)this.save('input-watch',{notices:list.filter(action=>action.kind==='notify').map(action=>action.id)});
+      return list;
+    });
+    const results=[];
+    for(const action of actions) {
+      if(action.kind==='requeue') {
+        let result;try{result=await requeue(action.id);}catch{result={state:'unavailable'};}
+        await this.locked(async()=>{
+          const record=this.state.inputs[action.id];if(!record||record.state!=='failed-before-submit')return;
+          if(['requeued','pending','processing'].includes(result?.state)){record.retry={...record.retry,requeuedAt:this.now(),nextAt:this.now()+stuckMs};this.save('input-requeued',{id:action.id});}
+          else {record.retry={...record.retry,exhausted:true,requeue:result?.state??'missing'};this.save('input-retry-exhausted',{id:action.id,reason:record.retry.requeue});}
+        });
+        results.push({...action,result:result?.state??null});continue;
+      }
+      if(action.kind==='reconcile') {
+        let result;try{result=await reconcileInput(action.id);}catch{result={state:'unknown'};}
+        await this.locked(async()=>{
+          const record=this.state.inputs[action.id];if(!record||!['unconfirmed','fenced-unconfirmed'].includes(record.state))return;
+          const state=['found','not-found'].includes(result?.state)?result.state:'unknown';
+          record.reconciliation={state,at:this.now()};
+          if(state==='found'){record.state='accepted';record.acceptedAt??=this.now();}
+          else if(state==='not-found'){this.notSubmitted(record,'reconciled-not-received',{restart:true,stage:'reconciliation'});record.retry.evidence='reconciled-not-received';}
+          this.save('input-reconciled',{id:action.id,state});
+        });
+        results.push({...action,result:result?.state??null});continue;
+      }
+      let receipt=null;
+      if(notifyOwner)try{receipt=await notifyOwner(action.notice,action.id);}catch{receipt=null;}
+      await this.locked(async()=>{
+        const record=this.state.inputs[action.id],notice=record?.ownerNotice;if(!notice)return;
+        notice.attempts=(notice.attempts??0)+1;notice.updatedAt=this.now();
+        const kind=notifyOwner?noticeReceiptClass(receipt):'no-port';
+        if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();}
+        else if(notice.attempts>=(kind==='unknown'?NOTICE_LOOKUP_BUDGET:NOTICE_SEND_BUDGET)){notice.state='exhausted';notice.lastReceipt=kind;}
+        else {notice.state=kind;notice.nextAt=this.now()+(kind==='not-submitted'?30000:120000);}
+        this.save('input-notice',{id:action.id,kind:notice.kind,state:notice.state});
+      });
+      results.push({...action,result:notifyOwner?noticeReceiptClass(receipt):'no-port'});
+    }
+    return results;
+  }
+}
+/** A task keeps a bounded history of replaced and late entries (AD1-08). */
+function trim(task,key,limit=64) {
+  const entries=Object.entries(task[key]??{});
+  if(entries.length>limit)task[key]=Object.fromEntries(entries.slice(-limit));
 }

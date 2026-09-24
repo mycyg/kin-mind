@@ -15,7 +15,10 @@ function canonical(value) {
   return value;
 }
 export class MemoryEventJournal {
-  constructor({directory,call,clock=Date.now,archivedState={}}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;this.archivedState=archivedState;}
+  constructor({directory,call,clock=Date.now,archivedState={}}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;this.archivedState=archivedState;this.listeners=new Set();}
+  /** Hear of every event this journal takes on. A listener never decides whether it is kept. */
+  observe(listener){this.listeners.add(listener);return ()=>this.listeners.delete(listener);}
+  notify(event){for(const listener of this.listeners)try{listener(event);}catch{/* Observers never refuse a durable event. */}}
   append(event) {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
@@ -35,6 +38,7 @@ export class MemoryEventJournal {
       return {state:'queued',id:event.id};
     }
     if(!createJsonExclusive(file,canonical(event))&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event ID conflicts with earlier contents');
+    this.notify(event);
     return {state:'queued',id:event.id};
   }
   errorFile(name){return path.join(this.directory,'errors',name);}
@@ -163,16 +167,92 @@ export function reconcileOutbox({directory,journal,historicalBefore}) {
   }
   return {queued,...(recorded?{recorded}:{}),...(unreadable?{unreadable}:{}),...(failed?{failed}:{})};
 }
+/** Credentials and opaque tokens never become memory. Private bodies are kept
+ * as they were (they are the owner's own material); these patterns only remove
+ * what would let anyone act as someone. */
+const SECRET_TEXT=[
+  /\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+  /((?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{12,}/gi,
+  /((?:api[_-]?key|secret|password|passwd|token|access[_-]?key|authorization|cookie)["']?\s*[:=]\s*["']?)[^\s"',;&]+/gi,
+  /([?&](?:key|token|sig|signature|secret|access_token|auth)=)[^&\s"']+/gi,
+  /\b[A-Za-z0-9+/_=-]{48,}\b/g,
+];
+const SECRET_KEY=/^(?:api[_-]?key|secret|password|passwd|token|access[_-]?key|authorization|cookie|credentials?|private[_-]?key)$/i;
+/** Every field of a tool experience is bounded. */
+export const TOOL_TEXT_LIMIT=4000;
+export function redactToolText(value,limit=TOOL_TEXT_LIMIT) {
+  let text=String(value??'');
+  for(const pattern of SECRET_TEXT)text=text.replace(pattern,(match,prefix)=>typeof prefix==='string'&&match.startsWith(prefix)?prefix+'[redacted]':'[redacted]');
+  return text.length>limit?text.slice(0,limit)+'…[truncated '+(text.length-limit)+' chars]':text;
+}
+function redactValue(value,depth=0) {
+  if(typeof value==='string')return redactToolText(value);
+  if(value===null||typeof value!=='object')return value;
+  if(depth>=6)return '[nested]';
+  if(Array.isArray(value))return value.slice(0,64).map(item=>redactValue(item,depth+1));
+  return Object.fromEntries(Object.entries(value).slice(0,64).map(([key,item])=>[key,SECRET_KEY.test(key)?'[redacted]':redactValue(item,depth+1)]));
+}
+const bounded=value=>{const text=JSON.stringify(value??null);return text.length>TOOL_TEXT_LIMIT*2?redactToolText(text,TOOL_TEXT_LIMIT*2):value;};
+/** The memory store's own recall tools: what they return is evidence already in the store, not a new observation. */
+const MEMORY_SERVER='memorypalace';
+
+/** One finished tool call as the eventmem `tool` host event the retired mobile
+ * hook wrote for PostToolUse (namespace `host:codex`, source "Kin 工具活动"). */
+export function toolExperience(call,{session,scope,scenario='companion'}) {
+  if(!call?.id||typeof session!=='string'||!session)return null;
+  const input=call.rawInput&&typeof call.rawInput==='object'?call.rawInput:{};
+  if(typeof input.server==='string'&&input.server===MEMORY_SERVER)return null;
+  const tool=typeof input.server==='string'&&typeof input.tool==='string'?'mcp__'+input.server+'__'+input.tool
+    :call.kind==='execute'?'shell':call.kind&&call.kind!=='other'?call.kind:String(call.title||'tool');
+  const arguments_=typeof input.server==='string'?input.arguments??{}:Object.keys(input).length?input:{title:call.title??null};
+  const output=call.rawOutput!==undefined?call.rawOutput:(call.content??[]).map(item=>item?.content?.text??(item?.type==='diff'?'[diff '+(item.path??'')+']':'')).filter(Boolean).join('\n');
+  const failed=call.status==='failed'||call.rawOutput?.isError===true||(Number.isInteger(call.rawOutput?.exit_code)&&call.rawOutput.exit_code!==0);
+  const payload={session_id:session,tool_name:redactToolText(tool,128),tool_use_id:call.id,tool_input:bounded(redactValue(arguments_)),
+    tool_response:bounded(redactValue(output)),isError:failed,host:'codex',scenario,hook_event_name:'PostToolUse',
+    ...(scope?{scope}:{}),memory_context_managed:true,extract:false};
+  payload.command_id=hash(JSON.stringify(['PostToolUse',session,call.id]));
+  return {event:'tool',payload};
+}
+/** The store's durable intake for host events: the memory service replays
+ * `<root>/host-spool/*.json` as receipts. One file per call, never rewritten. */
+export function spoolHostEvent(root,record) {
+  const directory=path.join(root,'host-spool');
+  fs.mkdirSync(directory,{recursive:true,mode:0o700});
+  const file=path.join(directory,'kin-tool-'+hash(record.payload.session_id+'\0'+record.payload.tool_use_id).slice(0,40)+'.json');
+  createJsonExclusive(file,record);
+  return file;
+}
 /** Only an observed edit effect establishes creator provenance. */
+/** Files up to this size are copied whole as the proof of their bytes; a larger
+ * one is recorded by its streamed fingerprint only, and one beyond the second
+ * bound not at all (AD2-12). */
+export const ARTIFACT_SNAPSHOT_BYTES=8*1024*1024;
+export const ARTIFACT_FINGERPRINT_BYTES=512*1024*1024;
+/** A tool call that never reports completed or failed is forgotten after this
+ * long, and at most this many are remembered at once. */
+export const ARTIFACT_PENDING_MS=30*60000;
+export const ARTIFACT_PENDING_MAX=200;
+function streamedSha256(file) {
+  const digest=createHash('sha256'),buffer=Buffer.allocUnsafe(1024*1024),fd=fs.openSync(file,'r');
+  try {for(let read;(read=fs.readSync(fd,buffer,0,buffer.length,null))>0;)digest.update(buffer.subarray(0,read));}
+  finally {fs.closeSync(fd);}
+  return digest.digest('hex');
+}
 export class ToolArtifactObserver {
-  constructor({journal,task=()=>null,clock=()=>new Date().toISOString()}) {Object.assign(this,{journal,task,clock});this.before=new Map();}
+  constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),now=()=>Date.now()}) {Object.assign(this,{journal,task,clock,now});this.before=new Map();}
   update(update) {
     if(!update.toolCallId)return;
     const id=update.toolCallId;
+    this.prune();
     const paths=[...(update.locations??[]).map(l=>l.path),update.rawInput?.path,update.rawInput?.file_path].filter(p=>typeof p==='string'&&path.isAbsolute(p));
     if(update.status==='failed'){this.before.delete(id);return;}
     if(update.status!=='completed') {
-      const previous=this.before.get(id)??new Map();
+      const previous=this.before.get(id)??Object.assign(new Map(),{since:this.now()});
       previous.kind=update.kind??previous.kind;
       for(const file of paths)if(!previous.has(file))previous.set(file,this.stat(file));
       this.before.set(id,previous);return;
@@ -182,9 +262,62 @@ export class ToolArtifactObserver {
       const after=this.stat(file),prior=before?.get(file);
       if(!after||after===prior)continue;
       const created=(update.kind??before?.kind)==='edit'&&before?.has(file);
+      // One file that cannot be read is not a reason to lose the others, nor
+      // to throw into the session's update stream.
+      let artifact;try{artifact=this.capture(file);}catch{continue;}
+      if(!artifact)continue;
       this.journal.append({id:`tool-artifact:${id}:${hash(file)}`,kind:created?'artifact-created':'artifact-observed',
-        at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact:snapshotArtifact(file,path.join(this.journal.directory,'artifacts'))});
+        at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact});
     }
+  }
+  capture(file) {
+    const size=fs.statSync(file).size;
+    if(size<=ARTIFACT_SNAPSHOT_BYTES)return snapshotArtifact(file,path.join(this.journal.directory,'artifacts'));
+    if(size>ARTIFACT_FINGERPRINT_BYTES)return null;
+    return {observed_path:file,name:path.basename(file),bytes:size,sha256:streamedSha256(file),snapshot:false};
+  }
+  prune() {
+    const cutoff=this.now()-ARTIFACT_PENDING_MS;
+    for(const [id,entry] of this.before)if(!(entry.since>=cutoff))this.before.delete(id);
+    // Oldest first: a Map keeps insertion order.
+    while(this.before.size>=ARTIFACT_PENDING_MAX)this.before.delete(this.before.keys().next().value);
   }
   stat(file) {try {const s=fs.statSync(file);return s.isFile()?`${s.size}:${s.mtimeMs}`:null;}catch{return null;}}
 }
+/** How long a tool call Kin began may stay unfinished, and how many are kept at once. */
+export const TOOL_ACTIVITY_PENDING_MS=30*60000,TOOL_ACTIVITY_PENDING_MAX=200;
+/** What Kin does with a tool in a turn that answers the owner, kept as her tool
+ * activity ("Kin 工具活动") through the memory store's host-event intake; this
+ * replaces the native hook, which is gone. Whether a call is hers is decided when
+ * it is first seen. Calls that never finish are forgotten after
+ * TOOL_ACTIVITY_PENDING_MS, and at most TOOL_ACTIVITY_PENDING_MAX are kept (AD2-12). */
+export class ToolActivityObserver {
+  constructor({root,scope=null,session=()=>null,owner=()=>false,scenario='companion',now=()=>Date.now()}) {
+    Object.assign(this,{root,scope,session,owner,scenario,now});this.calls=new Map();
+  }
+  update(update) {
+    if(!update?.toolCallId)return;
+    this.prune();
+    const id=update.toolCallId,known=this.calls.get(id);
+    let owner=known?.owner;
+    if(owner===undefined)try{owner=Boolean(this.owner());}catch{owner=false;}
+    const call={...known,id,owner,since:known?.since??this.now(),...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
+    if(!['completed','failed'].includes(update.status)){this.calls.set(id,call);return;}
+    this.calls.delete(id);
+    if(!owner)return;
+    try {
+      const record=toolExperience(call,{session:this.session(),scope:this.scope,scenario:this.scenario});
+      if(record)spoolHostEvent(this.root,record);
+    } catch{/* Tool activity is an observation; it never decides the turn. */}
+  }
+  prune() {
+    const cutoff=this.now()-TOOL_ACTIVITY_PENDING_MS;
+    for(const [id,call] of this.calls)if(!(call.since>=cutoff))this.calls.delete(id);
+    while(this.calls.size>=TOOL_ACTIVITY_PENDING_MAX)this.calls.delete(this.calls.keys().next().value);
+  }
+}
+/** One update stream to several observers; one that throws never stops the others. */
+export function observeToolUpdates(...observers) {
+  return {observers,update(update){for(const observer of observers)try{observer?.update(update);}catch{/* an observation never decides the turn */}}};
+}
+

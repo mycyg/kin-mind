@@ -1104,6 +1104,11 @@ footer span:nth-child(2) {
 .result-link .badge {
   margin-left: auto;
 }
+.result-link.derived {
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
 .policy-row,
 .schedule-row,
 .outbox-row {

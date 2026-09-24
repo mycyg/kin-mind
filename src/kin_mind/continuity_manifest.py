@@ -2,7 +2,10 @@
 
 Selection is local. Semantic notes are supplied by the existing appraisal, not
 by another per-message model request. Raw evidence and operation ledgers remain
-canonical; this module only persists derived views.
+canonical, and the checkpoints built from this set live in the host's
+conversation registry; nothing here is stored. Stores written by earlier
+releases keep their `mind_continuity_manifests` table: it is no longer written
+or read, and archiving it is an operator step.
 """
 import json
 
@@ -12,12 +15,6 @@ from .computer import redact
 from .graph import query_terms
 from .state import timestamp
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS mind_continuity_manifests(
- id TEXT PRIMARY KEY,scope TEXT NOT NULL,conversation TEXT NOT NULL,generation INTEGER NOT NULL,
- complete INTEGER NOT NULL,data TEXT NOT NULL,at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS mind_manifest_conversation ON mind_continuity_manifests(scope,conversation,generation,at);
-"""
 FIELDS = ('content', 'topic', 'target', 'status', 'kind', 'completion', 'reason', 'owner_request', 'concern_ids', 'expires_at')
 
 
@@ -27,8 +24,6 @@ class ContinuityManifest:
             from .context import Contexts
             contexts = Contexts(mind)
         self.ctx, self.mind, self.memory = contexts, mind, contexts.memory
-        with mind.engine.db.connect() as conn:
-            conn.executescript(SCHEMA)
 
     def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None):
         """Bounded candidate expansion, with open matters independent of recency."""
@@ -156,30 +151,3 @@ class ContinuityManifest:
         return {'durable_event_seq': durable, 'semantic_seq': row[0] if row else 0,
                 'pending_journal_count': len(pending), 'pending_digest': digest(pending),
                 'semantic_lag_is_not_missing_evidence': True}
-
-    def store(self, checkpoint):
-        with self.mind.engine.db.connect(write=True) as conn:
-            conn.execute('INSERT OR IGNORE INTO mind_continuity_manifests VALUES(?,?,?,?,?,?,?)',
-                (checkpoint['id'], self.mind.scope.key(), checkpoint['conversationId'], checkpoint['generation'],
-                 int(checkpoint['complete']), dumps(checkpoint), self.mind.clock()))
-        return checkpoint
-
-    def read(self, identifier=None, *, conversation=None, cursor=0, limit=20):
-        if not 0 <= cursor or not 1 <= limit <= 40:
-            raise ValueError('Invalid manifest page')
-        with self.mind.engine.db.connect() as conn:
-            if identifier:
-                row = conn.execute('SELECT data FROM mind_continuity_manifests WHERE scope=? AND id=?', (self.mind.scope.key(), identifier)).fetchone()
-                if not row:
-                    raise Missing(identifier)
-                value = json.loads(row[0])
-                deps = value.get('contextDependencies', [])
-                # A stored manifest that leans on something recall may no longer see needs review.
-                from eventmem.core.read_policy import ReadPolicy
-                policy = ReadPolicy.load(self.mind.engine, self.mind.scope, 'experience_recall', conn=conn)
-                return {'id': identifier, 'complete': value['complete'], 'needs_review': not all(self.ctx._current(i, policy) for i in deps),
-                        'payload': value['payload'], 'coverage': value['coverage'], 'watermarks': value.get('watermarks'),
-                        'sources': [{'id': i['id'], 'revision': i['revision']} for i in deps[cursor:cursor+limit]],
-                        'cursor': cursor+limit if len(deps) > cursor+limit else None, 'instruction_authority': 'data'}
-            rows = conn.execute('SELECT id,complete,at FROM mind_continuity_manifests WHERE scope=? AND (? IS NULL OR conversation=?) ORDER BY at DESC,id LIMIT ? OFFSET ?', (self.mind.scope.key(), conversation, conversation, limit+1, cursor)).fetchall()
-        return {'items': [dict(r) for r in rows[:limit]], 'cursor': cursor+limit if len(rows)>limit else None}

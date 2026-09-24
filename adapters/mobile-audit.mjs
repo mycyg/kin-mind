@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 import {atomicJson} from './mobile-router.mjs';
-import {REVIEWER_LANES,REVIEWER_PURPOSES} from './mobile-reviewer.mjs';
+import {REVIEWER_LANES,REVIEWER_PURPOSES,AUDIT_CODES} from './mobile-reviewer.mjs';
+
+const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export function appraisalProgress(operations, mind={}) {
   const running=operations?.queues?.find(q=>q.lane==='action'&&q.state==='running'&&q.count>0);
@@ -12,15 +14,28 @@ export function appraisalProgress(operations, mind={}) {
   return {state:'unknown',at:null,lastRecordedResult:mind.appraisal?.state??null};
 }
 
-/** Health reviews never change the conversation provider. Repair requests are
- * durable internal jobs which the shared conversation accepts when idle. */
+/** A failed reading is retried soon twice, then waits for its ordinary interval. */
+export const AUDIT_FAILURE_RETRY_MINUTES=Object.freeze([5,15]);
+/** A fault seen again within this long after it cleared is the same incident. */
+export const INCIDENT_REOPEN_MS=24*3600000;
+
+/** Health readings never change the conversation provider and never start work in
+ * the conversation. A reading that is not healthy is one incident, keyed by its
+ * fault classes: the same classes seen again only refresh its evidence. The
+ * findings are facts for Kin, who decides when and whether to look at them (N13). */
 export class MobileAudit {
   constructor({file,collect,review,intervalHours=4,now=()=>Date.now(),lease=null,
     lane=REVIEWER_LANES.audit,purpose=REVIEWER_PURPOSES.audit,skipRetryMs=5*60000}) {
     Object.assign(this,{file,collect,review,intervalHours,now,lease,lane,purpose,skipRetryMs});this.running=false;
-    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,nextAt:now(),history:[],repairs:{}};
+    this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,nextAt:now(),history:[],incidents:{}};
     if(this.state.schema!==1)throw Error('Unknown audit schema');
-    if(this.state.status==='running') {this.state.status='interrupted';atomicJson(file,this.state);}
+    this.state.incidents??={};
+    // Repairs from before the findings became Kin's are history: kept as they were,
+    // and nothing runs them any more.
+    if(this.state.repairs){this.state.retiredRepairs={at:now(),repairs:this.state.repairs,lastIncident:this.state.lastIncident??null,lastFollowup:this.state.lastFollowup??null};
+      delete this.state.repairs;delete this.state.lastIncident;delete this.state.lastFollowup;}
+    if(this.state.status==='running')this.state.status='interrupted';
+    atomicJson(file,this.state);
   }
   async tick() {
     if(this.running||this.now()<this.state.nextAt)return{state:'not-due'};
@@ -35,33 +50,53 @@ export class MobileAudit {
     atomicJson(this.file,this.state);
     try {
       const snapshot=await this.collect();const result=await this.review(snapshot,{held});
-      this.state.status=result.status;this.state.failures=0;this.state.lastSuccessAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;this.state.lastReview={id,at:this.now(),snapshot,result};
-      if(result.status==='healthy')this.state.lastIncident=null;
-      else {
-        const fingerprint=createHash('sha256').update(JSON.stringify(result.findings.map(f=>f.code).sort())).digest('hex');
-        if(fingerprint!==this.state.lastIncident) {
-          this.state.repairs[id]={id,state:'pending',fingerprint,result,createdAt:this.now()};
-          this.state.lastIncident=fingerprint;
-        }
-      }
-      this.state.history.push({id,at:this.now(),status:result.status});this.state.history=this.state.history.slice(-60);
+      const at=this.now();
+      this.state.status=result.status;this.state.failures=0;this.state.lastSuccessAt=at;this.state.nextAt=at+this.intervalHours*3600000;
+      this.state.lastReview={id,at,status:result.status,codes:[...new Set(result.findings.map(f=>f.code))].sort()};
+      this.record(id,result,at);
+      this.state.history.push({id,at,status:result.status});this.state.history=this.state.history.slice(-60);
       return{state:result.status};
     } catch(error) {
       // A lane that refused the run is not a failed review: nothing was spent, so it
       // costs no failure count and returns soon rather than in four hours.
       if(error?.leaseSkipped){this.state.status='skipped';this.state.nextAt=this.now()+this.skipRetryMs;return{state:'skipped',lane:this.lane,reason:error.lease?.leaseReason??error.lease?.leaseState??'model-lane-unavailable'};}
-      this.state.status='failed';this.state.failures=(this.state.failures??0)+1;this.state.nextAt=this.now()+(this.state.failures===1?5:15)*60000;this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
+      this.state.status='failed';this.state.failures=(this.state.failures??0)+1;
+      const minutes=AUDIT_FAILURE_RETRY_MINUTES[this.state.failures-1]??this.intervalHours*60;
+      this.state.nextAt=this.now()+minutes*60000;
+      this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
     finally {this.running=false;await held?.release();atomicJson(this.file,this.state);}
   }
-  pending() {return Object.values(this.state.repairs).filter(r=>r.state==='pending');}
-  settle(id,state,receipt) {
-    if(!this.state.repairs[id])throw Error('Unknown audit repair');
-    if(!['accepted','unconfirmed','resolved','needs-attention'].includes(state))throw Error('Invalid repair state');
-    Object.assign(this.state.repairs[id],{state,receipt,updatedAt:this.now()});
-    if(this.state.lastReview?.id===id&&['resolved','needs-attention'].includes(state)) {
-      this.state.status=state==='resolved'?'healthy':'needs_attention';
-      this.state.lastFollowup={id,state,at:this.now(),receipt};
+  record(id,result,at) {
+    const incidents=Object.values(this.state.incidents);
+    if(result.status==='healthy') {
+      for(const incident of incidents)if(incident.state==='open'){incident.state='cleared';incident.clearedAt=at;}
+      return null;
     }
-    atomicJson(this.file,this.state);
+    const codes=[...new Set(result.findings.map(f=>AUDIT_CODES.includes(f.code)?f.code:'other'))].sort(),fingerprint=digest(codes);
+    const same=incidents.filter(i=>i.fingerprint===fingerprint).sort((a,b)=>b.lastSeenAt-a.lastSeenAt)[0];
+    if(same&&(same.state==='open'||at-(same.clearedAt??0)<INCIDENT_REOPEN_MS)) {
+      Object.assign(same,{state:'open',findings:result.findings,lastSeenAt:at,seen:(same.seen??1)+1});delete same.clearedAt;
+      return same;
+    }
+    const incident={id,state:'open',fingerprint,codes,findings:result.findings,firstSeenAt:at,lastSeenAt:at,seen:1};
+    this.state.incidents[id]=incident;
+    const keep=Object.values(this.state.incidents).sort((a,b)=>b.lastSeenAt-a.lastSeenAt).slice(0,32).map(i=>i.id);
+    for(const key of Object.keys(this.state.incidents))if(!keep.includes(key))delete this.state.incidents[key];
+    return incident;
+  }
+  /** Open incidents Kin has not been told about yet, as facts. */
+  untold() {
+    return Object.values(this.state.incidents).filter(i=>i.state==='open'&&!i.toldAt)
+      .map(i=>({id:i.id,codes:i.codes,findings:i.findings.map(f=>({code:f.code,summary:f.summary,evidence:f.evidence})),firstSeenAt:i.firstSeenAt,lastSeenAt:i.lastSeenAt}));
+  }
+  markTold(ids,at=this.now()) {
+    let changed=false;
+    for(const id of ids){const incident=this.state.incidents[id];if(incident&&!incident.toldAt){incident.toldAt=at;changed=true;}}
+    if(changed)atomicJson(this.file,this.state);
+    return changed;
+  }
+  view() {
+    return {status:this.state.status??'not-run',nextAt:this.state.nextAt,lastSuccessAt:this.state.lastSuccessAt,failures:this.state.failures??0,
+      incidents:Object.values(this.state.incidents).filter(i=>i.state==='open').map(i=>({id:i.id,codes:i.codes,seen:i.seen,firstSeenAt:i.firstSeenAt,lastSeenAt:i.lastSeenAt,told:Boolean(i.toldAt)}))};
   }
 }
