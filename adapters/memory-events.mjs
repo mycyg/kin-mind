@@ -227,28 +227,19 @@ export function spoolHostEvent(root,record) {
   createJsonExclusive(file,record);
   return file;
 }
-const CALLS_KEPT=256;
-const keepBounded=(map,key,value)=>{map.delete(key);map.set(key,value);while(map.size>CALLS_KEPT)map.delete(map.keys().next().value);};
-
-/** Only an observed edit effect establishes creator provenance. With
- * `experiences`, what Kin does with a tool in an owner turn is also kept as her
- * tool activity (replacing the native hook, which is gone). Calls that never
- * finish are forgotten after `CALLS_KEPT` newer ones (AD2-12). */
+/** Only an observed edit effect establishes creator provenance. */
 export class ToolArtifactObserver {
-  constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),experiences=null}) {
-    Object.assign(this,{journal,task,clock,experiences});this.before=new Map();this.calls=new Map();
-  }
+  constructor({journal,task=()=>null,clock=()=>new Date().toISOString()}) {Object.assign(this,{journal,task,clock});this.before=new Map();}
   update(update) {
     if(!update.toolCallId)return;
     const id=update.toolCallId;
-    this.remember(update);
     const paths=[...(update.locations??[]).map(l=>l.path),update.rawInput?.path,update.rawInput?.file_path].filter(p=>typeof p==='string'&&path.isAbsolute(p));
     if(update.status==='failed'){this.before.delete(id);return;}
     if(update.status!=='completed') {
       const previous=this.before.get(id)??new Map();
       previous.kind=update.kind??previous.kind;
       for(const file of paths)if(!previous.has(file))previous.set(file,this.stat(file));
-      keepBounded(this.before,id,previous);return;
+      this.before.set(id,previous);return;
     }
     const before=this.before.get(id);this.before.delete(id);
     for(const file of new Set([...paths,...(before?.keys()??[])])) {
@@ -259,20 +250,42 @@ export class ToolArtifactObserver {
         at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact:snapshotArtifact(file,path.join(this.journal.directory,'artifacts'))});
     }
   }
-  /** A call is Kin's own when its turn answered the owner; that is decided when the call is first seen. */
-  remember(update) {
-    if(!this.experiences)return;
+  stat(file) {try {const s=fs.statSync(file);return s.isFile()?`${s.size}:${s.mtimeMs}`:null;}catch{return null;}}
+}
+/** How long a tool call Kin began may stay unfinished, and how many are kept at once. */
+export const TOOL_ACTIVITY_PENDING_MS=30*60000,TOOL_ACTIVITY_PENDING_MAX=200;
+/** What Kin does with a tool in a turn that answers the owner, kept as her tool
+ * activity ("Kin 工具活动") through the memory store's host-event intake; this
+ * replaces the native hook, which is gone. Whether a call is hers is decided when
+ * it is first seen. Calls that never finish are forgotten after
+ * TOOL_ACTIVITY_PENDING_MS, and at most TOOL_ACTIVITY_PENDING_MAX are kept (AD2-12). */
+export class ToolActivityObserver {
+  constructor({root,scope=null,session=()=>null,owner=()=>false,scenario='companion',now=()=>Date.now()}) {
+    Object.assign(this,{root,scope,session,owner,scenario,now});this.calls=new Map();
+  }
+  update(update) {
+    if(!update?.toolCallId)return;
+    this.prune();
     const id=update.toolCallId,known=this.calls.get(id);
     let owner=known?.owner;
-    if(owner===undefined)try{owner=Boolean(this.experiences.owner?.());}catch{owner=false;}
-    const call={...known,id,owner,...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
-    if(!['completed','failed'].includes(update.status)){keepBounded(this.calls,id,call);return;}
+    if(owner===undefined)try{owner=Boolean(this.owner());}catch{owner=false;}
+    const call={...known,id,owner,since:known?.since??this.now(),...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
+    if(!['completed','failed'].includes(update.status)){this.calls.set(id,call);return;}
     this.calls.delete(id);
     if(!owner)return;
     try {
-      const record=toolExperience(call,{session:this.experiences.session?.(),scope:this.experiences.scope,scenario:this.experiences.scenario});
-      if(record)spoolHostEvent(this.experiences.root,record);
+      const record=toolExperience(call,{session:this.session(),scope:this.scope,scenario:this.scenario});
+      if(record)spoolHostEvent(this.root,record);
     } catch{/* Tool activity is an observation; it never decides the turn. */}
   }
-  stat(file) {try {const s=fs.statSync(file);return s.isFile()?`${s.size}:${s.mtimeMs}`:null;}catch{return null;}}
+  prune() {
+    const cutoff=this.now()-TOOL_ACTIVITY_PENDING_MS;
+    for(const [id,call] of this.calls)if(!(call.since>=cutoff))this.calls.delete(id);
+    while(this.calls.size>=TOOL_ACTIVITY_PENDING_MAX)this.calls.delete(this.calls.keys().next().value);
+  }
 }
+/** One update stream to several observers; one that throws never stops the others. */
+export function observeToolUpdates(...observers) {
+  return {observers,update(update){for(const observer of observers)try{observer?.update(update);}catch{/* an observation never decides the turn */}}};
+}
+

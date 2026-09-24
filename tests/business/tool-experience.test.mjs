@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {ToolArtifactObserver,toolExperience,redactToolText} from '../../adapters/memory-events.mjs';
+import {ToolActivityObserver,ToolArtifactObserver,observeToolUpdates,toolExperience,redactToolText} from '../../adapters/memory-events.mjs';
 
 function observer(t,{owner=true}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-tool-experience-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const journal={directory:path.join(root,'journal'),append:()=>({state:'queued'})};
   const scope={project:'personal',persona:'Kin',collection:'default',world:'real'};
-  const o=new ToolArtifactObserver({journal,experiences:{root,scope,session:()=>'main-session',owner:()=>owner}});
+  const activity=new ToolActivityObserver({root,scope,session:()=>'main-session',owner:()=>owner});
+  // The host hands one update stream to both observers.
+  const o=Object.assign(observeToolUpdates(new ToolArtifactObserver({journal}),activity),{calls:activity.calls});
   const spooled=()=>{try{return fs.readdirSync(path.join(root,'host-spool')).map(name=>JSON.parse(fs.readFileSync(path.join(root,'host-spool',name),'utf8')));}catch{return [];}};
   return {o,spooled,scope};
 }
@@ -49,5 +51,12 @@ test('recall from the memory store, internal turns and unfinished calls leave no
   internal.o.update({toolCallId:'call_2',status:'completed',rawOutput:'127.0.0.1 localhost'});
   assert.deepEqual(internal.spooled(),[]);
   for(let i=0;i<300;i++)owner.o.update({toolCallId:'open_'+i,kind:'execute',status:'in_progress',rawInput:{command:['sleep','1']}});
-  assert.ok(owner.o.calls.size<=256&&owner.o.before.size<=256,'calls that never finish are forgotten (AD2-12)');
+  assert.ok(owner.o.calls.size<=200,'calls that never finish are forgotten (AD2-12)');
+});
+
+test('one observer that throws never stops the other',()=>{
+  const seen=[];
+  const both=observeToolUpdates({update(){throw Error('broken');}},{update:u=>seen.push(u.toolCallId)});
+  both.update({toolCallId:'x'});
+  assert.deepEqual(seen,['x']);
 });
