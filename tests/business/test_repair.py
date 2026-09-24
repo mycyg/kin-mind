@@ -168,3 +168,25 @@ def test_quarantined_work_whose_evidence_is_gone_is_retired_only_when_asked(stor
     with engine.db.connect() as conn:
         states = dict(conn.execute("SELECT id,state FROM mind_appraisals WHERE id IN ('gone','kept')").fetchall())
     assert states == {"gone": "superseded", "kept": "needs-repair"}
+
+
+def test_the_old_evidence_scan_is_switched_off_only_where_the_table_agrees(store):
+    engine, mind, notes, owner, versions = store
+    from kin_mind import evidence_keys
+    from kin_mind.autonomy_schema import optimized
+
+    other = Mind(engine, Scope(persona="synthetic-repair-other"))
+    MemoryContinuity(other)
+    with engine.db.connect(write=True) as conn:
+        conn.execute(evidence_keys.SCHEMA)
+        for scope in (mind.scope.key(), other.scope.key()):
+            conn.execute("INSERT OR IGNORE INTO mind_memory_config VALUES(?,?)", (scope, "{}"))
+        # The other scope's table credits a key no history row introduced: it disagrees.
+        conn.execute("INSERT INTO mind_evidence_keys VALUES(?,?,?,?)", (other.scope.key(), "k" * 64, "evt", 1))
+    dry = repair.run(engine.db.root, steps=("evidence",))["steps"]["evidence"]["plan"]
+    assert dry["scopes"] == 2 and dry["disagreements"] >= 1
+    done = repair.run(engine.db.root, apply=True, steps=("evidence",))["steps"]["evidence"]["done"]
+    assert done == {"legacy_scan_off": 1, "left_on": 1}
+    with engine.db.connect() as conn:
+        assert not optimized(conn, mind.scope.key(), evidence_keys.LEGACY_FLAG)
+        assert optimized(conn, other.scope.key(), evidence_keys.LEGACY_FLAG)

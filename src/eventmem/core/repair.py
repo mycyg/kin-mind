@@ -31,6 +31,10 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               (K4-10, DB1-07).
 - `spool`     Host receipts that can never be replayed move to host-spool/rejected/ (E1-02,
               E3-17, DB1-06); the rest are replayed as the service would.
+- `evidence`  The evidence-key table is filled up to the head of history and compared with the
+              snapshot scan row by row; where the two agree completely, the old scan stops
+              running inside every appraisal's write lock (`history_legacy_guard` off). Where
+              they do not, nothing is switched and the report names the counts (K4-15).
 - `reerase`   Opt-in. Deletes made before this release left their words in the mind's derived
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). It rewrites history rows, so it
@@ -58,7 +62,7 @@ from .read_policy import (
     origin_of_rule,
 )
 
-STEPS = ("origins", "maintenance", "versions", "queues", "indexes", "spool", "reerase", "quarantine")
+STEPS = ("origins", "maintenance", "versions", "queues", "indexes", "spool", "evidence", "reerase", "quarantine")
 DEFAULT_STEPS = STEPS[:-2]
 COMMAND = "repair-20260924"
 # The maintenance notes this release archives: session-maintenance requests. Internal mind
@@ -356,6 +360,51 @@ def apply_reerase(engine):
     return {"layers": counts, "history_job": job}
 
 
+# --- evidence --------------------------------------------------------------------------------
+
+def _evidence_scopes(conn):
+    from kin_mind import evidence_keys
+    from kin_mind.autonomy_schema import optimized
+
+    if not _table(conn, "mind_memory_config") or not evidence_keys.installed(conn):
+        return []
+    return [scope for (scope,) in conn.execute("SELECT scope FROM mind_memory_config ORDER BY scope")
+            if optimized(conn, scope, evidence_keys.INDEX_FLAG) and optimized(conn, scope, evidence_keys.LEGACY_FLAG)]
+
+
+def plan_evidence(engine):
+    from kin_mind import evidence_keys
+    from kin_mind.state import Mind
+
+    with engine.db.connect() as conn:
+        scopes = _evidence_scopes(conn)
+    found = []
+    for scope in scopes:
+        mind = Mind(engine, Scope.model_validate(json.loads(scope)))
+        filling = evidence_keys.backfill(mind, apply=False)
+        checked = evidence_keys.verify(mind)
+        found.append({"scope": scope, "would_insert": filling["would_insert"], "state": checked["state"],
+                      "missing": checked["missing_count"], "extra": checked["extra_count"],
+                      "mismatched": checked["mismatched_count"]})
+    return found
+
+
+def apply_evidence(engine, plan):
+    from kin_mind import evidence_keys
+    from kin_mind.state import Mind
+
+    switched = []
+    for entry in plan:
+        mind = Mind(engine, Scope.model_validate(json.loads(entry["scope"])))
+        done = evidence_keys.backfill(mind, apply=True)
+        if done["state"] == "complete" and done["verification"]["caught_up"]:
+            with engine.db.connect(write=True) as conn:
+                conn.execute("UPDATE mind_memory_config SET data=json_set(data,'$." + evidence_keys.LEGACY_FLAG
+                             + "',json('false')) WHERE scope=?", (entry["scope"],))
+            switched.append(entry["scope"])
+    return {"legacy_scan_off": len(switched), "left_on": len(plan) - len(switched)}
+
+
 # --- quarantine ------------------------------------------------------------------------------
 
 def _gone(conn, identifier):
@@ -426,6 +475,8 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
         }
     if "spool" in steps:
         plans["spool"] = plan_spool(engine)
+    if "evidence" in steps:
+        plans["evidence"] = plan_evidence(engine)
     for step in STEPS:
         if step not in steps:
             continue
@@ -444,6 +495,8 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
                 entry["done"] = apply_indexes(engine, plan)
             elif step == "spool":
                 entry["done"] = apply_spool(engine)
+            elif step == "evidence":
+                entry["done"] = apply_evidence(engine, plan)
             elif step == "reerase":
                 entry["done"] = apply_reerase(engine)
             elif step == "quarantine":
@@ -469,6 +522,10 @@ def _summary(step, plan):
                 "records_to_supersede": sum(len(group["source_ids"]) - 1 for group in plan)}
     if step == "queues":
         return {key: len(value) for key, value in plan.items()}
+    if step == "evidence":
+        return {"scopes": len(plan), "verified": sum(1 for e in plan if e["state"] == "verified"),
+                "would_insert": sum(e["would_insert"] for e in plan),
+                "disagreements": sum(e["missing"] + e["extra"] + e["mismatched"] for e in plan)}
     if step == "quarantine":
         return {"quarantined": plan["quarantined"], "by_reason": plan["by_reason"],
                 "evidence_gone": len(plan["evidence_gone"])}

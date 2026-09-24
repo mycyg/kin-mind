@@ -247,6 +247,32 @@ class EventGraph:
         graph_changed(conn, self.scope.key(), value, old, self.mind.clock())
         return value
 
+    def _repoint(self, conn, edge, subject, object_id, before, changed):
+        """An edge moved to new ends is the edge of those ends (K4-09). Its identity is computed
+        again from them, as `link` computes it; its evidence joins an edge those ends already
+        have; the old edge is retracted and names where it went. A merged or split relationship
+        is then never shown twice, and a later `link` finds the one edge. `before` keeps what an
+        undo puts back: the old edge, the edge that absorbed it, or nothing for a new one."""
+        before.setdefault(edge["id"], edge)
+        if subject == object_id:
+            changed.append(self._put(conn, {**edge, "state": "retracted"}, edge=True))
+            return
+        moved_id = self.identifier("edge", [subject, edge["predicate"], object_id, edge.get("layer"), edge.get("role")])
+        try:
+            existing = self.get(conn, moved_id)
+        except Missing:
+            existing = None
+        before.setdefault(moved_id, existing)
+        if existing is None:
+            moved = {**edge, "id": moved_id, "subject": subject, "object": object_id, "state": "active"}
+            moved.pop("moved_to", None)
+        else:
+            evidence = {r["record_id"]: r for r in [*existing.get("evidence", []), *edge.get("evidence", [])]}
+            moved = {**existing, "evidence": list(evidence.values()), "state": "active",
+                     "source_ids": sorted(set(existing.get("source_ids", [])) | set(edge.get("source_ids", [])))}
+        changed.append(self._put(conn, moved, edge=True))
+        changed.append(self._put(conn, {**edge, "state": "retracted", "moved_to": moved_id}, edge=True))
+
     def proof(self, conn, identifiers, allowed=None):
         roots = []
         for identifier in identifiers:
@@ -684,11 +710,9 @@ class EventGraph:
                 target = self._put(conn, {**target, "aliases": list(dict.fromkeys([*target.get("aliases", []), current["title"], *current.get("aliases", [])])), "merge_sources": list(dict.fromkeys([*target.get("merge_sources", []), identifier]))})
                 changed.append(target)
                 for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND (subject=? OR object=?) AND state='active'", (self.scope.key(), identifier, identifier)).fetchall():
-                    edge = json.loads(row[0]); before[edge["id"]] = edge
-                    edge = {**edge, "subject": target["id"] if edge["subject"] == identifier else edge["subject"], "object": target["id"] if edge["object"] == identifier else edge["object"]}
-                    if edge["subject"] == edge["object"]:
-                        edge["state"] = "retracted"
-                    changed.append(self._put(conn, edge, edge=True))
+                    edge = json.loads(row[0])
+                    self._repoint(conn, edge, target["id"] if edge["subject"] == identifier else edge["subject"],
+                                  target["id"] if edge["object"] == identifier else edge["object"], before, changed)
             elif action == "split_event":
                 if current["kind"] != "event" or current["state"] != "active":
                     raise Conflict("Only event membership can be split")
@@ -715,10 +739,13 @@ class EventGraph:
                 changed.append(split)
                 for edge in all_edges:
                     if edge["subject"] in selected:
-                        before[edge["id"]] = edge
-                        changed.append(self._put(conn, {**edge, "object": split_id}, edge=True))
+                        self._repoint(conn, edge, edge["subject"], split_id, before, changed)
                 current = {**current, "membership_command": request["command_id"]}
-            elif action in {"undo", "split"}:
+            elif action == "split":
+                # `split` used to be a second name for `undo`, which a model reading "split" took
+                # for the division of an event (K4-08).
+                raise ValueError("To divide an event use split_event; to reverse a command use undo")
+            elif action == "undo":
                 prior = conn.execute("SELECT data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["previous_command_id"])).fetchone()
                 if not prior:
                     raise Missing(request["previous_command_id"])
