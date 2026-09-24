@@ -1,4 +1,5 @@
-"""Read-only deployment assertions for a rehearsal (mind review 2026-09-24, deployment conditions).
+"""Deployment assertions for a rehearsal, read-only unless given a scratch directory (mind review
+2026-09-24, deployment conditions; mind2 review).
 
 Two facts the code alone cannot hold and a deployment must:
 
@@ -11,13 +12,15 @@ Two facts the code alone cannot hold and a deployment must:
   exploration run builds it, and paths into each protected root, directly and through a symlink
   when a scratch directory is given, are refused by the reader itself.
 
-Nothing here writes, opens the memory store for writing, reads a credentials file or returns
-persona text, source text or file content: each answer names problems by code only.
+By default nothing here writes: the memory store is opened read-only, no credentials file is
+read, and no persona text, source text or file content is returned; each answer names problems by
+code only. `--scratch DIR` is the one exception: the symlink probe then creates one symlink per
+protected root inside DIR and leaves it there, so DIR must be a rehearsal's own temporary directory,
+never an owner root.
 
     python -m kin_mind.deploy_checks /path/to/mind-config.json [--scratch DIR]
 
-prints both answers as JSON and exits 0 when both hold, 1 otherwise. `--scratch` names a directory
-the check may create a symlink in (a rehearsal's own temporary directory, never an owner root).
+prints both answers as JSON and exits 0 when both hold, 1 otherwise.
 """
 from __future__ import annotations
 
@@ -128,7 +131,8 @@ def _within(path, root):
 
 def exploration_exclusions(config, *, scratch=None):
     """Whether the exploration reader refuses the host, the memory store and Kin's Codex home,
-    directly and through symlinks. Read-only, except for one symlink made inside `scratch`."""
+    directly and through symlinks. Read-only without `scratch`; with it, one symlink per protected
+    root is made inside `scratch` and left there."""
     computer = config.get("computer_exploration") or {}
     if not (computer.get("enabled") and computer.get("file_reader_enabled", True)):
         return {"ok": True, "problems": [], "reader": "disabled", "refused": 0}
