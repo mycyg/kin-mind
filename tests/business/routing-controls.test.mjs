@@ -88,3 +88,16 @@ test('the host\'s configured profiles route work and chat; display names come fr
   assert.equal(runtimeReply({actual:{model:'gpt-6-astra',reasoningEffort:'high',verified:true},tasks:[],mode:'auto'},{names:f.router.modelNames}).includes('Astra (catalog)'),true);
   assert.equal(displayName('unknown-model'),'unknown-model');
 });
+
+test('a failed force leaves no force in progress, so nothing keeps its epoch suppressed (H1-01)',async t=>{
+  let inProgress=null;
+  const f=fixture(t,{classify:async()=>({route:'control',control:'work',force:true,reason:'owner forces the work profile'})});
+  f.args.forceSwitch=null;
+  const router=new MobileRouter({...f.args,forceSwitch:async()=>{inProgress=router.forceInProgress();return {state:'failed',reason:'native-cancel-request-failed'};}});
+  Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+  await router.dispatch({id:'force-now',kind:'owner',text:'立刻切到工作模式'},async()=>assert.fail('a control is not a prompt'));
+  assert.equal(inProgress,true,'while the host is interrupting, the force is in progress');
+  assert.equal(router.state.requests['owner-mode:force-now'].state,'failed');
+  assert.equal(router.forceInProgress(),false);
+  assert.equal(router.state.executionEpoch,0,'the epoch never advanced');
+});

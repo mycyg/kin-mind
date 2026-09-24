@@ -1088,6 +1088,11 @@ export class MobileRouter {
       await this.applyModeRequest(request,runtime);return clone(request);
     });
   }
+  /** A force for the current epoch that is still being carried out. While none is,
+   * nothing may keep that epoch's output suppressed (H1-01). */
+  forceInProgress() {
+    return Object.values(this.state.requests).some(request=>request.force===true&&request.forceState==='interrupting'&&!request.forceBoundary)||Boolean(this.unfencedForce());
+  }
   unfencedForce() {
     const boundaryAt=this.state.forceBoundaries.at(-1)?.at??-Infinity;
     return Object.values(this.state.requests).findLast(request=>{
