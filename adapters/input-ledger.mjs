@@ -40,7 +40,8 @@ export function inputSummary(record) {
   if(!record)return null;
   if(record.historical)return 'historical';
   if(record.state==='superseded')return 'superseded';
-  if(record.state==='accepted'&&(answered(record)||['control','maintenance'].includes(record.route)))return 'answered';
+  // A control or maintenance input is answered by its own receipt like any other (CR-LIFE-07).
+  if(record.state==='accepted'&&answered(record))return 'answered';
   if(record.canceledBy)return 'canceled-by-owner';
   if(record.ownerNotice?.state==='accepted')return 'failed-notified';
   if(record.state==='semantic-pending')return 'classifying';
