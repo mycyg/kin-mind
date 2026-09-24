@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import zipfile
 from datetime import timedelta
 from pathlib import Path
@@ -218,11 +219,58 @@ def fingerprint_file(path):
     return result
 
 
+# Set in `meta` once the memory index shares its rowids with `mind_memory_nodes` (see graph.py).
+SEARCH_ALIGNED = "mind_memory_search_rowid"
+_ready = set()
+
+
+def _store_key(path):
+    """This store file, as opposed to whatever file is at its path later: a restore that puts
+    another database in its place gets its schema checked again."""
+    try:
+        return (str(path), os.stat(path).st_ino)
+    except OSError:
+        return (str(path), None)
+
+
+def search_text(node):
+    text = " ".join(str(node.get(k, "")) for k in ("title", "topic", "summary", "name", "task_ids", "about_ids"))
+    return text + " " + " ".join(b.get("text", "") for b in (node.get("bubbles") or {}).values() if isinstance(b, dict))
+
+
+def index_node(conn, rowid, node):
+    """The node's index row, removed by rowid once the index is aligned, by a scan before."""
+    aligned = bool(conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone())
+    if aligned:
+        conn.execute("DELETE FROM mind_memory_search WHERE rowid=?", (rowid,))
+        conn.execute("INSERT INTO mind_memory_search(rowid,id,tokens) VALUES(?,?,?)", (rowid, node["id"], tokenize(search_text(node))))
+    else:
+        conn.execute("DELETE FROM mind_memory_search WHERE id=?", (node["id"],))
+        conn.execute("INSERT INTO mind_memory_search(id,tokens) VALUES(?,?)", (node["id"], tokenize(search_text(node))))
+
+
+def align_search(conn):
+    """Rebuild the memory index with the nodes' own rowids, once."""
+    conn.execute("DELETE FROM mind_memory_search")
+    rows = conn.execute("SELECT rowid,id,data FROM mind_memory_nodes").fetchall()
+    conn.executemany("INSERT INTO mind_memory_search(rowid,id,tokens) VALUES(?,?,?)",
+                     [(row[0], row[1], tokenize(search_text(json.loads(row[2])))) for row in rows])
+    conn.execute("INSERT OR IGNORE INTO meta VALUES(?,1)", (SEARCH_ALIGNED,))
+    return len(rows)
+
+
 class MemoryContinuity:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
-        with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + memory_items.SCHEMA)
+        key = _store_key(self.engine.db.path)
+        if key not in _ready:
+            with self.engine.db.connect() as conn:
+                conn.executescript(SCHEMA + memory_items.SCHEMA)
+            with self.engine.db.connect(write=True) as conn:
+                if not conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone() \
+                        and not conn.execute("SELECT 1 FROM mind_memory_nodes LIMIT 1").fetchone():
+                    align_search(conn)
+            _ready.add(key)
         self.graph = EventGraph(mind)
         self.sharing = ShareLedger(mind)
         self.habits = ConversationHabits(mind)
@@ -313,13 +361,11 @@ class MemoryContinuity:
         if previous and compare == {k: v for k, v in previous.items() if k not in {"revision", "updated_at"}}:
             return previous
         node = {**node, "revision": (row["revision"] if row else 0) + 1, "updated_at": self.mind.clock()}
-        conn.execute("INSERT OR REPLACE INTO mind_memory_nodes VALUES(?,?,?,?,?,?)",
+        conn.execute("INSERT INTO mind_memory_nodes VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                     "scope=excluded.scope,kind=excluded.kind,revision=excluded.revision,updated_at=excluded.updated_at,data=excluded.data",
                      (node["id"], self.scope.key(), node["kind"], node["revision"], node["updated_at"], dumps(node)))
         conn.execute("INSERT INTO mind_memory_revisions VALUES(?,?,?)", (node["id"], node["revision"], dumps(node)))
-        conn.execute("DELETE FROM mind_memory_search WHERE id=?", (node["id"],))
-        search_text = " ".join(str(node.get(k, "")) for k in ("title", "topic", "summary", "name", "task_ids", "about_ids"))
-        search_text += " " + " ".join(b.get("text", "") for b in node.get("bubbles", {}).values())
-        conn.execute("INSERT INTO mind_memory_search VALUES(?,?)", (node["id"], tokenize(search_text)))
+        index_node(conn, conn.execute("SELECT rowid FROM mind_memory_nodes WHERE id=?", (node["id"],)).fetchone()[0], node)
         if self.settings(conn)["graph"] or self.settings(conn)["sharing"]:
             self.graph.project_memory(conn, node)
         return node

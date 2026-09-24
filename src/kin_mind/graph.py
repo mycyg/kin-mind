@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import timedelta
 from typing import Literal
 
@@ -41,6 +42,50 @@ RELATIONS = {"participates", "part_of", "continues", "responds_to", "produces", 
              "follows", "about", "related"}
 
 GET_MANY_PAGE_SIZE = 400
+# Set in `meta` once the node index shares its rowids with `mind_graph_nodes`. From then on an
+# update removes its old index row by rowid; before, the only way was a scan of the whole index.
+SEARCH_ALIGNED = "mind_graph_search_rowid"
+_ready = set()
+
+
+def _store_key(path):
+    """This store file, as opposed to whatever file is at its path later: a restore that puts
+    another database in its place gets its schema checked again."""
+    try:
+        return (str(path), os.stat(path).st_ino)
+    except OSError:
+        return (str(path), None)
+
+
+def search_tokens(value):
+    return tokenize(" ".join(str(value.get(k, "")) for k in ("title", "text", "aliases")))
+
+
+def _aligned(conn):
+    return bool(conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone())
+
+
+def index_node(conn, value):
+    """The node's index row, rewritten after the node itself. An erased node has none."""
+    rowid = conn.execute("SELECT rowid FROM mind_graph_nodes WHERE id=?", (value["id"],)).fetchone()[0]
+    if _aligned(conn):
+        conn.execute("DELETE FROM mind_graph_search WHERE rowid=?", (rowid,))
+    else:
+        conn.execute("DELETE FROM mind_graph_search WHERE id=?", (value["id"],))
+    if value.get("state") != "deleted":
+        conn.execute("INSERT INTO mind_graph_search(rowid,id,tokens) VALUES(?,?,?)" if _aligned(conn)
+                     else "INSERT INTO mind_graph_search(id,tokens) VALUES(?,?)",
+                     ((rowid,) if _aligned(conn) else ()) + (value["id"], search_tokens(value)))
+
+
+def align_search(conn):
+    """Rebuild the node index with the nodes' own rowids, once. Returns the rows indexed."""
+    conn.execute("DELETE FROM mind_graph_search")
+    rows = conn.execute("SELECT rowid,id,data FROM mind_graph_nodes WHERE state!='deleted'").fetchall()
+    conn.executemany("INSERT INTO mind_graph_search(rowid,id,tokens) VALUES(?,?,?)",
+                     [(row[0], row[1], search_tokens(json.loads(row[2]))) for row in rows])
+    conn.execute("INSERT OR IGNORE INTO meta VALUES(?,1)", (SEARCH_ALIGNED,))
+    return len(rows)
 
 
 def query_terms(query, limit=40):
@@ -91,10 +136,20 @@ class GraphAssessment(Model):
 class EventGraph:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
+        key = _store_key(self.engine.db.path)
+        if key in _ready:
+            # Once per process and store: the tables exist, and running the script again took
+            # the schema lock on every construction, which is every host action.
+            return
         with self.engine.db.connect() as conn:
             conn.executescript(SCHEMA)
             from .lifecycle_schema import initialize_graph_refs
             initialize_graph_refs(conn)
+        with self.engine.db.connect(write=True) as conn:
+            if not _aligned(conn) and not conn.execute("SELECT 1 FROM mind_graph_nodes LIMIT 1").fetchone():
+                # A new store starts aligned; an existing one is aligned by the deploy migration.
+                align_search(conn)
+        _ready.add(key)
 
     def identifier(self, kind, key):
         return "graph_" + kind + "_" + digest([self.scope.key(), key])[:28]
@@ -146,11 +201,12 @@ class EventGraph:
             conn.execute("INSERT OR REPLACE INTO mind_graph_edges VALUES(?,?,?,?,?,?,?,?,?)", (
                 value["id"], self.scope.key(), value["subject"], value["object"], value["predicate"], value["layer"], value["revision"], value["state"], dumps(value)))
         else:
-            conn.execute("INSERT OR REPLACE INTO mind_graph_nodes VALUES(?,?,?,?,?,?,?,?)", (
+            # An upsert, not a replace: the row keeps its rowid, which is the index row's too.
+            conn.execute("INSERT INTO mind_graph_nodes VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                         "scope=excluded.scope,kind=excluded.kind,revision=excluded.revision,occurred_at=excluded.occurred_at,"
+                         "updated_at=excluded.updated_at,state=excluded.state,data=excluded.data", (
                 value["id"], self.scope.key(), value["kind"], value["revision"], value["occurred_at"], value["updated_at"], value["state"], dumps(value)))
-            if old:
-                conn.execute("DELETE FROM mind_graph_search WHERE id=?", (value["id"],))
-            conn.execute("INSERT INTO mind_graph_search VALUES(?,?)", (value["id"], tokenize(" ".join(str(value.get(k, "")) for k in ("title", "text", "aliases")))))
+            index_node(conn, value)
             conn.execute("DELETE FROM mind_graph_record_refs WHERE scope=? AND node_id=?", (self.scope.key(), value["id"]))
             record_ids = set(value.get("record_ids", [])) | {r["record_id"] for r in value.get("evidence", [])}
             conn.executemany("INSERT OR IGNORE INTO mind_graph_record_refs VALUES(?,?,?)",
