@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {MindLoop} from '../../adapters/owner-host.mjs';
+import {MindLoop,interactionView,stateContext,INTERACTION_LIMITS} from '../../adapters/owner-host.mjs';
 import {createContactBatch} from '../../adapters/contact-batch.mjs';
 import {parseContactDraft} from '../../adapters/contact-draft.mjs';
 function fixture(overrides={}) {
@@ -165,4 +165,15 @@ test('a send of unknown outcome is checked again under its own id and only then 
  loop.review=async()=>{};await loop.tick();
  assert.deepEqual(events.find(([action])=>action==='resume'),['resume','old']);
  const settled=events.at(-1)[1];assert.equal(settled.attempt_id,'old');assert.equal(settled.state,'unconfirmed');assert.equal(settled.reason,'receipt-still-unknown');
+});
+test('items whose sources moved are shown and marked 待复核; the bounds are wider (N12, N15)',()=>{
+ const desires=Array.from({length:20},(_,i)=>({id:'d'+i,kind:'contact',status:'wanted',topic:'t',content:'c'+i,needs_review:i===19,expires_at:'2999-01-01T00:00:00Z'}));
+ const state={continuity:{needs_review:true},expression:{guidance:['a','b','c','d']},appraisal_summary:{understanding:{meaning:'m',needs_review:true}},
+   selected_concerns:Array.from({length:8},(_,i)=>({id:'c'+i,needs_review:i===0})),rhythm:{phase:'awake',needs_review:false},desires,dimensions:{mood:{value:50,needs_review:true}}};
+ const view=interactionView(state);
+ assert.equal(view.desires.length,INTERACTION_LIMITS.desires);assert.equal(view.desires.at(-1).review,'待复核');
+ assert.equal(view.concerns.length,INTERACTION_LIMITS.concerns);assert.equal(view.concerns[0].review,'待复核');
+ assert.equal(view.understanding.review,'待复核');assert.equal(view.expression.review,'待复核');assert.equal(view.dimensions.mood.review,'待复核');
+ const text=stateContext({state:{...state,dimensions:{mood:{value:50}}}});
+ assert.ok(!text.includes('工作质量'));assert.ok(text.includes('拒绝、忙与停止要求优先'));
 });
