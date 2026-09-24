@@ -146,13 +146,13 @@ def outcome_for(state, data, *, owned):
     """The queue state an attempt ended in, as a ledger outcome.
 
     A lost attempt token means this worker's result was thrown away. A top-level
-    "already committed" finished the row from another attempt's receipt, so this
-    attempt committed nothing either.
+    "already committed" finished the row from another attempt's receipt, and "already
+    integrated" found nothing left to judge, so neither attempt committed anything.
     """
     if not owned:
         return "discarded"
     if state == "complete":
-        if data.get("completed_from") == "already-committed":
+        if data.get("completed_from") in {"already-committed", "already-integrated"}:
             return "discarded"
         return {"A": "reused", "B": "revalidated"}.get(data.get("tier"), "committed")
     if state == "needs-repair":

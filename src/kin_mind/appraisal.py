@@ -1879,26 +1879,29 @@ class Appraisals:
             if done:
                 data["result"] = done
             else:
+                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
+                    with self.engine.db.connect() as conn:
+                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
+                    if not remaining:
+                        # Everything this job was for is integrated already. The attempt ends here, with
+                        # no model call, no model slot and no charge: the count its claim took is given
+                        # back, and the ledger records an uncharged attempt that committed nothing.
+                        data["result"], data["completed_from"] = {"already_integrated": True}, "already-integrated"
+                        with self.engine.db.connect(write=True) as conn:
+                            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,attempts=MAX(0,attempts-1),data=? WHERE id=?",
+                                         (dumps(data), row["id"]))
+                            self._settle_children(conn, row["id"], data, "complete")
+                        slots.close()
+                        if ledger:
+                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=False,
+                                                 historical=historical, maintenance=maintenance)
+                        return self.status(row["id"])
+                    data["evidence_ids"] = remaining
                 # Admit the entire evaluation before any compression/review call.
                 # Nested calls reuse this lease, so a wait never hides partial usage.
                 slot = slots.enter_context(evaluation_slot(provider, self.engine, row["id"], data["attempt_token"]))
                 model_admitted = True
                 data.pop("waiting_reason", None)
-                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
-                    with self.engine.db.connect() as conn:
-                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
-                    if not remaining:
-                        data["result"] = {"already_integrated": True}
-                        with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
-                            self._settle_children(conn, row["id"], data, "complete")
-                        slots.close()
-                        if ledger:
-                            # This attempt ended here, without a model call and without a charge.
-                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=True,
-                                                 historical=historical, maintenance=maintenance)
-                        return self.status(row["id"])
-                    data["evidence_ids"] = remaining
                 if data.get("stimulus") == FOLLOW_UP and not data.get("review_source_id"):
                     # Normally made right after the parent's commit; this covers a process that died in between.
                     data.update(self._review_evidence(row["id"], data))

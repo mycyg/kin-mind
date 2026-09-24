@@ -489,3 +489,32 @@ def test_sixty_quiet_minutes_hold_as_many_assessments_as_kin_asked_for(setup):
         clock[0] += timedelta(minutes=1)
     assert 1 <= reviewer.calls <= 7
     assert max(sizes) < 40000
+
+
+def test_evidence_already_integrated_ends_the_attempt_with_no_call_no_slot_and_no_charge(setup, monkeypatch):
+    """WS8 docs pass: an appraisal whose sources the mind has already integrated makes no model
+    call, so it takes no model slot and is charged nothing: the claim's attempt count is given
+    back and the ledger records an uncharged attempt that committed nothing."""
+    from kin_mind import appraisal as module
+    from kin_mind.memory import MemoryContinuity
+    from test_kin_mind import FakeReviewer
+    mind, source, _ = setup
+    MemoryContinuity(mind).configure({"records": True, "semantic": True})
+    jobs = Appraisals(mind)
+    evidence = source('integrated-earlier')
+    job = jobs.enqueue([evidence], 'synthetic-v1')
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_semantic_sources VALUES(?,?,?)", (mind.scope.key(), evidence, 'event-earlier'))
+
+    def no_slot(*_args, **_kwargs):
+        raise AssertionError("no model slot for an attempt that makes no call")
+    monkeypatch.setattr(module, "evaluation_slot", no_slot)
+
+    class NoCall(FakeReviewer):
+        def appraise(self, context):
+            raise AssertionError("no model call")
+    out = jobs.run_one(NoCall(Appraisal(reason="unused")))
+    assert out["state"] == "complete" and out["result"] == {"already_integrated": True}
+    assert out["attempts"] == 0 and out["completed_from"] == "already-integrated"
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
+    assert (ledger["charged"], ledger["outcome"], ledger["calls"]) == (False, "discarded", [])
