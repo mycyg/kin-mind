@@ -331,3 +331,46 @@ test('an internal input whose submission is unknown is looked up by its id, and 
   assert.equal([h1,h2].some(holdsSession),false,'settled by the lookup, neither holds one any more');
   assert.deepEqual(notices,[],'the owner is never told about Kin\'s own continuation');
 });
+
+// A journal restore used to take every id it found for the owner's, so the watchdog could
+// tell her about one of Kin's own turns. Better one notice too few than a wrong one.
+test('a journal restore knows whose each input was; one an older journal cannot say is only looked up, never told about',async t=>{
+  // A new journal names the kind of every input it records.
+  const f=fixture(t);
+  await chat(f,'owner-a','在吗');
+  await f.router.dispatch({id:'handoff:h1',kind:'handoff',text:'继续写'},async()=> 'new-turn');
+  const events=fs.readFileSync(f.args.file+'.events.jsonl','utf8').trim().split('\n').map(line=>JSON.parse(line));
+  assert.ok(events.some(e=>e.kind==='input-selected'&&e.id==='owner-a'&&e.inputKind==='owner'));
+  assert.ok(events.some(e=>e.kind==='input-selected'&&e.id==='handoff:h1'&&e.inputKind==='handoff'));
+  fs.writeFileSync(f.args.file,'{broken');fs.writeFileSync(f.args.file+'.prev','{broken');
+  const restored=new MobileRouter(f.args);
+  assert.deepEqual(['owner-a','handoff:h1'].map(id=>restored.state.inputs[id].kind),['owner','handoff']);
+  const told=[];const notifyOwner=async(kind,id)=>{told.push([kind,id]);return {state:'accepted',messageId:'n'};};
+  await restored.watch({reconcileInput:async()=>({state:'found'}),notifyOwner});
+  f.clock.now+=11*MINUTE;
+  await restored.watch({reconcileInput:async()=>({state:'found'}),notifyOwner});
+  assert.deepEqual(told,[['unknown','owner-a']],'her own message, whose answer nobody can confirm now, is reported; Kin\'s continuation is not');
+
+  // An older journal does not say whose an input was: its kind is unknown.
+  const g=fixture(t);
+  const old=[{kind:'input-selected',id:'inj_feishu_old'},{kind:'input-accepted',id:'inj_feishu_old',route:'chat'},{kind:'input-selected',id:'internal:draft-1'},
+    {kind:'input-accepted',id:'internal:draft-1',route:'chat'},{kind:'input-reclassification-requested',id:'reclass-1',commandId:'owner-mode:x'}];
+  fs.writeFileSync(g.args.file+'.events.jsonl',old.map((event,i)=>JSON.stringify({at:g.clock.now,...event,revision:i+1})).join('\n')+'\n');
+  fs.writeFileSync(g.args.file,'{broken');fs.writeFileSync(g.args.file+'.prev','{broken');
+  const legacy=new MobileRouter(g.args);
+  assert.deepEqual(['inj_feishu_old','internal:draft-1','reclass-1'].map(id=>[legacy.state.inputs[id].kind,legacy.state.inputs[id].state]),
+    [['unknown','unconfirmed'],['unknown','unconfirmed'],['unknown','unconfirmed']]);
+  const heard=[],requeued=[],lookups={'inj_feishu_old':'not-found','internal:draft-1':'found','reclass-1':'not-found'};
+  const watch=()=>legacy.watch({reconcileInput:async id=>({state:lookups[id]}),
+    notifyOwner:async(kind,id)=>{heard.push([kind,id]);return {state:'accepted',messageId:'n'};},
+    requeue:async id=>{requeued.push(id);return {state:id==='inj_feishu_old'?'requeued':'missing'};}});
+  for(let pass=0;pass<8;pass++){await watch();g.clock.now+=11*MINUTE;}
+  assert.deepEqual(heard,[],'nothing is ever told about an input nobody can say was hers');
+  assert.deepEqual([legacy.state.inputs['internal:draft-1'].state,holdsSession(legacy.state.inputs['internal:draft-1'])],['accepted',false],'found: settled by its lookup');
+  assert.deepEqual([...new Set(requeued)].sort(),['inj_feishu_old','reclass-1'],'proven never received: back to an inbox under its own id, where there is one');
+  assert.equal(requeued.filter(id=>id==='inj_feishu_old').length,REQUEUE_BUDGET,'and only so many times');
+  assert.deepEqual([legacy.state.inputs['reclass-1'].retry.exhausted,legacy.state.inputs['reclass-1'].retry.requeue],[true,'missing'],'no job anywhere: it stops, silently');
+  // The owner's inbox takes it in again: now it is known to be hers.
+  const intake=await legacy.received({id:'inj_feishu_old',kind:'owner',channel:'feishu'});
+  assert.deepEqual([intake.record.kind,intake.record.state],['owner','preparing']);
+});

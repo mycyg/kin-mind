@@ -34,6 +34,8 @@ export const REQUEUE_BUDGET=3;
 export const DEFERRAL_PLAN_RETRY_MS=Object.freeze([60000,5*60000,15*60000,3600000,3*3600000]);
 /** The channels an input may arrive on, kept as its receipt fact (CR-LIFE-17). */
 const INPUT_CHANNELS=new Set(['feishu','wechat','desktop-handoff','cli']);
+/** An input's kind as the journal may name it (owner, handoff, work-result, the mind's own…). */
+const INPUT_KIND=/^[a-z][a-z-]{0,39}$/;
 /** When the host first received an input: its own receipt time, never in the future and
  * never refreshed by a retry (CR-LIFE-18). */
 function receiptTime(value,now) {
@@ -257,7 +259,10 @@ export class MobileRouter {
   }
   save(kind,detail={}) {
     this.state.revision++;
-    const event={at:this.now(),kind,...detail,revision:this.state.revision};
+    // An event about an input carries whose input it is, so a restore from the journal
+    // can tell the owner's words from Kin's own turns.
+    const input=kind.startsWith('input-')&&typeof detail.id==='string'?this.state.inputs[detail.id]:null;
+    const event={at:this.now(),kind,...detail,...(typeof input?.kind==='string'?{inputKind:input.kind}:{}),revision:this.state.revision};
     this.state.history.push(event);
     this.state.history=this.state.history.slice(-this.hotLimits.history);
     // Compact on disk; the journal keeps every event (AD1-08).
@@ -326,23 +331,30 @@ export class MobileRouter {
     return moved;
   }
   /** With no revision left to restore, the append-only journal still names every
-   * input this router took, by id and nothing more. They come back `unconfirmed` and
-   * `recovered`: a replay is refused until the watchdog has looked the id up in the
-   * native session. Found, the input stands as accepted and a replay is a duplicate;
-   * proven never received, it is known by its id alone, and a replay under that id is
-   * routed afresh (WS8 #3). Like any unconfirmed input they never hold the restart
+   * input this router took, by id and kind and nothing more. They come back
+   * `unconfirmed` and `recovered`: a replay is refused until the watchdog has looked the
+   * id up in the native session. Found, the input stands as accepted and a replay is a
+   * duplicate; proven never received, it is known by its id alone, and a replay under
+   * that id is routed afresh (WS8 #3). An id an older journal did not say the kind of
+   * comes back as kind `unknown`: it is only looked up by its id and never told about,
+   * since it may be Kin's own. Like any unconfirmed input they never hold the restart
    * profile (AD1-10). */
   restoreLedger() {
-    let ids=[];
+    let ids=[];const kinds=new Map();
     try {
       const journal=this.file+'.events.jsonl',size=fs.statSync(journal).size,from=Math.max(0,size-LEDGER_TAIL_BYTES),handle=fs.openSync(journal,'r');
       let body='';
       try {const buffer=Buffer.alloc(size-from);fs.readSync(handle,buffer,0,buffer.length,from);body=buffer.toString('utf8');} finally {fs.closeSync(handle);}
       ids=[...new Set(body.split('\n').slice(from?1:0).map(line=>{
-        try {const event=JSON.parse(line);return String(event?.kind).startsWith('input-')&&typeof event.id==='string'?event.id:null;} catch {return null;}
+        try {
+          const event=JSON.parse(line);
+          if(!String(event?.kind).startsWith('input-')||typeof event.id!=='string')return null;
+          if(typeof event.inputKind==='string'&&INPUT_KIND.test(event.inputKind))kinds.set(event.id,event.inputKind);
+          return event.id;
+        } catch {return null;}
       }).filter(Boolean))];
     } catch {/* No journal: this router never accepted anything here. */}
-    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,at:this.now()};
+    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',at:this.now()};
     return ids.length;
   }
   locked(fn) {
@@ -1149,10 +1161,10 @@ export class MobileRouter {
       this.state.reclassifications[id]=receipt;
       try {this.recordModeRequest(modeRequest);}
       catch(error){delete this.state.reclassifications[id];throw error;}
-      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-requested',{id,commandId});
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-requested',{reclassificationId:id,commandId});
       const runtime=await this.reconcileTransition(await this.inspect());
       await this.applyModeRequest(this.state.requests[commandId],runtime);
-      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-applied',{id,commandId,state:receipt.modeRequestState});
+      receipt.modeRequestState=this.state.requests[commandId].state;receipt.updatedAt=this.now();this.save('input-reclassification-applied',{reclassificationId:id,commandId,state:receipt.modeRequestState});
       return {receipt:clone(receipt),request:clone(this.state.requests[commandId])};
     });
   }
@@ -1975,6 +1987,8 @@ export class MobileRouter {
       if(!record&&this.archivedIds.has(id))return {record:{id,state:'accepted',archived:true},since:now};
       if(record&&intakeOnly(record)&&record.state==='failed-before-submit') {
         Object.assign(record,{state:'preparing',at:now});delete record.reason;delete record.failureStage;delete record.ownerNotice;
+        // A restored input nobody could say the kind of is the kind the host takes it in as.
+        if(record.kind==='unknown')record.kind=kind;
         this.save('input-intake-retry',{id,attempt:record.retry?.attempts??0});
       }
       if(record)return {record:clone(record),since:now};
@@ -2029,8 +2043,11 @@ export class MobileRouter {
         // An internal input whose submission is unknown (a handoff's continuation, the mind's
         // turns) is looked up by its id like the owner's, and nobody is told (WS8 #2).
         if(!ownerInput(record)) {
-          const reconciliation=record.reconciliation;
+          const reconciliation=record.reconciliation,retry=record.retry;
           if(['unconfirmed','fenced-unconfirmed'].includes(record.state)&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
+          // A restored input of unknown kind proven never received goes back to the inbox it
+          // may have come from, under its own id; with no job there it stops, and nobody is told.
+          else if(record.kind==='unknown'&&record.state==='failed-before-submit'&&retry&&!retry.exhausted&&requeue&&(retry.requeues??0)<REQUEUE_BUDGET&&retry.nextAt<=now&&!this.frozen())list.push({kind:'requeue',id:record.id});
           continue;
         }
         const summary=inputSummary(record),notice=record.ownerNotice;
@@ -2143,7 +2160,7 @@ export class MobileRouter {
           notice.nextAt=this.now()+NOTICE_ROUND_REST_MS[Math.min(notice.round,NOTICE_ROUND_REST_MS.length)-1];
         }
         else {notice.state=kind;notice.nextAt=this.now()+(kind==='not-submitted'?30000:120000);}
-        this.save('input-notice',{id:action.id,kind:notice.kind,state:notice.state,...(notice.round?{round:notice.round}:{})});
+        this.save('input-notice',{id:action.id,notice:notice.kind,state:notice.state,...(notice.round?{round:notice.round}:{})});
       });
       results.push({...action,result:kind});
     }
