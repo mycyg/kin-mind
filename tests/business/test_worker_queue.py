@@ -2,7 +2,8 @@
 that outlives its own failures, host receipts that cannot be replayed, and the graph index that
 an update no longer scans (E1-01, E2-02, E2-04, E2-05, E2-12, E1-02, E3-17, K4-04, K4-10). A paid
 result is not thrown away because a lease lapsed, and one whose job was taken over is kept for
-the run that took it (CR-MEM-09)."""
+the run that took it (CR-MEM-09) - never for a job a delete ended while the model answered
+(CR2-MEM-01)."""
 import json
 import sqlite3
 import threading
@@ -358,3 +359,38 @@ def test_a_kept_answer_is_used_only_for_the_very_same_request(engine, monkeypatc
     assert model.calls == 2 and not metrics(engine, "model_answer_reused")
     with engine.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM commands WHERE id LIKE 'job-answer:%'").fetchone()[0] == 0
+
+
+def test_a_late_answer_for_a_source_deleted_meanwhile_leaves_only_its_cost(engine, monkeypatch):
+    """The source is deleted while the extraction waits for the model. The delete cancels the job,
+    blanks its payload and takes the stored results that name the source; the answer that comes
+    back afterwards is not kept, so the erased words do not come back with it (CR2-MEM-01)."""
+    words = "prefers tea in the morning"
+    source = []
+
+    def deleted(engine):
+        engine.delete(source[0])
+
+    model = PaidModel(engine, monkeypatch, during=deleted)
+    source.append(receive(engine, "tea", f"The owner {words}.", extract=True))
+    worker = Worker(engine)
+    while worker.run_once():
+        pass
+    assert model.calls == 1
+    with engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM commands WHERE id LIKE 'job-answer:%'").fetchone()
+        extract = dict(conn.execute("SELECT state,payload FROM jobs WHERE kind='extract'").fetchone())
+    assert extract == {"state": "canceled", "payload": "{}"}
+    assert metrics(engine, "job_result_discarded")[0]["answers_kept"] == 0
+    # What the call cost is on record; what it said is not.
+    assert len(metrics(engine, "model_cost")) == 1
+    with sqlite3.connect(engine.db.path) as conn:
+        for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            columns = [row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")]
+            for column in columns:
+                try:
+                    found = conn.execute(f"SELECT 1 FROM '{table}' WHERE instr(CAST(\"{column}\" AS TEXT),?)>0 LIMIT 1",
+                                         (words,)).fetchone()
+                except sqlite3.DatabaseError:
+                    continue
+                assert not found, (table, column)
