@@ -74,6 +74,38 @@ test('inputs from before the ledger are history: never unsettled, never re-run (
   assert.equal(new MobileRouter(f.args).state.inputs.canceled.historical.reason,'pre-ledger:semantic-canceled','migration runs once');
 });
 
+test('the first release hands over the inputs that raced the old host\'s stop, and the freeze the new router starts under (WS7)',async t=>{
+  const f=fixture(t);
+  const state=JSON.parse(fs.readFileSync(f.args.file,'utf8'));delete state.ledgerVersion;
+  const old=(id,extra)=>({id,kind:'owner',hash:'h',at:1,...extra});
+  Object.assign(state.inputs,{answeredBefore:old('answeredBefore',{state:'accepted'}),oldFailure:old('oldFailure',{state:'failed-before-submit'}),
+    cut:old('cut',{state:'accepted',acceptedAt:5}),preparing:old('preparing',{state:'preparing'}),submitting:old('submitting',{state:'submitting'}),
+    selected:old('selected',{state:'selected'}),raced:old('raced',{state:'failed-before-submit'}),mind:{...old('mind',{state:'preparing'}),kind:'internal'}});
+  fs.writeFileSync(f.args.file,JSON.stringify(state));fs.rmSync(f.args.file+'.prev',{force:true});
+  const until=f.clock.now+3600000;
+  fs.writeFileSync(path.join(f.root,'release-carryover.json'),JSON.stringify({schema:1,releaseId:'r1',inputs:[{id:'cut'},{id:'preparing'},{id:'submitting'},
+    {id:'selected'},{id:'raced'},{id:'lost',create:true,at:900},{id:'mind'},{id:'../x',create:true}],freeze:{reason:'kin-deploy r1',at:1000,until}}));
+  const router=new MobileRouter(f.args),inputs=router.state.inputs;
+  assert.equal(inputs.answeredBefore.answer.state,'legacy');
+  assert.equal(inputs.oldFailure.historical.reason,'pre-ledger:failed-before-submit','what is not handed over is history, as before');
+  for(const id of ['cut','preparing','submitting','selected','raced','lost'])assert.ok(inputs[id].carriedOver&&!inputs[id].historical,id);
+  assert.equal(inputs.mind.carriedOver,undefined,'only the owner\'s inputs are handed over');
+  assert.equal(inputs.cut.answer,undefined,'a turn the stop may have cut is not taken as answered');
+  assert.deepEqual(['preparing','selected','raced','lost'].map(id=>inputs[id].state),Array(4).fill('failed-before-submit'));
+  assert.ok(['raced','lost'].every(id=>inputs[id].retry&&!inputs[id].retry.exhausted),'provably unsubmitted: retried by its own id');
+  assert.equal(inputs.submitting.state,'unconfirmed');
+  assert.equal(inputs['../x'],undefined,'an id that is not an input id is ignored');
+  assert.deepEqual([router.frozen(),router.state.freeze.by,router.state.freeze.until],[true,'kin-deploy',until],'the router starts under the release freeze');
+  assert.deepEqual(router.unsettledInputs().filter(i=>i.inFlight).map(i=>i.id),[],'nothing in flight: the release can verify while frozen');
+  const requeued=[],requeue=async id=>{requeued.push(id);return {state:'requeued'};};
+  await router.watch({requeue});
+  assert.deepEqual(requeued,[],'nothing goes out while frozen');
+  await router.thawDispatch('verified');
+  await router.watch({requeue});
+  assert.deepEqual(requeued.sort(),['lost','preparing','raced','selected']);
+  assert.equal(new MobileRouter(f.args).state.inputs.cut.historical,undefined,'the hand-over is read once, by the upgrade');
+});
+
 test('a freeze holds new dispatch, survives a restart and lifts itself, but never the owner\'s stop',async t=>{
   const f=fixture(t);
   const freeze=await f.router.freezeDispatch('release',{ttlMs:10*60000,by:'kin-deploy'});

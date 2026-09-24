@@ -45,6 +45,21 @@ export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
 /** How long a freeze nobody lifts holds new dispatch. */
 export const FREEZE_TTL_MS=2*3600000;
+/** KIN-FIX-20260924, the first release (WS7): kin-deploy stops a host that predates
+ * the ledger right after it is idle -- it cannot be frozen -- and hands over, beside
+ * this router's state file, the owner inputs that reached it between that idle check
+ * and its confirmed exit, and the freeze this router starts under. Ids and states
+ * only. Read once, by the ledger upgrade. */
+export const CARRYOVER_FILE='release-carryover.json';
+export function readCarryover(stateFile) {
+  const value=readJsonFile(path.join(path.dirname(stateFile),CARRYOVER_FILE)).value;
+  if(value?.schema!==1||!Array.isArray(value.inputs))return null;
+  const inputs=value.inputs.filter(entry=>typeof entry?.id==='string'&&/^[\w:.-]{1,200}$/.test(entry.id))
+    .map(entry=>({id:entry.id,create:entry.create===true,...(Number.isFinite(entry.at)?{at:entry.at}:{})}));
+  const freeze=typeof value.freeze?.reason==='string'&&value.freeze.reason.trim()&&Number.isFinite(value.freeze.until)
+    ?{reason:value.freeze.reason.trim().slice(0,200),at:Number.isFinite(value.freeze.at)?value.freeze.at:null,until:value.freeze.until}:null;
+  return {releaseId:typeof value.releaseId==='string'?value.releaseId.slice(0,120):null,inputs,freeze};
+}
 /** Hot state keeps what is unsettled plus a bounded recent tail; the rest moves to
  * `archive/router-YYYY-MM.jsonl` beside the state file, never deleted (AD1-08). */
 export const HOT_LIMITS=Object.freeze({inputs:200,internal:24,tasks:32,requests:64,notices:64,history:64,journalBytes:8*1024*1024});
@@ -171,7 +186,27 @@ export class MobileRouter {
     // An accepted one is taken as answered; any other keeps its reason and id as
     // history and is never acted on, or counted as unsettled, again.
     if(this.state.ledgerVersion!==2) {
+      // The first release's hand-over: these inputs raced the old host's stop and
+      // stay live for the watchdog -- retried when provably unsubmitted, reconciled
+      // or reported otherwise -- instead of becoming history.
+      const carried=readCarryover(file);
+      for(const entry of carried?.inputs??[]) {
+        let record=this.state.inputs[entry.id];
+        if(!record&&entry.create){
+          record=this.state.inputs[entry.id]={id:entry.id,kind:'owner',state:'failed-before-submit',route:null,at:entry.at??at,
+            conversationId:this.state.conversationId??null,generation:this.state.generation??null};
+          this.notSubmitted(record,'release-carryover',{restart:true});
+        }
+        if(!record||!ownerInput(record)||record.state==='superseded')continue;
+        record.carriedOver={at,...(carried.releaseId?{releaseId:carried.releaseId}:{})};
+        if((['selected','semantic-pending'].includes(record.state)||record.state==='failed-before-submit'&&!record.retry)&&!record.submissionStartedAt) {
+          if(this.state.semanticPending[record.id])this.state.semanticPending[record.id].state='superseded';
+          this.notSubmitted(record,'release-carryover',{restart:true});
+        }
+      }
+      if(carried?.freeze&&!this.frozen())this.state.freeze={reason:carried.freeze.reason,at:carried.freeze.at??at,until:carried.freeze.until,by:'kin-deploy'};
       for(const record of Object.values(this.state.inputs)) {
+        if(record.carriedOver)continue;
         if(record.state==='accepted')record.answer??={state:'legacy'};
         else if(!inputInFlight(record)&&record.state!=='superseded')record.historical={at,reason:'pre-ledger:'+record.state};
       }
