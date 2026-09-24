@@ -182,8 +182,11 @@ def put(engine, tool, request_digest, judgment, value, *, now, depends_on=(), va
     validity = TTL_SECONDS if valid_for is None else max(1.0, min(float(valid_for), MAX_VALIDITY_SECONDS))
     token = digest([request_digest, marks["judgment_type"], marks["goal_digest"],
                     marks["completion_digest"], marks["obligation_version"]])[:32]
-    with engine.db.connect(write=True) as conn:
+    with engine.db.connect() as conn:
+        # Before the write transaction, not in it: executescript commits the transaction it finds,
+        # and the sweep, the row and its dependencies would each commit alone (K3-17).
         conn.executescript(SCHEMA)
+    with engine.db.connect(write=True) as conn:
         if not enabled(conn, marks["scope"]):
             return None
         _expire(conn, now)
@@ -191,7 +194,7 @@ def put(engine, tool, request_digest, judgment, value, *, now, depends_on=(), va
             "INSERT OR REPLACE INTO mind_judgment_cache VALUES(?,?,?,?,?,?,?,?,0,?,?,?,?)",
             (request_digest, marks["judgment_type"], marks["goal_digest"], marks["completion_digest"],
              marks["obligation_version"], token, marks["scope"],
-             environment_digest(engine, conn, marks["scope"]), now, now + TTL_SECONDS,
+             environment_digest(engine, conn, marks["scope"]), now, now + validity,
              now + validity, dumps(value)))
         conn.execute("DELETE FROM mind_judgment_cache_deps WHERE token=?", (token,))
         for dependency in depends_on:

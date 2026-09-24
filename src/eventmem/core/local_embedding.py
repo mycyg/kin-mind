@@ -15,6 +15,34 @@ import httpx
 
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
 MODEL_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+# The index a vector belongs to is named partly by its preprocessing label; a label that names
+# a Qwen3 revision must name this one, or vectors of two models would share an index (E2-13).
+REVISION_MARK = MODEL_REVISION[:8]
+
+
+def check_endpoint(endpoint, model):
+    """The only local embedding endpoint there is: loopback, /v1, this model."""
+    address = urlsplit(endpoint)
+    if (
+        address.scheme != "http"
+        or address.hostname != "127.0.0.1"
+        or address.path != "/v1"
+        or address.query
+        or address.fragment
+        or address.username
+        or address.password
+        or model != MODEL
+    ):
+        raise ValueError(
+            "Local embedding requires Qwen3-Embedding-0.6B at http://127.0.0.1:PORT/v1"
+        )
+    return address.port or 80
+
+
+def check_preprocessing(label):
+    """A preprocessing label that names a Qwen3 revision must name the one this service loads."""
+    if label and "qwen3" in label.lower() and REVISION_MARK not in label:
+        raise ValueError("The embedding index names another Qwen3 revision than the local service loads")
 
 
 def token(root):
@@ -31,21 +59,9 @@ def token(root):
 
 
 def ensure_started(root, endpoint, model):
-    address = urlsplit(endpoint)
-    if (
-        address.scheme != "http"
-        or address.hostname != "127.0.0.1"
-        or address.path != "/v1"
-        or address.query
-        or address.fragment
-        or address.username
-        or address.password
-        or model != MODEL
-    ):
-        raise ValueError(
-            "Local embedding requires Qwen3-Embedding-0.6B at http://127.0.0.1:PORT/v1"
-        )
-    port = address.port or 80
+    """Start the service if nothing answers on its port, and return the credential. Called when
+    a request could not connect, not before every request (E2-13)."""
+    port = check_endpoint(endpoint, model)
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Separate processes (HTTP workers, hooks, MCP) serialize wake-up through
@@ -63,6 +79,10 @@ def ensure_started(root, endpoint, model):
                     response = client.get(url)
                 except httpx.ConnectError:
                     return False
+                if response.status_code == 401:
+                    # The service reads the credential file on every request, so a refusal
+                    # means the file changed under this call: the caller reads it again.
+                    return True
                 if (
                     response.status_code != 200
                     or response.json().get("service") != "memorypalace-embedding"
@@ -107,15 +127,23 @@ def create_app(root, loader=None):
     from pydantic import BaseModel, Field
 
     app = FastAPI()
-    auth = token(root)
+    token(root)
     guard = threading.Lock()
     state = {"model": None}
+    from .integrity import loaded_revision
+
+    source = {"root": str(Path(__file__).resolve().parents[2]), "revision": loaded_revision()}
 
     def authorize(value):
-        if not secrets.compare_digest(value or "", "Bearer " + auth):
+        # The credential file as it is now: a replaced token is honoured at once, instead of
+        # every client being refused until this process is stopped by hand (E2-13).
+        expected = ("Bearer " + token(root)).encode()
+        if not secrets.compare_digest((value or "").encode(), expected):
             raise HTTPException(401, "Authentication required")
 
     def load():
+        # The model comes from the local cache only; a service never downloads it (E2-13).
+        os.environ["HF_HUB_OFFLINE"] = "1"
         import torch
         from huggingface_hub import snapshot_download
         from huggingface_hub.errors import LocalEntryNotFoundError
@@ -138,11 +166,14 @@ def create_app(root, loader=None):
                 model_path = str(cached)
         except LocalEntryNotFoundError:
             pass
+        if model_path == MODEL:
+            raise RuntimeError("Qwen3-Embedding-0.6B at the pinned revision is not complete in the local cache")
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         model = SentenceTransformer(
             model_path,
             revision=MODEL_REVISION,
             device=device,
+            local_files_only=True,
             tokenizer_kwargs={"padding_side": "left"},
         )
         model.max_seq_length = 8192
@@ -160,7 +191,9 @@ def create_app(root, loader=None):
             "service": "memorypalace-embedding",
             "loaded": state["model"] is not None,
             "model": MODEL,
+            "model_revision": MODEL_REVISION,
             "pid": os.getpid(),
+            "source": source,
         }
 
     @app.post("/v1/embeddings")

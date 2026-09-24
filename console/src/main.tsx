@@ -250,7 +250,7 @@ function App() {
       tables.map((t) =>
         api.call("list_contact", {
           path: { table: t },
-          query: { limit: 50, ...(cursor ? { cursor } : {}) },
+          query: { limit: 50, order: "recent", ...(cursor ? { cursor } : {}) },
         }),
       ),
     );
@@ -1414,7 +1414,7 @@ function JobPanel({
     async (cursor?: string) => {
       const signal = latest();
       const r = await api.call("list_jobs", {
-        query: { state, limit: 20, ...(cursor ? { cursor } : {}) },
+        query: { state, limit: 20, order: "recent", ...(cursor ? { cursor } : {}) },
         signal,
       });
       if (signal.aborted) return;
@@ -1741,7 +1741,7 @@ function ContactView({ data, scope, onRefresh, onMore, run, notice }: any) {
                 const current = (
                   await api.call("list_contact", {
                     path: { table: "policies" },
-                    query: { limit: 200 },
+                    query: { limit: 200, order: "recent" },
                   })
                 ).items.find((p: any) => p.id === id)?.data;
                 await api.call("configure_contact", {

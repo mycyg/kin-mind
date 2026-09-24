@@ -45,13 +45,17 @@ def handle(engine, event, payload, *, receipt_only=False):
             ),
         )
     tool = str(payload.get("tool_name") or payload.get("toolName") or "")
-    arguments = payload.get("tool_input", payload.get("args", {}))
-    result = payload.get(
+    # A tool's arguments and output are stored as they came, so the secrets in them are taken
+    # out first, by the same rules as every other observation (E1-06).
+    from kin_mind.computer import redact
+
+    arguments = redact(payload.get("tool_input", payload.get("args", {})))
+    result = redact(payload.get(
         "tool_response", payload.get("value", payload.get("contentText", ""))
-    )
+    ))
     raw_text = str(payload.get("text") or payload.get("prompt") or "")
     message = current_message(raw_text) if payload.get("role") == "user" else raw_text
-    recalled = None
+    recalled = source = None
     if event == "message" and payload.get("recall_on_message") and not receipt_only and not payload.get("memory_context_managed"):
         # Query before receipt so the just-submitted prompt cannot echo back as
         # historical evidence or displace relevant earlier memories.
@@ -133,6 +137,9 @@ def handle(engine, event, payload, *, receipt_only=False):
                 phase="passive",
             )
         )
+    if source is None:
+        # A pre-action cue stores nothing; with no recall to make there is nothing to answer (E3-19).
+        return {}
     return {"status": "received", "id": source["id"], **(recalled or {})}
 
 

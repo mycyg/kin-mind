@@ -14,6 +14,10 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 
 from . import liveness
 from .memory import MemoryContinuity
+from .model_lanes import WAIT_CAPACITY, WAIT_FOREGROUND, WAIT_LEDGER, WAIT_USER_WORK
+
+# Every reason a model admission turned a job away: waits, never failures of the job (E2-03).
+ADMISSION_WAITS = frozenset({WAIT_CAPACITY, WAIT_FOREGROUND, WAIT_LEDGER, WAIT_USER_WORK})
 
 # Retry bookkeeping an approved resume gives back, preserved in recovery_history.
 RETRY_COUNTERS = ("error_signature", "error_repeats", "compression_waits", "compression_stalls",
@@ -67,7 +71,10 @@ def migrate_operational(mind, *, workers_stopped):
 def recover_history(mind, *, job_ids, command_id, source, workers_stopped, replacements=None, admission_only=False):
     """Resume approved historical jobs, preserving failures and original IDs.
 
-    Reused structured results still pass the normal transactional validators.
+    A resumed job is judged afresh: no stored or supplied proposal is replayed as its result.
+    Seeding used to accept only proposals made by one model name, which no longer matched the
+    model background work runs on, and a stored proposal of an older shape failed the whole
+    batch (K4-06). The stored proposal stays readable in recovery_history.
     This operation neither writes emotions nor submits a chat/send operation.
 
     It touches `needs-repair` rows only. A quarantined row is held by no worker and
@@ -81,11 +88,11 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
         raise ValueError("Verify termination of the owning workers first")
     if not command_id or not source or not 1 <= len(job_ids) <= 50 or len(set(job_ids)) != len(job_ids):
         raise ValueError("Recovery requires a sourced command and unique bounded jobs")
-    from .appraisal import Appraisal, Appraisals
+    from .appraisal import Appraisals
     Appraisals(mind)
-    replacements = replacements or {}
-    if set(replacements) - set(job_ids):
-        raise ValueError("Replacement outside the approved batch")
+    if replacements:
+        raise ValueError("A resumed job is judged afresh; replacement proposals are not replayed")
+    replacements = {}
     name = "history-recovery:" + command_id
     fingerprint = digest([job_ids, source, replacements, *([True] if admission_only else [])])
     with mind.engine.db.connect(write=True) as conn:
@@ -108,25 +115,12 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
                 continue
             if row["state"] != "needs-repair":
                 raise Conflict("Only quarantined historical jobs can be resumed")
-            if admission_only and data.get("error") not in {"deepseek-background-capacity", "deepseek-foreground-priority"}:
+            if admission_only and data.get("error") not in ADMISSION_WAITS:
                 raise Conflict("Recovery is limited to the approved admission waits")
-            chosen = replacements.get(identifier) or {"proposal": data.get("proposed_result"), "receipt": data.get("receipt"), "sources": data.get("evaluated_sources", [])}
-            proposal = Appraisal.model_validate(chosen["proposal"]) if chosen.get("proposal") and not admission_only else None
             data.setdefault("recovery_history", []).append({"command_id": command_id, "source": source, "at": mind.clock(),
                 "attempts": row["attempts"], "error": data.get("error"), "proposed_result": data.get("proposed_result"), "receipt": data.get("receipt")})
             data.pop("seed_manifest", None)
-            if proposal and chosen.get("receipt", {}).get("model") == "deepseek-flash":
-                refs = chosen.get("sources", [])
-                if refs and not mind._fresh(conn, refs):
-                    raise Conflict("Recovery proposal sources need review")
-                data.update(seed_memory=proposal.memory.model_dump(), seed_receipt={**chosen["receipt"], "recovery_command": command_id},
-                            seed_sources=refs, seed_rejected=False)
-                if identifier not in replacements and data.get("proposal_manifest"):
-                    # The row's own stored judgment: the manifest it rests on says what it was shown,
-                    # so the resumed attempt compares its read set like any other reuse.
-                    data["seed_manifest"] = data["proposal_manifest"]
-            else:
-                data["seed_rejected"] = True
+            data["seed_rejected"] = True
             if admission_only:
                 # Previous usage and proposals stay in recovery_history. Refresh
                 # source/configuration context; never replay an unrelated proposal.
@@ -146,7 +140,35 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
     return result
 
 
-def recover_quarantined(mind, *, job_ids, command_id, source):
+def resume_compaction_waits(conn, at):
+    """Give back to the queue what history compaction alone set aside (K3-14).
+
+    While `history_compaction_active` is set no revision can be written, so an assessment that
+    reached its commit then was refused there, and the same refusal twice quarantined it; nothing
+    about the assessment was at fault. When the marker is lifted each such row is pending again,
+    judged afresh as after an operator's resume, with the refusal kept in recovery_history. Runs
+    inside the transaction that lifts the marker."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisals'").fetchone():
+        return []
+    from .history import COMPACTING
+    resumed = []
+    for row in conn.execute("SELECT id,attempts,data FROM mind_appraisals WHERE state='needs-repair' "
+                            "AND json_extract(data,'$.error_detail.code')=?", (COMPACTING,)).fetchall():
+        data = json.loads(row["data"])
+        data.setdefault("recovery_history", []).append({
+            "command_id": "history-compaction-finished", "source": "host", "at": at, "attempts": row["attempts"],
+            **{field: data.get(field) for field in ("error", "error_detail", "repair_reason")},
+            **{field: data[field] for field in RETRY_COUNTERS if field in data}})
+        for field in ("error", "error_detail", "repair_reason", "waiting_reason",
+                      "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
+            data.pop(field, None)
+        conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
+                     (time.time(), dumps(data), row["id"]))
+        resumed.append(row["id"])
+    return resumed
+
+
+def recover_quarantined(mind, *, job_ids, command_id, source, retire=False):
     """Resume quarantined appraisals of any lane. Each one is judged afresh.
 
     A quarantined row is held by no worker (state `needs-repair`, no lease), so
@@ -154,13 +176,18 @@ def recover_quarantined(mind, *, job_ids, command_id, source):
     queue and the claim query takes it from there atomically. The failure stays
     readable in `recovery_history`; no stored proposal is replayed as a seed and
     no model is called here.
+
+    With `retire`, the rows end instead of running again: each becomes `superseded`, the
+    existing terminal state, for a moment that has passed or evidence that is gone, where a
+    resume would only pay to be quarantined again. The reason stays in recovery_history and
+    what a row had absorbed is released as for any superseded row (K4-06).
     """
     if not command_id or not source or not 1 <= len(job_ids) <= 50 or len(set(job_ids)) != len(job_ids):
         raise ValueError("Recovery requires a sourced command and unique bounded jobs")
     from .appraisal import Appraisals
-    Appraisals(mind)
-    name = "quarantine-recovery:" + command_id
-    fingerprint = digest([job_ids, source])
+    jobs = Appraisals(mind)
+    name = ("quarantine-retire:" if retire else "quarantine-recovery:") + command_id
+    fingerprint = digest([job_ids, source, *(["retire"] if retire else [])])
     with mind.engine.db.connect(write=True) as conn:
         previous = conn.execute("SELECT data FROM mind_memory_migrations WHERE scope=? AND name=?", (mind.scope.key(), name)).fetchone()
         if previous:
@@ -184,6 +211,14 @@ def recover_quarantined(mind, *, job_ids, command_id, source):
                 **{field: data.get(field) for field in ("error", "error_detail", "repair_reason",
                                                         "proposed_result", "receipt", "failed_call_receipt")},
                 **{field: data[field] for field in RETRY_COUNTERS if field in data}})
+            if retire:
+                data["recovery_history"][-1]["retired"] = True
+                data["retired_reason"] = data.get("repair_reason") or data.get("error") or "retired-by-operator"
+                conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0,data=? WHERE id=?",
+                             (dumps(data), identifier))
+                jobs._settle_children(conn, identifier, data, "superseded")
+                resumed.append(identifier)
+                continue
             if data.get("seed_memory"):
                 # The stored proposal stays audit data; this attempt judges again.
                 data["seed_rejected"] = True
@@ -193,7 +228,8 @@ def recover_quarantined(mind, *, job_ids, command_id, source):
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
                          (time.time(), dumps(data), identifier))
             resumed.append(identifier)
-        result = {"state": "resumed", "resumed": resumed, "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
+        result = {"state": "retired" if retire else "resumed", "retired" if retire else "resumed": resumed,
+                  "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
         conn.execute("INSERT INTO mind_memory_migrations VALUES(?,?,0,?)", (mind.scope.key(), name, dumps(result)))
     return result
 

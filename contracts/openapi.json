@@ -8,17 +8,14 @@
     "/v1/health": {
       "get": {
         "summary": "Health",
+        "description": "Ready means the background loop is going round as well: reminders, extraction,\norganising and host replay all run on it, so a service whose loop has stopped is not\nhealthy however well it answers (E2-02, H3-09).",
         "operationId": "health",
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Health"
-                }
+                "schema": {}
               }
             }
           }
@@ -614,7 +611,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RecallResult"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RecallResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ContextRecallResult"
+                    }
+                  ],
+                  "title": "Response Recall"
                 }
               }
             }
@@ -986,46 +991,6 @@
         }
       }
     },
-    "/v1/feedback": {
-      "post": {
-        "summary": "Record Feedback",
-        "operationId": "record_feedback",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FeedbackRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Record Feedback"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/sessions/boundary": {
       "post": {
         "summary": "Session Boundary",
@@ -1329,6 +1294,20 @@
               "minimum": 1,
               "default": 50,
               "title": "Limit"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "id",
+                "recent"
+              ],
+              "type": "string",
+              "default": "id",
+              "title": "Order"
             }
           }
         ],
@@ -2695,6 +2674,20 @@
               "default": 50,
               "title": "Limit"
             }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "id",
+                "recent"
+              ],
+              "type": "string",
+              "default": "id",
+              "title": "Order"
+            }
           }
         ],
         "responses": {
@@ -3223,6 +3216,140 @@
         "type": "object",
         "title": "ContactPolicy"
       },
+      "ContextIndexItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "title": "ContextIndexItem",
+        "description": "One entry of what a kin context selected: an id with the revision it was read at, which\nmay be a record's number or a digest of a derived view, and how deep it was read."
+      },
+      "ContextRecallResult": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ContextIndexItem"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "index": {
+            "items": {
+              "$ref": "#/components/schemas/ContextIndexItem"
+            },
+            "type": "array",
+            "title": "Index"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "tokens": {
+            "type": "integer",
+            "title": "Tokens"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget"
+          },
+          "accounts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Accounts"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          },
+          "latency_ms": {
+            "type": "number",
+            "title": "Latency Ms"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "session_used": {
+            "type": "integer",
+            "title": "Session Used",
+            "default": 0
+          },
+          "instruction_authority": {
+            "type": "string",
+            "title": "Instruction Authority"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "state",
+          "items",
+          "index",
+          "text",
+          "tokens",
+          "accounts",
+          "generation",
+          "latency_ms",
+          "instruction_authority"
+        ],
+        "title": "ContextRecallResult",
+        "description": "A recall in a scope whose memory context is on: the context's own shape. `items` is\nits index; the text is the rendered context, as data."
+      },
       "CreateRecord": {
         "properties": {
           "record": {
@@ -3350,55 +3477,6 @@
           "members"
         ],
         "title": "FamilyCreate"
-      },
-      "FeedbackRequest": {
-        "properties": {
-          "record_id": {
-            "type": "string",
-            "title": "Record Id"
-          },
-          "type": {
-            "type": "string",
-            "enum": [
-              "displayed",
-              "read",
-              "adopted",
-              "verified",
-              "corrected",
-              "unknown",
-              "same_file_observed"
-            ],
-            "title": "Type"
-          },
-          "session": {
-            "type": "string",
-            "title": "Session",
-            "default": ""
-          },
-          "attributes": {
-            "additionalProperties": true,
-            "type": "object",
-            "title": "Attributes"
-          },
-          "key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Key"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "record_id",
-          "type"
-        ],
-        "title": "FeedbackRequest"
       },
       "GraphCommand": {
         "properties": {

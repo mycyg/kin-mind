@@ -11,7 +11,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Health */
+        /**
+         * Health
+         * @description Ready means the background loop is going round as well: reminders, extraction,
+         *     organising and host replay all run on it, so a service whose loop has stopped is not
+         *     healthy however well it answers (E2-02, H3-09).
+         */
         get: operations["health"];
         put?: never;
         post?: never;
@@ -272,23 +277,6 @@ export interface paths {
         put?: never;
         /** Create Relation */
         post: operations["create_relation"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/feedback": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Record Feedback */
-        post: operations["record_feedback"];
         delete?: never;
         options?: never;
         head?: never;
@@ -869,6 +857,59 @@ export interface components {
             /** Allowed Kinds */
             allowed_kinds?: ("episode" | "fact" | "state" | "preference" | "procedure" | "relationship" | "commitment" | "reminder" | "prediction" | "diary" | "summary" | "portrait" | "self_narrative" | "knowledge" | "checkpoint" | "observation")[];
         };
+        /**
+         * ContextIndexItem
+         * @description One entry of what a kin context selected: an id with the revision it was read at, which
+         *     may be a record's number or a digest of a derived view, and how deep it was read.
+         */
+        ContextIndexItem: {
+            /** Id */
+            id: string;
+            /** Revision */
+            revision?: number | string | null;
+            /** Depth */
+            depth?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * ContextRecallResult
+         * @description A recall in a scope whose memory context is on: the context's own shape. `items` is
+         *     its index; the text is the rendered context, as data.
+         */
+        ContextRecallResult: {
+            /** State */
+            state: string;
+            /** Items */
+            items: components["schemas"]["ContextIndexItem"][];
+            /** Index */
+            index: components["schemas"]["ContextIndexItem"][];
+            /** Text */
+            text: string;
+            /** Tokens */
+            tokens: number;
+            /** Budget */
+            budget?: number | null;
+            /** Accounts */
+            accounts: {
+                [key: string]: number;
+            };
+            /** Generation */
+            generation: number;
+            /** Latency Ms */
+            latency_ms: number;
+            /** Cursor */
+            cursor?: number | string | null;
+            /**
+             * Session Used
+             * @default 0
+             */
+            session_used?: number;
+            /** Instruction Authority */
+            instruction_authority: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** CreateRecord */
         CreateRecord: {
             record: components["schemas"]["RecordInput"];
@@ -906,27 +947,6 @@ export interface components {
              * @enum {string}
              */
             kind?: "family" | "volume";
-        };
-        /** FeedbackRequest */
-        FeedbackRequest: {
-            /** Record Id */
-            record_id: string;
-            /**
-             * Type
-             * @enum {string}
-             */
-            type: "displayed" | "read" | "adopted" | "verified" | "corrected" | "unknown" | "same_file_observed";
-            /**
-             * Session
-             * @default
-             */
-            session?: string;
-            /** Attributes */
-            attributes?: {
-                [key: string]: unknown;
-            };
-            /** Key */
-            key?: string | null;
         };
         /** GraphCommand */
         GraphCommand: {
@@ -1538,9 +1558,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": unknown;
                 };
             };
         };
@@ -1907,7 +1925,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RecallResult"];
+                    "application/json": components["schemas"]["RecallResult"] | components["schemas"]["ContextRecallResult"];
                 };
             };
             /** @description Validation Error */
@@ -2106,41 +2124,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["RelationRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    record_feedback: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["FeedbackRequest"];
             };
         };
         responses: {
@@ -2398,6 +2381,7 @@ export interface operations {
                 state?: string | null;
                 cursor?: string;
                 limit?: number;
+                order?: "id" | "recent";
             };
             header?: never;
             path?: never;
@@ -3065,6 +3049,7 @@ export interface operations {
             query?: {
                 cursor?: string;
                 limit?: number;
+                order?: "id" | "recent";
             };
             header?: never;
             path: {

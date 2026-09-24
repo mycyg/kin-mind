@@ -103,7 +103,7 @@ def test_merge_and_split_retain_inverse_history(system):
     command = {"id": a["id"], "expected_revision": a["revision"], "target_id": b["id"], "target_revision": b["revision"], "action": "merge", "command_id": "merge", "reason": "Source identity", "evidence_ids": [sid]}
     merged = memory.graph.revise(command)
     assert merged == memory.graph.revise(command)
-    memory.graph.revise({"id": a["id"], "expected_revision": merged["after_revisions"][a["id"]], "action": "split", "previous_command_id": "merge", "command_id": "split", "reason": "New correction", "evidence_ids": [sid]})
+    memory.graph.revise({"id": a["id"], "expected_revision": merged["after_revisions"][a["id"]], "action": "undo", "previous_command_id": "merge", "command_id": "split", "reason": "New correction", "evidence_ids": [sid]})
     assert memory.graph.detail(a["id"])["state"] == "active"
     assert len(memory.graph.detail(a["id"])["history"]) == 3
 

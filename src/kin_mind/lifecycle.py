@@ -17,6 +17,13 @@ from .state import timestamp
 
 DIGEST_VERSION = "event-digest-v1"
 REAL_USES = {"user_query", "reply_reference", "followup"}
+# A digest whose job failed goes back to dirty after this long, this many times: a failure
+# that was the environment's clears itself, one that is the item's stops (K4-04).
+DIGEST_RETRY_COOLDOWN = 6 * 3600
+DIGEST_RETRY_LIMIT = 3
+# Why a digest is dirty, and the queue priority it is recomputed at. Work somebody waits for
+# first; history, operator recovery and retries of failures last (K4-05).
+DIGEST_PRIORITIES = {"source-revision": 20, "historical-backfill": 200, "derivative-recovery": 200, "failed-retry": 200}
 
 
 class EventIdentityJudgement(Model):
@@ -710,12 +717,15 @@ def schedule(engine, conn, at):
                 "AND json_type(d.data,'$.source_versions.'||r.id) IS NOT NULL",
                 (raw_scope, at))]
             mark_dirty(conn, raw_scope, expired, at, "source-expired")
+            retry_failed(conn, raw_scope, at)
             for row in conn.execute("SELECT event_id,generation,data FROM mind_event_digests WHERE scope=? AND state='dirty' AND due_at<=? ORDER BY dirty_at LIMIT 20", (raw_scope, timestamp(at).timestamp())).fetchall():
+                # The payload's scope was written with sorted keys; compared in that same form,
+                # or a job already on its way is never seen and a second one is queued (K4-05).
                 active = conn.execute("SELECT 1 FROM jobs WHERE kind='event_digest' AND state IN ('pending','retry','running','waiting_config') AND json_extract(payload,'$.event_id')=? AND json_extract(payload,'$.scope')=json(?)",
-                                      (row["event_id"], raw_scope)).fetchone()
+                                      (row["event_id"], dumps(scope))).fetchone()
                 if not active:
                     reason = json.loads(row["data"]).get("dirty_reason")
-                    priority = 20 if reason == "source-revision" else 200 if reason == "historical-backfill" else 40
+                    priority = DIGEST_PRIORITIES.get(reason, 40)
                     engine.enqueue("event_digest", {"scope": scope, "event_id": row["event_id"]},
                                    f"event-digest:{digest(raw_scope)}:{row['event_id']}:{row['generation']}", conn=conn, priority=priority)
         for kind, flag, priority in (("volumes", "auto_volumes", 150), ("temperature", "temperature_shadow", 180)):
@@ -777,12 +787,31 @@ def prepare_job(engine, job, payload):
     return commit
 
 
+def retry_failed(conn, scope, at, *, cooldown=DIGEST_RETRY_COOLDOWN, limit=DIGEST_RETRY_LIMIT):
+    """Failed digests back to dirty, each after a cooldown and at most `limit` times. Only the
+    digest itself: nothing it is part of is made dirty by its retry (K4-04, K4-05)."""
+    now = timestamp(at).timestamp()
+    retried = []
+    for row in conn.execute("SELECT event_id,data FROM mind_event_digests WHERE scope=? AND state='failed' LIMIT 50",
+                            (scope,)).fetchall():
+        data = json.loads(row["data"])
+        tries, failed_at = data.get("failed_retries", 0), data.get("failed_at")
+        if tries >= limit or (failed_at and now - timestamp(failed_at).timestamp() < cooldown):
+            continue
+        conn.execute("UPDATE mind_event_digests SET state='dirty',generation=generation+1,dirty_at=?,due_at=?,"
+                     "data=json_set(data,'$.failed_retries',?,'$.dirty_reason','failed-retry') WHERE scope=? AND event_id=?",
+                     (at, now, tries + 1, scope, row["event_id"]))
+        retried.append(row["event_id"])
+    return retried
+
+
 def job_failed(conn, job, state, reason):
     payload = json.loads(job["payload"])
     if job["kind"] == "event_digest":
-        conn.execute("UPDATE mind_event_digests SET state=?,data=json_set(data,'$.last_error',?) WHERE scope=? AND event_id=?",
+        from eventmem.core.models import now
+        conn.execute("UPDATE mind_event_digests SET state=?,data=json_set(data,'$.last_error',?,'$.failed_at',?) WHERE scope=? AND event_id=?",
                      ("failed" if state in {"failed", "canceled", "waiting_config"} else "dirty",
-                      reason[:200], Scope(**payload["scope"]).key(), payload["event_id"]))
+                      reason[:200], now(), Scope(**payload["scope"]).key(), payload["event_id"]))
     elif job["kind"] != "lifecycle_backfill" and job["kind"].startswith("lifecycle_") and state in {"failed", "canceled", "waiting_config"}:
         conn.execute("UPDATE mind_lifecycle_runs SET state=? WHERE scope=? AND kind=? AND slot=?",
                      (state, Scope(**payload["scope"]).key(), job["kind"].removeprefix("lifecycle_"), payload["slot"]))

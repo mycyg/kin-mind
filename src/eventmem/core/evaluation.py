@@ -132,7 +132,7 @@ def evaluate(output, dataset=None, answer_engine=None):
     about a remote production model's quality.
     """
     import numpy as np
-    from eventmem.recall import _bm25
+    from .retrieval import bm25 as _bm25
     from .retrieval import tokens
     from .baselines import LegacyAdapter, LEGACY_REVISION
 

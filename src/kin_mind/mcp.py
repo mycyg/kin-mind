@@ -9,7 +9,7 @@ from .state import AffectiveEvent, DesireChange, Mind
 def register_mind_tools(server, engine):
     @server.tool()
     def read_autonomous_plans(scope: Scope, identifier: str | None = None, status: str | None = None, cursor: int = 0, limit: int = 24, history: bool = False) -> dict:
-        """读取持久目标、时间安排、依赖、决定修订及实际执行、平台接收和小光回应的回执。时间使用 Asia/Singapore。计划和愿望不等于小光的承诺；到期事项先由主会话按当前情况复核，读取本身不授予执行权限。"""
+        """读取持久目标、时间安排、依赖、决定修订及实际执行、平台接收和主人回应的回执。时间使用 Asia/Singapore。计划和愿望不等于主人的承诺；到期事项先由主会话按当前情况复核，读取本身不授予执行权限。"""
         from .plans import AutonomousPlans
         return AutonomousPlans(Mind(engine, scope)).read(identifier, status=status, cursor=cursor, limit=limit, history=history)
 
@@ -27,13 +27,13 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def update_conversation_habits(scope: Scope, request: dict) -> dict:
-        """依据小光在对话中明确表达的偏好更新习惯。需要 command_id、expected_revision、evidence_ids、reason、preferences。支持 exploration_frequency、exploration_directions、exploration_min_interval_minutes、exploration_paused、reply_choice（always/autonomous）。返回持久修订；人格核心另行维护。"""
+        """依据主人在对话中明确表达的偏好更新习惯。需要 command_id、expected_revision、evidence_ids、reason、preferences。支持 exploration_frequency、exploration_directions、exploration_min_interval_minutes、exploration_paused、reply_choice（always/autonomous）。返回持久修订；人格核心另行维护。"""
         from .habits import ConversationHabits
         return ConversationHabits(Mind(engine, scope)).update(request)
 
     @server.tool()
     def choose_reply(scope: Scope, request: dict) -> dict:
-        """为当前真实 input_id 选择 reply、silent 或 merged，附简短决定缘由；merged 需要 merged_into。小光允许闲聊自主安静时可以不回复，每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
+        """为当前真实 input_id 选择 reply、silent 或 merged，附简短决定缘由；merged 需要 merged_into。主人允许闲聊自主安静时可以不回复，每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
         from .habits import ConversationHabits
         return ConversationHabits(Mind(engine, scope)).choose_reply(request)
 
@@ -54,7 +54,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def revise_graph(scope: Scope, request: dict) -> dict:
-        """更正、撤回、恢复图谱对象，归并身份或事件，或拆分、撤销旧命令。需要 command_id、id、expected_revision、evidence_ids、reason；归并另需 target_id、target_revision，撤销需 previous_command_id。保留原始证据与逆向修订。"""
+        """更正、撤回、恢复图谱对象，归并身份或事件，拆分事件（action=split_event，另需 member_ids、title），或撤销旧命令（action=undo，另需 previous_command_id）。需要 command_id、id、expected_revision、evidence_ids、reason；归并另需 target_id、target_revision。保留原始证据与逆向修订。"""
         from .graph import EventGraph
         return EventGraph(Mind(engine, scope)).revise(request)
 
@@ -92,7 +92,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_trait_ledger(scope: Scope, identifier: str | None = None, limit: int = 12, history: bool = False) -> dict:
-        """读取相处中逐渐形成的性格倾向、候选或已建立状态，以及按证据类别、独立经历和日期统计的支持与反例。撤回项保留来源。计数帮助判断，不自动判定性格；读取不构成成长新证据，变化来自评估或小光更正。"""
+        """读取相处中逐渐形成的性格倾向、候选或已建立状态，以及按证据类别、独立经历和日期统计的支持与反例。撤回项保留来源。计数帮助判断，不自动判定性格；读取不构成成长新证据，变化来自评估或主人更正。"""
         from .traits import Traits
         return Traits(Mind(engine, scope)).read(identifier, limit=limit, history=history)
 
@@ -108,5 +108,5 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def manage_desire(scope: Scope, request: DesireChange) -> dict:
-        """创建或修改有来源的联系、探索、创作愿望，填写 strength、expiry 和具体完成条件。小光交办的工作保留任务身份，不随情绪取消；完成依据实际结果。工具不发送消息，宿主按当前决定、授权、免打扰、联系偏好及回执执行。只有明确启用的旧兼容模式使用分数阈值。"""
+        """创建或修改有来源的联系、探索、创作愿望，填写 strength、expiry 和具体完成条件。主人交办的工作保留任务身份，不随情绪取消；完成依据实际结果。工具不发送消息，宿主按当前决定、授权、免打扰、联系偏好及回执执行。只有明确启用的旧兼容模式使用分数阈值。"""
         return Mind(engine, scope).manage_desire(request)

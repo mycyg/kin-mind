@@ -25,6 +25,10 @@ class Engine:
 
     def __init__(self, root: str | Path):
         self.db = Database(root)
+        from .retrieval import pin_encoding_cache
+
+        # The tokenizer's encoding lives with the store unless the process chose a place.
+        pin_encoding_cache(self.db.root / "cache" / "tiktoken")
         self.cache: dict = {}
         self.cache_lock = threading.RLock()
         self.interactive_until = 0.0
@@ -101,9 +105,10 @@ class Engine:
             )
             # What a source is gets decided once, as it arrives. Its row and the root record's
             # stamp belong to the first revision, so no stored record is rewritten to mark it.
-            from .read_policy import STAMP, stamp_source
+            from .read_policy import STAMP, classify_receipt, indexed
 
-            origin = stamp_source(self, conn, sid, source, record_text)
+            found = classify_receipt(self, conn, sid, source, record_text)
+            origin = (found.label or found.kind) if found else None
             # Deterministic text imports can be committed with the receipt.
             if attachment is None and source.text and len(source.text) <= 1_000_000:
                 confirmation = {
@@ -126,7 +131,9 @@ class Engine:
                     attributes={k: v for k, v in source.metadata.items() if k != STAMP}
                     | ({STAMP: origin} if origin else {}),
                 )
-                self._insert(conn, record)
+                # The host's own bookkeeping is kept and classified, and never offered as a
+                # recall candidate: it stays out of the text index and the organise queue.
+                self._insert(conn, record, index=indexed(found))
                 self.supersede_source_versions(conn, sid)
                 conn.execute(
                     "UPDATE sources SET mechanical='complete' WHERE id=?", (sid,)
@@ -265,7 +272,7 @@ class Engine:
             result["cursor"] = rows[limit - 1] if len(rows) > limit else None
             return result
 
-    def _insert(self, conn, record: RecordInput):
+    def _insert(self, conn, record: RecordInput, *, index=True):
         rid = record.id or uid("mem")
         if conn.execute("SELECT 1 FROM tombstones WHERE key=?", (rid,)).fetchone():
             raise Deleted(rid, code="tombstoned")
@@ -338,8 +345,9 @@ class Engine:
             self._relation(
                 conn, rid, "part_of", record.parent_id, {"basis": "document structure"}
             )
-        self._index_text(conn, data)
-        self._dirty(conn, data)
+        if index:
+            self._index_text(conn, data)
+            self._dirty(conn, data)
         return data
 
     def add_record(self, record: RecordInput, command_id: str) -> dict:
@@ -477,8 +485,31 @@ class Engine:
                 dumps(data),
             ),
         )
-        self._index_text(conn, data)
-        self._dirty(conn, data)
+        if self._indexable(conn, data):
+            self._index_text(conn, data)
+            self._dirty(conn, data)
+            if data["status"] != "active":
+                # Organising reads active records only: a row for one that left active use
+                # would stay in the queue for ever (DB1-08).
+                conn.execute("DELETE FROM dirty WHERE record_id=?", (data["id"],))
+        else:
+            rowid = conn.execute("SELECT rowid FROM records WHERE id=?", (data["id"],)).fetchone()[0]
+            conn.execute("DELETE FROM search WHERE rowid=?", (rowid,))
+
+    @staticmethod
+    def _indexable(conn, data):
+        """Whether a record belongs in the text index: not when every source behind it is
+        classified as an origin nothing reads as memory (the host's own bookkeeping)."""
+        from .read_policy import UNINDEXED_ORIGINS, origin_of_rule
+
+        ids = sorted(set(data.get("source_ids") or ()))
+        if not ids:
+            return True
+        marks = ",".join("?" for _ in ids)
+        unindexed = {row[0] for row in conn.execute(
+            f"SELECT source_id,rule FROM source_evidence_class WHERE source_id IN ({marks})", ids)
+            if origin_of_rule(row[1]) in UNINDEXED_ORIGINS}
+        return not unindexed.issuperset(ids)
 
     def revise(self, rid, change: RevisionInput):
         with self.db.connect(write=True) as conn:
@@ -713,47 +744,21 @@ class Engine:
 
         Corrections/retractions use revisions. Explicit deletion removes historical text.
         An explicitly reimported new source must have a new source identity/version.
+
+        What goes is `maintenance.erase_set`, the same set the preview shows. Everything else is
+        touched only where it names what goes: stored command results, sessions, prefetch rows,
+        metrics and jobs are found by the identifiers in them, not cleared wholesale, and the
+        mind's own layers — graph, state, wishes, plans, caches, and every revision of the state
+        — lose the words through `kin_mind.erasure`, the history in batches by a job.
         """
+        from kin_mind.erasure import erase as erase_derived, mentions, queue_history
+        from kin_mind.lifecycle import record_deleted
+
+        from .maintenance import erase_set
+
         with self.db.connect(write=True) as conn:
-            todo = {rid}
-            source_ids = {rid} if rid.startswith("src_") else set()
-            # Erasing a record also erases its raw source, whose bytes may contain
-            # the same text. Other records citing that source belong to the erase
-            # set; the preview endpoint exposes this set before a console delete.
-            source_ids.update(
-                r[0]
-                for r in conn.execute(
-                    "SELECT source_id FROM evidence WHERE record_id=?", (rid,)
-                )
-            )
-            for sid in source_ids:
-                todo.update(
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT record_id FROM evidence WHERE source_id=?", (sid,)
-                    )
-                )
-            deleted = set()
-            while todo:
-                current = todo.pop()
-                if current in deleted:
-                    continue
-                deleted.add(current)
-                todo.update(
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT record_id FROM dependencies WHERE evidence_id=?",
-                        (current,),
-                    )
-                )
-                todo.update(
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT id FROM records WHERE parent_id=?", (current,)
-                    )
-                )
-                # Derived narratives cite multiple sources. Only original sources
-                # of the selected object are erased; unrelated cited sources stay.
+            stamp = now()
+            deleted, source_ids = erase_set(conn, rid)
             blobs_to_remove = set()
             for sid in source_ids:
                 row = conn.execute(
@@ -768,8 +773,7 @@ class Engine:
                 if row:
                     conn.execute("DELETE FROM search WHERE rowid=?", (row[0],))
                     old_data = self._get(conn, current)
-                    from kin_mind.lifecycle import record_deleted
-                    record_deleted(conn, old_data, now())
+                    record_deleted(conn, old_data, stamp)
                     if old_data["locator"].get("blob"):
                         blobs_to_remove.add(old_data["locator"]["blob"])
                 family_ids = [
@@ -785,7 +789,7 @@ class Engine:
                     conn.execute("DELETE FROM families WHERE id=?", (family_id,))
                     conn.execute("DELETE FROM members WHERE family_id=?", (family_id,))
                 conn.execute(
-                    "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (current, now())
+                    "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (current, stamp)
                 )
                 conn.execute("DELETE FROM records WHERE id=?", (current,))
                 conn.execute("DELETE FROM revisions WHERE record_id=?", (current,))
@@ -801,6 +805,7 @@ class Engine:
                 conn.execute("DELETE FROM members WHERE record_id=?", (current,))
                 conn.execute("DELETE FROM dirty WHERE record_id=?", (current,))
                 conn.execute("DELETE FROM feedback WHERE record_id=?", (current,))
+                conn.execute("DELETE FROM prefetch WHERE record_id=?", (current,))
                 conn.execute(
                     "DELETE FROM outbox WHERE schedule_id IN (SELECT id FROM schedules WHERE record_id=?)",
                     (current,),
@@ -811,39 +816,44 @@ class Engine:
                     "SELECT 1 FROM evidence WHERE source_id=? LIMIT 1", (sid,)
                 ).fetchone():
                     conn.execute(
-                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (sid, now())
+                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)", (sid, stamp)
                     )
                     conn.execute("DELETE FROM sources WHERE id=?", (sid,))
                     conn.execute(
                         "DELETE FROM source_evidence_class WHERE source_id=?", (sid,)
                     )
-            # Stored command responses and session sets may contain deleted text.
-            conn.execute("DELETE FROM commands")
-            conn.execute("DELETE FROM sessions")
-            conn.execute("DELETE FROM prefetch")
-            conn.execute("DELETE FROM metrics")
-            # And so does the compressed context built out of it, which is the same
-            # text in a model's words. It goes only for a scope whose configuration
-            # asked for that sweep: erasing text nobody can read any more is one
-            # decision, hard-deleting a derived cache is another, and the second one
-            # is the flag. Without it the gap stays what it is today and is written
-            # down as such in the operator documentation.
+            erased = frozenset(deleted) | frozenset(source_ids)
+            # Stored command results and session sets name what they returned; the ones that
+            # name something erased may hold its text. The rest are other people's receipts.
+            for table, column in (("commands", "result"), ("sessions", "data"), ("metrics", "data")):
+                for row in mentions(conn, table, erased, "rowid AS key", column=column):
+                    conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["key"],))
+            # The mind's own layers, inside this transaction; its state history by a job. The
+            # compressed context that names what was erased goes whatever the scope's sweep
+            # setting; a scope that opted into the sweep still loses the whole cache as before.
+            erase_derived(conn, deleted, source_ids, stamp)
             from kin_mind.maintenance import purge_context_cache_on_erase
             purge_context_cache_on_erase(conn)
-            for job in conn.execute("SELECT id,payload FROM jobs").fetchall():
-                payload = json.loads(job["payload"])
-                if (
-                    payload.get("record_id") in deleted
-                    or payload.get("source_id") in source_ids
-                ):
-                    conn.execute(
-                        "UPDATE job_recovery SET target='[deleted]',prev_error=NULL WHERE job_id=?",
-                        (job["id"],),
-                    )
-                    conn.execute(
-                        "UPDATE jobs SET state='canceled',payload='{}',error=NULL WHERE id=?",
-                        (job["id"],),
-                    )
+            queue_history(self, conn, erased)
+            # A job about something erased keeps its row and loses its payload; one still to
+            # run is canceled. Found by the identifiers in the payload, not by reading them all.
+            for job in mentions(conn, "jobs", erased, "id,state,payload", column="payload"):
+                try:
+                    payload = json.loads(job["payload"])
+                except ValueError:
+                    payload = {}
+                if not (payload.get("record_id") in deleted or payload.get("source_id") in source_ids):
+                    continue
+                conn.execute(
+                    "UPDATE job_recovery SET target='[deleted]',prev_error=NULL WHERE job_id=?",
+                    (job["id"],),
+                )
+                conn.execute(
+                    "UPDATE jobs SET payload='{}',error=NULL,"
+                    "state=CASE WHEN state IN ('complete','failed','canceled') THEN state ELSE 'canceled' END"
+                    " WHERE id=?",
+                    (job["id"],),
+                )
             self.enqueue("purge_vectors", {}, f"purge:{uuid.uuid4().hex}", conn=conn)
             self.db.bump(conn)
         with self.db.connect(write=True) as conn:
@@ -938,30 +948,10 @@ class Engine:
             ).fetchone()
             return json.loads(row[0]) if row else {}
 
-    def feedback(self, rid, type_, session="", attributes=None, key=None):
-        if type_ not in {
-            "displayed",
-            "read",
-            "adopted",
-            "verified",
-            "corrected",
-            "unknown",
-            "same_file_observed",
-        }:
-            raise ValueError("Unsupported feedback type")
-        with self.db.connect(write=True) as conn:
-            self._get(conn, rid)
-            fid = key or uid("feedback")
-            conn.execute(
-                "INSERT OR IGNORE INTO feedback VALUES(?,?,?,?,?,?)",
-                (fid, rid, session, type_, now(), dumps(attributes or {})),
-            )
-        return {"id": fid, "type": type_}
-
-    def recall(self, request):
+    def recall(self, request, **options):
         from .retrieval import recall
 
-        return recall(self, request)
+        return recall(self, request, **options)
 
     def overview(self):
         with self.db.connect() as conn:
