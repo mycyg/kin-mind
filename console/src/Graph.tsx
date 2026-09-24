@@ -11,6 +11,17 @@ export function Graph({
   const ref = useRef<HTMLDivElement>(null);
   const [dimension, setDimension] = useState(2);
   const positions = useRef(new Map<string, [number, number, number]>());
+  // The scene is built from the data alone. A parent re-rendering (a pick, a keystroke in a
+  // filter) reaches the latest handler through this ref instead of rebuilding the scene, and a
+  // rebuild for more of the same graph keeps the camera where the reader left it.
+  const select = useRef(onSelect);
+  select.current = onSelect;
+  const camera0 = useRef<{
+    dimension: number;
+    ids: Set<string>;
+    position: THREE.Vector3;
+    target: THREE.Vector3;
+  } | null>(null);
   useEffect(() => {
     if (!ref.current || !data?.nodes.length) return;
     const root = ref.current,
@@ -31,7 +42,7 @@ export function Graph({
     const labelElements: {element:HTMLButtonElement;position:THREE.Vector3}[] = [];
     for (const node of data.nodes.filter((n:any)=>data.nodes.length<=24||["finding","work","entity"].includes(n.kind)).slice(0,24)) {
       const element=document.createElement("button");element.className="graph-node-label";
-      element.textContent=node.title;element.title=node.title;element.onclick=()=>onSelect(node.id);
+      element.textContent=node.title;element.title=node.title;element.onclick=()=>select.current(node.id);
       root.appendChild(element);labelElements.push({element,position:new THREE.Vector3()});
       element.dataset.nodeId=node.id;
     }
@@ -70,16 +81,25 @@ export function Graph({
       2,
       bounds.getSize(new THREE.Vector3()).length() / 2,
     );
-    controls.target.copy(center);
-    camera.position
-      .copy(center)
-      .add(
-        new THREE.Vector3(
-          0,
-          0,
-          (radius / Math.tan(THREE.MathUtils.degToRad(25))) * 1.35,
-        ),
-      );
+    const kept = camera0.current;
+    if (
+      kept?.dimension === dimension &&
+      data.nodes.some((n: any) => kept.ids.has(n.id))
+    ) {
+      controls.target.copy(kept.target);
+      camera.position.copy(kept.position);
+    } else {
+      controls.target.copy(center);
+      camera.position
+        .copy(center)
+        .add(
+          new THREE.Vector3(
+            0,
+            0,
+            (radius / Math.tan(THREE.MathUtils.degToRad(25))) * 1.35,
+          ),
+        );
+    }
     controls.update();
     for (const edge of data.edges) {
       const a = map.get(edge.subject),
@@ -124,7 +144,7 @@ export function Graph({
     const pointerdown = (e: PointerEvent) => {
       down = { x: e.clientX, y: e.clientY };
     };
-    const select = (e: PointerEvent) => {
+    const pointerup = (e: PointerEvent) => {
       if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
       const r = root.getBoundingClientRect(),
         ray = new THREE.Raycaster();
@@ -137,21 +157,28 @@ export function Graph({
         camera,
       );
       const hit = ray.intersectObjects(nodes)[0];
-      if (hit) onSelect(hit.object.userData.id);
+      if (hit) select.current(hit.object.userData.id);
     };
     renderer.domElement.addEventListener("pointerdown", pointerdown);
-    renderer.domElement.addEventListener("pointerup", select);
+    renderer.domElement.addEventListener("pointerup", pointerup);
     draw();
     return () => {
+      camera0.current = {
+        dimension,
+        ids: new Set(data.nodes.map((n: any) => n.id)),
+        position: camera.position.clone(),
+        target: controls.target.clone(),
+      };
       labelElements.forEach(label=>label.element.remove());
       resize.disconnect();
       controls.dispose();
       geometries.forEach((x) => x.dispose());
       materials.forEach((x) => x.dispose());
       renderer.dispose();
+      renderer.forceContextLoss();
       renderer.domElement.remove();
     };
-  }, [data, dimension, onSelect]);
+  }, [data, dimension]);
   return (
     <div className="graph-wrap">
       <div className="graph-tools">

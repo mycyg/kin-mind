@@ -122,3 +122,135 @@ test('event graph exposes delivery coverage, source-backed edges and recorded bo
   expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   expect(errors).toEqual([]);
 });
+
+test('opening a record reads and writes nothing, and a slow earlier search never replaces a newer one',async({page})=>{
+  const writes:string[]=[];page.on('request',r=>{if(r.method()!=='GET')writes.push(r.url())});
+  await page.locator('nav').getByRole('button',{name:'记忆浏览',exact:true}).click();
+  await page.getByRole('button').filter({hasText:'下次一起读完这篇论文'}).click();
+  await expect(page.getByRole('dialog',{name:'记忆详情'})).toContainText('下次对话继续阅读论文的实验章节');
+  expect(writes).toEqual([]);
+  await page.getByRole('button',{name:'关闭详情'}).click();
+  let held=false;
+  await page.route('**/v1/memories?*',async route=>{
+    if(new URL(route.request().url()).searchParams.get('query')==='花园'&&!held){held=true;await new Promise(r=>setTimeout(r,1500));}
+    await route.continue().catch(()=>{});
+  });
+  const search=page.getByLabel('搜索当前范围',{exact:true});
+  await search.fill('花园');await page.waitForTimeout(500);
+  await search.fill('论文');
+  await expect(page.getByRole('button').filter({hasText:'下次一起读完这篇论文'})).toBeVisible();
+  await page.waitForTimeout(1600);
+  expect(held).toBe(true);
+  await expect(page.getByRole('button').filter({hasText:'共同经历：秋日的花园'})).toHaveCount(0);
+  await expect(page.getByRole('button').filter({hasText:'下次一起读完这篇论文'})).toBeVisible();
+});
+
+test('continued reading never joins pages of two revisions',async({page})=>{
+  const headers={Authorization:'Bearer test-console-local'};
+  const title='Paged revision '+Date.now();
+  const receipt=await (await page.request.post('/v1/sources',{headers,data:{namespace:'browser-paged',key:title,title,text:'First revision paragraph. '.repeat(700)+'END'}})).json();
+  const id=(await (await page.request.get(`/v1/sources/${receipt.id}`,{headers})).json()).record_ids[0];
+  await page.locator('nav').getByRole('button',{name:'记忆浏览',exact:true}).click();
+  await page.getByLabel('搜索当前范围',{exact:true}).fill(title);
+  await page.getByRole('button').filter({hasText:title}).click();
+  const drawer=page.getByRole('dialog',{name:'记忆详情'});
+  await expect(drawer.getByRole('button',{name:'继续读取'})).toBeVisible();
+  const record=await (await page.request.get(`/v1/memories/${id}`,{headers})).json();
+  expect((await page.request.post(`/v1/memories/${id}/revisions`,{headers,data:{expected_revision:record.revision,command_id:'paged-'+Date.now(),action:'correct',content:'Second revision. '.repeat(700),reason:'Changed while the first page was open'}})).ok()).toBe(true);
+  await drawer.getByRole('button',{name:'继续读取'}).click();
+  await expect(page.getByRole('alert').first()).toContainText('记忆已更新');
+  await expect(drawer.getByText('Second revision.')).toHaveCount(0);
+});
+
+test('a contact policy is edited field by field and keeps its own scope and callback',async({page})=>{
+  const headers={Authorization:'Bearer test-console-local'};
+  const scope={project:'personal',persona:'Kin',collection:'default',world:'real'};
+  const channel='http://127.0.0.1:8320/contact/reminder';
+  expect((await page.request.put('/v1/contact/policies',{headers,data:{id:'browser-reminders',scope,enabled:true,channel,timezone:'Asia/Shanghai',quiet_start:0,quiet_end:0,max_per_day:5}})).ok()).toBe(true);
+  await page.locator('nav').getByRole('button',{name:'主动联系',exact:true}).click();
+  await page.getByRole('button',{name:'配置策略'}).click();
+  await page.getByLabel('编辑策略').selectOption('browser-reminders');
+  await expect(page.getByLabel('回调地址')).toHaveValue(channel);
+  await expect(page.getByLabel('启用发送')).toBeChecked();
+  await expect(page.getByLabel('时区')).toHaveValue('Asia/Shanghai');
+  await page.getByLabel('安静时段开始').fill('23');
+  await page.getByRole('button',{name:'保存策略'}).click();
+  await expect(page.locator('.notice')).toContainText('联系策略已保存');
+  const saved=(await (await page.request.get('/v1/contact/policies',{headers})).json()).items.find((p:any)=>p.id==='browser-reminders').data;
+  expect(saved).toMatchObject({scope,enabled:true,channel,timezone:'Asia/Shanghai',quiet_start:23,quiet_end:0,max_per_day:5});
+});
+
+test('a failed web import says why and keeps the dialog open',async({page})=>{
+  await page.route('**/v1/sources/url',route=>route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({detail:'Too many redirects'})}));
+  await page.getByRole('button',{name:'添加来源',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'添加来源'});
+  await dialog.getByLabel('网页地址').fill('https://example.invalid/page');
+  await dialog.getByRole('button',{name:'保存来源'}).click();
+  await expect(dialog.getByRole('alert')).toContainText('Too many redirects');
+  await expect(dialog).toBeVisible();
+});
+
+test('settings forms change only what was edited, over what the service holds now',async({page})=>{
+  const headers={Authorization:'Bearer test-console-local'};
+  const research={startup:3000,passive:300,cumulative:9000};
+  expect((await page.request.put('/v1/settings/budgets',{headers,data:{research}})).ok()).toBe(true);
+  await page.locator('nav').getByRole('button',{name:'设置',exact:true}).click();
+  await expect(page.locator('input[name="tool-startup"]')).toHaveValue('2000');
+  const summary={endpoint:'http://127.0.0.1:9/v1',model:'synthetic-summary'};
+  expect((await page.request.put('/v1/settings/models',{headers,data:{summary}})).ok()).toBe(true);
+  const support={startup:1000,passive:100,cumulative:5000};
+  expect((await page.request.put('/v1/settings/budgets',{headers,data:{research,support}})).ok()).toBe(true);
+  await page.locator('input[name="tool-startup"]').fill('2500');
+  await page.getByRole('button',{name:'保存预算'}).click();
+  await expect(page.locator('.notice')).toContainText('上下文预算已保存');
+  const budgets=await (await page.request.get('/v1/settings/budgets',{headers})).json();
+  expect(budgets).toMatchObject({research,support,tool:{startup:2500}});
+  expect(Object.keys(budgets.tool)).toEqual(['startup']);
+  await page.getByLabel('API 端点').fill('http://127.0.0.1:9/v1');
+  await page.getByLabel('模型名称').fill('synthetic-extraction');
+  await page.getByRole('button',{name:'保存 extraction'}).click();
+  await expect(page.locator('.notice')).toContainText('模型配置已保存');
+  const models=await (await page.request.get('/v1/settings/models',{headers})).json();
+  expect(models.summary).toMatchObject(summary);
+  expect(models.extraction).toMatchObject({model:'synthetic-extraction'});
+});
+
+test('picking a node or typing a filter keeps the graph scene',async({page})=>{
+  const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.getByRole('button',{name:'主题与关系',exact:true}).click();
+  await expect(page.locator('canvas')).toHaveCount(1);
+  const canvas=await page.locator('canvas').elementHandle();
+  await page.getByRole('region',{name:'事件时间线'}).getByRole('button').first().click();
+  await expect(page.getByRole('region',{name:'图谱详情'})).not.toContainText('点开事件或连线');
+  await page.getByLabel('人物、项目或旧事').fill('迁移');
+  expect(await canvas!.evaluate(el=>el.isConnected)).toBe(true);
+  await expect(page.locator('canvas')).toHaveCount(1);
+  expect(errors).toEqual([]);
+});
+
+test('jobs are read by state, the ones needing attention first',async({page})=>{
+  await page.getByRole('button',{name:'整理当前范围'}).first().click();
+  await expect(page.locator('.notice')).toContainText('任务已加入处理队列');
+  const tab=page.getByRole('tab',{name:/等待处理 [1-9]/});
+  await expect(tab).toBeVisible();await tab.click();
+  await expect(page.locator('.job-row').filter({hasText:'organize'}).first()).toBeVisible();
+});
+
+test('a JSON attachment previews as text',async({page})=>{
+  const headers={Authorization:'Bearer test-console-local'};
+  const title='JSON attachment '+Date.now();
+  const receipt=await (await page.request.post('/v1/sources/upload',{headers,multipart:{
+    metadata:JSON.stringify({namespace:'browser-json',key:title,title,media_type:'application/json',authority:'document'}),
+    file:{name:'data.json',mimeType:'application/json',buffer:Buffer.from('{"kept":"as stored"}')}}})).json();
+  // An attachment's own record waits for the parser; this record cites the stored file directly.
+  const record=await (await page.request.post('/v1/memories',{headers,data:{command_id:'json-'+Date.now(),record:{kind:'knowledge',title,content:'A record citing a JSON attachment',source_ids:[receipt.id]}}})).json();
+  await page.locator('nav').getByRole('button',{name:'记忆浏览',exact:true}).click();
+  await page.getByLabel('搜索当前范围',{exact:true}).fill(title);
+  await page.getByRole('button').filter({hasText:title}).click();
+  const drawer=page.getByRole('dialog',{name:'记忆详情'});
+  await expect(drawer.getByText(record.id)).toBeVisible();
+  await drawer.getByRole('button',{name:'来源',exact:true}).click();
+  await drawer.locator('.source-row button').first().click();
+  await drawer.getByRole('button',{name:'预览附件'}).click();
+  await expect(drawer.locator('.attachment-preview pre')).toHaveText('{"kept":"as stored"}');
+});

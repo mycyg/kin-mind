@@ -30,7 +30,9 @@ import {
   api,
   commandId,
   initialToken,
-  scopeDefault,
+  save,
+  savedScope,
+  saveScope,
   setToken,
   stamp,
   type Scope,
@@ -130,23 +132,47 @@ function Empty({ title, detail }: { title: string; detail: string }) {
     </div>
   );
 }
+const recordViews = ["memories", "timeline", "knowledge", "diary", "conflicts"];
+const aborted = (e: unknown) => (e as { name?: string })?.name === "AbortError";
+function useDebounced<T>(value: T, delay = 300) {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return settled;
+}
+// Each call cancels the request before it; the caller drops an answer whose signal was aborted.
+function useLatest() {
+  const current = useRef<AbortController | null>(null);
+  return useCallback(() => {
+    current.current?.abort();
+    current.current = new AbortController();
+    return current.current.signal;
+  }, []);
+}
 function App() {
   const [connected, setConnected] = useState(false),
     [token, setTokenInput] = useState(initialToken),
     [view, setView] = useState("overview"),
-    [scope, setScope] = useState<Scope>(scopeDefault),
+    [scopeInput, setScopeInput] = useState<Scope>(savedScope),
+    [scopes, setScopes] = useState<Scope[] | null>(null),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false),
+    [pending, setPending] = useState(0),
     [overview, setOverview] = useState<any>({}),
-    [items, setItems] = useState<RecordItem[]>([]),
-    [cursor, setCursor] = useState<string | null>(null),
-    [jobs, setJobs] = useState<any[]>([]),
+    [page, setPage] = useState<{
+      key: string;
+      items: RecordItem[];
+      cursor: string | null;
+    }>({ key: "", items: [], cursor: null }),
+    [browseInput, setBrowseInput] = useState(""),
     [selected, setSelected] = useState<RecordItem | null>(null),
     [revisions, setRevisions] = useState<any[]>([]),
     [source, setSource] = useState<any>(null),
     [drawerTab, setDrawerTab] = useState("content"),
     [importing, setImporting] = useState(false),
     [query, setQuery] = useState(""),
+    [recallMode, setRecallMode] = useState("fast"),
     [recall, setRecall] = useState<any>(null),
     [families, setFamilies] = useState<any[]>([]),
     [graph, setGraph] = useState<any>(null),
@@ -155,35 +181,41 @@ function App() {
       policies: [],
       schedules: [],
       outbox: [],
+      cursors: {},
     }),
     [models, setModels] = useState<any>({}),
     [revisionText, setRevisionText] = useState(""),
     [mobile, setMobile] = useState(false),
     [notice, setNotice] = useState("");
-  const scopeQuery = { ...scope };
+  const busy = pending > 0;
+  // Typing settles before anything is read, and a list only ever shows the query it was read for.
+  const scope = useDebounced(scopeInput),
+    browseSearch = useDebounced(browseInput);
+  const listKey = JSON.stringify([scope, view, browseSearch]);
+  const items = page.key === listKey ? page.items : [];
+  const latestRecords = useLatest(),
+    latestFamilies = useLatest(),
+    latestRead = useLatest();
+  useEffect(() => saveScope(scope), [scope]);
   const run = useCallback(async (task: () => Promise<any>) => {
-    setBusy(true);
+    setPending((n) => n + 1);
     setError("");
     try {
       return await task();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!aborted(e)) setError(e instanceof Error ? e.message : String(e));
       return null;
     } finally {
-      setBusy(false);
+      setPending((n) => n - 1);
     }
   }, []);
   const loadOverview = useCallback(async () => {
-    const [o, j] = await Promise.all([
-      api.call("overview"),
-      api.call("list_jobs", { query: { limit: 30 } }),
-    ]);
-    setOverview(o);
-    setJobs(j.items);
+    setOverview(await api.call("overview"));
   }, []);
-  const [browseSearch, setBrowseSearch] = useState("");
   const loadRecords = useCallback(
     async (next?: string) => {
+      const key = JSON.stringify([scope, view, browseSearch]);
+      const signal = latestRecords();
       const filter =
         view === "knowledge"
           ? { kind: "knowledge" }
@@ -199,69 +231,98 @@ function App() {
           limit: 100,
           query: browseSearch,
         },
+        signal,
       });
-      const filtered = r.items;
-      setItems((previous) => (next ? [...previous, ...filtered] : filtered));
-      setCursor(r.cursor);
+      if (signal.aborted) return;
+      setPage((previous) =>
+        !next
+          ? { key, items: r.items, cursor: r.cursor }
+          : previous.key === key
+            ? { key, items: [...previous.items, ...r.items], cursor: r.cursor }
+            : previous,
+      );
     },
-    [scope, view, browseSearch],
+    [scope, view, browseSearch, latestRecords],
   );
-  const loadContact = useCallback(async () => {
+  const loadContact = useCallback(async (table?: string, cursor?: string) => {
+    const tables = table ? [table] : ["policies", "schedules", "outbox"];
     const rows = await Promise.all(
-      ["policies", "schedules", "outbox"].map((table) =>
-        api.call("list_contact", { path: { table } }),
+      tables.map((t) =>
+        api.call("list_contact", {
+          path: { table: t },
+          query: { limit: 50, ...(cursor ? { cursor } : {}) },
+        }),
       ),
     );
-    setContact({
-      policies: rows[0].items,
-      schedules: rows[1].items,
-      outbox: rows[2].items,
+    setContact((previous: any) => {
+      const next = { ...previous, cursors: { ...previous.cursors } };
+      tables.forEach((t, i) => {
+        next[t] = cursor ? [...previous[t], ...rows[i].items] : rows[i].items;
+        next.cursors[t] = rows[i].cursor;
+      });
+      return next;
     });
   }, []);
   const loadFamilies = useCallback(async () => {
+    const signal = latestFamilies();
     const [f, g] = await Promise.all([
-      api.call("list_families", { query: scope }),
+      api.call("list_families", { query: scope, signal }),
       api.call("read_graph", {
         query: {
           ...scope,
           ...(family ? { family_id: family } : {}),
           limit: 150,
         },
+        signal,
       }),
     ]);
+    if (signal.aborted) return;
     setFamilies(f.items);
     setGraph(g);
-  }, [scope, family]);
-  const refresh = useCallback(async () => {
-    await loadOverview();
-    if (
-      ["memories", "timeline", "knowledge", "diary", "conflicts"].includes(view)
-    )
-      await loadRecords();
+  }, [scope, family, latestFamilies]);
+  const loadView = useCallback(async () => {
+    if (recordViews.includes(view)) await loadRecords();
     if (view === "families") await loadFamilies();
     if (view === "contact") await loadContact();
     if (view === "settings")
       setModels(await api.call("read_settings", { path: { key: "models" } }));
-  }, [view, loadOverview, loadRecords, loadFamilies, loadContact]);
+  }, [view, loadRecords, loadFamilies, loadContact]);
+  const refresh = useCallback(
+    () => Promise.all([loadOverview(), loadView()]),
+    [loadOverview, loadView],
+  );
   const connect = () =>
     run(async () => {
       setToken(token);
       await api.call("health");
       setConnected(true);
     });
+  const loadScopes = () => {
+    if (scopes === null)
+      void run(async () => setScopes((await api.call("list_scopes")).items));
+  };
   useEffect(() => {
     if (initialToken) void connect();
   }, []);
   useEffect(() => {
-    if (connected) void run(refresh);
-  }, [connected, refresh, run]);
+    if (connected) void run(loadView);
+  }, [connected, loadView, run]);
+  // The overview counts the whole store: read it on connect, then once a minute while the page
+  // is in view, and again when it comes back into view.
   useEffect(() => {
     if (!connected) return;
-    const timer = setInterval(() => {
-      void loadOverview().catch(() => {});
-    }, 10000);
-    return () => clearInterval(timer);
-  }, [connected, loadOverview]);
+    void run(loadOverview);
+    const tick = () => {
+      if (document.visibilityState === "visible")
+        void loadOverview().catch(() => {});
+    };
+    const timer = setInterval(tick, 60000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [connected, loadOverview, run]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -286,23 +347,35 @@ function App() {
     document.addEventListener("keydown", key);
     return () => document.removeEventListener("keydown", key);
   }, []);
+  // Opening a record reads it and its history, and writes nothing.
   const read = useCallback(
     (id: string) => {
       void run(async () => {
-        const r = await api.call("read_memory", { path: { record_id: id } });
+        const signal = latestRead();
+        const [r, h] = await Promise.all([
+          api.call("read_memory", { path: { record_id: id }, signal }),
+          api.call("read_revisions", { path: { record_id: id }, signal }),
+        ]);
+        if (signal.aborted) return;
         setSelected(r);
-        setRevisionText(r.content);
+        setRevisionText(r.content ?? "");
         setDrawerTab("content");
         setSource(null);
-        const h = await api.call("read_revisions", { path: { record_id: id } });
         setRevisions(h.items);
-        await api.call("record_feedback", {
-          body: { record_id: id, type: "read", session: "console" },
-        });
       });
     },
-    [run],
+    [run, latestRead],
   );
+  // A continued page belongs to the revision already shown, or it is not joined to it.
+  const readOn = (record: RecordItem, piece: any) => {
+    if (piece.revision !== record.revision)
+      throw new Error("记忆已更新，请重新打开这条记录。");
+    return {
+      ...record,
+      ...piece,
+      content: (record.content ?? "") + piece.content,
+    };
+  };
   const revise = (action: string, extra: any = {}) =>
     run(async () => {
       if (!selected) return;
@@ -333,15 +406,11 @@ function App() {
     });
   const download = async (sid: string) => {
     const r = await api.call("read_source", { path: { source_id: sid } });
-    const bytes = await api.call("read_attachment", {
-      path: { source_id: sid },
-    });
-    const url = URL.createObjectURL(new Blob([bytes], { type: r.media_type }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = r.title || "attachment";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    await save(
+      await api.response("read_attachment", { path: { source_id: sid } }),
+      r.title || "attachment",
+      r.media_type,
+    );
   };
   if (!connected)
     return (
@@ -381,7 +450,10 @@ function App() {
               {error}
             </p>
           )}
-          <small>也可运行 eventmem console 自动连接。</small>
+          <small>
+            控制台连接正在运行的记忆服务，不另起服务；凭据在该服务记忆库目录的
+            local-token 文件中。
+          </small>
         </div>
       </main>
     );
@@ -415,8 +487,10 @@ function App() {
             >
               <Icon size={18} />
               {label}
-              {key === "conflicts" && overview.jobs?.failed > 0 && (
-                <span className="nav-count">{overview.jobs.failed}</span>
+              {key === "overview" && overview.jobs?.failed > 0 && (
+                <span className="nav-count" title="失败的后台任务">
+                  {overview.jobs.failed}
+                </span>
               )}
             </button>
           ))}
@@ -488,14 +562,30 @@ function App() {
                   {["项目", "角色", "知识库", "领域"][i]}
                   <input
                     aria-label={["项目", "角色", "知识库", "领域"][i]}
-                    value={scope[key]}
+                    value={scopeInput[key]}
                     onChange={(e) =>
-                      setScope({ ...scope, [key]: e.target.value })
+                      setScopeInput({ ...scopeInput, [key]: e.target.value })
                     }
                   />
                 </label>
               ),
             )}
+            <label>
+              已有范围
+              <select
+                aria-label="已有范围"
+                value=""
+                onFocus={loadScopes}
+                onChange={(e) => e.target.value && setScopeInput(JSON.parse(e.target.value))}
+              >
+                <option value="">选择…</option>
+                {(scopes ?? []).map((s) => (
+                  <option key={JSON.stringify(s)} value={JSON.stringify(s)}>
+                    {s.project} / {s.persona} / {s.collection} / {s.world}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
           {error && (
             <div className="error banner" role="alert">
@@ -642,16 +732,10 @@ function App() {
                     <RefreshCw size={14} /> 整理当前范围
                   </button>
                 </div>
-                <JobList
-                  jobs={jobs}
-                  onAction={(id, action) =>
-                    void run(async () => {
-                      await api.call("control_job", {
-                        path: { job_id: id, action },
-                      });
-                      await loadOverview();
-                    })
-                  }
+                <JobPanel
+                  counts={overview.jobs ?? noCounts}
+                  run={run}
+                  onChanged={loadOverview}
                 />
               </section>
               <div className="foot-metrics">
@@ -673,8 +757,8 @@ function App() {
                 搜索当前范围
                 <input
                   type="search"
-                  value={browseSearch}
-                  onChange={(e) => setBrowseSearch(e.target.value)}
+                  value={browseInput}
+                  onChange={(e) => setBrowseInput(e.target.value)}
                   placeholder="标题、内容或标识符"
                 />
               </label>
@@ -713,11 +797,15 @@ function App() {
                   <span className="label-muted">{items.length} 条已加载</span>
                 )}
               </div>
-              <VirtualRecords items={items} onRead={read} />
-              {cursor && (
+              <VirtualRecords
+                items={items}
+                loading={page.key !== listKey}
+                onRead={read}
+              />
+              {page.key === listKey && page.cursor && (
                 <button
                   className="load-more"
-                  onClick={() => void run(() => loadRecords(cursor))}
+                  onClick={() => void run(() => loadRecords(page.cursor!))}
                 >
                   加载更多
                 </button>
@@ -746,7 +834,12 @@ function App() {
                   运行增量整理
                 </button>
               </div>
-              <EventGraphPanel data={graph} scope={scope} onSource={read} />
+              <EventGraphPanel
+                data={graph}
+                scope={scope}
+                family={family}
+                onSource={read}
+              />
               <FamilyEditor
                 families={families}
                 scope={scope}
@@ -812,7 +905,7 @@ function App() {
                           query,
                           scope,
                           scenario: data.get("scenario") as any,
-                          mode: data.get("mode") as any,
+                          mode: recallMode as any,
                           budget: Number(data.get("budget")),
                           history: data.get("history") === "on",
                           explain: true,
@@ -853,7 +946,11 @@ function App() {
                   </label>
                   <label>
                     路径
-                    <select name="mode">
+                    <select
+                      name="mode"
+                      value={recallMode}
+                      onChange={(e) => setRecallMode(e.target.value)}
+                    >
                       <option value="fast">快速</option>
                       <option value="deep">深度</option>
                     </select>
@@ -881,15 +978,22 @@ function App() {
                     <input name="known_at" placeholder="ISO 8601，可选" />
                   </label>
                 </div>
+                {recallMode === "deep" && (
+                  <p className="form-help">
+                    深度路径会调用已配置的检索与重排模型，按模型计费。
+                  </p>
+                )}
               </form>
               {recall && (
                 <>
                   <div className="recall-stats">
-                    <span>{recall.items.length} 条记录</span>
+                    <span>{recall.items?.length ?? 0} 条记录</span>
                     <span>
-                      {recall.tokens} / {recall.budget} token
+                      {recall.tokens} / {recall.budget ?? "—"} token
                     </span>
-                    <span>{recall.latency_ms.toFixed(1)} ms</span>
+                    {typeof recall.latency_ms === "number" && (
+                      <span>{recall.latency_ms.toFixed(1)} ms</span>
+                    )}
                     <span>索引版本 {recall.generation}</span>
                   </div>
                   <pre className="context-output">
@@ -900,7 +1004,7 @@ function App() {
                     <Trace title="过滤理由" data={recall.trace?.filtered} />
                     <Trace title="融合排序" data={recall.trace?.ranked} />
                   </div>
-                  {recall.items.map((r: any) => (
+                  {(recall.items ?? []).map((r: any) => (
                     <button
                       className="result-link"
                       key={r.id}
@@ -908,7 +1012,7 @@ function App() {
                     >
                       <FileText size={15} />
                       {r.title || r.id}
-                      <Badge value={r.status} />
+                      {r.status && <Badge value={r.status} />}
                       <ArrowUpRight size={14} />
                     </button>
                   ))}
@@ -920,7 +1024,10 @@ function App() {
             <ContactView
               data={contact}
               scope={scope}
-              onRefresh={() => run(loadContact)}
+              onRefresh={() => run(() => loadContact())}
+              onMore={(table: string) =>
+                run(() => loadContact(table, contact.cursors[table]))
+              }
               run={run}
               notice={setNotice}
             />
@@ -956,17 +1063,22 @@ function App() {
       {importing && (
         <ImportDialog
           scope={scope}
+          error={error}
           onClose={() => setImporting(false)}
-          onSubmit={async (data, file) => {
+          onSubmit={async (data, file, url) => {
             const result = await run(async () => {
-              if (file) await api.upload(file, data, file.name);
+              if (url)
+                await api.call("import_url", {
+                  body: { url, scope, title: data.title },
+                });
+              else if (file) await api.upload(file, data, file.name);
               else await api.call("receive_source", { body: data as any });
               await refresh();
               return true;
             });
             if (result) {
               setImporting(false);
-              setNotice("来源已可靠接收");
+              setNotice(url ? "网页已导入" : "来源已可靠接收");
             }
           }}
         />
@@ -991,11 +1103,11 @@ function App() {
               </button>
             </div>
             <div className="button-row">
-              <Badge value={selected.kind} />
-              <Badge value={selected.status} />
+              {selected.kind && <Badge value={selected.kind} />}
+              {selected.status && <Badge value={selected.status} />}
               <span className="label-muted">r{selected.revision}</span>
             </div>
-            <h2>{selected.title || kinds[selected.kind]}</h2>
+            <h2>{selected.title || kinds[selected.kind] || selected.id}</h2>
             <p className="record-id">{selected.id}</p>
             <div className="tabs">
               {[
@@ -1010,14 +1122,13 @@ function App() {
                   onClick={() => {
                     if (key !== "correct") { setDrawerTab(key); return; }
                     void run(async () => {
-                      let complete: RecordItem & { content: string } = {...selected, content:selected.content ?? ""};
+                      let complete: RecordItem = selected;
                       while (complete.cursor) {
                         const piece = await api.call("read_memory", {path:{record_id:complete.id},query:{offset:complete.cursor}});
-                        if (piece.revision !== selected.revision) throw new Error("记忆已更新，请重新打开后纠正。");
-                        complete = {...piece,content:complete.content + piece.content};
+                        complete = readOn(complete, piece);
                       }
                       setSelected(complete);
-                      setRevisionText(complete.content);
+                      setRevisionText(complete.content ?? "");
                       setDrawerTab("correct");
                     });
                   }}
@@ -1031,31 +1142,34 @@ function App() {
                 <div className="prose">{selected.content}</div>
                 <dl className="detail-meta">
                   <dt>领域</dt>
-                  <dd>{selected.scope.world}</dd>
+                  <dd>{selected.scope?.world ?? "—"}</dd>
                   <dt>确认程度</dt>
                   <dd>{selected.confirmation}</dd>
                   <dt>生成内容</dt>
                   <dd>{selected.generated ? "是" : "否"}</dd>
                   <dt>独立来源</dt>
                   <dd>
-                    {selected.independent_sources ?? selected.source_ids.length}
+                    {selected.independent_sources ??
+                      selected.source_ids?.length ??
+                      0}
                   </dd>
                   <dt>位置</dt>
-                  <dd>{JSON.stringify(selected.locator)}</dd>
+                  <dd>{JSON.stringify(selected.locator ?? null)}</dd>
                 </dl>
                 {selected.cursor && (
                   <button
                     className="subtle"
                     onClick={() =>
                       void run(async () => {
+                        const shown = selected;
                         const more = await api.call("read_memory", {
-                          path: { record_id: selected.id },
-                          query: { offset: selected.cursor },
+                          path: { record_id: shown.id },
+                          query: { offset: shown.cursor },
                         });
-                        setSelected({
-                          ...more,
-                          content: selected.content + more.content,
-                        });
+                        const joined = readOn(shown, more);
+                        setSelected((current) =>
+                          current === shown ? joined : current,
+                        );
                       })
                     }
                   >
@@ -1098,7 +1212,7 @@ function App() {
             )}
             {drawerTab === "sources" && (
               <>
-                {selected.source_ids.map((sid) => (
+                {(selected.source_ids ?? []).map((sid) => (
                   <div key={sid} className="source-row">
                     <button
                       onClick={() =>
@@ -1204,9 +1318,11 @@ function Logo() {
 }
 function VirtualRecords({
   items,
+  loading,
   onRead,
 }: {
   items: RecordItem[];
+  loading: boolean;
   onRead: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -1217,7 +1333,9 @@ function VirtualRecords({
     overscan: 6,
   });
   if (!items.length)
-    return (
+    return loading ? (
+      <Empty title="正在读取" detail="读取当前范围与筛选条件下的记录。" />
+    ) : (
       <Empty
         title="当前范围还没有记录"
         detail="添加来源，或切换项目、角色和知识库。"
@@ -1262,59 +1380,112 @@ function VirtualRecords({
     </div>
   );
 }
-function JobList({
-  jobs,
-  onAction,
+const jobStates = ["failed", "waiting_config", "retry", "running", "pending", "complete", "canceled"];
+const noCounts: Record<string, number> = {};
+function JobPanel({
+  counts,
+  run,
+  onChanged,
 }: {
-  jobs: any[];
-  onAction: (id: string, action: string) => void;
+  counts: Record<string, number>;
+  run: (task: () => Promise<any>) => Promise<any>;
+  onChanged: () => Promise<void>;
 }) {
-  if (!jobs.length)
-    return (
-      <Empty
-        title="处理队列为空"
-        detail="新的解析、抽取与整理任务会显示在这里。"
-      />
-    );
+  const [chosen, setChosen] = useState(""),
+    [list, setList] = useState<{ state: string; items: any[]; cursor: string | null }>({
+      state: "",
+      items: [],
+      cursor: null,
+    });
+  // Job ids are hashes, so one unfiltered page is an arbitrary handful: read by state instead,
+  // starting from the first state that needs attention.
+  const state = chosen || jobStates.find((s) => counts[s] > 0) || "failed";
+  const latest = useLatest();
+  const load = useCallback(
+    async (cursor?: string) => {
+      const signal = latest();
+      const r = await api.call("list_jobs", {
+        query: { state, limit: 20, ...(cursor ? { cursor } : {}) },
+        signal,
+      });
+      if (signal.aborted) return;
+      setList((previous) => ({
+        state,
+        items: cursor && previous.state === state ? [...previous.items, ...r.items] : r.items,
+        cursor: r.cursor,
+      }));
+    },
+    [state, latest],
+  );
+  useEffect(() => {
+    void run(() => load());
+  }, [load, counts, run]);
+  const act = (id: string, action: string) =>
+    void run(async () => {
+      await api.call("control_job", { path: { job_id: id, action } });
+      await onChanged();
+    });
+  const jobs = list.state === state ? list.items : [];
   return (
-    <div className="job-list">
-      <div className="job-head">
-        <span>任务</span>
-        <span>状态</span>
-        <span>尝试次数</span>
-        <span>操作</span>
+    <>
+      <div className="button-row" role="tablist" aria-label="任务状态">
+        {jobStates.map((s) => (
+          <button
+            key={s}
+            role="tab"
+            aria-selected={s === state}
+            className={s === state ? "subtle selected" : "subtle"}
+            onClick={() => setChosen(s)}
+          >
+            {statuses[s] ?? s} {counts[s] ?? 0}
+          </button>
+        ))}
       </div>
-      {jobs.slice(0, 8).map((j) => (
-        <div className="job-row" key={j.id}>
-          <div>
-            <strong>{j.kind}</strong>
-            <small>{j.error || j.id.slice(0, 26)}</small>
+      {!jobs.length ? (
+        <Empty
+          title="处理队列为空"
+          detail="新的解析、抽取与整理任务会显示在这里。"
+        />
+      ) : (
+        <div className="job-list">
+          <div className="job-head">
+            <span>任务</span>
+            <span>状态</span>
+            <span>尝试次数</span>
+            <span>操作</span>
           </div>
-          <Badge value={j.state} />
-          <span>
-            {j.attempts} / {j.max_attempts}
-          </span>
-          <div>
-            {["failed", "waiting_config", "retry"].includes(j.state) && (
-              <button
-                className="text-button"
-                onClick={() => onAction(j.id, "retry")}
-              >
-                重试
-              </button>
-            )}
-            {["pending", "running"].includes(j.state) && (
-              <button
-                className="text-button"
-                onClick={() => onAction(j.id, "cancel")}
-              >
-                取消
-              </button>
-            )}
-          </div>
+          {jobs.map((j) => (
+            <div className="job-row" key={j.id}>
+              <div>
+                <strong>{j.kind}</strong>
+                <small>{j.error || j.id.slice(0, 26)}</small>
+              </div>
+              <Badge value={j.state} />
+              <span>
+                {j.attempts} / {j.max_attempts}
+              </span>
+              <div>
+                {["failed", "waiting_config", "retry"].includes(j.state) && (
+                  <button className="text-button" onClick={() => act(j.id, "retry")}>
+                    重试
+                  </button>
+                )}
+                {["pending", "running"].includes(j.state) && (
+                  <button className="text-button" onClick={() => act(j.id, "cancel")}>
+                    取消
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
         </div>
-      ))}
-    </div>
+      )}
+      {list.state === state && list.cursor && (
+        <button className="load-more" onClick={() => void run(() => load(list.cursor!))}>
+          加载更多
+        </button>
+      )}
+    </>
   );
 }
 function Trace({ title, data }: { title: string; data: any }) {
@@ -1327,12 +1498,14 @@ function Trace({ title, data }: { title: string; data: any }) {
 }
 function ImportDialog({
   scope,
+  error,
   onClose,
   onSubmit,
 }: {
   scope: Scope;
+  error: string;
   onClose: () => void;
-  onSubmit: (data: any, file: File | null) => Promise<void>;
+  onSubmit: (data: any, file: File | null, url?: string) => Promise<void>;
 }) {
   const [file, setFile] = useState<File | null>(null),
     [sending, setSending] = useState(false),
@@ -1361,14 +1534,11 @@ function ImportDialog({
             const f = new FormData(e.currentTarget);
             try {
               if (webUrl) {
-                await api.call("import_url", {
-                  body: {
-                    url: webUrl,
-                    scope,
-                    title: String(f.get("title") || ""),
-                  },
-                });
-                onClose();
+                await onSubmit(
+                  { title: String(f.get("title") || "") },
+                  null,
+                  webUrl,
+                );
                 return;
               }
               await onSubmit(
@@ -1446,6 +1616,11 @@ function ImportDialog({
             项目 {scope.project} · 角色 {scope.persona}
             。未配置所需模型时，保留来源并显示待配置状态。
           </p>
+          {error && (
+            <p role="alert" className="error">
+              {error}
+            </p>
+          )}
           <div className="modal-actions">
             <button type="button" className="subtle" onClick={onClose}>
               取消
@@ -1459,8 +1634,45 @@ function ImportDialog({
     </div>
   );
 }
-function ContactView({ data, scope, onRefresh, run, notice }: any) {
-  const [editing, setEditing] = useState(false);
+const newPolicy: Record<string, any> = {
+  enabled: false,
+  channel: null,
+  timezone: "Asia/Singapore",
+  quiet_start: 22,
+  quiet_end: 8,
+  max_per_day: 3,
+  min_interval_minutes: 60,
+  triggers: ["reminder", "commitment"],
+  allowed_kinds: ["reminder", "commitment"],
+  require_confirmation: true,
+  idempotent_channel: false,
+  greeting_text: "想聊聊今天的近况吗？",
+};
+function policyForm(f: FormData): Record<string, any> {
+  return {
+    enabled: f.get("enabled") === "on",
+    channel: String(f.get("channel") || "") || null,
+    timezone: String(f.get("timezone")),
+    quiet_start: Number(f.get("start")),
+    quiet_end: Number(f.get("end")),
+    max_per_day: Number(f.get("max")),
+    min_interval_minutes: Number(f.get("interval")),
+    triggers: f.getAll("triggers"),
+    allowed_kinds: f.getAll("allowed_kinds"),
+    require_confirmation: f.get("confirm") === "on",
+    idempotent_channel: f.get("idempotent") === "on",
+    greeting_text: String(f.get("greeting_text") || "") || newPolicy.greeting_text,
+  };
+}
+const sameScope = (a: any, b: any) => JSON.stringify(a) === JSON.stringify(b);
+function ContactView({ data, scope, onRefresh, onMore, run, notice }: any) {
+  // The policy being edited: its id, "" for a new one, null while the form is closed.
+  const [editing, setEditing] = useState<string | null>(null);
+  const stored = data.policies.find((p: any) => p.id === editing)?.data;
+  const start: Record<string, any> = { ...newPolicy, ...(stored ?? {}) };
+  const reminderPolicy =
+    data.policies.find((p: any) => sameScope(p.data.scope, scope))?.id ??
+    "default";
   return (
     <>
       <section className="panel">
@@ -1469,7 +1681,12 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
             <h2>联系策略</h2>
             <p>每个角色独立设置渠道、安静时段和发送确认。</p>
           </div>
-          <button className="subtle" onClick={() => setEditing(!editing)}>
+          <button
+            className="subtle"
+            onClick={() =>
+              setEditing(editing === null ? (data.policies[0]?.id ?? "") : null)
+            }
+          >
             <Settings2 size={15} />
             配置策略
           </button>
@@ -1497,37 +1714,76 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
             detail="提醒保留为待发建议。配置渠道与策略后，才会发送。"
           />
         )}
-        {editing && (
+        {editing !== null && (
           <form
+            key={editing}
             className="settings-form"
             onSubmit={(e) => {
               e.preventDefault();
               const f = new FormData(e.currentTarget);
+              const values = policyForm(f);
+              const id = editing || String(f.get("id"));
+              // Saving replaces the whole row, so what is sent is the row as the service holds it
+              // now with only the fields changed here laid over it; its scope stays its own.
+              const changed = Object.keys(values).filter(
+                (k) => JSON.stringify(values[k]) !== JSON.stringify(start[k]),
+              );
               void run(async () => {
+                const current = (
+                  await api.call("list_contact", {
+                    path: { table: "policies" },
+                    query: { limit: 200 },
+                  })
+                ).items.find((p: any) => p.id === id)?.data;
                 await api.call("configure_contact", {
-                  body: {
-                    id: String(f.get("id")),
-                    scope,
-                    enabled: f.get("enabled") === "on",
-                    channel: String(f.get("channel") || "") || null,
-                    timezone: String(f.get("timezone")),
-                    quiet_start: Number(f.get("start")),
-                    quiet_end: Number(f.get("end")),
-                    max_per_day: Number(f.get("max")),
-                    min_interval_minutes: Number(f.get("interval")),
-                    triggers: f.getAll("triggers") as any,
-                    allowed_kinds: f.getAll("allowed_kinds") as any,
-                    require_confirmation: f.get("confirm") === "on",
-                    idempotent_channel: f.get("idempotent") === "on",
-                    greeting_text:String(f.get("greeting_text")||"想聊聊今天的近况吗？"),
-                  },
+                  body: current
+                    ? {
+                        ...current,
+                        ...Object.fromEntries(changed.map((k) => [k, values[k]])),
+                        id,
+                      }
+                    : { ...values, id, scope },
                 });
                 await onRefresh();
-                setEditing(false);
+                setEditing(null);
+                notice("联系策略已保存");
               });
             }}
           >
-            <label>自主问候内容<input name="greeting_text" defaultValue="想聊聊今天的近况吗？" maxLength={2000}/></label>
+            <label>
+              编辑策略
+              <select value={editing} onChange={(e) => setEditing(e.target.value)}>
+                {data.policies.map((p: any) => (
+                  <option key={p.id} value={p.id}>
+                    {p.id}
+                  </option>
+                ))}
+                <option value="">新建策略</option>
+              </select>
+            </label>
+            {editing === "" && (
+              <label>
+                策略名称
+                <input
+                  name="id"
+                  defaultValue={data.policies.length ? "" : "default"}
+                  required
+                />
+              </label>
+            )}
+            <p className="form-help">
+              范围 {(stored?.scope ?? scope).project} /{" "}
+              {(stored?.scope ?? scope).persona}
+              {stored ? "（保持该策略自己的范围）" : "（取当前范围）"}
+            </p>
+            <label>
+              自主问候内容
+              <input
+                name="greeting_text"
+                defaultValue={start.greeting_text}
+                maxLength={2000}
+              />
+            </label>
             <fieldset>
               <legend>触发条件</legend>
               <div className="button-row">
@@ -1543,7 +1799,7 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
                       name="triggers"
                       type="checkbox"
                       value={k}
-                      defaultChecked={["reminder", "commitment"].includes(k)}
+                      defaultChecked={start.triggers.includes(k)}
                     />
                     {String(v)}
                   </label>
@@ -1559,7 +1815,7 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
                       name="allowed_kinds"
                       type="checkbox"
                       value={k}
-                      defaultChecked={["reminder", "commitment"].includes(k)}
+                      defaultChecked={start.allowed_kinds.includes(k)}
                     />
                     {String(v)}
                   </label>
@@ -1568,31 +1824,33 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
             </fieldset>
             <label>
               最短间隔（分钟）
-              <input name="interval" type="number" min="0" defaultValue="60" />
+              <input
+                name="interval"
+                type="number"
+                min="0"
+                defaultValue={start.min_interval_minutes}
+              />
             </label>
             <div className="form-grid">
-              <label>
-                策略名称
-                <input name="id" defaultValue="default" required />
-              </label>
               <label>
                 回调地址
                 <input
                   name="channel"
                   type="url"
+                  defaultValue={start.channel ?? ""}
                   placeholder="https://your-host/callback"
                 />
               </label>
               <label>
                 时区
-                <input name="timezone" defaultValue="Asia/Singapore" required />
+                <input name="timezone" defaultValue={start.timezone} required />
               </label>
               <label>
                 每日上限
                 <input
                   name="max"
                   type="number"
-                  defaultValue="3"
+                  defaultValue={start.max_per_day}
                   min="0"
                   max="100"
                 />
@@ -1602,7 +1860,7 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
                 <input
                   name="start"
                   type="number"
-                  defaultValue="22"
+                  defaultValue={start.quiet_start}
                   min="0"
                   max="23"
                 />
@@ -1612,22 +1870,30 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
                 <input
                   name="end"
                   type="number"
-                  defaultValue="8"
+                  defaultValue={start.quiet_end}
                   min="0"
                   max="23"
                 />
               </label>
             </div>
             <label className="checkbox">
-              <input type="checkbox" name="enabled" />
+              <input type="checkbox" name="enabled" defaultChecked={start.enabled} />
               启用发送
             </label>
             <label className="checkbox">
-              <input type="checkbox" name="confirm" defaultChecked />
+              <input
+                type="checkbox"
+                name="confirm"
+                defaultChecked={start.require_confirmation}
+              />
               发送前逐次确认
             </label>
             <label className="checkbox">
-              <input type="checkbox" name="idempotent" />
+              <input
+                type="checkbox"
+                name="idempotent"
+                defaultChecked={start.idempotent_channel}
+              />
               回调支持 delivery id 去重
             </label>
             <button className="primary">保存策略</button>
@@ -1682,7 +1948,7 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
           </label>
           <label>
             策略
-            <input name="policy" defaultValue="default" />
+            <input name="policy" key={reminderPolicy} defaultValue={reminderPolicy} />
           </label>
           <label>
             重复
@@ -1746,6 +2012,11 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
             </div>
           </div>
         ))}
+        {data.cursors?.schedules && (
+          <button className="load-more" onClick={() => void onMore("schedules")}>
+            加载更多
+          </button>
+        )}
       </section>
       <section className="panel">
         <div className="panel-title">
@@ -1767,6 +2038,11 @@ function ContactView({ data, scope, onRefresh, run, notice }: any) {
             title="没有待发内容"
             detail="到期提醒与主动联系建议会显示在这里。"
           />
+        )}
+        {data.cursors?.outbox && (
+          <button className="load-more" onClick={() => void onMore("outbox")}>
+            加载更多
+          </button>
         )}
       </section>
     </>
@@ -1817,19 +2093,39 @@ function SettingsView({ models, setModels, run, notice, scope }: any) {
             onSubmit={(e) => {
               e.preventDefault();
               const f = new FormData(e.currentTarget),
-                config: any = {
-                  ...current,
+                vector = ["embedding", "visual_embedding"].includes(role);
+              const edited: Record<string, any> = {
                   protocol: String(f.get("protocol")),
                   endpoint: String(f.get("endpoint")),
                   model: String(f.get("model")),
                   api_key_env: String(f.get("env") || "") || null,
                   timeout_seconds: Number(f.get("timeout")),
+                  ...(vector ? { dimensions: Number(f.get("dimensions")) } : {}),
+                },
+                shown: Record<string, any> = {
+                  protocol: current.protocol ?? "openai",
+                  endpoint: current.endpoint ?? "",
+                  model: current.model ?? "",
+                  api_key_env: current.api_key_env ?? null,
+                  timeout_seconds: current.timeout_seconds ?? 60,
+                  ...(vector ? { dimensions: current.dimensions ?? 1024 } : {}),
                 };
-              if (f.get("dimensions"))
-                config.dimensions = Number(f.get("dimensions"));
+              const changed = Object.fromEntries(
+                Object.keys(edited)
+                  .filter((k) => JSON.stringify(edited[k]) !== JSON.stringify(shown[k]))
+                  .map((k) => [k, edited[k]]),
+              );
               void run(async () => {
+                // Saving replaces every role at once: start from the roles as the service holds
+                // them now and change only what was edited here in this one.
+                const fresh = await api.call("read_settings", {
+                  path: { key: "models" },
+                });
                 const updated = await api.call("configure_models", {
-                  body: { ...models, [role]: config },
+                  body: {
+                    ...fresh,
+                    [role]: fresh[role] ? { ...fresh[role], ...changed } : edited,
+                  },
                 });
                 setModels(updated);
                 notice("模型配置已保存，等待配置的任务可继续处理");

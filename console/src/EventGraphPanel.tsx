@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useState} from "react";
+import {useCallback, useEffect, useRef, useState} from "react";
 import {api, type Scope} from "./api";
 import {Graph} from "./Graph";
 
@@ -7,28 +7,40 @@ const shares: Record<string,string> = {unshared:"未分享", partial:"部分分�
 const relations: Record<string,string> = {participates:"参与",part_of:"属于",continues:"延续",responds_to:"回应",produces:"产生",delivers:"交付",shares:"分享",corrects:"更正",resolves:"解决",supports:"支持",refutes:"反驳",causes:"因果",association:"联想",follows:"先后",about:"关于",related:"关联"};
 const bases: Record<string,string> = {observed:"工具观察", explicit:"用户陈述", documented:"资料记载", inferred:"待核验解读", internal_thought:"Kin 的联想"};
 
-export function EventGraphPanel({data, scope, onSource}: {data:any; scope:Scope; onSource:(id:string)=>void}) {
+export function EventGraphPanel({data, scope, family, onSource}: {data:any; scope:Scope; family:string; onSource:(id:string)=>void}) {
   const [view,setView]=useState(data), [selected,setSelected]=useState<any>(null);
   const [query,setQuery]=useState(""), [layer,setLayer]=useState(""), [kind,setKind]=useState("");
   const [since,setSince]=useState(""), [until,setUntil]=useState(""), [focus,setFocus]=useState<string|undefined>();
   const [revisionAction,setRevisionAction]=useState("correct"),[reason,setReason]=useState(""),[evidence,setEvidence]=useState(""),[correction,setCorrection]=useState(""),[target,setTarget]=useState(""),[previousCommand,setPreviousCommand]=useState("");
   const [error,setError]=useState(""), [busy,setBusy]=useState(false);
+  // Only the newest search and the newest pick may land; an older answer arriving late is dropped.
+  const loads=useRef(0), picks=useRef(0), shown=useRef(view);
+  shown.current=view;
   useEffect(()=>{setView(data);setSelected(null);setFocus(undefined);},[data]);
   const load=useCallback(async (extra:Record<string,any>={}, append=false)=>{
+    const ticket=++loads.current;
     setBusy(true);setError("");
     try {
-      const next=await api.call("read_graph",{query:{...scope,query,...(layer?{layer}:{}),...(kind?{kind}:{}),
+      const next=await api.call("read_graph",{query:{...scope,...(family?{family_id:family}:{}),query,...(layer?{layer}:{}),...(kind?{kind}:{}),
         ...(since?{since:new Date(since).toISOString()}:{}),...(until?{until:new Date(until).toISOString()}:{}),limit:150,...extra}});
-      setView((previous:any)=>append ? {...next,nodes:[...new Map([...previous.nodes,...next.nodes].map((n:any)=>[n.id,n])).values()].slice(-300),
-        edges:[...new Map([...previous.edges,...next.edges].map((n:any)=>[n.id,n])).values()]} : next);
-    } catch(e) {setError(String(e));} finally {setBusy(false);}
-  },[scope,query,layer,kind,since,until]);
+      if(ticket!==loads.current)return;
+      setView((previous:any)=>{
+        if(!append||!previous)return next;
+        const nodes=[...new Map([...previous.nodes,...next.nodes].map((n:any)=>[n.id,n])).values()].slice(-300);
+        const kept=new Set(nodes.map((n:any)=>n.id));
+        const edges=[...new Map([...previous.edges,...next.edges].map((e:any)=>[e.id,e])).values()].filter((e:any)=>kept.has(e.subject)&&kept.has(e.object));
+        return {...next,nodes,edges};
+      });
+    } catch(e) {if(ticket===loads.current)setError(String(e));} finally {if(ticket===loads.current)setBusy(false);}
+  },[scope,family,query,layer,kind,since,until]);
   const choose=useCallback(async (id:string)=>{
-    const local=[...(view?.nodes??[]),...(view?.edges??[])].find(n=>n.id===id);
+    const ticket=++picks.current;
+    const local=[...(shown.current?.nodes??[]),...(shown.current?.edges??[])].find((n:any)=>n.id===id);
     setSelected(local??{id}); setError("");
-    try {setSelected(await api.call("read_graph_object",{path:{identifier:id},query:scope}));}
-    catch {if(id.startsWith("mem_"))onSource(id);else setError("这条关系的详细资料暂时无法读取。");}
-  },[scope,view,onSource]);
+    try {const found=await api.call("read_graph_object",{path:{identifier:id},query:scope});if(ticket===picks.current)setSelected(found);}
+    catch {if(ticket!==picks.current)return;if(id.startsWith("mem_"))onSource(id);else setError("这条关系的详细资料暂时无法读取。");}
+  },[scope,onSource]);
+  const pick=useCallback((id:string)=>void choose(id),[choose]);
   const coverage=(entry:any)=>entry?.share_coverage;
   const revise=async()=>{
     setBusy(true);setError("");
@@ -57,7 +69,7 @@ export function EventGraphPanel({data, scope, onSource}: {data:any; scope:Scope;
     </form>
     <p className="graph-legend">● 事件　■ 实体　◆ 发现　<span>实线：有来源的关联</span>　<span>虚线：主观联想</span>　发送回执与已读分别记录。</p>
     {error&&<p role="alert">{error}</p>}
-    <Graph data={view} onSelect={id=>void choose(id)}/>
+    <Graph data={view} onSelect={pick}/>
     <div className="graph-reading">
       <section aria-label="事件时间线"><h3>经过与后续</h3>
         <ol className="graph-timeline">{[...(view?.nodes??[])].sort((a,b)=>(a.occurred_at??"").localeCompare(b.occurred_at??"")).map((n:any)=><li key={n.id}>
