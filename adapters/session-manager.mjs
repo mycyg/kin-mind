@@ -47,6 +47,10 @@ export class SessionManager {
     this.limits={...MAINTENANCE_LIMITS,...limits};
     this.tail=Promise.resolve();this.closed=false;
     if(lease)this.acquireLease();
+    // A registry this process cannot open leaves the lease to the next one, not to its exit.
+    try{this.openRegistry({file,binding,config,now});}catch(error){this.close();throw error;}
+  }
+  openRegistry({file,binding,config,now}) {
     const loaded=loadState(file,{now,validate:value=>Boolean(value.binding?.threadId&&value.binding.nativeSessionId)&&Array.isArray(value.segments)});
     // The binding is a fencing token. A registry with no readable revision left cannot
     // be reopened at generation 1: an older fence, durable in a manifest, would pass it
@@ -60,7 +64,8 @@ export class SessionManager {
     if(!this.state.segments.length)this.state.segments.push({...this.state.binding,state:'active',activatedAt:null});
     // A crash cannot turn an uncertain create, compact or promotion into retry.
     for(const op of [this.state.candidate,...this.state.compactions])if(op&&['creating','injecting','committing','running'].includes(op.state))op.state='unconfirmed';
-    const legacyCandidateRetired=retireLegacyCandidate(this.state),retiredEvents=this.migrate(),drift=this.recordConfigDrift(config);
+    // A caller that configures nothing (the migration's one commit) leaves the drift record alone.
+    const legacyCandidateRetired=retireLegacyCandidate(this.state),retiredEvents=this.migrate(),drift=config===null?null:this.recordConfigDrift(config);
     this.prune();
     this.save('open',{...(legacyCandidateRetired?{candidateMigration:'legacy-profile-evidence-missing'}:{}),...(retiredEvents?{retiredLegacyEvents:retiredEvents}:{}),...(drift?{configDrift:drift}:{})});
   }
@@ -171,6 +176,39 @@ export class SessionManager {
       try{const receipt=await this.promote({previous,binding:this.fence(),candidate});if(!receipt?.verified||receipt.threadId!==this.state.binding.threadId)throw Error('Promotion recovery unverified');candidate.state='retired';candidate.promotion=receipt;this.state.sessionAdvice=null;this.settleRequests('complete',receipt);this.save('promotion-recovered');return {state:'complete',recovered:true,binding:this.fence()};}
       catch(error){candidate.error=error.name;this.save('promotion-recovery-waiting');return {state:'unconfirmed',reason:'promotion-recovery-pending'};}
     });
+  }
+  /** The one-time move into the Kin runtime home (SPEC-v2 §1, step 8). The thread it binds was
+   * built, given the checkpoint and verified before this is reached; this is the migration's
+   * single commit point. Before it the old thread is untouched and still usable. After it the
+   * generation only goes up and the old thread is never bound again. Asked again with the
+   * same id, it answers with what it already did. */
+  commitMigration({id,expected,native,codexHome,homeHash,checkpoint}) {
+    const done=this.state.migration;
+    if(done){
+      if(done.id!==id)throw Error('KIN_MIGRATION_ALREADY_COMMITTED');
+      if(done.binding.threadId!==native?.threadId)throw Error('KIN_MIGRATION_ID_CONFLICT');
+      return copy(done);
+    }
+    if(!id||!native?.threadId||!native.nativeSessionId||!codexHome||!homeHash||!checkpoint?.id)throw Error('KIN_MIGRATION_INCOMPLETE');
+    const fence=this.fence();
+    if(['conversationId','generation','threadId','nativeSessionId'].some(key=>fence[key]!==expected?.[key]))throw Error('KIN_MIGRATION_BINDING_CHANGED');
+    if(this.state.segments.some(s=>s.threadId===native.threadId))throw Error('KIN_MIGRATION_THREAD_REUSED');
+    const candidate=this.state.candidate;
+    if(['creating','injecting','committing','unconfirmed'].includes(candidate?.state))throw Error('KIN_MIGRATION_ROTATION_UNSETTLED');
+    if(candidate){
+      // A handover prepared for the old runtime goes with it; its record is kept.
+      if(!['retired','failed','stale'].includes(candidate.state))Object.assign(candidate,{state:'stale',staleReason:'kin-home-migration'});
+      this.state.retiredCandidates=[...(this.state.retiredCandidates??[]).filter(c=>c.id!==candidate.id),copy(candidate)];this.state.candidate=null;
+    }
+    const now=this.now(),next={conversationId:fence.conversationId,generation:fence.generation+1,threadId:native.threadId,nativeSessionId:native.nativeSessionId};
+    this.state.binding=next;Object.assign(this.state.segments.at(-1),{state:'retired',retiredAt:now});
+    this.state.segments.push({...next,state:'active',activatedAt:now,checkpointId:checkpoint.id,codexHome,homeHash,migrationId:id});
+    this.state.migration={id,state:'committed',previous:fence,binding:next,codexHome,homeHash,checkpointId:checkpoint.id,committedAt:now};
+    // The old window's judgment and pending restores stay with it. The checkpoint the new
+    // thread was given is the one the read tool now serves.
+    Object.assign(this.state,{sessionAdvice:null,restoreRequired:false,restorePending:false,restoreCheckpoint:copy(checkpoint),rollingCheckpoint:null,rollingCursor:null});
+    this.save('migration-committed',{id,generation:next.generation});
+    return copy(this.state.migration);
   }
   /** A judgment handed over by the appraisal that produced it, carried in the snapshot. */
   receive(record,runtime) {
@@ -452,4 +490,13 @@ export class SessionManager {
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('promotion-unconfirmed');return {state:'unconfirmed',binding:next};}
     });
   }
+}
+
+/** The migration's commit made from outside a running host. Whoever holds the registry lease
+ * is its only writer, so the host has been stopped first and this takes the lease for the one
+ * write. A live holder is refused, never waited out or broken. */
+export function commitRegistryMigration(file,request,{now=()=>Date.now()}={}) {
+  if(!fs.existsSync(file))throw Error('KIN_SESSION_REGISTRY_MISSING');
+  const manager=new SessionManager({file,binding:{},coordinator:{locked:fn=>fn()},config:null,now});
+  try{return manager.commitMigration(request);}finally{manager.close();}
 }

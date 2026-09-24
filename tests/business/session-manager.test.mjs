@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {SessionManager} from '../../adapters/session-manager.mjs';
+import {SessionManager,commitRegistryMigration} from '../../adapters/session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
-import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
+import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
 import {sha256} from '../../adapters/instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
@@ -480,3 +480,70 @@ test('the minute tick reads its judgment from the snapshot, builds fixed-budget 
  assert.equal(stored.assessments.at(-1).requestId,'appraisal:1');assert.equal(status.at(-1).status.state,'defer');
  assert.equal(calls.filter(c=>c.action==='read').length,0);
 });
+
+// SPEC-v2 §1, step 8: the migration's single commit, made while the host is stopped.
+function migrationRegistry(t,generation){
+ const f=fixture(t);f.manager.close();
+ const stored=JSON.parse(fs.readFileSync(f.options.file,'utf8'));
+ stored.binding.generation=generation;stored.segments.at(-1).generation=generation;
+ stored.sessionAdvice={action:'defer',generation};stored.rollingCheckpoint={id:'rolling'};stored.rollingCursor='cursor';
+ fs.writeFileSync(f.options.file,JSON.stringify(stored));
+ const expected={conversationId:'logical',generation,threadId:'old',nativeSessionId:'old'};
+ const checkpoint={id:'checkpoint:migration',payload:{kind:'internal-continuity-checkpoint'},items:[]};
+ const request={id:'kin-home:1',expected,native:{threadId:'kin-home-thread',nativeSessionId:'kin-home-thread'},codexHome:path.join(f.dir,'codex-home'),homeHash:'h'.repeat(64),checkpoint};
+ return {...f,expected,request,read:()=>JSON.parse(fs.readFileSync(f.options.file,'utf8'))};
+}
+test('the Kin home migration moves the binding one generation past the one the registry holds, once',t=>{
+ const f=migrationRegistry(t,4),before=fs.readFileSync(f.options.file,'utf8');
+ // A live host holds the lease: the commit is refused and nothing is written.
+ const host=new SessionManager({...f.options,config:null,lease:true});
+ assert.throws(()=>commitRegistryMigration(f.options.file,f.request),/KIN_SESSION_MANAGER_ALREADY_RUNNING/);
+ host.close();
+ assert.throws(()=>commitRegistryMigration(f.options.file,{...f.request,expected:{...f.expected,generation:3}}),/KIN_MIGRATION_BINDING_CHANGED/);
+ assert.throws(()=>commitRegistryMigration(f.options.file,{...f.request,native:{threadId:'old',nativeSessionId:'old'}}),/KIN_MIGRATION_BINDING_CHANGED|KIN_MIGRATION_THREAD_REUSED/);
+ assert.equal(JSON.parse(fs.readFileSync(f.options.file,'utf8')).binding.generation,4,'a refused commit changes no binding');
+ assert.equal(fs.existsSync(f.options.file+'.lease'),false,'a refused commit leaves no lease behind');
+ const receipt=commitRegistryMigration(f.options.file,f.request);
+ assert.deepEqual([receipt.state,receipt.previous.generation,receipt.binding.generation,receipt.binding.threadId],['committed',4,5,'kin-home-thread']);
+ const stored=f.read();
+ assert.deepEqual(stored.binding,{conversationId:'logical',generation:5,threadId:'kin-home-thread',nativeSessionId:'kin-home-thread'});
+ assert.deepEqual(stored.segments.map(s=>[s.generation,s.threadId,s.state]),[[4,'old','retired'],[5,'kin-home-thread','active']]);
+ assert.deepEqual([stored.segments[1].codexHome,stored.segments[1].homeHash,stored.segments[1].migrationId,stored.segments[1].checkpointId],[f.request.codexHome,'h'.repeat(64),'kin-home:1','checkpoint:migration']);
+ assert.equal(stored.sessionAdvice,null);assert.equal(stored.rollingCheckpoint,null);assert.equal(stored.restoreCheckpoint.id,'checkpoint:migration');
+ assert.equal(stored.restorePending,false);
+ assert.match(fs.readFileSync(f.options.file+'.events.jsonl','utf8'),/"kind":"migration-committed"/);
+ assert.equal(fs.existsSync(f.options.file+'.lease'),false,'the lease goes with the commit');
+ assert.notEqual(before,fs.readFileSync(f.options.file,'utf8'));
+ // Asked again (a run that died before it wrote down the answer): the same answer, no new revision.
+ const revision=stored.revision;
+ assert.deepEqual(commitRegistryMigration(f.options.file,f.request),receipt);assert.equal(f.read().revision,revision);
+ assert.throws(()=>commitRegistryMigration(f.options.file,{...f.request,id:'kin-home:2'}),/KIN_MIGRATION_ALREADY_COMMITTED/);
+ assert.throws(()=>commitRegistryMigration(f.options.file,{...f.request,native:{threadId:'another',nativeSessionId:'another'}}),/KIN_MIGRATION_ID_CONFLICT/);
+ assert.throws(()=>commitRegistryMigration(path.join(f.dir,'missing.json'),f.request),/KIN_SESSION_REGISTRY_MISSING/);
+});
+test('a rotation still in flight holds the migration back; a finished one is kept as a record',t=>{
+ const f=migrationRegistry(t,2),stored=f.read();
+ stored.candidate={id:'rotation:1',state:'unconfirmed',generation:2};fs.writeFileSync(f.options.file,JSON.stringify(stored));
+ assert.throws(()=>commitRegistryMigration(f.options.file,f.request),/KIN_MIGRATION_ROTATION_UNSETTLED/);
+ const profile={provider:'openai-15m',providerKind:'native',model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'default'};
+ const ready=f.read();ready.candidate={id:'rotation:1',state:'ready',generation:2,profile,native:{threadId:'candidate',nativeSessionId:'candidate',profile,providerBinding:providerBinding(profile)},checkpoint:{id:'old-candidate'}};
+ fs.writeFileSync(f.options.file,JSON.stringify(ready));
+ commitRegistryMigration(f.options.file,f.request);
+ const after=f.read();
+ assert.equal(after.candidate,null,'no handover prepared for the old runtime is left to promote');
+ assert.deepEqual([after.retiredCandidates.at(-1).id,after.retiredCandidates.at(-1).state,after.retiredCandidates.at(-1).staleReason],['rotation:1','stale','kin-home-migration']);
+});
+test('a host started after the migration reopens the committed thread, never an unrelated one',t=>{
+ const f=migrationRegistry(t,3);commitRegistryMigration(f.options.file,f.request);
+ const registry=f.read(),saved=scope=>({users:{owner:{sessions:{[scope]:{sessionId:'old',updatedAt:1}}}}});
+ const recovered=recoverSessionStore(registry,saved('main'),'owner');
+ assert.deepEqual(recovered.users.owner.sessions.main,{sessionId:'kin-home-thread',updatedAt:1});
+ assert.equal(recoverSessionStore(registry,{users:{owner:{sessions:{main:{sessionId:'kin-home-thread'}}}}},'owner'),null);
+ assert.throws(()=>recoverSessionStore(registry,{users:{owner:{sessions:{main:{sessionId:'unrelated'}}}}},'owner'),/unrelated session storage/);
+ assert.throws(()=>recoverSessionStore(registry,{users:{owner:{sessions:{}}}},'owner'),/unrelated session storage/);
+ // The package the new thread was given carries the payload and the marker that proves it arrived.
+ const injection=restoreInjection({payload:{kind:'internal-continuity-checkpoint',publicHistory:[]}},'op');
+ assert.equal(injection.marker,'kin-checkpoint:op');
+ assert.deepEqual(JSON.parse(injection.items[0].content[0].text),{kind:'internal-continuity-checkpoint',publicHistory:[],marker:'kin-checkpoint:op'});
+});
+

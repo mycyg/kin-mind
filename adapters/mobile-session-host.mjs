@@ -93,11 +93,26 @@ export async function loadCandidateSession({client,connection,binding,candidate,
 }
 
 export function recoverSessionStore(registry,saved,ownerId){
-  const candidate=registry?.candidate,binding=registry?.binding;
+  const candidate=registry?.candidate,binding=registry?.binding,migration=registry?.migration;
+  // A committed move into the Kin runtime home: the host was stopped for it, so the store
+  // still names the thread it replaced. Only that thread, or the new one, is reconciled.
+  if(migration?.state==='committed'&&migration.binding?.threadId===binding?.threadId&&migration.binding.generation===binding.generation){
+    const sessions=Object.values(saved.users?.[ownerId]?.sessions??{});
+    if(sessions.length!==1||![migration.previous?.threadId,binding.threadId].includes(sessions[0].sessionId))throw Error('Committed binding cannot reconcile unrelated session storage');
+    if(sessions[0].sessionId===binding.threadId)return null;
+    const result=structuredClone(saved);Object.values(result.users[ownerId].sessions)[0].sessionId=binding.threadId;return result;
+  }
   if(!candidate||!['committing','unconfirmed'].includes(candidate.state)||!candidateVerificationReady(candidate.verification,candidate)||candidate.native?.threadId!==binding?.threadId||candidate.generation+1!==binding.generation)return null;
   const sessions=Object.values(saved.users?.[ownerId]?.sessions??{}),previous=registry.segments.find(s=>s.generation===candidate.generation);
   if(sessions.length!==1||![previous?.threadId,binding.threadId].includes(sessions[0].sessionId))throw Error('Committed binding cannot reconcile unrelated session storage');
   const result=structuredClone(saved);Object.values(result.users[ownerId].sessions)[0].sessionId=binding.threadId;return result;
+}
+
+/** The recovery package as the native window receives it: one assistant item carrying the
+ * checkpoint's public payload and the marker that proves, in native history, it arrived. */
+export function restoreInjection(checkpoint,operationId) {
+  const marker='kin-checkpoint:'+operationId;
+  return {marker,items:[{type:'message',role:'assistant',content:[{type:'output_text',text:JSON.stringify({...checkpoint.payload,marker})}]}]};
 }
 
 /** Adapter dependencies are supplied by the mobile host. No desktop paths,
@@ -276,8 +291,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         if(op?.id===operationId&&['injecting','unconfirmed'].includes(op.state))throw Error('Recovery injection receipt unconfirmed');
         op={id:operationId,state:'injecting',checkpointId:cp.id};manager.state.restoration=op;manager.save('restore-injecting');
         const session=await routing.ensureSession('kin-host:restore-context');
-        const text=JSON.stringify({...cp.payload,marker});
-        try{await session.agentInfo.connection.extMethod('_kin/inject-checkpoint',{sessionId:runtime.threadId,operationId,items:[{type:'message',role:'assistant',content:[{type:'output_text',text}]}]});proof=await checkpointMarker(runtime.rolloutPath,marker);if(!proof.found)throw Error('Missing persisted injection');}
+        try{await session.agentInfo.connection.extMethod('_kin/inject-checkpoint',{sessionId:runtime.threadId,operationId,items:restoreInjection(cp,operationId).items});proof=await checkpointMarker(runtime.rolloutPath,marker);if(!proof.found)throw Error('Missing persisted injection');}
         catch(error){op.state='unconfirmed';manager.save('restore-unconfirmed');throw error;}
       }
       await mindCall('memory-injection-ack',{session:runtime.threadId,epoch:manager.state.restoreEpoch,id:operationId,tokens:cp.tokens});
