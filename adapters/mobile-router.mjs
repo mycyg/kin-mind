@@ -118,6 +118,21 @@ export function noticeReceiptClass(receipt) {
 /** The rests before a notice the platform refused outright is sent again under its own
  * id; past them it is only looked up (CR2-LIFE-06). */
 export const NOTICE_REJECT_RETRY_MS=Object.freeze([10*60000,3600000,6*3600000]);
+/** What a lookup by original id proves (CR2-INT-02). `found` anywhere is receipt. `not-found`
+ * proves an input never arrived only when the whole history of the very thread it was
+ * submitted to was read, by a runtime that recorded input ids when it was submitted; any
+ * other answer — an older runtime, another thread, a partial read, no record of the
+ * submission — stays unknown: looked up again, never submitted again. */
+export function reconciliationState(result,submit) {
+  if(result?.state==='found')return {state:'found'};
+  const reason=typeof result?.reason==='string'?result.reason.slice(0,80):null;
+  if(result?.state!=='not-found')return {state:'unknown',...(reason?{reason}:{})};
+  if(!submit)return {state:'unknown',reason:'no-submission-record'};
+  if(submit.correlation!==true)return {state:'unknown',reason:'runtime-without-input-correlation'};
+  if(result.complete!==true)return {state:'unknown',reason:'history-not-read-in-full'};
+  if(typeof result.sessionId!=='string'||result.sessionId!==submit.sessionId)return {state:'unknown',reason:'not-the-submitted-thread'};
+  return {state:'not-found'};
+}
 /** Whether the next call for a notice may start a physical send: it never began, its
  * receipt proved nothing reached the platform, or the platform refused it and its bounded
  * retries are not spent. A begun one whose outcome is unknown is only looked up. */
@@ -191,8 +206,10 @@ export class MobileRouter {
    * Left off, every request and every record is what it was before intents existed.
    * `profiles` are the host's configured chat and work routing profiles; `hotLimits`
    * narrows what the state file keeps (see HOT_LIMITS). */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null}) {
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null,runtimeId=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn});
+    // The runtime bundle this host runs, named on every submission it makes (CR2-INT-02).
+    this.runtimeId=typeof runtimeId==='string'&&runtimeId?runtimeId.slice(0,120):null;
     this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
     this.profiles=Object.freeze({chat:Object.freeze({...ROUTER_PROFILES.chat,...profiles?.chat}),work:Object.freeze({...ROUTER_PROFILES.work,...profiles?.work})});
     this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();this.deadlines=new Map();this.activities=new Map();this.watching=false;
@@ -364,7 +381,7 @@ export class MobileRouter {
    * since it may be Kin's own. Like any unconfirmed input they never hold the restart
    * profile (AD1-10). */
   restoreLedger() {
-    let ids=[];const kinds=new Map();
+    let ids=[];const kinds=new Map(),submits=new Map();
     try {
       const journal=this.file+'.events.jsonl',size=fs.statSync(journal).size,from=Math.max(0,size-LEDGER_TAIL_BYTES),handle=fs.openSync(journal,'r');
       let body='';
@@ -374,11 +391,12 @@ export class MobileRouter {
           const event=JSON.parse(line);
           if(!String(event?.kind).startsWith('input-')||typeof event.id!=='string')return null;
           if(typeof event.inputKind==='string'&&INPUT_KIND.test(event.inputKind))kinds.set(event.id,event.inputKind);
+          if(event.kind==='input-submitting'&&typeof event.submit?.sessionId==='string')submits.set(event.id,{sessionId:event.submit.sessionId,runtime:typeof event.submit.runtime==='string'?event.submit.runtime:null,correlation:event.submit.correlation===true});
           return event.id;
         } catch {return null;}
       }).filter(Boolean))];
     } catch {/* No journal: this router never accepted anything here. */}
-    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',at:this.now()};
+    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',...(submits.has(id)?{submit:submits.get(id)}:{}),at:this.now()};
     return ids.length;
   }
   locked(fn) {
@@ -1022,7 +1040,9 @@ export class MobileRouter {
     record.plannedTransition=this.state.transition?.id??null;
     this.reservations.set(input.id,{profile:targetProfile,at:this.now()});
     return {decision:{model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,
-      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch,...(record.interrupt?{newTurn:true}:{})}};
+      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch,...(record.interrupt?{newTurn:true}:{})},
+      // Where it goes and whether that runtime records input ids, for any later lookup (CR2-INT-02).
+      submit:{sessionId:this.sessionId,runtime:this.runtimeId,correlation:runtime.inputCorrelation===true}};
   }
   /** Phase two: the host prepares its prompt outside the mutex (AD1-06), then marks
    * the submission under it, re-checking the basis the dispatch was planned on. */
@@ -1039,11 +1059,12 @@ export class MobileRouter {
       if(record.state!=='preparing'||record.executionEpoch!==this.state.executionEpoch||(this.state.transition?.id??null)!==record.plannedTransition||this.state.transition?.state==='switching')
         throw Object.assign(Error('dispatch-basis-changed'),{dispatchRetry:true});
       record.state='submitting';record.submissionStartedAt=this.now();
+      record.submit={sessionId:plan.submit?.sessionId??this.sessionId,runtime:plan.submit?.runtime??this.runtimeId,correlation:plan.submit?.correlation===true,at:record.submissionStartedAt};
       // A new submission is reconciled on its own; what an earlier one proved is kept as history.
       if(record.reconciliation){record.priorReconciliations=[...(record.priorReconciliations??[]),record.reconciliation].slice(-4);delete record.reconciliation;}
       // A native command exists from its submission, never before it (AD1-03).
       if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-      this.save('input-submitting',{id:input.id});
+      this.save('input-submitting',{id:input.id,submit:record.submit});
     });
     if(input.submissionProtocol!=='host-boundary-v1')await markSubmitted().catch(()=>{});
     let outcome,failure=null;
@@ -2236,11 +2257,14 @@ export class MobileRouter {
         results.push({...action,result:result?.state??null});continue;
       }
       if(action.kind==='reconcile') {
-        let result;try{result=await reconcileInput(action.id);}catch{result={state:'unknown'};}
+        // Looked up on the thread it was submitted to, never on whatever is current now (CR2-INT-02).
+        const submit=this.state.inputs[action.id]?.submit??null;
+        let result;try{result=await reconcileInput(action.id,{sessionId:submit?.sessionId??null});}catch{result={state:'unknown'};}
         await this.locked(async()=>{
           const record=this.state.inputs[action.id];if(!record||!['unconfirmed','fenced-unconfirmed'].includes(record.state))return;
-          const state=['found','not-found'].includes(result?.state)?result.state:'unknown';
-          record.reconciliation={state,at:this.now()};
+          const read=reconciliationState(result,record.submit);
+          const state=read.state;
+          record.reconciliation={state,at:this.now(),...(read.reason?{reason:read.reason}:{})};
           // A record restored from the journal is settled by its lookup like any other (WS8 #3).
           if(state!=='unknown'&&record.recovered){delete record.recovered;record.restored='journal';}
           if(state==='found'){record.state='accepted';record.acceptedAt??=this.now();}

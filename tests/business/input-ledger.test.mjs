@@ -13,7 +13,7 @@ function fixture(t,options={}) {
   const clock={now:1000};
   const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
     model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',
-    active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0};
+    active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0,inputCorrelation:true};
   const args={file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),now:()=>++clock.now,
     classify:async({text})=>({route:/work/.test(text)?'work':'chat',reason:'synthetic'}),
     switchModel:async(model,profile={model})=>{Object.assign(runtime,{model,reasoningEffort:profile.reasoningEffort??runtime.reasoningEffort,serviceTierPreference:profile.serviceTierPreference??runtime.serviceTierPreference});return {...runtime};},
@@ -206,7 +206,7 @@ test('an uncertain submission is reconciled by its original id and never re-sent
   for(const id of ['found','absent','unknown'])
     await assert.rejects(f.router.dispatch({id,text:id,submissionProtocol:'host-boundary-v1'},async(_,started)=>{started();throw Error('lost response');}),/reconciliation/);
   assert.deepEqual((await f.router.restoreRoutingProfile()).state,'restored','an unconfirmed input no longer holds the restart profile');
-  const reconcileInput=async id=>({state:{found:'found',absent:'not-found'}[id]??'unknown'});
+  const reconcileInput=async id=>id==='absent'?{state:'not-found',complete:true,sessionId:'synthetic'}:{state:{found:'found'}[id]??'unknown'};
   await f.router.watch({reconcileInput});
   const inputs=f.router.state.inputs;
   assert.deepEqual([inputs.found.state,inputs.absent.state,inputs.absent.retry.evidence,inputs.unknown.reconciliation.state],['accepted','failed-before-submit','reconciled-not-received','unknown']);

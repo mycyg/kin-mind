@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,literalCommand} from '../../adapters/mobile-router.mjs';
+import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
 import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 
@@ -13,7 +13,7 @@ function fixture(t,options={}) {
   const clock={now:Date.parse('2026-09-25T00:00:00Z')};
   const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
     model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',
-    active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0};
+    active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0,inputCorrelation:true};
   const args={file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),now:()=>clock.now,
     classify:async({text})=>({route:/work|写/.test(text)?'work':'chat',reason:'synthetic'}),
     switchModel:async(model,profile={model})=>{Object.assign(runtime,{model,reasoningEffort:profile.reasoningEffort??runtime.reasoningEffort,serviceTierPreference:profile.serviceTierPreference??runtime.serviceTierPreference});return {...runtime};},
@@ -21,6 +21,9 @@ function fixture(t,options={}) {
   return {root,clock,runtime,args,router:new MobileRouter(args)};
 }
 const chat=(f,id,text='hi')=>f.router.dispatch({id,kind:'owner',text},async()=> 'new-turn');
+/** What the owned ACP answers when it read the whole of the submitted thread and the id is not there (CR2-INT-02). */
+const absent={state:'not-found',complete:true,sessionId:'synthetic'};
+const lookup=states=>async id=>(states[id]??'unknown')==='not-found'?absent:{state:states[id]??'unknown'};
 
 test('the owner\'s literal stop cuts the running turn, keeps the result on the stop, and settles at once (CR-LIFE-01)',async t=>{
   const calls=[];
@@ -65,7 +68,7 @@ test('a submission reconciled as not received is retried under its own id, and r
   await f.router.dispatch({id:'lost',kind:'owner',text:'hi'},async()=>{throw Error('connection reset');}).catch(()=>{});
   const record=f.router.state.inputs.lost;
   assert.equal(record.state,'unconfirmed');const submittedAt=record.submissionStartedAt;assert.ok(submittedAt);
-  await f.router.watch({reconcileInput:async id=>({state:id==='lost'?'not-found':'unknown'})});
+  await f.router.watch({reconcileInput:async id=>id==='lost'?absent:{state:'unknown'}});
   assert.deepEqual([record.state,record.retry.evidence,record.reconciliation.state],['failed-before-submit','reconciled-not-received','not-found']);
   assert.equal(record.submissionStartedAt,undefined,'the old submission no longer blocks a retry');
   assert.equal(record.reconciliation.submissionStartedAt,submittedAt,'it is kept as history');
@@ -302,7 +305,7 @@ test('an input restored from the journal is settled by its lookup: found stays a
   const submitted=[];const submit=async decision=>{submitted.push(decision.inputId);return 'new-turn';};
   await assert.rejects(router.dispatch({id:'lost-b',kind:'owner',text:'晚上吃什么'},submit),/requires reconciliation/,'refused until it is looked up');
   const lookups={'lost-a':'found','lost-b':'not-found','lost-c':'unknown'};
-  await router.watchOnce({reconcileInput:async id=>({state:lookups[id]??'unknown'}),notifyOwner:null,requeue:null,sessionBusy:false});
+  await router.watchOnce({reconcileInput:lookup(lookups),notifyOwner:null,requeue:null,sessionBusy:false});
   const [a,b,c]=['lost-a','lost-b','lost-c'].map(id=>router.state.inputs[id]);
   assert.deepEqual([a.state,a.recovered,a.restored],['accepted',undefined,'journal'],'found: it stands as accepted');
   assert.deepEqual([b.state,b.recovered,b.retry.evidence],['failed-before-submit',undefined,'reconciled-not-received'],'proven never received');
@@ -324,7 +327,7 @@ test('an internal input whose submission is unknown is looked up by its id, and 
     await assert.rejects(f.router.dispatch({id,kind:'handoff',text:'继续 '+id,submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
   assert.equal(holdsSession(f.router.state.inputs['handoff:h1']),true,'an unknown submission holds a session boundary');
   const notices=[];
-  await f.router.watch({reconcileInput:async id=>({state:id==='handoff:h1'?'found':'not-found'}),
+  await f.router.watch({reconcileInput:async id=>id==='handoff:h1'?{state:'found'}:absent,
     notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'n'};}});
   const [h1,h2]=['handoff:h1','handoff:h2'].map(id=>f.router.state.inputs[id]);
   assert.deepEqual([h1.state,h2.state,h2.retry.evidence],['accepted','failed-before-submit','reconciled-not-received']);
@@ -361,18 +364,16 @@ test('a journal restore knows whose each input was; one an older journal cannot 
   assert.deepEqual(['inj_feishu_old','internal:draft-1','reclass-1'].map(id=>[legacy.state.inputs[id].kind,legacy.state.inputs[id].state]),
     [['unknown','unconfirmed'],['unknown','unconfirmed'],['unknown','unconfirmed']]);
   const heard=[],requeued=[],lookups={'inj_feishu_old':'not-found','internal:draft-1':'found','reclass-1':'not-found'};
-  const watch=()=>legacy.watch({reconcileInput:async id=>({state:lookups[id]}),
+  const watch=()=>legacy.watch({reconcileInput:lookup(lookups),
     notifyOwner:async(kind,id)=>{heard.push([kind,id]);return {state:'accepted',messageId:'n'};},
     requeue:async id=>{requeued.push(id);return {state:id==='inj_feishu_old'?'requeued':'missing'};}});
   for(let pass=0;pass<8;pass++){await watch();g.clock.now+=11*MINUTE;}
   assert.deepEqual(heard,[],'nothing is ever told about an input nobody can say was hers');
   assert.deepEqual([legacy.state.inputs['internal:draft-1'].state,holdsSession(legacy.state.inputs['internal:draft-1'])],['accepted',false],'found: settled by its lookup');
-  assert.deepEqual([...new Set(requeued)].sort(),['inj_feishu_old','reclass-1'],'proven never received: back to an inbox under its own id, where there is one');
-  assert.equal(requeued.filter(id=>id==='inj_feishu_old').length,REQUEUE_BUDGET,'and only so many times');
-  assert.deepEqual([legacy.state.inputs['reclass-1'].retry.exhausted,legacy.state.inputs['reclass-1'].retry.requeue],[true,'missing'],'no job anywhere: it stops, silently');
-  // The owner's inbox takes it in again: now it is known to be hers.
-  const intake=await legacy.received({id:'inj_feishu_old',kind:'owner',channel:'feishu'});
-  assert.deepEqual([intake.record.kind,intake.record.state],['owner','preparing']);
+  // An older journal kept no record of the submission, so not-found proves nothing: only looked up (CR2-INT-02).
+  assert.deepEqual(['inj_feishu_old','reclass-1'].map(id=>[legacy.state.inputs[id].state,legacy.state.inputs[id].reconciliation.state,legacy.state.inputs[id].reconciliation.reason]),
+    [['unconfirmed','unknown','no-submission-record'],['unconfirmed','unknown','no-submission-record']]);
+  assert.deepEqual(requeued,[],'never sent again');
 });
 
 // ---- Second lifecycle review (CR2-LIFE) ----
@@ -434,7 +435,7 @@ test('the requeue budget counts across every attempt, taken before the requeue i
   const notifyOwner=async()=>({state:'accepted',messageId:'n'});
   for(let cycle=0;cycle<REQUEUE_BUDGET+2;cycle++) {
     await assert.rejects(f.router.dispatch({id:'x',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
-    await f.router.watch({reconcileInput:async()=>({state:'not-found'})});
+    await f.router.watch({reconcileInput:async()=>absent});
     assert.equal(f.router.state.inputs.x.retry.evidence,'reconciled-not-received');
     await f.router.watch({requeue:async()=>{requeues++;return {state:'requeued'};},notifyOwner});
     f.clock.now+=HOUR;
@@ -443,7 +444,7 @@ test('the requeue budget counts across every attempt, taken before the requeue i
   // A requeue whose job is taken up again before its answer comes back is still counted.
   const g=fixture(t);
   await assert.rejects(g.router.dispatch({id:'y',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
-  await g.router.watch({reconcileInput:async()=>({state:'not-found'})});
+  await g.router.watch({reconcileInput:async()=>absent});
   await g.router.watch({requeue:async id=>{await g.router.dispatch({id,kind:'owner',text:'在吗'},async()=> 'new-turn');return {state:'requeued'};},notifyOwner});
   assert.deepEqual([g.router.state.inputs.y.state,g.router.state.inputs.y.requeues],['accepted',1]);
 });
@@ -521,4 +522,41 @@ test('the owner\'s literal commands are read from a message of their own (CR2-LI
   assert.deepEqual(['停止任务','/compact',' /mode work！','/mode auto','/compact\n\n在吗','好的'].map(text=>literalCommand(text)),['stop','compact','work','auto',null,null]);
   assert.equal(literalCommand('/compact',{attachments:[{kind:'file'}]}),null,'a command with attachments is not one');
   assert.equal(literalCommand('停止任务',{attachments:[{kind:'file'}]}),'stop','her stop always is');
+});
+
+// ---- Integration review: CR2-INT-02 ----
+test('not-found proves an input never arrived only on its own thread, from a runtime that recorded input ids, read in full (CR2-INT-02)',async t=>{
+  const submit={sessionId:'thread-1',runtime:'bundle-2',correlation:true},absentThere={state:'not-found',complete:true,sessionId:'thread-1'};
+  assert.deepEqual(reconciliationState(absentThere,submit),{state:'not-found'});
+  assert.deepEqual(reconciliationState(absentThere,{...submit,correlation:false}),{state:'unknown',reason:'runtime-without-input-correlation'});
+  assert.deepEqual(reconciliationState({...absentThere,sessionId:'thread-2'},submit),{state:'unknown',reason:'not-the-submitted-thread'});
+  assert.deepEqual(reconciliationState({...absentThere,complete:false},submit),{state:'unknown',reason:'history-not-read-in-full'});
+  assert.deepEqual(reconciliationState({state:'not-found'},submit),{state:'unknown',reason:'history-not-read-in-full'},'an older ACP\'s bare answer');
+  assert.deepEqual(reconciliationState(absentThere,null),{state:'unknown',reason:'no-submission-record'});
+  assert.deepEqual(reconciliationState({state:'found',sessionId:'thread-2'},null),{state:'found'},'found anywhere is receipt');
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  const asked=[];const answer=(id,{sessionId})=>{asked.push(sessionId);return {state:'not-found',complete:true,sessionId};};
+
+  // 1. Submitted while an older runtime ran, which recorded no input ids; the new one cannot find it.
+  const old=fixture(t,{runtimeId:'bundle-1'});delete old.runtime.inputCorrelation;
+  await assert.rejects(old.router.dispatch({id:'x',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  assert.deepEqual(old.router.state.inputs.x.submit,{sessionId:'synthetic',runtime:'bundle-1',correlation:false,at:old.clock.now},'the ledger names where it went and on what');
+  old.runtime.inputCorrelation=true;
+  await old.router.watch({reconcileInput:async(id,options)=>answer(id,options)});
+  assert.deepEqual([old.router.state.inputs.x.state,old.router.state.inputs.x.reconciliation.reason],['unconfirmed','runtime-without-input-correlation'],'still unknown');
+  await assert.rejects(old.router.dispatch({id:'x',kind:'owner',text:'在吗'},async()=>assert.fail('never sent again')),/reconciliation/);
+
+  // 2. Its own thread, a runtime that records ids, the whole history read: proven, retried under its own id.
+  const f=fixture(t,{runtimeId:'bundle-2'});
+  await assert.rejects(f.router.dispatch({id:'y',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  await f.router.watch({reconcileInput:async(id,options)=>answer(id,options)});
+  assert.deepEqual([f.router.state.inputs.y.state,f.router.state.inputs.y.retry.evidence],['failed-before-submit','reconciled-not-received']);
+
+  // 3. The binding moved to a new thread: the lookup asks the original one, and an answer about another thread proves nothing.
+  const g=fixture(t,{runtimeId:'bundle-2'});
+  await assert.rejects(g.router.dispatch({id:'z',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  g.router.sessionId='thread-after-migration';
+  await g.router.watch({reconcileInput:async(id,options)=>{asked.push(options.sessionId);return {state:'not-found',complete:true,sessionId:'thread-after-migration'};}});
+  assert.deepEqual([g.router.state.inputs.z.state,g.router.state.inputs.z.reconciliation.reason],['unconfirmed','not-the-submitted-thread']);
+  assert.deepEqual(asked,['synthetic','synthetic','synthetic'],'every lookup went to the thread the input was submitted to');
 });
