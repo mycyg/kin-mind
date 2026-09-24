@@ -277,6 +277,11 @@ def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
     assert unknown == {"state": "needs-kin", "reason": "owner-source-unavailable"}
     past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
     assert past["state"] == "needs-kin"
+    # The router's own call (WS3 plan-deferral): the task text as `request`, its input ids as evidence.
+    MemoryContinuity(mind).ingest({"id": "wechat:task-4", "kind": "owner-message", "text": "Print the tickets", "at": mind.clock()})
+    routed = plans.defer_owner_task({"task_id": "task-4", "request": "Print the tickets", "reason": "Tomorrow morning",
+                                     "not_before": later, "evidence_ids": ["wechat:task-4"]})
+    assert routed["state"] == "created" and routed["plan_id"] == routed["planId"]
 
 def test_a_review_retires_the_queued_reviews_it_answered(env):
     """K2-04: reviews of a plan queued before a review read it are answered by that review;

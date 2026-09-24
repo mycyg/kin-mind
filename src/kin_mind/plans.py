@@ -223,7 +223,8 @@ class AutonomousPlans:
         Returns {"state": "created", "planId"} or, when the plan cannot be written here,
         {"state": "needs-kin", "reason"}: Kin then keeps it herself (manage_autonomous_plan)."""
         task_id = str(request.get("task_id") or "").strip()
-        goal = str(request.get("goal") or "").strip()
+        # The router names the task by what was asked (`request`); `goal` is the same field.
+        goal = str(request.get("goal") or request.get("request") or "").strip()
         reason = str(request.get("reason") or "").strip() or goal
         try:
             not_before = local_time(request.get("not_before"))
@@ -233,16 +234,20 @@ class AutonomousPlans:
             raise ValueError("A deferred task needs its task_id and goal")
         if not not_before or timestamp(not_before) <= timestamp(self.mind.clock()):
             return {"state": "needs-kin", "reason": "not-before-not-in-future"}
-        evidence = [str(i) for i in request.get("evidence_ids") or []]
+        # The router passes its own input ids; a source id passes as it is.
+        named = [str(i) for i in [*(request.get("evidence_ids") or []), *(request.get("input_ids") or [])]]
+        evidence = []
         with self.engine.db.connect() as conn:
             if not enabled(conn, self.scope, "autonomous_plans"):
                 return {"state": "needs-kin", "reason": "autonomous-plans-disabled"}
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone():
-                for input_id in request.get("input_ids") or []:
-                    row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
-                                       (self.scope, str(input_id))).fetchone()
-                    if row:
-                        evidence.append(row[0])
+            inputs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone())
+            for identifier in named:
+                row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
+                                   (self.scope, identifier)).fetchone() if inputs else None
+                if row:
+                    evidence.append(row[0])
+                elif identifier.startswith("src_"):
+                    evidence.append(identifier)
         evidence = list(dict.fromkeys(evidence))[:24]
         if not evidence:
             return {"state": "needs-kin", "reason": "owner-source-unavailable"}
@@ -256,7 +261,7 @@ class AutonomousPlans:
                            "owner_request_id": task_id}]})
         except (Conflict, Missing, ValueError) as error:
             return {"state": "needs-kin", "reason": ("plan-refused:" + str(error))[:160]}
-        return {"state": "created", "planId": plan["id"], "revision": plan["revision"]}
+        return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"]}
 
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.

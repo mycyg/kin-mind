@@ -67,7 +67,8 @@ def dispatch(config, action, request):
             return plans.manage(request)
         if action == "plan-migrate":
             return plans.migrate_desires()
-        if action == "plan-defer":
+        if action == "plan-deferral":
+            # The router's deferral pass (WS3) hands over a task Kin chose to do later (N10).
             return plans.defer_owner_task(request)
         if action == "plan-renew":
             return plans.renew(**request)
