@@ -1,5 +1,7 @@
 """Reminder delivery when the host refuses for a while or restarts (T-11: E2-01, E3-12), what the
-task list says about each delivery (E3-13), and a schedule whose policy is gone (E2-02)."""
+task list says about each delivery (E3-13, CR-MEM-04), a schedule whose policy is gone (E2-02),
+and the deadline of each occurrence, its due time plus 30 minutes, checked before every dispatch
+(CR-MEM-10)."""
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -26,11 +28,13 @@ class Answer:
 class Channel:
     """A host that answers from a script: an exception class, or a status code."""
 
-    def __init__(self, *script, then=200):
-        self.script, self.then, self.calls = list(script), then, []
+    def __init__(self, *script, then=200, clock=None):
+        self.script, self.then, self.calls, self.times, self.clock = list(script), then, [], [], clock
 
     def __call__(self, url, body, headers):
         self.calls.append(json.loads(body)["id"])
+        if self.clock:
+            self.times.append(self.clock[0])
         step = self.script.pop(0) if self.script else self.then
         if isinstance(step, type) and issubclass(step, Exception):
             raise step("scripted")
@@ -44,6 +48,7 @@ def world(tmp_path):
     made = {}
 
     def scheduler(channel, *, idempotent=False, recurrence="daily", key="walk"):
+        channel.clock = clock
         policy = ContactPolicy(id="reminders", scope=SCOPE, enabled=True, channel="http://127.0.0.1:9/deliver",
                                quiet_start=0, quiet_end=0, max_per_day=100, min_interval_minutes=0,
                                require_confirmation=False, idempotent_channel=idempotent)
@@ -81,7 +86,7 @@ def test_a_restarting_or_busy_host_is_retried_until_it_takes_the_reminder(world)
     engine, clock, scheduler, run = world
     channel = Channel(httpx.ConnectError, httpx.ConnectError, 409, 409, httpx.ConnectTimeout, 409, 409)
     found, sid = scheduler(channel)
-    run(found, 3 * 3600)
+    run(found, DELIVERY_WINDOW, step=60)  # the host ticks once a minute
     rows = outbox(engine, sid)
     assert rows[0]["state"] == "sent" and rows[0]["attempts"] == 8 > MAX_ATTEMPTS
     assert len(set(channel.calls)) == 1  # the same delivery each time, never a second one
@@ -96,7 +101,9 @@ def test_a_reminder_never_sent_within_its_window_is_given_up_on_and_says_so(worl
     found, sid = scheduler(channel, recurrence="none")
     run(found, DELIVERY_WINDOW + 1800)
     rows = outbox(engine, sid)
-    assert rows[0]["state"] == "canceled" and rows[0]["data"]["gave_up"]["reason"] == "undelivered-within-window"
+    assert rows[0]["state"] == "canceled" and rows[0]["data"]["gave_up"]["reason"] == "past-deadline"
+    # Nothing went out after this occurrence's deadline, its due time plus 30 minutes.
+    assert all(at <= START.timestamp() + DELIVERY_WINDOW for at in channel.times)
     assert schedule(engine, sid)["state"] == "queued"
     calls = len(channel.calls)
     run(found, 3600)
@@ -132,7 +139,7 @@ def test_a_verified_idempotent_channel_is_retried_past_five_unknown_outcomes(wor
     with engine.db.connect(write=True) as conn:
         conn.execute("INSERT INTO outbox_channel_contracts(channel,verified,delivery_id,checked_at) VALUES(?,1,'x','t')",
                      ("http://127.0.0.1:9/deliver",))
-    run(found, 4 * 3600)
+    run(found, DELIVERY_WINDOW, step=60)
     rows = outbox(engine, sid)
     assert rows[0]["state"] == "sent" and rows[0]["attempts"] == 8
 
@@ -147,3 +154,52 @@ def test_a_schedule_whose_policy_is_gone_pauses_and_the_others_still_run(world):
     assert schedule(engine, sid)["state"] == "paused"
     assert json.loads(schedule(engine, sid)["data"])["paused_reason"] == "policy-unavailable"
     assert [row["state"] for row in outbox(engine, other)] == ["sent"]
+
+
+def test_a_reminder_left_queued_past_its_deadline_is_never_sent_late(world):
+    """A service that was down: on its return the row is past its occurrence's deadline. It is
+    settled as not sent without a request, and the daily reminder moves on (CR-MEM-10)."""
+    engine, clock, scheduler, run = world
+    channel = Channel()
+    found, sid = scheduler(channel)
+    found.tick(deliver=False)
+    clock[0] += DELIVERY_WINDOW + 600
+    run(found, 600)
+    assert channel.calls == []
+    rows = outbox(engine, sid)
+    assert rows[0]["state"] == "canceled" and rows[0]["data"]["gave_up"]["reason"] == "past-deadline"
+    current = schedule(engine, sid)
+    assert current["state"] == "scheduled" and current["due_at"] > START.isoformat()
+    delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
+    assert delivery["never_sent"] and "截止时间" in delivery["meaning"]
+
+
+def test_an_unknown_outcome_past_the_deadline_is_kept_for_reconciliation(world):
+    """Possibly sent and past the deadline: kept under its id, never sent again (CR-MEM-10)."""
+    engine, clock, scheduler, run = world
+    channel = Channel(then=503)
+    found, sid = scheduler(channel, idempotent=True)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO outbox_channel_contracts(channel,verified,delivery_id,checked_at) VALUES(?,1,'x','t')",
+                     ("http://127.0.0.1:9/deliver",))
+    run(found, DELIVERY_WINDOW + 1800, step=60)
+    rows = outbox(engine, sid)
+    assert rows[0]["state"] == "uncertain" and "gave_up" not in rows[0]["data"]
+    assert all(at <= START.timestamp() + DELIVERY_WINDOW for at in channel.times)
+    assert len(set(channel.calls)) == 1  # one delivery id throughout, to reconcile by
+    delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"]
+    assert not next(d for d in delivery if d["id"] == rows[0]["id"])["never_sent"]
+
+
+def test_an_older_rows_unknown_outcome_is_not_reported_as_never_sent(world):
+    """A row an older build left 'uncertain' after attempts, with no refusal on record, may have
+    reached the channel: the task list says so, as the dispatcher treats it (CR-MEM-04)."""
+    engine, clock, scheduler, run = world
+    found, sid = scheduler(Channel())
+    found.tick(deliver=False)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE outbox SET state='uncertain',attempts=2,data=json_remove(data,'$.dispatch') WHERE schedule_id=?",
+                     (sid,))
+    delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
+    assert delivery["state"] == "uncertain" and not delivery["never_sent"]
+    assert delivery["meaning"] == "可能已经发出，结果未知；再次发送前需要核对"
