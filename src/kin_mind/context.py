@@ -32,6 +32,29 @@ BUDGETS = {"startup": 2000, "chat": 800, "proactive": 2500, "work": 4000, "read"
 # background context and continuity checkpoints alike. Relevance selects within it and
 # the rest stays readable through the paged tools.
 INJECTION_CEILING = 8000
+# The display contract the host's interactionView (owner-host.mjs) follows: an item waiting for
+# review stays in view, marked, within the approved bounds (N12, N15, CR-MIND-09).
+INTERACTION_LIMITS = {"concerns": 6, "guidance": 3}
+REVIEW_MARK = "待复核"
+
+
+def affect_projection(view):
+    """The mind state as the memory injection shows it, on the same terms as interactionView."""
+    continuity = view.get("continuity") or {}
+    active, pending = continuity.get("activation") != "shadow", bool(continuity.get("needs_review"))
+
+    def marked(item, flag):
+        if flag and isinstance(item, dict):
+            return {**item, "review": REVIEW_MARK}
+        return {"text": item, "review": REVIEW_MARK} if flag and item else item
+
+    understanding = (view.get("appraisal_summary") or {}).get("understanding") if active else None
+    return {"dimensions": {k: {"value": round(v["value"]), "review": REVIEW_MARK} if v.get("needs_review") else round(v["value"])
+                           for k, v in view["dimensions"].items()},
+            "understanding": marked(understanding, pending or (isinstance(understanding, dict) and understanding.get("needs_review"))),
+            "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:INTERACTION_LIMITS["guidance"]]] if active else [],
+            "concerns": [marked({k: c.get(k) for k in ("id", "content", "status", "basis")}, pending or bool(c.get("needs_review")))
+                         for c in view.get("selected_concerns", [])[:INTERACTION_LIMITS["concerns"]]] if active else []}
 # What a chat read is shown of a trait's counted facts: how many separate times, how many
 # counterexamples, when it was first and last seen, what is left of the support.
 FACTS = ("episodes", "counter_examples", "first_day", "last_day", "support_strength")
@@ -781,10 +804,7 @@ class Contexts:
             selected_intent = {k: intent.get(k) for k in ("id", "content", "topic", "kind", "strength", "completion", "status", "concern_ids", "exploration_id")}
             items.append({"id": "current-intent", "revision": digest(selected_intent), "text": dumps(selected_intent), "basis": "inferred"})
         view = self.mind.read(query=query)
-        dynamic = {"dimensions": {k: round(v["value"]) for k, v in view["dimensions"].items() if not v.get("needs_review")},
-                   "understanding": (view.get("appraisal_summary") or {}).get("understanding"),
-                   "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:3]],
-                   "concerns": [{k: c.get(k) for k in ("id", "content", "status", "basis")} for c in view.get("selected_concerns", [])[:3]]}
+        dynamic = affect_projection(view)
         affect_item = {"id": "affect", "revision": digest(dynamic), "text": dumps(dynamic), "basis": "inferred"}
         habits = self.memory.habits.read()
         if habits["revision"]:

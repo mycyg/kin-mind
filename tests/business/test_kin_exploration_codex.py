@@ -494,3 +494,32 @@ def test_the_minute_review_asks_the_resident_worker_before_a_process_is_started(
         conn.execute("INSERT INTO meta VALUES(?,1) ON CONFLICT(key) DO UPDATE SET value=1", (COMPACTION_MARKER,))
     for action in ("review-due", "review"):
         assert dispatch(config, action, {}) == {"state": "paused", "reason": COMPACTING}
+
+
+def test_an_exploration_reader_never_reads_the_host_the_memory_store_or_kins_home(tmp_path, monkeypatch):
+    """Deployment condition (mind review 2026-09-24): the owner may authorize a root broad enough
+    to hold the host and the memory store; every run's reader refuses them, Kin's Codex home and a
+    symlink into them all the same, and still reads her own files."""
+    from kin_mind.codex_executor import prepare_codex_exploration
+    from kin_mind.computer import ComputerReader
+    documents = tmp_path / "Documents"
+    host, memory = documents / "host", documents / "MemoryPalace"
+    home = host / "state" / "codex-home"
+    for directory in (home, memory, documents / "notes"):
+        directory.mkdir(parents=True, exist_ok=True)
+    (documents / "notes" / "trip.md").write_text("synthetic notes")
+    (documents / "notes" / "shortcut").symlink_to(memory, target_is_directory=True)
+    fake = fake_codex(tmp_path / "fake-reader", COMPLETE)
+    config = {"root": str(memory), "host_root": str(host), "exploration_command": str(fake),
+              "exploration_model_provider": PROVIDER, "computer_exploration": {"enabled": True, "roots": [str(documents)]}}
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    prepared = prepare_codex_exploration(config)
+    assert prepared["state"] == "ready"
+    assert prepared["computer"]["protected_roots"] == [str(host), str(memory)]
+    run_codex(fake, TOPIC, tmp_path / "job-reader", computer=prepared["computer"], codex_home=home, **codex_kwargs())
+    reader = ComputerReader(json.loads((tmp_path / "job-reader" / "computer-reader.json").read_text()))
+    assert reader.checked_path(documents / "notes" / "trip.md") == (documents / "notes" / "trip.md").resolve()
+    for path in (host / "mind-config.json", memory / "memory.sqlite3", memory / "persona-policy.json",
+                 documents / "notes" / "shortcut" / "memory.sqlite3", home / "auth.json"):
+        with pytest.raises(ValueError, match="host-execution-material-excluded"):
+            reader.checked_path(path)

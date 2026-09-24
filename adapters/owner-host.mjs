@@ -149,9 +149,10 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:current?(sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
           ...(current?{failure:detail}:{})});
       }
-      // Kin picked among every ready wish the attempt offered; unnamed means all of them (N11).
-      const {desire_ids:named,...semantic}=decision;
-      const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:{};
+      // Kin picked among the ready wishes handed to her this round; unnamed means all of those,
+      // never a wish she was not shown (N11, CR-MIND-04). `handed_ids` is the host's, not hers.
+      const {desire_ids:named,handed_ids:handed,...semantic}=decision;
+      const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:Array.isArray(handed)&&handed.length?{desire_ids:handed}:{};
       const content=decision.action==='send'?decision.text:null;
       const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch(),...chosen,...(typeof content==='string'?{text:content}:{})});
       if(valid.reason==='repeats-unconfirmed-send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});

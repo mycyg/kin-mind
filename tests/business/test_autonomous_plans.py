@@ -273,10 +273,14 @@ def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
     assert plan["steps"][0]["owner_request_id"] == "task-1" and plan["steps"][0]["actor"] == "contact"
     assert plan["next_review_at"] == local_time(later)
     assert plans.defer_owner_task(request) == created
+    # CR-MIND-03: a source not in memory yet is the router's to retry; a time already past is due now.
     unknown = plans.defer_owner_task({**request, "task_id": "task-2", "input_ids": ["wechat:never-seen"]})
-    assert unknown == {"state": "needs-kin", "reason": "owner-source-unavailable"}
+    assert unknown == {"state": "retry", "reason": "owner-source-unavailable"}
     past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
-    assert past["state"] == "needs-kin"
+    assert past["state"] == "created" and past["due"] == "now"
+    late = plans.read(past["planId"])["plans"][0]
+    assert late["next_review_at"] == mind.clock() and not late["steps"][0].get("not_before")
+    assert plans.tick(ActionEvents(mind)), "a plan due now wakes its review at once"
     # The router's own call (WS3 plan-deferral): the task text as `request`, its input ids as evidence.
     MemoryContinuity(mind).ingest({"id": "wechat:task-4", "kind": "owner-message", "text": "Print the tickets", "at": mind.clock()})
     routed = plans.defer_owner_task({"task_id": "task-4", "request": "Print the tickets", "reason": "Tomorrow morning",
@@ -511,3 +515,31 @@ def test_a_deployment_leaves_decided_steps_ready_and_wakes_no_plan(env):
         assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0] == before
     reasons = {p["id"]: p["steps"][0]["waiting_reason"] for p in plans.read()["plans"]}
     assert reasons[first["id"]] is None and reasons[second["id"]] is None
+
+
+def test_a_deferral_answers_whether_it_can_ever_be_a_plan(env):
+    """CR-MIND-03 with WS3's router: a passing failure answers `retry`; one that can never be a
+    plan answers `needs-kin` with a stable reason and `permanent`, which the router keeps and tells
+    Kin once. The mind tells her nothing itself; a plan already made answers `created` again even
+    after its time has passed."""
+    mind, plans, source, clock, initial = env
+    later = (clock[0] + timedelta(hours=3)).isoformat()
+
+    def events():
+        with mind.engine.db.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM mind_action_events").fetchone()[0]
+    before = events()
+    request = {"task_id": "task-9", "request": "Book the tickets", "not_before": later, "evidence_ids": ["wechat:task-9"]}
+    assert plans.defer_owner_task(request) == {"state": "retry", "reason": "owner-source-unavailable"}
+    MemoryContinuity(mind).ingest({"id": "wechat:task-9", "kind": "owner-message", "text": "Book the tickets", "at": mind.clock()})
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    clock[0] += timedelta(hours=4)
+    again = plans.defer_owner_task(request)
+    assert again["state"] == "created" and again["planId"] == created["planId"]
+    MemoryContinuity(mind).configure({"autonomous_plans": False})
+    refused = plans.defer_owner_task({**request, "task_id": "task-10"})
+    assert refused == {"state": "needs-kin", "reason": "autonomous-plans-disabled", "permanent": True}
+    assert events() == before
+
+

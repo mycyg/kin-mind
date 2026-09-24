@@ -105,3 +105,35 @@ test('render dependencies are recorded with their versions; a browser that canno
   assert.equal(verifier.capabilities().static_html_render,false);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('a stop or a shutdown during the claim is not lost: the claimed run is interrupted, never started (CR-MIND-05)',async()=>{
+ for(const [how,reason] of [['stop','owner-stop'],['close','host-closing']]) {
+  const calls=[],started=[];let release;
+  const loop={tick:async()=>{},review:()=>{},stopExploration:()=>{}};
+  const worker=startAutonomousWork({loop,isBusy:()=>false,creator:{run:async()=>{started.push('run');return {state:'produced'};},stop(){}},
+   call:async(action,input)=>{calls.push([action,input]);if(action==='plan-claim')return new Promise(resolve=>{release=()=>resolve({state:'claimed',run:{id:'r-'+how,fence:3},plan:{id:'p'}});});return {};}});
+  const ticking=worker.tick();
+  await new Promise(resolve=>setImmediate(resolve));
+  if(how==='stop')loop.stopExploration();else void worker.close();
+  release();await ticking;
+  assert.deepEqual(started,[],how);
+  assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-interrupt'],how);
+  assert.deepEqual(calls[1][1],{run_id:'r-'+how,owner:'creator-'+process.pid,fence:3,reason},how);
+ }
+});
+
+test('the creation executor starts only when the router admits it, and leaves the in-flight set when done (CR-MIND-01)',async()=>{
+ const calls=[],activities=[];let frozen=true;
+ const loop={tick:async()=>{},review:()=>{}};
+ const worker=startAutonomousWork({loop,isBusy:()=>false,creator:{run:async()=>({state:'produced'}),stop(){}},
+  beginActivity:spec=>{activities.push(spec);return frozen?{ok:false,reason:'frozen'}:{ok:true,release(){activities.push('released');}};},
+  call:async(action,input)=>{calls.push([action,input]);if(action==='plan-claim')return {state:'claimed',run:{id:'r1',fence:1},plan:{id:'p'}};
+   if(action==='plan-result')return {state:'completed'};return {};}});
+ await worker.tick();
+ assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-interrupt']);
+ assert.equal(calls[1][1].reason,'dispatch-frozen');
+ frozen=false;calls.length=0;activities.length=0;
+ await worker.tick();
+ assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-result']);
+ assert.deepEqual(activities,[{kind:'creation',id:'r1'},'released']);
+});

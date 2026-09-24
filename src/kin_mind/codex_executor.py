@@ -383,6 +383,28 @@ def native_codex(config, legacy_key="exploration_command"):
     return (str(legacy), "legacy-command") if legacy else (None, None)
 
 
+def protected_roots(config):
+    """What exploration never reads, whatever roots the owner authorizes: the host's own
+    directory (its configuration, state, runtime bundle and Kin's Codex home), the memory
+    store and Kin's Codex home wherever it is kept. The reader resolves every path, these
+    included, before it compares them, so a symlink into one of them is refused as well."""
+    roots = [config.get("host_root"), config.get("root"), config.get("native_codex_home")]
+    return list(dict.fromkeys(str(Path(root).expanduser()) for root in roots if root))
+
+
+def reader_settings(computer, *, directory, attempt, ledger, codex_home=None):
+    """The file reader's settings for one run. Its deny list is the host's own and no broad
+    authorized root or missing exclude relaxes it: the run's directory (host-created configs,
+    credentials by reference, ledgers), Kin's Codex home and the protected roots."""
+    return {
+        **{key: value for key, value in computer.items() if key != "ui"},
+        "execution_id": Path(directory).name, "attempt": attempt,
+        "ledger": str(ledger),
+        "internal_deny_roots": [str(directory)] + ([str(codex_home)] if codex_home else [])
+                               + [str(root) for root in computer.get("protected_roots") or []],
+    }
+
+
 def native_codex_home(config):
     """Kin's own Codex home, when it exists: the runtime directory the host generates, so an
     exploration never reads or writes the desktop's ~/.codex. None keeps the per-run home."""
@@ -676,24 +698,19 @@ def run_codex(
         from .computer import ComputerReader
         computer_ledger = directory / "computer-observations.json"
         # UI/backend configuration never enters the file reader's on-disk
-        # config. The execution directory is denied even when an authorized root
-        # is broad enough to contain it.
-        reader_settings = {
-            **{key: value for key, value in computer.items() if key != "ui"},
-            "execution_id": directory.name, "attempt": attempt,
-            "ledger": str(computer_ledger),
-            # Kin's Codex home holds her runtime state and auth link; never exploration material.
-            "internal_deny_roots": [str(directory)] + ([str(codex_home)] if shared_home else []),
-        }
+        # config. The execution directory, Kin's Codex home and the protected roots are
+        # denied even when an authorized root is broad enough to contain them.
+        settings = reader_settings(computer, directory=directory, attempt=attempt, ledger=computer_ledger,
+                                   codex_home=codex_home if shared_home else None)
         computer_config = directory / "computer-reader.json"
-        computer_config.write_text(dumps(reader_settings))
+        computer_config.write_text(dumps(settings))
         computer_config.chmod(0o600)
         computer_mcp = {"command": sys.executable,
                         "args": ["-m", "kin_mind.computer", str(computer_config)],
                         "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[1])}}
-        topic = {**topic, "computer_context": ComputerReader(reader_settings).context(),
-                 "authorized_roots": reader_settings.get("roots", []),
-                 "previous_observations": reader_settings.get("previous", [])}
+        topic = {**topic, "computer_context": ComputerReader(settings).context(),
+                 "authorized_roots": settings.get("roots", []),
+                 "previous_observations": settings.get("previous", [])}
     ui_ledger = None
     ui_mcp = None
     backend_readiness = None
@@ -1170,6 +1187,9 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
     published exploration-gateway state file, read fresh at each dispatch."""
     environ = os.environ if environ is None else environ
     resolved_computer = copy.deepcopy(config.get("computer_exploration") or {})
+    if resolved_computer:
+        # The host's own roots are never exploration material (deploy_checks verifies it).
+        resolved_computer["protected_roots"] = protected_roots(config)
     try:
         command, source = native_codex(config)
     except CodexUnavailable as error:

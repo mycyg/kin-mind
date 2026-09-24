@@ -564,3 +564,75 @@ def test_a_delivered_bubble_counts_for_its_own_reply_not_the_newest_with_the_sam
 
     assert deliver("to-old", reply_input_id="reply-old") == "reply-old"
     assert deliver("unlinked") == "unlinked"
+
+
+def test_no_more_than_four_background_calls_whatever_is_configured(setup):
+    """CR-MIND-10: the entry, the admission read and the older lane all hold four as the ceiling;
+    a stored eight from before is read as four."""
+    from kin_mind import model_lanes
+    mind, _source, _clock = setup
+    engine = mind.engine
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (model_lanes.CAPACITY_KEY, 8))
+        assert model_lanes.capacity(conn) == (4, "configured")
+    ledger = model_lanes.Ledger(engine.db.path)
+    answers = [ledger.acquire("background", "synthetic-" + str(i), holder="test") for i in range(5)]
+    assert [a["state"] for a in answers] == ["admitted"] * 4 + ["wait"]
+    stored = model_lanes.configure(engine, 8)
+    assert stored["background_model_limit"] == 4 and stored["requested"] == 8
+    assert model_lanes.sync_capacity(engine, {"background_model_limit": 8}, startup=True) is None
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT value FROM meta WHERE key=?", (model_lanes.CAPACITY_KEY,)).fetchone()[0] == 4
+
+
+def test_a_session_review_commits_to_the_carrier_without_a_mind_revision(setup):
+    """CR-RT-10: through the real commit path, a maintenance result reaches the registry carrier in
+    one leased, idempotent transaction; the mind's revision, state row and history stay as they were."""
+    from kin_mind.session_advice import SessionAdvice
+    mind, source, _ = setup
+    context = {"id": "snapshot-9", "binding": {"generation": 2}, "evidence": [], "recent": []}
+    jobs = Appraisals(mind, session_context=context)
+    job = jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")
+    with mind.engine.db.connect() as conn:
+        before = (mind._load(conn)["revision"], conn.execute("SELECT COUNT(*) FROM mind_events").fetchone()[0])
+
+    class SnapshotReviewer(FakeReviewer):
+        def appraise(self, context):
+            return self.proposal, {"provider": "deepseek", "model": "synthetic"}
+    reviewer = SnapshotReviewer(Appraisal(reason="Keep it", session_advice=SessionAdvice(action="keep", reason="Fine")))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        after = (mind._load(conn)["revision"], conn.execute("SELECT COUNT(*) FROM mind_events").fetchone()[0])
+        carried = conn.execute("SELECT snapshot,data FROM mind_session_advice WHERE scope=?", (mind.scope.key(),)).fetchone()
+        receipt = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (job["id"],)).fetchone()[0])["result"]
+    assert after == before and carried["snapshot"] == "snapshot-9"
+    assert receipt["maintenance_only"] and receipt["revision"] == before[0]
+    assert mind.read()["session_advice"]["decision"]["action"] == "keep"
+    # The same command again answers from its receipt: nothing runs twice.
+    ran = []
+    payload = {"command_id": "maintenance-replay", "expected_revision": before[0], "agent_version": "synthetic-v1"}
+    first = mind._record_only(payload, lambda conn, state, eid: ran.append(eid) or {"n": len(ran)})
+    assert mind._record_only(payload, lambda conn, state, eid: ran.append(eid) or {"n": len(ran)}) == first and len(ran) == 1
+
+
+def test_an_older_session_judgment_leaves_the_current_state_once_the_carrier_has_it(setup):
+    """CR-MIND-12: the migration copies a legacy judgment to the carrier when it has none, removes
+    the field from the current state in one new revision, leaves earlier revisions alone, and does
+    nothing the second time."""
+    mind, _source, _ = setup
+    legacy = {"decision": {"action": "keep"}, "snapshotId": "old-snapshot", "generation": 1, "eventId": "mind_old", "receipt": {}}
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        state["session_advice"] = legacy
+        mind._save(conn, state)
+        stored_revision = state["revision"]
+    moved = mind.retire_session_advice()
+    assert moved["state"] == "moved" and moved["revision"] == stored_revision + 1 and moved["carrier_event_id"] == "mind_old"
+    with mind.engine.db.connect() as conn:
+        assert "session_advice" not in mind._load(conn)
+        assert conn.execute("SELECT snapshot FROM mind_session_advice WHERE scope=?", (mind.scope.key(),)).fetchone()[0] == "old-snapshot"
+        assert conn.execute("SELECT kind FROM mind_events WHERE scope=? AND revision=?",
+                            (mind.scope.key(), moved["revision"])).fetchone()[0] == "session-advice-migration"
+    assert mind.retire_session_advice() == {"state": "unchanged"}
+    assert mind.read()["session_advice"]["snapshotId"] == "old-snapshot"

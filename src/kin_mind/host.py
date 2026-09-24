@@ -512,6 +512,8 @@ def dispatch(config, action, request):
     if action == "settle":
         return mind.settle_contact(**request)
     if action == "recover":
+        # CR-MIND-12: an older release kept the session judgment in the versioned state.
+        mind.retire_session_advice()
         # A start-up used to assume the previous service was gone and interrupt every
         # running exploration. It asks now: a row is interrupted only when its worker
         # is provably gone — the pid is dead, the pid became some other process, or

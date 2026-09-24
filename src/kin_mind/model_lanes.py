@@ -43,6 +43,9 @@ LEDGER_BUSY_MS = 2000
 BACKGROUND_BUSY_MS = 30000
 CAPACITY_KEY = "kin_background_model_limit"
 DEFAULT_BACKGROUND_LIMIT = 2
+# §0: never more than four background model calls at once, whatever a file, an operator or an
+# older store says. A larger value anywhere is read as this one (CR-MIND-10).
+BACKGROUND_LIMIT_CEILING = 4
 USER_WORK_LIMIT = 1
 RETRY_SECONDS = 30
 # core/jobs.py and recovery.py match on these two strings: they stay byte-identical.
@@ -122,7 +125,7 @@ def enabled(conn):
 def capacity(conn):
     """(limit, source). A missing limit is never a silent 2: the source says so and admission writes a metric."""
     row = conn.execute("SELECT value FROM meta WHERE key=?", (CAPACITY_KEY,)).fetchone()
-    return (max(1, min(8, row[0])), "configured") if row else (DEFAULT_BACKGROUND_LIMIT, "default-unconfigured")
+    return (max(1, min(BACKGROUND_LIMIT_CEILING, row[0])), "configured") if row else (DEFAULT_BACKGROUND_LIMIT, "default-unconfigured")
 
 
 def foreground_active(conn, scope=None):
@@ -307,12 +310,15 @@ def lease_command(root, request):
 
 
 def configure(engine, limit):
-    """One database-wide limit, shared by every process and scope."""
+    """One database-wide limit, shared by every process and scope. A request above the ceiling is
+    stored as the ceiling, and the answer says what was asked (CR-MIND-10)."""
     if type(limit) is not int or not 1 <= limit <= 8:
         raise ValueError("Background model capacity must be between 1 and 8")
+    effective = min(limit, BACKGROUND_LIMIT_CEILING)
     with engine.db.connect(write=True) as conn:
-        conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (CAPACITY_KEY, limit))
-    return {"background_model_limit": limit, "foreground_priority": True, "source": "configured", "user_work_limit": USER_WORK_LIMIT}
+        conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (CAPACITY_KEY, effective))
+    return {"background_model_limit": effective, "foreground_priority": True, "source": "configured", "user_work_limit": USER_WORK_LIMIT,
+            **({"requested": limit, "ceiling": BACKGROUND_LIMIT_CEILING} if effective != limit else {})}
 
 
 def sync_capacity(engine, config, *, startup=False):
@@ -328,9 +334,11 @@ def sync_capacity(engine, config, *, startup=False):
             # Not a reason to keep the host down, and not silent either.
             engine.db.metric("model_capacity_invalid", 1, {"source": "host-config"})
         return None
+    if limit > BACKGROUND_LIMIT_CEILING:
+        engine.db.metric("model_capacity_clamped", 1, {"source": "host-config"})
     with engine.db.connect() as conn:
         current = conn.execute("SELECT value FROM meta WHERE key=?", (CAPACITY_KEY,)).fetchone()
-    if current and (current[0] == limit or not startup):
+    if current and (current[0] == min(limit, BACKGROUND_LIMIT_CEILING) or not startup):
         return None
     return configure(engine, limit)
 
@@ -469,7 +477,7 @@ def _legacy_slot(engine, purpose, background):
         now = time.time()
         conn.execute("DELETE FROM mind_model_leases WHERE expires_at<=?", (now,))
         configured = conn.execute("SELECT value FROM meta WHERE key='kin_background_model_limit'").fetchone()
-        limit = max(1, min(8, configured[0])) if configured else 2
+        limit = max(1, min(BACKGROUND_LIMIT_CEILING, configured[0])) if configured else 2
         if conn.execute("SELECT COUNT(*) FROM mind_model_leases WHERE lane='background'").fetchone()[0] >= limit:
             raise ModelAdmissionWait("deepseek-background-capacity")
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_foreground_leases'").fetchone() and conn.execute("SELECT 1 FROM mind_foreground_leases WHERE expires_at>? LIMIT 1", (now,)).fetchone():

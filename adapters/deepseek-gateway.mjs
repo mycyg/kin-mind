@@ -106,13 +106,12 @@ const unflattenItem = (item, reverse) => {
 };
 
 export const DEEPSEEK_EFFORTS = Object.freeze(['none', 'low', 'high', 'max']);
-// The host's own background calls keep the instance's effort whatever a request
-// says; the phone session's requests are forwarded with the effort the session
-// asked for (its router profile, or the owner's explicit manual choice), and the
-// instance effort only fills in when a request names none.
-const FIXED_EFFORT_PROFILES = new Set(['exploration', 'computer-action-review']);
-export const forwardedEffort = (body, reasoningEffort, profile = null) =>
-  !FIXED_EFFORT_PROFILES.has(profile) && DEEPSEEK_EFFORTS.includes(body?.reasoning?.effort) ? body.reasoning.effort : reasoningEffort;
+// §0: every request the Kin host sends to DeepSeek runs at high, whatever the request, its
+// router profile or the instance option says: assessments, contact drafts and ordinary
+// session turns alike (CR-MIND-11). Other providers never pass through this gateway. What the
+// request asked for stays visible in the instruction evidence (`requestedReasoningEffort`).
+export const KIN_DEEPSEEK_EFFORT = 'high';
+export const forwardedEffort = () => KIN_DEEPSEEK_EFFORT;
 
 // DeepSeek treats developer messages as user input. Map trusted developer
 // instructions to its supported system role; leave user data and receipts alone.
@@ -242,16 +241,19 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       }
       const raw = Buffer.concat(parts).toString('utf8');
       const parsed=JSON.parse(raw);
+      const identity=nativeInstructionRequestIdentity(req.headers,parsed);
       // The callback is trusted host state. A request never self-declares its
       // purpose; dynamic contact drafts receive their structured contract from
       // the same explicit attribution that owns their background usage lane.
-      attributed = attribute() ?? nativeTurnPurpose();
+      // It is told which native thread asked, so a fork beside the owner's turn
+      // is told apart from her own request (CR-MIND-06).
+      attributed = attribute({identity, body: parsed}) ?? nativeTurnPurpose();
       const requestProfile=profile??(attributed.purpose==='native-assessment'?'assessment':attributed.purpose==='native-contact-draft'?'contact-draft':null);
       const body = deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
       const incomingInstructions=instructionTextEvidence(parsed.instructions);
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:'deepseek',lane:attributed.lane,
         purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,
-        requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:nativeInstructionRequestIdentity(req.headers,parsed),
+        requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:identity,
         nativeRequestSha256:sha256(raw),developerInstructions:developerInstructionEvidence(parsed),
         incomingInstructions,forwardedInstructions:instructionTextEvidence(body.instructions)};
       if(requiredIncomingInstructions&&(incomingInstructions.sha256!==requiredIncomingInstructions.sha256||
