@@ -18,8 +18,13 @@ function finalObject(text) {
   return null;
 }
 
+/** How long Kin may put a contact off (N9): five minutes to three days. A wait past either
+ * end is taken to that end and kept, never refused (kin_mind.state keeps the same range). */
+export const CONTACT_WAIT_SECONDS={min:300,max:259200};
+
 /** A decision, or null when the output is not one. No body is ever shortened:
- * content the channel cannot carry in one message is fragmented downstream. */
+ * content the channel cannot carry in one message is fragmented downstream. A decision names its
+ * action: an object with text and no action is not a send (AD2-17). */
 function decide(result) {
   if(result.action==='send'&&Array.isArray(result.bubbles)) {
     if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {
@@ -32,14 +37,13 @@ function decide(result) {
     }
     return null;
   }
-  // Older hosts can finish an already-started draft during a rolling upgrade.
-  if(result.text===null&&!result.action)return {action:'wait',condition:'new_evidence',reason:'Legacy empty draft; a new related source is required'};
-  if((result.action==='send'||!result.action)&&typeof result.text==='string'&&result.text.trim())return {action:'send',text:result.text.trim()};
+  if(result.action==='send'&&typeof result.text==='string'&&result.text.trim())return {action:'send',text:result.text.trim()};
   if(!['wait','abandon'].includes(result.action)||typeof result.reason!=='string'||!result.reason.trim()||result.reason.length>1200)return null;
   if(result.action==='abandon')return {action:'abandon',reason:result.reason.trim()};
   if(!['time','new_evidence','owner_reply'].includes(result.condition))return null;
-  const seconds=result.retry_after_seconds??1800;
-  if(result.condition==='time'&&(!Number.isSafeInteger(seconds)||seconds<300||seconds>21600))return null;
+  const requested=result.retry_after_seconds??1800;
+  if(result.condition==='time'&&(typeof requested!=='number'||!Number.isFinite(requested)))return null;
+  const seconds=Math.min(CONTACT_WAIT_SECONDS.max,Math.max(CONTACT_WAIT_SECONDS.min,Math.round(requested)));
   return {action:'wait',reason:result.reason.trim(),condition:result.condition,...(result.condition==='time'?{retry_after_seconds:seconds}:{})};
 }
 
@@ -62,4 +66,4 @@ export const contactDraftInstructions = `${chatVoice}\n内部主动联系草稿�
 {"action":"wait","condition":"time","retry_after_seconds":1800,"reason":"暂不适合、稍后复核的具体原因"}
 {"action":"wait","condition":"owner_reply","reason":"需要等待用户的回应"}
 {"action":"wait","condition":"new_evidence","reason":"需要什么新资料才能形成内容"}
-time 表示已有内容的临时推迟，复核间隔为 300—21600 秒；new_evidence 表示内容不足。过去的出门或忙碌不是永久禁联，不能据此虚构用户当前仍忙。明确的拒绝与停止仍有效。作息与打扰程度由我结合当前情境判断；宿主协调真实新消息、当前意图与发送回执，不另设固定时段或等待回复门槛。`;
+time 表示已有内容的临时推迟，复核间隔为 300—259200 秒（五分钟到三天）；new_evidence 表示内容不足。过去的出门或忙碌不是永久禁联，不能据此虚构用户当前仍忙。明确的拒绝与停止仍有效。作息与打扰程度由我结合当前情境判断；宿主协调真实新消息、当前意图与发送回执，不另设固定时段或等待回复门槛。`;

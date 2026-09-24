@@ -124,9 +124,9 @@ export class MindLoop {
       if(attempt.state!=='drafting')return attempt;
       let decision;
       try {
-        const result=await this.withHostContext({kind:'contact-draft',operation_id:attempt.id,lane:'background'},()=>this.draft(attempt));
-        decision=typeof result==='string'?{action:'send',text:result}:result??{action:'wait',condition:'new_evidence',reason:'Legacy empty draft'};
-        if(!['send','wait','abandon'].includes(decision.action))throw Error('contact-draft-invalid-result');
+        // The draft is Kin's decision object; the host never makes one up for her (AD2-17).
+        decision=await this.withHostContext({kind:'contact-draft',operation_id:attempt.id,lane:'background'},()=>this.draft(attempt));
+        if(!decision||typeof decision!=='object'||!['send','wait','abandon'].includes(decision.action))throw Error('contact-draft-invalid-result');
       } catch(error) {
         const current=!this.closed&&epoch===this.ownerEpoch();
         const detail=failure(error,{stage:'contact-draft-execution',code:'contact-draft-execution-failed'});

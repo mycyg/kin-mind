@@ -102,6 +102,17 @@ class AffectiveEvent(Model):
         return self
 
 
+# How long Kin may put a contact off (N9): five minutes to three days. A wait past either end is
+# taken to that end and kept, never refused.
+CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
+
+
+def contact_wait_seconds(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+        return max(CONTACT_WAIT_MIN_SECONDS, min(CONTACT_WAIT_MAX_SECONDS, int(round(v))))
+    return v
+
+
 class DesireChange(Model):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
@@ -122,9 +133,10 @@ class DesireChange(Model):
     exploration_id: str | None = Field(default=None, max_length=100)
     reason: str = Field(min_length=1)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
-    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
 
     _time = field_validator("expires_at")(lambda v: utc(v) if v else v)
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
 
     @model_validator(mode="after")
     def shape(self):
@@ -158,7 +170,9 @@ class ContactDecision(Model):
     action: Literal["wait", "abandon"]
     reason: str = Field(min_length=1)
     condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
-    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
+
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
 
 
 _CONTACT_RECEIPT_STRINGS = {

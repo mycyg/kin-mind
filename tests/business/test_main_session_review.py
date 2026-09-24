@@ -207,3 +207,13 @@ def test_kin_chooses_when_to_think_again_within_a_day(setup):
         memory.commit_action(conn, [], 'event-n8', 600, {})
         row = conn.execute('SELECT next_review FROM mind_action_schedule WHERE scope=?', (mind.scope.key(),)).fetchone()
     assert timestamp(row['next_review']) - timestamp(mind.clock()) >= timedelta(minutes=599)
+
+
+def test_contact_waits_reach_three_days_and_are_clamped_not_refused():
+    """N9: a wait of up to 72 hours is kept; one past either end is taken to that end."""
+    from kin_mind.appraisal import WishUpdate
+    from kin_mind.state import ContactDecision
+    assert ContactDecision(action='wait', reason='r', condition='time', retry_after_seconds=10**6).retry_after_seconds == 259200
+    update = lambda seconds: WishUpdate(desire_id='d', action='wait', reason='r', wait_condition='time',
+                                        retry_after_seconds=seconds).retry_after_seconds
+    assert [update(100), update(172800), update(10**7)] == [300, 172800, 259200]

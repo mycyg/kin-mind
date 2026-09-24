@@ -37,7 +37,8 @@ from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
 from .model_runtime import ModelAdmissionWait, evaluation_slot, request_client
 from .profile import DIMENSIONS
-from .state import AffectiveEvent, DesireChange, Evolution, Motivation, timestamp
+from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, AffectiveEvent, DesireChange, Evolution,
+                    Motivation, contact_wait_seconds, timestamp)
 
 APPRAISAL_INPUT_BUDGET = 64000
 # How far ahead the next quiet review may be asked for. The ordinary ceiling holds whenever the
@@ -128,7 +129,9 @@ class WishUpdate(Model):
     concern_ids: list[str] | None = Field(default=None, max_length=10)
     reason: str = Field(min_length=1)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
-    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
+
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
 
     @field_validator("action")
     @classmethod

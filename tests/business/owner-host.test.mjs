@@ -2,22 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MindLoop} from '../../adapters/owner-host.mjs';
 import {createContactBatch} from '../../adapters/contact-batch.mjs';
+import {parseContactDraft} from '../../adapters/contact-draft.mjs';
 function fixture(overrides={}) {
  const events=[];let epoch='owner-1';let eligible=true;let busy=false;
- const loop=new MindLoop({call:async(action,req)=>{events.push([action,req]);if(action==='candidate')return{eligible:true};if(action==='claim')return{id:'stable-id',state:'drafting'};if(action==='check')return{eligible:true};return req;},eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,draft:async()=> 'A sourced hello',send:async()=>({state:'accepted',messageId:'server-id'}),...overrides});
+ const loop=new MindLoop({call:async(action,req)=>{events.push([action,req]);if(action==='candidate')return{eligible:true};if(action==='claim')return{id:'stable-id',state:'drafting'};if(action==='check')return{eligible:true};return req;},eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,draft:async()=>({action:'send',text:'A sourced hello'}),send:async()=>({state:'accepted',messageId:'server-id'}),...overrides});
  // These tests exercise one contact tick; durable queue behavior is tested with SQLite.
  loop.review=async()=>{};
  return{loop,events,change:()=>{epoch='owner-2';},quiet:()=>{eligible=false;},busy:()=>{busy=true;}};
 }
-test('under four hours is allowed by threshold; accepted receipt settles',async()=>{const{loop,events}=fixture();await loop.tick();assert.equal(events.at(-1)[1].state,'accepted');assert.equal(events.filter(x=>x[0]==='claim').length,1);});
+test('an eligible wish is drafted once and an accepted receipt settles',async()=>{const{loop,events}=fixture();await loop.tick();assert.equal(events.at(-1)[1].state,'accepted');assert.equal(events.filter(x=>x[0]==='claim').length,1);});
 test('initial partial acceptance is preserved in the durable settlement',async()=>{const{loop,events}=fixture({send:async()=>({state:'accepted',messageId:'server-id',messageIds:['server-id'],partial:true,canceledBubbles:1})});await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'accepted');assert.equal(settled.partial,true);assert.equal(settled.canceled_bubbles,1);});
-test('quiet hours and waiting owner never draft',async()=>{const{loop,events,quiet}=fixture();quiet();await loop.tick();assert.equal(events.length,0);});
-test('new message invalidates a draft',async()=>{let f;f=fixture({draft:async()=>{f.change();return'outdated';},send:async()=>assert.fail('must not send')});await f.loop.tick();assert.equal(f.events.at(-1)[1].state,'canceled');});
+test('an ineligible moment never drafts',async()=>{const{loop,events,quiet}=fixture();quiet();await loop.tick();assert.equal(events.length,0);});
+test('new message invalidates a draft',async()=>{let f;f=fixture({draft:async()=>{f.change();return{action:'send',text:'outdated'};},send:async()=>assert.fail('must not send')});await f.loop.tick();assert.equal(f.events.at(-1)[1].state,'canceled');});
 test('missing message ID is unconfirmed',async()=>{const{loop,events}=fixture({send:async()=>({state:'accepted'})});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');});
 test('timeout never invents another send ID',async()=>{const{loop,events}=fixture({send:async()=>{throw Error('timeout');}});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');assert.equal(events.filter(x=>x[0]==='claim').length,1);});
-test('concurrent ticks share one draft',async()=>{let release;const gate=new Promise(r=>release=r);const{loop,events}=fixture({draft:async()=>{await gate;return'hello';}});const one=loop.tick();await new Promise(r=>setImmediate(r));await loop.tick();release();await one;assert.equal(events.filter(x=>x[0]==='claim').length,1);});
+test('concurrent ticks share one draft',async()=>{let release;const gate=new Promise(r=>release=r);const{loop,events}=fixture({draft:async()=>{await gate;return{action:'send',text:'hello'};}});const one=loop.tick();await new Promise(r=>setImmediate(r));await loop.tick();release();await one;assert.equal(events.filter(x=>x[0]==='claim').length,1);});
 
-test('empty legacy draft requires evidence without sending',async()=>{const{loop,events}=fixture({draft:async()=>null,send:async()=>assert.fail('must not send')});await loop.tick();assert.equal(events.at(-1)[1].decision.condition,'new_evidence');});
+test('a draft without a decision is a format failure, never a host-made wait (AD2-17)',async()=>{const{loop,events}=fixture({draft:async()=>null,send:async()=>assert.fail('must not send')});await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'canceled');assert.equal(settled.decision,undefined);assert.equal(settled.failure.category,'model-output');});
 
 test('temporary defer preserves a declared wake condition',async()=>{const{loop,events}=fixture({draft:async()=>({action:'wait',condition:'time',retry_after_seconds:1800,reason:'Revisit later'}),send:async()=>assert.fail('must not send')});await loop.tick();assert.equal(events.at(-1)[1].decision.retry_after_seconds,1800);assert.equal(events[0][0],'reconsider');});
 test('invalid draft is a recoverable execution failure with a redacted stage',async()=>{const{loop,events}=fixture({draft:async()=>{throw Error('invalid JSON');},send:async()=>assert.fail('must not send')});await loop.tick();assert.equal(events.at(-1)[1].reason,'draft-failed');assert.deepEqual(events.at(-1)[1].failure,{category:'unknown',stage:'contact-draft-execution',code:'contact-draft-execution-failed',retry_condition:'backoff'});});
@@ -32,7 +33,7 @@ test('routine blocking reasons are observable',async()=>{let status;const{loop}=
 test('the explicit contact-draft host context remains active for the complete draft promise',async()=>{
  let active,release;const gate=new Promise(resolve=>release=resolve),seen=[];
  const{loop}=fixture({withHostContext:async(context,run)=>{active=context;seen.push(['open',structuredClone(context)]);try{return await run();}finally{seen.push(['close',active.operation_id]);active=null;}},
-   draft:async()=>{assert.equal(active.kind,'contact-draft');assert.equal(active.lane,'background');await gate;return'hello';}});
+   draft:async()=>{assert.equal(active.kind,'contact-draft');assert.equal(active.lane,'background');await gate;return{action:'send',text:'hello'};}});
  const pending=loop.tick();await new Promise(resolve=>setImmediate(resolve));assert.equal(active.operation_id,'stable-id');release();await pending;
  assert.deepEqual(seen.map(event=>event[0]),['open','close']);assert.equal(active,null);
 });
@@ -83,7 +84,7 @@ test('repeated proven pre-submit failures release for DS review while unknown de
    const journal=new Map(),sent=[],settlements=[];let state=null;
    const batch=createContactBatch({read:key=>structuredClone(journal.get(key)),write:(key,value)=>journal.set(key,structuredClone(value)),
      maxFailures:2,receipt,send:async request=>{sent.push(request.id);throw Error('synthetic interruption');}});
-   const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-1',isBusy:()=>false,draft:async()=> 'One',send:batch,
+   const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-1',isBusy:()=>false,draft:async()=>({action:'send',text:'One'}),send:batch,
      resume:()=>batch({id}),call:async(action,request)=>{
        if(action==='reconsider')return{};
        if(action==='candidate')return ['pending','unconfirmed'].includes(state)
@@ -110,7 +111,7 @@ for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
  test(`a ${boundary} after durable pending never becomes an unknown send`,async()=>{
   let state,epoch='owner-1',busy=false,eligible=true,first=true,sends=0,claims=0;
   const loop=new MindLoop({eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,
-   draft:async()=> 'A current thought',send:async()=>{sends++;return{state:'accepted',messageId:'receipt'};},
+   draft:async()=>({action:'send',text:'A current thought'}),send:async()=>{sends++;return{state:'accepted',messageId:'receipt'};},
    resume:async()=>assert.fail('a proven unsent attempt must not require transport reconciliation'),
    call:async(action,request)=>{
     if(action==='candidate')return ['pending','unconfirmed'].includes(state)
@@ -143,4 +144,9 @@ test('a new owner message does not stop background exploration (N7); closing doe
  let stops=0;const{loop}=fixture({stopExploration:()=>{stops++;}});
  await loop.ingest({id:'owner-hi',text:'hi'});assert.equal(stops,0);
  loop.close();assert.equal(stops,1);
+});
+test('a contact wait of up to three days is kept; one past either end is taken to that end (N9)',()=>{
+ const wait=seconds=>parseContactDraft(JSON.stringify({action:'wait',condition:'time',retry_after_seconds:seconds,reason:'Later'})).retry_after_seconds;
+ assert.deepEqual([wait(60),wait(172800),wait(432000)],[300,172800,259200]);
+ assert.throws(()=>parseContactDraft(JSON.stringify({text:'An object without an action'})),/contact-draft-invalid-result/);
 });
