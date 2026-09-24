@@ -300,6 +300,65 @@ def test_tool_round_trip_search_read_cite_with_a_stand_in_cli(tmp_path, monkeypa
     assert not (job / "codex-home").exists()
 
 
+
+def _stub_site():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            port = str(self.server.server_address[1])
+            body = (('<a class="result__a" href="/l/?uddg=http%3A%2F%2F127.0.0.1%3A' + port + '%2Fpage">P</a>')
+                    if self.path.startswith("/search") else
+                    "<html><head><title>Probe Page</title></head><body>The answer is teal.</body></html>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_a_failed_citation_keeps_what_the_run_read_and_its_draft(tmp_path, monkeypatch):
+    """K2-08: one unread citation fails the run, but the page it did read and its draft stay in
+    the checkpoint the next attempt starts from."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    server, base = _stub_site()
+    driver = tmp_path / "codex-driver"
+    body = DRIVER.format(python=sys.executable).replace(
+        "'sources': [{'url': page['locator'], 'title': 'Probe Page'}]",
+        "'sources': [{'url': page['locator'], 'title': 'Probe Page'}, {'url': 'https://unread.example/x', 'title': 'Never read'}]")
+    assert "unread.example" in body
+    driver.write_text(body)
+    driver.chmod(0o700)
+    try:
+        report = run_codex(driver, {"question": "What does the probe page say?"}, tmp_path / "job",
+                           web={"enabled": True, "search_endpoint": base + "/search", "allow_hosts": ["127.0.0.1"]},
+                           budget_seconds=60, **codex_kwargs())
+    finally:
+        server.shutdown()
+    assert report["state"] == "failed" and report["reason"] == "unbacked-citation" and report["result"] is None
+    checkpoint = report["checkpoint"]
+    assert checkpoint["partial_findings"]["summary"] == "The answer is teal."
+    read = [entry for entry in checkpoint["sources_used"] if entry["state"] == "observed"]
+    assert read and read[0]["locator"].endswith("/page")
+    assert any("unread.example" in gap for gap in checkpoint["gaps"])
+
+
+def test_a_citation_prefers_what_this_run_read_over_a_carried_receipt():
+    """K4-17: the version read now wins over the checkpoint's older receipt for the same page."""
+    from kin_mind.source_ledger import legitimize
+    old = {"state": "historical", "locator": "https://site.example/a", "version": "v1", "evidence_id": "old"}
+    new = {"state": "observed", "locator": "https://site.example/a", "version": "v2", "evidence_id": "new"}
+    assert legitimize([new, old], "https://site.example/a")["version"] == "v2"
+    assert legitimize([old], "https://site.example/a")["version"] == "v1"
+
 def test_exploration_runs_the_runtime_bundle_codex_not_the_floating_cli(tmp_path):
     """K2-15, item 9: an explicit native_codex_command wins; else the verified runtime bundle's
     binary; the legacy command only where no bundle is installed; a changed manifest waits."""

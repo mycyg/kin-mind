@@ -27,9 +27,11 @@ from eventmem.core.db import digest, dumps
 from eventmem.paths import atomic_write
 
 from .exploration import CodexUnavailable, Findings
+from .computer import redact
 from .source_ledger import (
     build_ledger,
     coverage,
+    seal_source_receipt,
     valid_computer_receipt,
     valid_web_receipt,
     validate_continuation_sources,
@@ -991,7 +993,9 @@ def run_codex(
                         extra_gaps = ["rejected unbacked citation: " + citation for citation in rejected[:10]]
                         extra_gaps += ["rejected unknown evidence id: " + identifier for identifier in unknown_ids[:10]]
                         evidence_coverage = coverage(result, ledger)
-                        partial_findings = None
+                        # The run still failed and nothing of it reaches memory; what it
+                        # concluded stays the draft a later attempt starts from (K2-08).
+                        partial_findings = result
                         result = None
                     else:
                         state = "complete"
@@ -1016,7 +1020,12 @@ def run_codex(
         else:
             usage = {"status": "unknown", "per_request": reported, "total": None}
         checkpoint = None
-        if state != "complete" and (state in {"preempted", "timed-out"} or partial_findings is not None or extra_gaps):
+        # What this run itself read is kept whatever became of its answer: the host's own ledger,
+        # not the conclusion's citations, decides what a later attempt need not read again (K2-08).
+        read_now = [entry for entry in ledger if entry["state"] == "observed"
+                    and entry.get("execution_id") == directory.name and entry.get("attempt") == attempt]
+        if state != "complete" and (state in {"preempted", "timed-out"} or partial_findings is not None
+                                    or extra_gaps or read_now or turn_completed):
             # Sources are parsed before the checkpoint is written: only ledger-
             # verified receipts continue as usable; everything else is a draft
             # claim — never a fact, never a share, never persona growth.
@@ -1025,6 +1034,12 @@ def run_codex(
             unverified = [] if partial_findings is None else [
                 citation.url for citation in partial_findings.sources
                 if not any(entry["cited_as"] == citation.url for entry in verified)]
+            cited = {entry["locator"] for entry in verified}
+            for entry in read_now:
+                if entry["locator"] not in cited:
+                    cited.add(entry["locator"])
+                    verified.append({**seal_source_receipt(entry, execution_id=directory.name, attempt=attempt),
+                                     "cited_as": entry["locator"], "citation_title": entry.get("title", "")})
             checkpoint = {
                 "exploration_id": directory.name,
                 "attempt": attempt,
@@ -1101,6 +1116,10 @@ def run_codex(
             **({"observations": observations} if observations else {}),
             **({"web_observations": web_observations} if web_observations else {}),
             **({"checkpoint": checkpoint} if checkpoint else {}),
+            # The one text-only correction, paid or not, is part of this attempt's record (K2-08).
+            **({"final_repair": final_repair} if final_repair else {}),
+            # Why a run failed, in the CLI's own words, redacted and short (K2-15).
+            **({"stderr_tail": redact(diagnostic_text[-600:])} if state != "complete" and diagnostic_text.strip() else {}),
         }
         atomic_write(directory / "receipt.json", dumps(receipt))
         (directory / "receipt.json").chmod(0o600)
