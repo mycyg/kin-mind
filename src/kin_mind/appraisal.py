@@ -1305,15 +1305,22 @@ class NativeReview(DeepSeek):
             "context": context, "schema": schema, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
         if answer.get("state") == "waiting":
+            spent = answer.get("receipt") or {}
+            reason = str(answer.get("reason") or "")
             if answer.get("model_invoked"):
                 # A fork that failed, timed out or was interrupted is deferred, not failed (WS4);
                 # what it used is kept from its receipt (PROBE).
-                spent = answer.get("receipt") or {}
-                attempts.record_call(self, name, outcome=answer.get("reason") if spent else "owner-preempted",
+                attempts.record_call(self, name, outcome=reason if spent else "owner-preempted",
                                      model=spent.get("model"), request_id=spent.get("native_turn_id"),
                                      usage=spent.get("usage"), elapsed_ms=round((time.monotonic()-started)*1000),
                                      detail=({"fork_thread_id": spent["fork_thread_id"]} if spent.get("fork_thread_id") else None))
-            raise ModelAdmissionWait(answer.get("reason") or "foreground-active")
+            if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
+                # CR-MIND-07: this fork ran. It stays deferred and never goes to the main thread, but
+                # it is not "not admitted": it spends the transient-failure budget and its backoff,
+                # and the budget running out sets the row aside like any other outage.
+                self.failure_receipt = {**spent, **attempts.usage_entry(spent.get("usage")), "outcome": reason or "fork-deferred"}
+                raise RuntimeError("native-review-" + (reason if re.fullmatch(r"fork-[a-z-]{1,40}", reason) else "fork-deferred"))
+            raise ModelAdmissionWait(reason or "foreground-active")
         if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
             # No finished turn to fork from yet (or the session is not loaded): the assessment
             # cannot run now and is asked again later. Not Kin's failure, never charged, and never
@@ -1434,19 +1441,25 @@ class Appraisals:
             )
         return {"id": job_id, "state": self.status(job_id)["state"]}
 
-    def enqueue_maintenance(self, snapshot_id, agent_version):
+    def enqueue_maintenance(self, snapshot_id, agent_version, request_id=None):
         """A session review. Its stimulus is the session snapshot the host observed, named by its
         id; nothing is received into memory for it, so no maintenance source accumulates (item 7).
-        One job per snapshot."""
+        One job per snapshot and host attempt: asked again for the same attempt it is the same
+        job, a new attempt is a new one (CR-RT-08). The answer says which job, for which snapshot
+        and attempt, and whether this call created it."""
         if not isinstance(snapshot_id, str) or not snapshot_id:
             raise ValueError("A session review needs the observed snapshot id")
-        job_id = "appraise_" + digest([self.mind.scope.key(), "session-maintenance", snapshot_id])[:32]
+        if request_id is not None and (not isinstance(request_id, str) or not request_id):
+            raise ValueError("A session review attempt needs an id")
+        key = [self.mind.scope.key(), "session-maintenance", snapshot_id] + ([request_id] if request_id else [])
+        job_id = "appraise_" + digest(key)[:32]
         data = {"evidence_ids": [], "agent_version": agent_version, "origin": "reflection",
-                "stimulus": "session-maintenance", "session_snapshot_id": snapshot_id}
+                "stimulus": "session-maintenance", "session_snapshot_id": snapshot_id,
+                **({"session_request_id": request_id} if request_id else {})}
         with self.engine.db.connect(write=True) as conn:
-            conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                         (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data)))
-        return {"id": job_id, "state": self.status(job_id)["state"]}
+            created = conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                                   (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data))).rowcount == 1
+        return {"id": job_id, "state": self.status(job_id)["state"], "snapshotId": snapshot_id, "requestId": request_id, "created": created}
 
     def migrate_continuity(self, evidence_ids, agent_version):
         """One durable migration; include original evidence of live wishes only."""
@@ -1644,13 +1657,36 @@ class Appraisals:
 
     def _tool_fetched(self, proposal, receipt, supplied, started):
         """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
-        cites that this request did not supply is accepted when the turn's tool receipts show a
-        completed tool read, and the id resolves to a current record of this scope that already
-        existed when the attempt began. Anything else is still refused by the section's own check."""
+        cites that this request did not supply is accepted only when a completed tool call of this
+        turn returned that very source or record, at its current revision when the call named one
+        (its receipt's `ids`, CR-MIND-08), and the id resolves to a
+        current record of this scope that already existed when the attempt began. A tool that
+        succeeded at something else vouches for nothing; a receipt without ids admits nothing."""
         native = receipt.get("native_receipt") or {}
         calls = native.get("tool_calls") or receipt.get("tool_calls") or []
-        if not any(isinstance(call, dict) and call.get("ok") is True for call in calls):
+        # What each completed call returned, WS1's [{id, revision}]: {id: {revision, ...}}, with
+        # None where a call named no revision.
+        returned = {}
+        for call in calls:
+            if not (isinstance(call, dict) and call.get("ok") is True and isinstance(call.get("ids"), list)):
+                continue
+            for entry in call["ids"]:
+                identifier = entry.get("id") if isinstance(entry, dict) else entry
+                if isinstance(identifier, str) and identifier:
+                    revision = entry.get("revision") if isinstance(entry, dict) else None
+                    returned.setdefault(identifier, set()).add(
+                        revision if isinstance(revision, int) and not isinstance(revision, bool) else None)
+        if not returned:
             return {}
+
+        def read_back(ref):
+            # A record returned at a revision other than its current one: what was read is not
+            # what would be cited.
+            for key in ("record_id", "source_id"):
+                seen = returned.get(ref[key])
+                if seen is not None:
+                    return key != "record_id" or None in seen or ref.get("revision") in seen
+            return False
         known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
         cited = set()
 
@@ -1672,7 +1708,8 @@ class Appraisals:
                     refs = self.mind._evidence(conn, [identifier])
                 except (Conflict, Missing):
                     continue
-                if refs and self.mind._fresh(conn, refs) and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs):
+                if (refs and all(read_back(r) for r in refs) and self.mind._fresh(conn, refs)
+                        and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs)):
                     fetched.update({r["record_id"]: r for r in refs})
         return fetched
 
@@ -1845,26 +1882,29 @@ class Appraisals:
             if done:
                 data["result"] = done
             else:
+                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
+                    with self.engine.db.connect() as conn:
+                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
+                    if not remaining:
+                        # Everything this job was for is integrated already. The attempt ends here, with
+                        # no model call, no model slot and no charge: the count its claim took is given
+                        # back, and the ledger records an uncharged attempt that committed nothing.
+                        data["result"], data["completed_from"] = {"already_integrated": True}, "already-integrated"
+                        with self.engine.db.connect(write=True) as conn:
+                            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,attempts=MAX(0,attempts-1),data=? WHERE id=?",
+                                         (dumps(data), row["id"]))
+                            self._settle_children(conn, row["id"], data, "complete")
+                        slots.close()
+                        if ledger:
+                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=False,
+                                                 historical=historical, maintenance=maintenance)
+                        return self.status(row["id"])
+                    data["evidence_ids"] = remaining
                 # Admit the entire evaluation before any compression/review call.
                 # Nested calls reuse this lease, so a wait never hides partial usage.
                 slot = slots.enter_context(evaluation_slot(provider, self.engine, row["id"], data["attempt_token"]))
                 model_admitted = True
                 data.pop("waiting_reason", None)
-                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
-                    with self.engine.db.connect() as conn:
-                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
-                    if not remaining:
-                        data["result"] = {"already_integrated": True}
-                        with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
-                            self._settle_children(conn, row["id"], data, "complete")
-                        slots.close()
-                        if ledger:
-                            # This attempt ended here, without a model call and without a charge.
-                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=True,
-                                                 historical=historical, maintenance=maintenance)
-                        return self.status(row["id"])
-                    data["evidence_ids"] = remaining
                 if data.get("stimulus") == FOLLOW_UP and not data.get("review_source_id"):
                     # Normally made right after the parent's commit; this covers a process that died in between.
                     data.update(self._review_evidence(row["id"], data))
@@ -2251,13 +2291,11 @@ class Appraisals:
                         # advice_record() validates before it builds anything. The judgment goes to the
                         # session registry's carrier inside this transaction, not into the versioned
                         # mind state (DB1-03, §5.6). A core without that carrier keeps the old place.
-                        record = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        record = advice_record(proposal.session_advice, self.session_context, receipt, eid,
+                                               request_id=data.get("session_request_id"))
                         from . import session_advice as advice_store
-                        submit = getattr(advice_store, "submit", None)
-                        if record and submit:
-                            submit(conn, self.mind.scope.key(), record, self.mind.clock())
-                        elif record:
-                            state["session_advice"] = record
+                        if record:
+                            advice_store.submit(conn, self.mind.scope.key(), record, self.mind.clock())
                         advice_written.append(record)
                     if data.get("stimulus") == "session-maintenance":
                         applied = section("session_advice", apply_advice)
@@ -2583,7 +2621,12 @@ class Appraisals:
                     return semantic_enabled
 
                 committing = True
-                data["result"] = self.mind._mutate(event, "session-maintenance" if maintenance else "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+                if maintenance:
+                    # A session review changes nothing of the mind: its advice reaches the registry carrier
+                    # in one leased, idempotent transaction, and the mind keeps its revision and history (CR-RT-10).
+                    data["result"] = self.mind._record_only(event, apply)
+                else:
+                    data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             self.memory.remember_reflection(data["result"])
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])

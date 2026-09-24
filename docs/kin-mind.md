@@ -12,46 +12,60 @@ model request or native conversation.
 
 ## Storage and tools
 
-`Mind` persists the aggregate state, an append-only event snapshot history, and a
-contact outbox reservation. `read()` projects independent decay trajectories without
+`Mind` persists the aggregate state, an event snapshot history, and a contact
+outbox reservation. `read()` projects independent decay trajectories without
 writing. Every update freezes its source references and model/configuration version.
 A source correction, supersession or deletion marks affected views `needs_review`.
 Do not use those views to justify a contact. Expected revisions prevent stale model
 results from overwriting newer updates. Scoped command IDs and source identity dedupe
-replays. Desires are separate from the existing commitment/reminder task records.
+replays. Desires are separate from the commitment/reminder task records.
 
-Three tools are registered alongside the inherited MCP tools:
+`register_mind_tools` adds seventeen tools to the inherited MCP tools — plans,
+procedures, habits, the reply choice, the graph and event threads, share and work
+history, continuity context, the trait ledger and concerns among them. Three carry
+the affective state itself:
 
-- `read_affective_state(scope, history=0)` returns scores, reasons, evidence IDs,
-  configuration versions, desires and traits. History is limited to 100 snapshots.
+- `read_affective_state(scope, history=0, query="")` returns scores, reasons,
+  evidence IDs, configuration versions, desires and traits; `query` selects the
+  relevant concerns. History is limited to 100 snapshots.
 - `record_affective_event(scope, event)` validates sourced partial updates. Generic
   library users can submit an appraisal directly. The private Kin host replaces this
-  tool with an enqueue operation so DeepSeek owns evaluation.
-- `manage_desire(scope, request)` creates or revises a wish. Terminal wishes remain in
+  tool with an enqueue operation so the appraisal owns evaluation.
+- `manage_desire(scope, request)` creates or revises a wish. Terminal wishes stay in
   history; subsequent wishes require new identities. A model cannot confirm delivery.
 
 Transport transitions (`claim`, `check`, `settle`) are host-only methods and are not
-exposed as model-facing MCP tools. `python -m kin_mind.cli --root ROOT ACTION` accepts
-one JSON request on stdin, including a mandatory scope. The host wrapper
-`python -m kin_mind.host --config PRIVATE_CONFIG ACTION` reads credentials from an
-existing private environment file and emits sanitized operation receipts.
+exposed as model-facing MCP tools. The host wrapper
+`python -m kin_mind.host --config PRIVATE_CONFIG ACTION` takes the API key from the
+private credentials file the configuration names and one JSON request on stdin,
+prints the action's JSON result, and reduces a failure to its class, kind and
+static code. `serve` runs the resident worker instead: one JSON frame per line,
+answered in order, for the short store actions that call no model.
 
 ## DeepSeek and memory
 
-The existing `settings.models` extraction, conflict and summary endpoints remain
-responsible for memory processing. `DeepSeek.from_engine` reuses the configured
-summary endpoint and environment key name, with `deepseek-flash` for affect appraisal. The adapter
+The `settings.models` extraction, conflict and summary endpoints handle memory
+processing. `DeepSeek.from_engine` reuses the configured summary endpoint and
+environment key name, with `deepseek-flash` for affect appraisal. The adapter
 supports the official [Anthropic-compatible API](https://api-docs.deepseek.com/guides/anthropic_api/),
 with a typed `submit_appraisal` tool call. Credentials are sent only to the official
-HTTPS hostname. Embedding configuration remains independent.
+HTTPS hostname. Embedding configuration is independent.
 
-A structured tool call may be answered from the judgment cache (`mind_judgment_cache`
-and its dependency index) instead of the provider. Its key is the digest of the
-fully rendered request — tool name, system prompt, schema, context, endpoint, and
-model with its effort — and it no
-longer carries the database-wide generation, so an unrelated write elsewhere stops
-discarding a judgment that is still answerable. Four rules make dropping the
-generation safe. A caller states the judgment it is asking for — type, goal,
+DeepSeek is the appraiser unless the host configuration sets
+`main_session_review`. Then the action lane's appraisal and the daily review run
+on the main session's own model: by default in an ephemeral read-only fork of it,
+taken through `_kin/assess` with network off and only read-only memory tools, or,
+with `assessment_channel` set to `legacy`, as a quiet turn in the session itself.
+Enrichment always uses DeepSeek. A fork that cannot start or does not complete
+defers the appraisal as an uncharged admission wait.
+
+A structured tool call that declares its judgment may be answered from the
+judgment cache (`mind_judgment_cache` and its dependency index) instead of the
+provider. Its key is the digest of the fully rendered request — tool name, system
+prompt, schema, context, endpoint, and model with its effort — without the
+database-wide generation, so an unrelated write elsewhere does not discard a
+judgment that is still answerable. Four rules make leaving the generation out
+safe. A caller states the judgment it is asking for — type, goal,
 completion condition and obligation version — and all four are matched alongside the
 request digest, so the verdict that a step is complete can never answer whether the
 owner's own work is complete. Acceptance has two phases: the answer is stored pending
@@ -59,44 +73,50 @@ and becomes servable only once the caller reports that it passed the caller's ow
 validation, so a result the host refused is never replayed. Each row keeps the
 identifiers its request rested on, and a revised, corrected or deleted source, or a
 graph change, purges it at once; a changed persona or scope configuration ends it as
-well. A row lives at most 300 seconds, and a caller may declare a shorter validity. A
-hit is recorded as a call with `usage_status: "reused"` and no usage, and it never
+well. A row lives 300 seconds unless its caller declares a validity from one second
+to one day. A hit is recorded as a call with `usage_status: "reused"` and no usage, and it never
 skips the validation the caller runs before committing: an equal request proves the
 question is the same, not that the evidence behind it is still current.
 `submit_appraisal` is never served from this cache at all, because the host clock is
 part of that request; reuse on that path is the appraisal revalidation, not this.
-Setting `semantic_cache_v2` to false restores the previous generation-keyed cache in
-the older `mind_semantic_cache` table, which is otherwise left in place untouched.
+Structured calls that declare no judgment use the generation-keyed
+`mind_semantic_cache`, and setting `semantic_cache_v2` to false sends the
+declaring calls there as well.
 
-`Appraisals.enqueue` persists original evidence IDs. `run_one` leases one review per
-scope, makes one provider request — or a lighter one, or none, where an attempt after
-a commit conflict may reuse what the previous attempt already judged — validates the
-response, and commits state and wish proposals in one transaction. Eight optional
-sections of that commit are applied in savepoints of their own, so a section the
-host refuses is undone alone
-and the rest of the appraisal still commits; the refusal is recorded with static
-codes and host text only, and one bounded follow-up asks again for it and for
-whatever rested on it. A changed revision requires reappraisal. A lost queue
-acknowledgement after a committed mutation reuses the command receipt.
-Failures retain previous scores and use bounded retries with backoff. A charged
-attempt is one full appraisal call; waiting for admission, for evidence
-compression, through a provider outage, on a conflict raised before any call, or
-on a light revalidation is uncharged, and each of those has a counter and a bound
-of its own whose end is the same quarantine in the existing `needs-repair` state.
-A sourced host action resumes a quarantined row, which is then judged afresh with
-its failure history preserved. [Mobile recovery and operational
+`Appraisals.enqueue` persists original evidence IDs. `run_one` makes one provider
+request — or a lighter one, or none, where an attempt after a commit conflict may
+reuse what the previous attempt already judged — validates the response, and
+commits state and wish proposals in one transaction. A scope holds at most one
+leased review per lane — action, session maintenance and enrichment — or one in
+all with semantic mode off. Fourteen optional sections of that commit, a held
+personality proposal and each memory item are applied in savepoints of their own,
+so what the host refuses is undone alone and the rest of the appraisal commits;
+the refusal is recorded with static codes and host text only. A refusal of a
+section others rest on, or of a plan or action decision, arms one bounded
+follow-up; refused audited sections and dropped memory items are only recorded. A
+moved revision is rebased when nothing the proposal rests on changed; otherwise
+the next attempt reuses, revalidates or reappraises. A lost queue acknowledgement
+after a committed mutation reuses the command receipt. Failures keep previous
+scores and use bounded retries with backoff. A charged attempt is one full
+appraisal call, and four of them, or the same failure twice, quarantine the row in
+the `needs-repair` state. Evidence compression, a provider outage and a conflict
+raised before any call are uncharged waits that end in the same quarantine at
+bounds of their own; an admission wait backs off up to ten minutes without a
+bound, and a stored proposal gets at most two light revalidations. A sourced host
+action resumes a quarantined row, which is then judged afresh with its failure
+history preserved, or retires it. [Mobile recovery and operational
 progress](mobile-recovery.md) holds that whole account, with the conflict taxonomy
 it rests on. A timer checks
 queue readiness; no ready evidence means no model request. Source bodies and provider
 reasoning are absent from diagnostic errors. User-facing state may show the last
 valid revision while appraisal is pending. The request includes projected scores,
-active wishes with source IDs and compact completed-wish summaries. Full receipts
-and evidence history remain in the database. Max reasoning uses a 131,072-token
-output ceiling, matching the [official max-effort default](https://api-docs.deepseek.com/api/create-chat-completion/).
+active wishes with their evidence record IDs and compact summaries of recently
+completed wishes. Full receipts and evidence history stay in the database. The
+appraisal call asks for `high` effort with a 131,072-token output ceiling.
 The background request timeout is 600 seconds. A private host must enforce a
 660-second absolute review-subprocess deadline; the durable lease lasts 690 seconds,
 so another worker cannot reclaim it before the original subprocess exits.
-This does not block the chat session. Exhaustion remains a pending appraisal,
+This does not block the chat session. Exhaustion stays a pending appraisal,
 never an empty successful decision. Output ceilings do not require that many tokens
 to be generated.
 
@@ -109,16 +129,15 @@ compression serves a waiting reader and an idle queue alike.
 
 | Lane | Admission | Declared by |
 |---|---|---|
-| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; `share-preflight` and `share-preflight-group`; core recall; the Node classifier and chat turns; the [reply-tail decision](mobile-routing.md#the-unsent-rest-of-an-interrupted-reply), whether it rides on the classifier or is asked on its own |
-| `user-work` | one reserved slot, **exempt from the foreground yield** | the review that decides whether a held work task is finished |
-| `background` | `meta.kin_background_model_limit`, and only while no foreground session holds a lease anywhere on the machine | appraisals and everything nested in them, the daily review, event digests, procedure replay, completion review, prewarming, coverage backfill, core jobs, a context whose `access_origin` is `maintenance`, proactive drafts, the Node health audit |
+| `foreground` | always admitted; the row only records who is calling | `memory-context` and the read tools for a chat, work, read or start-up context the user asked for; `session-checkpoint`; core recall; the Node classifier and chat turns |
+| `user-work` | one reserved slot, **exempt from the foreground yield** | no current caller |
+| `background` | `meta.kin_background_model_limit`, and only while no foreground session holds a lease anywhere on the machine | appraisals and everything nested in them, the daily review, event digests, procedure replay, completion review, prewarming, coverage backfill, core jobs, a context whose `access_origin` is `maintenance`, proactive drafts, the gateway's contact-draft, creation, exploration and assessment turns, the Node work summary and health audit |
 
-The exemption is what prevents a deadlock. A held work task keeps a foreground lease,
-every background caller waits on it with `deepseek-foreground-priority`, and the one
-call that can release the task is that review. The foreground yield is machine-wide:
-a scope isolates data, not the model's attention, and a plan executor's claim follows
-the same rule. A caller that declares nothing keeps the behaviour it had before lanes,
-no lease at all, and leaves a `model_lane_undeclared` metric with its purpose label.
+A held work task keeps a foreground session lease, so every background caller waits
+on it with `deepseek-foreground-priority`. The foreground yield is machine-wide: a
+scope isolates data, not the model's attention, and a plan executor's claim follows
+the same rule. A caller that declares nothing takes no lease and leaves a
+`model_lane_undeclared` metric with its purpose label.
 
 Capacity comes from configuration. The host's own configuration states
 `background_model_limit` (1–8); the `recover` action, which the host already runs at
@@ -145,7 +164,7 @@ queue row's own lease in 180-second steps and never shortens it, so a long call 
 be reclaimed by another worker. No heartbeat outlives one hour: a worker that hangs
 without dying loses its row and its slot like one that crashed, only later. A thread started on a caller's behalf, such as the
 bounded rerank, is handed the caller's lease and declared lane and reuses them instead
-of taking a second slot; a thread abandoned at its deadline is no longer renewed, so
+of taking a second slot; a thread abandoned at its deadline stops being renewed, so
 it cannot keep a slot beyond the 90 seconds. The metrics are `model_capacity_unconfigured`,
 `model_capacity_invalid`, `model_lane_undeclared`, `model_lane_unrecorded` (a foreground
 or user-work call that went ahead while the ledger was busy), `model_lease_lost` and
@@ -171,17 +190,18 @@ counts, so a late renewal that still finds its row keeps it, and one that does n
 lost a slot that may already be somebody else's. The wait reasons are
 `deepseek-background-capacity`, `deepseek-foreground-priority` and
 `deepseek-user-work-capacity`. Lease operations use a two-second `busy_timeout`: a busy
-or missing ledger answers 503 with `{state:"busy"|"unavailable", reason}` instead of
-queuing behind a writer. The fallback when the service is down is the host action
+or missing ledger answers `{state:"busy"|"unavailable", reason}`, also with HTTP 200,
+instead of queuing behind a writer. The fallback when the service is down is the host action
 `model-lease` with `{op:"acquire"|"renew"|"release"|"status", …}` and the same fields
 and answers; it is handled before any engine opens, and reports a busy ledger as
 `{state:"busy"}`. Its `status` answers the same block as `GET /v1/model-leases` and
 the `model_lanes` block of `operational-status`, so an operator can read the lanes
 with the service down. On `lost`, abort the request and record its usage as
-unknown. When
+unknown. A Node caller treats a `busy` or `unavailable` answer like no answer: when
 neither path answers, foreground and user work go ahead and note it, and background
-work skips that run. `disabled` means `model_lanes` is off: carry on without a lease,
-as before. A rolled-back service answers 404, which is the same degraded mode.
+work skips that run. `disabled` means `model_lanes` is off: the caller proceeds without
+a lease. A service without these routes answers 404, and the caller falls back to the
+host action.
 
 A Node adapter writes one usage row per model call, on every exit of that call, with
 the lane and purpose it declared and what the provider reported, or an explicit
@@ -190,55 +210,66 @@ recorded as skipped with its lane and reason, so a degraded ledger is legible ra
 than silent.
 
 The switch is `model_lanes`. The ledger is shared, so it is machine-wide: set to
-`false` in any scope it restores the previous admission everywhere, with background
-capacity only, no quarantine, no heartbeat, and a plan claim that looks at its own
-scope.
+`false` in any scope, admission everywhere counts background capacity only, with no
+quarantine, no heartbeat, and a plan claim that looks at its own scope.
 
 The one-minute host timer is a local queue and wake-up check, not a periodic model
 request. Lengthening it to twenty minutes delays detection of changed evidence,
 due reviews and runnable decisions without reducing idle provider requests, which
-are already zero. In the default semantic mode, contact and exploration scores are
-context rather than admission gates; only explicitly enabled legacy mode restores
-the stored initiative and curiosity thresholds.
+are already zero. By default, contact and exploration scores are context rather
+than admission gates; the stored initiative and curiosity thresholds apply only
+with `legacy_drive_thresholds` on and `semantic_actions` off.
 
 The optional [mobile routing host](mobile-routing.md) keeps conversation and work
 models in one native thread, protects ongoing tasks during model changes, and
 separates four-hour mobile health reviews from the daily desktop check.
 
-A daily personality review is separate from short-term scoring. With `behavior_chain`
-enabled it makes no model request at all: an ordinary appraisal proposes the change and
-the daily action merges it host side. It requires three independent original
-interactions — one interaction window counts once, however many messages it holds — a
-pending proposal, and a prediction of the same configuration confirmed by host-verified
-evidence. "The same configuration" is a compatibility key over the approved persona, a
-declared behavior contract, the dimension definition texts, the appraisal model this
-evaluator pins for itself, the chat model the host registers with
-`configure-behavior-models` (unregistered until it does, which is stable rather than
-stale), and the relevant execution environment. An unrelated agent version bump no
-longer voids a check while a real change does. What a change voids stays
-readable, marked with the ingredient that moved. `Mind` enforces parameter limits and
-preserves the claim's hypothesis status. A later explicit correction can revert the
-latest personality revision while retaining history; intervening personality revisions
-require review. With the switch off the previous behaviour returns: one model request a
-day, and an assessment in the same agent version.
+A daily personality review is separate from short-term scoring. With
+`behavior_chain` and section isolation on it makes no model request at all: an
+ordinary appraisal proposes the change and the daily action merges it host side. It
+requires three independent original interactions — one interaction window counts
+once, however many messages it holds — a pending proposal, and a prediction of the
+same configuration confirmed by host-verified evidence. "The same configuration" is
+a compatibility key over the approved persona, a declared behavior contract, the
+dimension definition texts, the appraisal model this evaluator pins for itself, the
+chat model the host registers with `configure-behavior-models` (unregistered until
+it does, which is stable rather than stale), and the relevant execution environment.
+An unrelated agent version bump does not void a check, while a real change does.
+What a change voids stays readable, marked with the ingredient that moved. `Mind`
+enforces parameter limits and preserves the claim's hypothesis status. A later
+explicit correction can revert the latest personality revision while retaining
+history; intervening personality revisions require review. With the switch off the
+daily review makes one model request a day and requires an assessment in the same
+agent version.
 
 ## Exploration
 
-`Explorations` claims an unexpired question selected by DeepSeek. With `semantic_actions` enabled, a current DS decision replaces the legacy curiosity threshold; scores remain dynamic context. The worker claim and desire transition are atomic. There is no elapsed-time admission gate; the 1,200-second maximum remains in the profile. The executor is pluggable: `Explorations.run(..., runner=...)` is the extension point, and every runner shares one contract — an isolated per-exploration workdir, one total budget covering waiting, tool calls and bounded format repair, a cancellation signal that terminates only its own child process group, and an explicit checkpoint a later attempt continues from.
+`Explorations` claims an unexpired explore wish that a verified decision selected —
+with `semantic_actions` on, a current one — unless the owner paused exploration or
+set a minimum interval between runs (`exploration_min_interval_minutes`, default
+0). The fixed curiosity threshold applies only with `legacy_drive_thresholds`;
+otherwise scores are dynamic context. The worker claim and desire transition are
+atomic. The profile sets a 1,200-second maximum per run. The executor is pluggable:
+`Explorations.run(..., runner=...)` is the extension point, and every runner shares one contract — an isolated per-exploration workdir, one total budget covering waiting, tool calls and bounded format repair, a cancellation signal that terminates only its own child process group, and an explicit checkpoint a later attempt continues from.
 
-The current executor is `run_codex` (executor `codex-cli`, model provider DeepSeek — deepseek-flash, reasoning high — behind a dedicated local gateway). It runs `codex exec` with user configuration, rules, MCP servers, hooks, multi-agent, the generic shell and web search off, a read-only sandbox, an environment allowlist and host-side validation of the final Findings object. Receipts record executor and model provider separately. An executor that cannot start pauses the question with a recorded waiting reason; there is no fallback executor. The host should run it under the desired OS identity and pass only authorized project paths.
+The executor is `run_codex`, which runs the active runtime bundle's Codex, or a configured `native_codex_command` (labelled `codex-cli` in receipts), with model provider DeepSeek — deepseek-flash, reasoning high — behind the dedicated exploration gateway. It runs `codex exec` in a read-only sandbox with an environment allowlist, with user configuration, rules, hooks, multi-agent, apps, code mode, the generic shell, the image viewer and built-in web search off; its only MCP servers are the host's own `kin_web`, `kin_computer` and `kin_ui`, each injected when enabled. The host validates the final Findings object. Receipts record executor and model provider separately. An executor that cannot start pauses the question with a recorded waiting reason; there is no fallback executor. The host should run it under the desired OS identity and pass only authorized project paths.
 
-The wrapper consumes the executor's stream and keeps only validated final reports. Tool
-transcripts and thinking blocks are discarded. Citations remain model-reported and
+The wrapper consumes the executor's stream and keeps only validated final reports and
+validated web and computer observation receipts, which become memory sources. Tool
+transcripts and thinking blocks are discarded. Citations are model-reported and
 reviewable; a citation is not automatic factual verification, and the codex
 executor rejects a citation that rests on nothing the run supplied or observed.
-A new owner task sets
-the cancellation signal. The wrapper terminates only its own child process group.
-Timeouts retain any already completed final report as partial. A missing final report
-is recorded as incomplete, never fabricated. Crash-interrupted jobs stay inspectable.
-The `exploration_backend` configuration selects the runner (codex-cli; anything
-else pauses with a recorded reason); a host-provided runner with the same result and
-cancellation contract remains the extension point.
+A new owner message does not stop a running exploration: the host sets the
+cancellation signal only at shutdown or on the owner's literal stop command, and
+the run also stops, checked every fifteen seconds, when its wish leaves the
+in-progress state, its plan step is decided again or the owner pauses
+exploration. Busy owner work only keeps a new run from starting. The wrapper
+terminates only its own child process group. A timeout keeps any already
+completed final report as a partial checkpoint. A missing final report is recorded
+as incomplete, never fabricated. Crash-interrupted jobs stay inspectable.
+`exploration_backend` must be `codex`, the default; any other value pauses with
+`exploration-backend-unknown`, and a different runner with the same result and
+cancellation contract is passed only through `Explorations.run`.
 
 ## Shared-session contact host
 
@@ -265,36 +296,48 @@ It performs these operations:
 1. Ingest authenticated owner messages as real user sources. Internal wakes and
    exploration reports have independent event categories and do not change the
    owner's last-input timestamp or release unanswered-outreach waiting.
-2. Project dynamic scores after updates and on a 60-second timer. With
-   `semantic_actions` enabled, reserve a contact only with a current DS decision
-   and an actionable wish; the disabled legacy path retains its score gate.
-3. Ask the **original** shared session for a draft, capturing output locally. Do not
-   forward draft commentary, files or intermediate output to the phone.
+2. Project dynamic scores after updates and on a 60-second timer. Reserve a contact
+   only for an actionable wish — with `semantic_actions` on, one resting on a
+   current verified decision; the fixed score gate applies only with
+   `legacy_drive_thresholds`.
+3. Ask an ephemeral read-only fork of the shared session, through `_kin/assess`,
+   for a draft that must match the contact-draft schema, and capture the output
+   locally; with `assessment_channel` set to `legacy`, the draft is a quiet turn in
+   the original shared session. Do not forward draft commentary, files or
+   intermediate output to the phone.
 4. Recheck desire revision/expiry/source validity, owner input epoch, active work,
    quiet hours and unanswered outreach immediately before sending.
-5. Store pending before the platform call. Use the same stable attempt ID in the
-   transport outbox. Accepted requires the platform's message ID. A timeout, missing
-   ID, context race at the send boundary, or uncertain failure stays unconfirmed.
-   Never replay it under a fresh ID. Reconcile with actual platform evidence.
-6. On accepted delivery, complete that wish and atomically queue a DeepSeek reassessment. Hold further contact until that review finishes; transport does not assign a score. Track phone visibility separately. An internal wake does not count as a user reply.
+5. Store pending before the platform call. The transport outbox uses stable IDs
+   derived from the attempt ID, one per bubble or fragment. Accepted requires the
+   platform's message ID. A timeout, missing ID or uncertain failure of a bubble
+   that may have been submitted stays unconfirmed; a context race caught before
+   submission cancels the unsent bubbles as never started, and the attempt settles
+   as `contact-source-changed`. Never replay a send under a fresh ID. Reconcile with
+   actual platform evidence.
+6. On accepted delivery, complete that wish and queue a `delivery` reassessment in
+   the same transaction; transport does not assign a score. Without
+   `operational_lanes` that review holds all further contact; with it, only the
+   wishes the review names wait. Track phone visibility separately. An internal wake
+   does not count as a user reply.
 
-Drafts use the public `contact-draft.mjs` contract: send `bubbles` (legacy `text` remains valid), abandon an obsolete
+Drafts use the public `contact-draft.mjs` contract: send `bubbles` (a single `text` is also accepted), abandon an obsolete
 wish, or wait for a declared condition. Time waits include a bounded `retry_at`;
 owner-reply waits require authenticated owner activity; evidence waits require a
 new related source. The host calls `reconsider` before candidate selection. This
 deterministic operation survives restart and never creates evidence or scores.
-Expired or corrected sources cannot resume. Every attempted draft still passes
-the existing send-boundary checks after a condition becomes ready.
+Expired or corrected sources cannot resume. Every attempted draft passes the
+send-boundary checks again after a condition becomes ready.
 
-Invalid JSON, invalid structure, empty output and model execution errors are distinct
-technical stages, separate from a valid decision to wait. Their contact receipt keeps
-only a static category/code, retry condition and redacted model accounting. Failed
-drafts retry after five and ten minutes; the third failure waits for new evidence. A
-source change proven before model execution is reviewed without incrementing the bad-
-draft counter. An uncertain send remains held and is never converted into a retryable
-draft error. Contact status exposes the last check and blocking reason.
-Wishes already addressed in ordinary dialogue are retired without inventing a
-proactive delivery receipt.
+Unparseable or invalid output, empty output and model execution failures carry
+distinct failure codes, separate from a valid decision to wait. Their contact
+receipt keeps only a static category/code, retry condition and redacted model
+accounting. Failed drafts retry after five and ten minutes; the third failure
+waits for new evidence and asks for a review of the wish. A source change proven
+before model execution is reviewed without incrementing the bad-draft counter. An
+uncertain send stays held and is never converted into a retryable draft error.
+Contact status exposes the last check and blocking reason. The reviewer retires
+wishes already addressed in ordinary dialogue without inventing a proactive
+delivery receipt.
 
 `configure-behavior` records an explicit expression preference and optional quiet
 start hour under a new configuration version. It does not change scores, baselines,
@@ -306,19 +349,18 @@ preference sources mark that guidance for review.
 Owner activity, the contact state machine and the authenticated transport must be
 checked together. The library alone does not know recipient identity, quiet-hour
 preferences, phone read status, or whether a native session is still working. Do not
-use an older scheduled-checkin sender to bypass this entry point. Explicit user
+use a separate scheduled-checkin sender to bypass this entry point. Explicit user
 reminders keep their requested timing and task identity.
 
 ## Validation
 
-Python tests cover independent trajectories, mixed states, restart/replay, revision
-conflicts, source correction, scope isolation, semantic score independence and legacy
-threshold crossing, held unknown delivery, personality evidence and reversion, provider
-validation, and executor process cancellation. Node tests cover quiet/wait gates, owner
-input races, concurrent ticks, platform receipt requirements and uncertain sends. Real
-providers use private runtime verification; CI uses synthetic sources and controlled
-provider/CLI stubs.
-
+Python tests cover independent trajectories with decay, restart and deduplication,
+durable appraisal and wish replay, failed appraisals that keep state, reversible
+contact preferences, an unknown send that holds only its own wish, the main-session
+review, and explorations that stop for Kin's decision rather than for a new
+message. Node tests cover quiet and ineligible moments, owner input races,
+concurrent ticks, platform receipt requirements and uncertain sends. They run on
+synthetic sources with stand-in providers and CLIs.
 
 ## Affect-driven action episodes
 
@@ -327,73 +369,73 @@ reviewer receives `interaction_timing` from authenticated owner inputs and accep
 proactive receipts, and combines it with current affect. It need not invent a new
 topic. Internal reviews and configuration changes do not count as an owner reply;
 silence does not itself increase grievance or possessiveness. A new episode uses a
-new wish identity while delivery retries keep the existing message identities.
+new wish identity while delivery retries keep their message identities.
 
 `AffectiveEvent.motivations` and `Appraisal.motivations` accept `initiative` and
-`curiosity`, each with a target (0–100), a half-life in minutes (20, 60 or 180),
-and a sourced reason. These are short-term episode parameters; long-term trait
-calibration remains separate. A persisted crossing key prevents a high plateau
-or restart from calling the model repeatedly. Internal thoughts are model-origin
-sources and do not count as new owner interactions or personality evidence.
+`curiosity`, each with a target (0–100), a half-life of 10–720 minutes, and a
+sourced reason. These are short-term episode parameters; long-term trait
+calibration is separate. A drive that has run its course asks for one
+`motivation-review`, keyed by what ended. With `legacy_drive_thresholds`, a
+threshold crossing is an event too, and its persisted episode key keeps a high
+plateau or a restart from calling the model repeatedly. Internal thoughts are
+model-origin sources and do not count as new owner interactions or personality
+evidence.
 
-`ActionEvents` is the transactional outbox for bootstrap, semantic wake-ups, explicitly
-enabled legacy threshold crossings, exploration findings and accepted contact. It
+`ActionEvents` is the transactional outbox for bootstrap, semantic wake-ups, wish,
+motivation, expired-wish and rhythm reviews, threshold crossings under
+`legacy_drive_thresholds`, exploration findings and accepted contact. It
 materializes idempotent sources and appraisal jobs. The owner host also ingests public
-assistant results. Failed model requests remain pending with bounded backoff; corrected
+assistant results. Failed model requests stay pending with bounded backoff; corrected
 evidence requires review. A delivery receipt can update satisfaction and remaining
-motivation but cannot create a new wish on its own. Existing useful, playful or
-affectionate intentions can continue without imposing a fixed reset or a fixed sending
-interval.
+motivation but cannot create a new wish on its own. Useful, playful or affectionate
+intentions can continue without a fixed reset or a fixed sending interval.
 
 `configure-actions` requires explicit source evidence, configuration version and
 revision. It installs the policy and queues a one-time migration review without
 resetting scores or reopening completed, expired or abandoned wishes. `read`
 returns episode metadata, action-event state and a verified `decision_runtime`.
-Exploration wishes supplied through another tool are reviewed by DeepSeek before
-execution. The original shared conversation generates outreach only after its
-actual DeepSeek model is verified; active work defers it without changing GPT.
+Exploration wishes supplied through another tool are reviewed by the appraisal
+before execution. Outreach is drafted on the shared session's current verified
+profile, with no check for a particular model; busy owner work or work mode defers
+drafting, and no model is switched for it.
 
 `createContactBatch` freezes text, one review ID per bubble, its bubble index and each
-transport ID before review or sending. The per-bubble review ID is used consistently
-by review, reservations, references and delivery; a fragmented transport still keeps
-the original bubble identity. A restart reuses accepted receipts, reconciles uncertain
-bubbles, and only then sends the unsent remainder. A legacy wholly-unsent batch adopts
-its already-stable item IDs; a legacy batch already reviewed or exposed keeps its old
-group review identity. The migration is written before any review or transport call.
-The same paragraph splitter serves ordinary and proactive chat; it preserves fenced
+transport ID before the preflight or any send. The per-bubble review ID is used by
+the preflight, references and delivery; a fragmented transport keeps the original
+bubble identity. A restart reuses accepted receipts, reconciles uncertain bubbles,
+and only then sends the unsent remainder. A legacy wholly-unsent batch adopts its
+stable item IDs; a legacy batch already reviewed or exposed keeps its group review
+identity. That migration is written before any preflight or transport call. The
+same paragraph splitter serves ordinary and proactive chat; it preserves fenced
 code, words and links rather than truncating them to fit.
 
-The draft is persisted before anything is exposed, and the whole group is then
-reviewed once, before its first bubble leaves: released, held with a visible
-reason, or refused as a whole. None of `duplicate`, `silent` or `merged` applies
-to a single bubble, so a refusal cancels every bubble that was never exposed
-under one reason and keeps that reason on the finished batch; what was already
-sent stays sent. The verdict is persisted with the batch, so a group that has
-been reviewed is never charged for a second review and a group that has begun is
-never cut again. The returned `checked` list must contain exactly the requested IDs
-in the same order, with nonempty string bodies and reference arrays, before any
-reviewed body is accepted. A null or malformed verdict is a deterministic contract
-failure, never an exception that crosses the send boundary. Transport IDs are also
-globally unique across text and file items; an invalid legacy journal is parked before
-receipt lookup, review, file verification or delivery. Semantic holds and review
-infrastructure failures have separate finite budgets and a doubling wait. Exhaustion,
-a deterministic contract fault, or changed source parks a wholly-unsent group as
-`needs-review`; it does not pretend DeepSeek abandoned the content. Only after that
-state is durable may the owner host release the active contact slot and queue the wish
-for a fresh DeepSeek continue/rewrite/abandon decision. A transport retry budget may
-use the same release only when every item durably records a terminal `never-started`
-receipt. A pending or unknown send can never use it and remains reconciliation-only.
-If a new owner turn supersedes a wholly-unsent attempt, the host releases that attempt
-as a source change and queues the still-valid wish for DeepSeek review; it does not
-invent an `abandon` decision. A semantic whole-group refusal carries the actual review
-decision through the batch receipt, so only that decision can retire the wish.
-Quiet hours, eligibility, the owner epoch guard and free local checks spend neither
-budget.
+The draft is persisted before anything is exposed, and a local preflight then checks
+the unsent group once, before its first bubble leaves, with no model call: it
+releases the group with its bodies unchanged, or parks it as `needs-review` when a
+body is empty, carries a private marker or is flagged for repair. The verdict is
+persisted with the batch, so a group that has been checked is never checked again
+and a group that has begun is never cut again. The returned `checked` list must
+contain exactly the requested IDs in the same order, with nonempty string bodies and
+reference arrays; a null or malformed verdict is a deterministic contract failure
+that parks the group, never an exception that crosses the send boundary. Transport
+IDs are globally unique across text and file items; an invalid legacy journal is
+parked before receipt lookup, preflight, file verification or delivery. Only a file
+whose check is not ready is checked again: six checks at most, one, two, four, eight
+and fifteen minutes apart. A parked, wholly-unsent group settles its attempt as
+`contact-review-failed`, which releases the contact slot: the wish waits for new
+evidence and a `wish-review` event asks the reviewer to resume it, keep it waiting
+or abandon it; a resumed wish gets a new draft attempt. A transport retry may use
+the same release only when every item durably records a terminal `never-started`
+receipt. A pending or unknown send can never use it and stays reconciliation-only.
+If a new owner turn supersedes a wholly-unsent attempt, the host releases that
+attempt as a source change and queues the wish for review; it does not invent an
+`abandon` decision. Quiet hours, eligibility and the owner epoch guard cost no
+retry.
 
 Freezing is also where a body too long for the channel is cut, using the same
 fragment rule and the same transport identities as a phone reply, so each
 fragment becomes an ordinary journal entry with its own frozen ID and the
-existing replay sends the same bodies in the same order. Only the first fragment
+replay sends the same bodies in the same order. Only the first fragment
 carries the bubble's references. Content that no cut can fit stays whole and is
 sent as one file, with no words of the host's own. Receipts are read through the
 same classifier the sender uses, so the journal and the transport can never
@@ -403,14 +445,15 @@ refusal cancels that bubble alone while the rest of the group goes on, and an
 unknown outcome — or no receipt where the reader looked — leaves the batch
 unconfirmed for an operator, resending nothing and giving up on nothing.
 
-The draft parser reads the whole concatenated model output and takes the decision
-from the JSON object that output ends with, fence marks aside, trying each
-opening brace from the last one backwards until a slice parses. Concatenating
-first means a decision split across segments still arrives whole; requiring it to
-end the output means a stale earlier draft followed by unusable text is never
-revived. No body is ever shortened by the parser.
+On the fork path the draft is the fork's structured output, or failing that the
+first JSON object in its text. The quiet-turn parser reads the whole concatenated
+model output and takes the decision from the JSON object that output ends with,
+fence marks aside, trying each opening brace from the last one backwards until a
+slice parses. Concatenating first means a decision split across segments arrives
+whole; requiring it to end the output means a stale earlier draft followed by
+unusable text is never revived. Every draft then passes the same decision
+validation, and no body is ever shortened by the parser.
 
 DeepSeek requests enable thinking with `output_config.effort=high`, using the
 [official effort controls](https://api-docs.deepseek.com/guides/thinking_mode/).
-Only the validated structured tool result enters the state store. Public copies
-contain synthetic examples; persona contracts and actual state remain private.
+Only the validated structured tool result enters the state store.

@@ -29,6 +29,12 @@ export const candidateVerificationReady=(verification,candidate)=>Boolean(verifi
 const RETENTION=Object.freeze({ms:7*86400000,events:64,compactions:50,candidates:10,assessments:32});
 const SETTLED=new Set(['answered','rejected','superseded','executed']);
 const HOUR=3600000;
+// Observation fields whose change asks a review at any pressure (with the router's configuration
+// revision, read from the cursors): tasks, the serving model, the full configuration, corrections.
+const SEMANTIC_CAUSES=Object.freeze(['configVersion','policyVersion','profile','tasks','corrections']);
+// A review job the mind holds for an attempt: still to answer (or answered, through the
+// snapshot), or ended without an answer, which uses the attempt up.
+const LIVE_REVIEW_JOB=new Set(['pending','running','batched','complete']),SPENT_REVIEW_JOB=new Set(['needs-repair','superseded']);
 // How long the host waits on its own maintenance calls (N1-03) and on an unanswered review.
 export const MAINTENANCE_LIMITS=Object.freeze({reviewTimeoutMs:2*HOUR,compactTimeoutMs:600000,compactCheckMs:300000,
   compactCheckTimeoutMs:30000,compactQuietMs:HOUR});
@@ -214,7 +220,7 @@ export class SessionManager {
   receive(record,runtime) {
     if(!record?.eventId||record.eventId===this.state.lastAdviceEvent)return null;
     this.state.lastAdviceEvent=record.eventId;
-    try{return this.advise(record.decision,record.receipt,record.snapshotId,runtime);}
+    try{return this.advise(record.decision,record.receipt,record.snapshotId,runtime,record.requestId??null);}
     catch(error){
       const event=this.state.events[record.snapshotId],now=this.now();
       if(event&&event.state!=='answered')Object.assign(event,{state:'rejected',reason:error.message,settledAt:now,nextAt:now+this.backoff(event.attempts)});
@@ -228,7 +234,7 @@ export class SessionManager {
     this.state.assessments=[...(this.state.assessments??[]).filter(a=>a.turnId!==turnId),{requestId,turnId,forkThreadId,at:this.now()}].slice(-RETENTION.assessments);
     return this.save('assessment-recorded',{turnId});
   }
-  advise(advice,receipt,snapshotId,runtime) {
+  advise(advice,receipt,snapshotId,runtime,requestId=null) {
     if(!advice||!['keep','recall','compact','prepare','rotate','defer'].includes(advice.action)||!advice.reason?.trim()||!Array.isArray(advice.evidenceIds))throw Error('Invalid session advice');
     const native=receipt?.native_receipt;
     if(native) {
@@ -248,7 +254,7 @@ export class SessionManager {
       const id='session:'+hash([source.id,finding.kind]).slice(0,32);
       if(!this.state.evidence[id])this.evidence({id,sourceId:source.id,revision:source.revision,dependencies:source.dependencies??[],kind:finding.kind,at:Date.parse(source.at),basis:'owner-statement',accountBasis:'model-interpretation-of-owner-correction',quote:finding.quote,reason:finding.reason});
     }
-    const answer={action:advice.action,requestId:event?.requestId??null,turnId:native?.native_turn_id??null,forkThreadId:native?.fork_thread_id??null,at:now};
+    const answer={action:advice.action,requestId:requestId??event?.requestId??null,turnId:native?.native_turn_id??null,forkThreadId:native?.fork_thread_id??null,at:now};
     // A late answer still settles the question it was asked about: the same observation
     // coming back finds it answered instead of asking again at once.
     if(event)Object.assign(event,{state:'answered',answer,settledAt:now,nextAt:now+this.backoff(event.attempts)});
@@ -261,7 +267,13 @@ export class SessionManager {
    * and policy, the serving profile, the window and its pressure level, open tasks, owner
    * requests, sourced degradation and corrected sources. Dialogue that only grows, a
    * compaction that finished and memory entries an appraisal revised are recorded in the
-   * observation and read by the next review, but do not by themselves ask one. */
+   * observation and read by the next review, but do not by themselves ask one.
+   *
+   * Which of these ask one (spec §1, CR-RT-09): pressure above normal, sourced degradation
+   * and owner requests, as before; and at any pressure a change of task, model, full
+   * configuration or a corrected source. Token growth alone never does. A change of that
+   * kind at normal pressure is asked about at most once per cooldown: the question is kept,
+   * and a later change replaces it, rather than one review per change. */
   async observe(runtime,context) {
     if(!this.state.config.observe)return;
     this.assertFence(this.state.binding);
@@ -284,13 +296,16 @@ export class SessionManager {
     // Exact token counts stay current in memory without a write for each token used.
     const stable=value=>value&&hash({...value,id:undefined,at:undefined,pressure:{...value.pressure,inputTokens:undefined,expectedInputTokens:undefined,ratio:undefined}});
     const changed=previous?.id!==id||stable(previous)!==stable(content);
+    const semantic=Boolean(previous&&previous.binding?.generation===generation&&(SEMANTIC_CAUSES.some(key=>hash(previous[key]??null)!==hash(content[key]??null))||
+      hash(previous.cursors?.config??null)!==hash(cursors?.config??null)));
     this.state.observation={...content,id,at:changed?now:previous.at};
     if(changed)this.save('observation',{id});
-    await this.review(id,{entered:previous?.id!==id,worth:['elevated','critical'].includes(window.level)||evidence.length>0||requested.length>0});
+    const urgent=['elevated','critical'].includes(window.level)||evidence.length>0||requested.length>0;
+    await this.review(id,{entered:previous?.id!==id,worth:urgent||semantic,spaced:!urgent&&semantic});
   }
   /** One review per cause. The same cause again is the same question: already answered,
    * or asked again only after a wait that doubles each time. */
-  async review(cause,{entered,worth}) {
+  async review(cause,{entered,worth,spaced=false}) {
     const now=this.now(),events=this.state.events;
     if(entered)for(const other of Object.values(events))if(other.cause!==cause&&['pending','queued'].includes(other.state)){
       // An asked question is not asked again before its answer could have come back.
@@ -299,15 +314,25 @@ export class SessionManager {
     }
     let event=events[cause];
     const advised=this.state.sessionAdvice?.snapshotId===cause&&this.state.sessionAdvice.generation===this.state.binding.generation;
-    if(!event&&worth){event=events[cause]={cause,state:'pending',attempts:0,failures:0,at:now,nextAt:now};this.prune();}
+    if(!event&&worth){
+      const nextAt=spaced?Math.max(now,(this.state.semanticReviewAt??-Infinity)+this.state.config.compactCooldownMs):now;
+      event=events[cause]={cause,state:'pending',attempts:0,failures:0,at:now,nextAt,...(spaced?{spaced:true}:{})};this.prune();
+    }
     if(!event)return;
     if(event.state==='queued'&&now-event.queuedAt>=this.limits.reviewTimeoutMs)Object.assign(event,{state:'pending',unanswered:(event.unanswered??0)+1,nextAt:now+this.backoff(event.attempts)});
     else if(SETTLED.has(event.state)&&!advised&&worth&&now>=(event.nextAt??0))event.state='pending';
     if(event.state!=='pending'||now<event.nextAt)return;
-    const requestId='review:'+cause.slice(0,24)+':'+(event.attempts+1);
-    try{await this.reviewRequested({id:requestId,cause,observation:this.state.observation});}
-    catch(error){event.failures++;event.nextAt=now+(event.failures<2?0:Math.min(HOUR,60000*2**(event.failures-2)));this.save('review-request-failed',{cause});throw error;}
-    Object.assign(event,{state:'queued',attempts:event.attempts+1,failures:0,requestId,queuedAt:now});delete event.settledAt;
+    const attempt=event.attempts+1,requestId='review:'+cause.slice(0,24)+':'+attempt;
+    const failed=reason=>{event.failures++;event.nextAt=now+(event.failures<2?0:Math.min(HOUR,60000*2**(event.failures-2)));this.save('review-request-failed',{cause,reason});};
+    let job;
+    try{job=await this.reviewRequested({id:requestId,cause,attempt,observation:this.state.observation});}
+    catch(error){failed(error.message);throw error;}
+    // What the mind actually holds for this attempt, not the fact that it was asked: a job
+    // for another observation or attempt is no answer, and a failed one uses the attempt up.
+    if(job?.requestId!==requestId||job.snapshotId!==cause||!LIVE_REVIEW_JOB.has(job.state)&&!SPENT_REVIEW_JOB.has(job.state)){failed('review-not-queued');return;}
+    if(SPENT_REVIEW_JOB.has(job.state)){event.attempts=attempt;failed('review-job-'+job.state);return;}
+    Object.assign(event,{state:'queued',attempts:attempt,failures:0,requestId,jobId:job.id??null,queuedAt:now});delete event.settledAt;
+    if(event.spaced)this.state.semanticReviewAt=now;
     this.save('review-queued',{cause,requestId});
   }
   async tick({runtime:observed,context:collected}={}) {

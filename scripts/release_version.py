@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # What goes into the wheel and the sdist, and what pins what they run with.
 PACKAGE = ("src/eventmem", "src/kin_mind", "pyproject.toml", "uv.lock")
 LINE = re.compile(r'^version = "(\d+)\.(\d+)\.(\d+)"$', re.M)
+# The project's own entry in uv.lock carries the same version; a lock left behind would no
+# longer match its pyproject.toml.
+LOCKED_ROOT = re.compile(r'(\[\[package\]\]\nname = "[^"]+"\nversion = ")[^"]+("\nsource = \{ (?:editable|virtual) = "\." \})')
 
 
 def version(text: str) -> tuple[int, int, int]:
@@ -41,6 +44,9 @@ def write(root: Path, new: tuple[int, int, int]):
     head, rest = text.split("[project]", 1)
     project, sep, tail = rest.partition("\n[")
     path.write_text(head + "[project]" + LINE.sub('version = "%d.%d.%d"' % new, project, count=1) + sep + tail)
+    lock = root / "uv.lock"
+    if lock.exists():
+        lock.write_text(LOCKED_ROOT.sub(lambda m: m.group(1) + "%d.%d.%d" % new + m.group(2), lock.read_text(), count=1))
 
 
 def git(root: Path, *args: str) -> subprocess.CompletedProcess:

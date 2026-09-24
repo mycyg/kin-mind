@@ -19,28 +19,37 @@ contract is read leniently, so a contract awaiting host review never stops memor
 from being read. See [reading purpose and evidence classes](architecture.md#reading-purpose-and-evidence-classes).
 
 The host installs the approved core before SOUL in its instruction projections.
-The JavaScript adapter checks the exact core and hashes before synchronization.
-The Python consumers load the same scope-bound contract before model requests.
-Their structured output schemas and evaluator roles remain intact. Quotations
-remain verbatim, and historical assistant wording is evidence rather than a
-template for the current voice. Metadata exposes the loaded version and hashes.
+The file's own hashes and `requires_owner_confirmation` only catch accidental
+damage: whoever rewrites the text can rewrite them too. The owner's approval is a
+record the host keeps outside the file: `{version, core_sha256}`, plus
+`voice_sha256` and `maintenance_sha256` when recorded.
+`readPersonaContract(file, approved)` checks the file's fields, markers and
+hashes, and refuses a file that differs from that record; synchronization passes
+it. The Python consumers load the same scope-bound contract before model
+requests; they check the file's fields and hashes but do not read the host's
+record. Their structured output schemas and evaluator roles remain intact.
+Quotations remain verbatim, and historical assistant wording is evidence rather
+than a template for the current voice. Metadata exposes the loaded version and
+hashes.
 
 Personality proposals and reversions cannot write trait keys outside the approved
 list. State scores, wishes and the existing evidence requirements remain separate.
 This does not turn initialized traits into observed emotions or let a generated
 portrait change the role agreement.
 
-An explicit owner request is required to amend the core. The host records that
-source, archives the prior contract, installs a new version and hashes, and
-refreshes all projections. Automatic memory cleanup, repair, model switching and
-persona synchronization must not generate that approval. Operational settings
-remain editable through their existing authorized interfaces.
+In the host's instruction projection a new core takes effect only when the
+approval record names its version and hashes. Memory cleanup, repair, model
+switching and persona synchronization never write that record. Operational
+settings remain editable through their existing authorized interfaces. The
+private host's phone keeps running the last approved instructions until a runtime
+candidate built from the newly approved persona is proved and activated, and a
+resumed thread keeps the developer message it recorded until its context is
+rebuilt; see [mobile runtime](mobile-runtime.md#evidence).
 
-Hashes detect drift; they are not OS access control. An actor with permission to
-rewrite both the contract and its hashes still has filesystem access. Hosts must
-enforce the approval boundary in their configuration workflow and instructions.
-Already-running turns retain their loaded instructions until an idle reload.
+Neither the hashes nor the approval record is OS access control: an actor who
+can rewrite both files still has filesystem access. Hosts enforce the approval
+boundary in their configuration workflow and instructions.
 
-`tests/test_persona_contract.py` and `adapters/persona-contract.test.mjs` use only
-synthetic roles. They cover scope isolation, stable prompt propagation, evaluator
-receipts, frozen trait writes and detection of changed instruction prefixes.
+`tests/business/persona-contract.test.mjs` uses only synthetic roles. It covers
+the file's field, marker and hash checks and the rule that instructions begin
+with the approved core ahead of SOUL.

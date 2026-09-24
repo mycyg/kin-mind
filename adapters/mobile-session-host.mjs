@@ -116,6 +116,15 @@ export function restoreInjection(checkpoint,operationId) {
   return {marker,items:[{type:'message',role:'assistant',content:[{type:'output_text',text:JSON.stringify({...checkpoint.payload,marker})}]}]};
 }
 
+/** The model catalogue a maintenance candidate starts with: the active runtime's frozen
+ * copy the host names (mind-config's model_catalog_file, set from the verified runtime),
+ * never the refreshed root mobile-models.json (CR-RT-06). Asked when a candidate starts. */
+export function candidateCatalogFile(config) {
+  const file=config?.model_catalog_file;
+  if(typeof file!=='string'||!path.isAbsolute(file))throw Error('Candidate needs the active runtime\'s frozen model catalogue');
+  return file;
+}
+
 /** Adapter dependencies are supplied by the mobile host. No desktop paths,
  * credentials, channel IDs or shared experiences are built into this module. */
 export async function startMobileSessions({bridge,root,config,routerConfig,mindCall,recordStatus=()=>{}}) {
@@ -138,7 +147,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     if(written&&written!==writtenObservation){atomicJson(observationFile,observation);writtenObservation=written;}
   };
   const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
-    configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:path.join(root,'mobile-models.json'),gateway:routing.gateway,companionInstructions}),
+    configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:candidateCatalogFile(config),gateway:routing.gateway,companionInstructions}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
@@ -178,7 +187,8 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       return result;
     },
     reconcileCompact:async operationId=>{const session=await routing.ensureSession('kin-host:compact-status');return session.agentInfo.connection.extMethod('_kin/compact',{sessionId:manager.fence().threadId,operationId,checkOnly:true});},
-    reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id});},
+    // The attempt travels to the mind's queue key and comes back in its answer (CR-RT-08).
+    reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id,snapshotId:event.cause,attempt:event.attempt});},
     createCandidate:request=>native.create(request),injectCandidate:request=>native.inject(request),verifyCandidate:request=>native.verify(request),
     closeCandidate:()=>native.close(),
     reconcileCandidate:async candidate=>candidate.native.path&&fs.existsSync(candidate.native.path)&&(await checkpointMarker(candidate.native.path,'kin-checkpoint:'+candidate.injectionId)).found,

@@ -93,18 +93,31 @@ export function stopReason(error){
   const code=error?.failure?.code??error?.code;
   return typeof code==='string'&&/^[a-z0-9][a-z0-9-]{0,79}$/.test(code)?code:'creation-executor-failed';
 }
-export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS}){
-  let running=false,closed=false,controller=null,current=null;
+const halted=code=>Object.assign(Error(code),{code});
+/** `beginActivity({kind,id})`: the router's in-flight registration (CR-MIND-01), `{ok:false}` under
+ * a release freeze, else `{ok:true,release()}`. Without one, nothing is registered. */
+export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS,
+  beginActivity=()=>({ok:true,release(){}})}){
+  let running=false,closed=false,controller=null,current=null,stops=0;
   const owner='creator-'+process.pid;
   const tick=async()=>{
     // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
     if(closed||running||isBusy()||creator.command===null)return;
-    running=true;let claimed;
+    running=true;let claimed,activity=null;
+    // CR-MIND-05: the stop state exists before the claim is asked for. A literal stop or a
+    // shutdown that lands while the claim is on its way is seen when it comes back, and that
+    // claim is settled as interrupted under its own run id instead of starting.
+    const stopsBefore=stops;controller=new AbortController();
+    const stopped=()=>closed||stops!==stopsBefore||controller.signal.aborted;
     try{
       claimed=await call('plan-claim',{actor:'create',owner});
       if(claimed.state!=='claimed')return;
-      controller=new AbortController();
       const run=claimed.run;
+      if(stopped())throw halted(closed?'host-closing':'owner-stop');
+      // CR-MIND-01: in flight with the router from the moment the executor starts; a release
+      // freeze that began after the tick's own check defers it.
+      activity=beginActivity({kind:'creation',id:run.id});
+      if(!activity?.ok)throw halted('dispatch-frozen');
       current={plan_id:claimed.plan.id,goal:claimed.plan.goal,step:claimed.step?.goal,run_id:run.id};
       const result=await creator.run(claimed,{signal:controller.signal,onHeartbeat:async()=>{
         if(closed)return {state:'interrupt'};
@@ -127,9 +140,9 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
       recordStatus({creation:{state:'needs-review',reason}});
     }
-    finally{running=false;controller=null;current=null;}
+    finally{try{activity?.release?.();}catch{}running=false;controller=null;current=null;}
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
-  const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();controller?.abort();};
-  return {tick,async close(){closed=true;controller?.abort();await creator.stop();},get running(){return running;},get current(){return current;}};
+  const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();stops++;controller?.abort();};
+  return {tick,async close(){closed=true;stops++;controller?.abort();await creator.stop();},get running(){return running;},get current(){return current;}};
 }

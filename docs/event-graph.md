@@ -35,7 +35,7 @@ Raw host events are durable before semantic evaluation. Actual operations and re
 
 The queue combines complete events under a 24,000-token input target and a 40-source ceiling. Oversized individual events use the existing source-preserving compression route. Historical graph interpretation has a persisted newest-first cursor, reuses the same appraisal worker, and evaluates old receipts against their matching findings. Live events take priority over historical backfill; failed jobs retain their cursors and retry timing. A backfill does not create feelings, reopen completed wishes or send old findings.
 
-Idle appraisals remain independently scheduled by DeepSeek within 20–120 minutes. Exploration remains curiosity-driven and executor runs keep a twenty-minute ceiling. The work lock, shared conversation, current DS action decision and Singapore 00:00–09:00 quiet hours remain host responsibilities. With `semantic_actions` enabled, scores are dynamic context rather than an admission threshold.
+Each idle appraisal schedules the next one between 10 minutes and a day ahead; new events can bring it forward. Exploration remains curiosity-driven and executor runs keep a twenty-minute ceiling. The work lock, the shared conversation and the owner's configured contact rules (quiet hours, waiting for a reply, minimum gap) remain host responsibilities, and those rules hold whatever triggers a contact. With `semantic_actions` enabled, scores are dynamic context rather than an admission threshold.
 
 ## Recall and budgets
 
@@ -49,6 +49,8 @@ A graph lookup first considers identifiers, relevant text and entities, then rec
 | Work background | 4,000 |
 | Explicit reading page | 2,000 |
 | Accumulated automatic background per native window | 12,000 |
+
+These defaults apply with `native_window_context` off. With it on, an automatic addition takes what its selection needs within a fixed 8,000-token ceiling and the room the native window reports, and no per-window total applies.
 
 A finding, its provenance, important corrections and disclosure coverage form one context item. The graph itself stays in storage. Automatic context exposes at most three works and five shares, with cursors for deeper reading. Explicit reads are not blocked by automatic-injection deduplication.
 
@@ -92,8 +94,6 @@ Run `pytest`, `node --test tests/business/*.test.mjs` and the console's Playwrig
 
 See [the recorded validation results](event-graph-validation.md) for measured results and the limits of those measurements.
 
-Ordinary replies use the durable group sender without a second semantic review. Shared findings inform generation; repeating a game, joke or old topic is allowed. Proactive contact uses the existing DS decision and current contact conditions. An explicit `choose_reply` decision can still choose silence or merge inputs.
+Ordinary replies use the durable group sender with no review model. Shared findings inform generation; repeating a game, joke or old topic is allowed. Proactive contact uses the assessment's decision — the main session's with `main_session_review`, otherwise DeepSeek's — and current contact conditions. Kin's explicit `choose_reply` decision can choose silence or merge inputs.
 
-Malformed public content is regenerated once from the original input, recent public conversation, original draft and the specific error. This correction runs no tools and changes only unsent text. If it cannot finish, a short status bypasses the content review. Partial deliveries preserve accepted fragments; unknown receipts are reconciled under their original IDs. Delivery accounting uses the existing background journal.
-
-`share-preflight` and `share-preflight-group` remain available to explicit API callers for compatibility. They are not automatic gates in the phone reply path.
+A public body that cannot go out as written — carrying a private marker or a broken envelope, or flagged for repair — is withdrawn, never regenerated or rewritten; Kin's next owner turn is told that it went unsent, without its words. Partial deliveries preserve accepted fragments; unknown receipts are reconciled under their original IDs. Delivery accounting uses the background journal.

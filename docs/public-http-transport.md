@@ -26,7 +26,8 @@ unexpected schema changes fail closed instead of falling back to system DNS.
 ## Configuration
 
 The feature is opt-in. The host passes this object as
-`exploration_web.public_transport` and copies it into `web-reader.json`:
+`exploration_web.public_transport` and copies it into `web-reader.json` and
+`computer-use.json`:
 
 ```json
 {
@@ -46,10 +47,15 @@ fragment, or a non-standard port. Every bootstrap address must be a public IP.
 The resolver timeout is limited to ten seconds and the TTL cap to five minutes.
 Invalid enabled configuration fails closed.
 
-When the object is absent or `enabled` is false, `web_read.py` retains its
-existing direct path for compatibility. That path must use `trust_env=False`
-and keeps the existing public-address check, so FakeIP DNS remains refused. It
-does not silently switch to this transport, a proxy, or a browser.
+When the object is absent or `enabled` is false, `web_read.py` uses its direct
+path: `trust_env=False` and a public-address check of the operating-system
+resolver's answers, so FakeIP DNS is refused. It does not silently switch to
+this transport, a proxy, or a browser.
+
+The computer-use browser checks the host of every URL it opens or reads with
+the same rule: through this transport's resolver when it is enabled, and
+through the operating-system resolver otherwise, so the browser and the reader
+agree on what is public.
 
 ## Reader integration
 
@@ -66,9 +72,9 @@ with client_factory(timeout=15, follow_redirects=False) as client:
 
 The response remains streaming; the transport does not read the body. Each
 request performs a fresh resolution and creates a one-request connection pool.
-`web_read.py` must continue to handle redirects itself. Each accepted redirect
-therefore produces another resolution, address-policy check, pinned TCP
-connection, TLS check, and peer check.
+`web_read.py` handles redirects itself. Each accepted redirect therefore
+produces another resolution, address-policy check, pinned TCP connection, TLS
+check, and peer check.
 
 `response.extensions["kin_public_transport"]` contains only non-secret
 transport evidence: hostname, verified address set, actual peer address,

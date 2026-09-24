@@ -67,6 +67,21 @@ export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
 /** How long a freeze nobody lifts holds new dispatch. */
 export const FREEZE_TTL_MS=2*3600000;
+/** KIN-FIX-20260924, the first release (WS7): kin-deploy stops a host that predates
+ * the ledger right after it is idle -- it cannot be frozen -- and hands over, beside
+ * this router's state file, the owner inputs that reached it between that idle check
+ * and its confirmed exit, and the freeze this router starts under. Ids and states
+ * only. Read once, by the ledger upgrade. */
+export const CARRYOVER_FILE='release-carryover.json';
+export function readCarryover(stateFile) {
+  const value=readJsonFile(path.join(path.dirname(stateFile),CARRYOVER_FILE)).value;
+  if(value?.schema!==1||!Array.isArray(value.inputs))return null;
+  const inputs=value.inputs.filter(entry=>typeof entry?.id==='string'&&/^[\w:.-]{1,200}$/.test(entry.id))
+    .map(entry=>({id:entry.id,create:entry.create===true,...(Number.isFinite(entry.at)?{at:entry.at}:{})}));
+  const freeze=typeof value.freeze?.reason==='string'&&value.freeze.reason.trim()&&Number.isFinite(value.freeze.until)
+    ?{reason:value.freeze.reason.trim().slice(0,200),at:Number.isFinite(value.freeze.at)?value.freeze.at:null,until:value.freeze.until}:null;
+  return {releaseId:typeof value.releaseId==='string'?value.releaseId.slice(0,120):null,inputs,freeze};
+}
 /** Hot state keeps what is unsettled plus a bounded recent tail; the rest moves to
  * `archive/router-YYYY-MM.jsonl` beside the state file, never deleted (AD1-08). */
 export const HOT_LIMITS=Object.freeze({inputs:200,internal:24,tasks:32,requests:64,notices:64,history:64,journalBytes:8*1024*1024});
@@ -205,7 +220,27 @@ export class MobileRouter {
     // An accepted one is taken as answered; any other keeps its reason and id as
     // history and is never acted on, or counted as unsettled, again.
     if(this.state.ledgerVersion!==2) {
+      // The first release's hand-over: these inputs raced the old host's stop and
+      // stay live for the watchdog -- retried when provably unsubmitted, reconciled
+      // or reported otherwise -- instead of becoming history.
+      const carried=readCarryover(file);
+      for(const entry of carried?.inputs??[]) {
+        let record=this.state.inputs[entry.id];
+        if(!record&&entry.create){
+          record=this.state.inputs[entry.id]={id:entry.id,kind:'owner',state:'failed-before-submit',route:null,at:entry.at??at,
+            conversationId:this.state.conversationId??null,generation:this.state.generation??null};
+          this.notSubmitted(record,'release-carryover',{restart:true});
+        }
+        if(!record||!ownerInput(record)||record.state==='superseded')continue;
+        record.carriedOver={at,...(carried.releaseId?{releaseId:carried.releaseId}:{})};
+        if((['selected','semantic-pending'].includes(record.state)||record.state==='failed-before-submit'&&!record.retry)&&!record.submissionStartedAt) {
+          if(this.state.semanticPending[record.id])this.state.semanticPending[record.id].state='superseded';
+          this.notSubmitted(record,'release-carryover',{restart:true});
+        }
+      }
+      if(carried?.freeze&&!this.frozen())this.state.freeze={reason:carried.freeze.reason,at:carried.freeze.at??at,until:carried.freeze.until,by:'kin-deploy'};
       for(const record of Object.values(this.state.inputs)) {
+        if(record.carriedOver)continue;
         if(record.state==='accepted')record.answer??={state:'legacy'};
         else if(!inputInFlight(record)&&record.state!=='superseded')record.historical={at,reason:'pre-ledger:'+record.state};
       }
@@ -580,7 +615,8 @@ export class MobileRouter {
     // Phase one, under the mutex: identity, literal commands and everything that needs
     // no model. The classification itself never holds the mutex (AD1-06).
     const first=await this.locked(async()=>{
-      const previous=this.state.inputs[input.id];
+      // CR-LIFE-02: a record the host made when it took the input in is not routed yet.
+      const previous=intakeOnly(this.state.inputs[input.id])?null:this.state.inputs[input.id];
       // An archived input was settled long ago: a replay of it is never re-run (AD1-08).
       if(!previous&&this.archivedIds.has(input.id))return {record:{id:input.id,state:'accepted',archived:true}};
       if(previous) {
@@ -652,10 +688,14 @@ export class MobileRouter {
     }
     // Phase two, under the mutex: the answer applies only against the basis it was read from.
     return this.locked(async()=>{
-      if(this.state.inputs[input.id])return clone(this.state.inputs[input.id]);
+      // CR-LIFE-02: a record the host made on intake is replaced by the routed one, which
+      // keeps the retries this input already used.
+      const intake=intakeOnly(this.state.inputs[input.id])?this.state.inputs[input.id]:null;
+      if(this.state.inputs[input.id]&&!intake)return clone(this.state.inputs[input.id]);
       const now=this.now();
       const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt:receiptTime(input.receivedAt,now),
-        ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{})};
+        ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),
+        ...(intake?.retry?{retry:clone(intake.retry)}:{})};
       if(semanticFailure) {
         const current=this.currentTask(),runtime=first.classify.runtime;
         this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
@@ -765,6 +805,9 @@ export class MobileRouter {
     const pending=this.dispatchOnce(input,submit).catch(async error=>{
       const retry=await this.locked(()=>{
         const record=this.state.inputs[input.id];
+        // CR-LIFE-02: a freeze took nothing; an input known only from its intake waits in the
+        // inbox as it is, and the refusal counts no attempt.
+        if(error?.code==='dispatch-frozen'&&intakeOnly(record)&&record.state==='preparing'){this.notSubmitted(record,'dispatch-frozen',{restart:true,stage:'intake'});this.save('input-failed-before-submit',{id:input.id,reason:'dispatch-frozen'});return null;}
         if(record&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt){
           const retry=this.notSubmitted(record,error.message);
           this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});return retry;
@@ -1912,6 +1955,41 @@ export class MobileRouter {
       if(changed)this.save('reconciled');return {state:this.openWork().length?'work-held':'idle'};
     });
   }
+  // ---- CR-LIFE-02 (WS4): an owner input is on the ledger from the moment the host has
+  // verified its source, before anything that can fail prepares it (attachments, previews,
+  // the session). A failure there proves it never reached the native session: the watchdog
+  // retries it under its own id and, past the retries, tells the owner as the system.
+  /** Record a verified input about to be prepared, under its original id, as `preparing`
+   * with nothing routed yet (`intake`). A record already routed is left as it is; an
+   * earlier preparation failure of this input becomes this attempt. Returns the record and
+   * `since`, when this attempt began. */
+  received({id,kind='owner',channel=null,receivedAt=null}) {
+    return this.locked(async()=>{
+      const now=this.now(),record=this.state.inputs[id];
+      if(!record&&this.archivedIds.has(id))return {record:{id,state:'accepted',archived:true},since:now};
+      if(record&&intakeOnly(record)&&record.state==='failed-before-submit') {
+        Object.assign(record,{state:'preparing',at:now});delete record.reason;delete record.failureStage;delete record.ownerNotice;
+        this.save('input-intake-retry',{id,attempt:record.retry?.attempts??0});
+      }
+      if(record)return {record:clone(record),since:now};
+      const created={id,kind,at:now,firstReceivedAt:receiptTime(receivedAt,now),intake:{at:now},...(INPUT_CHANNELS.has(channel)?{channel}:{}),
+        state:'preparing',conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId};
+      this.state.inputs[id]=created;this.save('input-received',{id});
+      return {record:clone(created),since:now};
+    });
+  }
+  /** The host could not prepare this input: nothing of it was submitted. A failure the
+   * router's own dispatch already recorded for this attempt (`since`) is not counted twice. */
+  intakeFailed(id,reason,{since=0}={}) {
+    return this.locked(async()=>{
+      const record=this.state.inputs[id];
+      if(!record||this.inflight.has(id)||record.submissionStartedAt||!['selected','preparing','failed-before-submit'].includes(record.state))return record?clone(record):null;
+      if(record.state==='failed-before-submit'&&(record.retry?.lastFailureAt??-Infinity)>=since)return clone(record);
+      const retry=this.notSubmitted(record,reason);
+      this.save('input-failed-before-submit',{id,reason,attempt:retry.attempts});
+      return clone(record);
+    });
+  }
   /** The watchdog. Every owner input gets an outcome: a retry only on evidence that
    * the same id never arrived (not submitted, refused by the platform, reconciled as
    * not received), a reconciliation of an uncertain submission by its original id,
@@ -2077,6 +2155,8 @@ export class MobileRouter {
     return changed;
   }
 }
+/** CR-LIFE-02: a record the host made on intake, before anything routed it. */
+function intakeOnly(record){return Boolean(record?.intake&&!record.route&&['preparing','failed-before-submit'].includes(record.state));}
 /** A task keeps a bounded history of replaced and late entries (AD1-08). */
 function trim(task,key,limit=64) {
   const entries=Object.entries(task[key]??{});

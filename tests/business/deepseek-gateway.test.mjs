@@ -27,14 +27,22 @@ test('a name that could break the contract text is refused at start', async () =
     /invalid-owner-name/);
 });
 
-test('the session effort is forwarded; the host default fills in, and fixed background profiles keep theirs', () => {
+test('the retired computer-action reviewer has no gateway, profile or contract left (N6, N7)', async () => {
+  const gateway = await import('../../adapters/deepseek-gateway.mjs');
+  assert.equal(gateway.startComputerActionReviewGateway, undefined);
+  assert.equal(gateway.computerActionReviewSchema, undefined);
+  assert.equal(gateway.GATEWAY_PROFILES['computer-action-review'], undefined);
+  assert.throws(() => gateway.gatewayProfile('computer-action-review'), /unknown-gateway-profile/);
+  assert.equal('computer-action-review' in gatewayContracts(), false);
+  assert.doesNotMatch(source, /computer-action-review|computer_action_review/);
+});
+
+test('every Kin request to DeepSeek runs at high: sessions, assessments, drafts and background profiles (CR-MIND-11)', () => {
   const body = effort => ({model: 'deepseek-flash', input: [user('在吗')], ...(effort === undefined ? {} : {reasoning: {effort}})});
-  assert.equal(deepseekRequest(body('max'), 'high').reasoning.effort, 'max', 'an explicit manual choice reaches the provider');
-  assert.equal(deepseekRequest(body('low'), 'high', 'assessment').reasoning.effort, 'low');
-  assert.equal(deepseekRequest(body(undefined), 'high').reasoning.effort, 'high');
-  assert.equal(deepseekRequest(body('ultra'), 'high').reasoning.effort, 'high', 'an unknown effort is not forwarded');
-  assert.equal(deepseekRequest(body('max'), 'high', 'exploration').reasoning.effort, 'high');
-  assert.equal(deepseekRequest(body('none'), 'high', 'computer-action-review').reasoning.effort, 'high');
+  for (const profile of [null, 'chat', 'assessment', 'contact-draft', 'exploration'])
+    for (const effort of ['max', 'low', 'none', undefined, 'ultra'])
+      assert.equal(deepseekRequest(body(effort), 'high', profile).reasoning.effort, 'high', `${profile} ${effort}`);
+  assert.equal(deepseekRequest(body('low'), 'max').reasoning.effort, 'high', 'an instance option does not move it either');
 });
 
 test('a request body is read as bytes: multi-byte text split across chunks arrives intact, and evidence names both efforts', async t => {
@@ -56,9 +64,9 @@ test('a request body is read as bytes: multi-byte text split across chunks arriv
   assert.equal(status, 200);
   assert.equal(upstream.length, 1);
   assert.equal(upstream[0].input.at(-1).content[0].text, text);
-  assert.equal(upstream[0].reasoning.effort, 'max');
+  assert.equal(upstream[0].reasoning.effort, 'high');
   assert.match(upstream[0].instructions, /只输出给阿澄的回复/);
   const attempted = events.find(event => event.stage === 'forward-attempted');
-  assert.equal(attempted.reasoningEffort, 'max');
+  assert.equal(attempted.reasoningEffort, 'high');
   assert.equal(attempted.requestedReasoningEffort, 'max');
 });

@@ -183,8 +183,9 @@ def fresh_leases(conn, scope, *, now=None):
 
 
 def running_appraisal_leases(conn, scope, *, now=None):
-    """The rows the operational recoveries would release. A `running` row whose
-    lease has not expired is held by a worker that is still evaluating it."""
+    """The `running` appraisal rows whose lease has not expired: each is held by a worker
+    that is still evaluating it. The recoveries refuse while any is held (below), and the
+    context-cache sweep waits for the next tick (maintenance.sweep_context_cache)."""
     now = time.time() if now is None else now
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisals'").fetchone():
         return []
@@ -193,8 +194,11 @@ def running_appraisal_leases(conn, scope, *, now=None):
 
 
 def refuse_while_appraisal_leased(conn, scope, *, now=None):
-    """The guard `migrate_operational` and `recover_batched` use in place of the
-    boolean. Both release every `running` row, so a held one must stop them."""
+    """With liveness checks on, the evidence `migrate_operational` and `recover_batched`
+    take instead of the caller's `workers_stopped`. The first returns every `running`
+    row to the queue; the second settles `batched` children against their parent's
+    committed work, which a parent still under lease may yet change. Either would
+    decide about an evaluation still in progress, so any held row stops both."""
     held = running_appraisal_leases(conn, scope, now=now)
     if held:
         raise Conflict(LEASE_FRESH, kind="runtime", code="worker-lease-fresh", target=held[0], actual=len(held))

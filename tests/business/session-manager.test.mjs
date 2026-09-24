@@ -6,7 +6,7 @@ import path from 'node:path';
 import {SessionManager,commitRegistryMigration} from '../../adapters/session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
-import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
+import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateCatalogFile,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
 import {sha256} from '../../adapters/instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
@@ -24,7 +24,9 @@ function fixture(t){
   checkpoint:async(c,b)=>({id:'cp:'+c.cursors.input,conversationId:b.conversationId,generation:b.generation,configVersion:c.configVersion,cursors:c.cursors,complete:true,tokens:100,sourceRevisions:{u:1,a:1},items:[{id:'u',revision:1,role:'user',text:'蓝色机器人叫云朵。'},{id:'a',revision:1,role:'assistant',text:'你要云朵的方形贴纸吗？'}],pendingQuestions:[{sourceId:'a',target:'云朵的方形贴纸'}]}),
   compact:async id=>{calls.push('compact');runtime.lastTokenUsage.inputTokens=10000;return {completed:true,actual_session:'old',operationId:id,at:new Date(clock.now).toISOString()};},ackCompact:async()=>calls.push('ack'),
   createCandidate:async request=>{calls.push('create');candidateRequests.push(structuredClone(request));return {threadId:'new',nativeSessionId:'new',profile:structuredClone(request.profile),providerBinding:providerBinding(request.profile)};},injectCandidate:async()=>{calls.push('inject');return {verified:true};},verifyCandidate:async({checkpoint,profile,providerBinding:binding})=>({checkpointId:checkpoint.id,...verifiedProfileReceipt(profile,binding)}),
-  promote:async()=>{calls.push('promote');return {verified:true,threadId:'new'};},reviewRequested:async()=>calls.push('review')};
+  promote:async()=>{calls.push('promote');return {verified:true,threadId:'new'};},
+  // The mind answers with the job it holds for the attempt it was asked about.
+  reviewRequested:async request=>{calls.push('review');return {id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.cause};}};
  const manager=new SessionManager(options);
  const advise=async(action,evidenceIds=[])=>{await manager.observe(runtime,context);return manager.advise({action,reason:'Synthetic review',evidenceIds,compactionId:manager.state.compactions.at(-1)?.id},{model:'deepseek-flash',reasoning:'high'},manager.state.observation.id);};
  const degraded=()=>{clock.now+=2000000;manager.evidence({id:'failure',sourceId:'owner-correction',revision:1,kind:'reference-error',basis:'owner-statement',at:clock.now});};
@@ -99,6 +101,10 @@ test('maintenance candidates keep the verified companion base and developer laye
  assert.throws(()=>candidateConfigForRuntime(profile,{catalogFile:'/catalog.json',companionInstructions:{enabled:true}}),/incomplete/);
 });
 
+test('a maintenance candidate starts on the frozen catalogue the host names, never the refreshed root one (CR-RT-06)',()=>{
+ assert.equal(candidateCatalogFile({model_catalog_file:'/state/mobile-runtime/candidates/c/mobile-models.json'}),'/state/mobile-runtime/candidates/c/mobile-models.json');
+ for(const config of [{},{model_catalog_file:'mobile-models.json'},null])assert.throws(()=>candidateCatalogFile(config),/frozen model catalogue/);
+});
 test('enabled companion maintenance fails before touching the live router when its instruction contract is incomplete',async()=>{
  let touched=false;const bridge={get mobileRouting(){touched=true;throw Error('router must not be touched');}};
  await assert.rejects(startMobileSessions({bridge,root:'/synthetic',config:{adaptive_sessions:true,companion_instructions:{enabled:true}},
@@ -452,7 +458,7 @@ test('the minute tick reads its judgment from the snapshot, builds fixed-budget 
  const mindCall=async(action,request)=>{calls.push({action,request});
   if(action==='session-snapshot')return snapshot();
   if(action==='session-checkpoint')return {id:'cp',complete:true,tokens:100,budgetPlan:{reason:'recent-dialogue',requested:request.budget,effective:request.budget,limit:8000}};
-  if(action==='session-review')return {state:'queued'};
+  if(action==='session-review')return {id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.snapshotId};
   throw Error('unexpected mind call '+action);};
  const router={state:{},snapshot:()=>({inputs:{},notices:{},configRevision:0}),tasks:()=>[],restoreRoutingProfile:async()=>{},save(){},locked:async fn=>fn()};
  const bridge={ownerId:'owner',sessionManager:{getSession:()=>({processing:false,queue:[]})},
@@ -545,5 +551,62 @@ test('a host started after the migration reopens the committed thread, never an 
  const injection=restoreInjection({payload:{kind:'internal-continuity-checkpoint',publicHistory:[]}},'op');
  assert.equal(injection.marker,'kin-checkpoint:op');
  assert.deepEqual(JSON.parse(injection.items[0].content[0].text),{kind:'internal-continuity-checkpoint',publicHistory:[],marker:'kin-checkpoint:op'});
+});
+
+// CR-RT-09: spec §1 keeps these maintenance causes at every pressure, not only above normal.
+test('at normal pressure a task, the model, the configuration or a corrected source still asks a review; tokens alone do not',async t=>{
+ for(const change of ['task','correction','memory-correction','profile','configuration','router-configuration']){
+  const f=fixture(t);f.runtime.lastTokenUsage.inputTokens=10000;
+  await f.manager.tick();assert.equal(f.manager.state.observation.pressure.level,'normal');
+  for(let i=0;i<30;i++){minutes(f,1);f.runtime.lastTokenUsage.inputTokens+=100;await f.manager.tick();}
+  assert.equal(f.calls.filter(c=>c==='review').length,0,change+': token growth alone asks nothing');
+  if(change==='task')f.context.tasks=[{id:'work',inputVersion:1,status:'running'}];
+  if(change==='correction')f.context.invalidatedSources=['owner-message-with-corrected-source'];
+  if(change==='memory-correction')f.context.linked={items:[],needs_review_ids:['concern-with-corrected-source']};
+  if(change==='profile')Object.assign(f.runtime,{model:'gpt-6-sol',modelProvider:'openai-15m',providerOverride:false,reasoningEffort:'medium'});
+  if(change==='configuration')f.context.configVersion='persona-v2';
+  if(change==='router-configuration')f.context.cursors={...f.context.cursors,config:3};
+  await f.manager.tick();
+  assert.equal(f.calls.filter(c=>c==='review').length,1,change);
+  minutes(f,1);await f.manager.tick();
+  assert.equal(f.calls.filter(c=>c==='review').length,1,change+': the same observation is asked once');
+ }
+});
+test('changes at normal pressure are asked about once per cooldown, and the latest question stands',async t=>{
+ const f=fixture(t);f.runtime.lastTokenUsage.inputTokens=10000;await f.manager.tick();
+ f.context.tasks=[{id:'a',inputVersion:1,status:'running'}];await f.manager.tick();
+ assert.equal(f.calls.filter(c=>c==='review').length,1);
+ for(let version=2;version<=5;version++){minutes(f,5);f.context.tasks=[{id:'a',inputVersion:version,status:'running'}];await f.manager.tick();}
+ assert.equal(f.calls.filter(c=>c==='review').length,1,'four more changes inside the cooldown ask nothing yet');
+ const latest=f.manager.state.observation.id;
+ assert.equal(f.manager.state.events[latest].state,'pending');
+ assert.ok(Object.values(f.manager.state.events).filter(e=>e.state==='superseded').length>=3,'each earlier question gave way to the next');
+ minutes(f,10);await f.manager.tick();
+ assert.equal(f.calls.filter(c=>c==='review').length,2,'the latest change is asked once the cooldown is over');
+ assert.equal(f.manager.state.events[latest].state,'queued');
+ // Pressure above normal is not held by that cooldown.
+ f.runtime.lastTokenUsage.inputTokens=30000;minutes(f,1);await f.manager.tick();
+ assert.equal(f.calls.filter(c=>c==='review').length,3);
+});
+// CR-RT-08: a new attempt about the same observation used to come back as the first,
+// finished job; the host marked it queued and waited for an answer that never came.
+test('each review attempt is its own job in the mind, and only the job the mind reports for it counts',async t=>{
+ const f=fixture(t);critical(f);const asked=[];let answer;
+ f.manager.reviewRequested=async request=>{asked.push(request.id);return answer(request);};
+ answer=request=>({id:'job:old',state:'complete',requestId:'review:elsewhere:1',snapshotId:request.cause});
+ await f.manager.tick();
+ const cause=f.manager.state.observation.id,event=f.manager.state.events[cause],id=n=>'review:'+cause.slice(0,24)+':'+n;
+ assert.deepEqual([event.state,event.attempts,event.failures],['pending',0,1],'an answer about another attempt queues nothing');
+ answer=request=>({id:'job:'+request.id,state:'needs-repair',requestId:request.id,snapshotId:request.cause});
+ minutes(f,1);await f.manager.tick();
+ assert.deepEqual([event.state,event.attempts],['pending',1],'a job that ended without an answer uses its attempt up');
+ answer=request=>({id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.cause});
+ minutes(f,2);await f.manager.tick();
+ assert.deepEqual([event.state,event.requestId,event.jobId],['queued',id(2),'job:'+id(2)]);
+ assert.deepEqual(asked,[id(1),id(1),id(2)]);
+ f.context.sessionAdvice={eventId:'mind-event-9',snapshotId:cause,requestId:id(2),generation:1,
+  decision:{action:'defer',reason:'Wait for the window to settle',evidenceIds:[]},receipt:{model:'deepseek-flash',reasoning:'high'}};
+ assert.equal((await f.manager.tick()).state,'defer');
+ assert.deepEqual([event.state,event.answer.requestId],['answered',id(2)],'the judgment names the attempt it answers');
 });
 

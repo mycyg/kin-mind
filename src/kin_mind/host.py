@@ -167,7 +167,11 @@ def dispatch(config, action, request):
         if not config.get("adaptive_sessions") or not session_context:
             return {"state": "disabled"}
         # The observed snapshot is the stimulus; nothing is written into memory for a review.
-        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"])
+        # The host's attempt is part of the queue key: the same attempt is one job, a new
+        # attempt a new one, and the answer names the attempt it belongs to (CR-RT-08).
+        if request.get("snapshotId") not in (None, session_context["id"]):
+            return {"state": "stale", "snapshotId": session_context["id"], "requestId": request.get("id")}
+        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"], request_id=request.get("id"))
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":
@@ -508,6 +512,8 @@ def dispatch(config, action, request):
     if action == "settle":
         return mind.settle_contact(**request)
     if action == "recover":
+        # CR-MIND-12: an older release kept the session judgment in the versioned state.
+        mind.retire_session_advice()
         # A start-up used to assume the previous service was gone and interrupt every
         # running exploration. It asks now: a row is interrupted only when its worker
         # is provably gone — the pid is dead, the pid became some other process, or

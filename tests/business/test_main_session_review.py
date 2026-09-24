@@ -48,16 +48,41 @@ def test_preemption_records_unknown_usage_without_exhausting_repairs(setup):
     assert calls[0]['outcome']=='owner-preempted'
 
 
-def test_a_deferred_fork_is_a_wait_that_keeps_what_it_used(setup):
-    """WS4: a fork that timed out is deferred, never failed or retried in the main thread; its
-    receipt's usage and fork thread are recorded (PROBE)."""
+def test_a_deferred_fork_keeps_what_it_used_and_counts_as_a_transient_failure(setup):
+    """WS4, CR-MIND-07: a fork that ran and timed out is deferred, never retried in the main
+    thread; its receipt's usage and fork thread are recorded, and it is a transient failure, not a
+    wait for admission. A fork that never started is still only a wait."""
     mind,_,_=setup
     spent={'model':'gpt-6-sol','native_turn_id':'turn-9','fork_thread_id':'fork-3','usage':{'input_tokens':1200,'output_tokens':40}}
-    p=native_provider(mind,lambda request:{'state':'waiting','reason':'fork-timeout','model_invoked':True,'receipt':spent})
+    # The host's own shape (boundaries.runForkAssessment).
+    p=native_provider(mind,lambda request:{'state':'waiting','reason':'fork-timeout','model_invoked':True,'started':True,'receipt':spent})
     with attempts.collect(p) as calls:
-        with pytest.raises(ModelAdmissionWait,match='fork-timeout'):p._native('submit_appraisal',{},'',{},10)
+        with pytest.raises(RuntimeError,match='native-review-fork-timeout'):p._native('submit_appraisal',{},'',{},10)
     assert calls[0]['outcome']=='fork-timeout' and calls[0]['request_id']=='turn-9'
     assert calls[0]['usage_status']!='unknown' and calls[0]['detail']=={'fork_thread_id':'fork-3'}
+    idle=native_provider(mind,lambda request:{'state':'waiting','reason':'native-runtime','model_invoked':False})
+    with pytest.raises(ModelAdmissionWait,match='native-runtime'):idle._native('submit_appraisal',{},'',{},10)
+
+
+def test_a_fork_that_keeps_failing_spends_the_bounded_retries_and_is_set_aside(setup):
+    """CR-MIND-07: through run_one, the host's started-and-deferred answer spends transient_failures
+    with its backoff (never admission waits), and the budget running out sets the row aside."""
+    from kin_mind.appraisal import MAX_TRANSIENT_FAILURES
+    mind, source, _ = setup
+    answer={'state':'waiting','reason':'fork-failed','model_invoked':True,'started':True,
+            'receipt':{'model':'gpt-6-astra','native_turn_id':'t','fork_thread_id':'f','usage':None}}
+    jobs=Appraisals(mind);job=jobs.enqueue([source('fork-keeps-failing')],'synthetic-v1')
+    states=[]
+    for _ in range(MAX_TRANSIENT_FAILURES+1):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?",(job['id'],))
+        states.append(jobs.run_one(native_provider(mind,lambda request:answer))['state'])
+    with mind.engine.db.connect() as conn:
+        row=conn.execute("SELECT state,available,data FROM mind_appraisals WHERE id=?",(job['id'],)).fetchone()
+    data=json.loads(row['data'])
+    assert states==['pending']*MAX_TRANSIENT_FAILURES+['needs-repair'] and row['state']=='needs-repair'
+    assert data['transient_failures']==MAX_TRANSIENT_FAILURES+1 and not data.get('admission_waits')
+    assert data['error']=='native-review-fork-failed'
 
 
 def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
@@ -394,8 +419,8 @@ def test_an_idle_assessment_is_told_it_may_start_something(setup):
     assert 'provider' not in policy and 'reasoning' not in policy
 
 def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
-    """K1-16: an id the request did not supply is accepted when the turn's tool receipts show a
-    completed read and the record already existed; without a tool read it is not."""
+    """K1-16, CR-MIND-08: an id the request did not supply is accepted when a completed tool call of
+    the turn returned it (at its current revision, when named) and the record already existed."""
     mind, source, _ = setup
     earlier = source('read-by-tool')
     jobs = Appraisals(mind)
@@ -404,12 +429,26 @@ def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
             return {'understanding': {'evidence_ids': [earlier]}}
     from datetime import datetime, timedelta, timezone
     started = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
-    with_tools = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True}]}}
+    # WS1's receipt: each completed call names what it returned, [{id, revision}].
+    calls = lambda *entries, ok=True: {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': ok, 'ids': list(entries)}]}}
+    with_tools = calls({'id': earlier, 'revision': None})
     fetched = jobs._tool_fetched(Proposal(), with_tools, {}, started)
     assert any(ref['source_id'] == earlier for ref in fetched.values())
     assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': []}}, {}, started) == {}
     before = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     assert jobs._tool_fetched(Proposal(), with_tools, {}, before) == {}
+    # CR-MIND-08: a call that succeeded at something else, or names no ids, vouches for nothing.
+    other = source('read-elsewhere')
+    unrelated = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True, 'ids': [{'id': other, 'revision': None}]},
+                                                   {'name': 'search', 'ok': True, 'ids': []}]}}
+    assert jobs._tool_fetched(Proposal(), unrelated, {}, started) == {}
+    assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True}]}}, {}, started) == {}
+    assert jobs._tool_fetched(Proposal(), calls({'id': earlier, 'revision': None}, ok=False), {}, started) == {}
+    # Returned under its record: only at the revision it has now.
+    with mind.engine.db.connect() as conn:
+        ref = mind._evidence(conn, [earlier])[0]
+    assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision']}), {}, started)
+    assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision'] + 1}), {}, started) == {}
 
 
 def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):
@@ -450,3 +489,32 @@ def test_sixty_quiet_minutes_hold_as_many_assessments_as_kin_asked_for(setup):
         clock[0] += timedelta(minutes=1)
     assert 1 <= reviewer.calls <= 7
     assert max(sizes) < 40000
+
+
+def test_evidence_already_integrated_ends_the_attempt_with_no_call_no_slot_and_no_charge(setup, monkeypatch):
+    """WS8 docs pass: an appraisal whose sources the mind has already integrated makes no model
+    call, so it takes no model slot and is charged nothing: the claim's attempt count is given
+    back and the ledger records an uncharged attempt that committed nothing."""
+    from kin_mind import appraisal as module
+    from kin_mind.memory import MemoryContinuity
+    from test_kin_mind import FakeReviewer
+    mind, source, _ = setup
+    MemoryContinuity(mind).configure({"records": True, "semantic": True})
+    jobs = Appraisals(mind)
+    evidence = source('integrated-earlier')
+    job = jobs.enqueue([evidence], 'synthetic-v1')
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_semantic_sources VALUES(?,?,?)", (mind.scope.key(), evidence, 'event-earlier'))
+
+    def no_slot(*_args, **_kwargs):
+        raise AssertionError("no model slot for an attempt that makes no call")
+    monkeypatch.setattr(module, "evaluation_slot", no_slot)
+
+    class NoCall(FakeReviewer):
+        def appraise(self, context):
+            raise AssertionError("no model call")
+    out = jobs.run_one(NoCall(Appraisal(reason="unused")))
+    assert out["state"] == "complete" and out["result"] == {"already_integrated": True}
+    assert out["attempts"] == 0 and out["completed_from"] == "already-integrated"
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
+    assert (ledger["charged"], ledger["outcome"], ledger["calls"]) == (False, "discarded", [])

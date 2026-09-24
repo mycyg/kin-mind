@@ -102,8 +102,6 @@ export class MindLoop {
       if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
         if(candidate.owner_epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
           reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
-        if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
-          attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
         return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
           failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
       }
@@ -149,9 +147,10 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:current?(sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
           ...(current?{failure:detail}:{})});
       }
-      // Kin picked among every ready wish the attempt offered; unnamed means all of them (N11).
-      const {desire_ids:named,...semantic}=decision;
-      const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:{};
+      // Kin picked among the ready wishes handed to her this round; unnamed means all of those,
+      // never a wish she was not shown (N11, CR-MIND-04). `handed_ids` is the host's, not hers.
+      const {desire_ids:named,handed_ids:handed,...semantic}=decision;
+      const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:Array.isArray(handed)&&handed.length?{desire_ids:handed}:{};
       const content=decision.action==='send'?decision.text:null;
       const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch(),...chosen,...(typeof content==='string'?{text:content}:{})});
       if(valid.reason==='repeats-unconfirmed-send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});
@@ -183,8 +182,6 @@ export class MindLoop {
         if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
           if(epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
             reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
-          if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
-            attempt_id:attempt.id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
           return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
             failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
         }

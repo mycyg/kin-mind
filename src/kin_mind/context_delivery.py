@@ -108,7 +108,9 @@ class ContextDelivery:
                 return {'state': 'waiting', 'reason': 'automatic-background-budget'}
             value['state'] = 'sending'
             self._put(conn, value)
-            return self.view(value)
+            # CR-LIFE-09: this call took the send right, and only this one may append. A record
+            # that was already sending is returned as it is, without the flag.
+            return {**self.view(value), 'acquired': True}
 
     def uncertain(self, session, epoch, id):
         with self.db.connect(write=True) as conn:
@@ -118,14 +120,20 @@ class ContextDelivery:
                 self._put(conn, value)
             return self.view(value)
 
-    def pending(self, session):
+    def pending(self, session, after=None, limit=16):
         """What may still be in this window's native history, oldest first. An earlier window's
         leftovers are not: they would lead the list for ever and be searched for on every
-        delivery (DB1-12)."""
+        delivery (DB1-12). With `after` (an id; '' for the first page) it is one page in id
+        order, so a caller can read every one of them, not only the oldest (CR-LIFE-09)."""
+        limit = max(1, min(int(limit), 64))
         with self.db.connect() as conn:
             epoch = self.ctx.window(session, conn)['epoch']
-            rows = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND state IN ('sending','unconfirmed') ORDER BY at LIMIT 16",
-                                (self.scope, session, epoch)).fetchall()
+            if after is None:
+                rows = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND state IN ('sending','unconfirmed') ORDER BY at LIMIT ?",
+                                    (self.scope, session, epoch, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND state IN ('sending','unconfirmed') AND id>? ORDER BY id LIMIT ?",
+                                    (self.scope, session, epoch, str(after), limit)).fetchall()
         return [self.view(json.loads(row[0])) for row in rows]
 
     def acknowledge(self, session, epoch, id, *, actual_session, marker, text_hash, verified=False, native_at=None):
