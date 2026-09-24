@@ -1,8 +1,7 @@
 # bundle 自动激活的依据（package.json 的 dsh.bundle.patch 指向本文件）。
-# 全部配置项都有默认值，这里只写下最常需要改的两项。
+# 全部配置项都有默认值。
 - insert:
     - id: eventmem
       name: dsh-eventmem
       config:
-        surfaceK: 3
-        pythonExecutable: python3
+        enabled: true
