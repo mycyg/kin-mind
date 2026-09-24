@@ -1,6 +1,8 @@
 """A backup is the whole store and a restore brings all of it back (E2-09, S1-13): the persona's
 canonical text, configuration versions and history archives travel with the database, every
-record is embedded again, and a restore of a restored store still rebuilds."""
+record is embedded again, and a restore of a restored store still rebuilds. The canon is put in
+place as the owner's approval record names it (test_persona_approval.py)."""
+import hashlib
 import json
 import sqlite3
 import tarfile
@@ -17,8 +19,15 @@ def receive(engine, key, text):
                                       metadata={"role": "user", "host_event": "message"}))["id"]
 
 
+TEXTS = {"core": "【MY_PERSONA_LOAD】合成角色。【/MY_PERSONA_LOAD】", "voice": "合成的说话方式。", "maintenance": "合成的维护约定。"}
+HASHES = {k + "_sha256": hashlib.sha256(v.encode()).hexdigest() for k, v in TEXTS.items()}
+CANON = json.dumps({"schema": 1, "version": "persona-v3", "scope": Scope().model_dump(), "requires_owner_confirmation": True,
+                    "approved_source": "src_" + "a" * 32, "mutable_trait_keys": [], **TEXTS, **HASHES}, ensure_ascii=False)
+APPROVED = {"version": "persona-v3", **HASHES}  # the host's record of the owner's confirmation
+
+
 def fill(root):
-    (root / "persona-policy.json").write_text('{"synthetic": "persona"}')
+    (root / "persona-policy.json").write_text(CANON)
     (root / "configuration-versions").mkdir()
     (root / "configuration-versions" / "v1.json").write_text('{"synthetic": 1}')
     (root / "archive").mkdir()
@@ -41,10 +50,10 @@ def test_a_backup_carries_the_store_files_and_a_restore_embeds_again(tmp_path):
     assert "local-token" not in names and not any(n.startswith(("vectors", "cache")) for n in names)
     assert set(STORE_FOLDERS) >= {"archive", "configuration-versions"}
 
-    restored = restore(archive, tmp_path / "second")
+    restored = restore(archive, tmp_path / "second", persona_approval=APPROVED)
     assert restored["embeddings"] == 3
     second = Engine(tmp_path / "second")
-    assert (tmp_path / "second" / "persona-policy.json").read_text() == '{"synthetic": "persona"}'
+    assert (tmp_path / "second" / "persona-policy.json").read_text() == CANON
     assert (tmp_path / "second" / "archive" / "mind-events-v1-synthetic.sqlite3").is_file()
     with second.db.connect() as conn:
         pending = {json.loads(row[0])["record_id"] for row in conn.execute(
@@ -59,7 +68,7 @@ def test_a_backup_carries_the_store_files_and_a_restore_embeds_again(tmp_path):
         conn.execute("UPDATE jobs SET state='complete'")
     again = tmp_path / "again.tar.gz"
     backup(second, again)
-    assert restore(again, tmp_path / "third")["embeddings"] == 3
+    assert restore(again, tmp_path / "third", persona_approval=APPROVED)["embeddings"] == 3
     with Engine(tmp_path / "third").db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='rebuild' AND state='pending'").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='embed' AND state='pending'").fetchone()[0] == 3

@@ -227,7 +227,8 @@ ScopePart = Annotated[str | None, Query(
                 "只给出一部分时，其余字段取默认值。")]
 
 
-def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=True, default_scope=None):
+def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=True, default_scope=None,
+               persona_approval=None):
     engine = engine or Engine(root or Path.home() / ".memorypalace")
     auth_token = token or credential(engine.db.root)
     if not auth_token or not auth_token.strip():
@@ -239,6 +240,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     # scope its mind-config names), never an empty default one (E3-03). A read that names some of
     # the four fields gets the model's defaults for the rest, exactly as before.
     home = Scope.model_validate(default_scope) if default_scope is not None else Scope()
+    # The owner's approval record for the persona canon, read when a restore asks for it (a
+    # callable, so a record renewed since the start is the one held), or the record itself. A
+    # host that passes none restores no backup that carries a canon.
+    current_approval = persona_approval if callable(persona_approval) else (lambda: persona_approval)
 
     def scope_of(project, persona, collection, world):
         given = {key: value for key, value in (("project", project), ("persona", persona),
@@ -601,7 +606,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
                     if total > 16 * 1024**3:
                         raise HTTPException(413, "Backup exceeds 16 GiB")
                     output.write(chunk)
-            return await asyncio.to_thread(restore, path, target)
+            return await asyncio.to_thread(restore, path, target, persona_approval=current_approval())
 
     @app.get("/v1/scopes", operation_id="list_scopes")
     def list_scopes(cursor: str = "", limit: int = Query(100, ge=1, le=200)) -> dict:

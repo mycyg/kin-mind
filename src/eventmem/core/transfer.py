@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from .db import Conflict, dumps
 from .engine import Engine
+from .persona import approve_canon
 
 # What a store holds outside its database that nothing rebuilds from it: the persona's
 # canonical text, Kin's self-knowledge, the versions of configuration and persona, and the
@@ -126,7 +127,14 @@ def backup(engine, output: Path):
     }
 
 
-def restore(archive_path: Path, target: Path):
+def restore(archive_path: Path, target: Path, *, persona_approval=None):
+    """Restore a backup into an empty, isolated target.
+
+    A backup that carries a persona canon puts that canon in place for the restored store, so
+    it is restored only as `persona_approval` names it: the owner's approval record the host
+    keeps (mind-config `persona_contract`: the version and all three hashes). With no record,
+    an incomplete one or a canon that differs from it, nothing is restored and the canon is
+    left for host review. The canon's version history (persona-versions/) travels as it was."""
     target = target.expanduser()
     if target.is_symlink():
         raise ValueError("Restore target must not be a symlink")
@@ -191,6 +199,13 @@ def restore(archive_path: Path, target: Path):
         }
         if actual != set(manifest["files"]):
             raise ValueError("Backup contains unverified files")
+        persona = None
+        if "persona-policy.json" in manifest["files"]:
+            try:
+                canon = json.loads((stage / "persona-policy.json").read_text(encoding="utf-8"))
+            except ValueError:
+                raise ValueError("Persona contract needs host review") from None
+            persona = approve_canon(canon, persona_approval)["version"]
         with sqlite3.connect((stage / "memory.sqlite3").as_uri() + "?mode=ro", uri=True) as conn:
             if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("Backup database is corrupt")
@@ -242,6 +257,7 @@ def restore(archive_path: Path, target: Path):
         "rebuild": "queued",
         "embeddings": embeddings,
         "contacts": "Prior sending state requires reconciliation",
+        "persona_version": persona,
     }
 
 
