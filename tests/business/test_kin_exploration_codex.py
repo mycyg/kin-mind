@@ -427,3 +427,24 @@ def test_a_run_whose_worker_died_frees_the_slot_at_the_next_look(tmp_path):
         assert conn.execute("SELECT state FROM mind_explorations WHERE id='explore_dead'").fetchone()[0] == "interrupted"
     assert mind.read()["desires"][0]["status"] == "wanted"
     assert explorer.reclaim_dead() == []
+
+
+def test_the_resident_worker_answers_in_order_and_keeps_long_work_out(tmp_path):
+    """Item 6 (§5.7): one frame per line, answered in order; a long action is refused here, an
+    unreadable frame is answered, and nothing but frames reaches the answer stream."""
+    import io
+    from kin_mind.host import serve
+    _, mind, _ = exploration_world(tmp_path)
+    config = host_config(tmp_path, mind)
+    frames = [{"id": "1", "action": "read", "args": {}, "timeoutMs": 5000},
+              {"id": "2", "action": "explore", "args": {}, "timeoutMs": 5000},
+              {"id": "3", "action": "candidate", "args": {}, "timeoutMs": 5000}]
+    stdin = io.StringIO("".join(json.dumps(f) + "\n" for f in frames) + "not json\n")
+    out = io.StringIO()
+    serve(config, stdin, out)
+    answers = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [a["id"] for a in answers] == ["1", "2", "3", None]
+    assert answers[0]["ok"] and answers[0]["result"]["state"]["revision"] >= 1
+    assert answers[1] == {"id": "2", "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
+    assert answers[2]["ok"] and "eligible" in answers[2]["result"]
+    assert answers[3]["error"]["code"] == "invalid-frame"

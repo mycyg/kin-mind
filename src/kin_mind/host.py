@@ -546,6 +546,62 @@ APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "
                  "maintenance-tick", "vector-optimize", "history-compact", "history-restore")
 
 
+# The resident worker's actions (§5.7): short reads and writes on the store, no model call and
+# no long executor. Exploration, creation's completion review, memory preparation and every
+# request that may take a native review keep their own process, executor and lease.
+RESIDENT_ACTIONS = frozenset({
+    "reply-status", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
+    "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
+    "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review",
+    "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
+    "context-delivery-metrics", "configure-habits", "reply-choice",
+})
+
+
+def _failure(error):
+    found = classify(error)
+    return {"error": type(error).__name__, "kind": found.kind, **({"code": found.code} if found.code else {})}
+
+
+def serve(config, stdin=None, stdout=None):
+    """The resident worker (§5.7): one request per line, `{id, action, args, timeoutMs}`, answered in
+    order as `{id, ok, result|error}`. Requests run one at a time; the caller owns each timeout and
+    restarts this process when one runs over. Anything a request prints goes to stderr, so the
+    answer stream carries frames only."""
+    import sys
+
+    stdin, out = stdin or sys.stdin, stdout or sys.stdout
+    previous, sys.stdout = sys.stdout, sys.stderr
+    try:
+        while True:
+            line = stdin.readline()
+            if not line:
+                return None
+            if not line.strip():
+                continue
+            try:
+                frame = json.loads(line)
+                identifier, action = frame["id"], frame["action"]
+                args = frame.get("args") or {}
+                if not isinstance(args, dict):
+                    raise TypeError("args")
+            except (ValueError, KeyError, TypeError):
+                reply = {"id": None, "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "invalid-frame"}}
+            else:
+                if action not in RESIDENT_ACTIONS:
+                    reply = {"id": identifier, "ok": False,
+                             "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
+                else:
+                    try:
+                        reply = {"id": identifier, "ok": True, "result": dispatch(config, action, args)}
+                    except Exception as error:  # noqa: BLE001 - one request's failure is its own answer
+                        reply = {"id": identifier, "ok": False, "error": _failure(error)}
+            out.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            out.flush()
+    finally:
+        sys.stdout = previous
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -579,6 +635,8 @@ def main():
         # never acted on: this process is running, so a broken interpreter cannot
         # hurt it, and refusing would remove the one path still able to report it.
         warn_interpreter(config.get("python"))
+        if args.action == "serve":
+            return serve(config)
         # An operator runs these from a terminal, with no request to pipe in.
         raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if args.action in {"review", "daily"} and config.get("main_session_review") else sys.stdin.read())
         request = json.loads(raw) if raw.strip() else {}
@@ -593,9 +651,7 @@ def main():
         # Caller sees an error category, never provider payloads or credentials.
         # Additive: the class stays the caller's contract, the taxonomy tells it
         # whether waiting can help. Static codes only, never the failing payload.
-        found = classify(error)
-        result = {"error": type(error).__name__, "kind": found.kind,
-                  **({"code": found.code} if found.code else {})}
+        result = _failure(error)
     print(json.dumps(result, ensure_ascii=False))
 
 

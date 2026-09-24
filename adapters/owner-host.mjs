@@ -46,7 +46,9 @@ export class MindLoop {
     this.closed=false; this.contactRunning=false; this.reviewRunning=false;
   }
   start() {
-    this.timer=setInterval(()=>{void this.review();void this.tick();},60000);
+    // One contact tick a minute: a review ends in a tick of its own, so the minute starts one
+    // directly only while a review is already running (AD2-15).
+    this.timer=setInterval(()=>{if(this.reviewRunning)void this.tick();else void this.review();},60000);
     this.timer.unref?.();
   }
   close() {this.closed=true;clearInterval(this.timer);this.stopExploration?.();}

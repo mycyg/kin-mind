@@ -180,3 +180,15 @@ test('items whose sources moved are shown and marked 待复核; the bounds are w
  const text=stateContext({state:{...state,dimensions:{mood:{value:50}}}});
  assert.ok(!text.includes('工作质量'));assert.ok(text.includes('拒绝、忙与停止要求优先'));
 });
+test('the minute loop runs one contact tick a minute (AD2-15)',async t=>{
+ t.mock.timers.enable({apis:['setInterval']});
+ const events=[];
+ const loop=new MindLoop({call:async action=>{events.push(action);return action==='review'?{state:'idle'}:{eligible:false,reason:'no-actionable-desire'};},
+  eligibility:()=>({eligible:true}),ownerEpoch:()=>'owner-1',isBusy:()=>false,draft:async()=>assert.fail('no draft'),send:async()=>assert.fail('no send')});
+ loop.start();
+ t.mock.timers.tick(60000);
+ for(let i=0;i<20;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(events.filter(action=>action==='review').length,1);
+ assert.equal(events.filter(action=>action==='candidate').length,1);
+ loop.close();
+});
