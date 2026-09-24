@@ -252,11 +252,35 @@ def timestamp(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+# A short-term drive runs for four of its half-lives (at most two days), and then it has run its
+# course: the value goes on from where it got to, toward the dimension's own baseline at the
+# dimension's own pace. Nothing is reset, and the end only asks Kin to look again (K1-02).
+MOTIVATION_HALF_LIVES, MOTIVATION_MAX_HOURS = 4, 48
+
+
+def motivation_expiry(entry):
+    motive = entry.get("motivation")
+    if not motive:
+        return None
+    if motive.get("expires_at"):
+        return motive["expires_at"]
+    hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * entry["half_life_hours"])
+    return (timestamp(entry["at"]) + timedelta(hours=hours)).isoformat()
+
+
+def _toward(score, target, half_life_hours, start, end):
+    elapsed = max(0, (timestamp(end) - timestamp(start)).total_seconds())
+    return target + (score - target) * 0.5 ** (elapsed / (half_life_hours * 3600))
+
+
 def project(entry, at):
-    elapsed = max(0, (timestamp(at) - timestamp(entry["at"])).total_seconds())
-    value = entry["target"] + (entry["score"] - entry["target"]) * 0.5 ** (
-        elapsed / (entry["half_life_hours"] * 3600)
-    )
+    until = motivation_expiry(entry)
+    if until and timestamp(at) > timestamp(until):
+        reached = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], until)
+        pace = entry["motivation"].get("base_half_life_hours") or entry["half_life_hours"]
+        value = _toward(reached, entry.get("baseline", entry["target"]), pace, until, at)
+    else:
+        value = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], at)
     return min(100.0, max(0.0, value))
 
 
@@ -781,12 +805,27 @@ class Mind(Continuity):
                 "event_id": event_id,
                 "agent_version": request.agent_version,
             }
-            if motivation or previous.get("motivation"):
-                setting = motivation.model_dump() if motivation else previous["motivation"]
+            if motivation:
+                setting = motivation.model_dump()
+                hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * setting["half_life_minutes"] / 60)
                 state["dimensions"][key].update(
                     target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
-                    motivation={**setting, "episode_id": event_id},
+                    motivation={**setting, "episode_id": event_id, "started_at": self.clock(),
+                                "expires_at": (timestamp(self.clock()) + timedelta(hours=hours)).isoformat(),
+                                "base_half_life_hours": spec["half_life_hours"]},
                 )
+            elif previous.get("motivation"):
+                until = motivation_expiry(previous)
+                if timestamp(self.clock()) < timestamp(until):
+                    # The same drive goes on, as the same episode with the same end (K1-02). One that
+                    # has run its course is not carried into a new event: the dimension's own target
+                    # and pace take over from the value it had reached.
+                    setting = previous["motivation"]
+                    state["dimensions"][key].update(
+                        target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
+                        motivation={**setting, "expires_at": until,
+                                    "base_half_life_hours": setting.get("base_half_life_hours") or spec["half_life_hours"]},
+                    )
         state["last_evidence_key"] = evidence_key
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())

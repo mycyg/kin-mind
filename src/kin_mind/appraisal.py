@@ -65,7 +65,8 @@ MAX_TRANSIENT_FAILURES = 8
 # their own passes.
 INTERACTION_STIMULI = {None, "assistant-result", "runtime-result", "delivery"}
 MERGEABLE_STIMULI = INTERACTION_STIMULI | {"idle-review", "wish-review", "trait-wish-review", "drive-crossing",
-                                           "plan-review", "exploration-result"}
+                                           "plan-review", "exploration-result", "motivation-review",
+                                           "rhythm-review", "expired-wish-review"}
 
 
 def batch_stimulus(stimuli):
@@ -664,7 +665,7 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
 SYSTEM += """
 自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时用只读记忆工具补读，本回合读到的记录可以作为证据引用；不用关键词或分数替代判断。补读后仍不确定时选择等待。
 plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。
-到期只触发复核。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
+到期只触发复核。state.expired_unsettled_wishes 是过了期限还没结算的愿望：过期不是结论，按实际情况用 wish_updates 标为 complete 或 abandon。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
 同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
 procedure_learning=true 时，从实际任务结果提出 procedure_candidates。result_ids 只能引用三种已核验的结果：回执显示 state=completed 且 verified=true 的计划步骤 run_id、已接收(accepted)的交付、或 verified=true 的任务结果。被打断或未核验的运行、只有产物没有核验的任务、以及聊天里对做过什么的描述都不算；没有这样的结果就把 procedure_candidates 留空。方法保存条件、步骤、工具环境、成功标准、失败反例；候选不等于当前可执行方法，独立验证由宿主完成。已有方法先读适用条件，再在行动中选择 procedure_ids；不能修改人设或新增权限。
 这些字段在功能未启用、历史整理或纯会话维护时留空；无需每次都安排事情。reason 只写简短公开结论，不输出推理轨迹。宿主不使用分数阈值，行动依据当前有效决定、明确授权与真实情境；你判断联系时机，宿主保证新输入优先和执行不冲突。
@@ -736,6 +737,13 @@ def appraisal_context(context):
     state["desires"] = []
     all_desires = original.get("desires", [])
     active_desires = [d for d in all_desires if d.get("status") in {"wanted", "waiting", "in_progress"} and not d.get("expired")]
+    # Past their window but never settled: shown so Kin can settle them in wish_updates (complete or
+    # abandon). Expiry alone neither settles nor archives a wish (K1-15, K4-18).
+    unsettled = sorted((d for d in all_desires if d.get("status") in {"wanted", "waiting", "in_progress"} and d.get("expired")),
+                       key=lambda d: (d.get("expires_at", ""), d["id"]))
+    if unsettled:
+        state["expired_unsettled_wishes"] = [{k: d.get(k) for k in ("id", "kind", "status", "topic", "content", "completion", "expires_at", "revision")}
+                                             for d in unsettled[:12]]
     completed_desires = [d for d in all_desires if d not in active_desires]
     chosen_desires = sorted(active_desires, key=lambda d: (d.get("updated_at", ""), d["id"]), reverse=True)[:16] + completed_desires[-8:]
     for desire in chosen_desires:
@@ -2368,7 +2376,11 @@ class Appraisals:
                     def apply_wish_updates():
                         for _, update in updates:
                             desire = state["desires"].get(update.desire_id)
-                            if not desire or desire["status"] in {"completed", "abandoned"} or timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()):
+                            if not desire or desire["status"] in {"completed", "abandoned"}:
+                                continue
+                            if timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()) and update.action not in {"complete", "abandon"}:
+                                # Expiry is not a conclusion: an expired wish is settled by Kin, as done or
+                                # set down, and is not taken up again under its old window (K1-15, K4-18).
                                 continue
                             # Ordinary conversation can supersede a wish without inventing
                             # a proactive transport receipt. Retire it as abandoned.

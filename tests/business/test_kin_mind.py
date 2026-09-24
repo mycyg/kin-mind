@@ -286,3 +286,59 @@ def test_session_advice_goes_to_the_registry_carrier_not_the_mind_state(setup, m
     with mind.engine.db.connect() as conn:
         assert "session_advice" not in mind._load(conn)
     assert mind.read()["session_advice"]["snapshotId"] == "snapshot-1"
+
+
+def test_a_short_term_drive_runs_its_course_and_asks_again(setup):
+    """K1-02: a drive lasts four half-lives, then the value goes on from where it was toward the
+    baseline; a later event does not carry the spent drive, and its end asks Kin to look again."""
+    from kin_mind.actions import ActionEvents
+    from kin_mind.state import Motivation, project
+    mind, source, clock = setup
+    baseline = mind.read()["dimensions"]["initiative"]["baseline"]
+    mind.record(AffectiveEvent(command_id="night", agent_version="synthetic-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[source("night")], values={"initiative": 60}, reason="Winding down for the night",
+        motivations={"initiative": Motivation(target=5, half_life_minutes=30, reason="Wants to rest")}))
+    with mind.engine.db.connect() as conn:
+        entry = mind._load(conn)["dimensions"]["initiative"]
+    assert entry["motivation"]["expires_at"]
+    clock[0] += timedelta(hours=2)
+    at_end = project(entry, mind.clock())
+    clock[0] += timedelta(hours=10)
+    later = project(entry, mind.clock())
+    assert later > at_end and abs(later - baseline) < abs(at_end - baseline)
+    ActionEvents(mind).crossings()
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='motivation-review'").fetchone()[0] == 1
+    mind.record(event(mind, source, "morning", {"initiative": 40}))
+    with mind.engine.db.connect() as conn:
+        after = mind._load(conn)["dimensions"]["initiative"]
+    assert after["target"] == baseline and "motivation" not in after
+
+
+def test_a_resting_phase_is_not_moved_by_a_timer(setup):
+    """K1-04: past its half-life Kin's phase stays as she gave it; the view only says a review is due."""
+    from kin_mind.rhythm import rhythm_view
+    entry = {"phase": "resting", "alertness": 10, "target": 10, "half_life_minutes": 60, "at": "2026-01-01T00:00:00+00:00",
+             "reason": "Sleeping", "event_id": "e", "config_version": "v", "evidence": []}
+    interactions = {"sample_status": "observing", "last_owner_at": None}
+    view = rhythm_view(entry, "2026-01-01T09:00:00+00:00", interactions)
+    assert view["phase"] == "resting" and view["review_due"] is True
+    awake = rhythm_view({**entry, "phase": "awake", "alertness": 80, "target": 5}, "2026-01-01T09:00:00+00:00", interactions)
+    assert awake["phase"] == "awake"
+
+
+def test_an_expired_wish_is_shown_for_settlement_and_can_be_settled(setup):
+    """K1-15, K4-18: past its window a wish is neither hidden nor archived by expiry; Kin settles it."""
+    from kin_mind.appraisal import WishUpdate
+    mind, source, clock = setup
+    wish(mind, source, "old-wish", content="Share the old photo")
+    desire = mind.read()["desires"][0]
+    clock[0] += timedelta(days=3)
+    context = appraisal_context({"state": mind.read(), "new_evidence": []})
+    assert [w["id"] for w in context["state"]["expired_unsettled_wishes"]] == [desire["id"]]
+    jobs = Appraisals(mind)
+    jobs.enqueue([source("settle")], "synthetic-v1")
+    reviewer = FakeReviewer(Appraisal(reason="That moment passed", wish_updates=[
+        WishUpdate(desire_id=desire["id"], action="abandon", reason="The moment for it passed")]))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert mind.read()["desires"][0]["status"] == "abandoned"

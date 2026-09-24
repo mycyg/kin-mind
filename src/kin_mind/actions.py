@@ -1,6 +1,7 @@
 """Durable internal stimuli. A clock crossing queues one appraisal, not a send."""
 
 import json
+from datetime import timedelta
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import SourceInput
@@ -82,6 +83,7 @@ class ActionEvents:
         queued = []
         with self.mind.engine.db.connect(write=True) as conn:
             state = self.mind._load(conn)
+            queued.extend(self._due_reviews(conn, state))
             from .autonomy_schema import legacy_thresholds
             if not legacy_thresholds(conn, self.mind.scope.key()):
                 # Scores are context. Only due reviews and new evidence wake DS.
@@ -119,6 +121,43 @@ class ActionEvents:
                     },
                 )
                 queued.append(key)
+        return queued
+
+    def _due_reviews(self, conn, state):
+        """What has run its course asks Kin to look again; nothing is changed for her (K1-02, K1-04).
+        A short-term drive past its end, and a rhythm phase past its half-life with no word from 小光
+        since. Each asks once, keyed by what ended."""
+        from .rhythm import stamp
+        from .state import motivation_expiry, timestamp
+        now = self.mind.clock()
+        queued = []
+        for name in ("initiative", "curiosity"):
+            entry = state["dimensions"].get(name) or {}
+            until = motivation_expiry(entry)
+            if until and timestamp(until) <= timestamp(now) and entry.get("evidence") and self.mind._entry_fresh(conn, entry):
+                queued.append(self.emit(conn, "motivation-review", [name, entry["motivation"].get("episode_id"), until], {
+                    "dimension": name, "ended_at": until, "reason": "This short-term drive has run its course",
+                    "evidence_ids": [r["record_id"] for r in entry["evidence"]], "agent_version": state["agent_version"]}))
+        expired = sorted(d["id"] for d in state["desires"].values()
+                         if d["status"] in {"wanted", "waiting", "in_progress"} and timestamp(d["expires_at"]) <= timestamp(now))
+        if expired:
+            # One question for the wishes whose window closed unsettled; asked again only when that set changes.
+            fresh = []
+            for identifier in expired[:12]:
+                refs = state["desires"][identifier].get("evidence") or []
+                if refs and self.mind._fresh(conn, refs):
+                    fresh.extend(r["record_id"] for r in refs)
+            queued.append(self.emit(conn, "expired-wish-review", [expired], {
+                "desire_ids": expired[:12], "reason": "These wishes passed their window without being settled",
+                "evidence_ids": list(dict.fromkeys(fresh))[:24], "agent_version": state["agent_version"]}))
+        rhythm = state.get("rhythm")
+        if rhythm and rhythm.get("evidence") and rhythm.get("half_life_minutes"):
+            ends = stamp(rhythm["at"]) + timedelta(minutes=rhythm["half_life_minutes"])
+            if ends <= stamp(now) and self.mind._fresh(conn, rhythm["evidence"]):
+                queued.append(self.emit(conn, "rhythm-review", [rhythm.get("event_id"), ends.isoformat()], {
+                    "phase": rhythm.get("phase"), "ended_at": ends.isoformat(),
+                    "reason": "The rhythm phase Kin gave has passed its half-life",
+                    "evidence_ids": [r["record_id"] for r in rhythm["evidence"]], "agent_version": state["agent_version"]}))
         return queued
 
     def drain(self, jobs):
