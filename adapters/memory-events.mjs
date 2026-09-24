@@ -15,7 +15,10 @@ function canonical(value) {
   return value;
 }
 export class MemoryEventJournal {
-  constructor({directory,call,clock=Date.now,archivedState={}}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;this.archivedState=archivedState;}
+  constructor({directory,call,clock=Date.now,archivedState={}}) {this.directory=directory;this.call=call;this.clock=clock;this.running=false;this.archivedState=archivedState;this.listeners=new Set();}
+  /** Hear of every event this journal takes on. A listener never decides whether it is kept. */
+  observe(listener){this.listeners.add(listener);return ()=>this.listeners.delete(listener);}
+  notify(event){for(const listener of this.listeners)try{listener(event);}catch{/* Observers never refuse a durable event. */}}
   append(event) {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
@@ -35,6 +38,7 @@ export class MemoryEventJournal {
       return {state:'queued',id:event.id};
     }
     if(!createJsonExclusive(file,canonical(event))&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event ID conflicts with earlier contents');
+    this.notify(event);
     return {state:'queued',id:event.id};
   }
   errorFile(name){return path.join(this.directory,'errors',name);}

@@ -12,7 +12,7 @@ export function splitChatText(text) {
 }
 
 // These are wire-envelope openings, not private topic keywords or source IDs.
-export const privateReplyPrefixes = ['kin-context:context:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜'];
+export const privateReplyPrefixes = ['kin-context:context:', 'kin-effect:', '<｜｜DSML｜｜', '</｜｜DSML｜｜', '<｜DSML｜', '</｜DSML｜'];
 export function privateReplyBoundary(text) {
   let offset=0,fence=null;
   for(const line of text.split('\n')) {
@@ -21,7 +21,7 @@ export function privateReplyBoundary(text) {
     else if(!fence&&!line.trimStart().startsWith('>')) {
       // Quoted code remains a useful explanation, including protocol examples.
       const visible=line.replace(/(`+)(.*?)\1/g,m=>' '.repeat(m.length));
-      const match=/^\s*kin-context:context:|<\/?[｜]{1,2}DSML[｜]{1,2}/u.exec(visible);
+      const match=/^\s*(?:kin-context:context:|kin-effect:)|<\/?[｜]{1,2}DSML[｜]{1,2}/u.exec(visible);
       if(match)return offset+match.index;
     }
     offset+=line.length+1;
