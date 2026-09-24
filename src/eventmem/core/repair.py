@@ -3,6 +3,7 @@
     python -m eventmem.core.repair --root <MemoryPalace>            # dry run: writes nothing
     python -m eventmem.core.repair --root <MemoryPalace> --apply    # the default steps
     python -m eventmem.core.repair --root <MemoryPalace> --apply --steps reerase
+    python -m eventmem.core.repair --root <MemoryPalace> --apply --steps quarantine
 
 Run it with the memory service stopped, after the backup the deploy takes. Every step is
 idempotent: it asks what is already done rather than counting what it did, so a second run
@@ -11,7 +12,7 @@ a history row; records leave active use by a new revision (`archive`, `supersede
 change state, and derived indexes are rebuilt. The report carries identifiers, namespaces and
 counts only — never a line of content.
 
-Steps, in order (the default is all but `reerase`):
+Steps, in order (the default is all but `reerase` and `quarantine`):
 
 - `origins`   Relabel what is already stored by the source-origin table
               (`source-origins.json`): a classification row for every source whose namespace or
@@ -24,6 +25,8 @@ Steps, in order (the default is all but `reerase`):
 - `queues`    Dirty rows of records that left active use are dropped (DB1-08); failed digest
               jobs whose digest is ready again are marked canceled, and sources whose
               extraction can no longer finish are marked failed rather than pending (DB1-09).
+              Embed jobs that failed only because the embedding service was down, for a record
+              still current at that revision, are queued once more (K4-04).
 - `indexes`   The graph and memory node indexes are rebuilt under their nodes' rowids, once
               (K4-10, DB1-07).
 - `spool`     Host receipts that can never be replayed move to host-spool/rejected/ (E1-02,
@@ -32,6 +35,9 @@ Steps, in order (the default is all but `reerase`):
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). It rewrites history rows, so it
               is named explicitly.
+- `quarantine` Opt-in. Quarantined appraisals whose evidence is gone are retired (state
+              `superseded`, reason kept, no model call); the others are listed by reason for a
+              decision, never resumed here, because a resume pays for a model call (K4-06, DB1-05).
 """
 from __future__ import annotations
 
@@ -52,8 +58,8 @@ from .read_policy import (
     origin_of_rule,
 )
 
-STEPS = ("origins", "maintenance", "versions", "queues", "indexes", "spool", "reerase")
-DEFAULT_STEPS = STEPS[:-1]
+STEPS = ("origins", "maintenance", "versions", "queues", "indexes", "spool", "reerase", "quarantine")
+DEFAULT_STEPS = STEPS[:-2]
 COMMAND = "repair-20260924"
 # The maintenance notes this release archives: session-maintenance requests. Internal mind
 # events stay active — appraisals and actions cite them as their stimulus — and only leave the
@@ -233,7 +239,23 @@ def plan_queues(conn):
         " AND j.state NOT IN ('failed','canceled')) AND EXISTS(SELECT 1 FROM jobs j WHERE"
         " j.kind IN ('extract','extract_part','extract_complete') AND json_extract(j.payload,'$.source_id')=s.id)"
         " ORDER BY s.id")]
-    return {"dirty": dirty, "digest_jobs": digests, "extraction_sources": stuck}
+    from .jobs import ENVIRONMENTAL_ERRORS
+
+    embeds = []
+    for row in conn.execute("SELECT j.id,j.error,j.payload FROM jobs j WHERE j.kind IN ('embed','visual_embed')"
+                            " AND j.state='failed' ORDER BY j.id"):
+        if (row["error"] or "") not in ENVIRONMENTAL_ERRORS:
+            continue
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        current = conn.execute("SELECT 1 FROM records WHERE id=? AND revision=? AND deleted=0"
+                               " AND status IN ('active','unverified')",
+                               (payload.get("record_id"), payload.get("revision"))).fetchone()
+        if current:
+            embeds.append(row["id"])
+    return {"dirty": dirty, "digest_jobs": digests, "extraction_sources": stuck, "embed_jobs": embeds}
 
 
 def apply_queues(engine, plan):
@@ -245,7 +267,13 @@ def apply_queues(engine, plan):
             conn.execute("UPDATE jobs SET state='canceled',updated_at=datetime('now') WHERE id=? AND state='failed'", (jid,))
         for sid in plan["extraction_sources"]:
             conn.execute("UPDATE sources SET model='failed' WHERE id=? AND model='pending'", (sid,))
-    return {key: len(value) for key, value in plan.items()}
+    from .jobs import Worker
+
+    recovered = 0
+    for start in range(0, len(plan["embed_jobs"]), 50):
+        page = plan["embed_jobs"][start:start + 50]
+        recovered += len(Worker(engine).recover(page, command_id=f"{COMMAND}:embeds:{digest(page)[:16]}")["recovered"])
+    return {**{key: len(value) for key, value in plan.items()}, "embed_jobs": recovered}
 
 
 # --- indexes ---------------------------------------------------------------------------------
@@ -328,6 +356,51 @@ def apply_reerase(engine):
     return {"layers": counts, "history_job": job}
 
 
+# --- quarantine ------------------------------------------------------------------------------
+
+def _gone(conn, identifier):
+    if identifier.startswith("src_"):
+        return not conn.execute("SELECT 1 FROM sources WHERE id=? AND deleted=0", (identifier,)).fetchone()
+    if identifier.startswith("mem_"):
+        return not conn.execute("SELECT 1 FROM records WHERE id=? AND deleted=0", (identifier,)).fetchone()
+    return False
+
+
+def plan_quarantine(conn):
+    from kin_mind.model_lanes import label
+
+    if not _table(conn, "mind_appraisals"):
+        return {"quarantined": 0, "by_reason": {}, "evidence_gone": []}
+    reasons, gone, total = {}, [], 0
+    for row in conn.execute("SELECT id,scope,data FROM mind_appraisals WHERE state='needs-repair' ORDER BY id"):
+        total += 1
+        data = json.loads(row["data"])
+        reason = label(data.get("repair_reason") or data.get("error") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+        ids = [i for i in data.get("evidence_ids") or [] if isinstance(i, str)]
+        if ids and any(_gone(conn, i) for i in ids):
+            gone.append({"id": row["id"], "scope": row["scope"]})
+    return {"quarantined": total, "by_reason": dict(sorted(reasons.items())), "evidence_gone": gone}
+
+
+def apply_quarantine(engine, plan):
+    from kin_mind.recovery import recover_quarantined
+    from kin_mind.state import Mind
+
+    retired = 0
+    scopes = {}
+    for row in plan["evidence_gone"]:
+        scopes.setdefault(row["scope"], []).append(row["id"])
+    for scope, ids in scopes.items():
+        mind = Mind(engine, Scope.model_validate(json.loads(scope)))
+        for start in range(0, len(ids), 50):
+            page = ids[start:start + 50]
+            done = recover_quarantined(mind, job_ids=page, command_id=f"{COMMAND}:retire:{digest(page)[:16]}",
+                                       source=f"{COMMAND}: evidence gone", retire=True)
+            retired += len(done.get("retired", []))
+    return {"retired": retired}
+
+
 # --- the command -----------------------------------------------------------------------------
 
 def run(root, *, apply=False, steps=DEFAULT_STEPS):
@@ -349,6 +422,7 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
             "queues": plan_queues(conn) if "queues" in steps else None,
             "indexes": plan_indexes(conn) if "indexes" in steps else None,
             "reerase": plan_reerase(conn) if "reerase" in steps else None,
+            "quarantine": plan_quarantine(conn) if "quarantine" in steps else None,
         }
     if "spool" in steps:
         plans["spool"] = plan_spool(engine)
@@ -372,6 +446,8 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
                 entry["done"] = apply_spool(engine)
             elif step == "reerase":
                 entry["done"] = apply_reerase(engine)
+            elif step == "quarantine":
+                entry["done"] = apply_quarantine(engine, plan)
         report["steps"][step] = entry
     return report
 
@@ -393,6 +469,9 @@ def _summary(step, plan):
                 "records_to_supersede": sum(len(group["source_ids"]) - 1 for group in plan)}
     if step == "queues":
         return {key: len(value) for key, value in plan.items()}
+    if step == "quarantine":
+        return {"quarantined": plan["quarantined"], "by_reason": plan["by_reason"],
+                "evidence_gone": len(plan["evidence_gone"])}
     return plan
 
 

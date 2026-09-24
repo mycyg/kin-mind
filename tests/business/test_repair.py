@@ -128,3 +128,43 @@ def test_unknown_steps_are_refused(store):
     engine = store[0]
     with pytest.raises(ValueError):
         repair.run(engine.db.root, steps=("origins", "drop-everything"))
+
+
+def test_embeds_that_failed_on_a_down_service_are_queued_again_once(store):
+    engine, mind, notes, owner, versions = store
+    with engine.db.connect(write=True) as conn:
+        revision = conn.execute("SELECT revision FROM records WHERE id=?", (root_id(owner),)).fetchone()[0]
+        down = engine.enqueue("embed", {"record_id": root_id(owner), "revision": revision},
+                              f"embed:{root_id(owner)}:{revision}:down", conn=conn)
+        bad = engine.enqueue("embed", {"record_id": root_id(owner), "revision": revision},
+                             f"embed:{root_id(owner)}:{revision}:bad", conn=conn)
+        conn.execute("UPDATE jobs SET state='failed',attempts=5,error='ConnectError' WHERE id=?", (down,))
+        conn.execute("UPDATE jobs SET state='failed',attempts=5,error='ValueError' WHERE id=?", (bad,))
+    report = repair.run(engine.db.root, apply=True, steps=("queues",))
+    assert report["steps"]["queues"]["plan"]["embed_jobs"] == 1 and report["steps"]["queues"]["done"]["embed_jobs"] == 1
+    with engine.db.connect() as conn:
+        states = {jid: state for jid, state in conn.execute("SELECT id,state FROM jobs WHERE id IN (?,?)", (down, bad))}
+        assert conn.execute("SELECT COUNT(*) FROM job_recovery WHERE job_id=?", (down,)).fetchone()[0] == 1
+    assert states == {down: "pending", bad: "failed"}
+    assert repair.run(engine.db.root, steps=("queues",))["steps"]["queues"]["plan"]["embed_jobs"] == 0
+
+
+def test_quarantined_work_whose_evidence_is_gone_is_retired_only_when_asked(store):
+    engine, mind, notes, owner, versions = store
+    from kin_mind.appraisal import Appraisals
+
+    Appraisals(mind)
+    with engine.db.connect(write=True) as conn:
+        for identifier, evidence, reason in (("gone", ["src_" + "0" * 32], "Missing"),
+                                             ("kept", [owner], "native-review-unconfirmed")):
+            conn.execute("INSERT INTO mind_appraisals VALUES(?,?,?,?,0,2,?)",
+                         (identifier, mind.scope.key(), "needs-repair", 0,
+                          json.dumps({"evidence_ids": evidence, "repair_reason": reason})))
+    assert "quarantine" not in repair.run(engine.db.root)["steps"]
+    report = repair.run(engine.db.root, apply=True, steps=("quarantine",))
+    assert report["steps"]["quarantine"]["plan"] == {
+        "quarantined": 2, "by_reason": {"Missing": 1, "native-review-unconfirmed": 1}, "evidence_gone": 1}
+    assert report["steps"]["quarantine"]["done"] == {"retired": 1}
+    with engine.db.connect() as conn:
+        states = dict(conn.execute("SELECT id,state FROM mind_appraisals WHERE id IN ('gone','kept')").fetchall())
+    assert states == {"gone": "superseded", "kept": "needs-repair"}
