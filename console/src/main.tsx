@@ -33,6 +33,7 @@ import {
   save,
   savedScope,
   saveScope,
+  scopeWasSaved,
   setToken,
   stamp,
   type Scope,
@@ -291,10 +292,16 @@ function App() {
     () => Promise.all([loadOverview(), loadView()]),
     [loadOverview, loadView],
   );
+  const adoptedScope = useRef(scopeWasSaved);
   const connect = () =>
     run(async () => {
       setToken(token);
-      await api.call("health");
+      const health: any = await api.call("health");
+      // A console never pointed at a scope opens on the deployment's own, once (E3-03).
+      if (!adoptedScope.current && health?.default_scope) {
+        adoptedScope.current = true;
+        setScopeInput(health.default_scope);
+      }
       setConnected(true);
     });
   const loadScopes = () => {

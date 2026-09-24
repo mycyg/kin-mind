@@ -28,6 +28,15 @@ export function savedScope(): Scope {
   } catch {}
   return scopeDefault;
 }
+// Whether this browser had chosen a scope before this page loaded. Until it has, the console
+// opens on the scope the service reports as its own (health `default_scope`, E3-03).
+export const scopeWasSaved = (() => {
+  try {
+    return localStorage.getItem("memorypalace-scope") !== null;
+  } catch {
+    return false;
+  }
+})();
 export function saveScope(scope: Scope) {
   try {
     localStorage.setItem("memorypalace-scope", JSON.stringify(scope));
