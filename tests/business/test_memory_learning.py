@@ -60,6 +60,11 @@ def test_one_plan_cannot_heat_every_step_and_old_trial_cannot_enable_new_weights
     with pytest.raises(Conflict):
         MemoryContinuity(mind).configure({"reinforcement_ranking": True, "temperature_shadow_started_at": "2020-01-01T00:00:00+00:00"})
 
+def record_trial(methods, **trial):
+    """A replay verdict as the replay job records it; the host trial entry is gone (K2-16)."""
+    with methods.engine.db.connect(write=True) as conn:
+        return methods._record_trial(conn, **trial)
+
 def propose(env):
     mind, plans, source, clock, initial = env
     memory = MemoryContinuity(mind)
@@ -82,8 +87,8 @@ def test_methods_need_two_independent_cases_and_failure_revokes_current(env):
     methods, p, ids = propose(env)
     assert methods.read(identifier=p["id"])["procedures"][0]["executable"] is False
     def trial(key, result, passed=True):
-        return methods.record_trial(identifier=p["id"], revision=p["revision"], trial_id=key, result_id=result,
-            passed=passed, isolated=True, environment=p["environment"], verification="Host replay of a real result")
+        return record_trial(methods, identifier=p["id"], revision=p["revision"], trial_id=key, result_id=result,
+            passed=passed, environment=p["environment"], verification="Host replay of a real result")
     trial("one", ids[0])
     trial("same-case-again", ids[0])
     assert not methods.read(identifier=p["id"])["procedures"][0]["executable"]
@@ -144,8 +149,8 @@ def test_inferred_graph_refutation_reviews_method_once(env):
             return schema.model_validate({"cases": [{"result_id": case["result_id"], "passed": True,
                 "reason": "Earlier outcome passed"} for case in context["cases"]]}), {"provider": "synthetic"}
     for index, result_id in enumerate(outcomes):
-        methods.record_trial(identifier=method["id"], revision=method["revision"], trial_id=f"initial-{index}",
-            result_id=result_id, passed=True, isolated=True, environment=method["environment"], verification="Host verified independent case")
+        record_trial(methods, identifier=method["id"], revision=method["revision"], trial_id=f"initial-{index}",
+            result_id=result_id, passed=True, environment=method["environment"], verification="Host verified independent case")
     assert methods.read(identifier=method["id"])["procedures"][0]["executable"]
     queued_apply = prepare_replay(mind.engine, {"scope": mind.scope.model_dump(), "id": method["id"],
         "revision": method["revision"]}, Reviewer())
@@ -168,8 +173,8 @@ def test_inferred_graph_refutation_reviews_method_once(env):
     assert pending["status"] == "needs_review" and not pending["executable"]
     reviewed = MemoryContinuity(mind).ingest({"id": "reviewed-case", "kind": "task-result", "task_id": "reviewed-case",
         "at": mind.clock(), "text": "Host replayed the counterexample conditions", "verified": True})
-    methods.record_trial(identifier=method["id"], revision=method["revision"], trial_id="reviewed-counterexample",
-        result_id=reviewed["id"], passed=True, isolated=True, environment=method["environment"],
+    record_trial(methods, identifier=method["id"], revision=method["revision"], trial_id="reviewed-counterexample",
+        result_id=reviewed["id"], passed=True, environment=method["environment"],
         verification="Host checked the new conditions")
     with mind.engine.db.connect(write=True) as conn:
         with pytest.raises(Conflict, match="Procedure changed during replay"):

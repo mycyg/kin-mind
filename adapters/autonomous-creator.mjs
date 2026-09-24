@@ -86,7 +86,14 @@ export class AutonomousCreator {
  * owner message does not stop it (she hears of it and decides, through her plan); shutdown,
  * an explicit stop and a changed plan or decision do. It starts only while the owner's work
  * is not running. */
-export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{}}){
+const REVIEW_RETRIES=15,REVIEW_RETRY_MS=20000;
+const pause=ms=>new Promise(resolve=>{setTimeout(resolve,ms);});
+/** A static reason for a stop, never a message text: a worker's failure code, else a generic one. */
+export function stopReason(error){
+  const code=error?.failure?.code??error?.code;
+  return typeof code==='string'&&/^[a-z0-9][a-z0-9-]{0,79}$/.test(code)?code:'creation-executor-failed';
+}
+export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS}){
   let running=false,closed=false,controller=null,current=null;
   const owner='creator-'+process.pid;
   const tick=async()=>{
@@ -103,12 +110,22 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
         if(closed)return {state:'interrupt'};
         return call('plan-renew',{run_id:run.id,owner,fence:run.fence});
       }});
-      const settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      let settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      // The completion review found no free model slot: the same verified result is offered
+      // again while the lease is kept, instead of the whole creation running again (K2-02).
+      for(let tries=0;settled?.state==='waiting'&&tries<REVIEW_RETRIES&&!closed;tries++){
+        await pause(retryMs);
+        if(closed||(await call('plan-renew',{run_id:run.id,owner,fence:run.fence})).state!=='renewed')break;
+        settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      }
+      if(settled?.state==='waiting')throw Object.assign(Error('completion-review-unavailable'),{code:'completion-review-unavailable'});
       recordStatus({creation:{state:settled.state,plan_id:claimed.plan.id,run_id:run.id}});
       void loop.review();
-    }catch{
-      if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence});}catch{}
-      recordStatus({creation:{state:'needs-review',reason:'creation-executor-failed'}});
+    }catch(error){
+      // The reason travels into the plan's receipt: Kin decides what to do with the step (K2-02).
+      const reason=stopReason(error);
+      if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
+      recordStatus({creation:{state:'needs-review',reason}});
     }
     finally{running=false;controller=null;current=null;}
   };

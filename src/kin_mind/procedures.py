@@ -41,6 +41,14 @@ class Procedures:
             status="active" if procedure["status"] == "active" else "unverified", confirmation="inferred", generated=True,
             attributes={"procedure_id": procedure["id"], "procedure_revision": procedure["revision"], "execution_gate": "read_procedure_memory"}))
 
+    def _case(self, conn, task_id):
+        """One case per piece of work: a task that is a plan run counts as its plan, as the plan run
+        itself does, so reruns of one step never make two independent cases (K2-16)."""
+        if not task_id:
+            return None
+        row = conn.execute("SELECT plan_id FROM mind_plan_runs WHERE scope=? AND id=?", (self.scope, task_id)).fetchone()
+        return row[0] if row else task_id
+
     def outcome(self, conn, identifier):
         row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND id=? AND state='completed'", (self.scope, identifier)).fetchone()
         if row:
@@ -61,10 +69,11 @@ class Procedures:
                     if not completion:
                         raise Conflict("Artifact presence alone does not verify a method outcome")
                     data = json.loads(completion[0])
+                from .behavior_chain import settled_task
                 if (data.get("kind") == "delivery" and data.get("state") == "accepted" and data.get("message_id")) or (
                     data.get("kind") == "artifact-created" and data.get("artifact", {}).get("sha256")) or (
-                    data.get("kind") == "task-result" and data.get("verified") is True):
-                    return {"case_id": data.get("task_id") or data.get("delivery_id") or identifier,
+                    data.get("kind") == "task-result" and data.get("verified") is True and settled_task(conn, self.scope, data)):
+                    return {"case_id": self._case(conn, data.get("task_id")) or data.get("delivery_id") or identifier,
                             "source_id": data["source_id"], "external": data.get("kind") == "delivery"}
         raise Conflict("Method learning requires an actual verified result")
 
@@ -125,25 +134,17 @@ class Procedures:
             raise Conflict("Procedure has a failed counterexample")
         return p
 
-    def record_trial(self, *, identifier, revision, trial_id, result_id, passed, isolated, environment, verification):
-        """Host-only test receipt. The model cannot fabricate independent trials."""
-        if type(passed) is not bool or type(isolated) is not bool or not verification:
-            raise ValueError("Replay needs a host verification description")
-        with self.engine.db.connect(write=True) as conn:
-            return self._record_trial(conn, identifier=identifier, revision=revision, trial_id=trial_id, result_id=result_id,
-                passed=passed, isolated=isolated, environment=environment, verification=verification)
-
-    def _record_trial(self, conn, *, identifier, revision, trial_id, result_id, passed, isolated, environment, verification):
+    def _record_trial(self, conn, *, identifier, revision, trial_id, result_id, passed, environment, verification):
+        """A replay verdict on one recorded outcome. A replay reads what already happened and never
+        repeats an external effect, so it claims no isolation it does not have (K2-16)."""
         p = self.get(conn, identifier)
         if p["revision"] != revision:
             raise Conflict("Trial ran a different method revision", target=identifier,
                            expected=revision, actual=p["revision"])
         outcome = self.outcome(conn, result_id)
-        if outcome["external"] and not isolated:
-            raise Conflict("External effects must use isolated validation and existing receipts")
         if environment != p["environment"] or not self.mind._fresh(conn, p["evidence"]):
             raise Conflict("Trial dependencies are no longer current")
-        trial = {"passed": passed, "isolated": isolated, "result_id": result_id, "case_id": outcome["case_id"],
+        trial = {"passed": passed, "result_id": result_id, "case_id": outcome["case_id"],
                  "verification": verification, "at": self.mind.clock(), "environment": environment}
         old = conn.execute("SELECT data FROM mind_procedure_trials WHERE scope=? AND id=?", (self.scope, trial_id)).fetchone()
         if old:
@@ -235,7 +236,7 @@ def prepare_replay(engine, payload, provider=None):
         judgment_cache.accept(engine, receipt, conn=conn)
         for c in verdict.cases:
             methods._record_trial(conn, identifier=p["id"], revision=p["revision"], trial_id=digest([p["id"], p["revision"], c.result_id]),
-                result_id=c.result_id, passed=c.passed, isolated=True, environment=p["environment"],
+                result_id=c.result_id, passed=c.passed, environment=p["environment"],
                 verification={"reason": c.reason, "decision_receipt": receipt, "method": "independent-recorded-outcome-replay"})
     return apply
 

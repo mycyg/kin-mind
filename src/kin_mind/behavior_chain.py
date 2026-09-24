@@ -77,6 +77,16 @@ def _refs(conn, mind, ids, allowed):
     return refs
 
 
+def settled_task(conn, scope, event):
+    """Whether a verified task-result stands: when it names a plan run, only if that run settled
+    completed. A result the plan refused is not a verified execution (K2-18)."""
+    if event.get("kind") != "task-result" or not event.get("task_id"):
+        return True
+    row = conn.execute("SELECT state FROM mind_plan_runs WHERE scope=? AND id=?", (scope, event["task_id"])).fetchone() \
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_plan_runs'").fetchone() else None
+    return row is None or row[0] == "completed"
+
+
 def _receipt(conn, scope, identifier):
     """An execution the host can resolve, and the source that records it."""
     row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND id=?", (scope, identifier)).fetchone()
@@ -89,7 +99,10 @@ def _receipt(conn, scope, identifier):
                            " AND (id=? OR json_extract(data,'$.id')=?)", (scope, identifier, identifier)).fetchone()
         if row:
             event = json.loads(row[0])
-            return {key: event.get(key) for key in ("kind", "state", "verified", "message_id")}, event.get("source_id")
+            found = {key: event.get(key) for key in ("kind", "state", "verified", "message_id")}
+            if found.get("verified") is True and not settled_task(conn, scope, event):
+                found["verified"] = False
+            return found, event.get("source_id")
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_explorations'").fetchone():
         row = conn.execute("SELECT state,data FROM mind_explorations WHERE scope=? AND id=?", (scope, identifier)).fetchone()
         if row:

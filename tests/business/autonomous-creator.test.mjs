@@ -69,3 +69,20 @@ test('a running creation keeps its lease when 小光 writes; only a close interr
  assert.ok(calls.includes('plan-renew'));assert.equal(worker.current,null);
  await worker.close();
 });
+test('a busy completion review is asked again with the same result; a refusal names its reason (K2-02)',async()=>{
+ const calls=[];let results=[{state:'waiting'},{state:'waiting'},{state:'completed'}];const status=[];
+ const worker=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,retryMs:1,recordStatus:value=>status.push(value),
+  creator:{run:async()=>({state:'produced'}),stop(){}},
+  call:async(action,input)=>{calls.push(action);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:1},plan:{id:'p'}};
+   if(action==='plan-renew')return{state:'renewed'};if(action==='plan-result')return results.shift();return{};}});
+ await worker.tick();
+ assert.deepEqual(calls,['plan-claim','plan-result','plan-renew','plan-result','plan-renew','plan-result']);
+ assert.equal(status.at(-1).creation.state,'completed');
+ const seen=[];
+ const refusing=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,creator:{run:async()=>({state:'produced'}),stop(){}},
+  call:async(action,input)=>{seen.push([action,input]);if(action==='plan-claim')return{state:'claimed',run:{id:'r2',fence:3},plan:{id:'p'}};
+   if(action==='plan-result')throw Object.assign(Error('contract'),{failure:{code:'creation-artifact-invalid'}});return{};}});
+ await refusing.tick();
+ assert.equal(seen.at(-1)[0],'plan-interrupt');assert.equal(seen.at(-1)[1].reason,'creation-artifact-invalid');
+ await worker.close();await refusing.close();
+});

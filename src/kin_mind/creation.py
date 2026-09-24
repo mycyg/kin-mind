@@ -1,5 +1,6 @@
 """Host verification of isolated creator output before plan completion."""
 import json
+from xml.etree.ElementTree import ParseError as ET_ERRORS
 from pathlib import Path
 
 from pydantic import Field
@@ -23,18 +24,19 @@ def accept_result(mind, config, request, provider=None):
     from . import judgment_cache
     from .appraisal import DeepSeek
     from .memory import MemoryContinuity, fingerprint_file
+    from .model_lanes import ModelAdmissionWait
     from .plans import AutonomousPlans
     plans, memory = AutonomousPlans(mind), MemoryContinuity(mind)
     run_id, owner, fence, result = (request[k] for k in ("run_id", "owner", "fence", "result"))
     with mind.engine.db.connect() as conn:
         row = conn.execute("SELECT data,state FROM mind_plan_runs WHERE scope=? AND id=?", (mind.scope.key(), run_id)).fetchone()
         if not row:
-            raise Conflict("Unknown creator run")
+            raise Conflict("Unknown creator run", code="creation-run-unknown")
         run = json.loads(row[0])
         if row["state"] != "running":
             if run.get("result", {}).get("manifest_hash") == digest(result):
                 return run
-            raise Conflict("Conflicting creator retry")
+            raise Conflict("Conflicting creator retry", code="creation-retry-conflict")
         plan = plans.get(conn, run["plan_id"])
         step = next(s for s in plan["steps"] if s["id"] == run["step_id"])
     renewal = plans.renew(run_id, owner, fence)
@@ -43,29 +45,33 @@ def accept_result(mind, config, request, provider=None):
         return plans.settle(run_id, owner, fence, state="interrupted" if result.get("state") == "interrupted" or renewal["state"] != "renewed" else "failed", result=base)
     receipt = result.get("receipt", {})
     if receipt.get("model") != config.get("creation_model", "gpt-6-sol") or receipt.get("run_id") != run_id or receipt.get("exit_code") != 0 or not receipt.get("thread_id"):
-        raise Conflict("Native creation receipt is incomplete")
+        raise Conflict("Native creation receipt is incomplete", code="creation-receipt-incomplete")
     root = Path(config["creation_directory"]).resolve(strict=True)
     workspace = Path(receipt["workspace"]).resolve(strict=True)
     if not workspace.is_relative_to(root):
-        raise Conflict("Creation workspace is outside its isolated root")
+        raise Conflict("Creation workspace is outside its isolated root", code="creation-workspace-outside")
     artifacts = []
     for artifact in result.get("artifacts", []):
         path = Path(artifact["path"]).resolve(strict=True)
         if not path.is_relative_to(workspace):
-            raise Conflict("Artifact is outside its creation workspace")
+            raise Conflict("Artifact is outside its creation workspace", code="creation-artifact-outside")
         actual = fingerprint_file(path)
         if actual["sha256"] != artifact["sha256"] or actual["bytes"] != artifact["bytes"] or not actual["bytes"]:
-            raise Conflict("Creation output changed before verification")
+            raise Conflict("Creation output changed before verification", code="creation-output-changed")
         inspection = {"format": path.suffix.lower(), "content_verified": False}
         if path.suffix.lower() in {".txt", ".md", ".json", ".csv", ".svg", ".html", ".py", ".js"}:
-            text = path.read_text(encoding="utf-8")
+            # An unreadable artifact is a reason Kin is told, not an unexplained stop (K2-02).
+            try:
+                text = path.read_text(encoding="utf-8")
+                if path.suffix.lower() == ".json":
+                    json.loads(text)
+                if path.suffix.lower() == ".svg":
+                    import xml.etree.ElementTree as ET
+                    if not ET.fromstring(text).tag.endswith("svg"):
+                        raise ValueError("not-svg")
+            except (ValueError, ET_ERRORS) as error:
+                raise Conflict("Invalid artifact content", code="creation-artifact-invalid") from error
             inspection.update(excerpt=text[:18000], excerpt_complete=len(text) <= 18000)
-            if path.suffix.lower() == ".json":
-                json.loads(text)
-            if path.suffix.lower() == ".svg":
-                import xml.etree.ElementTree as ET
-                if not ET.fromstring(text).tag.endswith("svg"):
-                    raise Conflict("Invalid SVG artifact")
             inspection["content_verified"] = True
         artifacts.append({**actual, "inspection": inspection})
     # Only the trusted executor adapter supplies these receipts; creator JSON
@@ -73,34 +79,35 @@ def accept_result(mind, config, request, provider=None):
     for rendered in result.get("host_verification", []):
         source = next((a for a in artifacts if a["sha256"] == rendered.get("source_sha256")), None)
         if not source:
-            raise Conflict("Renderer cites an unknown source version")
+            raise Conflict("Renderer cites an unknown source version", code="creation-render-unknown-source")
         if rendered.get("state") != "verified":
             source["inspection"]["rendering"] = rendered
             continue
         if rendered.get("method") != "host-static-browser-v1" or rendered.get("capabilities") != {"scripts": False, "network": False, "external_files": False}:
-            raise Conflict("Unknown rendering capability")
+            raise Conflict("Unknown rendering capability", code="creation-render-capability")
         checks = rendered.get("checks", [])
         if len(checks) != 2:
-            raise Conflict("Rendering receipt is incomplete")
+            raise Conflict("Rendering receipt is incomplete", code="creation-render-incomplete")
         for check in checks:
             image = check["image"]
             path = Path(image["path"]).resolve(strict=True)
             if not path.is_relative_to(workspace / ".host-verification"):
-                raise Conflict("Rendered image is outside the verification workspace")
+                raise Conflict("Rendered image is outside the verification workspace", code="creation-render-outside")
             actual = fingerprint_file(path)
             header = path.read_bytes()[:24]
             if actual["sha256"] != image["sha256"] or actual["bytes"] != image["bytes"] or header[:8] != b"\x89PNG\r\n\x1a\n":
-                raise Conflict("Rendered image does not match its receipt")
+                raise Conflict("Rendered image does not match its receipt", code="creation-render-mismatch")
             import struct
             width, height = struct.unpack(">II", header[16:24])
             if not 0 < width <= 4096 or not 0 < height <= 8000:
-                raise Conflict("Rendered image dimensions exceed verification budget")
+                raise Conflict("Rendered image dimensions exceed verification budget", code="creation-render-too-large")
             artifacts.append({**actual, "inspection": {"format": ".png", "content_verified": False,
                 "render_verified": True, "source_sha256": source["sha256"], "width": width, "height": height,
                 "visual_quality": "not-independently-assessed"}})
         source["inspection"]["rendering"] = rendered
-    if not artifacts or len(artifacts) > 24:
-        raise Conflict("Creation must produce bounded, nonempty artifacts")
+    # The creator's own bound is 24 files; the host's renders of them come on top (K2-02).
+    if not artifacts or len([a for a in artifacts if not a["inspection"].get("render_verified")]) > 24:
+        raise Conflict("Creation must produce bounded, nonempty artifacts", code="creation-artifacts-out-of-bounds")
     provider = provider or DeepSeek.from_engine(mind.engine)
     provider.timeout = 120
     provider.background = True
@@ -132,6 +139,10 @@ def accept_result(mind, config, request, provider=None):
                       "obligation_version": plan["revision"]},
             depends_on=[plan["id"], step["id"], *(r["record_id"] for r in run["decision"]["evidence"]),
                         *(r["source_id"] for r in run["decision"]["evidence"])])
+    except ModelAdmissionWait:
+        # No free model slot for the review: the run stays open and the host asks again with the
+        # same verified result, instead of the whole creation running again (K2-02).
+        return {"state": "waiting", "reason": "completion-review-slot-busy", "run_id": run_id}
     except Exception as error:
         # Keep the actual files and outcome when the optional reviewer fails.
         # A later DS review can resume this workspace; no delivery is granted.
@@ -153,9 +164,9 @@ def accept_result(mind, config, request, provider=None):
     for artifact in artifacts:
         actual = fingerprint_file(Path(artifact["path"]))
         if actual["sha256"] != artifact["sha256"] or actual["bytes"] != artifact["bytes"]:
-            raise Conflict("Creation output changed during completion review")
+            raise Conflict("Creation output changed during completion review", code="creation-output-changed")
     if set(decision.artifact_hashes) - {a["sha256"] for a in artifacts}:
-        raise Conflict("Completion review cites unknown artifacts")
+        raise Conflict("Completion review cites unknown artifacts", code="creation-review-unknown-artifact")
     # Second phase: the verdict became servable only here, after the host checked the
     # artifacts and the lease it was judged under. A verdict reached over a lost lease
     # is thrown away rather than left to expire.
@@ -164,25 +175,34 @@ def accept_result(mind, config, request, provider=None):
     else:
         judgment_cache.accept(mind.engine, review_receipt)
     produced_at = result.get("produced_at") or run["started_at"]
-    for index, artifact in enumerate(artifacts):
-        memory.ingest({"id": run_id + ":artifact:" + str(index), "kind": "artifact-created", "at": produced_at,
-            "task_id": run_id, "actor": "Kin", "artifact": artifact,
+    # One work per plan step, whichever run made its bytes (K2-20).
+    work_id = memory._id("work", ["plan-step", plan["id"], step["id"]])
+    placed = [memory.ingest({"id": run_id + ":artifact:" + str(index), "kind": "artifact-created", "at": produced_at,
+            "task_id": run_id, "work_id": work_id, "actor": "Kin", "artifact": artifact,
             "text": result["summary"], "input_source_ids": [r["source_id"] for r in run["decision"]["evidence"]]})
+        for index, artifact in enumerate(artifacts)]
+    # The artifacts are facts whatever the plan says; the verified result is written only once
+    # the plan has accepted the completion, so a refused settlement leaves no verified result
+    # behind for recall, the behaviour chain or method learning (K2-03, K2-18).
+    artifact_source = next((entry.get("source_id") for entry in placed if entry.get("source_id")), None)
+    if not artifact_source:
+        return plans.settle(run_id, owner, fence, state="interrupted", result={**base, "verified": False,
+            "artifacts": artifacts, "completion_review": decision.model_dump(), "review_receipt": review_receipt,
+            "waiting_reason": "result-memory-disabled"})
+    lost = invalid or current["state"] != "renewed"
+    # A review that found the step incomplete is not an interruption (K2-02).
+    settled = plans.settle(run_id, owner, fence, state="completed" if complete else "interrupted" if lost else "failed",
+        result={**base, "verified": complete, "source_id": artifact_source, "artifacts": artifacts,
+                "completion_review": decision.model_dump(), "review_receipt": review_receipt,
+                "summary": result.get("summary"),
+                "phase": "completed" if complete else "interrupted" if lost else "needs_verification",
+                "reason": None if complete else "lease-lost-during-review" if lost else "completion-review-incomplete",
+                "verification_gaps": gaps if gaps else ([] if complete else ["completion-not-established"]),
+                "resume_action": None if complete else "inspect-checkpoint-and-run-missing-checks"})
     outcome = memory.ingest({"id": run_id + ":result:" + digest([complete, decision.model_dump()])[:16], "kind": "task-result", "at": produced_at,
         "task_id": run_id, "text": result["summary"], "verified": complete,
         "plan_id": plan["id"], "step_id": step["id"], "completion_review": decision.model_dump(),
         "review_receipt": review_receipt, "native_receipt": receipt})
-    if not outcome.get("source_id"):
-        return plans.settle(run_id, owner, fence, state="interrupted", result={**base, "verified": False,
-            "artifacts": artifacts, "completion_review": decision.model_dump(), "review_receipt": review_receipt,
-            "waiting_reason": "result-memory-disabled"})
-    settled = plans.settle(run_id, owner, fence, state="completed" if complete else "interrupted",
-        result={**base, "verified": complete, "source_id": outcome["source_id"], "artifacts": artifacts,
-                "completion_review": decision.model_dump(), "review_receipt": review_receipt,
-                "summary": result.get("summary"),
-                "phase": "completed" if complete else "interrupted" if invalid or current["state"] != "renewed" else "needs_verification",
-                "verification_gaps": gaps if gaps else ([] if complete else ["completion-not-established"]),
-                "resume_action": None if complete else "inspect-checkpoint-and-run-missing-checks"})
     if complete:
         from .reinforcement import record
         with mind.engine.db.connect(write=True) as conn:
@@ -192,5 +212,5 @@ def accept_result(mind, config, request, provider=None):
     from .actions import ActionEvents
     with mind.engine.db.connect(write=True) as conn:
         ActionEvents(mind).emit(conn, "creation-result", run_id,
-            {"evidence_ids": [outcome["source_id"]], "agent_version": config["agent_version"], "plan_id": plan["id"], "run_id": run_id})
+            {"evidence_ids": [outcome.get("source_id") or artifact_source], "agent_version": config["agent_version"], "plan_id": plan["id"], "run_id": run_id})
     return settled

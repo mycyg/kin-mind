@@ -16,6 +16,9 @@ class ExplorationCadence:
             )
 
     def status(self):
+        from .exploration import Explorations
+        # A run whose worker is provably gone no longer holds the slot (K2-09).
+        Explorations(self.mind).reclaim_dead()
         with self.mind.engine.db.connect() as conn:
             if (
                 conn.execute(

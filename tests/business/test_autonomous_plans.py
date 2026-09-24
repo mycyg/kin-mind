@@ -386,3 +386,54 @@ def test_plan_explanations_are_not_limited_to_twelve_items(env):
     explanations = ['Context explanation ' + str(i) for i in range(20)]
     plan = decide(env, create(env), conditions_met=explanations)
     assert plan['steps'][0]['decision']['conditions_met'] == explanations
+
+
+def test_an_expired_run_is_taken_back_at_the_next_claim(env):
+    """K2-01: a creation whose host vanished no longer reserves the executor until a lucky restart;
+    the next claim takes it back, and the old executor's late answer is refused."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    assert plans.claim("create", "creator-2") == {"state": "waiting", "reason": "executor-reserved", "run_id": run["id"]}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=? WHERE id=?", (0, run["id"]))
+    assert plans.claim("create", "creator-2")["state"] == "waiting"  # the step now needs Kin's new decision
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and step["receipts"][-1]["reason"] == "lease-expired"
+    with pytest.raises(Conflict):
+        plans.renew(run["id"], "creator-1", run["fence"])
+    with pytest.raises(Conflict):
+        plans.settle(run["id"], "creator-1", run["fence"], state="interrupted", result={})
+
+
+def test_the_host_reason_for_a_stop_reaches_the_plan(env):
+    """K2-02: plan-interrupt carries the host's static reason into the step's receipts."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    settled = plans.settle(run["id"], "creator-1", run["fence"], state="interrupted",
+                           result={"checkpoint_retained": True, "reason": "creation-artifact-invalid"})
+    assert settled["result"]["reason"] == "creation-artifact-invalid"
+    assert plans.read(plan["id"])["plans"][0]["steps"][0]["receipts"][-1]["reason"] == "creation-artifact-invalid"
+
+
+def test_a_revised_step_keeps_its_wish_and_the_cursor_counts_the_real_page(env):
+    """K2-05: revising a plan keeps the wish its step carries; K2-07: the cursor follows the
+    page size the query used."""
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    with mind.engine.db.connect(write=True) as conn:
+        stored = plans.get(conn, plan["id"])
+        stored["steps"][0]["desire_id"] = "desire-linked"
+        stored["revision"] += 1
+        plans._save(conn, stored, "link")
+    revised = plans.manage({"command_id": "revise", "id": plan["id"], "expected_revision": stored["revision"], "action": "update",
+                            "reason": "Sharper completion", "evidence_ids": [initial],
+                            "steps": [{"id": "make", "actor": "create", "goal": "Make the clock", "completion": "A verified SVG with hands is saved"}]})
+    assert revised["steps"][0]["desire_id"] == "desire-linked"
+    for index in range(3):
+        create(env, key="more-" + str(index))
+    page = plans.read(limit=500)
+    assert len(page["plans"]) == 4 and page["next_cursor"] is None
+    first = plans.read(limit=2)
+    assert first["next_cursor"] == 2 and len(plans.read(cursor=2, limit=2)["plans"]) == 2

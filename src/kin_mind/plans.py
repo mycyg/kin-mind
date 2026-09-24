@@ -170,7 +170,10 @@ class AutonomousPlans:
                         raise Conflict("Executed or reserved steps cannot be overwritten")
                     updated.append(old)
                 else:
-                    updated.append({**definition, "state": old.get("state", "pending") if old else "pending",
+                    # The host's links outlive a new definition: the wish this step already carries
+                    # stays its wish, so a revision never grows a second one for it (K2-05).
+                    links = {k: old[k] for k in ("desire_id", "strength", "delivery_artifacts") if old and k in old and definition.get(k) is None}
+                    updated.append({**definition, **links, "state": old.get("state", "pending") if old else "pending",
                                     "revision": old.get("revision", 0) + 1 if old else 1,
                                     "owner_status": old.get("owner_status", "proposed") if old else "proposed",
                                     "receipts": old.get("receipts", []) if old else []})
@@ -599,7 +602,9 @@ class AutonomousPlans:
                     plan["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plan_history WHERE id=? ORDER BY revision", (plan["id"],))]
             # Same snapshot as the plans themselves, so it describes exactly what is returned.
             shown = self.manifest(conn, plans) if manifest else None
-        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == limit else None, "timezone": "Asia/Singapore"}
+        # The page size the query used, not the one asked for (K2-07).
+        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == min(100, max(1, limit)) and not identifier else None,
+                  "timezone": "Asia/Singapore"}
         return {**result, "manifest": shown} if manifest else result
 
     def _source_state(self, conn, ref):
@@ -682,6 +687,12 @@ class AutonomousPlans:
                 return {"state": "waiting", "reason": "user-work-priority"}
             if actor == "create" and not enabled(conn, self.scope, "records"):
                 return {"state": "waiting", "reason": "result-memory-disabled"}
+            # A run whose lease has run out has no executor left: the one that held it lived in a
+            # host that is gone, or lost the claim's answer. It is taken back here, on the next
+            # claim, not only at a start-up that happens to come late enough (K2-01).
+            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND actor=? AND state='running' AND lease_until<=?",
+                                    (self.scope, actor, time.time())).fetchall():
+                self._reclaim(conn, row, "lease-expired")
             active = conn.execute("SELECT id FROM mind_plan_runs WHERE scope=? AND actor=? AND state IN ('running','unconfirmed')", (self.scope, actor)).fetchone()
             if active:
                 return {"state": "waiting", "reason": "executor-reserved", "run_id": active[0]}
@@ -776,20 +787,28 @@ class AutonomousPlans:
                 if evidence and row["lease_until"] > time.time():
                     held.append({"id": row["id"], "lease_until": row["lease_until"]})
                     continue
-                run = json.loads(row["data"])
-                # Contact delivery may have happened before the crash. Preserve
-                # uncertainty until the existing transport reconciles receipts.
-                state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
-                run.update(state=state, reason="host-restart", checkpoint_retained=True, fence=row["fence"] + 1)
-                conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, dumps(run), row["id"]))
-                plan = self.get(conn, row["plan_id"])
-                step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
-                step.update(state="unconfirmed" if state == "unconfirmed" else "waiting", revision=step["revision"] + 1)
-                step.pop("decision", None)
-                plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
-                self._save(conn, plan, "recover:" + row["id"])
+                self._reclaim(conn, row, "host-restart")
                 recovered.append(row["id"])
         return {"recovered": recovered, "still_leased": held}
+
+    def _reclaim(self, conn, row, reason):
+        """Take back a run no executor holds any more. The fence moves, so a late answer from the
+        old executor is refused; the step waits for Kin's next decision with the reason in its
+        receipts."""
+        run = json.loads(row["data"])
+        # Contact delivery may have happened before the crash. Preserve
+        # uncertainty until the existing transport reconciles receipts.
+        state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
+        run.update(state=state, reason=reason, checkpoint_retained=True, fence=row["fence"] + 1)
+        conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, dumps(run), row["id"]))
+        plan = self.get(conn, row["plan_id"])
+        step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
+        if step.get("run_id") == row["id"]:
+            step.update(state="unconfirmed" if state == "unconfirmed" else "waiting", revision=step["revision"] + 1)
+            step.pop("decision", None)
+            step.setdefault("receipts", []).append({"run_id": row["id"], "state": state, "reason": reason, "checkpoint_retained": True})
+        plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
+        self._save(conn, plan, "reclaim:" + row["id"])
 
     def migrate_desires(self):
         """Preserve existing identities; migration grants no execution decision."""

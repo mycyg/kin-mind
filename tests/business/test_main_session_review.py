@@ -157,6 +157,24 @@ def test_a_failed_native_assessment_waits_and_is_tried_again(setup):
     assert jobs.run_one(native_provider(mind,exchange))['state']=='pending' and len(calls)==2
 
 
+
+def test_a_fork_without_a_finished_turn_waits_uncharged(setup):
+    """PROBE: with no finished turn to fork from, the assessment cannot run now. It waits and is
+    asked again; it is not a failure, not charged, and not sent into the main thread instead."""
+    mind, source, _ = setup
+    calls = []
+    def exchange(request):
+        calls.append(request)
+        return {'state': 'failed', 'reason': 'no-completed-turn', 'receipt': {}}
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('fork-too-early')], 'synthetic-v1')
+    result = jobs.run_one(native_provider(mind, exchange))
+    assert result['state'] != 'needs-repair' and len(calls) == 1
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    assert row['state'] == 'pending' and row['attempts'] == 0
+    assert not json.loads(row['data']).get('transient_failures')
+
 def test_provider_outage_is_retried_for_about_two_hours(setup):
     """K1-08: eight retries at 1, 2, 4, 8, 16, 30, 30 and 30 minutes, then the row is set aside."""
     mind,_,_=setup; jobs=Appraisals(mind); data={'error':'deepseek-http-503'}

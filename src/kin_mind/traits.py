@@ -191,6 +191,9 @@ class Traits:
                                "('task-result','delivery')", (self.scope, identifier)).fetchone()
             if row:
                 data = json.loads(row[0])
+                from .behavior_chain import settled_task
+                if data.get("verified") is True and not settled_task(conn, self.scope, data):
+                    data = {**data, "verified": False}
                 return {**data, "execution_id": data.get("task_id") or data.get("delivery_id") or identifier}
         return None
 

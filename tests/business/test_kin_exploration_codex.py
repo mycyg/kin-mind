@@ -404,3 +404,26 @@ def test_a_running_exploration_stops_for_kin_not_for_a_new_message(tmp_path):
                                     evidence_ids=[source], action="abandon", desire_id=desire["id"], reason="Kin chose to stop"))
     assert stop() is True
     assert Explorations(mind)._stop_when(lambda: True, desire["id"])() is True
+
+
+def test_a_run_whose_worker_died_frees_the_slot_at_the_next_look(tmp_path):
+    """K2-09: a running exploration whose worker the host killed does not block exploration until
+    the next restart; the next status check takes it back and the wish is wanted again."""
+    import time as clock_time
+    from kin_mind.exploration import Explorations
+    from kin_mind.exploration_cadence import ExplorationCadence
+    from kin_mind.state import DesireChange
+    engine, mind, source = exploration_world(tmp_path)
+    desire = next(iter(mind.read()["desires"]))
+    mind.manage_desire(DesireChange(command_id="start", agent_version="test-v1", expected_revision=mind.read()["revision"],
+                                    evidence_ids=[source], action="start", desire_id=desire["id"], reason="Started"))
+    explorer = Explorations(mind)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", ("explore_dead", mind.scope.key(), "running", mind.clock(),
+            json.dumps({"desire_id": desire["id"], "liveness": {"pid": 999999, "started": None, "deadline": clock_time.time() - 1}})))
+        conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", ("explore_old", mind.scope.key(), "interrupted", mind.clock(), "{}"))
+    ExplorationCadence(mind).status()
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_explorations WHERE id='explore_dead'").fetchone()[0] == "interrupted"
+    assert mind.read()["desires"][0]["status"] == "wanted"
+    assert explorer.reclaim_dead() == []

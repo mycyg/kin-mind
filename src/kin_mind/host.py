@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from eventmem.core import Engine
@@ -56,7 +57,7 @@ def dispatch(config, action, request):
     if config.get("contact_policy_file"):
         # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
         mind.register_contact_policy(config["contact_policy_file"])
-    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
+    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory"}:
         from .plans import AutonomousPlans
         from .procedures import Procedures
         plans = AutonomousPlans(mind)
@@ -73,8 +74,13 @@ def dispatch(config, action, request):
         if action == "plan-recover":
             return plans.recover(**request)
         if action == "plan-interrupt":
+            # The host's static reason for stopping goes into the plan's receipt, so Kin sees why
+            # a step stopped instead of one generic phrase (K2-02). Never free text.
+            reason = request.get("reason")
+            if not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", reason):
+                reason = "executor-stopped-before-settlement"
             return plans.settle(request["run_id"], request["owner"], request["fence"], state="interrupted",
-                result={"checkpoint_retained": True, "reason": "executor-stopped-before-settlement"})
+                result={"checkpoint_retained": True, "reason": reason})
         if action == "plan-result":
             from .creation import accept_result
             return accept_result(mind, config, request)
@@ -88,8 +94,6 @@ def dispatch(config, action, request):
             return result
         if action == "procedure-memory":
             return Procedures(mind).read(**request)
-        if action == "procedure-trial":
-            return Procedures(mind).record_trial(**request)
         raise ValueError("Unknown autonomy operation")
     session_context = None
     observation_file = config.get("session_observation_file")

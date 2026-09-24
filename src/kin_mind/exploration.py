@@ -182,6 +182,38 @@ class Explorations:
                 )
             ]
 
+    def reclaim_dead(self):
+        """Take back a running exploration whose worker is provably gone (the host timed it out or
+        restarted) at the next look, not only at the next start-up: the pid is dead or became
+        another process, or the deadline it recorded has passed. A row that cannot be shown dead
+        stays running (K2-09)."""
+        scope = self.mind.scope.key()
+        with self.engine.db.connect() as conn:
+            if not liveness.checks_enabled(conn, scope):
+                return []
+            dead = [r["id"] for r in conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state='running'", (scope,))
+                    if not liveness.record_alive(json.loads(r["data"]).get("liveness"))]
+        if not dead:
+            return []
+        with self.engine.db.connect(write=True) as conn:
+            current, reclaimed = self.mind._load(conn), []
+            for row in conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state='running'", (scope,)).fetchall():
+                data = json.loads(row["data"])
+                if row["id"] not in dead or liveness.record_alive(data.get("liveness")):
+                    continue
+                conn.execute("UPDATE mind_explorations SET state='interrupted' WHERE id=? AND scope=? AND state='running'", (row["id"], scope))
+                desire = current["desires"].get(data.get("desire_id"))
+                if desire and desire["status"] == "in_progress":
+                    desire.update(status="wanted", revision=desire["revision"] + 1, updated_at=self.mind.clock())
+                reclaimed.append(row["id"])
+            if reclaimed:
+                current["revision"] += 1
+                current["updated_at"] = self.mind.clock()
+                self.mind._save(conn, current)
+                self.mind._history(conn, "mind_" + digest([scope, "exploration-reclaim", current["revision"]])[:32], current,
+                                   "exploration-recovery", {"interrupted": len(reclaimed)})
+        return reclaimed
+
     def _stop_when(self, canceled, desire_id, *, every=15):
         """The run stops for the host's own stop (shutdown) or for Kin's decision, never for a
         new owner message by itself: the wish it serves is no longer in progress, its plan step

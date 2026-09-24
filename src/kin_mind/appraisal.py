@@ -41,6 +41,9 @@ from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, Affectiv
                     Motivation, contact_wait_seconds, timestamp)
 
 APPRAISAL_INPUT_BUDGET = 64000
+# A fork assessment that cannot run yet: the main thread has no finished turn to fork from, or the
+# session is not loaded. Asked again later, never counted as a failure (PROBE).
+FORK_UNAVAILABLE = re.compile(r"no-completed-turn|session-not-loaded|no-rollout|rollout|native-runtime")
 # How far ahead the next quiet review may be asked for. The request states the range in the
 # prompt and in the schema, and the host clamps to the same numbers; there is no separate night
 # ceiling any more (K1-03).
@@ -662,7 +665,7 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
 
 
 SYSTEM += """
-自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时用只读记忆工具补读，本回合读到的记录可以作为证据引用；不用关键词或分数替代判断。补读后仍不确定时选择等待。
+自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时，直接用只读记忆工具去查，本回合查到的记录可以作为证据引用；不用关键词或分数替代判断。查过仍不确定时，等还是做由你决定。
 plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。
 到期只触发复核。state.expired_unsettled_wishes 是过了期限还没结算的愿望：过期不是结论，按实际情况用 wish_updates 标为 complete 或 abandon。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
 同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
@@ -1277,7 +1280,7 @@ class NativeReview(DeepSeek):
         started = time.monotonic()
         # Shared semantic contracts may name their API submission tool. A native
         # turn delivers that same schema as its final, without an invented tool.
-        system += "\n本回合通过最终 JSON 返回结果；上述 submit_* 或修正工具名只是结构标识，不调用这些提交工具。需要回忆时可以用只读记忆工具补读，本回合读到的记录可以作为证据引用。"
+        system += "\n本回合通过最终 JSON 返回结果；上述 submit_* 或修正工具名只是结构标识，不调用这些提交工具。需要回忆时直接用只读记忆工具去查，本回合查到的记录可以作为证据引用。最近的对话就在本会话里，不再另附。"
         # Three parts for `_kin/assess` (WS4): the standing contract (instructions and fixed
         # definitions), the dynamic context, and the schema object, which travels only as
         # outputSchema and is never pasted into the input. `system` repeats the contract for the
@@ -1290,6 +1293,11 @@ class NativeReview(DeepSeek):
                 attempts.record_call(self, name, outcome="owner-preempted", model=None, usage=None,
                                      elapsed_ms=round((time.monotonic()-started)*1000))
             raise ModelAdmissionWait(answer.get("reason") or "foreground-active")
+        if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
+            # No finished turn to fork from yet (or the session is not loaded): the assessment
+            # cannot run now and is asked again later. Not Kin's failure, never charged, and never
+            # sent into the main thread instead (PROBE).
+            raise ModelAdmissionWait("fork-unavailable")
         receipt = answer.get("receipt") or {}
         if answer.get("state") != "complete" or not receipt.get("native_turn_id") or receipt.get("model") != self.model:
             self.failure_receipt = {**receipt, **attempts.usage_entry(receipt.get("usage")), "outcome": "native-review-unconfirmed"}
@@ -1307,6 +1315,9 @@ class NativeReview(DeepSeek):
         # standing prefix of every assessment stays the same.
         dynamic = json.loads(rendered)
         definitions = dynamic.pop("definitions", None)
+        # The fork already holds the main session up to its last finished turn, the dialogue
+        # included: it is not sent a second time (PROBE, K1-06).
+        dynamic.pop("recent_dialogue", None)
         contract = self._system(context, policy) + ("\n维度定义（固定，不随本轮变化）：" + dumps(definitions) if definitions else "")
         result, receipt = self._native("submit_appraisal", schema, contract, dynamic, timeout)
         return {"model": receipt["model"], "id": receipt["native_turn_id"], "usage": receipt.get("usage"),
