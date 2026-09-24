@@ -19,11 +19,12 @@ test('an uncertain previous append is kept without replay',async()=>{
   assert.equal(injected,0);
 });
 
-test('the native gateway owns at most three HTTP retries with no stream replay loop',()=>{
+// The owned entry itself is checked in the host's mobile-owned-acp test.
+test('patchModelRetries writes the gateway retry limits once and refuses a second pass',()=>{
   const original='config = {\n        wire_api: wireApi\n}';
   const patched=patchModelRetries(original);
   assert.match(patched,/request_max_retries: 3/);assert.match(patched,/stream_max_retries: 0/);
-  assert.equal(patchModelRetries(patched),patched);
+  assert.throws(()=>patchModelRetries(patched),/already carries/);
 });
 
 test('one uncertain identity does not hold unrelated fresh background forever',async()=>{

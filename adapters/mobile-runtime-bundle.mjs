@@ -219,7 +219,10 @@ export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
   const observed=listRegularFiles(bundle,{exclude:['manifest.json']});if(!exactFiles(observed,manifest.files))throw Error('Runtime bundle bytes differ from manifest');
   const entry=path.join(bundle,safeRelative(manifest.runtime.acp.entry_path,'ACP entry'));ensureInside(bundle,entry,'ACP entry');
   const vendorEntry=path.join(bundle,safeRelative(manifest.runtime.acp.vendor_entry_path,'ACP vendor entry'));ensureInside(bundle,vendorEntry,'ACP vendor entry');
-  const source=fs.readFileSync(entry,'utf8');for(const marker of REQUIRED_OWNED_ACP_MARKERS)if(count(source,marker)!==1)throw Error('Bundled ACP owned patch is missing or duplicated');
+  // Every marker recorded when the entry was built must still be present once.
+  const source=fs.readFileSync(entry,'utf8'),recorded=manifest.runtime.acp.owned_entry?.markers??[];
+  if(!Array.isArray(recorded))throw Error('Bundled ACP marker record is invalid');
+  for(const marker of new Set([...REQUIRED_OWNED_ACP_MARKERS,...recorded]))if(typeof marker!=='string'||!marker||count(source,marker)!==1)throw Error('Bundled ACP owned patch is missing or duplicated');
   if(sha256(fs.readFileSync(entry))!==manifest.runtime.acp.entry_sha256)throw Error('Bundled ACP entry digest changed');
   if(sha256(fs.readFileSync(vendorEntry))!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.source_vendor_sha256!==manifest.runtime.acp.vendor_entry_sha256||manifest.runtime.acp.owned_entry?.generated_sha256!==manifest.runtime.acp.entry_sha256)throw Error('Vendor and owned ACP bytes are not independently bound');
   validateBundledClosure(bundle,manifest);
@@ -457,7 +460,7 @@ export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,
     if(expectedRevision!==null&&(current?.revision??0)!==expectedRevision)throw Error('Activation revision changed');
     if(current&&canonicalJson(current.current)===canonicalJson(pointer))return {index:current,changed:false};
     const index={schema_version:MOBILE_RUNTIME_ACTIVATION_SCHEMA,revision:(current?.revision??0)+1,activated_at:activatedAt,current:pointer,previous:current?.current??null};
-    writeIndex(activationFile(root),index,{previous:true,pretty:true,mode:0o600});return {index,changed:true};
+    writeIndex(activationFile(root),index,{pretty:true,mode:0o600});return {index,changed:true};
   },reconcile:async()=>({state:'needs-retry',reason:'interrupted-activation-kept-existing-index'})});
   if(result.state!=='ran')return {state:result.state,...result.value};return {state:result.value.changed?'activated':'already-active',index:result.value.index};
 }
