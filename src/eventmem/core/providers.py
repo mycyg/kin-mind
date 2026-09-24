@@ -18,6 +18,12 @@ class NotConfigured(Exception):
     pass
 
 
+class SessionRequired(NotConfigured):
+    """A look asked for a model. It pays for nothing, so it records no cost and takes no
+    admission: refused before any of them, and the caller goes on without the model, as for a
+    role that is not configured (CR2-MEM-02)."""
+
+
 class ProviderError(RuntimeError):
     """Sanitized provider failure safe for durable job diagnostics."""
 
@@ -147,6 +153,10 @@ class Providers:
         return role
 
     def request(self, role, route, *, json_=None, files=None, data=None):
+        from .db import recording
+
+        if not recording():
+            raise SessionRequired(f"Model role {role} is not asked for by a look")
         config = self.role(role)
         headers = (
             {"Authorization": "Bearer " + os.environ[config.api_key_env]}

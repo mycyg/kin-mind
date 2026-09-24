@@ -937,6 +937,10 @@ class DeepSeek:
         cache_state, hit = self._cache_get(name, schema, system, context, judgment)
         if hit is not None:
             return hit
+        from eventmem.core.db import recording
+        if not recording():
+            # A look pays for nothing: no admission, no call, no cost (CR2-MEM-02).
+            raise RuntimeError("deepseek-session-required")
         body, request_digest = {}, digest([name, system, context])
         def elapsed():
             return round((time.monotonic() - started) * 1000)
