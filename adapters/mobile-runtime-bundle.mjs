@@ -21,6 +21,20 @@ const hex64=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
 const candidateId=value=>typeof value==='string'&&/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
 export const canonicalJson=value=>JSON.stringify(canonical(value));
+const releaseParts=value=>/(\d+)\.(\d+)\.(\d+)/.exec(String(value??''))?.slice(1).map(Number)??null;
+/** -1, 0 or 1 comparing two release versions ("codex-cli 0.156.1" or "0.156.1"); null when either is not one. */
+export function compareReleases(left,right){
+  const a=releaseParts(left),b=releaseParts(right);if(!a||!b)return null;
+  for(let i=0;i<3;i++)if(a[i]!==b[i])return a[i]<b[i]?-1:1;return 0;
+}
+/** Whether a version satisfies a caret range such as ^0.153.4 (true / false), or null
+ * for a range of another form. */
+export function caretRangeSatisfied(range,version){
+  const floor=/^\^(\d+\.\d+\.\d+)$/.exec(String(range??'').trim())?.[1],v=releaseParts(version);if(!floor||!v)return null;
+  const [major,minor,patch]=releaseParts(floor);
+  if(compareReleases(v.join('.'),floor)<0)return false;
+  return major>0?v[0]===major:minor>0?v[0]===0&&v[1]===minor:v[0]===0&&v[1]===0&&v[2]===patch;
+}
 export const mobileRuntimeDigest=value=>sha256(Buffer.isBuffer(value)||typeof value==='string'?value:canonicalJson(value));
 
 function syncDirectory(directory){let fd;try{fd=fs.openSync(directory,'r');fs.fsyncSync(fd);}catch(error){if(!['EINVAL','ENOTSUP','EISDIR','EBADF'].includes(error.code))throw error;}finally{if(fd!==undefined)fs.closeSync(fd);}}
@@ -444,6 +458,10 @@ export function verifyMobileRuntimeBundle({rootDir,bundleId,descriptorPath,runne
       // What the proof is: a protocol proof on a loopback provider, and what it cannot show.
       proof_scope:typeof proof.scope==='string'?proof.scope:'protocol',not_covered:Array.isArray(proof.not_covered)?proof.not_covered.filter(item=>typeof item==='string'):[],
       home_shape:typeof proof.home_shape==='string'?proof.home_shape:'isolated-fixture-home',
+      // The ACP package declares the Codex releases it was built for; a bundle outside
+      // that range runs on the strength of this native proof, and says so (N1-09).
+      compatibility_range:{acp_declared:bundle.manifest.runtime.acp.declared_codex_range??null,codex:bundle.manifest.runtime.codex.version,
+        satisfied:caretRangeSatisfied(bundle.manifest.runtime.acp.declared_codex_range,bundle.manifest.runtime.codex.version),accepted_by:'native-proof'},
       scenarios,reasons:[]};
     return {...receipt,...writeReceipt(root,receipt)};
   }catch(error){
@@ -504,9 +522,16 @@ export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,
   if(result.state!=='ran')return {state:result.state,...result.value};return {state:result.value.changed?'activated':'already-active',index:result.value.index};
 }
 
-export async function rollbackMobileRuntimeBundle({rootDir,expectedRevision=null,activatedAt=new Date().toISOString()}){
+/** Back to the previous verified runtime. A previous runtime with an older Codex is
+ * refused unless `allowDowngrade`: the current one has written the main thread, and an
+ * older binary reading it is unproven (N1-09). Prove it on the thread first. */
+export async function rollbackMobileRuntimeBundle({rootDir,expectedRevision=null,activatedAt=new Date().toISOString(),allowDowngrade=false}){
   const active=resolveActiveMobileRuntime({rootDir});if(!active.index.previous)throw Error('No previous verified mobile runtime is recorded');
   const previous=active.index.previous,receipt=readReceiptBound(active.root,previous);
+  const from=active.manifest.runtime.codex.version,to=readJsonStrict(path.join(active.root,'versions',previous.bundle_id,'manifest.json'),'Previous runtime manifest').runtime?.codex?.version;
+  const order=compareReleases(to,from);
+  if(order!==0&&order!==1&&!allowDowngrade)throw Error(order===null?`Cannot compare Codex ${to} with ${from}; check, then roll back with --allow-downgrade`
+    :`Rollback would run ${to} on a thread ${from} has written; prove ${to} on this thread first, then roll back with --allow-downgrade`);
   return activateMobileRuntimeBundle({rootDir,bundleId:previous.bundle_id,receiptPath:receipt.file,expectedRevision:expectedRevision??active.index.revision,activatedAt});
 }
 
@@ -525,7 +550,8 @@ export async function mobileRuntimeBundleCli(argv=process.argv.slice(2)){
   if(command==='prepare')result=prepareMobileRuntimeBundle(readJsonStrict(requiredArg(args,'spec'),'Bundle specification'));
   else if(command==='verify')result=verifyMobileRuntimeBundle({rootDir:requiredArg(args,'root'),bundleId:requiredArg(args,'bundle'),descriptorPath:requiredArg(args,'descriptor'),runnerInputPath:requiredArg(args,'runner-input')});
   else if(command==='activate')result=await activateMobileRuntimeBundle({rootDir:requiredArg(args,'root'),bundleId:requiredArg(args,'bundle'),receiptPath:requiredArg(args,'receipt'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision'])});
-  else if(command==='rollback')result=await rollbackMobileRuntimeBundle({rootDir:requiredArg(args,'root'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision'])});
+  else if(command==='rollback')result=await rollbackMobileRuntimeBundle({rootDir:requiredArg(args,'root'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision']),
+    allowDowngrade:args['allow-downgrade']===true});
   else if(command==='status')result=readMobileRuntimeBundleState({rootDir:requiredArg(args,'root')});
   else if(command==='resolve'){const active=resolveActiveMobileRuntime({rootDir:requiredArg(args,'root')});result={state:'verified',bundle_dir:active.bundleDir,codex_path:active.codexPath,acp_entry_path:active.acpEntryPath,index:active.index};}
   else throw Error('Usage: mobile-runtime-bundle.mjs prepare|verify|activate|rollback|status|resolve');
