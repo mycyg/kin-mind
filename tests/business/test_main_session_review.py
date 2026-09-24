@@ -309,6 +309,26 @@ def test_the_assessment_frame_keeps_contract_context_and_schema_apart(setup):
     assert frame['system'] == frame['contract']
 
 
+
+def test_an_idle_assessment_is_told_it_may_start_something(setup):
+    """K1-05: the contract no longer claims the host raises longing over time, the closing line
+    invites a new thought instead of "leave it empty and move the review", and the install-time
+    provider label is not shown as the model deciding."""
+    mind, source, _ = setup
+    frames = []
+    def exchange(request):
+        frames.append(request)
+        return {'state':'complete','result':{'reason':'Nothing new.'},
+                'receipt':{'native_turn_id':'turn-1','native_session_id':'same-main','model':'gpt-6-astra','provider':'custom','reasoning':'medium','usage':{}}}
+    jobs = Appraisals(mind)
+    jobs.enqueue([source('idle')], 'synthetic-v1')
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
+    contract = frames[0]['contract']
+    assert '自主起念的机会' in contract and '更新复核时间即可' not in contract
+    assert '确定性公式' not in contract and '不会让想念或主动随时间自己上升' in contract
+    policy = frames[0]['context'].get('state', {}).get('action_policy') or {}
+    assert 'provider' not in policy and 'reasoning' not in policy
+
 def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
     """K1-16: an id the request did not supply is accepted when the turn's tool receipts show a
     completed read and the record already existed; without a tool read it is not."""

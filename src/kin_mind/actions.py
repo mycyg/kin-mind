@@ -44,8 +44,6 @@ class ActionEvents:
             state["action_policy"] = {
                 "version": request["agent_version"],
                 "trigger": "semantic-decision" if semantic else "affect",
-                "provider": "deepseek-flash",
-                "reasoning": "high",
                 "configured_at": self.mind.clock(),
                 "evidence": refs,
                 "reason": request["reason"],
