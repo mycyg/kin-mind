@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {MobileAudit,AUDIT_FAILURE_RETRY_MINUTES,INCIDENT_REOPEN_MS} from '../../adapters/mobile-audit.mjs';
-import {AUDIT_CODES,TAIL_DECISIONS} from '../../adapters/mobile-reviewer.mjs';
+import {AUDIT_CODES,REVIEWER_LANES,createMobileReviewer} from '../../adapters/mobile-reviewer.mjs';
 
 const HOUR=3600000;
 function fixture(t,{readings=[],state=null}={}) {
@@ -52,7 +52,8 @@ test('repairs queued before this change are kept as history and never run',async
   assert.deepEqual(JSON.parse(fs.readFileSync(f.file,'utf8')).retiredRepairs.repairs['audit-1'],{id:'audit-1',state:'pending'});
 });
 
-test('fault classes are a fixed set, and an interrupted reply is never discarded by a model (N4)',()=>{
+test('fault classes are a fixed set, and no reviewer decides what becomes of an interrupted reply (N4)',()=>{
   assert.ok(AUDIT_CODES.includes('other'));
-  assert.deepEqual([...TAIL_DECISIONS],['continue','rewrite_remainder']);
+  assert.equal('tail' in REVIEWER_LANES,false);
+  assert.equal(createMobileReviewer({key:'unused'}).tail,undefined);
 });

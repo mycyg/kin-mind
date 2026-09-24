@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {ReplyGuard} from '../../adapters/reply-guard.mjs';
+import {MobileRouter} from '../../adapters/mobile-router.mjs';
 
 function chat(t, options={}) {
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-chat-'));
@@ -116,4 +117,21 @@ test('a group the older tail left mid-decision is migrated: its promised words b
   assert.equal(old.tail_intent.state,'settled');assert.equal(old.state,'retired');
   assert.deepEqual(h.guard.tail.owed().map(o=>o.unsent),[['旧的未发正文']]);
   assert.equal(old.tail_owed.resurfaced,undefined,'no count survives');
+});
+
+test('the router hands the owner\'s literal stop to the reply tail and asks its classifier nothing about any reply (N4)',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-chat-router-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
+    model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',
+    active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0};
+  const heard=[],asked=[];let now=1000;
+  const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),now:()=>++now,
+    classify:async input=>{asked.push(input);return {route:'chat',reason:'synthetic'};},
+    switchModel:async()=>({...runtime}),waitForIdle:async()=>{throw Error('waiting');},
+    replyTail:{stopped:async detail=>{heard.push(detail);return {state:'recorded'};}}});
+  await router.dispatch({id:'chat-1',text:'在吗'},async()=>'new-turn');
+  await router.dispatch({id:'stop-1',text:'停止任务'},async()=>'new-turn');
+  assert.deepEqual(heard,[{inputId:'stop-1'}]);
+  assert.deepEqual(router.state.inputs['stop-1'].tail,{carrier:'owner-stop',state:'recorded'});
+  assert.equal(asked.length,1);assert.equal('interruptedReply' in asked[0],false);assert.equal(router.state.inputs['chat-1'].tail,undefined);
 });

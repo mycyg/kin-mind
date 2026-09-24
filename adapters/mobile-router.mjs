@@ -116,9 +116,9 @@ export function loadState(file,{schema=1,validate=()=>true,now=()=>Date.now()}={
 /** One host owns this durable state; all provider changes and input acceptance
  * share its mutex. MCP requests only record intent and never wait for a turn. */
 export class MobileRouter {
-  /** `replyTail` is the host's reply-tail port (`pending`, `decided`, `missed`, `stopped`), all
-   * optional. It lets the unsent rest of an interrupted reply ride on the routing call this
-   * router makes anyway; without it nothing here changes.
+  /** `replyTail` is the host's reply-tail port. Its one method, `stopped`, hears the owner's
+   * literal stop, so what is still unsent of an earlier reply is withdrawn and owed to Kin's
+   * next turn (N4). No model is asked about it; without the port nothing here changes.
    * `classifyIntents` lets that same call carry what the owner wants done with the message —
    * whether to stop the running task, whether a file was asked for, what they call themselves
    * — and lets an owner message with attachments be classified instead of assumed to be work.
@@ -521,24 +521,16 @@ export class MobileRouter {
     if(first.deferred)return first.deferred;
     // The reply tail never decides routing: a port that is absent, slow to answer or failing changes nothing here.
     const port=async(method,detail)=>{try{return await this.replyTail?.[method]?.(detail)??null;}catch{return null;}};
-    let tail=null,offered=null,classified=false,semanticFailure=null,read=null;
+    let tail=null,classified=false,semanticFailure=null,read=null;
     if(first.decided) {
-      // A literal stop needs no model: whatever is still unsent is retired by the host itself.
+      // A literal stop needs no model: whatever is still unsent is withdrawn by the host itself.
       if(owner&&first.decided.command==='stop'&&this.replyTail)tail={carrier:'owner-stop',...(await port('stopped',{inputId:input.id}))};
-      // Attachments and commands are never classified, so they cannot carry a tail decision either.
-      else if(owner)await port('missed',{inputId:input.id,reason:'not-classified'});
     } else {
-      // An interrupted reply with nothing unknown about it rides on this call. With none,
-      // the classifier is asked exactly what it was always asked.
       classified=true;
-      offered=owner?await port('pending',{id:input.id,text:input.text}):null;
-      if(!offered?.reply)offered=null;
       const files=intents?attachmentMetadata(input.attachments):[];
       try {
-        const result=await this.askClassification(input,{files,intents,offered,runtime:first.classify.runtime,wait:this.state.config.classifierTimeoutMs});
+        const result=await this.askClassification(input,{files,intents,runtime:first.classify.runtime,wait:this.state.config.classifierTimeoutMs});
         read=this.readClassification(result,{owner,intents,allowStop:true});
-        if(offered)tail=result.tail?.decision?{carrier:'classify',decision:result.tail.decision,...(await port('decided',{inputId:input.id,key:offered.key,tail:result.tail}))}
-          :{carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'no-tail-decision'}))};
       } catch(error) {
         // KIN-ITER-20260918-02 REVISES the old tradeoff in which a classification
         // anomaly always became work: the catch manufactured a provisional task and
@@ -546,8 +538,6 @@ export class MobileRouter {
         // nothing — no task, no provider switch, no execution grant — and the
         // input waits as itself for the bounded review, failure class on record.
         semanticFailure=classificationFailure(error);
-        // The remainder waits for its next carrier: the review of the next reply, or a call of its own.
-        if(offered)tail={carrier:'classify',state:'missed',...(await port('missed',{inputId:input.id,key:offered.key,reason:'classifier-unconfirmed'}))};
       }
     }
     // Phase two, under the mutex: the answer applies only against the basis it was read from.
@@ -588,14 +578,14 @@ export class MobileRouter {
   }
   /** One bounded ask of the classifier, with its own clock. The longest the call
    * may wait is the caller's; the answer is never rerouted by trigger words. */
-  async askClassification(input,{files=[],intents=false,offered=null,runtime=null,wait}) {
+  async askClassification(input,{files=[],intents=false,runtime=null,wait}) {
     // The catalog is read before the clock starts, and the clock always has a
     // listener: a slow catalog can never leave a rejection nobody handles (AD1-05).
     const availableModels=await this.availableModels(runtime);
     let timer;
     const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
     timeout.catch(()=>{});
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
+    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
   /** A classification answer, validated and read within its bounds. It never owns
