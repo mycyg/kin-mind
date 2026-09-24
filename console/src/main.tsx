@@ -1004,18 +1004,27 @@ function App() {
                     <Trace title="过滤理由" data={recall.trace?.filtered} />
                     <Trace title="融合排序" data={recall.trace?.ranked} />
                   </div>
-                  {(recall.items ?? []).map((r: any) => (
-                    <button
-                      className="result-link"
-                      key={r.id}
-                      onClick={() => read(r.id)}
-                    >
-                      <FileText size={15} />
-                      {r.title || r.id}
-                      {r.status && <Badge value={r.status} />}
-                      <ArrowUpRight size={14} />
-                    </button>
-                  ))}
+                  {(recall.items ?? []).map((r: any) =>
+                    // A kin context's index also names derived views, read at a digest
+                    // rather than a record revision; only records open in the drawer.
+                    typeof r.revision === "string" ? (
+                      <span className="result-link derived" key={r.id}>
+                        <Layers3 size={15} />
+                        {r.id}
+                      </span>
+                    ) : (
+                      <button
+                        className="result-link"
+                        key={r.id}
+                        onClick={() => read(r.id)}
+                      >
+                        <FileText size={15} />
+                        {r.title || r.id}
+                        {r.status && <Badge value={r.status} />}
+                        <ArrowUpRight size={14} />
+                      </button>
+                    ),
+                  )}
                 </>
               )}
             </section>

@@ -254,3 +254,25 @@ test('a JSON attachment previews as text',async({page})=>{
   await drawer.getByRole('button',{name:'预览附件'}).click();
   await expect(drawer.locator('.attachment-preview pre')).toHaveText('{"kept":"as stored"}');
 });
+
+test('a kin context recall shows its text and opens only the records in its index',async({page})=>{
+  const headers={Authorization:'Bearer test-console-local'};
+  const title='Context index '+Date.now();
+  const receipt=await (await page.request.post('/v1/sources',{headers,data:{namespace:'browser-context',key:title,title,text:'Context index record body.'}})).json();
+  const id=(await (await page.request.get(`/v1/sources/${receipt.id}`,{headers})).json()).record_ids[0];
+  // What a scope with memory context answers (ContextRecallResult): ids read at a record's revision
+  // or at a derived view's digest, and the rendered context as text.
+  const items=[{id:'affect',revision:'e3c5'.repeat(16),depth:'original'},{id,revision:1,depth:'original'}];
+  await page.route('**/v1/recall',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
+    state:'ready',items,index:items,text:'合成的上下文正文',tokens:12,budget:2000,accounts:{},generation:3,latency_ms:4.2,
+    cursor:null,session_used:0,instruction_authority:'data'})}));
+  await page.getByRole('button',{name:'召回实验室',exact:true}).click();
+  await page.locator('#recall-query').fill('上下文');
+  await page.getByRole('button',{name:'召回',exact:true}).click();
+  await expect(page.locator('.context-output')).toHaveText('合成的上下文正文');
+  await expect(page.locator('.recall-stats')).toContainText('2 条记录');
+  await expect(page.locator('.result-link.derived')).toHaveText('affect');
+  await expect(page.getByRole('button',{name:'affect'})).toHaveCount(0);
+  await page.locator('button.result-link').filter({hasText:id}).click();
+  await expect(page.getByRole('dialog',{name:'记忆详情'})).toContainText('Context index record body.');
+});
