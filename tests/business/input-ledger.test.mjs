@@ -152,6 +152,8 @@ test('an input proven never submitted is retried by its own id, then reported; o
   f.clock.now+=120000;answer={state:'accepted',messageId:'notice-1'};
   await f.router.watch({requeue,notifyOwner});
   assert.deepEqual(notices.at(-1),['stopped','owner-2'],'the same notice, by the same input id');
+  assert.equal(f.router.state.inputs['owner-2'].ownerNotice.id,'kin-input-notice-'+createHash('sha256').update(JSON.stringify(['owner-2','stopped'])).digest('hex').slice(0,32),
+    'the ledger names the notice by the identity its sender uses');
   assert.equal(inputSummary(f.router.state.inputs['owner-2']),'failed-notified');
   assert.equal(f.router.unsettledInputs().some(i=>i.id==='owner-2'),false);
 });

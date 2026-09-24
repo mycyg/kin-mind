@@ -1762,7 +1762,8 @@ export class MobileRouter {
       // One notice at a time, never two within the gap: the oldest input first.
       if(due.length&&!(now-this.state.lastOwnerNoticeAt<gapMs)) {
         const {record,verdict}=due.sort((a,b)=>(a.record.at??0)-(b.record.at??0))[0];
-        record.ownerNotice={kind:verdict,id:'kin-input-notice-'+digest([this.sessionId,record.id,verdict]).slice(0,32),state:'sending',attempts:0,at:now};
+        // The notice's transport identity is the one the sender derives: the input and the kind.
+        record.ownerNotice={kind:verdict,id:'kin-input-notice-'+digest([record.id,verdict]).slice(0,32),state:'sending',attempts:0,at:now};
         this.state.lastOwnerNoticeAt=now;list.push({kind:'notify',id:record.id,notice:verdict});changed=true;
       }
       if(changed)this.save('input-watch',{notices:list.filter(action=>action.kind==='notify').map(action=>action.id)});
