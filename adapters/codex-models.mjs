@@ -1,5 +1,10 @@
 const text=value=>typeof value==='string'&&value.trim()?value.trim():null;
-const preferenceTier=value=>{const tier=text(value);return ['priority','fast'].includes(tier)?'fast':['standard','default'].includes(tier)?'default':tier;};
+/** One mapping for every layer: Codex 0.153+ may report a Fast thread as
+ * `priority`, and the owned ACP's fast-mode patch reads it the same way. */
+export const FAST_SERVICE_TIERS=Object.freeze(['fast','priority']);
+export const preferenceTier=value=>{const tier=text(value);return FAST_SERVICE_TIERS.includes(tier)?'fast':['standard','default'].includes(tier)?'default':tier;};
+/** A service tier counts as verified only when the runtime explicitly says so. */
+export const serviceTierVerified=runtime=>Boolean(text(runtime?.serviceTier)&&runtime?.serviceTierVerified===true);
 const effortList=model=>(model.reasoningEfforts??model.supportedReasoningEfforts??model.supported_reasoning_levels??[])
   .map(value=>text(typeof value==='string'?value:value?.effort)).filter(Boolean);
 const tierList=model=>{
@@ -67,7 +72,7 @@ export function runtimeProfile(runtime={}) {
   const serviceTierPreference=preferenceTier(runtime.serviceTierPreference)??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null);
   return {provider:text(runtime.modelProvider),providerKind:runtime.providerOverride===true?'gateway':runtime.providerOverride===false?'native':null,
     model:text(runtime.model),reasoningEffort:text(runtime.reasoningEffort),serviceTier,
-    serviceTierVerified:Boolean(serviceTier&&runtime.serviceTierVerified!==false),serviceTierPreference};
+    serviceTierVerified:serviceTierVerified(runtime),serviceTierPreference};
 }
 
 export function profileMatches(runtime,expected,{actualServiceTier=false}={}) {
@@ -123,7 +128,7 @@ export async function switchCodexModel({connection,sessionId,profile=null,model=
   if(target.serviceTierPreference)await connection.setSessionConfigOption({sessionId,configId:'fast-mode',value:target.serviceTierPreference==='fast'?'on':'off'});
   const actual=await connection.extMethod('_kin/runtime',{sessionId});
   actual.serviceTierPreference??=actual.fastMode==='on'||actual.fastMode===true?'fast':actual.fastMode==='off'||actual.fastMode===false?'default':null;
-  actual.serviceTier??=null;actual.serviceTierVerified=Boolean(actual.serviceTier&&actual.serviceTierVerified!==false);
+  actual.serviceTier??=null;actual.serviceTierVerified=serviceTierVerified(actual);
   actual.profileReady=profileReady(actual,gateway,target);
   if(!actual.known||!actual.profileReady||actual.threadId!==sessionId||actual.nativeSessionId!==sessionId)throw Error('Mobile model verification failed');
   actual.requestedProfile=target;

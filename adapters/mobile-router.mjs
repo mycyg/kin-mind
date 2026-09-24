@@ -1319,7 +1319,7 @@ export class MobileRouter {
   modeApplied(request,runtime,{unchanged=false}={}) {
     request.state='applied';request.appliedAt=this.now();
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
-      serviceTier:runtime.serviceTier??null,serviceTierVerified:Boolean(runtime.serviceTier&&runtime.serviceTierVerified!==false),
+      serviceTier:runtime.serviceTier??null,serviceTierVerified:runtime.serviceTierVerified===true&&Boolean(runtime.serviceTier),
       serviceTierPreference:runtime.serviceTierPreference??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null),
       mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
     request.waitingReason=null;

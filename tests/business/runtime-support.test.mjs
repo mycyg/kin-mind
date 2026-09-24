@@ -30,3 +30,19 @@ test('runtime packaging keeps code-mode sibling and shell resources; missing sup
   assert.throws(()=>prepareMobileRuntimeBundle({...args,bundleId:'missing-support'}),/ENOENT/);
   assert.equal(fs.existsSync(path.join(root,'host/state/mobile-runtime/activation.json')),false);
 });
+
+test('a bundle is valid only while every marker recorded at build time is present once',t=>{
+  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'kin-markers-')));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const bin=path.join(root,'vendor/bin'),modules=path.join(root,'node_modules'),acp=path.join(modules,'@agentclientprotocol/codex-acp');
+  fs.mkdirSync(bin,{recursive:true});fs.mkdirSync(acp,{recursive:true});
+  fs.writeFileSync(path.join(bin,'codex'),'#!/bin/sh\necho "codex-cli 0.156.1"\n',{mode:0o700});fs.writeFileSync(path.join(bin,'codex-code-mode-host'),'#!/bin/sh\n',{mode:0o700});
+  fs.writeFileSync(path.join(acp,'package.json'),JSON.stringify({name:'@agentclientprotocol/codex-acp',version:'1.11.0',main:'index.js'}));
+  const markers=[...REQUIRED_OWNED_ACP_MARKERS,'// KIN_ASSESS_V1'],body=markers.join('\n')+'\n';fs.writeFileSync(path.join(acp,'index.js'),body);
+  const owned=path.join(root,'owned.mjs');fs.writeFileSync(owned,body);
+  const bundle=prepareMobileRuntimeBundle({rootDir:path.join(root,'host'),bundleId:'marker-fixture',codexBinary:path.join(bin,'codex'),acpPackageRoot:acp,nodeModulesRoot:modules,
+    allowedPackages:['@agentclientprotocol/codex-acp'],ownedAcpEntry:{path:owned,realpath:owned,allowed_root:root,sha256:hash(body),source_vendor_sha256:hash(body),bytes:Buffer.byteLength(body),required_markers:markers}});
+  assert.ok(bundle.manifest.runtime.acp.owned_entry.markers.includes('// KIN_ASSESS_V1'));
+  const manifestFile=path.join(bundle.bundleDir,'manifest.json'),manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8'));
+  manifest.runtime.acp.owned_entry.markers.push('// KIN_NOT_BUILT_IN');fs.writeFileSync(manifestFile,JSON.stringify(manifest,null,2));
+  assert.throws(()=>validateMobileRuntimeBundle(bundle.bundleDir),/missing or duplicated/);
+});

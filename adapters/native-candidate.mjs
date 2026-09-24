@@ -4,9 +4,14 @@ import fs from 'node:fs';
 import {checkpointMarker} from './native-window.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {isCompanionInstructionBinding,sameInstructionBinding} from './instruction-evidence.mjs';
+import {preferenceTier} from './codex-models.mjs';
 
 const requestedServiceTier=launch=>launch.fastMode==='on'?'fast':null;
 const evidence=(actual,key,expected)=>!Object.hasOwn(actual??{},key)?'unknown':actual[key]===expected?'verified':'mismatch';
+// A Fast thread may come back as `priority`; no tier and `default` are the same.
+const tierOf=value=>value==null?'default':preferenceTier(value);
+const tierEvidence=(actual,launch)=>!Object.hasOwn(actual??{},'serviceTier')?'unknown':
+  tierOf(actual.serviceTier)===tierOf(requestedServiceTier(launch))?'verified':'mismatch';
 
 /** App-server start/resume receipts are the authority for the profile that the
  * isolated thread actually accepted. `serviceTier` is a thread configuration
@@ -16,7 +21,7 @@ export function candidateResponseProfileEvidence(actual,launch) {
     model:evidence(actual,'model',launch.profile.model),
     modelProvider:evidence(actual,'modelProvider',launch.modelProvider),
     reasoningEffort:evidence(actual,'reasoningEffort',launch.profile.reasoningEffort),
-    serviceTierConfiguration:evidence(actual,'serviceTier',requestedServiceTier(launch)),
+    serviceTierConfiguration:tierEvidence(actual,launch),
   };
 }
 
@@ -33,12 +38,12 @@ const responseReceipt=(actual,launch)=>({
 /** A mobile-only, read-only app-server instance. It never owns a channel or an
  * MCP credential. Native API responses are the authority for its thread IDs. */
 export class NativeCandidate {
-  constructor({command,args=[],cwd,env={},configForModel,personaInstructions,timeoutMs=180000}) {
-    Object.assign(this,{command,args,cwd,env,configForModel,personaInstructions,timeoutMs});this.pending=new Map();this.events=[];this.serial=0;this.loaded=new Set();
+  constructor({command,args=[],cwd,env={},inheritEnv=true,configForModel,personaInstructions,timeoutMs=180000}) {
+    Object.assign(this,{command,args,cwd,env,inheritEnv,configForModel,personaInstructions,timeoutMs});this.pending=new Map();this.events=[];this.serial=0;this.loaded=new Set();
   }
   async start(){
     if(this.child)return;
-    const child=spawn(this.command,[...this.args,'app-server','--stdio'],{cwd:this.cwd,env:{...process.env,...this.env},stdio:['pipe','pipe','pipe']});this.child=child;
+    const child=spawn(this.command,[...this.args,'app-server','--stdio'],{cwd:this.cwd,env:this.inheritEnv?{...process.env,...this.env}:{...this.env},stdio:['pipe','pipe','pipe']});this.child=child;
     child.stderr.on('data',()=>{});
     createInterface({input:child.stdout}).on('line',line=>{let message;try{message=JSON.parse(line);}catch{return;}
       if(this.pending.has(message.id)){const p=this.pending.get(message.id);this.pending.delete(message.id);message.error?p.reject(Error(message.error.message)):p.resolve(message.result);}

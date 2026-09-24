@@ -46,10 +46,9 @@ requests. A model requesting a handoff ends its turn; the host resumes the same
 native thread and continues the retained task. It must not synchronously wait for
 the provider restart inside the requesting tool call.
 
-`mobile-memory-hook.py` uses private host event receipts to separate owner input
-from internal continuations and reviews. It saves the original owner text instead
-of transport metadata. Internal prompts, answers and tool events stay in the
-native transcript and host journal without becoming new interpersonal evidence.
+The phone session runs no Codex hooks. The host records owner input from its own
+ledger; internal prompts, answers and tool events stay in the native transcript and
+host journal without becoming new interpersonal evidence.
 
 ## Runtime controls and native maintenance
 
