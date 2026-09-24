@@ -92,6 +92,9 @@ class ContextDelivery:
     def begin(self, session, epoch, id):
         with self.db.connect(write=True) as conn:
             value = self._get(conn, session, epoch, id)
+            if value.get('erased_at'):
+                # Its words were erased (CR-MEM-02): never sent, whatever state it had reached.
+                return {**self.view(value), 'state': 'erased'}
             if value['state'] != 'prepared':
                 return self.view(value)
             window, policy = self.ctx.window(session, conn), self._policy()
@@ -143,7 +146,9 @@ class ContextDelivery:
             # Sources can change after a real injection. Count the bytes that did
             # arrive, but only current evidence participates in future de-dup.
             policy = self._policy()
-            current = [i for i in value['items'] if self.ctx._current(i, policy)]
+            # An erased delivery still settles by its marker and hash, but nothing it named counts
+            # as read or seen (CR-MEM-02).
+            current = [] if value.get('erased_at') else [i for i in value['items'] if self.ctx._current(i, policy)]
             window = self.ctx.window(session, conn)
             historical = window['epoch'] != epoch
             if not historical:

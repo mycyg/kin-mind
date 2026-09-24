@@ -206,3 +206,24 @@ def test_invalid_maintenance_settings_keep_last_valid_configuration(service):
     with pytest.raises(ValueError):
         engine.settings("maintenance", {"interval_seconds": float("nan")})
     Worker(engine).schedule_maintenance()
+
+
+def test_an_attachment_is_its_bytes_whatever_its_media_type_says(service, tmp_path):
+    """CR-MEM-12: as the TypeScript SDK does, the Python SDK returns attachments, pages, clips and
+    exports as bytes. A JSON or NDJSON file the owner stored is that file, never parsed."""
+    from eventmem.sdk import BINARY_OPERATIONS
+
+    engine, url = service
+    stored = {"notes.json": ("application/json", b'{"b": 1,\n  "a": [1, 2]}\n'),
+              "events.ndjson": ("application/x-ndjson", b'{"n": 1}\n{"n": 2}\n')}
+    with Client(url, token="test-protocol") as client:
+        for name, (media_type, raw) in stored.items():
+            path = tmp_path / name
+            path.write_bytes(raw)
+            source = client.upload(path, {"namespace": "sdk-bytes", "key": name, "media_type": media_type,
+                                          "title": name, "extract": False})
+            served = client.http.get(f"/v1/sources/{source['id']}/content")
+            assert "json" in served.headers["content-type"]
+            answer = client.read_attachment(source_id=source["id"])
+            assert isinstance(answer, bytes) and answer == raw
+    assert BINARY_OPERATIONS == {"read_attachment", "read_page", "read_clip", "download_export"}

@@ -323,3 +323,120 @@ def test_delete_leaves_receipts_sessions_and_metrics_that_name_nothing_erased(sy
     assert "unrelated-command" in commands and "secret-command" not in commands
     assert sessions == {"unrelated-session"}
     assert "unrelated_metric" in metrics and "memory_erased" in metrics
+
+
+def test_a_context_rendered_from_erased_words_keeps_its_identity_and_is_never_sent(system):
+    """CR-MEM-02: a delivery names what it rests on as items[].id and dependencies[].id, and a
+    window keeps receipts with index[].id and rendered_text. The erase finds them by what they
+    really name, takes the words out, and leaves id, hash and state for reconciliation."""
+    from kin_mind.context_delivery import ContextDelivery
+
+    mind, memory, source, clock = system
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk.")
+    contexts = Contexts(mind)
+    packed = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-2", receipt_mode=True)
+    contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1")
+    injection = packed["injection"]
+    assert injection["state"] == "prepared" and MARKER in injection["text"]
+    tables = {table for table, _ in texts_everywhere(mind.engine, MARKER)}
+    assert {"mind_context_deliveries", "mind_context_windows"} <= tables
+
+    mind.engine.delete(secret)
+    settle(mind.engine)
+
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect() as conn:
+        stored = json.loads(conn.execute("SELECT data FROM mind_context_deliveries WHERE id=?",
+                                         (injection["id"],)).fetchone()[0])
+        window = json.loads(conn.execute("SELECT data FROM mind_context_windows WHERE session='thread-1'").fetchone()[0])
+    assert (stored["id"], stored["marker"], stored["text_hash"], stored["state"]) == \
+        (injection["id"], injection["marker"], injection["text_hash"], "prepared")
+    assert stored["text"] == erasure.ERASED and stored["erased_at"] and all("text" not in i for i in stored["items"])
+    begun = ContextDelivery(contexts).begin("thread-1", injection["epoch"], injection["id"])
+    assert begun["state"] == "erased" and not begun.get("acquired")
+    receipt = window["receipts"]["turn-1"]
+    assert receipt["erased_at"] and receipt["rendered_text"] == erasure.ERASED
+    assert not contexts._receipt_current(receipt, None)
+    # The same turn asked again is rendered afresh, from what is left.
+    again = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1")
+    assert MARKER not in json.dumps(again, ensure_ascii=False)
+
+
+def test_a_history_read_is_scrubbed_before_the_rewrite_has_run(system):
+    """CR-MEM-03: the stored rows are rewritten by a job, which may wait behind compaction or a
+    stopped worker; a read of the history meets the delete at once."""
+    mind, memory, source, clock = system
+    secret = source("secret", f"Private {MARKER}")
+    wish(mind, clock, [secret], "secret-wish", f"Remember {MARKER}")
+    rounds(mind, clock, source, 2)
+    mind.engine.delete(secret)
+    history_compaction._set_marker(mind.engine.db, True)  # the rewrite now waits
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_events WHERE instr(data,?)>0", (MARKER,)).fetchone()[0]
+    view = mind.read(history=100)["history"]
+    assert len(view) >= 3 and MARKER not in json.dumps(view, ensure_ascii=False)
+    assert any(erasure.ERASED in json.dumps(entry["request"], ensure_ascii=False) for entry in view)
+
+
+def every_row(engine):
+    """Every row of every table of the store, to prove a run wrote nothing at all."""
+    with sqlite3.connect(engine.db.path) as conn:
+        tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        return {table: sorted(map(repr, conn.execute(f"SELECT * FROM '{table}'").fetchall())) for table in tables}
+
+
+def test_a_second_reerase_changes_nothing_and_a_rerun_reuses_the_history_under_way(system, monkeypatch):
+    from eventmem.core import repair
+
+    mind, memory, source, clock = system
+    engine = mind.engine
+    secret, other = source("secret", f"The owner said {MARKER} in confidence."), source("other", "It stays.")
+    with engine.db.connect(write=True) as conn:
+        graph = memory.graph
+        proof, kept = graph.proof(conn, [secret]), graph.proof(conn, [other])
+        graph._put(conn, {"id": "secret-event", "kind": "event", "title": f"Talk about {MARKER}",
+                          "text": f"They discussed {MARKER}.", "source_ids": [secret], "evidence": proof,
+                          "basis": "documented"})
+        graph._put(conn, {"id": "shared-event", "kind": "event", "title": "A shared evening",
+                          "text": "Two sources describe it.", "source_ids": [secret, other],
+                          "evidence": proof + kept, "basis": "documented"})
+    rounds(mind, clock, source, 2)
+    wish(mind, clock, [secret], "secret-wish", f"Ask about {MARKER}")
+    rounds(mind, clock, source, 2, start=2)
+    # A delete as the release before this one made it: the source, its records and their
+    # tombstones, and nothing of what the mind built from them.
+    monkeypatch.setattr(erasure, "erase", lambda *args, **kwargs: {})
+    monkeypatch.setattr(erasure, "queue_history", lambda *args, **kwargs: None)
+    engine.delete(secret)
+    monkeypatch.undo()
+    settle(engine)
+    assert texts_everywhere(engine, MARKER)
+
+    plan = repair.run(engine.db.root, steps=("reerase",))["steps"]["reerase"]["plan"]
+    assert plan["layers"]["graph"] == 2 and plan["history_rows"] > 0 and plan["history_ids"] == plan["tombstones"]
+    first = repair.run(engine.db.root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
+    assert first["layers"]["graph"] == 2 and first["history_job"]
+    # A rerun before the worker has taken the history up: the layers are done, and the step
+    # already queued for the same identifiers is the one it answers with.
+    rerun = repair.run(engine.db.root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
+    assert rerun == {"layers": {}, "history_ids": first["history_ids"], "history_job": first["history_job"]}
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='erase_history' AND json_extract(payload,'$.ids')"
+                            " IS NOT NULL AND state!='done'").fetchone()[0] == 1
+        node = conn.execute("SELECT revision,updated_at FROM mind_graph_nodes WHERE id='secret-event'").fetchone()
+    settle(engine)
+    assert texts_everywhere(engine, MARKER) == set()
+    assert "failed" not in sweep(mind).values()
+
+    # Done: a second run finds nothing to change, and writes nothing — not a node revision, not
+    # a timestamp, not a history job, not a metric.
+    before = every_row(engine)
+    again = repair.run(engine.db.root, steps=("reerase",))["steps"]["reerase"]["plan"]
+    assert again["layers"] == {} and again["derived_rows"] == 0
+    assert again["history_ids"] == 0 and again["history_rows"] == 0 and again["history_passes_owed"] == 0
+    done = repair.run(engine.db.root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
+    assert done == {"layers": {}, "history_ids": 0, "history_job": None}
+    assert every_row(engine) == before
+    with engine.db.connect() as conn:
+        assert tuple(conn.execute("SELECT revision,updated_at FROM mind_graph_nodes WHERE id='secret-event'")
+                     .fetchone()) == tuple(node)

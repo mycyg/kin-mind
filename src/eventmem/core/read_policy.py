@@ -74,6 +74,8 @@ RULE_NAMESPACE = "namespace-registry"
 RULE_APPROVED = "persona-approved-source"
 RULE_REQUEST = "owner-configuration-request"
 RULE_STAMP = "insert-stamp"
+# A derived record whose experience rests on more than one kind of material (CR-MEM-08).
+RULE_MIXED = "mixed-sources"
 # A stored row whose rule starts with this was written by an operator with the text in hand. It
 # is the only thing that can hide the owner's own words; every rule above is automatic and the
 # classification and the migration never write one.
@@ -167,9 +169,23 @@ class Found(NamedTuple):
     kind: str
     label: str | None
     rule: str
+    # Set only for a derived record whose experience rests on more than one kind of material:
+    # every supplementary label behind it, sorted, and whether plain experience is behind it too.
+    # `label` is then those labels joined by "+", the same whichever source came first (CR-MEM-08).
+    labels: tuple = ()
+    mixed: bool = False
 
 
 PLAIN = Found("experience", None, "")
+
+
+def label_facts(found):
+    """What a reader is told about the nature of an experience besides its text: the label, and
+    for material of more than one kind every label behind it and whether some of it is plain."""
+    if found.kind != "experience" or not found.label:
+        return {}
+    return {"evidence_label": found.label, **({"evidence_labels": list(found.labels)} if found.labels else {}),
+            **({"evidence_mixed": True} if found.mixed else {})}
 
 
 def _matches(namespace, pattern):
@@ -523,7 +539,11 @@ class ReadPolicy:
 
     @staticmethod
     def _combine(found):
-        """Not experience only when nothing behind it is. A label only when no plain experience is."""
+        """Not experience only when nothing behind it is. What is experience keeps the nature of
+        every source behind it (CR-MEM-08): one kind of material reads as that kind; a summary of
+        the owner's words and Kin's own reflection is partly Kin's thought and says so, rather
+        than reading as plain experience; one of a thought and a web page names both, in the
+        same order whichever source came first."""
         if not found:
             return PLAIN
         if len(found) == 1:
@@ -532,9 +552,14 @@ class ReadPolicy:
         if len(outside) == len(found):
             first = next((k for k in PRECEDENCE if any(f.kind == k for f in outside)), outside[0].kind)
             return next(f for f in outside if f.kind == first)
-        if all(f.label for f in found if f.kind == "experience"):
-            return next(f for f in found if f.label)
-        return PLAIN
+        inside = [f for f in found if f.kind == "experience"]
+        labels = sorted({label for f in inside for label in (f.labels or ((f.label,) if f.label else ()))})
+        plain = any(f.mixed or not f.label for f in inside)
+        if not labels:
+            return PLAIN
+        if len(labels) == 1 and not plain:
+            return next(f for f in inside if f.label == labels[0])
+        return Found("experience", "+".join(labels), RULE_MIXED, tuple(labels), plain)
 
     def classify(self, record):
         """In the order of the module's first paragraph. A claim's own sources are the owner's
@@ -610,8 +635,8 @@ class ReadPolicy:
             view["evidence_class"] = found.kind
             if "confirmation" in view:
                 view["confirmation"] = found.kind
-        elif found.label:
-            view["evidence_label"] = found.label
+        else:
+            view.update(label_facts(found))
         return view
 
     def present_source(self, source, text=None):
@@ -636,7 +661,7 @@ class ReadPolicy:
             return f"[{label} {record['confirmation']} {info.get('agent_version', 'unknown')}] "
         found = self.classify(record)
         if found.kind == "experience":
-            return f"[{found.label}] " if found.label else ""
+            return f"[{'partly ' if found.mixed else ''}{found.label}] " if found.label else ""
         if info:
             return f"[{found.kind} {info.get('basis', info.get('entry', 'self_knowledge'))} {info.get('agent_version', 'unknown')}] "
         return f"[{found.kind}] "

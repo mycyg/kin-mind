@@ -2,8 +2,10 @@
 
 Opening a store that is already current takes no write lock, and health names the structure it
 has (E2-08). A recall without a session writes nothing however often it is retried; one that
-names its session is a use as before (S1-02). A pre-action cue with nothing to recall answers
-empty (E3-19). The delivery inbox closes every connection it opens (E3-21)."""
+names its session is a use as before (S1-02); a deep one that compresses keeps nothing it
+computed and records what the model call cost (CR-MEM-07). A pre-action cue with nothing to
+recall answers empty (E3-19). The delivery inbox closes every connection it opens (E3-21)."""
+import json
 import sqlite3
 import time
 
@@ -81,6 +83,70 @@ def test_a_recall_without_a_session_writes_nothing(tmp_path):
     client.post("/v1/recall", headers=HEADERS, json={**LAB, "scope": KIN.model_dump(), "session": "s1"})
     after = counts(engine)
     assert after["mind_memory_access"] > before["mind_memory_access"] and after["memory_metrics"] > before["memory_metrics"]
+
+
+def every_row(engine):
+    with sqlite3.connect(engine.db.path) as conn:
+        tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        return {table: sorted(map(repr, conn.execute(f"SELECT * FROM '{table}'").fetchall())) for table in tables}
+
+
+def test_a_deep_recall_without_a_session_keeps_no_compression_and_records_its_cost(tmp_path, monkeypatch):
+    """Over budget, nothing cached, the compression succeeds: the look reads as a use would and
+    keeps nothing it computed — no compressed context, no cached model answer. The model call
+    it made is admitted and paid for like any other, so what it cost is on record."""
+    import httpx
+
+    from eventmem.core.db import BILLED_METRICS
+    from kin_mind import context as context_module
+    from kin_mind.appraisal import APPRAISAL_MODEL, DeepSeek
+
+    engine, client = kin_store(tmp_path)
+    for i in range(8):
+        engine.receive(SourceInput(namespace="contract", key=f"long-{i}", scope=KIN, kind="knowledge",
+                                   title=f"迁移长记录 {i}", authority="explicit",
+                                   text=f"数据库迁移第{i}轮。" + "在隔离目录完成恢复检查，核对索引与行数，记录每一步的结果。" * 80))
+    calls = []
+
+    def answer(request):
+        sent = json.loads(request.content)
+        asked = json.loads(sent["messages"][0]["content"])
+        calls.append(sent["tools"][0]["name"])
+        return httpx.Response(200, json={
+            "id": f"synthetic-{len(calls)}", "model": APPRAISAL_MODEL, "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": "submit_compression", "input": {
+                "entries": [{"item_ids": asked["allowed_item_ids"], "summary": "合成摘要：各轮迁移均已完成并通过检查。"}],
+                "omitted_ids": []}}],
+            "usage": {"input_tokens": 1200, "output_tokens": 40}})
+
+    def provider(contexts):
+        found = DeepSeek("https://api.deepseek.com/anthropic", APPRAISAL_MODEL, transport=httpx.MockTransport(answer))
+        found.engine = contexts.engine
+        return found
+
+    monkeypatch.setattr(context_module.Contexts, "_provider", provider)
+    monkeypatch.setenv("EVENTMEM_API_KEY", "synthetic-key")
+    context_module.Contexts(Mind(engine, KIN))  # a store that has served a context before
+    before = every_row(engine)
+    with engine.db.connect() as conn:
+        last_metric = conn.execute("SELECT COALESCE(MAX(id),0) FROM metrics").fetchone()[0]
+    reply = client.post("/v1/recall", headers=HEADERS, json={**LAB, "mode": "deep", "budget": 4000, "scope": KIN.model_dump()})
+    assert reply.status_code == 200, reply.text[:300]
+    assert reply.json()["state"] == "compressed" and reply.json()["compression_model_requests"] >= 1
+    assert calls and set(calls) == {"submit_compression"}
+    after = every_row(engine)
+    changed = {table for table in after if after[table] != before.get(table)}
+    # Nothing the look computed is kept, and nothing of the memory it read is marked as used ...
+    assert not changed & {"mind_context_cache", "mind_semantic_cache", "mind_judgment_cache", *TABLES}
+    # ... and what changed at all is the admission and the bill.
+    assert changed <= {"metrics", "sqlite_sequence", "mind_model_leases"}
+    with engine.db.connect() as conn:
+        written = conn.execute("SELECT name,data FROM metrics WHERE id>?", (last_metric,)).fetchall()
+    names = {row["name"] for row in written}
+    assert "structured_model_usage" in names
+    assert all(name.startswith("model_") or name in BILLED_METRICS for name in names)
+    usage = [json.loads(row["data"]) for row in written if row["name"] == "structured_model_usage"]
+    assert len(usage) == len(calls) and all(entry["usage"] == {"input_tokens": 1200, "output_tokens": 40} for entry in usage)
 
 
 def test_a_pre_action_cue_with_nothing_to_recall_answers_empty(tmp_path):

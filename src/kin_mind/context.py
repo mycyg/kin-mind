@@ -11,7 +11,7 @@ from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallRequest
-from eventmem.core.read_policy import ReadPolicy
+from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
 
 from .computer import redact
@@ -201,8 +201,14 @@ class Contexts:
                 return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None):
-        """A cache entry covers exact input revisions and query purpose, not DB age."""
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None, persist=None):
+        """A cache entry covers exact input revisions and query purpose, not DB age.
+
+        `persist=False` is a look (S1-02): it reads the cache and may compress, and keeps
+        nothing it computed (CR-MEM-07). Left out, it follows the ambient `unrecorded()`."""
+        if persist is None:
+            from eventmem.core.db import recording
+            persist = recording()
         if not isinstance(budget, int) or budget < 0:
             raise ValueError("Invalid context budget")
         if not 1 <= work_seconds <= 600:
@@ -309,8 +315,9 @@ class Contexts:
                         omitted_ids = set(value.omitted_ids)
                         if not covered & omitted_ids and covered | omitted_ids == ids and (not require_all or not omitted_ids):
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
-                            with self.engine.db.connect(write=True) as connection:
-                                connection.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (part_key,self.mind.scope.key(),dumps({"value":value.model_dump(),"receipt":receipt}),self.mind.clock()))
+                            if persist:
+                                with self.engine.db.connect(write=True) as connection:
+                                    connection.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (part_key,self.mind.scope.key(),dumps({"value":value.model_dump(),"receipt":receipt}),self.mind.clock()))
                             if on_progress is not None:
                                 on_progress(part_key)
                             return value, receipt
@@ -366,7 +373,7 @@ class Contexts:
                 result = {"text": text, "tokens": tokens(text), "state": "compressed" if lines else "insufficient",
                           "covered_ids": list(dict.fromkeys(covered)), "omitted_ids": list(dict.fromkeys([*omitted, *[i for i in source if i not in covered]])),
                           "items": selected, "receipt": receipts, "cache_hit": False, "model_requests": model_requests, "elapsed_ms": round((time.monotonic() - started) * 1000)}
-                if lines and (not require_all or not result["omitted_ids"]):
+                if persist and lines and (not require_all or not result["omitted_ids"]):
                     with self.engine.db.connect(write=True) as conn:
                         conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (cache_id, self.mind.scope.key(), dumps(result), self.mind.clock()))
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": sum(r.get("requests", 1) for r in receipts), "state": result["state"]})
@@ -450,8 +457,8 @@ class Contexts:
                         found = policy.classify(record)
                         if found.kind != "experience":
                             basis = facts["basis"] = found.kind
-                        elif found.label:
-                            facts["evidence_label"] = found.label
+                        else:
+                            facts.update(label_facts(found))
                 if fallback:
                     text = "\n".join(fallback)
             facts["relations"] = [{k: e.get(k) for k in ("id", "subject", "object", "predicate", "layer", "basis", "role", "reason")} for e in related[:8]]
@@ -575,7 +582,7 @@ class Contexts:
         return {"id": record["id"], "revision": record["revision"], "text": record["content"],
                 "basis": record["confirmation"] if found.kind == "experience" else found.kind,
                 "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until"),
-                          **({"evidence_label": found.label} if found.kind == "experience" and found.label else {})},
+                          **label_facts(found)},
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
     def _overview_key(self, item):
@@ -885,7 +892,8 @@ class Contexts:
             budget = min(needed, INJECTION_CEILING, max(0, available) if isinstance(available, int) else INJECTION_CEILING)
         remaining = 150 - (time.monotonic() - started)
         packed = self.pack(selected, query, max(0, budget - overhead), provider=provider,
-                           allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining), policy=policy)
+                           allow_model=allow_model and remaining >= 1, work_seconds=max(1, remaining), policy=policy,
+                           persist=record)
         if explicit:
             self._compact_receipt(packed)
         if not explicit:
@@ -962,7 +970,8 @@ class Contexts:
         """A stored window receipt is replayed only while everything it rendered is still
         something this read may see. A receipt written before the classification existed names
         its evidence, so it is checked against the records and nodes themselves, not a stamp."""
-        if not isinstance(receipt, dict):
+        if not isinstance(receipt, dict) or receipt.get("erased_at"):
+            # An erased receipt is never replayed (CR-MEM-02).
             return False
         index = receipt.get("index")
         if not policy.enabled or index is None:

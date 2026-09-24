@@ -276,3 +276,26 @@ test('a kin context recall shows its text and opens only the records in its inde
   await page.locator('button.result-link').filter({hasText:id}).click();
   await expect(page.getByRole('dialog',{name:'记忆详情'})).toContainText('Context index record body.');
 });
+
+test('the scope picker lists every page of scopes and reads them again after a refresh',async({page})=>{
+  // CR-MEM-13: more scopes than one page holds; the picker follows the cursor to the end.
+  const scopes=Array.from({length:250},(_,i)=>({project:`p${String(i).padStart(3,'0')}`,persona:'Kin',collection:'default',world:'real'}));
+  const asked:string[]=[];
+  await page.route('**/v1/scopes*',route=>{
+    const url=new URL(route.request().url());
+    const cursor=url.searchParams.get('cursor'),limit=Number(url.searchParams.get('limit')||100);
+    asked.push(cursor??'');
+    const start=cursor?scopes.findIndex(s=>JSON.stringify(s)===cursor)+1:0,items=scopes.slice(start,start+limit);
+    return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({items,
+      cursor:start+limit<scopes.length?JSON.stringify(items.at(-1)):null,default_scope:scopes[0]})});
+  });
+  const picker=page.getByLabel('已有范围');
+  await picker.focus();
+  await expect(picker.locator('option')).toHaveCount(251);
+  await expect(picker.locator('option').last()).toHaveText('p249 / Kin / default / real');
+  expect(asked.length).toBe(2);
+  await page.getByRole('button',{name:'刷新'}).click();
+  await page.locator('body').click();
+  await picker.focus();
+  await expect.poll(()=>asked.length).toBe(4);
+});

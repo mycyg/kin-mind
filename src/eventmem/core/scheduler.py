@@ -28,15 +28,17 @@ DISPATCH_LEASE = 30  # seconds a 'sending' row may wait for its receipt
 # Attempts a possibly-sent row gets when no delivery window can be read off it (rows an older
 # build queued). Every other row is bounded by its window.
 MAX_ATTEMPTS = 5
-# How long after it was queued a delivery is still worth making. Within it, a row nothing can
-# have been sent for — every attempt refused, or the connection never made — is tried again
-# however often that takes, and so is one on a declared and verified idempotent channel, whose
-# receiver keys its effect by the delivery id. A host restarting or a send lease briefly held
-# used to exhaust five attempts in half a minute and park the reminder for good (E2-01, E3-12).
-DELIVERY_WINDOW = 6 * 3600
+# How long after this occurrence was due a delivery is still worth making: 30 minutes (F4,
+# CR-MEM-10). Within it, a row nothing can have been sent for — every attempt refused, or the
+# connection never made — is tried again however often that takes, and so is one on a declared
+# and verified idempotent channel, whose receiver keys its effect by the delivery id. Every
+# dispatch checks it first: past it, a row proven unsent is settled as not sent, and one whose
+# outcome is unknown stays under its id for reconciliation, never sent late (E2-01, E3-12).
+DELIVERY_WINDOW = 30 * 60
 RETRY_CAP = 300  # the longest wait between two attempts
 HTTP_TIMEOUT = 5
-UNSENT_KEYS = ("attempts", "claim", "dispatch", "gave_up")  # bookkeeping, never part of a body
+# Bookkeeping, never part of a body: the body the host receives is what it always was.
+UNSENT_KEYS = ("attempts", "claim", "dispatch", "gave_up", "due_at")
 # What each delivery state means to a reader that decides whether to say it was done or to
 # ask again. Static text: the model reads it through the task tools (E3-13).
 MEANINGS = {
@@ -139,30 +141,46 @@ def phase(row):
 
 def describe(row):
     """A delivery as a reader should take it: its state, its derived phase, whether anything
-    can have reached the channel, and what that means in words (E3-13)."""
+    can have reached the channel, and what that means in words (E3-13).
+
+    "Never sent" is the dispatcher's own judgement, `unsent()`, so a reader is never told less
+    than the dispatcher knows: an older row with attempts and no refusal on record stays
+    "possibly sent" and is reconciled under its id (CR-MEM-04). A canceled row was canceled only
+    when nothing could have been sent. Readers select `lease_until` with the row."""
     data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
-    attempts = row["attempts"] if "attempts" in row.keys() else 0
-    dispatch = data.get("dispatch") or {}
-    never_sent = row["state"] in ("suggested", "ready") or (
-        row["state"] in ("retry", "uncertain", "canceled")
-        and (not dispatch or dispatch.get("refused_through") == attempts))
+    keys = row.keys()
+    attempts = row["attempts"] if "attempts" in keys else 0
+    never_sent = row["state"] == "canceled" or unsent(
+        {"state": row["state"], "attempts": attempts,
+         "lease_until": row["lease_until"] if "lease_until" in keys else None}, data)
     found = {"id": row["id"], "state": row["state"], "phase": phase(row), "attempts": attempts,
              "never_sent": bool(never_sent), "meaning": MEANINGS.get(row["state"], row["state"])}
     if data.get("gave_up"):
-        found["meaning"] = "没有发出：投递时段内渠道一直拒收或连接不上，已停止重试"
+        found["meaning"] = ("没有发出：到截止时间仍未能发送，不再发送"
+                            if data["gave_up"].get("reason") == "past-deadline"
+                            else "没有发出：投递时段内渠道一直拒收或连接不上，已停止重试")
         found["gave_up_at"] = data["gave_up"].get("at")
     elif row["state"] == "uncertain" and never_sent:
         found["meaning"] = "没有发出（每次都被拒收），已停止自动重试"
     return found
 
 
+def deadline(data):
+    """The last moment this occurrence is still worth delivering: its due time plus the window.
+    A row an older build queued names no due time; it was queued when it fell due, so its
+    creation stands in. None when neither can be read (CR-MEM-10)."""
+    for key in ("due_at", "created_at"):
+        try:
+            return datetime.fromisoformat(data[key]).timestamp() + DELIVERY_WINDOW
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
 def window_open(data, now, attempts):
     """Whether a delivery is still inside the window in which it is worth making."""
-    try:
-        created = datetime.fromisoformat(data["created_at"]).timestamp()
-    except (KeyError, TypeError, ValueError):
-        return attempts < MAX_ATTEMPTS
-    return now < created + DELIVERY_WINDOW
+    until = deadline(data)
+    return attempts < MAX_ATTEMPTS if until is None else now < until
 
 
 class Scheduler:
@@ -435,6 +453,7 @@ class Scheduler:
                     "record_id": record["id"],
                     "record_revision": record["revision"],
                     "created_at": stamp,
+                    "due_at": schedule["due_at"],
                     "text": record["content"],
                     "source_ids": record["source_ids"],
                     "scope": record["scope"],
@@ -549,6 +568,17 @@ class Scheduler:
                     ),
                 )
 
+            if not window_open(data, self.clock(), row["attempts"]):
+                # Past this occurrence's deadline nothing is sent (CR-MEM-10). Proven unsent, it
+                # is settled as not sent; possibly sent, it stays under its id to be reconciled.
+                # Either way the occurrence is over, and a recurring reminder moves on.
+                if clean:
+                    data["gave_up"] = {"at": stamp, "reason": "past-deadline"}
+                    conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('reminder_undelivered',1,?,?)",
+                                 (stamp, dumps({"attempts": row["attempts"], "reason": "past-deadline"})))
+                release("canceled" if clean else "uncertain")
+                self._complete_schedule(conn, schedule, policy, stamp, row["id"], delivered=False)
+                return None
             if (
                 not policy.enabled
                 or not policy.channel

@@ -172,7 +172,7 @@ class ContactTasks:
                 # Each delivery with what it means: sent, never sent, or possibly sent and to
                 # be reconciled before anything is said about it or asked again.
                 deliveries = [describe(delivery) for delivery in conn.execute(
-                    "SELECT id,state,attempts,data FROM outbox WHERE schedule_id=? ORDER BY available DESC,id LIMIT 3",
+                    "SELECT id,state,attempts,lease_until,data FROM outbox WHERE schedule_id=? ORDER BY available DESC,id LIMIT 3",
                     (row["id"],),
                 ).fetchall()]
                 items.append(

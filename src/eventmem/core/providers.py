@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import os
 import time
+from contextlib import contextmanager
 
 import httpx
 
+from .db import digest, dumps
 from .models import ModelRole
 
 
@@ -20,6 +23,45 @@ class ProviderError(RuntimeError):
 
 class ParseError(ValueError):
     """A reply came back and is not one JSON object. Only this is asked again in place."""
+
+
+# The job this thread is preparing, and the model answers it has paid for on the way, by the
+# digest of the exact request. A run that cannot commit hands them to the run that took the job
+# over, through the store (CR-MEM-09).
+_JOB = contextvars.ContextVar("eventmem_job_answers", default=None)
+KEPT_PREFIX = "job-answer:"
+
+
+def _kept_id(job_id, request):
+    return f"{KEPT_PREFIX}{job_id}:{request[:40]}"
+
+
+@contextmanager
+def job_answers(job):
+    """Around one job's preparation: the model answers it pays for are collected, and a request
+    this job already paid for under a run that could not commit is answered from the store."""
+    answers = []
+    token = _JOB.set({"job": job["id"], "answers": answers})
+    try:
+        yield answers
+    finally:
+        _JOB.reset(token)
+
+
+def keep_answers(conn, job, answers):
+    """A run whose job was taken over leaves what it paid for with the job, in the stored
+    command results. Beside the answer, the job's payload: the identifiers in it are what an
+    erase finds such a row by. Returns how many answers were kept."""
+    for request, answer in answers:
+        conn.execute("INSERT OR REPLACE INTO commands VALUES(?,?,?)",
+                     (_kept_id(job["id"], request), request,
+                      dumps({"job": job["id"], "kind": job["kind"], "payload": job.get("payload"), "answer": answer})))
+    return len(answers)
+
+
+def drop_answers(conn, job_id):
+    """The job committed, or ended: what was kept for it is spent."""
+    conn.execute("DELETE FROM commands WHERE id>=? AND id<?", (f"{KEPT_PREFIX}{job_id}:", f"{KEPT_PREFIX}{job_id};"))
 
 
 FENCE = "```"
@@ -110,6 +152,18 @@ class Providers:
 
         from kin_mind.attempts import cost_entry, token_counts
         from kin_mind.model_runtime import model_slot
+        job = _JOB.get()
+        request = (digest([role, route, config.endpoint, config.model, json_])
+                   if job is not None and json_ is not None and files is None and data is None else None)
+        if request:
+            with self.engine.db.connect() as conn:
+                kept = conn.execute("SELECT result FROM commands WHERE id=? AND digest=?",
+                                    (_kept_id(job["job"], request), request)).fetchone()
+            if kept:
+                # Checked again before it is used: the same job, and the very same request, so an
+                # input that changed since is asked afresh. Nothing is paid, nothing is billed twice.
+                self.engine.db.metric("model_answer_reused", 1, {"role": role, "model": config.model})
+                return json.loads(kept[0])["answer"]
         with self.engine.db.connect() as conn:
             has_shared_slots = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_model_leases'").fetchone())
         start = time.perf_counter()
@@ -149,6 +203,8 @@ class Providers:
                         f"Model role {role} returned HTTP {response.status_code}"
                     )
                 result = response.json()
+                if request:
+                    job["answers"].append((request, result))
                 break
             except httpx.TimeoutException:
                 unknown_usage("timeout")

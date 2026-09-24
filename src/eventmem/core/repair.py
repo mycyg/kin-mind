@@ -7,7 +7,14 @@
 
 Run it with the memory service stopped, after the backup the deploy takes. Every step is
 idempotent: it asks what is already done rather than counting what it did, so a second run
-reports nothing left and writes nothing. Nothing here deletes a record, a source, a revision or
+reports nothing left and writes nothing. The dry run opens the store read-only and builds
+nothing: no table, index or metadata of this release, no cache under the root (CR-MEM-05).
+A root without a `memory.sqlite3` is refused in both modes rather than becoming a new store.
+
+Exit status: 0 with the JSON report on stdout (also in `--output`, 0600); 2 when refused — an
+unknown step or no store at the root — with one line on stderr and nothing on stdout; anything
+else (1) is a failure with a traceback, and an `--apply` that failed may have finished the steps
+before the failing one, each of which a rerun finds done. Nothing here deletes a record, a source, a revision or
 a history row; records leave active use by a new revision (`archive`, `superseded`), queue rows
 change state, and derived indexes are rebuilt. The report carries identifiers, namespaces and
 counts only — never a line of content.
@@ -38,7 +45,9 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
 - `reerase`   Opt-in. Deletes made before this release left their words in the mind's derived
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). It rewrites history rows, so it
-              is named explicitly.
+              is named explicitly. What an earlier run already erased is left alone, and the
+              history is queued only for identifiers it has neither finished nor still owes a
+              pass for, so a second run changes nothing (CR-MEM-06).
 - `quarantine` Opt-in. Quarantined appraisals whose evidence is gone are retired (state
               `superseded`, reason kept, no model call); the others are listed by reason for a
               decision, never resumed here, because a resume pays for a model call (K4-06, DB1-05).
@@ -48,8 +57,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from .db import digest
 from .models import Scope
@@ -71,6 +83,41 @@ COMMAND = "repair-20260924"
 ARCHIVED_NAMESPACES = ("kin-session-maintenance",)
 CHUNK = 200
 IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
+
+
+class Refused(ValueError):
+    """The command was asked for something it will not do; nothing was read or written."""
+
+
+class ReadOnlyStore:
+    """The store as the dry run sees it (CR-MEM-05): a read-only connection per read, and nothing
+    created or initialised on the way in. `Engine()` would run this release's DDL, fill in
+    metadata and pin the tokenizer cache under the root before the report said a word. The only
+    files that may appear are the `-wal` and `-shm` SQLite coordinates its readers with."""
+
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.root = self.path.parent
+        self.blobs = self.root / "blobs"
+
+    @contextmanager
+    def connect(self, write=False):
+        if write:
+            raise PermissionError("The dry run writes nothing")
+        conn = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA query_only=1")
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+    def metric(self, name, value, data=None):
+        """A dry run records nothing, not even that it ran."""
 
 
 def _table(conn, name):
@@ -333,31 +380,48 @@ def apply_spool(engine):
 
 # --- reerase ---------------------------------------------------------------------------------
 
+def _split(ids):
+    return frozenset(i for i in ids if i.startswith("mem_")), frozenset(i for i in ids if i.startswith("src_"))
+
+
 def plan_reerase(conn):
-    from kin_mind.erasure import erased_ids, mentions
+    """What a run would change, not what merely names a tombstone: an earlier run leaves
+    tombstone references behind on purpose, and a second run finds nothing left (CR-MEM-06)."""
+    from kin_mind.erasure import erase, erased_ids, history_covered, history_owed, mentions
+
+    from .models import now
 
     ids = erased_ids(conn)
     if not ids or not _table(conn, "mind_state"):
-        return {"tombstones": len(ids), "history_rows": 0, "derived_rows": 0}
-    history = len(mentions(conn, "mind_events", ids, "rowid AS key")) if _table(conn, "mind_events") else 0
-    derived = sum(len(mentions(conn, table, ids, "rowid AS key")) for table in
-                  ("mind_state", "mind_graph_nodes", "mind_graph_edges", "mind_context_cache")
-                  if _table(conn, table))
-    return {"tombstones": len(ids), "history_rows": history, "derived_rows": derived}
+        return {"tombstones": len(ids), "layers": {}, "derived_rows": 0, "history_ids": 0, "history_rows": 0,
+                "history_passes_owed": 0}
+    layers = erase(conn, *_split(ids), now(), write=False)
+    waiting = ids - history_covered(conn)
+    rows = len(mentions(conn, "mind_events", waiting, "rowid AS key")) if waiting and _table(conn, "mind_events") else 0
+    return {"tombstones": len(ids), "layers": layers, "derived_rows": sum(layers.values()),
+            "history_ids": len(waiting), "history_rows": rows, "history_passes_owed": history_owed(conn)}
 
 
 def apply_reerase(engine):
-    from kin_mind.erasure import erase, erased_ids, queue_history
+    """The same erase for every tombstone, and the history rewrite for what it has not finished
+    and does not owe: a rerun after a success writes nothing, and one after a failure takes up
+    only what is left, reusing the passes already under way (CR-MEM-06)."""
+    from kin_mind.erasure import erase, erased_ids, history_covered, queue_history
 
     from .models import now
 
     with engine.db.connect(write=True) as conn:
         ids = erased_ids(conn)
-        records = frozenset(i for i in ids if i.startswith("mem_"))
-        sources = frozenset(i for i in ids if i.startswith("src_"))
-        counts = erase(conn, records, sources, now())
-        job = queue_history(engine, conn, ids)
-    return {"layers": counts, "history_job": job}
+        counts = erase(conn, *_split(ids), now(), again=True)
+        if counts:
+            # As after a delete: an FTS5 delete leaves the words in the index's segments until
+            # they are merged, and the node indexes were just rewritten.
+            from .jobs import purge_text_indexes
+
+            purge_text_indexes(conn)
+        waiting = ids - history_covered(conn)
+        job = queue_history(engine, conn, waiting, reuse=True) if waiting else None
+    return {"layers": counts, "history_ids": len(waiting), "history_job": job}
 
 
 # --- evidence --------------------------------------------------------------------------------
@@ -374,13 +438,15 @@ def _evidence_scopes(conn):
 
 def plan_evidence(engine):
     from kin_mind import evidence_keys
-    from kin_mind.state import Mind
+
+    from .models import now
 
     with engine.db.connect() as conn:
         scopes = _evidence_scopes(conn)
     found = []
     for scope in scopes:
-        mind = Mind(engine, Scope.model_validate(json.loads(scope)))
+        # What the two reads use of a mind, and not a `Mind`, whose constructor runs its DDL.
+        mind = SimpleNamespace(engine=engine, scope=Scope.model_validate(json.loads(scope)), clock=now)
         filling = evidence_keys.backfill(mind, apply=False)
         checked = evidence_keys.verify(mind)
         found.append({"scope": scope, "would_insert": filling["would_insert"], "state": checked["state"],
@@ -457,8 +523,15 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
 
     unknown = sorted(set(steps) - set(STEPS))
     if unknown:
-        raise ValueError(f"Unknown steps: {', '.join(unknown)}")
-    engine = Engine(Path(root))
+        raise Refused(f"Unknown steps: {', '.join(unknown)}")
+    store = Path(root).expanduser() / "memory.sqlite3"
+    if not store.is_file():
+        # A mistyped root would otherwise become a new, empty store, and the report would say
+        # there was nothing to repair.
+        raise Refused(f"No memory store at {store}")
+    # Only an apply builds the engine, and with it this release's structure; the dry run reads
+    # the store exactly as it is.
+    engine = Engine(store.parent) if apply else SimpleNamespace(db=ReadOnlyStore(store))
     report = {"command": COMMAND, "root": str(Path(root)), "applied": apply, "steps": {}}
     with engine.db.connect() as conn:
         origins = plan_origins(conn) if "origins" in steps else []
@@ -540,7 +613,11 @@ def main(argv=None):
                         help=f"comma-separated, from {', '.join(STEPS)}; default {','.join(DEFAULT_STEPS)}")
     parser.add_argument("--output", help="also write the report here (0600)")
     args = parser.parse_args(argv)
-    report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s))
+    try:
+        report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s))
+    except Refused as refusal:
+        print(f"{COMMAND}: refused: {refusal}", file=sys.stderr)
+        return 2
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         path = Path(args.output)

@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 # The quiet-review interval Kin may choose (N8, set by kin_mind.appraisal). The stored
 # review_min/max_minutes keys stay readable for older configurations and bound nothing now.
 REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
+# Settings an earlier release registered and nothing reads any more. A stored configuration or a
+# caller that still carries one is not refused for it: it is left out when read, and dropped from
+# the configuration the next time it is written.
+RETIRED_SETTINGS = frozenset({"chunked_reply_review", "rest_review_window", "review_rest_max_minutes"})
 
 DEFAULTS = {"native_window_context": False, "records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
@@ -83,18 +87,14 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "attempt_ledger": True, "idempotency_fingerprint": True, "manifest_rebase": True,
             "appraisal_reuse": True, "appraisal_revalidation": True, "model_lanes": True,
             "semantic_cache_v2": True, "memory_item_isolation": True,
-            # Stage 3 WP B3: a long reply is reviewed in chunks, an interrupted group's unsent
-            # remainder can be reviewed again, and an earlier tail settles through this call.
-            # Off restores the stage-2 limits, which refuse such a group for ever.
-            "chunked_reply_review": True,
             # Stage 3: purpose-typed recall. Off restores `history` admitting self-knowledge, the
             # prefix-only envelope filters, relation seeds taken before validation and bare labels.
             "recall_purpose_policy": True,
             # Registered once here and read through autonomy_schema.optimized(). Each one off takes
             # its sections out of the appraisal schema and prompt and blanks them before validation,
-            # which is the previous behavior exactly. The last two carry no appraisal section.
+            # which is the previous behavior exactly. The last one carries no appraisal section.
             "trait_ledger": True, "behavior_chain": True, "expression_intent": True,
-            "next_move_audit": True, "wish_version_review": True, "rest_review_window": True,
+            "next_move_audit": True, "wish_version_review": True,
             # Stage 5, read through autonomy_schema.optimized(). `evidence_key_index` off takes the
             # evidence key table out of the dedupe guard and leaves only the scan of the snapshots,
             # which is the previous behavior exactly. `history_legacy_guard` off stops paying for
@@ -121,11 +121,12 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # stays in the document exactly as it does today.
             "desire_archive": False,
             # Stage 5 housekeeping, all three off and all three read through
-            # autonomy_schema.enabled(). `context_cache_sweep` is the only hard delete in the
-            # programme: it removes rows of `mind_context_cache`, which hold compressed context
-            # and nothing else, and a removed row costs one model call to build again. It stays
-            # off until an owner has been told exactly that and has agreed to it, and off the
-            # cache keeps every row and an erase leaves the compressed copies behind, as today.
+            # autonomy_schema.enabled(). `context_cache_sweep` sweeps `mind_context_cache`, which
+            # holds compressed context and nothing else, by age and by count, and takes a scope's
+            # whole cache on an erase; a removed row costs one model call to build again. It
+            # stays off until an owner has been told exactly that and has agreed to it. Off, the
+            # cache is not swept; an erase still removes the rows that name what it erased, or a
+            # graph item it took words from, whatever this says (kin_mind.erasure).
             # `metrics_name_ring` gives the telemetry table a ring per name instead of one
             # shared ring; off is the shared ring, unchanged. `vector_optimize` only unlocks a
             # command, which still refuses unless the store is provably quiet and still writes
@@ -135,10 +136,6 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
             "review_max_minutes": 120, "first_review_minutes": 20,
-            # The ceiling while the rhythm rests or the owner's quiet hours run, so a night costs
-            # one appraisal instead of one every two hours. Applied only there, and only with
-            # `rest_review_window` on; everywhere else `review_max_minutes` still decides.
-            "review_rest_max_minutes": 480,
             # What the owner is called, for the recall lane that looks for their own words. Empty
             # by default: with none configured that lane uses generic first/second-person words.
             "recall_owner_aliases": [],
@@ -307,17 +304,19 @@ class MemoryContinuity:
             with self.engine.db.connect() as connection:
                 return self.settings(connection)
         row = conn.execute("SELECT data FROM mind_memory_config WHERE scope=?", (self.scope.key(),)).fetchone()
-        return DEFAULTS | (json.loads(row[0]) if row else {})
+        stored = json.loads(row[0]) if row else {}
+        return DEFAULTS | {key: value for key, value in stored.items() if key not in RETIRED_SETTINGS}
 
     def configure(self, values):
+        values = {key: value for key, value in values.items() if key not in RETIRED_SETTINGS}
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
         for key in ("native_window_context", "records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
                     "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
                     "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
-                    "chunked_reply_review", "recall_purpose_policy",
+                    "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
-                    "wish_version_review", "rest_review_window", "legacy_drive_thresholds",
+                    "wish_version_review", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
@@ -348,9 +347,6 @@ class MemoryContinuity:
                     raise Conflict("Cooling needs a current successful replay validation")
             if not 20 <= config["review_min_minutes"] <= config["first_review_minutes"] <= config["review_max_minutes"] <= 120:
                 raise ValueError("Review range must be within 20..120 minutes")
-            if (type(config["review_rest_max_minutes"]) is not int
-                    or not config["review_max_minutes"] <= config["review_rest_max_minutes"] <= 720):
-                raise ValueError("The resting review ceiling must be between the ordinary one and 720 minutes")
             aliases = config["recall_owner_aliases"]
             if (type(aliases) is not list or len(aliases) > 8
                     or any(type(a) is not str or not a.strip() or len(a) > 40 for a in aliases)):

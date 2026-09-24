@@ -44,8 +44,9 @@ features reads the columns it always read. `mind_model_leases` also serves
 admission with `model_lanes` off; every other table above belongs to its switch
 alone. A rollback leaves the tables in place, and a re-enabled switch finds its
 history. `max_charged_attempts` is a number in the same configuration rather
-than a switch. `configure-memory` also accepts `chunked_reply_review` as a
-boolean; no code reads it.
+than a switch. `chunked_reply_review` is retired: a configuration that still
+carries it is not refused, and the key is ignored when read and dropped on the
+next write.
 
 Several mechanisms documented across these pages have no switch. The conflict
 taxonomy that classifies a commit failure only adds fields to existing records.

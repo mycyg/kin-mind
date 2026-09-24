@@ -60,6 +60,7 @@
     "role-configuration:*": "configuration",
     "persona-configuration": "configuration",
     "persona-configuration:*": "configuration",
+    "kin-configuration-declaration": "configuration",
     "synthetic-example": "synthetic_example",
     "synthetic-example:*": "synthetic_example",
     "kin-reflection": "kin_thought",
