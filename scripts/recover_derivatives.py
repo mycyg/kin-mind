@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sqlite3
 import sys
 import tempfile
@@ -67,7 +66,9 @@ def snapshot_db(root: Path, workdir: Path, attempts=40):
             "source_schema_version": source.execute("PRAGMA schema_version").fetchone()[0],
             "source_journal_mode": source.execute("PRAGMA journal_mode").fetchone()[0],
         }
-        source.backup(destination, pages=4096, sleep=0.05)
+        # One step: a single read transaction on a WAL store does not block writers, and a
+        # stepped backup restarts whenever the live service writes between two steps (T1-08).
+        source.backup(destination, pages=-1)
         check = destination.execute("PRAGMA integrity_check").fetchone()[0]
         if check != "ok":
             raise RuntimeError(f"Snapshot integrity check failed: {check}")
@@ -369,8 +370,6 @@ def apply(root: Path, args):
         snapshot_engine = Engine(tmp)
         with snapshot_engine.db.connect() as conn:
             contract = dr.embedding_vector_contract(conn)
-            models_row = conn.execute("SELECT data FROM settings WHERE key='models'").fetchone()
-            models = json.loads(models_row[0]) if models_row else {}
         reviewed_contract = manifest["vector_store"]["contract"]
         contract_keys = ("index_id", "model", "dimensions", "preprocessing")
         if not contract.get("resolved") or any(
@@ -407,10 +406,6 @@ def apply(root: Path, args):
             )
             if review["blocked"] or review["drifted"]:
                 raise RuntimeError("Reviewed targets are blocked or drifted; apply was not started")
-        if selection["digests"]:
-            key_env = models.get("summary", {}).get("api_key_env", "EVENTMEM_API_KEY")
-            if not os.environ.get(key_env):
-                raise RuntimeError(f"Required digest credential environment variable is absent: {key_env}")
 
     selection["selection_review"] = review
     selection["preapply_snapshot"] = snapshot_evidence
@@ -422,6 +417,8 @@ def apply(root: Path, args):
         probe=lambda: probe_embedding(root)["alive"],
         vector_probe=lambda record_ids: probe_vectors(root, record_ids, contract),
     )
+    # From here a failure is the runner's: the command lease lets the same command id resume.
+    args.runner_started = True
     result = runner.run(
         command_id=args.command_id,
         selection=selection,
@@ -461,7 +458,7 @@ def main():
             "command_id": args.command_id,
             "error_type": type(exc).__name__,
             "error": str(exc),
-            "stopped": "precondition",
+            "stopped": "runner" if getattr(args, "runner_started", False) else "precondition",
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

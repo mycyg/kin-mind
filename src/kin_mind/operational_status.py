@@ -45,6 +45,16 @@ def operational_status(mind, config=None):
         from .isolation_migration import status as isolation_status
         from .erasure import status as erasure_status
         memory = {"evidence_isolation": isolation_status(conn, scope), "history_erase": erasure_status(conn, scope)}
+        # Quarantined appraisals have no automatic way out: how many, since when, and why, as
+        # static labels, so an operator can retire or resume them (K4-06, DB1-05).
+        from .model_lanes import label
+        count, oldest = conn.execute("SELECT COUNT(*),MIN(available) FROM mind_appraisals WHERE scope=? AND state='needs-repair'",
+                                     (scope,)).fetchone()
+        reasons = {}
+        for reason, n in conn.execute("SELECT json_extract(data,'$.repair_reason'),COUNT(*) FROM mind_appraisals "
+                                      "WHERE scope=? AND state='needs-repair' GROUP BY 1", (scope,)):
+            reasons[label(reason) if reason else "unknown"] = reasons.get(label(reason) if reason else "unknown", 0) + n
+        memory["quarantined"] = {"count": count, "oldest_available_unix": oldest, "reasons": reasons}
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
     # Which copy of the source answered this call, and which other copies are still

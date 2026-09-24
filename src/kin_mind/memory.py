@@ -221,6 +221,29 @@ def fingerprint_file(path):
 
 # Set in `meta` once the memory index shares its rowids with `mind_memory_nodes` (see graph.py).
 SEARCH_ALIGNED = "mind_memory_search_rowid"
+# The states in which a queued appraisal is still going to run. Every other state, and a job
+# that is not there at all, has ended, whether it organised anything or not (K3-01, K4-02).
+RUNNING_JOB_STATES = frozenset({"pending", "running", "batched"})
+# How many ended-but-not-complete job ids a replay keeps; counts by state are kept whole.
+DEFERRED_KEPT = 100
+
+
+def job_ended(jobs, job_id):
+    """The state a tracked appraisal ended in ("missing" when it is not there), or None while
+    it is still going to run."""
+    status = jobs.status(job_id) if job_id else None
+    state = status["state"] if status else "missing"
+    return None if state in RUNNING_JOB_STATES else state
+
+
+def note_ended(data, job_id, state):
+    """What a replay keeps of a job that ended without completing: the latest ids, bounded,
+    and a count per state. The replay itself moves on (K4-06)."""
+    if state != "complete":
+        data["deferred_repairs"] = [*data.get("deferred_repairs", []), job_id][-DEFERRED_KEPT:]
+        counts = data.setdefault("ended", {})
+        counts[state] = counts.get(state, 0) + 1
+    return data
 _ready = set()
 
 
@@ -655,9 +678,8 @@ class MemoryContinuity:
             return {"state": "idle"}
         ended = {}
         for job_id in dict.fromkeys(r["data"].get("job_id") for r in rows if r["state"] == "queued"):
-            status = jobs.status(job_id) if job_id else None
-            state = status["state"] if status else "missing"
-            if state in {"pending", "running", "batched"}:
+            state = job_ended(jobs, job_id)
+            if state is None:
                 return {"state": "pending", "job_id": job_id}
             ended[job_id] = state
         ready, unavailable = [], []
@@ -699,21 +721,40 @@ class MemoryContinuity:
             row = conn.execute("SELECT * FROM mind_memory_migrations WHERE scope=? AND name='semantic'", (self.scope.key(),)).fetchone()
             cursor, data = (row["cursor"], json.loads(row["data"])) if row else (0, {})
         if data.get("job_id"):
-            job = jobs.status(data["job_id"])
-            if job["state"] not in {"complete", "needs-repair"}:
+            # Any end moves the replay on: a job superseded, quarantined or gone is noted, never
+            # waited for (K3-01).
+            state = job_ended(jobs, data["job_id"])
+            if state is None:
                 return {"state": "pending", "job_id": data["job_id"]}
-            if job["state"] == "needs-repair":
-                data.setdefault("deferred_repairs", []).append(data["job_id"])
+            note_ended(data, data["job_id"], state)
             cursor = data["through_seq"]
         with self.engine.db.connect() as conn:
             rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND json_extract(data,'$.historical')=1 ORDER BY seq LIMIT 16", (self.scope.key(), cursor)).fetchall()
+            sources, unavailable = [], 0
+            for source_id in dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows):
+                # A source deleted since it was recorded is passed over; asking for it would
+                # fail the review on every run.
+                try:
+                    current = self.mind._fresh(conn, self.mind._evidence(conn, [source_id]))
+                except (Missing, Conflict):
+                    current = False
+                if current:
+                    sources.append(source_id)
+                else:
+                    unavailable += 1
         if not rows:
             return {"state": "complete", "cursor": cursor}
-        sources = list(dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows))
-        receipt = jobs.enqueue(sources, agent_version, origin="reflection", stimulus="memory-backfill")
-        data = {"job_id": receipt["id"], "through_seq": rows[-1]["seq"], "deferred_repairs": data.get("deferred_repairs", [])}
+        receipt = None
+        if sources:
+            try:
+                receipt = jobs.enqueue(sources, agent_version, origin="reflection", stimulus="memory-backfill")
+            except (Missing, Conflict):
+                return {"state": "pending", "job_id": None}  # a source moved just now; look again
+        data = {**data, "job_id": receipt["id"] if receipt else None, "through_seq": rows[-1]["seq"],
+                "unavailable_sources": data.get("unavailable_sources", 0) + unavailable}
         with self.engine.db.connect(write=True) as conn:
-            conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)", (self.scope.key(), "semantic", cursor, dumps(data)))
+            conn.execute("INSERT OR REPLACE INTO mind_memory_migrations VALUES(?,?,?,?)",
+                         (self.scope.key(), "semantic", rows[-1]["seq"] if not receipt else cursor, dumps(data)))
         return {"state": "pending", **data}
 
     def due(self):
