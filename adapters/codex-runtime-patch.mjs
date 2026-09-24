@@ -10,8 +10,9 @@ const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V1';
 const assessmentMarker = '// KIN_ASSESS_V1';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
+const utf8Marker = '// KIN_UTF8_READER_V1';
 export const KIN_OWNED_ACP_MARKERS = Object.freeze([marker, lastReplyMarker, compactionMarker, compactionReceiptMarker,
-  sessionMarker, inputIdentityMarker, assessmentMarker, retriesMarker]);
+  sessionMarker, inputIdentityMarker, assessmentMarker, retriesMarker, utf8Marker]);
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 const handlerAnchor = 'var CodexEventHandler = class _CodexEventHandler {';
 
@@ -376,4 +377,15 @@ export function patchModelRetries(source) {
   if (source.includes(retriesMarker)) throw Error(`Codex ACP source already carries ${retriesMarker}`);
   source = replaceOnce(source, '        wire_api: wireApi\n', '        wire_api: wireApi,\n        request_max_retries: 3,\n        stream_max_retries: 0\n', 'Codex gateway retry configuration');
   return mark(source, retriesMarker);
+}
+
+/** The vendor line reader decoded every stdout chunk on its own, so a multi-byte
+ * character split across two chunks of a long native line (a long Chinese reply,
+ * a completed turn with its items) arrived as U+FFFD. One streaming decoder per
+ * connection keeps the text exact. */
+export function patchUtf8Reader(source) {
+  if (source.includes(utf8Marker)) throw Error(`Codex ACP source already carries ${utf8Marker}`);
+  source = replaceOnce(source, '      let buf = "";\n      const onData = (chunk) => {\n        buf += chunk.toString();',
+    '      let buf = "";\n      const decoder = new TextDecoder();\n      const onData = (chunk) => {\n        buf += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });', 'Codex app-server line reader');
+  return mark(source, utf8Marker);
 }
