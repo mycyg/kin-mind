@@ -11,8 +11,9 @@ const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V1';
 const assessmentMarker = '// KIN_ASSESS_V1';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
+const inputStatusMarker = '// KIN_INPUT_STATUS_V1';
 export const KIN_OWNED_ACP_MARKERS = Object.freeze([marker, lastReplyMarker, compactionMarker, compactionReceiptMarker,
-  sessionMarker, inputIdentityMarker, assessmentMarker, retriesMarker, utf8Marker]);
+  sessionMarker, inputIdentityMarker, inputStatusMarker, assessmentMarker, retriesMarker, utf8Marker]);
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 const handlerAnchor = 'var CodexEventHandler = class _CodexEventHandler {';
 
@@ -282,6 +283,107 @@ function kinClientUserMessageId(params) {
   source = replaceOnce(source, '        return await this.executeOrQueueSteeringRequest(this.parseSessionSteerParams(methodRequest.params));',
     '        return await this.executeOrQueueSteeringRequest({ ...this.parseSessionSteerParams(methodRequest.params), _meta: kinInputMeta(methodRequest.params) });', 'ACP steer parameters');
   return mark(source, inputIdentityMarker);
+}
+
+/** `_kin/input-status`: did an input the host sent with `_meta.kinInputId` reach the
+ * native thread? For the watchdog's reconciliation by original id. `found`: a user
+ * message of the thread carries the id as its clientId (a turn this ACP saw, or the
+ * native history), a prompt or steer carrying it is still being handled here, or a
+ * steer the native side accepted waits in the running turn (it is recorded only
+ * when the model takes it up). `not-found`: the whole history was read and no user
+ * message carries it. Anything else is `unknown` (the session is not loaded here,
+ * the thread has no persisted turn yet, the history could not be read in full or in
+ * time), because not-found makes the host send the input again. Checked against the
+ * pinned 0.156.1: user messages keep clientId across an app-server restart, the
+ * running turn is listed, a steered message appears once it is taken up. */
+export function patchKinInputStatus(source) {
+  if (source.includes(inputStatusMarker)) throw Error(`Codex ACP source already carries ${inputStatusMarker}`);
+  for (const helper of ['function kinClientUserMessageId(', 'function kinOwnThread(', 'function kinWithin('])
+    if (!source.includes(helper)) throw Error('ACP input status needs the input identity, reply cache and compaction bound helpers');
+  source = helpers(source, `function kinPendingKey(sessionId, inputId) {
+  return sessionId + "\\n" + inputId;
+}
+function kinTrackInput(agent, params) {
+  const inputId = kinClientUserMessageId(params);
+  if (!inputId || typeof params?.sessionId !== "string") return () => {};
+  const pending = agent.kinPendingInputs ??= new Map(), key = kinPendingKey(params.sessionId, inputId);
+  pending.set(key, (pending.get(key) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (pending.get(key) ?? 1) - 1;
+    if (left > 0) pending.set(key, left); else pending.delete(key);
+  };
+}
+function kinRememberInputId(state, event) {
+  const id = event?.item?.clientId;
+  if (!kinOwnThread(state, event?.threadId) || typeof id !== "string" || !id) return;
+  const seen = state.kinSeenInputIds ??= new Set();
+  seen.delete(id);
+  seen.add(id);
+  if (seen.size > 1000) seen.delete(seen.values().next().value);
+  state.kinSteered?.delete(id);
+}
+function kinSteerAccepted(state, params) {
+  const id = kinClientUserMessageId(params);
+  if (!state || !id || state.kinSeenInputIds?.has(id) || state.kinTurn?.status !== "inProgress") return;
+  const steered = state.kinSteered ??= new Map();
+  steered.set(id, state.kinTurn.turnId);
+  if (steered.size > 200) steered.delete(steered.keys().next().value);
+}
+`, 'ACP input status helpers');
+  const method = `
+  async kinInputStatus(params) {
+    const sessionId = params?.sessionId, inputId = params?.inputId;
+    if (typeof inputId !== "string" || !inputId || inputId.length > 200) return { state: "unknown", reason: "invalid-input-id" };
+    const state = this.sessions.get(sessionId);
+    if (!state) return { state: "unknown", reason: "session-not-loaded" };
+    const local = () => {
+      if (state.kinSeenInputIds?.has(inputId)) return "turn";
+      if (this.kinPendingInputs?.has(kinPendingKey(sessionId, inputId))) return "pending";
+      const turnId = state.kinSteered?.get(inputId);
+      return turnId && state.kinTurn?.status === "inProgress" && state.kinTurn.turnId === turnId ? "steered" : null;
+    };
+    let source = local();
+    if (source) return { state: "found", source };
+    const deadline = Date.now() + Math.min(Math.max(Number(params.timeoutMs) || 20000, 1000), 120000);
+    const api = this.codexAcpClient.appServerClient, cursors = new Set();
+    let cursor = null, complete = true;
+    try {
+      do {
+        const page = await kinWithin(api.threadTurnsList({ threadId: sessionId, cursor, limit: 50, sortDirection: "desc", itemsView: "full" }), deadline, "timeout");
+        for (const turn of page.data ?? []) {
+          if ((turn.items ?? []).some((item) => item.type === "userMessage" && item.clientId === inputId)) return { state: "found", source: "native", turnId: turn.id };
+          if (turn.itemsView !== undefined && turn.itemsView !== "full") complete = false;
+        }
+        cursor = page.nextCursor ?? null;
+        if (cursor !== null && (cursors.has(cursor) || cursors.size >= 200)) return { state: "unknown", reason: "native-history-incomplete" };
+        if (cursor !== null) cursors.add(cursor);
+      } while (cursor !== null);
+    } catch (error) {
+      return { state: "unknown", reason: String(error?.message ?? error) === "timeout" ? "native-history-timeout" : "native-history-unavailable" };
+    }
+    // An input that arrived while the history was read came through this ACP.
+    source = local();
+    if (source) return { state: "found", source };
+    return complete ? { state: "not-found" } : { state: "unknown", reason: "native-history-incomplete" };
+  }
+`;
+  source = replaceOnce(source, '  async kinLastReply(sessionId) {', method + '\n  async kinLastReply(sessionId) {', 'ACP input status extension');
+  source = replaceOnce(source, '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);',
+    '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);\n    if (method === "_kin/input-status") return await this.kinInputStatus(params);', 'ACP input status dispatch');
+  source = replaceOnce(source, '.onRequest("_kin/runtime",',
+    '.onRequest("_kin/input-status", external_exports.object({sessionId: external_exports.string(), inputId: external_exports.string(), timeoutMs: external_exports.number().optional()}), (ctx) => getAgent().extMethod("_kin/input-status", ctx.params)).onRequest("_kin/runtime",', 'ACP input status registration');
+  // A prompt (including a steer that starts a turn) and a steer are tracked from
+  // arrival until they are handled; a user message the ACP sees is remembered.
+  source = replaceOnce(source, '  async prompt(params, signal, onTurnStarted) {\n    if (this.providerUpdate !== null) {',
+    '  async prompt(params, signal, onTurnStarted) {\n    const kinRelease = kinTrackInput(this, params);\n    try {\n      return await this.kinPromptInput(params, signal, onTurnStarted);\n    } finally {\n      kinRelease();\n    }\n  }\n  async kinPromptInput(params, signal, onTurnStarted) {\n    if (this.providerUpdate !== null) {', 'ACP prompt input tracking');
+  source = replaceOnce(source, '        return await this.executeOrQueueSteeringRequest({ ...this.parseSessionSteerParams(methodRequest.params), _meta: kinInputMeta(methodRequest.params) });',
+    '      {\n        const kinSteer = { ...this.parseSessionSteerParams(methodRequest.params), _meta: kinInputMeta(methodRequest.params) };\n        const kinRelease = kinTrackInput(this, kinSteer);\n        try {\n          const kinOutcome = await this.executeOrQueueSteeringRequest(kinSteer);\n          if (kinOutcome?.outcome === "injected") kinSteerAccepted(this.sessions.get(kinSteer.sessionId), kinSteer);\n          return kinOutcome;\n        } finally {\n          kinRelease();\n        }\n      }', 'ACP steer input tracking');
+  source = replaceOnce(source, '      case "userMessage":\n        kinRememberInput(this.sessionState, event);',
+    '      case "userMessage":\n        kinRememberInput(this.sessionState, event);\n        kinRememberInputId(this.sessionState, event);', 'ACP seen input');
+  return mark(source, inputStatusMarker);
 }
 
 /** `_kin/assess`: one internal assessment in an ephemeral fork of the main
