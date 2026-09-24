@@ -26,7 +26,9 @@ test('the eight summary states are a view over the facts, which are all kept',()
     [{state:'semantic-pending'},'classifying'],[{state:'selected'},'queued'],[{state:'preparing'},'queued'],[{state:'queued'},'queued'],
     [{state:'submitting'},'submitted'],[{state:'unconfirmed'},'submitted'],[{state:'fenced-unconfirmed'},'submitted'],
     [{state:'accepted'},'submitted'],[{state:'accepted',answer:{state:'accepted'}},'answered'],[{state:'accepted',answer:{state:'silent'}},'answered'],
-    [{state:'accepted',route:'control'},'answered'],[{state:'failed-before-submit'},'received'],
+    // A control is answered by its own reply's receipt, not by being a control (CR-LIFE-07).
+    [{state:'accepted',route:'control'},'submitted'],[{state:'accepted',route:'control',answer:{state:'accepted',basis:'control-reply'}},'answered'],
+    [{state:'accepted',route:'maintenance'},'submitted'],[{state:'failed-before-submit'},'received'],
     [{state:'failed-before-submit',ownerNotice:{state:'accepted'}},'failed-notified'],[{state:'superseded'},'superseded'],
     [{state:'accepted',canceledBy:'stop'},'canceled-by-owner'],[{state:'semantic-canceled',historical:{reason:'pre-ledger'}},'historical'],
     [{kind:'assessment',state:'accepted',turnStartedAt:1},'submitted'],[{kind:'assessment',state:'accepted',turnStartedAt:1,turnEndedAt:2},'answered'],
@@ -39,7 +41,7 @@ test('the eight summary states are a view over the facts, which are all kept',()
   assert.equal(inputSettled({state:'semantic-failed',historical:{reason:'pre-ledger'}}),true);
 });
 
-test('native turns and reply receipts settle owner inputs by their original ids',async t=>{
+test('native turns and reply receipts settle owner inputs by their original ids; a later reply never covers an earlier input (CR-LIFE-06)',async t=>{
   const f=fixture(t);
   await f.router.dispatch({id:'first',text:'hi'},async()=> 'new-turn');
   await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['first']});
@@ -50,10 +52,19 @@ test('native turns and reply receipts settle owner inputs by their original ids'
   [open]=f.router.unsettledInputs();assert.equal(open.inFlight,false,'read but not yet answered');
   await f.router.dispatch({id:'second',text:'still there?'},async()=> 'new-turn');
   await f.router.observe('reply-complete',{inputId:'second'});
-  assert.deepEqual(f.router.unsettledInputs(),[],'the answer to the later message covers the earlier one');
-  assert.equal(f.router.state.inputs.first.answer.state,'covered');
+  assert.deepEqual(f.router.unsettledInputs().map(input=>input.id),['first'],'a reply to a later message answers only that message');
+  assert.equal(f.router.state.inputs.first.answer,undefined);
+  await f.router.observe('reply-choice',{inputId:'first',state:'silent'});
+  assert.equal(f.router.state.inputs.first.answer.state,'silent','Kin chose, for this input');
+  // Two messages one native turn carried are answered by its one reply.
+  await f.router.dispatch({id:'third',text:'a'},async()=> 'new-turn');
+  await f.router.dispatch({id:'fourth',text:'b'},async()=> 'new-turn');
+  await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['third','fourth']});
+  await f.router.observe('reply-complete',{inputId:'fourth'});
+  await f.router.observe('prompt-end',{taskId:null,inputVersion:null,turnFence:0,stopReason:'end_turn'});
+  assert.deepEqual([f.router.state.inputs.third.answer.state,f.router.state.inputs.third.answer.basis],['covered','same-turn']);
   const summary=f.router.summary({received:[{id:'inbox-only',at:1}]});
-  assert.deepEqual([summary.answered,summary.received,summary.historical,summary.frozen],[2,1,0,null]);
+  assert.deepEqual([summary.answered,summary.received,summary.historical,summary.frozen],[4,1,0,null]);
   assert.deepEqual(f.router.unsettledInputs({received:[{id:'inbox-only',at:1,processing:true}]}).map(i=>[i.id,i.state,i.inFlight]),[['inbox-only','received',true]]);
 });
 

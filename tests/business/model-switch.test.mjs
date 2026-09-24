@@ -157,6 +157,9 @@ test('a natural manual Astra profile is catalog-validated, announced once and pe
   await f.router.dispatch({id:'work-after-manual',text:'现在写代码并交付'},async detail=>{work=detail;return'new-turn';});
   assert.equal(work.model,'gpt-6-astra');assert.equal(f.switches.length,1,'automatic work routing cannot override the manual pin');
   const task=f.router.currentTask();
+  // The work label only proposed it; Kin takes it on before it is hers to complete (CR-LIFE-10).
+  assert.equal(task.status,'proposed');assert.equal(f.router.openWork().length,0,'a proposal holds no lock');
+  await f.router.requestMode({commandId:'take-on',mode:'work',reason:'taking it on',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};
   await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',turnFence:task.executionEpoch});
   await f.router.observe('delivery',{taskId:task.id,id:'manual-delivery',state:'accepted',messageId:'m-manual',inputVersion:task.inputVersion,turnFence:task.executionEpoch});
@@ -411,6 +414,10 @@ test('repeated manual profile keeps active work, tools and pending delivery inta
   await f.router.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('control'));
   assert.equal(f.router.state.requests['owner-mode:same-control'].state,'applied');
   assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.equal(f.router.state.executionEpoch,epoch);
+  // The only thing added is the reply to her control, which answers it (CR-LIFE-07).
+  const reply=Object.values(f.router.state.notices).filter(notice=>!notices[notice.id]);
+  assert.deepEqual(reply.map(notice=>[notice.kind,notice.sourceInputId]),[['status','same-control']]);
+  for(const notice of reply)notices[notice.id]=structuredClone(notice);
   assert.deepEqual(f.router.state.notices,notices);assert.deepEqual(task.tools,tools);assert.deepEqual(task.deliveries,deliveries);
   assert.equal(task.inputVersion,version);assert.equal(task.handoff,undefined);
   const restarted=new MobileRouter(f.args);
