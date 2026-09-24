@@ -8,7 +8,7 @@
  * evidence that its holder is still alive. */
 import fs from 'node:fs';
 import path from 'node:path';
-import {randomBytes} from 'node:crypto';
+import {createHash,randomBytes} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 
 const unique=()=>process.pid+'.'+randomBytes(8).toString('hex');
@@ -190,19 +190,37 @@ function identityVerdict(pid,{started=null,command=null,probe=probeProcess}={}) 
 
 // ---------------------------------------------------------------------------
 // The lock a state file is written under
+//
+// The one process lock of the hosts: scoped work (`withPidLock`), a lease held
+// for a process's lifetime (`claimPidLock`), and a service's pid file
+// (`claimPidFile`) are all this claim, judged by pid and start time.
 // ---------------------------------------------------------------------------
+
+const readBytes=file=>{try{return fs.readFileSync(file);}catch(error){if(error.code==='ENOENT')return null;throw error;}};
+const fingerprint=bytes=>createHash('sha256').update(bytes).digest('hex');
+
+/** Who a lock record names. Records written before the claim had its current
+ * shape keep what they had: a lease's bare pid, or a pid file owner's pid with
+ * its start time and command. A bare pid can only be asked whether it is alive. */
+function lockHolder(owner) {
+  if(owner?.holder?.pid)return owner.holder;
+  return Number.isSafeInteger(owner?.pid)?{pid:owner.pid,started:owner.started??null,command:owner.command??null}:null;
+}
+function lockStateOf(bytes,{probe}) {
+  let owner=null;try{owner=JSON.parse(bytes);}catch{/* judged below */}
+  const holder=lockHolder(owner);
+  if(!holder)return {state:'stale',owner,reason:'unreadable-lock'};
+  const verdict=identityVerdict(holder.pid,{started:holder.started,command:holder.command,probe});
+  return verdict.gone?{state:'stale',owner,reason:verdict.reason}:{state:'held',owner,reason:verdict.reason};
+}
 
 /** Who holds `file` now: `free`, `held` by a process that is still there, or
  * `stale`. A lock nobody can read is stale too — a lock file that can never be
  * broken would wedge the work it guards for good, which is the failure this
  * whole module exists to prevent. */
 export function readPidLock(file,{probe=probeProcess}={}) {
-  const result=readJsonFile(file);
-  if(result.state==='missing')return {state:'free',owner:null,reason:null};
-  const owner=result.state==='ok'?result.value:null;
-  if(!owner?.nonce||!owner?.holder?.pid)return {state:'stale',owner,reason:'unreadable-lock'};
-  const verdict=identityVerdict(owner.holder.pid,{started:owner.holder.started,command:owner.holder.command,probe});
-  return verdict.gone?{state:'stale',owner,reason:verdict.reason}:{state:'held',owner,reason:verdict.reason};
+  const bytes=readBytes(file);
+  return bytes===null?{state:'free',owner:null,reason:null}:lockStateOf(bytes,{probe});
 }
 
 /** Whether this claim is still the one in the lock file. A holder that is about
@@ -225,10 +243,52 @@ export function releasePidLock(file,claim) {
   return true;
 }
 
-/** A stale lock is moved aside, not removed. It is the only record that an
- * attempt was interrupted, and the reconciliation may be the thing that needs
- * to read it. */
-const breakPidLock=file=>quarantineFile(file,path.join(path.dirname(file),'broken'),{reason:'stale'});
+/** Replace a stale lock with `body`, once. It is replaced, never removed first:
+ * a moment with no lock at all would let a newcomer start the very work the dead
+ * holder may have left half done. Of the contenders that judged the same stale
+ * claim, only the one holding its break marker replaces it, and only while the
+ * lock still holds that claim; a breaker that died half way is superseded by the
+ * next marker. The stale bytes stay in `broken/`: they are the only record that
+ * an attempt was interrupted, and the reconciliation may need to read them. */
+function replaceStale(file,token,body,{probe,mode}) {
+  const directory=path.dirname(file),prefix=path.basename(file)+'.break.'+token.slice(0,24)+'.';
+  const markers=()=>{try{return fs.readdirSync(directory).filter(name=>name.startsWith(prefix)).map(name=>Number(name.slice(prefix.length))).filter(Number.isSafeInteger);}catch{return [];}};
+  const top=Math.max(0,...markers());
+  if(top&&readPidLock(path.join(directory,prefix+top),{probe}).state==='held')return {state:'busy'};
+  if(!createFileExclusive(path.join(directory,prefix+(top+1)),body,{mode}))return {state:'busy'};
+  try {
+    const current=readBytes(file);
+    if(current===null||fingerprint(current)!==token)return {state:'changed'};
+    const aside=path.join(directory,'broken');fs.mkdirSync(aside,{recursive:true,mode:0o700});
+    const kept=path.join(aside,path.basename(file)+'.stale.'+unique());
+    try{fs.linkSync(file,kept);}catch{fs.writeFileSync(kept,current,{mode});}
+    replaceAtomically(file,body,mode,()=>false);
+    return {state:'replaced',kept};
+  } finally {for(const number of markers())fs.rmSync(path.join(directory,prefix+number),{force:true});}
+}
+
+/** Claim `file` for `pid` (this process unless told otherwise) and keep it until
+ * `releasePidLock`. `{state:'held',claim,broken}` -- `broken` names a stale claim
+ * this one replaced, whose work may be half done -- or `{state:'busy',owner,reason}`
+ * while somebody that is still there holds it. `fields` adds top-level fields to
+ * the record for readers that predate its shape. */
+export function claimPidLock(file,{pid=process.pid,probe=probeProcess,identity=processIdentity,mode=0o600,fields=null}={}) {
+  fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
+  const claim={holder:identity(pid,{probe}),nonce:unique(),at:new Date().toISOString()};
+  const body=JSON.stringify(fields?{...fields(claim.holder),...claim}:claim);
+  for(let attempt=0;attempt<3;attempt++) {
+    if(createFileExclusive(file,body,{mode}))return {state:'held',claim,broken:null};
+    // `free` means the holder released it between the two calls: go round again.
+    const bytes=readBytes(file);if(bytes===null)continue;
+    const seen=lockStateOf(bytes,{probe});
+    if(seen.state==='held')return {state:'busy',owner:seen.owner,reason:seen.reason};
+    const taken=replaceStale(file,fingerprint(bytes),body,{probe,mode});
+    if(taken.state==='replaced')return {state:'held',claim,broken:{owner:seen.owner,reason:seen.reason,kept:taken.kept}};
+    // Somebody else is replacing this very claim: they hold it, or will in a moment.
+    if(taken.state==='busy')return {state:'busy',owner:seen.owner,reason:'lock-contended'};
+  }
+  return {state:'busy',owner:null,reason:'lock-contended'};
+}
 
 /** Run `work` while holding `file`, and never run it on the strength of a lock
  * that was broken.
@@ -250,19 +310,9 @@ const breakPidLock=file=>quarantineFile(file,path.join(path.dirname(file),'broke
  * previous attempt before asking again) or `busy` (somebody is still holding
  * it). Anything but `ran` means the work did not happen. */
 export async function withPidLock(file,{work,reconcile,probe=probeProcess,identity=processIdentity,mode=0o600}={}) {
-  fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
-  const claim={holder:identity(process.pid,{probe}),nonce:unique(),at:new Date().toISOString()};
-  let broken=null,held=false;
-  for(let attempt=0;attempt<3&&!held;attempt++) {
-    if(createJsonExclusive(file,claim,{mode})){held=true;break;}
-    const seen=readPidLock(file,{probe});
-    if(seen.state==='held')return {state:'busy',owner:seen.owner,reason:seen.reason,ran:false};
-    // `free` means the holder released it between the two calls: go round again.
-    if(seen.state==='stale')broken??={owner:seen.owner,reason:seen.reason,kept:breakPidLock(file)};
-  }
-  // Two contenders can break the same stale lock; only one of them ends up
-  // holding it, and the other waits rather than working beside the winner.
-  if(!held)return {state:'busy',owner:broken?.owner??null,reason:'lock-contended',ran:false};
+  const claimed=claimPidLock(file,{probe,identity,mode});
+  if(claimed.state!=='held')return {state:'busy',owner:claimed.owner??null,reason:claimed.reason,ran:false};
+  const {claim,broken}=claimed;
   try {
     if(broken) {
       // The previous holder died with the work in flight. What happens now is an
@@ -272,4 +322,26 @@ export async function withPidLock(file,{work,reconcile,probe=probeProcess,identi
     }
     return {state:'ran',owner:null,reason:null,ran:true,value:await work({claim,file})};
   } finally{releasePidLock(file,claim);}
+}
+
+/** A service's pid file: the one plain number that other tools read, with who
+ * holds it recorded beside it in `<file>.owner.json`. That record is the claim --
+ * taken, judged and replaced exactly like any lock here -- and the number is
+ * written after it. A number left by a release that recorded nobody beside it can
+ * only be asked whether that process is alive, which is what it always meant.
+ * Returns the claim (with `pid`), or null while the service belongs to another. */
+export function claimPidFile(file,{pid=process.pid,probe=probeProcess,identity=processIdentity}={}) {
+  const owner=file+'.owner.json',number=Number(String(readBytes(file)??'').trim()),recorded=readJsonFile(owner).value;
+  if(Number.isSafeInteger(number)&&number>1&&lockHolder(recorded)?.pid!==number&&!identityVerdict(number,{probe}).gone)return null;
+  const claimed=claimPidLock(owner,{pid,probe,identity,fields:holder=>({pid:holder.pid,started:holder.started,command:holder.command})});
+  if(claimed.state!=='held')return null;
+  writeFileAtomic(file,String(pid));
+  return {pid,...claimed.claim,broken:claimed.broken};
+}
+
+export function releasePidFile(file,claim) {
+  if(!claim)return false;
+  try{if(fs.readFileSync(file,'utf8').trim()===String(claim.pid))fs.rmSync(file,{force:true});}
+  catch(error){if(error.code!=='ENOENT')throw error;}
+  return releasePidLock(file+'.owner.json',claim);
 }

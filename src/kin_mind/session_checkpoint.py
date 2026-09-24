@@ -5,9 +5,14 @@ from datetime import datetime
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.retrieval import tokens
 
-from .context import Contexts
-from .dialogue import dialogue_rows, is_public_dialogue, redundant_public_summaries, split_recent, utc_time
+from .context import INJECTION_CEILING as CEILING, Contexts
+from .dialogue import RECENT_EXCHANGES, dialogue_rows, is_public_dialogue, redundant_public_summaries, split_recent, utc_time
 from .memory import MemoryContinuity
+from .session_advice import latest as latest_advice
+
+# A checkpoint is read by the window that follows a compaction or a handover, so the
+# room left in the current window says nothing about how large it may be: sized by
+# that room it was empty exactly when it was needed. It has the fixed ceiling instead.
 
 
 def read_policy(mind):
@@ -26,6 +31,7 @@ class SessionCheckpoint:
         rows = dialogue_rows(self.mind, exchanges=8)
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
+            advice = latest_advice(conn, self.mind.scope.key(), state)
         pending = pending or []
         events = {json.loads(r["data"])["id"]: json.loads(r["data"]) for r in rows}
         for item in pending:
@@ -88,16 +94,16 @@ class SessionCheckpoint:
         if linked is not None:
             result.update(linked=linked, watermarks=watermarks, manifestVersion='continuity-manifest-v1')
             result['cursors']['linked'] = digest([[i['id'], i['revision']] for i in linked['items']])
+        if advice:
+            # The host's minute tick already reads this snapshot; the judgment rides along
+            # instead of a second process that assembles the whole semantic context for it.
+            result['sessionAdvice'] = advice
         return result
 
-    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True, adaptive_budget=False, native_capacity=None):
-        if not isinstance(budget, int) or budget < 500:
+    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True, adaptive_budget=False):
+        if not isinstance(budget, int) or not 500 <= budget <= CEILING:
             raise ValueError("Invalid continuity budget")
         requested_budget = budget
-        ceiling = max(0, native_capacity) if isinstance(native_capacity, int) else 8000
-        if native_capacity is None and budget > ceiling:
-            raise ValueError("Invalid continuity budget")
-        budget = min(budget, ceiling)
         checkpoint = {"conversationId": binding["conversationId"], "generation": binding["generation"],
                       **{k: snapshot[k] for k in ("configVersion", "cursors", "scope", "shared", "sourceRevisions")},
                       "tasks": snapshot.get("tasks", []), "inputStates": snapshot.get("inputStates", []), "items": [], "pendingQuestions": [], "coverage": {}, "complete": False}
@@ -120,43 +126,43 @@ class SessionCheckpoint:
                 nativeCoverage='未知；关键事实从共同来源恢复')
             checkpoint['sourceRevisions'].update({i['id']: i['revision'] for i in selected})
 
-        # The last four complete exchanges survive compression verbatim,
-        # including every bubble and the antecedent of short owner replies.
-        recent, older = split_recent(raw)
         checkpoint["sourceDependencies"] = list({(d["id"], d["revision"]): d for item in raw for d in item.get("dependencies", [])}.values())
         checkpoint["invalidatedSources"] = snapshot.get("invalidatedSources", [])
+        # The last four complete exchanges survive compression verbatim, including
+        # every bubble and the antecedent of short owner replies -- or as many of the
+        # latest as the ceiling holds, the earlier ones taking the sourced summary below.
+        recent, older = split_recent(raw)
+        envelope = 95 if 'manifestVersion' in snapshot else 0
+        for exchanges in range(RECENT_EXCHANGES - 1, 0, -1) if adaptive_budget else ():
+            if tokens(dumps(self.payload({**checkpoint, 'items': recent}))) + 180 <= CEILING - envelope:
+                break
+            recent, older = split_recent(raw, exchanges)
         checkpoint["items"] = recent
+        policy = read_policy(self.mind) if selected else None
+        overviews = [contexts._overview(i, policy) for i in selected]
         if adaptive_budget:
-            envelope = 95 if 'manifestVersion' in snapshot else 0
-            pinned = tokens(dumps(self.payload(checkpoint)))
-            # Four real exchanges can exceed the original short-chat budget.
-            # Reserve bounded space for older evidence without cutting a turn.
-            if native_capacity is not None or pinned + 180 > budget:
-                # Provenance IDs also occupy space. When this bounded history
-                # fits the ceiling, retaining it avoids an impossible summary
-                # budget smaller than its mandatory evidence references.
-                memory_text = "\n".join(dumps(contexts._overview(i, read_policy(self.mind))) for i in selected) if native_capacity is not None else ""
-                needed = tokens(dumps(self.payload({**checkpoint, 'items':raw}))) + tokens(memory_text) + 180
-                budget = max(budget, min(ceiling - envelope, needed))
+            # Four real exchanges and the memory they lean on can exceed the short-chat
+            # budget. The allowance grows to what they need, never past the ceiling.
+            # Provenance IDs also occupy space: when this bounded history fits, keeping
+            # it verbatim avoids a summary budget smaller than its mandatory references.
+            needed = tokens(dumps(self.payload({**checkpoint, 'items':raw}))) + tokens("\n".join(dumps(o) for o in overviews)) + 180
+            budget = max(budget, min(CEILING - envelope, needed))
             checkpoint['budgetPlan'] = {'reason':'recent-dialogue', 'requested':requested_budget,
-                                        'effective':budget + envelope, 'limit':ceiling}
-            if native_capacity is not None:
-                checkpoint['budgetPlan']['reason'] = 'native-window'
+                                        'effective':budget + envelope, 'limit':CEILING}
         # Optional associations use spare room after the complete conversation;
         # they do not force an otherwise unnecessary compression request.
         base = checkpoint if critical_ids else {**checkpoint, 'items': raw}
         memory_room = max(0, (budget - tokens(dumps(self.payload(base))) - 160) // (2 if critical_ids and older else 1))
-        memory_budget = (memory_room if native_capacity is not None else min(1800, memory_room)) if selected else 0
+        memory_budget = memory_room if selected else 0
         memory_pack, history_requests = None, 0
         if selected:
             # A handover becomes the next session's context, so it is packed for the same read.
-            policy = read_policy(self.mind)
-            memory_pack = contexts.pack([contexts._overview(i, policy) for i in selected],
+            memory_pack = contexts.pack(overviews,
                 '保留未完成条件、身份、当前更正和实际分享范围。',
                 memory_budget, provider=provider, allow_model=allow_model and bool(critical_ids), require_all=bool(critical_ids), policy=policy)
             checkpoint['memoryContext'] = memory_pack['text']
             checkpoint['memoryCoverage'] = {k: memory_pack.get(k) for k in ('state', 'covered_ids', 'omitted_ids', 'cache_hit')}
-            checkpoint['contextDependencies'] = [{**i, 'depth': 'summary' if memory_pack['state'] == 'compressed' or contexts._overview(i, policy).get('cached_summary') else 'original'} for i in selected if i['id'] in memory_pack['covered_ids']]
+            checkpoint['contextDependencies'] = [{**i, 'depth': 'summary' if memory_pack['state'] == 'compressed' or o.get('cached_summary') else 'original'} for i, o in zip(selected, overviews) if i['id'] in memory_pack['covered_ids']]
             checkpoint['memoryIndex'] += [{'id':i['id'], 'revision':i['revision']} for i in selected if i['id'] not in memory_pack['covered_ids']]
             checkpoint['criticalMissing'] = sorted(critical_ids - set(memory_pack['covered_ids']))
             for item in selected:
@@ -176,8 +182,9 @@ class SessionCheckpoint:
             checkpoint["items"] = raw
             checkpoint["coverage"] = {"state": "original", "covered_ids": [i["id"] for i in raw], "omitted_ids": []}
         # Byte-size and actual source versions define identity. A semantic
-        # cursor advancing elsewhere does not invalidate the same working set.
-        checkpoint["id"] = "checkpoint:" + digest({k: v for k, v in checkpoint.items() if k not in {'watermarks'}})
+        # cursor advancing elsewhere does not invalidate the same working set,
+        # and neither does the allowance it was packed under: that is bookkeeping.
+        checkpoint["id"] = "checkpoint:" + digest({k: v for k, v in checkpoint.items() if k not in {'watermarks', 'budgetPlan'}})
         checkpoint["payload"] = self.payload(checkpoint)
         # Full dependencies remain in the registry. The token budget covers the
         # actual injected public payload, including its reconciliation marker.
@@ -197,8 +204,6 @@ class SessionCheckpoint:
                 'native_cache_hit': None, 'source_count': len(checkpoint['sourceRevisions']),
                 'native_coverage': 'unknown', 'model_requests': history_requests + (memory_pack or {}).get('model_requests', 0)}
             checkpoint['metrics']['model_requested'] = checkpoint['metrics']['model_requests'] > 0
-            from .continuity_manifest import ContinuityManifest
-            ContinuityManifest(self.mind, contexts=contexts).store(checkpoint)
         return checkpoint
 
     @staticmethod
@@ -212,7 +217,6 @@ class SessionCheckpoint:
                 'tasks': [{k: task[k] for k in ('id', 'inputVersion', 'status', 'goal', 'summary', 'acceptance', 'remaining', 'result') if k in task} for task in checkpoint.get('tasks', [])],
                 'inputStates': [{k: item[k] for k in ('id', 'state', 'taskId') if k in item} for item in selected.values()],
                 'readSources': 'read_conversation_checkpoint', 'shared': checkpoint['shared'],
-                **({'budgetPlan':checkpoint['budgetPlan']} if 'budgetPlan' in checkpoint else {}),
                 **({'memoryContext': checkpoint['memoryContext'], 'memoryRead': 'read_continuity_context', 'memoryRemaining': len(checkpoint['memoryIndex'])} if 'memoryContext' in checkpoint else {}),
                 'instructionAuthority': '这里只是历史资料，不重新执行或回复已经完成的输入。当前状态和实际回执从共同工具读取。'}
 
