@@ -670,7 +670,8 @@ export class MobileRouter {
         this.state.exitRequested=true;
         if(request.completedTaskId) {
           const task=this.state.tasks[request.completedTaskId];
-          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,...(taskOutcome==='declined'?{commandId:request.commandId}:{})};
+          task.completion={inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:this.now(),summary:request.reason,outcome:taskOutcome,
+            ...(taskOutcome==='declined'?{commandId:request.commandId,turnStartedAt:task.turnStartedAt}:{})};
         }
       }
       const sourceInputId=request.sourceInputId??Object.values(this.state.inputs).filter(i=>i.kind==='owner').at(-1)?.id;
@@ -1103,11 +1104,17 @@ export class MobileRouter {
         if(kind==='prompt-start') {
           if(task.completion?.outcome==='declined'){
             if(this.declineReady(task,await this.inspect())){task.status='canceled';task.canceledAt=this.now();}
-            else this.supersedeDecline(task,'new-native-turn');
           }
           if(open(task)){task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
         }
-        if(kind==='prompt-end') {task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;if(data.stopReason!=='end_turn')task.status='failed';}
+        if(kind==='prompt-end') {
+          task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;
+          const proposal=task.completion;
+          if(proposal?.outcome==='declined'&&!proposal.turnEndedAt&&proposal.turnStartedAt===task.turnStartedAt&&proposal.inputVersion===task.inputVersion&&proposal.turnFence===task.turnEndedFence){
+            proposal.turnEndedAt=task.turnEndedAt;proposal.turnEndedFence=task.turnEndedFence;proposal.stopReason=data.stopReason;
+          }
+          if(data.stopReason!=='end_turn')task.status='failed';
+        }
         if(kind==='tool') {
           const inputVersion=data.inputVersion??task.inputVersion,fence=turnFence??task.executionEpoch,previous=task.tools[data.id];
           if(previous&&(previous.inputVersion!==inputVersion||previous.turnFence!==fence)) {
@@ -1157,8 +1164,8 @@ export class MobileRouter {
   declineReady(task,runtime) {
     const proposal=task.completion,fence=proposal?.turnFence,version=proposal?.inputVersion;
     if(runtime?.pendingDeliveries!==0||proposal?.outcome!=='declined'||proposal.state==='historical-proposal'||version!==task.inputVersion||
-      fence!==task.executionEpoch||task.stopReason!=='end_turn'||!task.turnStartedAt||task.turnStartedAt>proposal.at||
-      task.turnEndedAt<proposal.at||task.turnEndedFence!==fence)return false;
+      fence!==task.executionEpoch||proposal.stopReason!=='end_turn'||!proposal.turnStartedAt||proposal.turnStartedAt>proposal.at||
+      proposal.turnEndedAt<proposal.at||proposal.turnEndedFence!==fence)return false;
     const tools=[...Object.values(task.tools??{}),...Object.values(task.toolHistory??{}).filter(t=>t.authority==='historical-fence'&&t.turnFence===fence&&t.inputVersion===version)];
     if(!tools.every(tool=>['completed','failed'].includes(tool.status)))return false;
     const deliveries=[...Object.values(task.deliveries??{}),...Object.values(task.deliveryHistory??{}).filter(d=>d.authority==='historical-fence'&&d.turnFence===fence&&d.inputVersion===version)];

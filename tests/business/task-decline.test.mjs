@@ -100,6 +100,28 @@ test('a new chat dispatch keeps its input and does not revoke an already deliver
   assert.equal(f.router.state.inputs['new-chat'].taskId,undefined);
 });
 
+test('a pending refusal survives a new chat and settles only after its own bubble is accepted',async t=>{
+  const f=await fixture(t);await f.router.requestMode(f.command);
+  await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
+  const originalEnd=f.task.completion.turnEndedAt;
+  await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,id:'refusal',state:'deferred'});
+  f.runtime.pendingDeliveries=1;
+  const result=await f.router.dispatch({id:'new-chat',kind:'owner',text:'chat'},async (_decision,markSubmitted)=>{markSubmitted();return 'new-turn';});
+  assert.equal(result.route,'new-turn');
+  assert.equal(f.router.state.inputs['new-chat'].state,'accepted');
+  await f.router.observe('prompt-start',{taskId:f.task.id,inputVersion:1,turnFence:0});
+  assert.equal(f.task.completion.outcome,'declined');
+  assert.equal(f.task.completion.turnEndedAt,originalEnd);
+  await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,id:'chat',state:'accepted',messageId:'accepted-chat'});
+  await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
+  f.runtime.pendingDeliveries=0;
+  await f.router.reconcile();assert.equal(f.task.status,'running');
+  await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,id:'refusal',state:'accepted',messageId:'accepted-refusal'});
+  await f.router.reconcile();
+  assert.equal(f.task.status,'canceled');
+  assert.equal(f.router.state.inputs['new-chat'].state,'accepted');
+});
+
 test('a later owner mode request keeps its flags when new work invalidates an old decline',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
   await f.router.requestMode({mode:'auto',commandId:'later-auto',reason:'owner requested automatic routing'});
