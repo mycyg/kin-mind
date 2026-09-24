@@ -63,6 +63,8 @@ def dispatch(config, action, request):
             return plans.manage(request)
         if action == "plan-migrate":
             return plans.migrate_desires()
+        if action == "plan-defer":
+            return plans.defer_owner_task(request)
         if action == "plan-renew":
             return plans.renew(**request)
         if action == "plan-recover":

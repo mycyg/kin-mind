@@ -212,6 +212,49 @@ class AutonomousPlans:
             record(conn, stamp, key, self.mind.clock())
             return plan
 
+    def defer_owner_task(self, request):
+        """N10, the plan side. An owner task Kin chose to do later becomes her own plan: the router
+        has released the work lock, and at her `not_before` the plan comes up for her review, where
+        she decides whether and how to return to it. Its source is 小光's own message.
+
+        Returns {"state": "created", "planId"} or, when the plan cannot be written here,
+        {"state": "needs-kin", "reason"}: Kin then keeps it herself (manage_autonomous_plan)."""
+        task_id = str(request.get("task_id") or "").strip()
+        goal = str(request.get("goal") or "").strip()
+        reason = str(request.get("reason") or "").strip() or goal
+        try:
+            not_before = local_time(request.get("not_before"))
+        except (TypeError, ValueError):
+            not_before = None
+        if not task_id or not goal:
+            raise ValueError("A deferred task needs its task_id and goal")
+        if not not_before or timestamp(not_before) <= timestamp(self.mind.clock()):
+            return {"state": "needs-kin", "reason": "not-before-not-in-future"}
+        evidence = [str(i) for i in request.get("evidence_ids") or []]
+        with self.engine.db.connect() as conn:
+            if not enabled(conn, self.scope, "autonomous_plans"):
+                return {"state": "needs-kin", "reason": "autonomous-plans-disabled"}
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone():
+                for input_id in request.get("input_ids") or []:
+                    row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
+                                       (self.scope, str(input_id))).fetchone()
+                    if row:
+                        evidence.append(row[0])
+        evidence = list(dict.fromkeys(evidence))[:24]
+        if not evidence:
+            return {"state": "needs-kin", "reason": "owner-source-unavailable"}
+        try:
+            plan = self.manage({
+                "command_id": "defer-task:" + task_id, "action": "create", "key": "deferred-task:" + task_id,
+                "goal": goal, "motivation": "小光交给我的事，我决定晚点再做", "reason": reason,
+                "evidence_ids": evidence, "next_review_at": not_before,
+                "steps": [{"id": "return", "actor": "contact", "goal": "回到小光交给我的事：" + goal,
+                           "completion": "我已回到这件事，并如实说明做到哪一步", "not_before": not_before,
+                           "owner_request_id": task_id}]})
+        except (Conflict, Missing, ValueError) as error:
+            return {"state": "needs-kin", "reason": ("plan-refused:" + str(error))[:160]}
+        return {"state": "created", "planId": plan["id"], "revision": plan["revision"]}
+
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
         rebased: that proof, not the model's stale expected_revision, fenced this decision."""

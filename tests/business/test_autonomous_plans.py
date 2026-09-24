@@ -260,6 +260,24 @@ def test_owner_message_does_not_interrupt_a_running_step(env):
     run = plans.settle(claimed["run"]["id"], "worker", 1, state="completed", result={"verified": True, "source_id": verified})
     assert run["state"] == "completed"
 
+def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
+    """N10, plan side: the router released the lock; the task comes back as Kin's plan at her time."""
+    from kin_mind.plans import local_time
+    mind, plans, source, clock, initial = env
+    MemoryContinuity(mind).ingest({"id": "wechat:task-1", "kind": "owner-message", "text": "Sort my photos", "at": mind.clock()})
+    later = (clock[0] + timedelta(hours=3)).isoformat()
+    request = {"task_id": "task-1", "goal": "Sort the photos", "reason": "After dinner", "not_before": later, "input_ids": ["wechat:task-1"]}
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    plan = plans.read(created["planId"])["plans"][0]
+    assert plan["steps"][0]["owner_request_id"] == "task-1" and plan["steps"][0]["actor"] == "contact"
+    assert plan["next_review_at"] == local_time(later)
+    assert plans.defer_owner_task(request) == created
+    unknown = plans.defer_owner_task({**request, "task_id": "task-2", "input_ids": ["wechat:never-seen"]})
+    assert unknown == {"state": "needs-kin", "reason": "owner-source-unavailable"}
+    past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
+    assert past["state"] == "needs-kin"
+
 def test_waiting_plan_rechecks_new_evidence_before_its_distant_review(env):
     mind, plans, source, clock, initial = env
     p=decide(env, create(env), 'wait', next_review_at='2028-01-01T09:00:00+08:00')
