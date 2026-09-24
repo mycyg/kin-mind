@@ -106,13 +106,12 @@ const unflattenItem = (item, reverse) => {
 };
 
 export const DEEPSEEK_EFFORTS = Object.freeze(['none', 'low', 'high', 'max']);
-// The host's own background calls keep the instance's effort whatever a request
-// says; the phone session's requests are forwarded with the effort the session
-// asked for (its router profile, or the owner's explicit manual choice), and the
-// instance effort only fills in when a request names none.
-const FIXED_EFFORT_PROFILES = new Set(['exploration', 'computer-action-review']);
-export const forwardedEffort = (body, reasoningEffort, profile = null) =>
-  !FIXED_EFFORT_PROFILES.has(profile) && DEEPSEEK_EFFORTS.includes(body?.reasoning?.effort) ? body.reasoning.effort : reasoningEffort;
+// §0: every request the Kin host sends to DeepSeek runs at high, whatever the request, its
+// router profile or the instance option says: assessments, contact drafts and ordinary
+// session turns alike (CR-MIND-11). Other providers never pass through this gateway. What the
+// request asked for stays visible in the instruction evidence (`requestedReasoningEffort`).
+export const KIN_DEEPSEEK_EFFORT = 'high';
+export const forwardedEffort = () => KIN_DEEPSEEK_EFFORT;
 
 // DeepSeek treats developer messages as user input. Map trusted developer
 // instructions to its supported system role; leave user data and receipts alone.
