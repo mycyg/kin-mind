@@ -220,13 +220,12 @@ def sweep_context_cache(mind, *, apply=False, now=None):
 
 
 def purge_context_cache_on_erase(conn):
-    """Erase takes the text out of the store; the compressed copies of that text
-    have to go the same way or the erase is a half-measure.
+    """The whole compressed-context cache of every scope that opted into the sweep.
 
-    Scoped to the configurations that asked for the sweep, and to those only. A
-    scope that has not opted into the hard delete does not have one performed on it
-    by another scope's erase — which is also why this cannot use the sweeping rules
-    above: an erase is not an age or a cap, it takes everything derived.
+    Every erase already takes out the cache rows that name what it erased, or a graph item
+    it took words from, whatever this setting says (`kin_mind.erasure`). This is the wider
+    sweep on top, for a scope that asked for it, and only for that scope: an erase is not an
+    age or a cap, and one scope's choice is not performed on another.
     """
     if not (_table(conn, "mind_context_cache") and _table(conn, "mind_memory_config")):
         return 0

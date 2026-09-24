@@ -31,7 +31,7 @@ UNSENT_ERRORS = frozenset({"FileNotFoundError", "ConnectError", "ConnectTimeout"
 # Kinds that never call a paid model. They are also the only ones a worker takes while the
 # foreground holds its lease, because a paid background call would only be refused then.
 MODEL_FREE_KINDS = ("embed", "visual_embed", "parse", "media_complete", "extract_complete",
-                    "build_vectors", "purge_vectors", "rebuild")
+                    "build_vectors", "purge_vectors", "rebuild", "erase_history")
 # How long a kind whose environment just failed is left alone, and the longest wait between
 # retries of one job.
 ENVIRONMENT_PAUSE = 60
@@ -57,6 +57,19 @@ def environmental(kind, exc):
     name = type(exc).__name__
     return name in UNSENT_ERRORS or (kind in MODEL_FREE_KINDS and (
         name in ENVIRONMENTAL_ERRORS or isinstance(exc, ProviderError)))
+
+
+# Full-text indexes whose deleted rows have to leave the index itself after an erase.
+TEXT_INDEXES = ("search", "mind_graph_search", "mind_memory_search")
+
+
+def purge_text_indexes(conn):
+    """An FTS5 delete only marks a row deleted: its tokens stay in the index's segments until
+    those are merged. After an explicit erase they are merged at once, so no deleted word is
+    left in the index."""
+    for table in TEXT_INDEXES:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+            conn.execute(f"INSERT INTO {table}({table}) VALUES('optimize')")
 
 
 class Worker:
@@ -689,7 +702,15 @@ class Worker:
             for index_id in indexes:
                 index = VectorIndex(engine, index_id)
                 index.build() if kind == "build_vectors" else index.purge()
+            if kind == "purge_vectors":
+                return purge_text_indexes
             return lambda conn: None
+        if kind == "erase_history":
+            # What an explicit delete took out of the records, taken out of every revision of
+            # the mind's state as well, a batch at a time; see kin_mind.erasure.
+            from kin_mind.erasure import history_step
+
+            return history_step(engine, payload)
         raise ValueError(f"Unknown job kind: {kind}")
 
     def run(self):
@@ -733,8 +754,10 @@ class Worker:
         from datetime import datetime, timedelta, timezone
 
         with self.engine.db.connect(write=True) as conn:
+            from kin_mind.erasure import resume_history
             from kin_mind.lifecycle import schedule
             schedule(self.engine, conn, now())
+            resume_history(self.engine, conn)
             scopes = conn.execute(
                 "SELECT r.scope,COUNT(*),MAX(d.revision) FROM dirty d JOIN records r ON r.id=d.record_id WHERE r.deleted=0 AND r.status='active' AND d.revision=r.revision GROUP BY r.scope LIMIT 30"
             ).fetchall()
