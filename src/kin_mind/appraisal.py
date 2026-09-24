@@ -41,10 +41,9 @@ from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, Affectiv
                     Motivation, contact_wait_seconds, timestamp)
 
 APPRAISAL_INPUT_BUDGET = 64000
-# How far ahead the next quiet review may be asked for. The ordinary ceiling holds whenever the
-# role is up; the resting one applies only while the rhythm rests or the owner's quiet hours run,
-# so a night is one review rather than one every two hours. The request always states the ceiling
-# it allows, in the prompt and in the schema, and the host clamps to the same number.
+# How far ahead the next quiet review may be asked for. The request states the range in the
+# prompt and in the schema, and the host clamps to the same numbers; there is no separate night
+# ceiling any more (K1-03).
 # When Kin thinks again is hers to choose, from ten minutes to a day (N8). A new event still
 # wakes her earlier: the queue runs it on its own, so the earlier of the two applies.
 REVIEW_MIN_MINUTES = 10

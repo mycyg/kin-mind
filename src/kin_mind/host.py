@@ -53,6 +53,9 @@ def dispatch(config, action, request):
     # holds. Any other action only fills a missing value.
     sync_capacity(engine, config, startup=action == "recover")
     mind = Mind(engine, Scope.model_validate(config["scope"]))
+    if config.get("contact_policy_file"):
+        # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
+        mind.register_contact_policy(config["contact_policy_file"])
     if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
         from .plans import AutonomousPlans
         from .procedures import Procedures
@@ -557,6 +560,10 @@ def main():
         import sys
 
         config = load_config(args.config)
+        # The live contact policy sits beside the host's configuration unless it names another.
+        policy = Path(args.config).resolve().with_name("proactive-policy.json")
+        if "contact_policy_file" not in config and policy.exists():
+            config["contact_policy_file"] = str(policy)
         # Before the store opens and before the request is even read: the code this process
         # would run has to be the code the deployment points at. A refusal is a SystemExit,
         # which the handler below cannot turn into a result -- an ordinary exception here

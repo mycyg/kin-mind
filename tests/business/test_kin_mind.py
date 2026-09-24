@@ -182,6 +182,42 @@ def test_owner_contact_preference_is_reversible_and_does_not_change_scores(setup
     assert mind.read()["dimensions"] == before["dimensions"]
 
 
+
+def test_contact_constraints_come_from_the_live_policy_not_the_install_copy(setup, tmp_path):
+    """K1-03: the state kept quiet hours 0–9 and threshold 75 from the first install. Once the
+    host names its live policy, Kin is shown what the host applies: no quiet window when the
+    policy has none, no score threshold outside the legacy gates, and the owner's preference
+    event still decides wait_for_reply."""
+    from kin_mind import manifest
+    mind, source, _ = setup
+    installed = mind.read()["contact"]
+    assert [installed["quiet_start"], installed["quiet_end"]] == [0, 9]
+    policy = tmp_path / "proactive-policy.json"
+    policy.write_text(json.dumps({"enabled": True, "timeZone": "Asia/Singapore", "quietStartHour": 0,
+                                  "quietEndHour": 0, "minimumGapHours": 0, "waitForReply": True,
+                                  "trigger": "semantic-decision", "initiativeThreshold": None}))
+    assert mind.register_contact_policy(policy) is True
+    assert mind.register_contact_policy(policy) is False
+    contact = mind.read()["contact"]
+    assert contact["quiet_start"] is None and contact["quiet_end"] is None
+    assert "threshold" not in contact and contact["wait_for_reply"] is True
+    assert contact["source"] == "live-policy"
+    assert not [b for b in manifest._boundaries({}, {"contact": contact}, {}, "2026-09-24T10:00:00+00:00") if b[0] == "quiet-hours"]
+    # A policy that does keep a window is shown with it, and read live.
+    policy.write_text(json.dumps({"enabled": True, "timeZone": "Asia/Singapore", "quietStartHour": 23,
+                                  "quietEndHour": 7, "waitForReply": False}))
+    contact = mind.read()["contact"]
+    assert [contact["quiet_start"], contact["quiet_end"], contact["wait_for_reply"]] == [23, 7, False]
+    # The owner's own preference event decides, whatever the file says.
+    mind.configure_contact({"command_id": "wait", "agent_version": "synthetic-v2",
+        "expected_revision": mind.read()["revision"], "evidence_ids": [source("wait")],
+        "reason": "The owner asked Kin to wait for a reply", "wait_for_reply": True})
+    assert mind.read()["contact"]["wait_for_reply"] is True
+    # An unreadable policy shows no window it cannot vouch for.
+    policy.write_text("{broken")
+    contact = mind.read()["contact"]
+    assert contact["source"] == "live-policy-unreadable" and contact["quiet_start"] is None
+
 def test_every_ready_wish_is_offered_and_kin_picks(setup):
     """N11: the draft is offered every ready wish; a send completes only the ones Kin chose."""
     mind, source, _ = setup

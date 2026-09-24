@@ -284,6 +284,10 @@ def project(entry, at):
     return min(100.0, max(0.0, value))
 
 
+# The settings key under which the host names its live contact policy file (K1-03).
+CONTACT_POLICY_SETTING = "kin_mind.contact_policy"
+
+
 class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
@@ -586,6 +590,68 @@ class Mind(Continuity):
             return {"contact_preference": state["contact_preference"]}
 
         return self._mutate(request, "contact-preference", apply)
+
+    def register_contact_policy(self, path):
+        """Name the live contact policy the host applies (its proactive-policy.json). The view reads
+        the owner's current contact constraints there, so the copy kept in the state since the
+        first install (quiet hours 0–9, threshold 75) is never shown as a current constraint
+        (K1-03). Written only when the path changes; returns whether it did."""
+        key, value = CONTACT_POLICY_SETTING + ":" + self.scope.key(), json.dumps({"path": str(path)})
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT data FROM settings WHERE key=?", (key,)).fetchone()
+        if row and row[0] == value:
+            return False
+        with self.engine.db.connect(write=True) as conn:
+            conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, value))
+        return True
+
+    def _live_contact_policy(self, conn):
+        """The registered live policy: None when none is registered, {} when it cannot be read."""
+        row = conn.execute("SELECT data FROM settings WHERE key=?",
+                           (CONTACT_POLICY_SETTING + ":" + self.scope.key(),)).fetchone()
+        if not row:
+            return None
+        from pathlib import Path
+        try:
+            policy = json.loads(Path(json.loads(row[0])["path"]).read_text())
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        return policy if isinstance(policy, dict) else {}
+
+    def _contact_view(self, conn, state):
+        """The contact constraints as the host applies them now (K1-03). The live policy is the
+        source; an owner preference event still decides wait_for_reply; the score threshold is
+        shown only while the legacy score gates decide. Without a registered policy (older stores,
+        direct callers) the stored profile is shown as before."""
+        from .autonomy_schema import legacy_thresholds
+        stored = state["profile"]["contact"]
+        contact = {key: stored.get(key) for key in ("reset_policy", "timezone", "check_seconds")}
+        live = self._live_contact_policy(conn)
+        if live is None:
+            contact.update({key: stored.get(key) for key in ("quiet_start", "quiet_end", "wait_for_reply", "minimum_gap_hours")})
+        else:
+            start, end = live.get("quietStartHour"), live.get("quietEndHour")
+            quiet = all(type(h) is int and 0 <= h <= 23 for h in (start, end)) and start != end
+            contact.update(source="live-policy", enabled=live.get("enabled") is True,
+                           timezone=live.get("timeZone") or stored.get("timezone"),
+                           quiet_start=start if quiet else None, quiet_end=end if quiet else None,
+                           minimum_gap_hours=live.get("minimumGapHours"),
+                           wait_for_reply=live.get("waitForReply") if type(live.get("waitForReply")) is bool else stored.get("wait_for_reply"))
+            if not live:
+                contact["source"] = "live-policy-unreadable"
+        if legacy_thresholds(conn, self.scope.key()):
+            contact["threshold"] = stored.get("threshold")
+        preference = state.get("contact_preference")
+        if preference:
+            contact["wait_for_reply"] = preference["wait_for_reply"]
+            contact["preference"] = {
+                "event_id": preference["event_id"],
+                "configured_at": preference["configured_at"],
+                "reason": preference["reason"],
+                "needs_review": not self._fresh(conn, preference["evidence"]),
+                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
+            }
+        return contact
 
     def configure_behavior(self, request):
         """Install sourced expression/contact policy without changing any score."""
@@ -1225,16 +1291,7 @@ class Mind(Continuity):
         if ledger:
             # Only the ledger's own switch produces `legacy`; the chain's projection travels beside it.
             traits = {**traits, **ledger.get("legacy", {})}
-        contact = deepcopy(state["profile"]["contact"])
-        preference = state.get("contact_preference")
-        if preference:
-            contact["preference"] = {
-                "event_id": preference["event_id"],
-                "configured_at": preference["configured_at"],
-                "reason": preference["reason"],
-                "needs_review": not self._fresh(conn, preference["evidence"]),
-                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
-            }
+        contact = self._contact_view(conn, state)
         view = {
             "revision": state["revision"],
             "scope": self.scope.model_dump(),
