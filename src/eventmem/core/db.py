@@ -155,16 +155,18 @@ class Deleted(Conflict):
 
 # Set inside a look that must leave the store as it found it (S1-02).
 _UNRECORDED = contextvars.ContextVar("eventmem_unrecorded", default=False)
-# What a model call cost, under the names the structured provider records it by. A look that
-# asks a model is not free, and leaving its cost out would make it look so (CR-MEM-07).
+# What a model call cost, under the names the structured provider records it by. A look asks no
+# model (CR2-MEM-02); should one ever be paid for under a look all the same, its cost is not the
+# telemetry a look leaves out, and it stays on record (CR-MEM-07).
 BILLED_METRICS = frozenset({"structured_model_usage", "structured_rejected"})
 
 
 @contextmanager
 def unrecorded():
     """A read that records nothing about itself: no telemetry of the memory it looked at, no
-    cache of what it computed (S1-02, CR-MEM-07). What a model call costs is recorded all the
-    same — `model_*` and `BILLED_METRICS` — and so is its admission in the model ledger."""
+    cache of what it computed (S1-02, CR-MEM-07), and no model call — nothing paid for, so no
+    cost and no admission to record (CR2-MEM-02). It answers from what is stored: an existing
+    cache, or the originals. Paid work takes a session, whose recall records what it costs."""
     token = _UNRECORDED.set(True)
     try:
         yield

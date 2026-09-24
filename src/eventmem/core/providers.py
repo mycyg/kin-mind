@@ -4,6 +4,7 @@ import base64
 import contextvars
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 
@@ -15,6 +16,12 @@ from .models import ModelRole
 
 class NotConfigured(Exception):
     pass
+
+
+class SessionRequired(NotConfigured):
+    """A look asked for a model. It pays for nothing, so it records no cost and takes no
+    admission: refused before any of them, and the caller goes on without the model, as for a
+    role that is not configured (CR2-MEM-02)."""
 
 
 class ProviderError(RuntimeError):
@@ -48,10 +55,29 @@ def job_answers(job):
         _JOB.reset(token)
 
 
+# The identifiers a job's payload can name, as the tombstones hold them.
+_NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
+
+
 def keep_answers(conn, job, answers):
     """A run whose job was taken over leaves what it paid for with the job, in the stored
     command results. Beside the answer, the job's payload: the identifiers in it are what an
-    erase finds such a row by. Returns how many answers were kept."""
+    erase finds such a row by. Returns how many answers were kept.
+
+    Only for a job that can still use them, checked inside the caller's transaction (CR2-MEM-01):
+    it is still to run or running, its payload is the one this run was given, and nothing that
+    payload names has been deleted. A delete cancels the job and blanks its payload after taking
+    the stored results that named what it erased; a late answer kept after that would put the
+    erased words back. The cost of the call is already recorded; that is all such a call leaves."""
+    if not answers:
+        return 0
+    row = conn.execute("SELECT state,payload FROM jobs WHERE id=?", (job["id"],)).fetchone()
+    if row is None or row["state"] not in ("pending", "retry", "running") or row["payload"] != job.get("payload"):
+        return 0
+    named = sorted(set(_NAMED.findall(row["payload"] or "")))
+    if named and conn.execute(f"SELECT 1 FROM tombstones WHERE key IN ({','.join('?' * len(named))}) LIMIT 1",
+                              named).fetchone():
+        return 0
     for request, answer in answers:
         conn.execute("INSERT OR REPLACE INTO commands VALUES(?,?,?)",
                      (_kept_id(job["id"], request), request,
@@ -127,6 +153,10 @@ class Providers:
         return role
 
     def request(self, role, route, *, json_=None, files=None, data=None):
+        from .db import recording
+
+        if not recording():
+            raise SessionRequired(f"Model role {role} is not asked for by a look")
         config = self.role(role)
         headers = (
             {"Authorization": "Bearer " + os.environ[config.api_key_env]}

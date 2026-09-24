@@ -87,22 +87,32 @@ inbox, or proven never to have reached the native session), `classifying`, `queu
 ledger count apart as `historical` and are never run again, and the host's own turns
 are summarised on their own. An owner input is answered when its whole reply
 reached the platform, when Kin chose not to reply or merged it into another answer,
-or when a reply to a later input covered it; a control or maintenance command is
-answered by being applied. An answer outranks a notice. An internal input settles
-when it leaves the native session.
+or when a reply group names it among the inputs its reply answered when it was formed
+(`answeredInputIds`) — sharing a native turn with a reply is not enough; a control or
+maintenance command is answered by being applied. An answer outranks a notice. An
+internal input settles when it leaves the native session, unless its submission is
+still to be looked up by its own ID.
 
 Every owner input ends in one of three ways: a reply, a retry under its original ID,
 or one system notice to the owner. The router's `watch()`, which the host runs every
 minute, decides from evidence alone:
 
-- An input proven never submitted — its preparation failed, it reached only the
-  host's in-memory queue, or reconciliation found it absent — goes back to the inbox
-  under the same ID after 30 seconds, 2 minutes and 10 minutes, never while dispatch
-  is frozen; after that it is told as `stopped`. A failed model control of the
-  owner's is reported by its own mode notice instead.
-- A submission whose outcome is uncertain is reconciled once by its original ID
-  through the owned ACP's `_kin/input-status`: `found` accepts it, `not-found` proves
-  it never arrived and it is retried, and `unknown` is told as `unknown`.
+- An input proven never submitted — its preparation failed or was withdrawn, it
+  reached only the host's in-memory queue, or reconciliation proved it absent — goes
+  back to the inbox under the same ID after 30 seconds, 2 minutes and 10 minutes, at
+  most three times across all its attempts, never while dispatch is frozen; after
+  that it is told as `stopped`. A failed model control of the owner's is reported by
+  its own mode notice instead. What the owner's stop withdrew before it was submitted
+  is canceled by her, never retried.
+- A submission whose outcome is uncertain is looked up by its original ID through
+  the owned ACP's `_kin/input-status`, on the thread the ledger recorded it was
+  submitted to. `found` accepts it. `not-found` proves it never arrived, and it is
+  retried, only when all three hold: the runtime it was submitted on declared
+  `inputCorrelation` (recorded with the submission), the answer is `complete: true`,
+  and the thread the answer read is the one it was submitted to. Any other answer —
+  a bare `not-found` from an older runtime, an input with no recorded submission, a
+  thread a migration replaced — leaves it `unknown`: looked up again, told as
+  `unknown`, never submitted again.
 - An accepted input with no reply, no running turn and no progress for
   `inputStuckMinutes` while the session is idle is told as `partial` when part of its
   reply reached the platform, and as `unknown` otherwise.
@@ -111,12 +121,16 @@ Notices go out one at a time, the oldest input first, and never two within
 `noticeGapMinutes`. `bridge.notifyOwner(kind, inputId)` sends each as the host's own
 labelled system notice, with fixed words chosen by the facts, never in Kin's voice
 and never remembered as her words, under a transport ID derived from the input and
-the kind: an attempt already begun is only looked up, never sent twice. The input
-becomes `failed-notified` only once that notice has a platform receipt; sends and
-lookups are bounded. A dispatch waits for the coordinator, a switch or a
-classification at most `dispatchWaitMinutes`; past that nothing has been submitted,
-and the same ID is retried or reported like any other unsubmitted input. So is an
-input selected but never handed to the session within `workReviewIntervalMinutes`.
+the kind: an attempt already begun is only looked up, never sent twice, except one
+the platform refused outright, which goes again under the same ID after 10 minutes,
+1 hour and 6 hours. The input becomes `failed-notified` only once that notice has a
+platform receipt; sends and lookups are bounded. A dispatch waits for the
+coordinator, a switch or a classification at most `dispatchWaitMinutes`; past that
+nothing has been submitted, and the same ID is retried or reported like any other
+unsubmitted input. The watchdog holds a dispatch whose preparation hangs to the same
+deadline and refuses its late submission, and an input still waiting before
+submission past `inputStuckMinutes` is told as `stopped`. An input selected but never
+handed to the session within `workReviewIntervalMinutes` is unsubmitted too.
 
 At shutdown the host stops taking input first: WeChat polling ends and the inbox
 takes nothing new. It waits up to 10 seconds for inputs the inbox already took, then

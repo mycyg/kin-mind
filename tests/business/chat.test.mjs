@@ -178,10 +178,11 @@ test('CR-LIFE-13: a group finished by a later pass tells its input once, again a
   assert.deepEqual(h.sent,['稍后续发的一句。']);
   assert.deepEqual(answered,[],'the answer could not be told yet');
   assert.equal(h.guard.manifests.isLive('later'),true,'the group stays live while its answer is owed');
+  h.time.ms+=60000; // its backoff (CR2-LIFE-07)
   const restarted=new ReplyGuard({directory:h.directory,receipt:async id=>h.receipts.get(id),lease:{heartbeat:false},clock:()=>h.time.ms,
     onAnswered:async detail=>{answered.push(detail);}});
   await restarted.resumeDue({guard:async()=>'send',send:h.send});
-  assert.deepEqual(answered,[{groupId:'later',inputId:'in-9',state:'accepted'}]);
+  assert.deepEqual(answered,[{groupId:'later',inputId:'in-9',answeredInputIds:['in-9'],state:'accepted'}],'a group formed without the set answers its own input');
   assert.equal(restarted.manifests.isLive('later'),false,'filed once told');
   await restarted.resumeDue({guard:async()=>'send',send:h.send});
   assert.equal(answered.length,1,'never twice');
@@ -191,7 +192,7 @@ test('CR-LIFE-13: Kin\'s own choice is told the same way, once',async t=>{
   const answered=[];
   const h=chat(t,{call:async action=>action==='reply-status'?{action:'merged',merged_into:'in-2'}:undefined,onAnswered:async detail=>{answered.push(detail);}});
   assert.equal((await h.guard.deliver(h.entries('并进下一条了。',{batch:'merged',input:'in-1'}),'epoch',{send:h.send})).state,'merged');
-  assert.deepEqual(answered,[{groupId:'merged',inputId:'in-1',state:'merged',mergedInto:'in-2'}]);
+  assert.deepEqual(answered,[{groupId:'merged',inputId:'in-1',answeredInputIds:['in-1'],state:'merged',mergedInto:'in-2'}]);
   assert.deepEqual(h.sent,[]);
 });
 
@@ -210,4 +211,46 @@ test('CR-LIFE-08: a fragment the activity gate held back waits unsent, counts no
   frozen=false;
   assert.equal((await h.guard.deliver(draft,'epoch',{send})).state,'accepted');
   assert.deepEqual(h.sent,['冻结时写好的一句。']);
+});
+
+test('CR2-LIFE-04: a group answers the inputs its reply answered when it was formed, and only those',async t=>{
+  const answered=[];
+  const h=chat(t,{onAnswered:async detail=>{answered.push(detail);}});
+  // Formed while its turn held in-a (its own) and in-b (merged in before the turn began).
+  const formed=h.entries(['第一句。','第二句。'],{batch:'formed',input:'in-a'}).map(e=>({...e,request:{...e.request,answered_input_ids:['in-a','in-b']}}));
+  assert.equal((await h.guard.deliver(formed,'epoch',{send:h.send})).state,'accepted');
+  assert.deepEqual(h.guard.manifests.read('formed')?.answered_input_ids??JSON.parse(fs.readFileSync(path.join(h.directory,'reply-manifests','formed.json'),'utf8')).answered_input_ids,['in-a','in-b']);
+  assert.deepEqual(answered,[{groupId:'formed',inputId:'in-a',answeredInputIds:['in-a','in-b'],state:'accepted'}]);
+  // An input steered in after the reply formed is not in the set, however late the group finishes.
+  const early=h.entries('先写好的回复。',{batch:'early',input:'in-c'}).map(e=>({...e,request:{...e.request,answered_input_ids:['in-c']}}));
+  await h.guard.deliver(early,'epoch',{send:async()=>({state:'not-submitted',submissionStarted:false})});
+  h.time.ms+=10*60000;
+  await h.guard.resumeDue({guard:async()=>'send',send:h.send});
+  assert.deepEqual(answered.at(-1),{groupId:'early',inputId:'in-c',answeredInputIds:['in-c'],state:'accepted'});
+});
+
+test('CR2-LIFE-07: the answer counts as told only once the ledger has it; a failure is told again on a backoff, never given up',async t=>{
+  const answered=[];let failures=7,seen=[];
+  const h=chat(t,{onAnswered:detail=>new Promise((resolve,reject)=>{
+    // While the ledger writes, the group has not recorded the answer.
+    seen.push(h.guard.manifests.read('ledger')?.answered??null);
+    setImmediate(()=>{if(failures>0){failures--;reject(Error('ledger write failed'));}else{answered.push(detail);resolve();}});
+  })});
+  const draft=h.entries('一句回复。',{batch:'ledger',input:'in-7'});
+  assert.equal((await h.guard.deliver(draft,'epoch',{send:h.send})).state,'accepted');
+  let manifest=h.guard.manifests.read('ledger');
+  assert.equal(manifest.answered,undefined);assert.equal(manifest.answer_failures,1);
+  assert.equal(h.guard.manifests.isLive('ledger'),true,'owed, so not filed');
+  // Before its backoff nothing is tried; after it, the same group is told again.
+  const tries=()=>seen.length;
+  let before=tries();
+  await h.guard.resumeDue({guard:async()=>'send',send:h.send});
+  assert.equal(tries(),before,'not before its backoff');
+  for(let i=0;i<7&&!answered.length;i++){h.time.ms+=15*60000;await h.guard.resumeDue({guard:async()=>'send',send:h.send});}
+  assert.equal(answered.length,1,'told once the ledger took it, past the old limit of five');
+  assert.deepEqual(seen.filter(Boolean),[],'never recorded before the ledger answered');
+  manifest=h.guard.manifests.read('ledger');
+  assert.equal(manifest.answered.state,'accepted');assert.equal(manifest.answer_failures,7);
+  assert.equal(h.guard.manifests.isLive('ledger'),false,'filed once told');
+  assert.deepEqual(h.sent,['一句回复。'],'the reply itself went out once');
 });

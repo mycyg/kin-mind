@@ -161,27 +161,171 @@ def test_the_wheel_check_takes_only_this_tree(tmp_path):
         check_wheel.main([], root=root)
 
 
-LOCK = {"package": [
+def env(python):
+    """A marker environment for one Python, the rest of it this machine's."""
+    return {**python_env.environment(), "python_full_version": python, "python_version": ".".join(python.split(".")[:2]),
+            "sys_platform": "darwin", "platform_system": "Darwin", "os_name": "posix"}
+
+
+# The shape uv writes: numpy locked twice, each version for its own Pythons.
+LOCK = {"requires-python": ">=3.10", "package": [
     {"name": "kin-mind", "version": "0.1.0", "source": {"editable": "."},
-     "dependencies": [{"name": "httpx"}, {"name": "colorama", "marker": "sys_platform == 'win32'"}]},
+     "dependencies": [{"name": "httpx"}, {"name": "colorama", "marker": "sys_platform == 'win32'"},
+                      {"name": "numpy", "version": "2.2.6", "marker": "python_full_version < '3.11'"},
+                      {"name": "numpy", "version": "2.5.3", "marker": "python_full_version >= '3.12'"}]},
     {"name": "httpx", "version": "0.28.1", "dependencies": [{"name": "idna"}]},
     {"name": "idna", "version": "3.19"},
     {"name": "colorama", "version": "0.4.6"},
-    {"name": "numpy", "version": "2.2.6"}, {"name": "numpy", "version": "2.5.3"},
+    {"name": "numpy", "version": "2.2.6", "resolution-markers": ["python_full_version < '3.11'"]},
+    {"name": "numpy", "version": "2.5.3", "resolution-markers": ["python_full_version >= '3.12'"]},
 ]}
 
 
 def test_the_environment_must_be_the_one_the_lock_pins():
     same = {"kin-mind": "9.9.9", "httpx": "0.28.1", "idna": "3.19", "numpy": "2.5.3", "pip": "25.0"}
     # The project's installed copy, and what the lock does not name, are not its business.
-    assert python_env.differences(LOCK, same) == []
-    assert python_env.differences(LOCK, {**same, "idna": "3.20"}) == ["idna 3.20 (lock 3.19)"]
-    assert python_env.differences(LOCK, {**same, "numpy": "2.4.0"}) == ["numpy 2.4.0 (lock 2.2.6, 2.5.3)"]
+    assert python_env.differences(LOCK, same, env("3.13.1"), extras=()) == []
+    assert python_env.differences(LOCK, {**same, "idna": "3.20"}, env("3.13.1"), extras=()) == ["idna 3.20 (lock 3.19)"]
     # A runtime dependency followed through the lock must be there; one guarded by a marker
     # this interpreter does not meet need not be.
     without = {name: version for name, version in same.items() if name != "idna"}
-    assert python_env.differences(LOCK, without) == ["idna missing (lock 3.19)"]
-    assert "colorama" not in python_env.closure(LOCK, "kin-mind")
+    assert python_env.differences(LOCK, without, env("3.13.1"), extras=()) == ["idna missing (lock 3.19)"]
+    assert "colorama" not in python_env.Lock(LOCK).resolve(env("3.13.1"), set())
+    # A Python the lock does not support is not its environment, whatever is installed.
+    assert python_env.differences(LOCK, same, env("3.9.18"), extras=()) == \
+        ["Python 3.9.18 is outside the lock's requires-python >=3.10"]
+
+
+def test_a_version_locked_for_another_python_does_not_pass():
+    """CR2-OPS-08: numpy 2.2.6 is locked for Pythons before 3.11 only. Before, any version the lock
+    named anywhere passed; now the edge this Python takes decides."""
+    same = {"httpx": "0.28.1", "idna": "3.19"}
+    for python, installed, found in (("3.13.1", "2.2.6", ["numpy 2.2.6 (lock 2.5.3)"]), ("3.10.12", "2.2.6", []),
+                                     ("3.10.12", "2.5.3", ["numpy 2.5.3 (lock 2.2.6)"]),
+                                     # Python 3.11 gets no numpy from this lock at all.
+                                     ("3.11.9", "2.5.3", ["numpy 2.5.3 (not locked for this interpreter beside these extras)"])):
+        assert python_env.differences(LOCK, {**same, "numpy": installed}, env(python), extras=()) == found
+
+
+# local-embedding and media are declared in conflict and pull different typer versions; uv marks
+# each edge with the side it belongs to, as it does in the core's lock.
+LE, MEDIA = "extra-8-kin-mind-local-embedding", "extra-8-kin-mind-media"
+BRANCHES = {
+    "conflicts": [[{"package": "kin-mind", "extra": "local-embedding"}, {"package": "kin-mind", "extra": "media"}]],
+    "package": [
+        {"name": "kin-mind", "version": "0.1.0", "source": {"editable": "."}, "dependencies": [{"name": "httpx"}],
+         "optional-dependencies": {
+             "local-embedding": [{"name": "sentence-transformers"}, {"name": "typer", "version": "0.27.2"}],
+             "media": [{"name": "docling"}]}},
+        {"name": "httpx", "version": "0.28.1"},
+        {"name": "sentence-transformers", "version": "5.7.0",
+         "dependencies": [{"name": "typer", "version": "0.27.2", "marker": f"extra == '{LE}'"}]},
+        {"name": "docling", "version": "2.60.0",
+         "dependencies": [{"name": "typer", "version": "0.26.8", "marker": f"extra == '{MEDIA}' or extra != '{LE}'"}]},
+        {"name": "typer", "version": "0.26.8"},
+        {"name": "typer", "version": "0.27.2"},
+    ]}
+LOCAL = {"httpx": "0.28.1", "sentence-transformers": "5.7.0", "typer": "0.27.2"}
+
+
+def test_the_chosen_extras_must_be_installed_whole():
+    """CR2-MEM-03: a deployment that chose local-embedding without its dependencies is not the
+    environment the lock pins for it. Before, optional dependencies were never followed."""
+    assert python_env.differences(BRANCHES, LOCAL, env("3.13.1"), extras=["local-embedding"]) == []
+    without = {name: version for name, version in LOCAL.items() if name != "sentence-transformers"}
+    assert python_env.differences(BRANCHES, without, env("3.13.1"), extras=["local-embedding"]) == \
+        ["sentence-transformers missing (lock 5.7.0)"]
+    # Without the extra chosen, nothing of it is required.
+    assert python_env.differences(BRANCHES, without, env("3.13.1"), extras=()) == []
+
+
+def test_the_chosen_side_of_a_conflict_decides_the_versions():
+    """CR2-MEM-03: typer 0.26.8 is in the lock, but on the media side only. Before, a version
+    anywhere in the lock passed."""
+    assert python_env.differences(BRANCHES, {**LOCAL, "typer": "0.26.8"}, env("3.13.1"), extras=["local-embedding"]) == \
+        ["typer 0.26.8 (lock 0.27.2)"]
+    media = {"httpx": "0.28.1", "docling": "2.60.0", "typer": "0.26.8"}
+    assert python_env.differences(BRANCHES, media, env("3.13.1"), extras=["media"]) == []
+    assert python_env.differences(BRANCHES, {**media, "typer": "0.27.2"}, env("3.13.1"), extras=["media"]) == \
+        ["typer 0.27.2 (lock 0.26.8)"]
+    # What only the other side installs does not belong beside the chosen extras.
+    assert python_env.differences(BRANCHES, {**LOCAL, "docling": "2.60.0"}, env("3.13.1"), extras=["local-embedding"]) == \
+        ["docling 2.60.0 (not locked for this interpreter beside these extras)"]
+    # With neither side chosen, typer from either is one the lock selects beside them; others are not.
+    for typer, found in (("0.27.2", []), ("0.26.8", []), ("0.25.0", ["typer 0.25.0 (lock 0.26.8, 0.27.2)"])):
+        assert python_env.differences(BRANCHES, {"httpx": "0.28.1", "typer": typer}, env("3.13.1"), extras=()) == found
+    # Extras the lock keeps apart, or does not have, decide nothing.
+    with pytest.raises(python_env.Undecided, match="local-embedding and media are declared in conflict"):
+        python_env.differences(BRANCHES, LOCAL, env("3.13.1"), extras=["local-embedding", "media"])
+    with pytest.raises(python_env.Undecided, match="no extra 'gpu'"):
+        python_env.differences(BRANCHES, LOCAL, env("3.13.1"), extras=["gpu"])
+
+
+def test_an_extra_that_names_the_projects_own_extras_brings_them_in():
+    root = BRANCHES["package"][0]
+    lock = {**BRANCHES, "package": [
+        {**root, "optional-dependencies": {**root["optional-dependencies"],
+                                           "embed": [{"name": "kin-mind", "extra": ["local-embedding"]}]}},
+        *BRANCHES["package"][1:]]}
+    found, taken = python_env.check(lock, LOCAL, env("3.13.1"), extras=["embed"])
+    assert (found, taken["extras"]) == ([], ["embed", "local-embedding"])
+    assert python_env.differences(lock, {**LOCAL, "typer": "0.26.8"}, env("3.13.1"), extras=["embed"]) == \
+        ["typer 0.26.8 (lock 0.27.2)"]
+    with pytest.raises(python_env.Undecided, match="declared in conflict"):
+        python_env.differences(lock, LOCAL, env("3.13.1"), extras=["embed", "media"])
+
+
+@pytest.mark.parametrize("marker", ["python_full_version >= ", "python_flavour == 'cpython'",
+                                    "(sys_platform == 'darwin'", "sys_platform = 'darwin'", "extra == 'socks'"])
+def test_a_marker_that_cannot_be_read_stops_the_check(tmp_path, capsys, marker):
+    """Before, such an edge counted as not needed. Now nothing is decided, even when the edge is
+    one this interpreter would not take."""
+    lock = {"package": [
+        {"name": "kin-mind", "version": "0.1.0", "source": {"editable": "."},
+         "dependencies": [{"name": "httpx"}, {"name": "colorama", "marker": marker}]},
+        {"name": "httpx", "version": "0.28.1"}, {"name": "colorama", "version": "0.4.6"}]}
+    with pytest.raises(python_env.Undecided, match="marker"):
+        python_env.differences(lock, {"httpx": "0.28.1"}, env("3.13.1"), extras=())
+    path = tmp_path / "uv.lock"
+    path.write_text('version = 1\n\n[[package]]\nname = "kin-mind"\nversion = "0.1.0"\nsource = { editable = "." }\n'
+                    'dependencies = [\n    { name = "colorama", marker = "' + marker.replace('"', '\\"') + '" },\n]\n\n'
+                    '[[package]]\nname = "colorama"\nversion = "0.4.6"\n')
+    assert python_env.main(["--extras", "", str(path)]) == 2
+    assert "cannot decide" in (err := capsys.readouterr().err) and "marker" in err
+
+
+def test_the_repository_lock_resolves_each_deployment_to_one_branch():
+    """Every marker in the committed uv.lock parses and production's extras are extras of it. On
+    each Python it supports, a deployment resolves to one version per package: local-embedding to
+    a typer the media side does not take, and one numpy for the interpreter."""
+    import tomllib
+
+    data = tomllib.loads((SCRIPTS.parent / "uv.lock").read_text())
+    lock = python_env.Lock(data)
+    production = lock.choose(python_env.PRODUCTION_EXTRAS)
+    for python in ("3.10.12", "3.11.9", "3.12.8", "3.13.1", "3.14.0"):
+        closure = lock.resolve(env(python), production)
+        assert "docling" not in closure and lock.resolve(env(python), set())
+        assert closure["typer"]["version"] != lock.resolve(env(python), lock.choose(["all"]))["typer"]["version"]
+        assert lock.selectable(env(python), production)["numpy"] == {closure["numpy"]["version"]}
+        with pytest.raises(python_env.Undecided, match="declared in conflict"):
+            lock.resolve(env(python), lock.choose(["local-embedding", "media"]))
+
+
+def lock_of(tmp_path, name, version, extras=None):
+    """A uv.lock of one package, required by the project and by each extra in `extras`, which maps
+    an extra to further (name, version) it requires."""
+    path = tmp_path / "uv.lock"
+    sections = "".join(f'{extra} = [\n    {{ name = "{name}" }},\n'
+                       + "".join(f'    {{ name = "{more}" }},\n' for more, _ in requires) + "]\n"
+                       for extra, requires in (extras or {}).items())
+    others = "".join(f'\n[[package]]\nname = "{more}"\nversion = "{pinned}"\n'
+                     for requires in (extras or {}).values() for more, pinned in requires)
+    path.write_text(f'version = 1\n\n[[package]]\nname = "kin-mind"\nversion = "0.1.0"\nsource = {{ editable = "." }}\n'
+                    f'dependencies = [\n    {{ name = "{name}" }},\n]\n'
+                    + (f"\n[package.optional-dependencies]\n{sections}" if extras else "")
+                    + f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n' + others)
+    return path
 
 
 def test_the_environment_check_reads_this_interpreter(tmp_path, capsys):
@@ -189,14 +333,19 @@ def test_the_environment_check_reads_this_interpreter(tmp_path, capsys):
 
     have = python_env.installed()
     name = "pydantic" if "pydantic" in have else sorted(have)[0]
-    lock = tmp_path / "uv.lock"
-
-    def pin(version):
-        lock.write_text(f'version = 1\n\n[[package]]\nname = "kin-mind"\nversion = "0.1.0"\nsource = {{ editable = "." }}\n'
-                        f'dependencies = [\n    {{ name = "{name}" }},\n]\n\n[[package]]\nname = "{name}"\nversion = "{version}"\n')
-
-    pin(metadata.version(name))
-    assert python_env.main([str(lock)]) == 0
-    pin("0.0.0.dev0")
-    assert python_env.main([str(lock)]) == 1
+    assert python_env.main(["--extras", "", str(lock_of(tmp_path, name, metadata.version(name)))]) == 0
+    assert python_env.main(["--extras", "", str(lock_of(tmp_path, name, "0.0.0.dev0"))]) == 1
     assert f"{name} {metadata.version(name)} (lock 0.0.0.dev0)" in capsys.readouterr().err
+
+
+def test_production_extras_are_checked_unless_others_are_named(tmp_path, capsys):
+    """CR2-MEM-03: without --extras the check holds the interpreter to what production installs."""
+    have = python_env.installed()
+    name = "pydantic" if "pydantic" in have else sorted(have)[0]
+    extras = {extra: [] for extra in python_env.PRODUCTION_EXTRAS}
+    extras["local-embedding"] = [("kin-absent-package", "1.0")]
+    path = lock_of(tmp_path, name, have[name], extras)
+    assert python_env.main([str(path)]) == 1
+    assert "kin-absent-package missing (lock 1.0)" in capsys.readouterr().err
+    assert python_env.main(["--extras", "graph,vector", str(path)]) == 0
+    assert "extras graph, vector" in capsys.readouterr().out

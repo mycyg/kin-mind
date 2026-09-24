@@ -1,10 +1,12 @@
 """Reads that leave the store as they found it.
 
 Opening a store that is already current takes no write lock, and health names the structure it
-has (E2-08). A recall without a session writes nothing however often it is retried; one that
-names its session is a use as before (S1-02); a deep one that compresses keeps nothing it
-computed and records what the model call cost (CR-MEM-07). A pre-action cue with nothing to
-recall answers empty (E3-19). The delivery inbox closes every connection it opens (E3-21)."""
+has (E2-08). A recall without a session writes nothing however often it is retried — no row in
+any table, no telemetry, no lease — and one that names its session is a use as before (S1-02).
+A deep one without a session asks no model: it answers from an existing cache or the originals
+and says a session is required, while the same recall with a session compresses and records
+what it cost (CR-MEM-07, CR2-MEM-02). A pre-action cue with nothing to recall answers empty
+(E3-19). The delivery inbox closes every connection it opens (E3-21)."""
 import json
 import sqlite3
 import time
@@ -70,15 +72,19 @@ def counts(engine):
 
 
 def test_a_recall_without_a_session_writes_nothing(tmp_path):
+    from kin_mind.context import Contexts
+
     engine, client = kin_store(tmp_path)
-    before = counts(engine)
+    Contexts(Mind(engine, KIN))  # a store that has served a context before has its context tables
+    before, rows = counts(engine), every_row(engine)
     for _ in range(2):  # the owner retries after an error banner
         answer = client.post("/v1/recall", headers=HEADERS, json={**LAB, "scope": KIN.model_dump()})
         assert answer.status_code == 200, answer.text[:300]
         assert answer.json()["index"]
     listed = client.get("/v1/memories", headers=HEADERS, params=KIN.model_dump()).json()["items"]
     assert client.get(f"/v1/memories/{listed[0]['id']}", headers=HEADERS).status_code == 200
-    assert counts(engine) == before
+    after = every_row(engine)
+    assert not {table for table in after if after[table] != rows.get(table)}  # every table, row for row
     # Named by its session, the same recall is a use of the memory, as before.
     client.post("/v1/recall", headers=HEADERS, json={**LAB, "scope": KIN.model_dump(), "session": "s1"})
     after = counts(engine)
@@ -91,13 +97,14 @@ def every_row(engine):
         return {table: sorted(map(repr, conn.execute(f"SELECT * FROM '{table}'").fetchall())) for table in tables}
 
 
-def test_a_deep_recall_without_a_session_keeps_no_compression_and_records_its_cost(tmp_path, monkeypatch):
-    """Over budget, nothing cached, the compression succeeds: the look reads as a use would and
-    keeps nothing it computed — no compressed context, no cached model answer. The model call
-    it made is admitted and paid for like any other, so what it cost is on record."""
+def test_a_deep_recall_without_a_session_asks_no_model_and_writes_nothing(tmp_path, monkeypatch):
+    """Over budget, nothing cached: only a model could compress it. Without a session the recall
+    asks none — no admission, no call, no cost — and no table changes, cost and lease tables
+    included; it answers with the originals that fit and says a session is required. With a
+    session the same recall compresses and records what every call cost. A look afterwards reads
+    the cache that recall left, still asking no model and writing nothing (CR2-MEM-02)."""
     import httpx
 
-    from eventmem.core.db import BILLED_METRICS
     from kin_mind import context as context_module
     from kin_mind.appraisal import APPRAISAL_MODEL, DeepSeek
 
@@ -127,26 +134,83 @@ def test_a_deep_recall_without_a_session_keeps_no_compression_and_records_its_co
     monkeypatch.setattr(context_module.Contexts, "_provider", provider)
     monkeypatch.setenv("EVENTMEM_API_KEY", "synthetic-key")
     context_module.Contexts(Mind(engine, KIN))  # a store that has served a context before
+    deep = {**LAB, "mode": "deep", "budget": 4000, "scope": KIN.model_dump()}
     before = every_row(engine)
+    for _ in range(2):
+        reply = client.post("/v1/recall", headers=HEADERS, json=deep)
+        assert reply.status_code == 200, reply.text[:300]
+        found = reply.json()
+        assert found["state"] == "needs-compression" and found["reason"] == "session-required"
+        assert found["covered_ids"] and found["text"] and found["compression_model_requests"] == 0
+    assert calls == []
+    after = every_row(engine)
+    # Every table: metrics, sqlite_sequence and mind_model_leases too.
+    assert not {table for table in after if after[table] != before.get(table)}
+
+    # The same recall with a session pays for the compression, and the bill is complete.
     with engine.db.connect() as conn:
         last_metric = conn.execute("SELECT COALESCE(MAX(id),0) FROM metrics").fetchone()[0]
-    reply = client.post("/v1/recall", headers=HEADERS, json={**LAB, "mode": "deep", "budget": 4000, "scope": KIN.model_dump()})
+    reply = client.post("/v1/recall", headers=HEADERS, json={**deep, "session": "s1"})
     assert reply.status_code == 200, reply.text[:300]
     assert reply.json()["state"] == "compressed" and reply.json()["compression_model_requests"] >= 1
     assert calls and set(calls) == {"submit_compression"}
-    after = every_row(engine)
-    changed = {table for table in after if after[table] != before.get(table)}
-    # Nothing the look computed is kept, and nothing of the memory it read is marked as used ...
-    assert not changed & {"mind_context_cache", "mind_semantic_cache", "mind_judgment_cache", *TABLES}
-    # ... and what changed at all is the admission and the bill.
-    assert changed <= {"metrics", "sqlite_sequence", "mind_model_leases"}
     with engine.db.connect() as conn:
         written = conn.execute("SELECT name,data FROM metrics WHERE id>?", (last_metric,)).fetchall()
-    names = {row["name"] for row in written}
-    assert "structured_model_usage" in names
-    assert all(name.startswith("model_") or name in BILLED_METRICS for name in names)
     usage = [json.loads(row["data"]) for row in written if row["name"] == "structured_model_usage"]
     assert len(usage) == len(calls) and all(entry["usage"] == {"input_tokens": 1200, "output_tokens": 40} for entry in usage)
+
+    # What a recorded pack keeps is there to be read: a look uses it, and still pays for and
+    # writes nothing.
+    from eventmem.core.db import unrecorded
+    from eventmem.core.read_policy import ReadPolicy
+
+    contexts = context_module.Contexts(Mind(engine, KIN))
+    policy = ReadPolicy.load(engine, KIN, "experience_recall")
+    with engine.db.connect() as conn:
+        long = [row[0] for row in conn.execute(
+            "SELECT e.record_id FROM evidence e JOIN sources s ON s.id=e.source_id WHERE s.source_key LIKE 'long-%'")]
+    items = [contexts.record_item(engine.get(rid), policy=policy) for rid in sorted(set(long))]
+    kept = contexts.pack(items, "数据库迁移", 3000, allow_model=True, policy=policy, persist=True)
+    assert kept["state"] == "compressed" and not kept["cache_hit"]
+    paid, before = len(calls), every_row(engine)
+    with unrecorded():
+        looked = contexts.pack(items, "数据库迁移", 3000, allow_model=True, policy=policy)
+        refused = contexts.pack(items, "数据库迁移迁移", 3000, allow_model=True, policy=policy)
+    assert looked["state"] == "compressed" and looked["cache_hit"] and looked["text"] == kept["text"]
+    assert refused["state"] == "needs-compression" and refused["reason"] == "session-required"
+    after = every_row(engine)
+    assert len(calls) == paid and not {table for table in after if after[table] != before.get(table)}
+
+
+def test_a_generic_deep_recall_without_a_session_asks_no_model(tmp_path, monkeypatch):
+    """Outside the kin context a deep recall asks models for an embedding, follow-up searches and
+    a rerank. Without a session it asks for none of them and writes nothing; the lexical channels
+    answer and the trace names why the rest are missing (CR2-MEM-02)."""
+    import httpx
+
+    engine = Engine(tmp_path / "generic")
+    scope = Scope(persona="synthetic-generic")
+    for i in range(3):
+        engine.receive(SourceInput(namespace="contract", key=str(i), scope=scope, kind="knowledge", title=f"迁移记录 {i}",
+                                   authority="explicit", text=f"数据库迁移第{i}次在隔离目录完成，恢复检查通过。"))
+    calls = []
+
+    class Refusing(httpx.BaseTransport):
+        def handle_request(self, request):
+            calls.append(str(request.url))
+            return httpx.Response(500)
+
+    real = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda *a, **k: real(*a, **{**k, "transport": Refusing()}))
+    models = {role: {"endpoint": "https://synthetic.invalid/v1", "model": "synthetic-" + role}
+              for role in ("embedding", "query", "rerank")}
+    engine.settings("models", models)
+    client = TestClient(create_app(engine=engine, token="synthetic-reads", workers=False, mcp_enabled=False))
+    before = every_row(engine)
+    reply = client.post("/v1/recall", headers=HEADERS, json={**LAB, "mode": "deep", "scope": scope.model_dump()})
+    assert reply.status_code == 200, reply.text[:300]
+    assert reply.json()["items"] and "session_required" in reply.json()["trace"]["degraded"]
+    assert calls == [] and every_row(engine) == before
 
 
 def test_a_pre_action_cue_with_nothing_to_recall_answers_empty(tmp_path):
