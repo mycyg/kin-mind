@@ -22,18 +22,21 @@ from eventmem.core.models import now
 
 SECRET_NAME = re.compile(r"^(?:\.env(?:\..*)?|credentials?(?:\..*)?|auth\.json|secrets?(?:\..*)?|id_(?:rsa|ed25519)(?:\.pub)?|.*\.(?:pem|p12|keychain-db))$", re.IGNORECASE)
 SECRET_DIRS = {".ssh", ".aws", ".azure", ".gnupg", ".codex", ".kimi-code", "keychains", "cookies", ".git", "node_modules"}
-# The one set of redaction rules (E1-06): a secret named by its key, in `key=value`, `key: value`
-# and JSON `"key": "value"` form, the scheme of an Authorization value included; secrets
-# recognisable by their shape; and the Chinese words for a password or key.
-SECRET_VALUE = re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|authorization|client[_-]?secret)\b[\s\"']*[:=][\s\"']*)(?:(?:basic|bearer|token)\s+)?([^\s\"',;}]+)")
+SECRET_VALUE = re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|authorization|client[_-]?secret)\b[\s\"']*[:=][\s\"']*)([^\s\"',;}]+)")
+TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._~+/-]{12,})", re.IGNORECASE)
+# What the two rules above miss (E1-06), applied with them by `redact` as one rule set: a secret
+# under a plain `token`/`secret`/`authorization` key with its scheme (`Basic ...`), GitHub
+# fine-grained tokens, Google API keys, and the Chinese words for a password or key.
+SECRET_MORE = re.compile(r"(?i)(\b(?:token|secret|authorization)\b[\s\"']*[:=][\s\"']*)(?:(?:basic|bearer|token)\s+)?([^\s\"',;}]+)")
+TOKEN_MORE = re.compile(r"\b(?:github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{30,})")
 SECRET_WORD = re.compile(r"((?:密码|口令|密钥|令牌)\s*[:：=]\s*)(\S+)")
-TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_-]{30,}|Bearer\s+[A-Za-z0-9._~+/-]{12,})", re.IGNORECASE)
 
 
 def redact(value):
     if isinstance(value, str):
         value = re.sub(r"https?://[^\s<>\"']+", lambda m: safe_url(m.group()), value)
-        return TOKEN.sub("[redacted]", SECRET_WORD.sub(r"\1[redacted]", SECRET_VALUE.sub(r"\1[redacted]", value)))
+        value = SECRET_VALUE.sub(r"\1[redacted]", SECRET_MORE.sub(r"\1[redacted]", value))
+        return TOKEN.sub("[redacted]", TOKEN_MORE.sub("[redacted]", SECRET_WORD.sub(r"\1[redacted]", value)))
     if isinstance(value, list):
         return [redact(v) for v in value]
     if isinstance(value, dict):
