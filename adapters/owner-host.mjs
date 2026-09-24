@@ -38,6 +38,9 @@ function failure(record={},fallback={}) {
   return {category,stage,code,retry_condition,...(model_invoked===undefined?{}:{model_invoked}),...(receipt?{model_receipt:receipt}:{})};
 }
 
+/** The owner's rules that hold one contact after another (owner-activity's evaluateContactPolicy):
+ * they wait for a reply or keep the minimum gap before the NEXT contact. */
+const BETWEEN_CONTACTS=new Set(['waiting-for-reply','recent-conversation']);
 /** Single-session host orchestration. Each dependency is owner-bound by the adapter. */
 export class MindLoop {
   constructor({call, eligibility, ownerEpoch, isBusy, draft, send, resume, recordStatus, stopExploration,
@@ -113,11 +116,14 @@ export class MindLoop {
   async contactTick() {
     if(this.closed||this.contactRunning||this.isBusy())return {state:'busy'};
     const eligibility=this.eligibility();
-    if(!eligibility.eligible)return {state:'waiting',reason:eligibility.reason};
+    // The rules between two contacts (wait for a reply, the minimum gap) hold the next contact, never
+    // the rest of one already under way: that one is still taken up and finished (CR2-INT-01).
+    const between=!eligibility.eligible&&BETWEEN_CONTACTS.has(eligibility.reason);
+    if(!eligibility.eligible&&!between)return {state:'waiting',reason:eligibility.reason};
     this.contactRunning=true;
     let attempt,possibleSend=false;
     try {
-      await this.call('reconsider',{owner_epoch:this.ownerEpoch()});
+      if(!between)await this.call('reconsider',{owner_epoch:this.ownerEpoch()});
       const candidate=await this.call('candidate',{});
       if(candidate.reason==='attempt-in-progress'&&['pending','unconfirmed'].includes(candidate.state)&&this.resume)
         return await this.settleResumed(candidate,await this.resume(candidate));
@@ -128,8 +134,9 @@ export class MindLoop {
         const unconfirmed={...due,state:'unconfirmed'};
         const reconciled=await this.settleResumed(unconfirmed,await this.resume(unconfirmed),
           {unknown:()=>this.call('settle',{attempt_id:due.attempt_id,state:'unconfirmed',reason:'receipt-still-unknown'})});
-        if(!candidate.eligible)return reconciled;
+        if(!candidate.eligible||between)return reconciled;
       }
+      if(between)return {state:'waiting',reason:eligibility.reason};
       if(!candidate.eligible)return candidate;
       const epoch=this.ownerEpoch();
       if(this.closed||this.isBusy()||!this.eligibility().eligible)return {state:'waiting'};
@@ -176,8 +183,9 @@ export class MindLoop {
       }
       possibleSend=true;
       const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
+      // The batch asks about this contact itself (`within`): its own attempt is not a contact before it.
       const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files,
-        guard:()=>!this.closed&&!this.isBusy()&&this.eligibility().eligible&&epoch===this.ownerEpoch()});
+        guard:within=>!this.closed&&!this.isBusy()&&this.eligibility(within).eligible&&epoch===this.ownerEpoch()});
       if(receipt.state==='needs-review') {
         if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
           reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});

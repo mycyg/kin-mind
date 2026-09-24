@@ -57,7 +57,12 @@ function reviewFailure(verdict={},fallback={}) {
   return {category,stage,code,retry_condition,...(model_invoked===undefined?{}:{model_invoked}),...(receipt?{model_receipt:receipt}:{})};
 }
 
-/** The journal freezes content and IDs before sending. Unknown sends only reconcile. */
+/** What the owner's contact rules are asked about while a group runs (CR2-INT-01 follow-up): the
+ * contact itself, by its ID, and whether a bubble of it has begun. Its own traces are not a contact
+ * before it, and once it has begun the rules between two contacts no longer hold its remainder. */
+const within=batch=>({contact:batch.id,started:batch.deliveryStarted===true||batch.items.some(item=>BEGUN.includes(item.state))});
+/** The journal freezes content and IDs before sending. Unknown sends only reconcile. `eligible` and
+ * `guard` are asked with `within(batch)`. */
 export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,
   preflight=async request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))}),
   verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
@@ -189,7 +194,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     // remainder the owner was already promised, and a group that is already
     // checked is never checked again.
     if(!batch.review&&batch.items.some(x=>x.state==='unsent')) {
-      if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
+      if(!await eligible(within(batch))||!await guard(within(batch))){batch.state='pending';await write(id,batch);return result(batch);}
       // A journal an older release held (its reviewer's failures and pause) is honoured as written;
       // nothing sets either field any more.
       const legacyFailures=batch.reviewFailures??0;
@@ -229,7 +234,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     for(const item of batch.items) {
       if(item.state==='unsent') {
         // A new owner input can arrive while the semantic review is running.
-        if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
+        if(!await eligible(within(batch))||!await guard(within(batch))){batch.state='pending';await write(id,batch);return result(batch);}
         // In flight with the router from before the bubble is marked begun until its send
         // returns, so a freeze can never report idle between the two (CR2-INT-01).
         const activity=await admit(gate,item,batch);
