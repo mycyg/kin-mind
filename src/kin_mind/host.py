@@ -181,19 +181,6 @@ def dispatch(config, action, request):
         provider.timeout = 120
         with declared("foreground", action):
             return ReplyReviews(memory.sharing).regenerate(request, provider)
-    if action == "share-preflight-group":
-        from .reply_review import ReplyReviews
-        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
-        if provider:
-            provider.timeout = 120
-        with declared("foreground", action):
-            return ReplyReviews(memory.sharing).preflight(request, provider)
-    if action == "share-preflight":
-        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
-        if provider:
-            provider.timeout = 120
-        with declared("foreground", action):
-            return memory.sharing.preflight(request, provider)
     if action == "share-cancel":
         return memory.sharing.cancel(request["draft_id"])
     if action == "reply-references":

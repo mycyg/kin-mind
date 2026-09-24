@@ -20,7 +20,6 @@ from kin_mind.sharing import (
     ContentReference,
     CoverageAssessment,
     CoverageMapping,
-    ShareCheck,
 )
 
 from kin_mind.state import Mind

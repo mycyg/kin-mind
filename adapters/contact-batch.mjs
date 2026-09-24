@@ -82,7 +82,6 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(index<0){items.push(item);continue;}
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
-      if(checked.text?.trim()&&checked.text!==item.text){item.originalText=item.text;item.text=checked.text;}
       items.push(...(begun?[item]:cut(item,limit)));
     }
     batch.items=items;batch.review={at:now(),...(verdict.review_id?{id:verdict.review_id}:{})};
