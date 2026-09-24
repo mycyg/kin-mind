@@ -103,3 +103,21 @@ def test_interaction_is_offered_without_any_reviewer():
     assert capabilities["computer_interaction"]["categories"] == ["local_reversible", "navigation", "read"]
     assert capabilities["ui_permissions"]["local_write"] is False
     assert not hasattr(computer_use, "DeepSeekActionReviewer")
+
+
+@pytest.mark.parametrize("relative", [".netrc", ".docker/config.json", ".config/gh/hosts.yml", "keys/id_ecdsa",
+                                      "state/local-token", "state/embedding-token", "Library/login.keychain",
+                                      ".codex/auth.json", ".ssh/config"])
+def test_exact_authentication_files_are_excluded_inside_an_authorized_root(tmp_path, relative):
+    """K2-12: the known authentication files are refused; the root stays as authorized."""
+    from kin_mind.computer import ComputerReader
+    reader = ComputerReader({"roots": [str(tmp_path)], "ledger": str(tmp_path / "ledger.json")})
+    with pytest.raises(ValueError, match="credential-or-runtime-material-excluded"):
+        reader.checked_path(tmp_path / relative)
+
+
+def test_the_rest_of_those_directories_stays_readable(tmp_path):
+    from kin_mind.computer import ComputerReader
+    reader = ComputerReader({"roots": [str(tmp_path)], "ledger": str(tmp_path / "ledger.json")})
+    for relative in (".docker/daemon.json", ".config/gh/config.yml", "notes/token-list.md", "backup.private.json"):
+        assert reader.checked_path(tmp_path / relative) == (tmp_path / relative).resolve()

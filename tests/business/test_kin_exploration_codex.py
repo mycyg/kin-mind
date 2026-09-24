@@ -206,15 +206,49 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
     report = run_codex(fake, topic, tmp_path / "job-altered", **codex_kwargs())
     assert report["state"] == "failed" and report["reason"] == "unbacked-citation"
 
-@pytest.mark.skipif(__import__("shutil").which("codex") is None, reason="codex CLI not installed")
-def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
-    """W1.6 real-tool case, fully isolated: a stub serves the model AND the web
-    targets; no external network, no real DS call, no phone path."""
+# A stand-in for `codex exec`: no model and no real CLI (item 10). It reads the host's own kin_web
+# server from the -c overrides it was given and drives that reader the way the model would:
+# search, read the page it found, cite the read with its evidence id. The frames it prints are
+# the CLI's JSON events, so the host's parsing, ledger and citation checks all run for real.
+DRIVER = """#!{python}
+import json, os, re, sys
+argv = sys.argv[1:]
+if argv[:1] == ['--version']:
+    sys.stdout.write('codex-cli 0.156.1\\n'); raise SystemExit(0)
+overrides = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
+value = lambda key: next(o.split('=', 1)[1] for o in overrides if o.startswith(key + '='))
+config_file = json.loads(value('mcp_servers.kin_web.args'))[-1]
+sys.path.insert(0, re.search(r'PYTHONPATH="([^"]+)"', value('mcp_servers.kin_web.env')).group(1))
+from kin_mind.web_read import WebReader
+open(os.path.join(os.getcwd(), 'observed.json'), 'w').write(json.dumps({{'argv': argv, 'env': dict(os.environ)}}))
+last = argv[argv.index('--output-last-message') + 1]
+sys.stdin.read()
+reader = WebReader(json.loads(open(config_file).read()))
+def emit(frame):
+    sys.stdout.write(json.dumps(frame) + '\\n'); sys.stdout.flush()
+def call(n, tool, output):
+    emit({{'type': 'item.completed', 'item': {{'id': 'item_%d' % n, 'type': 'mcp_tool_call', 'server': 'kin_web',
+          'tool': tool, 'status': 'completed', 'result': {{'content': [{{'type': 'text', 'text': json.dumps(output)}}]}}}}}})
+emit({{'type': 'thread.started', 'thread_id': 'th_driver'}})
+found = reader.search('probe', max_results=3)
+call(1, 'web_search', {{'state': found['state'], 'evidence_id': found['evidence_id'], 'results': found['results']}})
+page = reader.read_page(found['results'][0]['url'])
+call(2, 'read_page', {{'state': page['state'], 'evidence_id': page['evidence_id'], 'locator': page['locator']}})
+payload = {{'summary': 'The answer is teal.', 'findings': ['The page says teal.'],
+           'sources': [{{'url': page['locator'], 'title': 'Probe Page'}}], 'open_questions': [],
+           'suggested_share': None, 'evidence_map': {{'1': [page['evidence_id']]}}}}
+open(last, 'w').write(json.dumps(payload))
+emit({{'type': 'turn.completed', 'usage': {{'input_tokens': 50, 'output_tokens': 10}}}})
+"""
+
+
+def test_tool_round_trip_search_read_cite_with_a_stand_in_cli(tmp_path, monkeypatch):
+    """W1.6 round trip without the real CLI: a stub serves the web targets, the stand-in drives
+    the host's own web reader, and the run uses Kin's Codex home (item 9, item 10)."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
-    requests = []
 
     class Stub(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -232,53 +266,24 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-            parsed = json.loads(body)
-            requests.append(parsed)
-            n = len(requests)
-            outputs = [i for i in parsed.get("input", []) if i.get("type") == "function_call_output"]
-            if n == 1:
-                output = [{"type": "function_call", "id": "fc1", "call_id": "c1",
-                           "name": "web_search", "namespace": "mcp__kin_web",
-                           "arguments": json.dumps({"query": "probe"})}]
-            elif n == 2:
-                output = [{"type": "function_call", "id": "fc2", "call_id": "c2",
-                           "name": "read_page", "namespace": "mcp__kin_web",
-                           "arguments": json.dumps({"url": f"http://127.0.0.1:{self.server.server_address[1]}/page"})}]
-            else:
-                read_output = json.loads(outputs[-1]["output"][1]["text"]) if outputs and isinstance(outputs[-1]["output"], list) else {}
-                evidence_id = read_output.get("evidence_id", "")
-                locator = read_output.get("locator", "")
-                payload = {"summary": "The answer is teal.", "findings": ["The page says teal."],
-                           "sources": [{"url": locator, "title": "Probe Page"}],
-                           "open_questions": [], "suggested_share": None,
-                           "evidence_map": {"1": [evidence_id]} if evidence_id else None}
-                output = [{"type": "message", "role": "assistant",
-                           "content": [{"type": "output_text", "text": json.dumps(payload)}]}]
-            frames = ""
-            for i, item in enumerate(output):
-                frames += 'event: response.output_item.done\ndata: ' + json.dumps({"type": "response.output_item.done", "output_index": i, "item": item}) + '\n\n'
-            frames += 'event: response.completed\ndata: ' + json.dumps({"type": "response.completed", "response": {"id": f"r{n}", "model": "deepseek-flash", "status": "completed", "output": output, "usage": {"input_tokens": 50, "output_tokens": 10, "total_tokens": 60}}}) + '\n\ndata: [DONE]\n\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            self.wfile.write(frames.encode())
-
         def log_message(self, *args):
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Stub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
+    driver = tmp_path / "codex-driver"
+    driver.write_text(DRIVER.format(python=sys.executable))
+    driver.chmod(0o700)
+    kin_home = tmp_path / "kin-codex-home"
+    kin_home.mkdir()
     job = tmp_path / "job"
-    provider = {"id": "deepseek", "name": "DeepSeek", "base_url": base + "/v1",
-                "wire_api": "responses", "env_key": "KIN_TEST_DS_KEY"}
-    report = run_codex("codex", {"question": "What does the probe page say?"}, job,
-                       provider=provider, web={"enabled": True, "search_endpoint": base + "/search",
-                                               "allow_hosts": ["127.0.0.1"]},
-                       budget_seconds=180, **{k: v for k, v in codex_kwargs().items() if k != "provider"})
-    server.shutdown()
+    try:
+        report = run_codex(driver, {"question": "What does the probe page say?"}, job,
+                           web={"enabled": True, "search_endpoint": base + "/search", "allow_hosts": ["127.0.0.1"]},
+                           budget_seconds=60, codex_home=kin_home, executor_source="runtime-bundle", **codex_kwargs())
+    finally:
+        server.shutdown()
     assert report["state"] == "complete", report.get("reason")
     assert report["result"]["summary"] == "The answer is teal."
     states = {r["state"] for r in report["web_observations"]}
@@ -288,13 +293,38 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
     assert citation == observed[0]["locator"] and observed[0]["version"]
     assert report["evidence_coverage"] == {"mapped_claims": 1, "covered_claims": 1}
     assert any(t.get("type") == "mcp_tool_call" and t.get("server") == "kin_web" for t in report["tool_results"])
-    # This test points Codex directly at the stub, so its native MCP namespace
-    # wrapper is expected here.  The production gateway's flattening is covered
-    # independently in deepseek-gateway.test.mjs.  Code mode itself stays off.
-    assert not any(tool.get("type") == "custom" and tool.get("name") == "exec"
-                   for tool in requests[0].get("tools", []))
     # No phone path: the tool surface has no send/message tool.
     assert not any("send" in str(t) or "message" in str(t.get("tool", "")) for t in report["tool_results"])
+    seen = json.loads((job / "observed.json").read_text())
+    assert seen["env"]["CODEX_HOME"] == str(kin_home) and "--ignore-user-config" in seen["argv"]
+    assert not (job / "codex-home").exists()
+
+
+def test_exploration_runs_the_runtime_bundle_codex_not_the_floating_cli(tmp_path):
+    """K2-15, item 9: an explicit native_codex_command wins; else the verified runtime bundle's
+    binary; the legacy command only where no bundle is installed; a changed manifest waits."""
+    import hashlib
+    from kin_mind.codex_executor import native_codex, native_codex_home
+    host = tmp_path / "host"
+    runtime = host / "state" / "mobile-runtime"
+    bundle = runtime / "versions" / "codex-0.156.1-bundle"
+    (bundle / "bin").mkdir(parents=True)
+    (bundle / "bin" / "codex").write_text("#!/bin/sh\n")
+    manifest = json.dumps({"runtime": {"codex": {"path": "bin/codex"}}}).encode()
+    (bundle / "manifest.json").write_bytes(manifest)
+    legacy = {"host_root": str(host), "exploration_command": "/Users/someone/.local/bin/codex"}
+    assert native_codex(legacy) == (legacy["exploration_command"], "legacy-command")
+    (runtime / "activation.json").write_text(json.dumps({"current": {
+        "bundle_id": "codex-0.156.1-bundle", "manifest_sha256": hashlib.sha256(manifest).hexdigest()}}))
+    assert native_codex(legacy) == (str((bundle / "bin" / "codex").resolve()), "runtime-bundle")
+    assert native_codex({**legacy, "native_codex_command": "/fixed/codex"}) == ("/fixed/codex", "configured")
+    (bundle / "manifest.json").write_bytes(manifest + b" ")
+    with pytest.raises(CodexUnavailable):
+        native_codex(legacy)
+    assert native_codex_home(legacy) is None
+    (host / "state" / "codex-home").mkdir()
+    assert native_codex_home(legacy) == host / "state" / "codex-home"
+
 
 def test_a_running_exploration_stops_for_kin_not_for_a_new_message(tmp_path):
     """N7: a new owner message does not end the run; Kin setting the wish down does."""

@@ -20,8 +20,10 @@ export function artifactManifest(directory,artifacts){
   });
 }
 
-/** Independent creation process. No phone binding, channel credentials, MCP,
- * hooks or direct network tools. Only its workspace is writable. */
+/** Independent creation process. No phone binding, MCP, hooks or network. Only its workspace
+ * is writable: /tmp and $TMPDIR are excluded from the sandbox's writable roots too (AD2-22).
+ * Reading is not confined by the sandbox; the instructions ask it to leave channel credentials
+ * alone, and nothing it reads leaves except through its own artifacts. */
 export class AutonomousCreator {
   constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env}){
     Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env});this.child=null;
@@ -43,7 +45,8 @@ export class AutonomousCreator {
     const args=['exec','--ignore-user-config','--ignore-rules','--ephemeral','--skip-git-repo-check','--json','--color','never',
       '--sandbox','workspace-write','--cd',directory,'--model',this.model,'--output-schema',schemaFile,'--output-last-message',lastFile,
       '-c','approval_policy="never"','-c','mcp_servers={}','-c','features.apps=false','-c','features.hooks=false','-c','features.multi_agent=false',
-      '-c','web_search="disabled"','-c','sandbox_workspace_write.network_access=false','-c','model_reasoning_effort='+JSON.stringify(this.reasoning),
+      '-c','web_search="disabled"','-c','sandbox_workspace_write.network_access=false',
+      '-c','sandbox_workspace_write.exclude_slash_tmp=true','-c','sandbox_workspace_write.exclude_tmpdir_env_var=true','-c','model_reasoning_effort='+JSON.stringify(this.reasoning),
       '-c','shell_environment_policy.inherit="none"'];
     if(this.fast)args.push('-c','service_tier="fast"');
     if(this.modelCatalog)args.push('-c','model_catalog_json='+JSON.stringify(this.modelCatalog));
@@ -87,7 +90,8 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
   let running=false,closed=false,controller=null,current=null;
   const owner='creator-'+process.pid;
   const tick=async()=>{
-    if(closed||running||isBusy())return;
+    // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
+    if(closed||running||isBusy()||creator.command===null)return;
     running=true;let claimed;
     try{
       claimed=await call('plan-claim',{actor:'create',owner});

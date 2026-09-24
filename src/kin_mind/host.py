@@ -560,6 +560,9 @@ def main():
         import sys
 
         config = load_config(args.config)
+        # The host's own directory: its state holds the runtime bundle and Kin's Codex home, which
+        # exploration uses unless the configuration names others (K2-15).
+        config.setdefault("host_root", str(Path(args.config).resolve().parent))
         # The live contact policy sits beside the host's configuration unless it names another.
         policy = Path(args.config).resolve().with_name("proactive-policy.json")
         if "contact_policy_file" not in config and policy.exists():

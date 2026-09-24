@@ -32,8 +32,32 @@ test('isolated worker uses configured model and returns native and artifact rece
 });
 test('user work prevents claims and failed result review releases only its own finished run',async()=>{
  const calls=[];let busy=true;const loop={tick:async()=>{},review:()=>{}};
- const worker=startAutonomousWork({loop,isBusy:()=>busy,creator:{run:async()=>({state:'produced'}),stop(){}},call:async(action)=>{calls.push(action);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:1},plan:{id:'p'}};if(action==='plan-result')throw Error('timeout');}});
- await worker.tick();assert.equal(calls.length,0);busy=false;await worker.tick();assert.deepEqual(calls,['plan-claim','plan-result','plan-interrupt']);worker.close();
+ const worker=startAutonomousWork({loop,isBusy:()=>busy,creator:{run:async()=>({state:'produced'}),stop(){}},call:async(action,input)=>{calls.push([action,input]);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:7},plan:{id:'p'}};if(action==='plan-result')throw Error('timeout');}});
+ await worker.tick();assert.equal(calls.length,0);busy=false;await worker.tick();
+ assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-result','plan-interrupt']);
+ // T1-06: the release names this worker's own run, owner and fence, nothing wider.
+ const owner='creator-'+process.pid;
+ assert.equal(calls[0][1].owner,owner);
+ assert.deepEqual({run_id:calls[2][1].run_id,owner:calls[2][1].owner,fence:calls[2][1].fence},{run_id:'r',owner,fence:7});
+ worker.close();
+});
+test('the production combination: configured model, Fast, catalogue, and no writable /tmp (T1-06, AD2-22)',async()=>{
+ const root=temporary();let captured;
+ const spawnImpl=(command,args,options)=>{captured={command,args,options};const child=new EventEmitter();Object.assign(child,{pid:99999998,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
+ child.stdin.on('finish',()=>{child.stdout.end(JSON.stringify({type:'thread.started',thread_id:'t'})+'\n');setImmediate(()=>child.emit('exit',1));});return child;};
+ try{const creator=new AutonomousCreator({command:'/runtime/versions/b/bin/codex',root,model:'gpt-5.6-sol',reasoning:'medium',fast:true,
+   modelCatalog:'/host/mobile-models.json',spawnImpl,env:{PATH:'/usr/bin',HOME:root,CODEX_HOME:'/host/state/codex-home'}});
+ const result=await creator.run({plan:{id:'p',goal:'Create'},step:{id:'s'},run:{id:'r'},brief:{}});
+ assert.equal(result.state,'failed');
+ assert.equal(captured.command,'/runtime/versions/b/bin/codex');assert.equal(captured.options.env.CODEX_HOME,'/host/state/codex-home');
+ assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-5.6-sol');assert.ok(captured.args.includes('service_tier="fast"'));
+ assert.ok(captured.args.includes('model_catalog_json="/host/mobile-models.json"'));assert.ok(captured.args.includes('mcp_servers={}'));
+ assert.ok(captured.args.includes('sandbox_workspace_write.exclude_slash_tmp=true'));assert.ok(captured.args.includes('sandbox_workspace_write.exclude_tmpdir_env_var=true'));
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('without a Codex to run nothing is claimed',async()=>{
+ const calls=[];const worker=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,creator:{command:null,run:async()=>({}),stop(){}},call:async action=>{calls.push(action);return {};}});
+ await worker.tick();assert.deepEqual(calls,[]);await worker.close();
 });
 test('a running creation keeps its lease when 小光 writes; only a close interrupts it (N7)',async()=>{
  const calls=[];let busy=false,seen=null;const loop={tick:async()=>{},review:()=>{}};

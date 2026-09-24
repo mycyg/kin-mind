@@ -10,6 +10,7 @@ instructions. The runner contract is `ExecutionReport` in exploration.py.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -234,7 +235,7 @@ def exploration_capabilities(config, *, computer_override=None):
     is a fact about configured tools, never a keyword or a score gate."""
     web = config.get("exploration_web") or {}
     web_enabled = web.get("enabled", True)
-    command = bool(config.get("exploration_command"))
+    command = bool(config.get("native_codex_command") or config.get("exploration_command") or _runtime_installed(config))
     computer_config = computer_override if computer_override is not None \
         else config.get("computer_exploration") or {}
     computer = computer_config.get("enabled", False)
@@ -335,6 +336,56 @@ def codex_cli_version(executable, *, timeout=10):
         raise CodexUnavailable("codex-cli-too-old", ".".join(str(part) for part in version))
     return ".".join(str(part) for part in version)
 
+
+
+def runtime_bundle_codex(runtime_root):
+    """The codex binary of the verified runtime bundle the phone runs. The activation index names
+    the bundle and its manifest digest, the manifest names the binary; the service verified the
+    bundle's bytes when it started, and this only follows the index to the same file."""
+    root = Path(runtime_root)
+    try:
+        current = json.loads((root / "activation.json").read_text())["current"]
+        bundle = root / "versions" / str(current["bundle_id"])
+        manifest = (bundle / "manifest.json").read_bytes()
+        if hashlib.sha256(manifest).hexdigest() != current["manifest_sha256"]:
+            raise CodexUnavailable("codex-runtime-manifest-changed")
+        binary = (bundle / json.loads(manifest)["runtime"]["codex"]["path"]).resolve()
+    except CodexUnavailable:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise CodexUnavailable("codex-runtime-unavailable", error) from error
+    if bundle.resolve() not in binary.parents or not binary.is_file():
+        raise CodexUnavailable("codex-runtime-unavailable", "binary-outside-bundle")
+    return binary
+
+
+def _host_state(config, name):
+    return Path(config["host_root"]) / "state" / name if config.get("host_root") else None
+
+
+def _runtime_installed(config):
+    root = config.get("mobile_runtime_root") or _host_state(config, "mobile-runtime")
+    return bool(root) and (Path(root) / "activation.json").exists()
+
+
+def native_codex(config, legacy_key="exploration_command"):
+    """(command, source) of the Codex exploration and creation run (K2-15, N1-09): an explicit
+    `native_codex_command`, else the binary of the verified runtime bundle, never the floating
+    desktop CLI. Only an install without a runtime bundle still uses its configured legacy
+    command, and the receipt says so."""
+    if config.get("native_codex_command"):
+        return str(config["native_codex_command"]), "configured"
+    if _runtime_installed(config):
+        return str(runtime_bundle_codex(config.get("mobile_runtime_root") or _host_state(config, "mobile-runtime"))), "runtime-bundle"
+    legacy = config.get(legacy_key)
+    return (str(legacy), "legacy-command") if legacy else (None, None)
+
+
+def native_codex_home(config):
+    """Kin's own Codex home, when it exists: the runtime directory the host generates, so an
+    exploration never reads or writes the desktop's ~/.codex. None keeps the per-run home."""
+    home = config.get("native_codex_home") or _host_state(config, "codex-home")
+    return Path(home) if home and Path(home).is_dir() else None
 
 def findings_schema():
     """The Findings JSON schema handed to codex. Strict-shaped for the CLI; the
@@ -570,8 +621,13 @@ def run_codex(
     web=None,
     model_catalog=None,
     repair=None,
+    codex_home=None,
+    executor_source=None,
 ):
     """One bounded codex attempt. Returns the ExecutionReport-shaped receipt.
+
+    `codex_home` is Kin's own Codex home when the host has one; without it the run gets an
+    isolated home of its own. Either way the desktop's ~/.codex is never used.
 
     Terminal states: complete only when the CLI exited cleanly, emitted its native
     completion event (turn.completed) and left a final message that validates
@@ -601,9 +657,11 @@ def run_codex(
     started_at = time.time()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    codex_home = directory / "codex-home"
-    codex_home.mkdir(exist_ok=True, mode=0o700)
-    codex_home.chmod(0o700)
+    shared_home = codex_home is not None
+    if not shared_home:
+        codex_home = directory / "codex-home"
+        codex_home.mkdir(exist_ok=True, mode=0o700)
+        codex_home.chmod(0o700)
     attempt = int((continuation or {}).get("attempt") or 0) + 1
     computer_ledger = None
     computer_mcp = None
@@ -621,7 +679,9 @@ def run_codex(
         reader_settings = {
             **{key: value for key, value in computer.items() if key != "ui"},
             "execution_id": directory.name, "attempt": attempt,
-            "ledger": str(computer_ledger), "internal_deny_roots": [str(directory)],
+            "ledger": str(computer_ledger),
+            # Kin's Codex home holds her runtime state and auth link; never exploration material.
+            "internal_deny_roots": [str(directory)] + ([str(codex_home)] if shared_home else []),
         }
         computer_config = directory / "computer-reader.json"
         computer_config.write_text(dumps(reader_settings))
@@ -743,6 +803,7 @@ def run_codex(
         extra_env_keys=(ui_mcp or {}).get("env_vars", []),
     )
     identity = {"executor": "codex-cli", "executor_version": cli_version, "model": model,
+                "executor_source": executor_source, "codex_home": "kin" if shared_home else "isolated",
                 "reasoning": reasoning, "sandbox": "read-only",
                 "capabilities": capabilities,
                 "computer_use_backend": backend_readiness,
@@ -1046,13 +1107,15 @@ def run_codex(
         return receipt
 
 
-def codex_runner(*, reasoning, provider, cli_version, model_catalog=None, repair=None):
+def codex_runner(*, reasoning, provider, cli_version, model_catalog=None, repair=None,
+                 codex_home=None, executor_source=None):
     """Bind the injected model configuration into an `Explorations.run` runner."""
 
     def run(executable, topic, directory, **kwargs):
         return run_codex(executable, topic, directory, reasoning=reasoning,
                          provider=provider, cli_version=cli_version,
-                         model_catalog=model_catalog, repair=repair, **kwargs)
+                         model_catalog=model_catalog, repair=repair, codex_home=codex_home,
+                         executor_source=executor_source, **kwargs)
 
     run.wants_continuation = True
     return run
@@ -1088,9 +1151,14 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
     published exploration-gateway state file, read fresh at each dispatch."""
     environ = os.environ if environ is None else environ
     resolved_computer = copy.deepcopy(config.get("computer_exploration") or {})
-    command = config.get("exploration_command")
+    try:
+        command, source = native_codex(config)
+    except CodexUnavailable as error:
+        return {"state": "waiting", "reason": "exploration-executor-unavailable",
+                "detail": error.reason, "backend": "codex"}
     if not command:
-        raise ValueError('exploration_backend "codex" requires exploration_command')
+        raise ValueError('exploration_backend "codex" requires a Codex: native_codex_command, '
+                         'an installed runtime bundle or exploration_command')
     provider_config = dict(config.get("exploration_model_provider") or {})
     if not provider_config.get("base_url"):
         state_file = config.get("exploration_gateway_state_file")
@@ -1128,8 +1196,10 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
         "cli_version": version,
         # An operator catalog may override the bundled DeepSeek metadata. The
         # bundled file prevents Codex from guessing OpenAI-model capabilities.
+        "executor_source": source,
         "runner": codex_runner(repair=repair, reasoning=config.get("exploration_reasoning") or "high",
                                provider=provider, cli_version=version,
                                model_catalog=config.get("exploration_model_catalog")
-                               or DEEPSEEK_MODEL_CATALOG),
+                               or DEEPSEEK_MODEL_CATALOG,
+                               codex_home=native_codex_home(config), executor_source=source),
     }
