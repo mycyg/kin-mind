@@ -39,6 +39,7 @@ import {
   type Scope,
 } from "./api";
 import { EventGraphPanel } from "./EventGraphPanel";
+import { listScopes, type ScopeList } from "./scopes.mjs";
 import {
   FamilyEditor,
   AttachmentPreview,
@@ -152,12 +153,13 @@ function useLatest() {
     return current.current.signal;
   }, []);
 }
+const MORE_SCOPES = "__more_scopes__";
 function App() {
   const [connected, setConnected] = useState(false),
     [token, setTokenInput] = useState(initialToken),
     [view, setView] = useState("overview"),
     [scopeInput, setScopeInput] = useState<Scope>(savedScope),
-    [scopes, setScopes] = useState<Scope[] | null>(null),
+    [scopes, setScopes] = useState<ScopeList | null>(null),
     [error, setError] = useState(""),
     [pending, setPending] = useState(0),
     [overview, setOverview] = useState<any>({}),
@@ -288,10 +290,11 @@ function App() {
     if (view === "settings")
       setModels(await api.call("read_settings", { path: { key: "models" } }));
   }, [view, loadRecords, loadFamilies, loadContact]);
-  const refresh = useCallback(
-    () => Promise.all([loadOverview(), loadView()]),
-    [loadOverview, loadView],
-  );
+  const refresh = useCallback(() => {
+    // The picker's list is read again the next time it is opened: scopes come and go.
+    setScopes(null);
+    return Promise.all([loadOverview(), loadView()]);
+  }, [loadOverview, loadView]);
   const adoptedScope = useRef(scopeWasSaved);
   const connect = () =>
     run(async () => {
@@ -304,9 +307,18 @@ function App() {
       }
       setConnected(true);
     });
-  const loadScopes = () => {
-    if (scopes === null)
-      void run(async () => setScopes((await api.call("list_scopes")).items));
+  // Every page, following the cursor, up to twenty pages a time; what is left past that is
+  // one choice away (CR-MEM-13).
+  const loadScopes = (more = false) => {
+    if (scopes !== null && !more) return;
+    void run(async () =>
+      setScopes(
+        await listScopes(
+          async (query) => (await api.call("list_scopes", { query })) as any,
+          more && scopes ? { cursor: scopes.cursor, items: scopes.items } : {},
+        ),
+      ),
+    );
   };
   useEffect(() => {
     if (initialToken) void connect();
@@ -582,15 +594,19 @@ function App() {
               <select
                 aria-label="已有范围"
                 value=""
-                onFocus={loadScopes}
-                onChange={(e) => e.target.value && setScopeInput(JSON.parse(e.target.value))}
+                onFocus={() => loadScopes()}
+                onChange={(e) => {
+                  if (e.target.value === MORE_SCOPES) loadScopes(true);
+                  else if (e.target.value) setScopeInput(JSON.parse(e.target.value));
+                }}
               >
                 <option value="">选择…</option>
-                {(scopes ?? []).map((s) => (
+                {(scopes?.items ?? []).map((s) => (
                   <option key={JSON.stringify(s)} value={JSON.stringify(s)}>
                     {s.project} / {s.persona} / {s.collection} / {s.world}
                   </option>
                 ))}
+                {scopes?.cursor && <option value={MORE_SCOPES}>加载更多范围…</option>}
               </select>
             </label>
           </div>
