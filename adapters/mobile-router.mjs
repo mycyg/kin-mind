@@ -506,6 +506,8 @@ export class MobileRouter {
       else if(input.attachments?.length&&!intents||['repair','work-result','exploration-plan','handoff'].includes(input.kind)){decision='work';reason='work-input';}
       else if(input.kind==='assessment'){decision='chat';reason='silent-main-assessment';}
       else if(input.kind==='proactive'){decision='chat';reason='casual-outreach';}
+      // The host stating facts about open work is context for Kin, never a new requirement (N2).
+      else if(input.kind==='work-facts'){decision='chat';reason='host-work-facts';}
       if(decision===null)return {classify:{runtime,taskVersions:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))}};
       const recall={mode:'light',reason:'no-semantic-recall-decision'};
       if(stop) {
@@ -1757,7 +1759,7 @@ export class MobileRouter {
         } else if(record.state==='queued') {
           // Only the host's in-memory queue held it: with the session idle and its
           // prompt never begun, it provably never reached the native session.
-          if(idle&&!sessionBusy){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});changed=true;}
+          if(idle&&!sessionBusy){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});this.settleAcceptance(record.id,{state:record.state});changed=true;}
         } else if(['unconfirmed','fenced-unconfirmed'].includes(record.state)) {
           if(!record.reconciliation&&reconcileInput)list.push({kind:'reconcile',id:record.id});
           else verdict='unknown';
