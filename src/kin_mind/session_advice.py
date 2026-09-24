@@ -2,12 +2,25 @@
 
 The host owns native receipts, execution locks and final decisions. A judgment
 does not claim that compaction, delivery or a handover has happened.
+
+Where a judgment lives: the host's conversation registry (`sessionAdvice`), which
+its session manager alone writes. It never belongs in the versioned mind state,
+whose every revision is a full snapshot. The appraisal that produced it hands it
+over through `submit`, one small row replaced by the next, in the same
+transaction as the rest of its commit; the host's minute snapshot carries it
+from there.
 """
+import json
+import sqlite3
 from typing import Literal
 
 from pydantic import Field
 
+from eventmem.core.db import dumps
 from eventmem.core.models import Model
+
+CARRIER = """CREATE TABLE IF NOT EXISTS mind_session_advice(
+ scope TEXT PRIMARY KEY,event_id TEXT NOT NULL,snapshot TEXT NOT NULL,data TEXT NOT NULL,at TEXT NOT NULL)"""
 
 
 class SessionFinding(Model):
@@ -87,3 +100,32 @@ def repair_input(proposal, context, problem):
             "allowed_evidence": [{k: entry[k] for k in ("id", "at", "needsReview", "resolved") if k in entry} for entry in context.get("evidence", [])],
             "last_compaction": {k: compact[k] for k in ("id", "completedAt") if k in compact} or None,
             "advice": proposal.model_dump()}
+
+
+def submit(conn, scope, record, at):
+    """Hand one validated judgment to the host, inside the caller's transaction.
+
+    One statement at a time: a script would commit the transaction it runs in."""
+    if not record or not record.get("eventId") or not record.get("snapshotId"):
+        raise ValueError("A session judgment needs its event and observation")
+    conn.execute(CARRIER)
+    conn.execute("INSERT INTO mind_session_advice VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
+                 "event_id=excluded.event_id,snapshot=excluded.snapshot,data=excluded.data,at=excluded.at",
+                 (scope, record["eventId"], record["snapshotId"], dumps(record), at))
+    return record
+
+
+def latest(conn, scope, state=None):
+    """The newest judgment waiting for the host, or none.
+
+    Releases before the registry kept it in the mind state, and a store written by
+    one of them still answers from there until a newer judgment replaces it."""
+    try:
+        row = conn.execute("SELECT data FROM mind_session_advice WHERE scope=?", (scope,)).fetchone()
+    except sqlite3.OperationalError as error:
+        if "no such table" not in str(error):
+            raise
+        row = None
+    if row:
+        return json.loads(row[0])
+    return (state or {}).get("session_advice")

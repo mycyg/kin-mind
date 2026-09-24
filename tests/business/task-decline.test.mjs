@@ -21,6 +21,8 @@ async function fixture(t,{manual=false}={}) {
   await router.dispatch({id:'original-work',kind:'owner',text:'work'},async()=> 'new-turn');
   const task=router.currentTask();
   await router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:router.state.executionEpoch});
+  // The classifier only proposed the work; Kin takes it on (N5).
+  await router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-'+task.id,completedTaskId:task.id,completedInputVersion:task.inputVersion,reason:'I will do it'});
   const command={mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'original-work',
     reason:'I did the initial check and do not want to do the rest',commandId:'decline-'+task.id};
   return {router,runtime,task,command,options,switches:()=>switches,now:()=>++tick};
@@ -153,13 +155,51 @@ test('an arriving chat stays an independent input while a declined work turn wai
   assert.equal(f.task.status,'running');
 });
 
-test('existing work review waits for host decline settlement without declaring completion',async t=>{
+test('the idle summary never reviews a task Kin has already declared',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
-  let reviews=0;
+  let summaries=0;
   const review=new WorkLockReview({router:f.router,file:path.join(path.dirname(f.options.file),'review.json'),
-    now:f.now,collect:async()=>assert.fail('decline does not need a semantic work verdict'),
-    review:async()=>{reviews++;throw Error('unexpected semantic review');}});
+    now:f.now,collect:async()=>assert.fail('a declared outcome needs no model summary'),
+    summarize:async()=>{summaries++;throw Error('unexpected summary');}});
   const result=await review.tick();
-  assert.equal(result.state,'waiting');assert.equal(result.reason,'assistant-decline-awaiting-host-settlement');
-  assert.equal(reviews,0);assert.equal(f.task.status,'running');
+  assert.equal(result.state,'waiting');assert.equal(result.reason,'kin-declared-outcome');
+  assert.equal(summaries,0);assert.equal(f.task.status,'running');
+});
+
+test('Kin may decline a proposal she never took on, and the decline is reported, not faked as done',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-task-proposal-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  let tick=1000;
+  const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
+    model:'gpt-6-sol',modelProvider:'custom-gateway',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
+    active:false,queued:0,backgroundTasks:0,pendingDeliveries:0,handoffTasks:0};
+  const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++tick,inspect:async()=>({...runtime}),
+    classify:async()=>({route:'work',reason:'synthetic'}),switchModel:async()=>({...runtime}),waitForIdle:async()=>assert.fail('unexpected wait')});
+  await router.dispatch({id:'ask',kind:'owner',text:'please do it'},async()=> 'new-turn');
+  const task=router.currentTask();assert.equal(task.status,'proposed');
+  await router.observe('prompt-start',{taskId:task.id,inputVersion:1,turnFence:0});
+  await router.requestMode({mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:1,sourceInputId:'ask',reason:'not now, and not this way',commandId:'decline-proposal'});
+  await router.observe('delivery',{taskId:task.id,inputVersion:1,turnFence:0,sourceInputId:'ask',id:'why',state:'accepted',messageId:'told'});
+  await router.observe('prompt-end',{taskId:task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
+  assert.equal(task.status,'proposed','a declared proposal does not lapse; it closes on its own outcome');
+  await router.reconcile();
+  assert.deepEqual([task.status,task.outcome,task.closure.reported],['canceled','declined',true]);
+});
+
+test('an undeclared proposal lapses when its own turn ends and releases the lock (N5)',async t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-task-lapse-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  let tick=1000;
+  const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
+    model:'gpt-6-sol',modelProvider:'custom-gateway',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
+    active:false,queued:0,backgroundTasks:0,pendingDeliveries:0,handoffTasks:0};
+  const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++tick,inspect:async()=>({...runtime}),
+    classify:async()=>({route:'work',reason:'synthetic'}),switchModel:async()=>({...runtime}),waitForIdle:async()=>assert.fail('unexpected wait')});
+  await router.dispatch({id:'ask',kind:'owner',text:'quick question labelled as work'},async()=> 'new-turn');
+  const task=router.currentTask();
+  await router.observe('prompt-start',{taskId:task.id,inputVersion:1,turnFence:0,inputIds:['ask']});
+  assert.equal(router.tasks().length,1,'the proposal keeps its own turn on the work profile');
+  await router.observe('prompt-end',{taskId:task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
+  assert.deepEqual([task.status,task.outcome,router.tasks().length],['unclaimed','not-accepted',0]);
+  await assert.rejects(()=>router.requestMode({mode:'auto',completedTaskId:task.id,completedInputVersion:1,reason:'late',commandId:'late'}),/not open/);
+  const accepted=await router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-late',completedTaskId:task.id,completedInputVersion:1,reason:'on second thought I will do it'});
+  assert.equal(accepted.state,'applied');assert.equal(task.status,'running');
 });

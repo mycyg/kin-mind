@@ -33,8 +33,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test ../tests/clients/plugin.mjs",
-    "fixtures": "python3 scripts/gen-fixtures.py"
+    "test": "npm run build && node --test ../tests/clients/plugin.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"

@@ -10,7 +10,20 @@ export type Body<K extends Operation> = K extends keyof Contract
     : unknown
   : unknown;
 
-export type Output<K extends Operation> = K extends
+// Attachments, pages, clips and exports are bytes whatever their media type says: a JSON or
+// NDJSON attachment is the file the owner stored, not a response to parse.
+const binaryOperations = [
+  "read_attachment",
+  "read_page",
+  "read_clip",
+  "download_export",
+] as const;
+export type BinaryOperation = (typeof binaryOperations)[number];
+const binary = new Set<Operation>(binaryOperations);
+
+export type Output<K extends Operation> = K extends BinaryOperation
+  ? ArrayBuffer
+  : K extends
   | "receive_source"
   | "upload_source"
   | "read_source"
@@ -27,6 +40,14 @@ export type Output<K extends Operation> = K extends
     : any
   : any;
 
+export type CallOptions<K extends Operation> = {
+  body?: Body<K>;
+  path?: Record<string, string>;
+  query?: Record<string, string | number | boolean | undefined>;
+  form?: FormData;
+  signal?: AbortSignal;
+};
+
 export class Client {
   constructor(
     readonly url: string,
@@ -36,14 +57,21 @@ export class Client {
 
   async call<K extends Operation>(
     operation: K,
-    options: {
-      body?: Body<K>;
-      path?: Record<string, string>;
-      query?: Record<string, string | number | boolean | undefined>;
-      form?: FormData;
-      signal?: AbortSignal;
-    } = {},
+    options: CallOptions<K> = {},
   ): Promise<Output<K>> {
+    const response = await this.response(operation, options);
+    if (binary.has(operation))
+      return response.arrayBuffer() as Promise<Output<K>>;
+    return response.headers.get("content-type")?.includes("json")
+      ? response.json()
+      : (response.arrayBuffer() as Promise<Output<K>>);
+  }
+
+  /** The checked response itself, for a caller that streams a large body instead of holding it. */
+  async response<K extends Operation>(
+    operation: K,
+    options: CallOptions<K> = {},
+  ): Promise<Response> {
     const spec = operations[operation];
     let path: string = spec.path;
     for (const [key, value] of Object.entries(options.path ?? {}))
@@ -67,9 +95,7 @@ export class Client {
       throw new Error(
         `MemoryPalace ${response.status}: ${(await response.text()).slice(0, 500)}`,
       );
-    return response.headers.get("content-type")?.includes("json")
-      ? response.json()
-      : (response.arrayBuffer() as Promise<Output<K>>);
+    return response;
   }
 
   async upload(

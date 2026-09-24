@@ -48,9 +48,10 @@ export const LIVE_STATES=Object.freeze([...NEVER_ARCHIVED,'unsent','submitting',
  * never heard of keeps its file. */
 export const SETTLED_STATES=Object.freeze(['accepted','canceled','cancelled','silent','merged','retired',
   'superseded','undeliverable','recorded',
-  // A routing task is open until it is one of these two, by the router's own
-  // definition; a status the router would still call open must not settle here.
-  'completed']);
+  // A routing task is closed in these statuses, by the router's own definition
+  // (`TASK_CLOSED`); a status the router would still call open must not settle here.
+  // Its `deferred` is also a live delivery state elsewhere, and stays live here.
+  'completed','partial','unclaimed']);
 
 /** Where a record keeps the time something last happened to it. The newest of
  * them wins: a record that was accepted after it was attempted is as old as its
