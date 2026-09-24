@@ -99,7 +99,8 @@ MIXES = (
 
 
 # What a stated intent adds to the wording. It is never quoted: it says how to be present, and
-# the persona still decides the words. Without one the table below is the whole answer.
+# the persona still decides the words. Without one the score-band table above is the fallback;
+# with one the table is not used.
 INTENT_CONTINUE = "接着聊："
 INTENT_AVOID = "这段时间先不提："
 
@@ -207,11 +208,11 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
             }
         ]
     if intent:
-        # A fresh intent leads: what was just judged about this moment, then whatever the table
-        # still has room for. A rhythm cadence keeps the last of the three; it is the host's own
-        # projection of how this hour reads, and an intent does not overrule it.
+        # A fresh intent is Kin's own judgment of this moment. The fixed score bands above are only
+        # the fallback when there is none, so none of them is added beside it (K1-22). A rhythm
+        # cadence keeps the last place: it projects the phase Kin herself last judged.
         cadence = [item for item in selected if item["basis"] == "runtime_inferred"]
-        selected = (intent_guidance(intent) + [i for i in selected if i not in cadence])[:max(0, 3 - len(cadence))] + cadence
+        selected = intent_guidance(intent)[:max(0, 3 - len(cadence))] + cadence
     for item in selected:
         item.pop("priority", None)
     result = {

@@ -419,3 +419,61 @@ def test_a_wish_on_a_moved_trait_asks_again_and_a_confirmation_readies_it(setup)
                                     evidence_ids=[source("confirm")], action="resume", desire_id=did, reason="Still want to"))
     with mind.engine.db.connect() as conn:
         assert links_fresh(conn, mind, mind._load(conn)["desires"][did])
+
+
+def test_a_trait_stands_only_on_two_separate_times(setup):
+    """K1-14: counter_evidence no longer skips the two-episode gate, and diaries written later
+    about one conversation are that one time, not one each."""
+    from kin_mind.appraisal import TraitDecision, TraitEpisode, TraitObservation
+    from kin_mind.traits import Traits
+    mind, source, clock = setup
+    engine = mind.engine
+    talk, other = source("owner-talk"), source("another-talk")
+    clock[0] += timedelta(hours=6)
+
+    def diary(key, cites):
+        return engine.receive(SourceInput(namespace="kin-reflection", key=key, scope=mind.scope,
+            text="小Kin自己琢磨的：" + key, authority="model", occurred_at=clock[0].isoformat(),
+            metadata={"role": "assistant", "host_event": "diary", "internal": True,
+                      "appraisal_event_id": "evt-" + key, "evidence_ids": cites}))["id"]
+
+    traits = Traits(mind)
+
+    def observe(ref, command):
+        with engine.db.connect(write=True) as conn:
+            return traits.observe(conn, [TraitObservation(key="好奇", category="interests", slug="curious",
+                evidence_class="self_statement", polarity="support", evidence_ids=[ref])], command, {}, None, command)[0]
+
+    def establish(basis, refs, trait):
+        with engine.db.connect(write=True) as conn:
+            return traits.decide(conn, [TraitDecision(action="establish", trait_id=trait["id"],
+                expected_revision=trait["revision"], text="好奇", basis=basis, observation_refs=refs,
+                episodes=[TraitEpisode(ref=r, why_distinct="different day") for r in refs],
+                reason="Kin keeps noticing it")], "establish-" + basis, {}, None, "evt-establish")[0]
+
+    first, second = observe(diary("d1", [talk]), "o1"), observe(diary("d2", [talk]), "o2")
+    assert first["episode_key"] == second["episode_key"]
+    with engine.db.connect(write=True) as conn:
+        proposed = traits.decide(conn, [TraitDecision(action="propose", text="好奇", basis="inference",
+            observation_refs=[first["id"]], reason="A first sign")], "propose", {}, None, "evt-propose")[0]
+    for basis in ("inference", "counter_evidence"):
+        with pytest.raises(Conflict) as refused:
+            establish(basis, [first["id"], second["id"]], proposed)
+        assert refused.value.code == "trait-single-episode"
+    third = observe(diary("d3", [other]), "o3")
+    assert third["episode_key"] != first["episode_key"]
+    assert establish("counter_evidence", [first["id"], third["id"]], proposed)["status"] == "established"
+
+
+def test_a_fresh_intent_replaces_the_score_band_table():
+    """K1-22: the fixed score bands are the fallback; a fresh intent is not padded with them."""
+    from kin_mind.expression import compile_expression
+    dimensions = {"longing": {"value": 90, "basis": "event_inferred", "evidence_ids": ["src_a"]},
+                  "playfulness": {"value": 85, "basis": "event_inferred", "evidence_ids": ["src_b"]},
+                  "initiative": {"value": 95, "basis": "event_inferred", "evidence_ids": ["src_c"], "baseline": 50}}
+    fallback = compile_expression(dimensions)["guidance"]
+    assert any(item["id"] == "longing-play" for item in fallback)
+    intent = {"id": "intent-1", "valid_until": "2099-01-01T00:00:00+00:00", "stance": "安静陪着她",
+              "continue_topics": [{"topic": "她的论文"}], "avoid": [], "evidence_ids": ["src_d"]}
+    guided = compile_expression(dimensions, intent=intent)["guidance"]
+    assert [item["id"] for item in guided] == ["intent-stance", "intent-continue"]
