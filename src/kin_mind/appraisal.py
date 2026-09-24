@@ -2110,12 +2110,23 @@ class Appraisals:
                                 kept = remaining
                         return kept
 
+                    advice_written = []
+
                     def apply_advice():
-                        # advice_record() validates before it builds anything; state changes only once it has returned.
-                        state["session_advice"] = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        # advice_record() validates before it builds anything. The judgment goes to the
+                        # session registry's carrier inside this transaction, not into the versioned
+                        # mind state (DB1-03, §5.6). A core without that carrier keeps the old place.
+                        record = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        from . import session_advice as advice_store
+                        submit = getattr(advice_store, "submit", None)
+                        if record and submit:
+                            submit(conn, self.mind.scope.key(), record, self.mind.clock())
+                        elif record:
+                            state["session_advice"] = record
+                        advice_written.append(record)
                     if data.get("stimulus") == "session-maintenance":
                         applied = section("session_advice", apply_advice)
-                        return {"provider": receipt, "session_advice": state["session_advice"] if applied else None, "maintenance_only": True,
+                        return {"provider": receipt, "session_advice": advice_written[-1] if applied and advice_written else None, "maintenance_only": True,
                                 **({"rejected_sections": rejected} if rejected else {})}
                     referenced_graph = {v for n in proposal.memory.graph.nodes for v in (n.id,n.owner_id) if v}
                     referenced_graph.update(v for e in proposal.memory.graph.edges for v in (e.subject,e.object))

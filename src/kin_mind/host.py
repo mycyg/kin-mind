@@ -257,9 +257,6 @@ def dispatch(config, action, request):
         if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
             request['receipt_mode'] = True
         return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
-    if action == "memory-window":
-        window = Contexts(mind).window(config["session_id"])
-        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":not memory.settings()["native_window_context"] and window["used"]>=12000}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":

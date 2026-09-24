@@ -586,6 +586,11 @@ class Mind(Continuity):
 
         return self._mutate(request, "behavior-policy", apply)
 
+    def _session_advice(self, conn, state):
+        from . import session_advice as advice_store
+        latest = getattr(advice_store, "latest", None)
+        return latest(conn, self.scope.key(), state) if latest else state.get("session_advice")
+
     def decision_current(self, conn, receipt, state=None):
         """A verified decision holds while what decides Kin's behaviour is unchanged: the approved
         persona, the behaviour contract, the definitions, the models and the environment (the
@@ -1190,7 +1195,8 @@ class Mind(Continuity):
             "agent_version": state["agent_version"],
             "profile_version": state["profile_version"],
             "dimensions": values,
-            "session_advice": deepcopy(state.get("session_advice")),
+            # Read where the session registry keeps it now, and from the state for older stores.
+            "session_advice": deepcopy(self._session_advice(conn, state)),
             "desires": desires,
             "traits": traits,
             "contact": contact,

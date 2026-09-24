@@ -266,3 +266,23 @@ def test_a_decision_outlives_a_deployment_but_not_a_change_of_what_decides_behav
                      (json.dumps({"chat": "another-model", "chat_effort": "high"}),))
     with mind.engine.db.connect() as conn:
         assert not mind.decision_current(conn, {"compat": stamped})
+
+
+def test_session_advice_goes_to_the_registry_carrier_not_the_mind_state(setup, monkeypatch):
+    """DB1-03 (write side): a maintenance judgment is handed to session_advice.submit inside the
+    commit; the versioned mind state no longer holds it, and reads go through the carrier."""
+    from kin_mind import session_advice
+    from kin_mind.session_advice import SessionAdvice
+    mind, source, _ = setup
+    carried = []
+    monkeypatch.setattr(session_advice, "submit", lambda conn, scope, record, at: carried.append((scope, record)) or record, raising=False)
+    monkeypatch.setattr(session_advice, "latest", lambda conn, scope, state=None: carried[-1][1] if carried else None, raising=False)
+    context = {"id": "snapshot-1", "binding": {"generation": 3}, "evidence": [], "recent": []}
+    jobs = Appraisals(mind, session_context=context)
+    jobs.enqueue([source("pressure")], "synthetic-v1", origin="reflection", stimulus="session-maintenance")
+    reviewer = FakeReviewer(Appraisal(reason="Keep the session", session_advice=SessionAdvice(action="keep", reason="Fine")))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert carried and carried[0][1]["snapshotId"] == "snapshot-1" and carried[0][1]["decision"]["action"] == "keep"
+    with mind.engine.db.connect() as conn:
+        assert "session_advice" not in mind._load(conn)
+    assert mind.read()["session_advice"]["snapshotId"] == "snapshot-1"
