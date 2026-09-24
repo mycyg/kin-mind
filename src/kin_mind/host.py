@@ -167,7 +167,11 @@ def dispatch(config, action, request):
         if not config.get("adaptive_sessions") or not session_context:
             return {"state": "disabled"}
         # The observed snapshot is the stimulus; nothing is written into memory for a review.
-        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"])
+        # The host's attempt is part of the queue key: the same attempt is one job, a new
+        # attempt a new one, and the answer names the attempt it belongs to (CR-RT-08).
+        if request.get("snapshotId") not in (None, session_context["id"]):
+            return {"state": "stale", "snapshotId": session_context["id"], "requestId": request.get("id")}
+        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"], request_id=request.get("id"))
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":
