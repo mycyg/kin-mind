@@ -59,15 +59,14 @@ function reads(t) {
 }
 const ctx=(id,text)=>{const marker='kin-context:context:'+id,body=marker+'\n'+text;return {id:'context:'+id,session:'main',epoch:'e1',marker,text:body,text_hash:sha(body)};};
 
-test('the receipt index keeps hashes, markers, offsets and times of injections and inputs, never text',async t=>{
+test('the receipt index keeps hashes, markers, offsets and times of injections, never text',async t=>{
   const f=rollout(t),context=ctx('a1','PRIVATE BACKGROUND');
   fs.appendFileSync(f.file,line({type:'turn_context',payload:{turn_id:'t1'}})+user('小光的话 <kin-host-event>'+'b'.repeat(32)+'</kin-host-event>')+assistant(context.text,'2026-09-24T01:00:00Z'));
   const window=new NativeWindow({file:f.file,threadId:'main',stateFile:f.stateFile});
   await window.poll();
   const hit=window.receipts.get(context.text_hash);
   assert.equal(hit.m[0],context.marker);assert.equal(hit.at,'2026-09-24T01:00:00Z');assert.ok(Number.isSafeInteger(hit.o));
-  const input=window.receipts.input('b'.repeat(32));
-  assert.ok(input.o>input.tc,'the turn context that owns the input comes first');
+  assert.equal(window.state.receipts.items.length,1,'an owner message without a marker is not indexed');
   const saved=fs.readFileSync(f.stateFile,'utf8');
   assert.ok(!saved.includes('PRIVATE BACKGROUND')&&!saved.includes('小光的话'),'no message text is kept');
   assert.equal(nativeWindowFor(f.file),window);

@@ -17,11 +17,10 @@ export function nativePressureRuntime(runtime,history) {
       kind:estimate!==undefined?'post-compaction-context-estimate':'input-usage'}};
 }
 
-/** How many injection and input receipts the window keeps. A receipt is looked
- * up right after its own append; older ones only matter while still unsettled. */
+/** How many injection receipts the window keeps. A receipt is looked up right
+ * after its own append; older ones only matter while still unsettled. */
 export const RECEIPTS_KEPT=512;
 const INJECTION=/kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+/g;
-const INPUT=/<kin-host-event>([a-f0-9]{32})<\/kin-host-event>/g;
 const INDEXED=/^kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+$/;
 const sha256=value=>createHash('sha256').update(value).digest('hex');
 const windows=new Map();
@@ -39,13 +38,12 @@ async function readLines(file,start,end,visit) {
 const publicParts=item=>item?.type==='response_item'&&item.payload?.type==='message'&&['user','assistant'].includes(item.payload.role)&&Array.isArray(item.payload.content)
   ?item.payload.content.filter(p=>['input_text','output_text'].includes(p?.type)&&typeof p.text==='string'):[];
 /** What a public message proves without keeping its words: the exact hash of each
- * text part that carries an injection marker, and the host event of an input. */
-function receiptsOf(item,offset,turnContext) {
+ * text part that carries an injection marker. */
+function receiptsOf(item,offset) {
   const found=[];
   for(const part of publicParts(item)) {
     const markers=[...new Set(part.text.match(INJECTION)??[])].slice(0,4);
     if(markers.length)found.push({h:sha256(part.text),m:markers,r:item.payload.role,o:offset,at:item.timestamp??null});
-    if(item.payload.role==='user')for(const [,event] of part.text.matchAll(INPUT))found.push({e:event,r:'user',o:offset,tc:turnContext,at:item.timestamp??null});
   }
   return found;
 }
@@ -66,18 +64,16 @@ export class NativeWindow {
   covers(){return this.state.receipts.from===0||Boolean(this.state.receipts.legacy);}
   index(entries) {
     const items=this.state.receipts.items;
-    for(const entry of entries)if(!items.some(r=>r.o===entry.o&&r.h===entry.h&&r.e===entry.e))items.push(entry);
+    for(const entry of entries)if(!items.some(r=>r.o===entry.o&&r.h===entry.h))items.push(entry);
     // Oldest indexed first out: a receipt found late by reconciliation is kept as long as a fresh one.
     if(items.length>RECEIPTS_KEPT)items.splice(0,items.length-RECEIPTS_KEPT);
   }
-  /** The receipt index (interface `nativeWindow.receipts`): by exact text hash, by
-   * marker, or by host input event. */
+  /** The receipt index (interface `nativeWindow.receipts`): by exact text hash or by marker. */
   get receipts() {
     const items=this.state.receipts.items,from=this.state.receipts.from,legacy=this.state.receipts.legacy??null;
     return {from,legacy,covers:this.covers(),
       get:hash=>items.findLast(r=>r.h===hash)??null,
-      find:({marker,textHash,role}={})=>items.findLast(r=>r.m&&(!marker||r.m.includes(marker))&&(!textHash||r.h===textHash)&&(!role||r.r===role))??null,
-      input:event=>items.findLast(r=>r.e===event)??null};
+      find:({marker,textHash,role}={})=>items.findLast(r=>r.m&&(!marker||r.m.includes(marker))&&(!textHash||r.h===textHash)&&(!role||r.r===role))??null};
   }
   save(){atomicJson(this.stateFile,this.state);}
   async poll() {
@@ -90,11 +86,10 @@ export class NativeWindow {
       // Lines are parsed only when their structure can matter here.
       const found=[];
       this.state.offset=await readLines(this.file,this.state.offset,end,(line,at)=>{
-        const turn=line.includes('"type":"turn_context"'),injection=line.includes('kin-context:')||line.includes('kin-checkpoint:')||line.includes('kin-effect:')||line.includes('<kin-host-event>');
-        if(!turn&&!injection&&!line.includes('"type":"compacted"')&&!line.includes('"type":"token_count"')&&!line.includes('"type":"session_meta"'))return;
+        const injection=line.includes('kin-context:')||line.includes('kin-checkpoint:')||line.includes('kin-effect:');
+        if(!injection&&!line.includes('"type":"compacted"')&&!line.includes('"type":"token_count"')&&!line.includes('"type":"session_meta"'))return;
         let item;try{item=JSON.parse(line);}catch{return;}
         if(item.type==='session_meta'&&item.payload.id!==this.threadId)throw Error('Native rollout owner mismatch');
-        if(item.type==='turn_context'){this.state.turnContext=at;return;}
         if(item.type==='compacted'){
           const id=item.payload.window_id??('compact:'+item.timestamp);
           if(!this.state.eventIds.includes(id)){this.state.eventIds.push(id);this.state.compactions++;this.state.events.push({id,kind:'context-compaction',state:'completed',threadId:this.threadId,at:item.timestamp,origin:'native-history'});}
@@ -103,7 +98,7 @@ export class NativeWindow {
           const info=item.payload.info;
           if(info?.last_token_usage){const u=info.last_token_usage;this.state.lastTokenUsage={inputTokens:u.input_tokens,cachedInputTokens:u.cached_input_tokens,outputTokens:u.output_tokens,totalTokens:u.total_tokens};this.state.modelContextWindow=info.model_context_window;this.state.measuredAt=item.timestamp;}
         }
-        if(injection)found.push(...receiptsOf(item,at,this.state.turnContext??null));
+        if(injection)found.push(...receiptsOf(item,at));
       });
       this.index(found);
       this.state.inode=stat.ino;this.save();return this.state;
@@ -123,12 +118,10 @@ export async function reconcileLegacyInjections(window,markers,{maxBytes=Infinit
   const wanted=[...new Set((markers??[]).filter(marker=>typeof marker==='string'&&INDEXED.test(marker)))];
   const end=receipts.from,start=Number.isFinite(maxBytes)?Math.max(0,end-maxBytes):0,found=[];
   if(wanted.length&&fs.existsSync(window.file)) {
-    let turnContext=null;
     await readLines(window.file,start,end,(line,at)=>{
-      if(line.includes('"type":"turn_context"')){turnContext=at;return;}
       if(!wanted.some(marker=>line.includes(marker)))return;
       let item;try{item=JSON.parse(line);}catch{return;}
-      found.push(...receiptsOf(item,at,turnContext).filter(r=>r.m?.some(marker=>wanted.includes(marker))));
+      found.push(...receiptsOf(item,at).filter(r=>r.m.some(marker=>wanted.includes(marker))));
     });
   }
   window.index(found);
