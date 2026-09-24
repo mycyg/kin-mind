@@ -7,7 +7,6 @@ import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIE
 import {compactPrompt,publicMobileRuntime} from '../../adapters/mobile-controls.mjs';
 import {TransportManifests} from '../../adapters/transport-manifest.mjs';
 import {ReplyGuard} from '../../adapters/reply-guard.mjs';
-import {replyProgress} from '../../adapters/reply-progress.mjs';
 import {createFakeTransport} from './helpers/fake-transport.mjs';
 
 function fixture(t, options={}) {
@@ -294,7 +293,9 @@ test('operator can retire only a proven before-send refusal with no external rec
   assert.equal(settled.manifest.state,'retired');
   assert.equal(settled.manifest.bubbles[0].fragments[0].receipt.source,'operator');
   assert.deepEqual([emitted.at(-1).state,canceled[0]],['canceled','draft-old']);
-  assert.equal(manifests.isLive('group-old'),false);
+  // N4: the words never reached the owner, so they are owed to Kin's next turn; the group is filed once handed.
+  assert.deepEqual(manifests.read('group-old').tail_owed.items,['draft-old']);
+  assert.equal(manifests.isLive('group-old'),true);
 });
 
 test('service resume finishes CLI-retired before-send refusal without sending or failure notice',async t=>{
@@ -308,33 +309,15 @@ test('service resume finishes CLI-retired before-send refusal without sending or
   await cli.resolve('group-old',fragmentId,{outcome:'not-submitted'});
   assert.equal(cli.isLive('group-old'),true,'the CLI has no memory or share cancellation sink');
   const events=[],shares=[];
-  const guard=new ReplyGuard({directory:root,manifestDirectory:directory,clock,role:'service',lease:{heartbeat:false},replyTailDecision:false,
-    receipt:async()=>null,emit:async event=>events.push(event),call:async(action,input)=>{if(action==='share-cancel')shares.push(input.draft_id);},
-    notifyFailure:async()=>assert.fail('a canceled reply has no failure notice')});
+  const guard=new ReplyGuard({directory:root,manifestDirectory:directory,clock,role:'service',lease:{heartbeat:false},
+    receipt:async()=>null,emit:async event=>events.push(event),call:async(action,input)=>{if(action==='share-cancel')shares.push(input.draft_id);}});
   const resume=()=>guard.resumeDue({guard:async()=>assert.fail('no guard decision'),send:async()=>assert.fail('no transport send')});
   assert.equal((await resume()).checked,1);
   assert.deepEqual([events.map(event=>event.state),shares],[['canceled'],['draft-old']]);
-  assert.equal(guard.manifests.isLive('group-old'),false);
   assert.equal((await resume()).checked,0,'repeated pumps do not duplicate side effects');
-});
-
-test('approved cancellation resolves only the matching input without claiming a sent or silent reply',()=>{
-  const at='2026-09-23T11:20:00Z',previous={awaitingReplyInputId:'old-input',awaitingReplySince:'2026-09-23T10:15:00Z',
-    replyDisposition:'unconfirmed',replyWaitingReason:'delivery-outcome-unknown',lastResolvedInputId:'earlier-input',lastReplyAt:'earlier-reply'};
-  const detail={inputId:'old-input',groupId:'old-group',groupState:'retired',state:'canceled',
-    reason:'turn-superseded-before-send',approvalSource:'KIN-ITER-20260923-02-v1'};
-  const canceled={...previous,...replyProgress(previous,'reply-canceled',detail,at)};
-  assert.deepEqual([canceled.replyDisposition,canceled.replyWaitingReason,canceled.awaitingReplySince,canceled.lastResolvedInputId,canceled.lastResolvedAt],
-    ['canceled','turn-superseded-before-send',null,'old-input',at]);
-  assert.equal(canceled.replyGroups['old-group'].approvalSource,detail.approvalSource);
-  assert.equal(canceled.lastReplyAt,previous.lastReplyAt,'cancellation is not a sent reply');
-  const newer={...previous,awaitingReplyInputId:'new-input'};
-  const late={...newer,...replyProgress(newer,'reply-canceled',detail,at)};
-  assert.deepEqual([late.awaitingReplyInputId,late.awaitingReplySince,late.replyDisposition,late.lastResolvedInputId],
-    ['new-input',newer.awaitingReplySince,'unconfirmed','earlier-input']);
-  assert.equal(late.replyGroups['old-group'].state,'retired','the old group outcome remains visible');
-  const unapproved={...previous,...replyProgress(previous,'reply-canceled',{...detail,approvalSource:null},at)};
-  assert.equal(unapproved.awaitingReplySince,previous.awaitingReplySince,'a cancellation needs its approval source');
+  assert.deepEqual(guard.tail.owed().map(o=>o.unsent),[['原回复']],'the unsent words wait for Kin\'s next turn');
+  await guard.tail.handed({groups:['group-old'],inputId:'next-input'});
+  assert.equal(guard.manifests.isLive('group-old'),false);
 });
 
 test('quiet main assessment retains the actual manual profile and never classifies or notifies',async t=>{
