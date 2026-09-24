@@ -13,6 +13,11 @@ import httpx
 
 from ._operations import OPERATIONS
 
+# Attachments, pages, clips and exports are bytes whatever their media type says: a JSON or
+# NDJSON attachment is the file the owner stored, not a response to parse. The same list as the
+# TypeScript SDK's `binaryOperations` (CR-MEM-12).
+BINARY_OPERATIONS = frozenset({"read_attachment", "read_page", "read_clip", "download_export"})
+
 
 class Client:
     def __init__(
@@ -70,6 +75,8 @@ class Client:
             kwargs["json"] = body
         response = self.http.request(spec["method"], path, **kwargs)
         response.raise_for_status()
+        if operation in BINARY_OPERATIONS:
+            return response.content
         return (
             response.json()
             if "json" in response.headers.get("content-type", "")
