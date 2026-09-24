@@ -4,7 +4,6 @@ service answers with, and a console read changes nothing it reads (S1-01, S1-02,
 import sys
 from pathlib import Path
 
-import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import TypeAdapter
@@ -75,16 +74,11 @@ def test_plain_scope_recall_and_read_follow_the_contract(tmp_path):
     conforms(client, Scope())
 
 
-@pytest.mark.xfail(strict=True, reason="S1-01/E3-20: the kin context branch answers outside the model /v1/recall "
-                   "publishes (500); the service side is WS6's. Remove this mark when it lands.")
 def test_kin_scope_recall_and_read_follow_the_contract(tmp_path):
     _, client = store(tmp_path, KIN, records=True, context=True)
     conforms(client, KIN)
 
 
-@pytest.mark.xfail(strict=True, reason="S1-02: a recall without a session still writes mind_memory_access and "
-                   "mind_event_usage rows (and leases the foreground); the service side is WS6's. Remove this mark "
-                   "when it lands.")
 def test_a_console_recall_changes_nothing_it_reads(tmp_path):
     engine, client = store(tmp_path, KIN, records=True, context=True, usage_reinforcement=True,
                            temperature_shadow=True, event_lifecycle=True)
