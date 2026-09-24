@@ -190,3 +190,78 @@ def test_the_old_evidence_scan_is_switched_off_only_where_the_table_agrees(store
     with engine.db.connect() as conn:
         assert not optimized(conn, mind.scope.key(), evidence_keys.LEGACY_FLAG)
         assert optimized(conn, other.scope.key(), evidence_keys.LEGACY_FLAG)
+
+
+# What this release adds to a store's structure. A store written by the release before has none of
+# it, and a dry run must leave it that way (CR-MEM-05).
+ADDED_INDEXES = ("job_recent", "job_state_recent", "mind_action_event_recent", "mind_action_event_state",
+                 "mind_plan_history_command", "mind_plan_wish_sync")
+ADDED_TABLES = ("mind_session_advice",)
+SQLITE_OWN = ("memory.sqlite3-wal", "memory.sqlite3-shm")
+
+
+def as_before_this_release(root):
+    conn = sqlite3.connect(root / "memory.sqlite3", isolation_level=None)
+    for name in ADDED_INDEXES:
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+    for name in ADDED_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {name}")
+    conn.execute("DELETE FROM meta WHERE key='schema_version'")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    cache = root / "cache"
+    if cache.exists():
+        for path in sorted(cache.rglob("*"), reverse=True):
+            path.rmdir() if path.is_dir() else path.unlink()
+        cache.rmdir()
+    (root / "memory.sqlite3").chmod(0o644)
+
+
+def on_disk(root):
+    """The store's structure, its metadata, its bytes and mode, and every path under the root."""
+    import hashlib
+
+    path = root / "memory.sqlite3"
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as conn:
+        structure = conn.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+        meta = conn.execute("SELECT key,value FROM meta ORDER BY key").fetchall()
+    conn.close()
+    return {"structure": structure, "meta": meta, "bytes": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "mode": path.stat().st_mode & 0o777,
+            "paths": sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.name not in SQLITE_OWN)}
+
+
+def test_a_dry_run_on_a_store_from_before_this_release_builds_nothing(store, capsys):
+    engine = store[0]
+    root = engine.db.root
+    as_before_this_release(root)
+    before = on_disk(root)
+    assert not {name for _, name, _ in before["structure"]} & {"job_recent", "job_state_recent"}
+    assert repair.main(["--root", str(root)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["applied"] is False and report["steps"]["origins"]["plan"]["by_namespace"] == {
+        "kin-session-maintenance": 4}
+    # Every step read, nothing built: no index or table of this release, no metadata filled in, not a
+    # byte of the file, not its mode, no cache directory beside it.
+    assert on_disk(root) == before
+    # The read-only connection refuses a write outright.
+    with pytest.raises(PermissionError):
+        with repair.ReadOnlyStore(root / "memory.sqlite3").connect(write=True):
+            pass
+    # Only an apply builds this release's structure.
+    repair.run(root, apply=True, steps=("indexes",))
+    after = on_disk(root)
+    assert {"job_recent", "job_state_recent"} <= {name for _, name, _ in after["structure"]}
+    assert ("schema_version", 1) in after["meta"]
+
+
+def test_a_root_without_a_store_is_refused_and_nothing_is_created(tmp_path, capsys):
+    missing = tmp_path / "mistyped" / "MemoryPalace"
+    for argv in (["--root", str(missing)], ["--root", str(missing), "--apply"]):
+        assert repair.main(argv + ["--output", str(tmp_path / "report.json")]) == 2
+        out, err = capsys.readouterr()
+        assert out == "" and "refused" in err and "No memory store" in err
+    assert not (tmp_path / "mistyped").exists() and not (tmp_path / "report.json").exists()
+    with pytest.raises(repair.Refused):
+        repair.run(missing, apply=True)
+    assert not (tmp_path / "mistyped").exists()

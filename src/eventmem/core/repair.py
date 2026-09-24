@@ -7,7 +7,14 @@
 
 Run it with the memory service stopped, after the backup the deploy takes. Every step is
 idempotent: it asks what is already done rather than counting what it did, so a second run
-reports nothing left and writes nothing. Nothing here deletes a record, a source, a revision or
+reports nothing left and writes nothing. The dry run opens the store read-only and builds
+nothing: no table, index or metadata of this release, no cache under the root (CR-MEM-05).
+A root without a `memory.sqlite3` is refused in both modes rather than becoming a new store.
+
+Exit status: 0 with the JSON report on stdout (also in `--output`, 0600); 2 when refused — an
+unknown step or no store at the root — with one line on stderr and nothing on stdout; anything
+else (1) is a failure with a traceback, and an `--apply` that failed may have finished the steps
+before the failing one, each of which a rerun finds done. Nothing here deletes a record, a source, a revision or
 a history row; records leave active use by a new revision (`archive`, `superseded`), queue rows
 change state, and derived indexes are rebuilt. The report carries identifiers, namespaces and
 counts only — never a line of content.
@@ -48,8 +55,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from .db import digest
 from .models import Scope
@@ -71,6 +81,41 @@ COMMAND = "repair-20260924"
 ARCHIVED_NAMESPACES = ("kin-session-maintenance",)
 CHUNK = 200
 IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
+
+
+class Refused(ValueError):
+    """The command was asked for something it will not do; nothing was read or written."""
+
+
+class ReadOnlyStore:
+    """The store as the dry run sees it (CR-MEM-05): a read-only connection per read, and nothing
+    created or initialised on the way in. `Engine()` would run this release's DDL, fill in
+    metadata and pin the tokenizer cache under the root before the report said a word. The only
+    files that may appear are the `-wal` and `-shm` SQLite coordinates its readers with."""
+
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.root = self.path.parent
+        self.blobs = self.root / "blobs"
+
+    @contextmanager
+    def connect(self, write=False):
+        if write:
+            raise PermissionError("The dry run writes nothing")
+        conn = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA query_only=1")
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+    def metric(self, name, value, data=None):
+        """A dry run records nothing, not even that it ran."""
 
 
 def _table(conn, name):
@@ -374,13 +419,15 @@ def _evidence_scopes(conn):
 
 def plan_evidence(engine):
     from kin_mind import evidence_keys
-    from kin_mind.state import Mind
+
+    from .models import now
 
     with engine.db.connect() as conn:
         scopes = _evidence_scopes(conn)
     found = []
     for scope in scopes:
-        mind = Mind(engine, Scope.model_validate(json.loads(scope)))
+        # What the two reads use of a mind, and not a `Mind`, whose constructor runs its DDL.
+        mind = SimpleNamespace(engine=engine, scope=Scope.model_validate(json.loads(scope)), clock=now)
         filling = evidence_keys.backfill(mind, apply=False)
         checked = evidence_keys.verify(mind)
         found.append({"scope": scope, "would_insert": filling["would_insert"], "state": checked["state"],
@@ -457,8 +504,15 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
 
     unknown = sorted(set(steps) - set(STEPS))
     if unknown:
-        raise ValueError(f"Unknown steps: {', '.join(unknown)}")
-    engine = Engine(Path(root))
+        raise Refused(f"Unknown steps: {', '.join(unknown)}")
+    store = Path(root).expanduser() / "memory.sqlite3"
+    if not store.is_file():
+        # A mistyped root would otherwise become a new, empty store, and the report would say
+        # there was nothing to repair.
+        raise Refused(f"No memory store at {store}")
+    # Only an apply builds the engine, and with it this release's structure; the dry run reads
+    # the store exactly as it is.
+    engine = Engine(store.parent) if apply else SimpleNamespace(db=ReadOnlyStore(store))
     report = {"command": COMMAND, "root": str(Path(root)), "applied": apply, "steps": {}}
     with engine.db.connect() as conn:
         origins = plan_origins(conn) if "origins" in steps else []
@@ -540,7 +594,11 @@ def main(argv=None):
                         help=f"comma-separated, from {', '.join(STEPS)}; default {','.join(DEFAULT_STEPS)}")
     parser.add_argument("--output", help="also write the report here (0600)")
     args = parser.parse_args(argv)
-    report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s))
+    try:
+        report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s))
+    except Refused as refusal:
+        print(f"{COMMAND}: refused: {refusal}", file=sys.stderr)
+        return 2
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         path = Path(args.output)
