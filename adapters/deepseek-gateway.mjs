@@ -241,16 +241,19 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       }
       const raw = Buffer.concat(parts).toString('utf8');
       const parsed=JSON.parse(raw);
+      const identity=nativeInstructionRequestIdentity(req.headers,parsed);
       // The callback is trusted host state. A request never self-declares its
       // purpose; dynamic contact drafts receive their structured contract from
       // the same explicit attribution that owns their background usage lane.
-      attributed = attribute() ?? nativeTurnPurpose();
+      // It is told which native thread asked, so a fork beside the owner's turn
+      // is told apart from her own request (CR-MIND-06).
+      attributed = attribute({identity, body: parsed}) ?? nativeTurnPurpose();
       const requestProfile=profile??(attributed.purpose==='native-assessment'?'assessment':attributed.purpose==='native-contact-draft'?'contact-draft':null);
       const body = deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
       const incomingInstructions=instructionTextEvidence(parsed.instructions);
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:'deepseek',lane:attributed.lane,
         purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,
-        requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:nativeInstructionRequestIdentity(req.headers,parsed),
+        requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:identity,
         nativeRequestSha256:sha256(raw),developerInstructions:developerInstructionEvidence(parsed),
         incomingInstructions,forwardedInstructions:instructionTextEvidence(body.instructions)};
       if(requiredIncomingInstructions&&(incomingInstructions.sha256!==requiredIncomingInstructions.sha256||
