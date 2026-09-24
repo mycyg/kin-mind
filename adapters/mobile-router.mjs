@@ -240,7 +240,6 @@ export class MobileRouter {
           this.notSubmitted(record,'release-carryover',{restart:true});
         }
       }
-      if(carried?.freeze&&!this.frozen())this.state.freeze={reason:carried.freeze.reason,at:carried.freeze.at??at,until:carried.freeze.until,by:'kin-deploy'};
       for(const record of Object.values(this.state.inputs)) {
         if(record.carriedOver)continue;
         if(record.state==='accepted')record.answer??={state:'legacy'};
@@ -253,6 +252,19 @@ export class MobileRouter {
         task.acceptedAt??=task.createdAt??at;task.acceptance??='legacy';
       }
       this.state.ledgerVersion=2;
+    }
+    // KIN-FIX-20260924, CR2-OPS-04: a release's freeze comes beside the state file, and
+    // the release renews it before it starts a host, so a long stop never lets a new
+    // host dispatch before it is verified. It is taken up at every start: extended,
+    // never shortened, never over another holder's freeze; the same hand-over is not
+    // taken up again once it has been lifted.
+    const handed=readCarryover(file)?.freeze,taken=this.state.freezeHandover;
+    if(handed&&handed.until>at&&!(taken?.reason===handed.reason&&taken.until===handed.until&&!this.frozen())){
+      const current=this.frozen()?this.state.freeze:null;
+      if(!current||current.reason===handed.reason){
+        this.state.freeze={...(current??{}),reason:handed.reason,at:current?.at??handed.at??at,until:Math.max(handed.until,current?.until??0),by:current?.by??'kin-deploy'};
+        this.state.freezeHandover={reason:handed.reason,until:handed.until};
+      }
     }
     this.archivedIds=this.loadArchivedIds();
     this.save('startup');
