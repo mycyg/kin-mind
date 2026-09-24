@@ -187,7 +187,8 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       return result;
     },
     reconcileCompact:async operationId=>{const session=await routing.ensureSession('kin-host:compact-status');return session.agentInfo.connection.extMethod('_kin/compact',{sessionId:manager.fence().threadId,operationId,checkOnly:true});},
-    reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id});},
+    // The attempt travels to the mind's queue key and comes back in its answer (CR-RT-08).
+    reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id,snapshotId:event.cause,attempt:event.attempt});},
     createCandidate:request=>native.create(request),injectCandidate:request=>native.inject(request),verifyCandidate:request=>native.verify(request),
     closeCandidate:()=>native.close(),
     reconcileCandidate:async candidate=>candidate.native.path&&fs.existsSync(candidate.native.path)&&(await checkpointMarker(candidate.native.path,'kin-checkpoint:'+candidate.injectionId)).found,

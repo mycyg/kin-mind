@@ -1431,19 +1431,25 @@ class Appraisals:
             )
         return {"id": job_id, "state": self.status(job_id)["state"]}
 
-    def enqueue_maintenance(self, snapshot_id, agent_version):
+    def enqueue_maintenance(self, snapshot_id, agent_version, request_id=None):
         """A session review. Its stimulus is the session snapshot the host observed, named by its
         id; nothing is received into memory for it, so no maintenance source accumulates (item 7).
-        One job per snapshot."""
+        One job per snapshot and host attempt: asked again for the same attempt it is the same
+        job, a new attempt is a new one (CR-RT-08). The answer says which job, for which snapshot
+        and attempt, and whether this call created it."""
         if not isinstance(snapshot_id, str) or not snapshot_id:
             raise ValueError("A session review needs the observed snapshot id")
-        job_id = "appraise_" + digest([self.mind.scope.key(), "session-maintenance", snapshot_id])[:32]
+        if request_id is not None and (not isinstance(request_id, str) or not request_id):
+            raise ValueError("A session review attempt needs an id")
+        key = [self.mind.scope.key(), "session-maintenance", snapshot_id] + ([request_id] if request_id else [])
+        job_id = "appraise_" + digest(key)[:32]
         data = {"evidence_ids": [], "agent_version": agent_version, "origin": "reflection",
-                "stimulus": "session-maintenance", "session_snapshot_id": snapshot_id}
+                "stimulus": "session-maintenance", "session_snapshot_id": snapshot_id,
+                **({"session_request_id": request_id} if request_id else {})}
         with self.engine.db.connect(write=True) as conn:
-            conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                         (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data)))
-        return {"id": job_id, "state": self.status(job_id)["state"]}
+            created = conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                                   (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data))).rowcount == 1
+        return {"id": job_id, "state": self.status(job_id)["state"], "snapshotId": snapshot_id, "requestId": request_id, "created": created}
 
     def migrate_continuity(self, evidence_ids, agent_version):
         """One durable migration; include original evidence of live wishes only."""
@@ -2248,7 +2254,8 @@ class Appraisals:
                         # advice_record() validates before it builds anything. The judgment goes to the
                         # session registry's carrier inside this transaction, not into the versioned
                         # mind state (DB1-03, §5.6). A core without that carrier keeps the old place.
-                        record = advice_record(proposal.session_advice, self.session_context, receipt, eid)
+                        record = advice_record(proposal.session_advice, self.session_context, receipt, eid,
+                                               request_id=data.get("session_request_id"))
                         from . import session_advice as advice_store
                         submit = getattr(advice_store, "submit", None)
                         if record and submit:

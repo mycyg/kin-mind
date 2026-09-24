@@ -83,3 +83,57 @@ def test_automatic_background_has_a_fixed_ceiling_and_ignores_free_room(setup):
     large = contexts.build('', purpose='chat', session='other', runtime={'model': 'synthetic', 'contextAvailableTokens': 200000,
                                                                           'note': '很长的运行说明。' * 6000})
     assert large['budget'] == INJECTION_CEILING and large['tokens'] <= INJECTION_CEILING
+
+
+def test_each_review_attempt_is_its_own_job_and_its_answer_names_it(setup):
+    # CR-RT-08: the queue key was the snapshot alone, so a second attempt about the same
+    # snapshot came back as the first, finished job and nothing new was ever judged.
+    from kin_mind import session_advice
+    from kin_mind.appraisal import Appraisal, Appraisals
+    from kin_mind.session_advice import SessionAdvice
+    from test_kin_mind import FakeReviewer
+
+    class Reviewer(FakeReviewer):
+        def appraise(self, context):
+            self.calls += 1
+            return self.proposal, {"provider": "deepseek", "model": "synthetic"}
+
+    mind, _, _ = setup
+    context = {"id": "snapshot-8", "binding": {"generation": 2}, "evidence": [], "recent": []}
+    jobs = Appraisals(mind, session_context=context)
+    first = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")
+    assert (first["created"], first["state"], first["requestId"], first["snapshotId"]) == (True, "pending", "review:snapshot-8:1", "snapshot-8")
+    again = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")
+    assert again["id"] == first["id"] and again["created"] is False, "the same attempt is the same job"
+    reviewer = Reviewer(Appraisal(reason="Keep the session", session_advice=SessionAdvice(action="keep", reason="Fine")))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")["state"] == "complete"
+    second = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:2")
+    assert second["id"] != first["id"] and second["created"] and second["state"] == "pending", "a new attempt is a new job"
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert reviewer.calls == 2
+    with mind.engine.db.connect() as conn:
+        carried = session_advice.latest(conn, mind.scope.key())
+    assert (carried["snapshotId"], carried["requestId"]) == ("snapshot-8", "review:snapshot-8:2")
+    # Without an attempt (an older host) the snapshot alone is the key, as it was.
+    assert jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"] == jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"]
+
+
+def test_the_tasks_a_migration_puts_into_its_snapshot_reach_the_restore_payload(setup):
+    # CR-RT-07: the snapshot action uses the tasks it is given to choose linked material but
+    # returns none, so a caller that does not put them back builds a checkpoint without them.
+    # The migration puts them back the way the host's collector does, and the payload the new
+    # thread is given carries every one of them.
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    tasks = [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张', 'private': 'not carried'}]
+    binding = {'conversationId': 'c', 'generation': 1}
+    snapshot = checkpoints.snapshot([], tasks=tasks)
+    assert 'tasks' not in snapshot
+    snapshot['items'] = [{'id': 'owner-1', 'revision': 'r1', 'role': 'user', 'text': '照片整理到哪了？', 'at': '2026-09-24T01:00:00Z',
+                          'basis': 'owner-statement', 'delivery': 'not-confirmed-by-this-record'}]
+    assert checkpoints.build(dict(snapshot), binding, budget=4000, allow_model=False, adaptive_budget=True)['payload']['tasks'] == []
+    snapshot['tasks'] = tasks
+    built = checkpoints.build(snapshot, binding, budget=4000, allow_model=False, adaptive_budget=True)
+    assert built['complete']
+    assert built['payload']['tasks'] == [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张'}]
