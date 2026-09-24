@@ -351,6 +351,11 @@ class TaskHandoffs:
             ]
 
     def work_locks(self, sender="mobile"):
+        """Tasks this sender still waits on: one not yet finished, or a finished one
+        whose closing notice is still on its way (pending or sending). A notice that
+        failed or whose send is unconfirmed is a delivery fact for status, reconciled
+        by its own id; it never holds the phone's work for good, and neither does a
+        finished task that had no notice at all (E3-11)."""
         with self.connect() as c:
             return [
                 r[0]
@@ -358,10 +363,11 @@ class TaskHandoffs:
                     """
                 SELECT id FROM handoffs h WHERE scope=?
                 AND json_extract(data,'$.sender')=?
-                AND json_extract(data,'$.state')!='canceled'
-                AND (json_extract(data,'$.state')!='completed' OR NOT EXISTS(
+                AND (json_extract(data,'$.state') NOT IN ('completed','failed','canceled')
+                OR EXISTS(
                     SELECT 1 FROM handoff_outbox o WHERE o.task_id=h.id
-                    AND o.state='accepted' AND json_extract(o.data,'$.kind')='completed'))
+                    AND o.state IN ('pending','sending')
+                    AND json_extract(o.data,'$.kind')=json_extract(h.data,'$.state')))
             """,
                     (self.scope, sender),
                 )
