@@ -13,8 +13,28 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "./config.js";
-import type { InjectFn, ToolObservation, MaintenanceHost } from "./runtime.js";
-import type { FeedTodo } from "./feed.js";
+import type { FeedTodo } from "./narrow.js";
+
+/** Put a text into the model context as a `form: 'recall'` user message. */
+export type InjectFn = (text: string) => void;
+
+/** A host that can run work from a true idle phase; dsh's `Agent` satisfies it. */
+export interface MaintenanceHost {
+  runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+}
+
+/** One tool result as the service receives it. */
+export interface ToolObservation {
+  sessionId: string;
+  cwd: string;
+  toolName: string;
+  callId: string;
+  args: unknown;
+  isError: boolean;
+  value: unknown;
+  errorMessage: string | undefined;
+  contentText: string;
+}
 
 export class ServiceRuntime {
   private pending = new Map<string, Promise<void>>();

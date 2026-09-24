@@ -1,6 +1,7 @@
-/** MemoryPalace 1.0 DeepSeek Harness adapter.
- * Default: durable event spool and common Python service for capture, recall,
- * context and lifecycle. legacyMode explicitly selects the file-based adapter.
+/** MemoryPalace 1.0 DeepSeek Harness adapter: a durable event spool and the common
+ * Python service for capture, recall, context and lifecycle. The file-based `.memory`
+ * adapter (legacyMode) was removed with that store; a config that still asks for it
+ * is refused at load.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,18 +16,12 @@ import { guard, guardAsync } from './log.js'
 import type { LogTarget } from './log.js'
 import { MemoryPaths } from './memory.js'
 import { asTodos, blocksToText } from './narrow.js'
-import { EventmemRuntime } from './runtime.js'
 import { ServiceRuntime } from './service-runtime.js'
-import type { InjectFn } from './runtime.js'
+import type { InjectFn } from './service-runtime.js'
 
 export { Config } from './config.js'
-export type { ToolRole } from './config.js'
-export { DEFAULT_DELEGATION_TOOLS, DEFAULT_TOOL_NAME_MAP, DEFAULT_TOOL_ROLES } from './config.js'
-export type { InjectFn, MaintenanceHost, ToolObservation } from './runtime.js'
-export { EventmemRuntime, SessionState } from './runtime.js'
+export type { InjectFn, MaintenanceHost, ToolObservation } from './service-runtime.js'
 export { MemoryPaths } from './memory.js'
-export { errorSignature } from './signature.js'
-export { anchorKey, intentTokens, tokenize } from './tokenize.js'
 export { relativeToProject } from './relpath.js'
 
 /** 插件名，同时用作注入消息的 `source.plugin`。 */
@@ -46,7 +41,10 @@ const EVENTMEM_SOURCE: MessageSource = { kind: 'plugin', plugin: name, form: 're
  */
 export function apply(ctx: Context, config: Config): void {
   if (!config.enabled) return
-  const runtime = config.legacyMode ? new EventmemRuntime(config) : new ServiceRuntime(config)
+  if ((config as { legacyMode?: unknown }).legacyMode === true) {
+    throw new Error('eventmem: legacyMode was removed with the .memory store; drop it from the config to use the MemoryPalace service')
+  }
+  const runtime = new ServiceRuntime(config)
   const agents = new Map<string, Agent>()
 
   const injectVia = (agent: Agent): InjectFn => (text: string) => {
@@ -81,18 +79,17 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('agent/session-start', ({ agent, source }) => {
     guard(logAt(() => agent.session), 'session-start', () => {
       agents.set(agent.session.id, agent)
-      if (runtime instanceof ServiceRuntime) runtime.sessionStart(agent.session.id, cwdOf(agent.session), injectVia(agent), source)
-      else runtime.sessionStart(agent.session.id, cwdOf(agent.session), injectVia(agent))
+      runtime.sessionStart(agent.session.id, cwdOf(agent.session), injectVia(agent), source)
     })
   })
 
-  if (runtime instanceof ServiceRuntime) ctx.on('tools/execute', async (exec, next) => {
+  ctx.on('tools/execute', async (exec, next) => {
     const agent = exec.agent
     if (agent) await guardAsync(logAt(() => agent.session), 'pre-action', () => runtime.preAction(agent.session.id, cwdOf(agent.session), exec.name, exec.arguments, injectVia(agent)))
     return next()
   })
 
-  // ---- 工具结果：纯观察浮现 ＋ feed 落盘 ----
+  // ---- 工具结果：交给服务记录 ----
   ctx.on('tools/result', (exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) => {
     guard(logAt(() => exec.agent?.session), 'tools/result', () => {
       const agent = exec.agent
@@ -117,10 +114,10 @@ export function apply(ctx: Context, config: Config): void {
     guard(logAt(() => session), 'session/event', () => {
       switch (event.type) {
         case 'user/message':
-          if (runtime instanceof ServiceRuntime && event.data.source.kind === 'user') runtime.message(session.id, cwdOf(session), 'user', blocksToText(event.data.content), event.seq)
+          if (event.data.source.kind === 'user') runtime.message(session.id, cwdOf(session), 'user', blocksToText(event.data.content), event.seq)
           return
         case 'assistant/message':
-          if (runtime instanceof ServiceRuntime) runtime.message(session.id, cwdOf(session), 'assistant', blocksToText(event.data.message.content), event.seq)
+          runtime.message(session.id, cwdOf(session), 'assistant', blocksToText(event.data.message.content), event.seq)
           return
         case 'todo/write': {
           const agent = agentFor(session)
