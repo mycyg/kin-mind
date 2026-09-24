@@ -62,11 +62,33 @@ test('a superseded wholly-unsent attempt releases for DS review instead of host 
  assert.equal(settled.decision,undefined);assert.equal(settled.failure.category,'source-changed');
 });
 
-test('only the semantic decision carried by a safe batch can retire a wish',async()=>{
- const semantic={action:'abandon',reason:'The group repeats something already shared'};
- const{loop,events}=fixture({send:async()=>({state:'canceled',safeToRelease:true,acceptedBubbles:0,decision:semantic})});
- await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'canceled');assert.deepEqual(settled.decision,semantic);
- assert.equal(settled.reason,undefined);
+test('no reviewer word retires a wish: a safe canceled group goes back to Kin (WS8 docs pass, AD2-16)',async()=>{
+ // A receipt that still carried an old whole-group verdict is read like any other canceled group.
+ const verdict={action:'abandon',reason:'The group repeats something already shared'};
+ const{loop,events}=fixture({send:async()=>({state:'canceled',safeToRelease:true,acceptedBubbles:0,decision:verdict})});
+ await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'canceled');assert.equal(settled.decision,undefined);
+ assert.equal(settled.reason,'contact-review-failed');assert.equal(settled.failure.code,'contact-canceled-without-semantic-decision');
+});
+
+test('the group check refuses nothing and holds nothing: an old refusal verdict or a file not ready goes back to Kin at once (WS8 docs pass)',async()=>{
+ const run=async({preflight,verifyFile,files=[]})=>{
+   const journal=new Map();let transports=0;
+   const send=createContactBatch({read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),
+     preflight,verifyFile,send:async()=>{transports++;return {state:'accepted',messageId:'m'};}});
+   return {result:await send({id:'group-9',text:'Hello',files,channel:'feishu'}),journal,transports:()=>transports};
+ };
+ for(const state of ['duplicate','silent','merged']) {
+   const {result,journal,transports}=await run({preflight:async()=>({state,reason:'synthetic'})});
+   assert.equal(result.state,'needs-review',state);assert.equal(result.safeToRelease,true);assert.equal(result.decision,undefined);
+   assert.equal(result.failure.code,'contact-review-verdict-invalid');assert.equal(transports(),0);
+   assert.equal(journal.get('group-9').items.every(item=>item.state==='unsent'),true,'nothing is canceled on a verdict');
+ }
+ const file={path:'/synthetic/artifact.txt',bytes:3,sha256:'a'.repeat(64)};
+ const {result,journal,transports}=await run({preflight:async()=>assert.fail('the group is not checked before its files'),
+   verifyFile:async()=>({state:'pending',reason:'still-writing'}),files:[file]});
+ assert.equal(result.state,'needs-review');assert.equal(result.failure.category,'source-changed');assert.equal(result.failure.code,'still-writing');
+ assert.equal(transports(),0);
+ const stored=journal.get('group-9');assert.equal(stored.reviewFailures,undefined);assert.equal(stored.reviewNotBefore,undefined);
 });
 
 test('a malformed review verdict remains pre-send and releases the owner slot for DS review',async()=>{

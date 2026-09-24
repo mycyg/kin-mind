@@ -102,8 +102,6 @@ export class MindLoop {
       if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
         if(candidate.owner_epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
           reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
-        if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
-          attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
         return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
           failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
       }
@@ -184,8 +182,6 @@ export class MindLoop {
         if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
           if(epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
             reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
-          if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
-            attempt_id:attempt.id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
           return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
             failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
         }

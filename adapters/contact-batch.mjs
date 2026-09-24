@@ -4,11 +4,11 @@ import {CHANNEL_CONTRACTS,channelContract,classifyReceipt,normalizeReceipt} from
 import {fragmentText,fileFragment} from './text-fragments.mjs';
 import {transportId} from './transport-manifest.mjs';
 
-/** Verdicts that refuse a whole group. None of them applies to one bubble. */
-const REFUSED=['duplicate','silent','merged'];
 const BEGUN=['pending','accepted','unconfirmed'];
-const REVIEW_STATES=new Set(['ready','pending','needs-review',...REFUSED]);
-const HOLD_BASE_MS=60000,HOLD_MAX_MS=15*60000;
+/** What the host's preflight may answer. It is a local check (reply-guard directReply): a group it
+ * does not release goes back to Kin. No reviewer refuses a group or holds it any more (AD2-16,
+ * N17), so a verdict naming the old refusals (duplicate, silent, merged) is simply invalid. */
+const REVIEW_STATES=new Set(['ready','pending','needs-review']);
 const FAILURE_CATEGORIES=new Set(['contract','model-unavailable','source-changed','model-output','unknown']);
 const RETRY_CONDITIONS=new Set(['repair-input','backoff','source-change','deepseek-decision','reconcile','none']);
 /** A platform's own refusal code travels as a code and never as a message. */
@@ -164,12 +164,14 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       }
     }
     if(batch.state==='needs-review'&&!superseded)return result(batch);
-    // One review of the whole group, before its first bubble is exposed: the
-    // group is released, held with a visible reason, or refused as a whole. A
-    // verdict never cancels a remainder the owner was already promised, and a
-    // group that is already reviewed is never charged for a second one.
+    // One local check of the whole group, before its first bubble is exposed: the
+    // group is released, or goes back to Kin with its reason. It never cancels a
+    // remainder the owner was already promised, and a group that is already
+    // checked is never checked again.
     if(!batch.review&&batch.items.some(x=>x.state==='unsent')) {
       if(!await eligible()||!await guard()){batch.state='pending';await write(id,batch);return result(batch);}
+      // A journal an older release held (its reviewer's failures and pause) is honoured as written;
+      // nothing sets either field any more.
       const legacyFailures=batch.reviewFailures??0;
       if(legacyFailures>=maxReviewFailures)return needsReview(batch,id,reviewFailure({},
         {category:'unknown',stage:'contact-review-model',code:'legacy-review-failures-exhausted',retry_condition:'deepseek-decision'}));
@@ -179,7 +181,10 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         try {checked=await verifyFile(item.file);}
         catch {return needsReview(batch,id,reviewFailure({},
           {category:'source-changed',stage:'contact-review-source',code:'contact-file-verification-failed',retry_condition:'source-change'}));}
-        if(checked.state!=='ready')return hold(batch,id,checked,false);   // a local check, free to repeat
+        // A local check with no model call: a file that is not ready goes back to Kin at once,
+        // like one that fails its check; nothing waits or counts a failure against the group.
+        if(checked.state!=='ready')return needsReview(batch,id,reviewFailure(checked,
+          {category:'source-changed',stage:'contact-review-source',code:'contact-file-not-ready',retry_condition:'source-change'}),checked.reason);
       }
       const reviewed=batch.items.filter(x=>!x.file&&x.state==='unsent');
       const entries=reviewed.map(item=>({draft_id:item.draftId,text:item.text,references:item.references??[],bubble_index:item.bubbleIndex}));
@@ -196,8 +201,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         verdict={state:'pending',reason:failure.code,failure};}
       if(!verdict||typeof verdict!=='object'||Array.isArray(verdict)||!REVIEW_STATES.has(verdict.state))return needsReview(batch,id,reviewFailure({},
         {category:'contract',stage:'contact-review-contract',code:'contact-review-verdict-invalid',retry_condition:'repair-input'}));
-      if(REFUSED.includes(verdict.state))return refuse(batch,id,verdict.reason??verdict.state);
-      if(verdict.state!=='ready')return hold(batch,id,verdict,true);
+      if(verdict.state!=='ready')return needsReview(batch,id,reviewFailure(verdict),verdict.reason);
       if(!checkedContract(reviewed,verdict))return needsReview(batch,id,reviewFailure({},
         {category:'contract',stage:'contact-review-contract',code:'contact-review-response-mismatch',retry_condition:'repair-input'}));
       freeze(batch,reviewed,verdict);await write(id,batch);
@@ -230,18 +234,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     else if(batch.state==='canceled'&&!batch.deliveryStarted&&!batch.items.some(x=>BEGUN.includes(x.state)))batch.safeToRelease=true;
     await write(id,batch);return result(batch);
   }
-  /** Not released as a whole. The preflight is a local check now, so a group it does not
-   * release goes back to Kin at once instead of waiting out a semantic hold (AD2-16). Only a
-   * file whose check is not ready yet waits and is asked again, within a finite budget. */
-  async function hold(batch,id,verdict,preflighted) {
-    const failure=reviewFailure(verdict);
-    batch.failure=failure;batch.lastFailure=failure;
-    if(preflighted||['contract','source-changed'].includes(failure.category)||verdict.state==='needs-review')return needsReview(batch,id,failure,verdict.reason);
-    if((batch.reviewFailures=(batch.reviewFailures??0)+1)>=maxReviewFailures)
-      return needsReview(batch,id,{...failure,code:'contact-review-failures-exhausted',retry_condition:'deepseek-decision'},'contact-review-failures-exhausted');
-    batch.reviewNotBefore=verdict.retryAt??now()+(verdict.retryAfterMs??Math.min(HOLD_MAX_MS,HOLD_BASE_MS*2**Math.max(0,batch.reviewFailures-1)));
-    batch.reason=verdict.reason;batch.state='pending';await write(id,batch);return result(batch);
-  }
+  /** Not released as a whole: the group goes back to Kin at once, before any bubble is exposed
+   * when that is still true, never waiting out a hold (AD2-16). */
   async function needsReview(batch,id,failure,reason) {
     if(batch.items.some(item=>BEGUN.includes(item.state))||batch.deliveryStarted) {
       batch.failure={...failure,retry_condition:'reconcile'};batch.reason=reason??failure.code;batch.state='unconfirmed';
@@ -251,22 +245,12 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='needs-review';batch.safeToRelease=true;delete batch.reviewNotBefore;
     await write(id,batch);return result(batch);
   }
-  /** Refused as a whole: every bubble that was never exposed is canceled under
-   * one reason, and that reason stays on the finished batch. What was already
-   * sent stays sent; the review precedes the first bubble, so usually nothing was. */
-  async function refuse(batch,id,reason) {
-    const semanticReason=typeof reason==='string'&&reason.trim()?reason.trim().slice(0,1200):'Whole-group semantic review declined the unsent draft';
-    for(const item of batch.items.filter(x=>x.state==='unsent'))Object.assign(item,{state:'canceled',reason});
-    batch.reason=reason;batch.decision={action:'abandon',reason:semanticReason};batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'canceled';
-    batch.safeToRelease=!batch.deliveryStarted&&!batch.items.some(x=>BEGUN.includes(x.state));delete batch.failure;
-    await write(id,batch);return result(batch);
-  }
   function result(batch){const ids=batch.items.filter(x=>x.state==='accepted').map(x=>x.messageId);return {
     id:batch.id,state:batch.state,reason:batch.reason,channel:batch.channel,messageId:batch.state==='accepted'?ids[0]:undefined,
     messageIds:ids,acceptedBubbles:ids.length,totalBubbles:batch.items.length,
     canceledBubbles:batch.items.filter(x=>x.state==='canceled').length,
     partial:batch.items.some(x=>x.state==='canceled'),visibility:'unverified',
-    ...(batch.failure?{failure:batch.failure}:{}),...(batch.decision?{decision:batch.decision}:{}),
+    ...(batch.failure?{failure:batch.failure}:{}),
     ...(batch.safeToRelease?{safeToRelease:true}: {})};}
   return request=>{
     if(active.has(request.id))return active.get(request.id);
