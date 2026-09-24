@@ -105,14 +105,23 @@ const unflattenItem = (item, reverse) => {
   return {...item, name: mapped.name, namespace: mapped.namespace};
 };
 
+export const DEEPSEEK_EFFORTS = Object.freeze(['none', 'low', 'high', 'max']);
+// The host's own background calls keep the instance's effort whatever a request
+// says; the phone session's requests are forwarded with the effort the session
+// asked for (its router profile, or the owner's explicit manual choice), and the
+// instance effort only fills in when a request names none.
+const FIXED_EFFORT_PROFILES = new Set(['exploration', 'computer-action-review']);
+export const forwardedEffort = (body, reasoningEffort, profile = null) =>
+  !FIXED_EFFORT_PROFILES.has(profile) && DEEPSEEK_EFFORTS.includes(body?.reasoning?.effort) ? body.reasoning.effort : reasoningEffort;
+
 // DeepSeek treats developer messages as user input. Map trusted developer
 // instructions to its supported system role; leave user data and receipts alone.
 export function deepseekRequest(body, reasoningEffort = 'high', profile = null, contracts = gatewayContracts()) {
   if (body.model !== 'deepseek-flash' || !Array.isArray(body.input)) throw Error('unsupported-request');
   if(body.instructions!==undefined&&typeof body.instructions!=='string')throw Error('unsupported-request');
-  if (!['none','low','high','max'].includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
+  if (!DEEPSEEK_EFFORTS.includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
   const bound = profile === null ? null : gatewayProfile(profile);
-  const result = {...body, reasoning: {effort: reasoningEffort}, max_output_tokens:Math.max(65536,body.max_output_tokens??0), store: false};
+  const result = {...body, reasoning: {effort: forwardedEffort(body, reasoningEffort, profile)}, max_output_tokens:Math.max(65536,body.max_output_tokens??0), store: false};
   result.input = body.input.filter(item => !isPrivateOutput(item)).map((item,index,items) => {
     // Native turn/start toolOutput emits a named host event without call_id.
     // DS requires call_id on tool output. Preserve it as non-user event data;
@@ -223,11 +232,15 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
         recordedAt:new Date().toISOString()});
     };
     try {
-      let raw = '';
+      // Bytes are counted as they arrive and decoded once: a running string would
+      // re-measure itself on every chunk and split multi-byte characters.
+      const parts = []; let received = 0;
       for await (const chunk of req) {
-        raw += chunk;
-        if (Buffer.byteLength(raw) > 64 * 1024 * 1024) throw Error('request-too-large');
+        received += chunk.length;
+        if (received > 64 * 1024 * 1024) throw Error('request-too-large');
+        parts.push(chunk);
       }
+      const raw = Buffer.concat(parts).toString('utf8');
       const parsed=JSON.parse(raw);
       // The callback is trusted host state. A request never self-declares its
       // purpose; dynamic contact drafts receive their structured contract from
@@ -237,7 +250,8 @@ export async function startDeepSeekGateway({key, fetchImpl = fetch, onUsage = ()
       const body = deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
       const incomingInstructions=instructionTextEvidence(parsed.instructions);
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:'deepseek',lane:attributed.lane,
-        purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,nativeRequestIdentity:nativeInstructionRequestIdentity(req.headers,parsed),
+        purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,
+        requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:nativeInstructionRequestIdentity(req.headers,parsed),
         nativeRequestSha256:sha256(raw),developerInstructions:developerInstructionEvidence(parsed),
         incomingInstructions,forwardedInstructions:instructionTextEvidence(body.instructions)};
       if(requiredIncomingInstructions&&(incomingInstructions.sha256!==requiredIncomingInstructions.sha256||

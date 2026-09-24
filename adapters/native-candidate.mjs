@@ -4,9 +4,14 @@ import fs from 'node:fs';
 import {checkpointMarker} from './native-window.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {isCompanionInstructionBinding,sameInstructionBinding} from './instruction-evidence.mjs';
+import {preferenceTier} from './codex-models.mjs';
 
 const requestedServiceTier=launch=>launch.fastMode==='on'?'fast':null;
 const evidence=(actual,key,expected)=>!Object.hasOwn(actual??{},key)?'unknown':actual[key]===expected?'verified':'mismatch';
+// A Fast thread may come back as `priority`; no tier and `default` are the same.
+const tierOf=value=>value==null?'default':preferenceTier(value);
+const tierEvidence=(actual,launch)=>!Object.hasOwn(actual??{},'serviceTier')?'unknown':
+  tierOf(actual.serviceTier)===tierOf(requestedServiceTier(launch))?'verified':'mismatch';
 
 /** App-server start/resume receipts are the authority for the profile that the
  * isolated thread actually accepted. `serviceTier` is a thread configuration
@@ -16,7 +21,7 @@ export function candidateResponseProfileEvidence(actual,launch) {
     model:evidence(actual,'model',launch.profile.model),
     modelProvider:evidence(actual,'modelProvider',launch.modelProvider),
     reasoningEffort:evidence(actual,'reasoningEffort',launch.profile.reasoningEffort),
-    serviceTierConfiguration:evidence(actual,'serviceTier',requestedServiceTier(launch)),
+    serviceTierConfiguration:tierEvidence(actual,launch),
   };
 }
 
