@@ -16,6 +16,8 @@ from kin_mind.appraisal import Appraisal, Appraisals, DeepSeek, Wish, appraisal_
 
 from kin_mind.state import AffectiveEvent, DesireChange, Mind
 
+from test_event_graph import findings, system  # noqa: F401  (the sharing fixture, E3-25)
+
 @pytest.fixture
 def setup(tmp_path):
     clock = [datetime.now(timezone.utc)]
@@ -540,3 +542,25 @@ def test_the_schema_is_created_once_per_store_per_process(setup, tmp_path):
     assert calls[:-1] and all(ran is False for _name, ran in calls[:-1]) and calls[-1] == ("mind", True)
     with fresh.engine.db.connect() as conn:
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_action_event_state'").fetchone()
+
+
+def test_a_delivered_bubble_counts_for_its_own_reply_not_the_newest_with_the_same_words(system):
+    """E3-25: the reply registration is found by the delivery's reply id. The same words in a later
+    reply do not take the use, and a delivery without a reply id counts under its own id."""
+    mind, memory, _source, clock = system
+    unit = findings(system)[0]
+    ref = [{"unit_id": unit["id"], "version": 1, "mode": "new"}]
+    for reply_id in ("reply-old", "reply-new"):
+        memory.sharing.register({"reply_id": reply_id, "bubbles": [{"text": "晚安", "references": ref}]})
+        clock[0] += timedelta(minutes=1)
+
+    def deliver(event_id, **extra):
+        memory.ingest({"id": event_id, "kind": "delivery", "at": mind.clock(), "channel": "a", "delivery_id": event_id,
+                       "bubble_id": event_id + "-b", "text": "晚安", "state": "accepted", "message_id": event_id + "-m",
+                       "references": ref, **extra})
+        with mind.engine.db.connect() as conn:
+            row = conn.execute("SELECT data FROM mind_share_coverage WHERE bubble_id=?", (event_id + "-b",)).fetchone()
+        return json.loads(row[0])["usage_id"]
+
+    assert deliver("to-old", reply_input_id="reply-old") == "reply-old"
+    assert deliver("unlinked") == "unlinked"

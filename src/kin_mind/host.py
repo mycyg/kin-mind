@@ -388,11 +388,18 @@ def dispatch(config, action, request):
         else:
             return DeepSeek.from_engine(engine)
 
-    if action == "review":
+    def review_pause():
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
-        # The existing minute review queues work; the original host owns execution
-        # and waits for owner tasks. No extra model call is used for the clock.
+        from .history import COMPACTING, compacting
+        with engine.db.connect() as conn:
+            # Every commit is refused while history compaction owns the store (WS6, K3-14): the
+            # minute neither queues nor claims anything until it ends.
+            return {"state": "paused", "reason": COMPACTING} if compacting(conn) else None
+
+    def review_minute(run=None):
+        """The minute's review: queue what is due, run one appraisal when `run` is given, then
+        settle the wishes it decided. No extra model call is used for the clock."""
         actions.crossings()
         from .plans import AutonomousPlans
         plans = AutonomousPlans(mind)
@@ -405,8 +412,7 @@ def dispatch(config, action, request):
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
-        provider = review_provider()
-        result = jobs.run_one(provider, lane="action")
+        result = run() if run else None
         plans.sync_wishes()
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":
@@ -419,6 +425,22 @@ def dispatch(config, action, request):
                 # reach the disk before the rename rather than after it.
                 atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
         return result
+
+    if action == "review-due":
+        # T-14: the resident worker does the minute's bookkeeping and says whether an appraisal is
+        # there to run; the host starts a model process only then. `tick: false` only asks.
+        paused = review_pause()
+        if paused:
+            return paused
+        if request.get("tick", True):
+            review_minute()
+        due = {lane: jobs.runnable(lane) for lane in ("action", "enrichment")}
+        return {"state": "due" if any(due.values()) else "idle", **due}
+    if action == "review":
+        paused = review_pause()
+        if paused:
+            return paused
+        return review_minute(lambda: jobs.run_one(review_provider(), lane="action"))
     if action == "daily":
         provider = review_provider()
         provider.native_attempt = ("daily:" + mind.clock()[:10], config["agent_version"])
@@ -545,7 +567,7 @@ RESIDENT_ACTIONS = frozenset({
     "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
-    "context-delivery-metrics", "configure-habits", "reply-choice",
+    "context-delivery-metrics", "configure-habits", "reply-choice", "review-due",
 })
 
 

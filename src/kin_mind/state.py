@@ -1519,7 +1519,7 @@ class Mind(Continuity):
                 (self.scope.key(),),
             ).fetchone()
             if existing:
-                raise Conflict("A contact attempt is already in flight")
+                raise Conflict("A contact attempt is already in flight", kind="runtime", code="contact-attempt-open")
 
             if self._action_review_pending(conn):
                 raise Conflict("Action appraisal is pending")
@@ -1548,7 +1548,7 @@ class Mind(Continuity):
                 if not conn.execute("SELECT 1 FROM mind_contacts WHERE id=?", (aid,)).fetchone():
                     break
             else:
-                raise Conflict("Too many attempts for the same wishes")
+                raise Conflict("Too many attempts for the same wishes", kind="runtime", code="contact-attempts-exhausted")
             attempt = {
                 "id": aid,
                 "state": "drafting",

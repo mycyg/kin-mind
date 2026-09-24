@@ -1705,6 +1705,24 @@ class Appraisals:
             return self._quarantine(data, "compression-passes-exhausted:" + str(waits))
         return "pending"
 
+    def runnable(self, lane):
+        """Whether run_one(lane=lane) would find a job now, without claiming it: the host starts a
+        model process only then (T-14). A compaction in progress runs nothing (K3-14)."""
+        lanes = self.memory.settings()["operational_lanes"]
+        if lane == "enrichment" and not lanes:
+            return False
+        lane_filter = ""
+        if lanes and lane:
+            lane_filter = " AND COALESCE(json_extract(data,'$.stimulus'),'') " + ("IN" if lane == "enrichment" else "NOT IN") + " ('memory-backfill','memory-enrichment')"
+        now = time.time()
+        with self.engine.db.connect() as conn:
+            from .history import compacting
+            if compacting(conn):
+                return False
+            return bool(conn.execute(
+                "SELECT 1 FROM mind_appraisals WHERE scope=? AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))"
+                + lane_filter + " LIMIT 1", (self.mind.scope.key(), now, now)).fetchone())
+
     def run_one(self, provider, *, lane=None, job_id=None):
         provider.background = True
         settings = self.memory.settings()

@@ -175,15 +175,24 @@ class ShareLedger:
                     "at": bubble["at"], "mode": ref.mode, "reason": mapping.reason if mapping else ref.reason,
                     "basis": "semantic-mapping" if mapping else "registered-reference", "confidence": mapping.confidence if mapping else 1,
                     "needs_review": bool(mapping and mapping.confidence < 0.8), "visibility": "unverified"}
-                registered = conn.execute("SELECT reply_id FROM mind_reply_references r WHERE scope=? AND EXISTS "
-                    "(SELECT 1 FROM json_each(r.data,'$.bubbles') b WHERE json_extract(b.value,'$.text_hash')=?) "
-                    "ORDER BY json_extract(data,'$.at') DESC LIMIT 1", (self.scope.key(), body_hash(bubble.get("text", "")))).fetchone()
-                data["usage_id"] = registered[0] if registered else share.get("delivery_id") or share["id"]
+                # The registration of the reply this bubble belongs to, by its id: not the newest
+                # registration anywhere with the same words (E3-25).
+                registered = self._registered(conn, bubble)
+                data["usage_id"] = registered or share.get("delivery_id") or share["id"]
                 refs = self.graph.available_proof(conn, share["source_ids"])
                 edge = self.graph.link(conn, ref.unit_id, "shares", share["id"], refs, role=bid, basis="inferred" if mapping else "observed", reason=data["reason"] or "Registered content reference and delivery receipt")
                 data.update(relation_id=edge["id"], relation_revision=edge["revision"])
                 self._save_coverage(conn, data)
                 conn.execute("UPDATE mind_share_reservations SET state=? WHERE scope=? AND recipient='owner' AND unit_id=? AND version=? AND draft_id=?", (bubble["state"], self.scope.key(), ref.unit_id, ref.version, bubble.get("draft_id", share.get("delivery_id"))))
+
+    def _registered(self, conn, bubble):
+        reply_id = bubble.get("reply_id")
+        if not reply_id:
+            return None
+        row = conn.execute("SELECT data FROM mind_reply_references WHERE scope=? AND reply_id=?",
+                           (self.scope.key(), reply_id)).fetchone()
+        text_hash = body_hash(bubble.get("text", ""))
+        return reply_id if row and any(b["text_hash"] == text_hash for b in json.loads(row[0])["bubbles"]) else None
 
     def apply(self, conn, assessment, allowed_share_ids, *, items=None):
         """`allowed_share_ids`: the evaluated shares, or a test of one share id. `items` (memory_items.Items):

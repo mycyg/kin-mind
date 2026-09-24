@@ -517,7 +517,8 @@ class MemoryContinuity:
                     raise ValueError("Invalid delivery state")
                 if prior.get("state") != "accepted":
                     share["bubbles"][bubble] = {"id": bubble, "text": content, "state": state, "message_id": event.get("message_id"), "at": event["at"], "artifact_id": receipt.get("artifact_id"),
-                        "references": event.get("references", prior.get("references", [])), "draft_id": event.get("draft_id")}
+                        "references": event.get("references", prior.get("references", [])), "draft_id": event.get("draft_id"),
+                        "reply_id": event.get("reply_input_id") or prior.get("reply_id")}
                 elif event.get("message_id") and prior["message_id"] != event["message_id"]:
                     raise Conflict("Accepted bubble cannot change platform ID")
                 states = {b["state"] for b in share["bubbles"].values()}

@@ -476,3 +476,21 @@ def test_the_resident_worker_answers_in_order_and_keeps_long_work_out(tmp_path):
     assert answers[1] == {"id": "2", "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
     assert answers[2]["ok"] and "eligible" in answers[2]["result"]
     assert answers[3]["error"]["code"] == "invalid-frame"
+
+
+def test_the_minute_review_asks_the_resident_worker_before_a_process_is_started(tmp_path):
+    """T-14: `review-due` does the minute's bookkeeping in the resident worker and says whether an
+    appraisal is there to run; nothing runs while history compaction owns the store (WS6)."""
+    from kin_mind.appraisal import Appraisals
+    from kin_mind.history import COMPACTING, COMPACTION_MARKER
+    from kin_mind.host import RESIDENT_ACTIONS, dispatch
+    _, mind, _ = exploration_world(tmp_path)
+    config = host_config(tmp_path, mind)
+    assert "review-due" in RESIDENT_ACTIONS and "review" not in RESIDENT_ACTIONS
+    assert dispatch(config, "review-due", {}) == {"state": "idle", "action": False, "enrichment": False}
+    Appraisals(mind).enqueue_maintenance("snapshot-1", "test-v1")
+    assert dispatch(config, "review-due", {"tick": False}) == {"state": "due", "action": True, "enrichment": False}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO meta VALUES(?,1) ON CONFLICT(key) DO UPDATE SET value=1", (COMPACTION_MARKER,))
+    for action in ("review-due", "review"):
+        assert dispatch(config, action, {}) == {"state": "paused", "reason": COMPACTING}
