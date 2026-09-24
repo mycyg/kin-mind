@@ -18,6 +18,43 @@ class ProviderError(RuntimeError):
     """Sanitized provider failure safe for durable job diagnostics."""
 
 
+class ParseError(ValueError):
+    """A reply came back and is not one JSON object. Only this is asked again in place."""
+
+
+FENCE = "```"
+# The shortest wait for a request that thinks at high effort before it answers.
+REASONING_TIMEOUT = 300
+
+
+def json_object(text):
+    """The one JSON object a model reply carries.
+
+    The whole reply first. A fence that wraps the whole reply is opened from the line after
+    it to the *last* fence, so a fence quoted inside a string value cannot cut the object
+    short. Otherwise the object is the one that ends the reply: an example printed before the
+    answer, or an inner block of the answer, never stands for it. A list, a fragment or prose
+    after the object is a ParseError, and the caller asks once more."""
+    text = (text or "").strip()
+    if text.startswith(FENCE) and text.endswith(FENCE) and "\n" in text:
+        text = text[text.index("\n") + 1:text.rindex(FENCE)].strip()
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value, decoder, start = None, json.JSONDecoder(), text.find("{")
+        while start >= 0 and value is None:
+            try:
+                found, end = decoder.raw_decode(text, start)
+                if not text[end:].strip().removesuffix(FENCE).strip():
+                    value = found
+            except ValueError:
+                pass
+            start = text.find("{", start + 1)
+    if not isinstance(value, dict):
+        raise ParseError("Model reply is not one JSON object")
+    return value
+
+
 class Providers:
     """Configurable OpenAI-compatible endpoints; keys are environment references.
 
@@ -34,8 +71,15 @@ class Providers:
         if not config:
             raise NotConfigured(f"Configure model role: {name}")
         role = ModelRole.model_validate(config)
+        seconds = role.timeout_seconds
+        if role.protocol == "anthropic" and role.model.startswith("deepseek"):
+            # These requests always think at high effort; a minute cut them off mid-answer,
+            # after the tokens were already spent.
+            seconds = max(seconds, REASONING_TIMEOUT)
         if self.timeout is not None:
-            role = role.model_copy(update={"timeout_seconds": max(.1, min(role.timeout_seconds, self.timeout))})
+            seconds = max(.1, min(seconds, self.timeout))
+        if seconds != role.timeout_seconds:
+            role = role.model_copy(update={"timeout_seconds": seconds})
         if role.api_key_env and not os.environ.get(role.api_key_env):
             raise NotConfigured(f"Set environment variable for role: {name}")
         return role
@@ -137,9 +181,10 @@ class Providers:
         return result
 
     def json(self, role, instruction, payload, image=None):
-        from eventmem.llm import LLMError
-
-        for attempt in range(3):
+        """One more request only for a reply that came back unreadable. A timeout or a broken
+        connection is the job's to retry with its own backoff: asking again here multiplied
+        every job attempt into three paid calls."""
+        for attempt in range(2):
             try:
                 return self._json_once(
                     role,
@@ -152,19 +197,12 @@ class Providers:
                     payload,
                     image,
                 )
-            except (
-                json.JSONDecodeError,
-                LLMError,
-                KeyError,
-                IndexError,
-                httpx.TimeoutException,
-                httpx.RemoteProtocolError,
-            ):
-                if attempt == 2:
+            except (ParseError, KeyError, IndexError, TypeError):
+                if attempt:
                     raise ValueError(
                         f"Model role {role} returned no valid structured result"
                     ) from None
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.2)
 
     def _json_once(self, role, instruction, payload, image=None):
         from .persona import load_persona, persona_prompt
@@ -200,12 +238,10 @@ class Providers:
                     "messages": [{"role": "user", "content": content}],
                 },
             )
-            from eventmem.llm import _parse_json_payload
-
             if response.get('stop_reason') == 'max_tokens':
                 raise ProviderError('model-output-budget-exhausted')
 
-            return _parse_json_payload(
+            return json_object(
                 "".join(
                     r.get("text", "")
                     for r in response.get("content", [])
@@ -240,7 +276,7 @@ class Providers:
                 ],
             },
         )
-        return json.loads(response["choices"][0]["message"]["content"])
+        return json_object(response["choices"][0]["message"]["content"])
 
     def embed(self, texts, role="embedding"):
         config = self.role(role)
