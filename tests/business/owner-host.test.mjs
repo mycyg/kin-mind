@@ -161,6 +161,21 @@ test('Kin names the wishes her draft is for; check and pending carry them with t
  const pending=events.find(([action,request])=>action==='settle'&&request.state==='pending')[1];
  assert.deepEqual(pending.desire_ids,['d-tea']);assert.equal(pending.text,'The tea was lovely');
 });
+test('a draft that names no wish acts on the wishes handed to Kin that round, never on one she was not shown (CR-MIND-04)',async()=>{
+ const handed=fixture({draft:async()=>({action:'send',text:'Both of these',handed_ids:['d-a','d-b']})});
+ await handed.loop.tick();
+ const check=handed.events.find(([action])=>action==='check')[1],pending=handed.events.find(([action,request])=>action==='settle'&&request.state==='pending')[1];
+ assert.deepEqual(check.desire_ids,['d-a','d-b']);assert.deepEqual(pending.desire_ids,['d-a','d-b']);
+ assert.ok(handed.events.every(([,request])=>!('handed_ids' in (request??{}))),'the host list is not part of her decision');
+ // Her own choice among them still wins, and a wait settles the handed set with its decision.
+ const named=fixture({draft:async()=>({action:'send',text:'Just this',desire_ids:['d-b'],handed_ids:['d-a','d-b']})});
+ await named.loop.tick();
+ assert.deepEqual(named.events.find(([action])=>action==='check')[1].desire_ids,['d-b']);
+ const waited=fixture({draft:async()=>({action:'wait',condition:'time',retry_after_seconds:600,reason:'Later',handed_ids:['d-a']}),send:async()=>assert.fail('must not send')});
+ await waited.loop.tick();
+ const settled=waited.events.at(-1)[1];
+ assert.deepEqual(settled.desire_ids,['d-a']);assert.equal(settled.decision.handed_ids,undefined);
+});
 test('a send of unknown outcome is checked again under its own id and only then does the tick go on (AD2-14)',async()=>{
  const events=[];const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-1',isBusy:()=>false,draft:async()=>assert.fail('nothing ready'),send:async()=>assert.fail('must not send'),
    resume:async candidate=>{events.push(['resume',candidate.attempt_id]);return{state:'unconfirmed',reason:'receipt-unavailable'};},
