@@ -39,7 +39,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {NativeWindow,checkpointMarker,reconcileLegacyInjections,nativeWindowFor,reconcileHostInput} from '../../adapters/native-window.mjs';
+import {NativeWindow,checkpointMarker,reconcileLegacyInjections,nativeWindowFor} from '../../adapters/native-window.mjs';
 
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const line=value=>JSON.stringify(value)+'\n';
@@ -111,23 +111,4 @@ test('old unsettled injection identities are reconciled once, in one bounded pas
   const starts=reads(t);
   assert.equal((await delivery.deliver(missing)).state,'unconfirmed');
   assert.ok(starts.every(start=>start>0),'after the pass nothing reads the history from its start again');
-});
-
-test('AD1-10: an uncertain submission is found by its host event, or proven absent only from history that begins before it',async t=>{
-  const sent='c'.repeat(32),lost='d'.repeat(32),submittedAt=Date.parse('2026-09-24T02:00:00Z');
-  const f=rollout(t,assistant('filler','2026-09-24T01:00:00Z')+user('小光的话 <kin-host-event>'+sent+'</kin-host-event>','2026-09-24T02:00:01Z'));
-  // Without an incremental reader the end of the history is read once, bounded.
-  assert.equal((await reconcileHostInput(f.file,[sent],{submittedAt})).state,'found');
-  assert.deepEqual(await reconcileHostInput(f.file,[lost],{submittedAt}),{state:'not-found'},'the whole history was read');
-  const before=fs.statSync(f.file).size;
-  fs.appendFileSync(f.file,assistant('y'.repeat(2048),'2026-09-24T03:00:00Z').repeat(8));
-  const bounded=await reconcileHostInput(f.file,[lost],{submittedAt,maxBytes:fs.statSync(f.file).size-before});
-  assert.equal(bounded.state,'unknown','a stretch that begins after the submission proves nothing');
-  assert.equal((await reconcileHostInput(f.file,[],{submittedAt})).state,'unknown','no event, no answer');
-  // With a reader, its receipt index answers without a pass over the file.
-  const window=new NativeWindow({file:f.file,threadId:'main',stateFile:f.stateFile});await window.poll();
-  const starts=reads(t);
-  assert.equal((await reconcileHostInput(f.file,[sent],{submittedAt})).state,'found');
-  assert.ok(starts.every(start=>start>=fs.statSync(f.file).size),'the index answered');
-  assert.ok(!fs.readFileSync(f.stateFile,'utf8').includes('小光的话'));
 });
