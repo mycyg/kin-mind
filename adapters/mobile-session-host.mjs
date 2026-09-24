@@ -139,14 +139,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     }
     return value;
   };
-  const buildCheckpoint=async request=>{
-    if(config.main_session_review===true){
-      const runtime=await inspect();
-      const capacity=runtime.modelContextWindow-(runtime.lastTokenUsage?.inputTokens??0)-(config.session_management?.outputReserve??32768)-(config.session_management?.toolReserve??8192);
-      if(Number.isFinite(capacity))request.native_capacity=Math.max(0,Math.floor(capacity));
-    }
-    return mindCall('session-checkpoint',request);
-  };
+  // Every checkpoint has the same fixed allowance. It is read by the window after a
+  // compaction or handover, so the room left in the current one is no measure of it.
+  const buildCheckpoint=request=>mindCall('session-checkpoint',request);
   const background=new NativeContextDelivery({call:mindCall,
     runtime:async()=>{const current=await routing.ensureSession('kin-host:context-status');return current.agentInfo.connection.extMethod('_kin/runtime',{sessionId:manager.fence().threadId});},
     inject:async request=>{const current=await routing.ensureSession('kin-host:context');return current.agentInfo.connection.extMethod('_kin/inject-checkpoint',request);}});
