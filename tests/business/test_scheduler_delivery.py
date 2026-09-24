@@ -2,7 +2,8 @@
 task list says about each delivery (E3-13, CR-MEM-04), a schedule whose policy is gone (E2-02),
 and the deadline of each occurrence, its due time plus 30 minutes, checked before every dispatch
 (CR-MEM-10) and handed to the host, signed, as the very moment the dispatcher judges by
-(CR2-INT-07)."""
+(CR2-INT-07); for a row an older build queued too, whose due time is found from its schedule or
+the row is held (CR2-MEM-04)."""
 import hashlib
 import hmac
 import json
@@ -14,7 +15,7 @@ import pytest
 from eventmem.core import Engine
 from eventmem.core.contact_tasks import ContactTasks
 from eventmem.core.models import ContactPolicy, ScheduleInput, Scope, SourceInput
-from eventmem.core.scheduler import DELIVERY_WINDOW, MAX_ATTEMPTS, Scheduler, window_open
+from eventmem.core.scheduler import DELIVERY_WINDOW, Scheduler, window_open
 
 SCOPE = Scope(persona="synthetic-reminders")
 START = datetime(2026, 9, 23, 1, tzinfo=timezone.utc)
@@ -91,7 +92,7 @@ def test_a_restarting_or_busy_host_is_retried_until_it_takes_the_reminder(world)
     found, sid = scheduler(channel)
     run(found, DELIVERY_WINDOW, step=60)  # the host ticks once a minute
     rows = outbox(engine, sid)
-    assert rows[0]["state"] == "sent" and rows[0]["attempts"] == 8 > MAX_ATTEMPTS
+    assert rows[0]["state"] == "sent" and rows[0]["attempts"] == 8  # the window bounds it, not a count
     assert len(set(channel.calls)) == 1  # the same delivery each time, never a second one
     # The daily reminder moved on to its next occurrence.
     current = schedule(engine, sid)
@@ -235,7 +236,7 @@ def test_the_host_is_handed_the_deadline_the_dispatcher_judges_by_under_the_sign
     # One moment, not two: the dispatcher's own check closes exactly at the deadline it handed over.
     row = outbox(engine, sid)[0]
     moment = datetime.fromisoformat(expected).timestamp()
-    assert window_open(row["data"], moment - 0.001, 1) and not window_open(row["data"], moment, 1)
+    assert window_open(row["data"], moment - 0.001) and not window_open(row["data"], moment)
     # And a 2xx reads as what it is: handed to the host, not delivered.
     assert row["state"] == "sent"
     delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
@@ -248,6 +249,115 @@ def test_a_deadline_is_the_due_time_plus_the_window_in_utc_to_the_millisecond():
     local = {"due_at": "2026-09-23T09:15:30.123456+08:00"}
     assert deadline_at(local) == "2026-09-23T01:45:30.123Z"
     assert deadline(local) == datetime(2026, 9, 23, 1, 45, 30, 123000, tzinfo=timezone.utc).timestamp()
-    # A row an older build queued names no due time: its creation stands in, as for the check.
-    assert deadline_at({"created_at": "2026-09-23T01:00:00+00:00"}) == "2026-09-23T01:30:00.000Z"
+    # When it was queued is not when it was due: a row naming no due time has no deadline of its
+    # own, and nothing is inside a window it cannot read (CR2-MEM-04).
+    assert deadline_at({"created_at": "2026-09-23T01:00:00+00:00"}) is None
     assert deadline_at({}) is None and deadline({"due_at": "not a time"}) is None
+    assert not window_open({"created_at": "2026-09-23T01:00:00+00:00"}, START.timestamp())
+
+
+def older_row(engine, clock, found, sid, *, queued_after, **columns):
+    """What an older build left: the occurrence due at START, queued `queued_after` seconds late
+    (a service that was down, a tick that ran late), its row naming no due time of its own."""
+    clock[0] = START.timestamp() + queued_after
+    found.tick(deliver=False)
+    sets = "".join(f",{name}=?" for name in columns)
+    with engine.db.connect(write=True) as conn:
+        conn.execute(f"UPDATE outbox SET data=json_remove(data,'$.due_at'){sets} WHERE schedule_id=?",
+                     (*columns.values(), sid))
+    row = outbox(engine, sid)[0]
+    assert "due_at" not in row["data"] and row["data"]["created_at"] > START.isoformat()
+    return row["id"]
+
+
+def test_an_older_row_queued_late_is_held_to_its_occurrences_deadline_not_its_queueing(world):
+    """Due 09:00, queued 09:25 by an older build: its deadline is 09:30, found from the schedule
+    and frozen into the row, never 09:55 from when it was queued. At 09:40 nothing is sent, and the
+    daily reminder moves on (CR2-MEM-04)."""
+    engine, clock, scheduler, run = world
+    channel = Channel()
+    found, sid = scheduler(channel)
+    delivery = older_row(engine, clock, found, sid, queued_after=25 * 60)
+    clock[0] = START.timestamp() + 40 * 60
+    found.tick()
+    assert channel.calls == []
+    row = outbox(engine, sid)[0]
+    assert row["id"] == delivery and row["state"] == "canceled"
+    assert row["data"]["gave_up"]["reason"] == "past-deadline" and datetime.fromisoformat(row["data"]["due_at"]) == START
+    current = schedule(engine, sid)
+    assert current["state"] == "scheduled" and current["due_at"] > START.isoformat()
+
+
+def test_an_older_row_sent_in_its_window_hands_the_host_the_occurrences_deadline(world):
+    """Queued ten minutes late and sent at once: the host is told 09:30, the moment the dispatcher
+    judges by, and not a deadline counted from the queueing (CR2-MEM-04 with CR2-INT-07)."""
+    engine, clock, scheduler, run = world
+    sent = []
+
+    class Recording(Channel):
+        def __call__(self, url, body, headers):
+            sent.append(json.loads(body))
+            return super().__call__(url, body, headers)
+
+    found, sid = scheduler(Recording())
+    older_row(engine, clock, found, sid, queued_after=10 * 60)
+    clock[0] = START.timestamp() + 12 * 60
+    found.tick()
+    assert [body["deadlineAt"] for body in sent] == ["2026-09-23T01:30:00.000Z"]
+    assert "due_at" not in sent[0] and "hold" not in sent[0]
+    row = outbox(engine, sid)[0]
+    assert row["state"] == "sent" and datetime.fromisoformat(row["data"]["due_at"]) == START
+
+
+def test_an_older_rows_lapsed_send_is_not_sent_again_past_its_occurrences_deadline(world):
+    """An older build's send whose lease lapsed, on a verified idempotent channel: at 09:40 it is
+    past the occurrence's deadline, so it stays possibly sent under its id and is not sent again,
+    however late it had been queued (CR2-MEM-04)."""
+    engine, clock, scheduler, run = world
+    channel = Channel()
+    found, sid = scheduler(channel, idempotent=True)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO outbox_channel_contracts(channel,verified,delivery_id,checked_at) VALUES(?,1,'x','t')",
+                     ("http://127.0.0.1:9/deliver",))
+    older_row(engine, clock, found, sid, queued_after=25 * 60, state="sending", attempts=1,
+              lease_until=START.timestamp() + 26 * 60)
+    clock[0] = START.timestamp() + 40 * 60
+    run(found, 600, step=60)
+    assert channel.calls == []
+    rows = outbox(engine, sid)
+    assert rows[0]["state"] == "uncertain" and datetime.fromisoformat(rows[0]["data"]["due_at"]) == START
+    delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"]
+    assert not next(d for d in delivery if d["id"] == rows[0]["id"])["never_sent"]
+    assert schedule(engine, sid)["due_at"] > START.isoformat()  # the daily reminder moved on
+
+
+def test_an_older_row_whose_due_time_cannot_be_confirmed_is_held_unsent(world):
+    """The schedule no longer holds the occurrence the row was made for, so the row's due time
+    cannot be confirmed. Nothing is sent and no deadline is made up for it: the row waits, unsent,
+    for someone to reconcile it, and says so (CR2-MEM-04)."""
+    engine, clock, scheduler, run = world
+    channel = Channel()
+    found, sid = scheduler(channel)
+    delivery = older_row(engine, clock, found, sid, queued_after=25 * 60)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE schedules SET due_at=? WHERE id=?", ((START + timedelta(minutes=10)).isoformat(), sid))
+    clock[0] = START.timestamp() + 26 * 60
+    run(found, 3600, step=60)
+    assert channel.calls == []
+    row = outbox(engine, sid)[0]
+    assert row["id"] == delivery and row["state"] == "suggested"
+    assert row["data"]["hold"]["reason"] == "due-time-unknown" and "due_at" not in row["data"]
+    assert schedule(engine, sid)["state"] == "queued"  # nothing decided on the occurrence's behalf
+    found_delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
+    assert found_delivery["never_sent"]
+    assert found_delivery["meaning"] == "没有发出：确认不了这次提醒的到期时间，不会自动发送，等待核对"
+    # A confirmation does not send it either: it is held again at its next dispatch.
+    current = schedule(engine, sid)
+    found.control(sid, "confirm", current["revision"])
+    run(found, 600, step=60)
+    assert channel.calls == [] and outbox(engine, sid)[0]["state"] == "suggested"
+    # Canceled, it is simply not sent, and no longer said to wait for anyone.
+    outcome = found.control(sid, "cancel", schedule(engine, sid)["revision"])
+    assert outcome["deliveries"] == [{"id": delivery, "outcome": "canceled"}]
+    found_delivery = ContactTasks(engine, SCOPE, ["reminders"]).list()["items"][0]["deliveries"][0]
+    assert found_delivery["meaning"] == "没有发出" and channel.calls == []
