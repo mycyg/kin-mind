@@ -83,3 +83,28 @@ def test_automatic_background_has_a_fixed_ceiling_and_ignores_free_room(setup):
     large = contexts.build('', purpose='chat', session='other', runtime={'model': 'synthetic', 'contextAvailableTokens': 200000,
                                                                           'note': '很长的运行说明。' * 6000})
     assert large['budget'] == INJECTION_CEILING and large['tokens'] <= INJECTION_CEILING
+
+
+def test_the_injected_state_keeps_items_awaiting_review_marked_within_the_new_bounds(setup):
+    """CR-MIND-09: the memory projection follows interactionView: a dimension or a concern waiting
+    for review stays, marked 待复核, and six concerns are shown, not three."""
+    from kin_mind.context import affect_projection, REVIEW_MARK
+    view = {"dimensions": {"mood": {"value": 61.4}, "missing": {"value": 70.2, "needs_review": True}},
+            "continuity": {"activation": "active", "needs_review": False},
+            "appraisal_summary": {"understanding": {"text": "她今天很累", "needs_review": True}},
+            "expression": {"guidance": [{"text": g} for g in "abcd"]},
+            "selected_concerns": [{"id": "c" + str(i), "content": "心事" + str(i), "status": "active", "basis": "inferred",
+                                   "needs_review": i == 4} for i in range(8)]}
+    shown = affect_projection(view)
+    assert shown["dimensions"] == {"mood": 61, "missing": {"value": 70, "review": REVIEW_MARK}}
+    assert shown["understanding"]["review"] == REVIEW_MARK and len(shown["expression"]) == 3
+    assert [c["id"] for c in shown["concerns"]] == ["c" + str(i) for i in range(6)]
+    assert shown["concerns"][4]["review"] == REVIEW_MARK and "review" not in shown["concerns"][0]
+    shadow = affect_projection({**view, "continuity": {"activation": "shadow"}})
+    assert shadow["concerns"] == [] and shadow["understanding"] is None
+    # And it is what a built context injects.
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'context': True})
+    mind.read = lambda **_: view
+    built = Contexts(mind).build('', purpose='chat')
+    assert "待复核" in built["text"] and "missing" in built["text"] and "c5" in built["text"]
