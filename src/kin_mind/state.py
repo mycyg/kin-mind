@@ -127,6 +127,8 @@ class AffectiveEvent(Model):
 # How long Kin may put a contact off (N9): five minutes to three days. A wait past either end is
 # taken to that end and kept, never refused.
 CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
+# A draft that could not start waits five minutes more each time, up to half an hour (CR2-INT-06).
+DRAFT_START_WAIT_MAX_SECONDS = 1800
 
 
 def contact_wait_seconds(v):
@@ -1071,6 +1073,7 @@ class Mind(Continuity):
                 desire.pop("contact_wait", None)
                 desire.pop("contact_failures", None)
                 desire.pop("contact_review_failures", None)
+                desire.pop("contact_start_waits", None)
             if request.action == "wait":
                 desire["contact_wait"] = self._wait_details(
                     ContactDecision(action="wait", reason=request.reason,
@@ -1730,7 +1733,7 @@ class Mind(Continuity):
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-source-changed", "contact-review-failed", "repeats-unconfirmed-send"}):
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-not-started", "draft-source-changed", "contact-source-changed", "contact-review-failed", "repeats-unconfirmed-send"}):
                 current = self._load(conn)
                 targets = list(dict.fromkeys(desire_ids or attempt.get("chosen") or offered))
                 # A decision or a failure applies to the wishes it names that are still as drafted.
@@ -1753,6 +1756,15 @@ class Mind(Continuity):
                                 condition="time" if failures < 3 else "new_evidence",
                                 retry_after_seconds=300 * failures)
                             review_failures = failures
+                        elif reason == "draft-not-started":
+                            # CR2-INT-06: the draft never started (its fork was never made, no mind
+                            # worker ran, a release freeze refused it), so no model ran. The wish only
+                            # waits and is drafted again, later each time; it is no drafting failure
+                            # and is never set aside for it.
+                            waits = desire.get("contact_start_waits", 0) + 1
+                            desire["contact_start_waits"] = waits
+                            applied = ContactDecision(action="wait", reason="The draft could not start yet",
+                                condition="time", retry_after_seconds=min(DRAFT_START_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS * waits))
                         elif reason == "contact-review-failed":
                             failures = desire.get("contact_review_failures", 0) + 1
                             desire["contact_review_failures"] = failures

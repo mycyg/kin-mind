@@ -143,8 +143,14 @@ export class MindLoop {
       } catch(error) {
         const current=!this.closed&&epoch===this.ownerEpoch();
         const detail=failure(error,{stage:'contact-draft-execution',code:'contact-draft-execution-failed'});
-        const sourceMoved=current&&detail.category==='source-changed'&&detail.model_invoked===false;
-        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:current?(sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
+        // CR2-INT-06: a draft that never started ran no model — its fork was never made (the
+        // host says model_invoked:false, WS4), no mind worker could run, or a release freeze
+        // refused it. It only waits and is drafted again; it is no drafting failure. A fork
+        // that started, or that nobody can place (null), still counts as one.
+        const unstarted=current&&detail.model_invoked===false&&(detail.category==='model-unavailable'||detail.code==='dispatch-frozen');
+        const sourceMoved=current&&!unstarted&&detail.category==='source-changed'&&detail.model_invoked===false;
+        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',
+          reason:current?(unstarted?'draft-not-started':sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
           ...(current?{failure:detail}:{})});
       }
       // Kin picked among the ready wishes handed to her this round; unnamed means all of those,
