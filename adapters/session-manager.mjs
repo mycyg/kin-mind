@@ -120,9 +120,17 @@ export class SessionManager {
       catch(error){candidate.error=error.name;this.save('promotion-recovery-waiting');return {state:'unconfirmed',reason:'promotion-recovery-pending'};}
     });
   }
-  advise(advice,receipt,snapshotId) {
+  advise(advice,receipt,snapshotId,runtime) {
     if(!advice||!['keep','recall','compact','prepare','rotate','defer'].includes(advice.action)||!advice.reason?.trim()||!Array.isArray(advice.evidenceIds))throw Error('Invalid session advice');
-    if(receipt?.model!=='deepseek-flash'||receipt.reasoning!=='high')throw Error('Session advice provider unverified');
+    const native=receipt?.native_receipt;
+    if(native) {
+      // The main-session host already verifies final completion and the full profile.
+      if(!runtime?.known||!native.native_turn_id||!native.verified_at||
+        native.native_session_id!==this.state.binding.nativeSessionId||native.generation!==this.state.binding.generation||
+        native.model!==runtime.model||native.provider!==runtime.modelProvider||native.reasoning!==runtime.reasoningEffort||
+        receipt.request_id!==native.native_turn_id||receipt.model!==native.model||receipt.reasoning!==native.reasoning)
+        throw Error('Session advice native receipt unverified');
+    } else if(receipt?.model!=='deepseek-flash'||receipt.reasoning!=='high')throw Error('Session advice provider unverified');
     if(this.state.observation?.id!==snapshotId)return {state:'stale',reason:'observation-changed'};
     for(const finding of advice.findings??[]){
       const source=this.state.observation.recent?.find(i=>i.id===finding.sourceId&&i.role==='user'&&i.text?.includes(finding.quote));
@@ -137,17 +145,21 @@ export class SessionManager {
     if(!this.state.config.observe)return;
     this.assertFence(this.state.binding);
     const last=this.state.compactions.findLast(c=>c.state==='complete');
-    const content={binding:this.fence(),configVersion:context.configVersion,policyVersion:this.state.config.version,cursors:context.cursors,pressure:windowPressure(runtime,this.state.config),
+    const content={binding:this.fence(),configVersion:context.configVersion,policyVersion:this.state.config.version,cursors:context.reviewCursors??context.cursors,profile:candidateProfile(runtime),pressure:windowPressure(runtime,this.state.config),
       lastCompaction:last?{id:last.id,completedAt:last.completedAt,before:last.before,after:last.after,origin:last.origin}:null,
       evidence:Object.values(this.state.evidence).filter(e=>e.generation===this.state.binding.generation&&!e.needsReview&&!e.resolved),
       tasks:(context.tasks??[]).map(t=>({id:t.id,inputVersion:t.inputVersion,status:t.status})),
       recent:(context.items??[]).slice(-8).map(i=>({id:i.id,role:i.role,at:i.at,revision:i.revision,dependencies:i.dependencies??[],...(i.text.length<=2000?{text:i.text}:{readId:i.sourceId,textOmitted:true})})),
       requested:Object.values(this.state.requests).filter(r=>r.state==='pending')};
-    const id=hash(content);
-    if(this.state.observation?.id!==id){this.state.observation={...content,id,at:this.now()};this.save('observation',{id});}
+    // Keep exact pressure available, without expiring a judgment for each token it used.
+    const {inputTokens,expectedInputTokens,ratio,...pressure}=content.pressure;
+    const id=hash({...content,pressure});
+    const changed=this.state.observation?.id!==id||hash(this.state.observation?.pressure??null)!==hash(content.pressure);
+    this.state.observation={...content,id,at:this.now()};
+    if(changed)this.save('observation',{id});
     // Edge/event driven. Repeated minute ticks carry no new evaluation request.
     const level=content.pressure.level;
-    const key=hash([content.binding.generation,content.policyVersion,content.lastCompaction?.id,level,content.evidence.map(e=>[e.id,e.revision]),content.requested.map(r=>r.id)]);
+    const key=id;
     if((['elevated','critical'].includes(level)||content.evidence.length||content.requested.length)&&!this.state.events[key]) {
       this.state.events[key]={state:'pending',observationId:id};this.save('review-event',{key});
     }
