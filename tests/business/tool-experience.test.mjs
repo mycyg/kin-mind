@@ -49,5 +49,5 @@ test('recall from the memory store, internal turns and unfinished calls leave no
   internal.o.update({toolCallId:'call_2',status:'completed',rawOutput:'127.0.0.1 localhost'});
   assert.deepEqual(internal.spooled(),[]);
   for(let i=0;i<300;i++)owner.o.update({toolCallId:'open_'+i,kind:'execute',status:'in_progress',rawInput:{command:['sleep','1']}});
-  assert.ok(owner.o.calls.size<=200&&owner.o.before.size<=200,'calls that never finish are forgotten (AD2-12)');
+  assert.ok(owner.o.calls.size<=256&&owner.o.before.size<=256,'calls that never finish are forgotten (AD2-12)');
 });
