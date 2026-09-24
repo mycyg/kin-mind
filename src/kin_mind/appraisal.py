@@ -1655,16 +1655,35 @@ class Appraisals:
     def _tool_fetched(self, proposal, receipt, supplied, started):
         """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
         cites that this request did not supply is accepted only when a completed tool call of this
-        turn returned that very source (its receipt's `ids`, CR-MIND-08), and the id resolves to a
+        turn returned that very source or record, at its current revision when the call named one
+        (its receipt's `ids`, CR-MIND-08), and the id resolves to a
         current record of this scope that already existed when the attempt began. A tool that
         succeeded at something else vouches for nothing; a receipt without ids admits nothing."""
         native = receipt.get("native_receipt") or {}
         calls = native.get("tool_calls") or receipt.get("tool_calls") or []
-        returned = {str(i.get("id") if isinstance(i, dict) else i) for call in calls
-                    if isinstance(call, dict) and call.get("ok") is True and isinstance(call.get("ids"), list)
-                    for i in call["ids"] if isinstance(i, (str, dict))}
+        # What each completed call returned, WS1's [{id, revision}]: {id: {revision, ...}}, with
+        # None where a call named no revision.
+        returned = {}
+        for call in calls:
+            if not (isinstance(call, dict) and call.get("ok") is True and isinstance(call.get("ids"), list)):
+                continue
+            for entry in call["ids"]:
+                identifier = entry.get("id") if isinstance(entry, dict) else entry
+                if isinstance(identifier, str) and identifier:
+                    revision = entry.get("revision") if isinstance(entry, dict) else None
+                    returned.setdefault(identifier, set()).add(
+                        revision if isinstance(revision, int) and not isinstance(revision, bool) else None)
         if not returned:
             return {}
+
+        def read_back(ref):
+            # A record returned at a revision other than its current one: what was read is not
+            # what would be cited.
+            for key in ("record_id", "source_id"):
+                seen = returned.get(ref[key])
+                if seen is not None:
+                    return key != "record_id" or None in seen or ref.get("revision") in seen
+            return False
         known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
         cited = set()
 
@@ -1686,8 +1705,7 @@ class Appraisals:
                     refs = self.mind._evidence(conn, [identifier])
                 except (Conflict, Missing):
                     continue
-                read_back = identifier in returned or all({r["source_id"], r["record_id"]} & returned for r in refs)
-                if (refs and read_back and self.mind._fresh(conn, refs)
+                if (refs and all(read_back(r) for r in refs) and self.mind._fresh(conn, refs)
                         and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs)):
                     fetched.update({r["record_id"]: r for r in refs})
         return fetched

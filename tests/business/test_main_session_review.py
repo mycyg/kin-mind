@@ -419,8 +419,8 @@ def test_an_idle_assessment_is_told_it_may_start_something(setup):
     assert 'provider' not in policy and 'reasoning' not in policy
 
 def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
-    """K1-16: an id the request did not supply is accepted when the turn's tool receipts show a
-    completed read and the record already existed; without a tool read it is not."""
+    """K1-16, CR-MIND-08: an id the request did not supply is accepted when a completed tool call of
+    the turn returned it (at its current revision, when named) and the record already existed."""
     mind, source, _ = setup
     earlier = source('read-by-tool')
     jobs = Appraisals(mind)
@@ -429,7 +429,9 @@ def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
             return {'understanding': {'evidence_ids': [earlier]}}
     from datetime import datetime, timedelta, timezone
     started = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
-    with_tools = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True, 'ids': [earlier]}]}}
+    # WS1's receipt: each completed call names what it returned, [{id, revision}].
+    calls = lambda *entries, ok=True: {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': ok, 'ids': list(entries)}]}}
+    with_tools = calls({'id': earlier, 'revision': None})
     fetched = jobs._tool_fetched(Proposal(), with_tools, {}, started)
     assert any(ref['source_id'] == earlier for ref in fetched.values())
     assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': []}}, {}, started) == {}
@@ -437,12 +439,16 @@ def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
     assert jobs._tool_fetched(Proposal(), with_tools, {}, before) == {}
     # CR-MIND-08: a call that succeeded at something else, or names no ids, vouches for nothing.
     other = source('read-elsewhere')
-    unrelated = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True, 'ids': [other]},
-                                                   {'name': 'search', 'ok': True}]}}
+    unrelated = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True, 'ids': [{'id': other, 'revision': None}]},
+                                                   {'name': 'search', 'ok': True, 'ids': []}]}}
     assert jobs._tool_fetched(Proposal(), unrelated, {}, started) == {}
     assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True}]}}, {}, started) == {}
-    failed = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': False, 'ids': [earlier]}]}}
-    assert jobs._tool_fetched(Proposal(), failed, {}, started) == {}
+    assert jobs._tool_fetched(Proposal(), calls({'id': earlier, 'revision': None}, ok=False), {}, started) == {}
+    # Returned under its record: only at the revision it has now.
+    with mind.engine.db.connect() as conn:
+        ref = mind._evidence(conn, [earlier])[0]
+    assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision']}), {}, started)
+    assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision'] + 1}), {}, started) == {}
 
 
 def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):
