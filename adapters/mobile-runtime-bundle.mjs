@@ -144,7 +144,27 @@ function copyOwnedAcpEntry(descriptor,vendorEntry,ownedEntry){
   return {source_vendor_sha256:sha256(vendor),generated_sha256:sha256(owned),descriptor_sha256:sha256(Buffer.from(canonicalJson({sha256:descriptor.sha256,bytes:descriptor.bytes,source_vendor_sha256:descriptor.source_vendor_sha256,required_markers:descriptor.required_markers}))),markers};
 }
 
-function listRegularFiles(root,{exclude=[]}={}){
+// Large bundle files are hashed in full when a bundle is prepared, verified and
+// activated. Activation also records their file identity (device, inode, size,
+// modification and change times) as a seal; resolving the active runtime (every
+// app-server start, service start and health check) hashes the small files and
+// compares a sealed file's identity instead of reading it (N1-12). Writing a file
+// in place changes its ctime, so a seal cannot hide an edit; without a matching
+// seal every file is hashed as before.
+const SEAL_MIN_BYTES=1024*1024;
+const fileIdentity=stat=>({dev:stat.dev,ino:stat.ino,bytes:stat.size,mtime_ms:stat.mtimeMs,ctime_ms:stat.ctimeMs});
+function sealFile(root,bundleId){return path.join(root,'seals',bundleId+'.json');}
+// The identities come from the full validation itself (taken before each read), so a
+// file that changed after it was hashed does not match its seal.
+function writeBundleSeal(root,bundle){
+  writeJsonStrict(sealFile(root,bundle.manifest.bundle_id),{schema:1,manifest_sha256:bundle.manifestSha256,files:bundle.hashedIdentities});
+}
+function readBundleSeal(root,pointer){
+  try{const seal=JSON.parse(fs.readFileSync(sealFile(root,pointer.bundle_id),'utf8'));
+    return seal?.schema===1&&seal.manifest_sha256===pointer.manifest_sha256&&seal.files&&typeof seal.files==='object'?seal.files:null;}catch{return null;}
+}
+
+function listRegularFiles(root,{exclude=[],seal=null,identities=null}={}){
   const excluded=new Set(exclude),files=[];
   const walk=relative=>{
     const absolute=path.join(root,relative),stat=fs.lstatSync(absolute);
@@ -152,7 +172,11 @@ function listRegularFiles(root,{exclude=[]}={}){
     if(stat.isDirectory()){for(const name of fs.readdirSync(absolute).sort())walk(path.join(relative,name));return;}
     if(!stat.isFile())throw Error('Runtime bundle contains a special file');
     const portable=relative.split(path.sep).join('/');if(excluded.has(portable))return;
-    const bytes=fs.readFileSync(absolute);files.push({path:portable,bytes:bytes.length,mode:modeOf(stat),sha256:sha256(bytes)});
+    const sealed=seal?.[portable];
+    if(sealed&&hex64(sealed.sha256)&&canonicalJson(fileIdentity(stat))===canonicalJson({dev:sealed.dev,ino:sealed.ino,bytes:sealed.bytes,mtime_ms:sealed.mtime_ms,ctime_ms:sealed.ctime_ms})){
+      files.push({path:portable,bytes:stat.size,mode:modeOf(stat),sha256:sealed.sha256});return;}
+    const bytes=fs.readFileSync(absolute),digest=sha256(bytes);files.push({path:portable,bytes:bytes.length,mode:modeOf(stat),sha256:digest});
+    if(identities&&stat.size>=SEAL_MIN_BYTES)identities[portable]={sha256:digest,...fileIdentity(stat)};
   };
   for(const name of fs.readdirSync(root).sort())walk(name);
   return files.sort((a,b)=>a.path.localeCompare(b.path));
@@ -212,11 +236,11 @@ function validateBundledClosure(bundle,manifest){
   if(canonicalJson(compact(observed))!==canonicalJson(compact(manifest.packages)))throw Error('Bundled ACP dependency closure changed');
 }
 
-export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
+export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false,seal=null}={}){
   const lstat=fs.lstatSync(bundleDir);if(lstat.isSymbolicLink()||!lstat.isDirectory())throw Error('Runtime bundle must be a real directory');
   const bundle=fs.realpathSync(bundleDir),manifestFile=path.join(bundle,'manifest.json'),manifestBytes=fs.readFileSync(manifestFile),manifest=JSON.parse(manifestBytes);
   validateManifestShape(manifest);if(path.basename(bundle)!==manifest.bundle_id)throw Error('Runtime bundle directory does not match its manifest');
-  const observed=listRegularFiles(bundle,{exclude:['manifest.json']});if(!exactFiles(observed,manifest.files))throw Error('Runtime bundle bytes differ from manifest');
+  const hashedIdentities={},observed=listRegularFiles(bundle,{exclude:['manifest.json'],seal,identities:hashedIdentities});if(!exactFiles(observed,manifest.files))throw Error('Runtime bundle bytes differ from manifest');
   const entry=path.join(bundle,safeRelative(manifest.runtime.acp.entry_path,'ACP entry'));ensureInside(bundle,entry,'ACP entry');
   const vendorEntry=path.join(bundle,safeRelative(manifest.runtime.acp.vendor_entry_path,'ACP vendor entry'));ensureInside(bundle,vendorEntry,'ACP vendor entry');
   // Every marker recorded when the entry was built must still be present once.
@@ -234,7 +258,7 @@ export function validateMobileRuntimeBundle(bundleDir,{executeBinary=false}={}){
     fs.accessSync(helper,fs.constants.X_OK);
   }
   if(executeBinary&&codexVersion(binary)!==manifest.runtime.codex.version)throw Error('Bundled Codex version changed');
-  return {bundleDir:bundle,manifestPath:manifestFile,manifest,manifestSha256:sha256(manifestBytes),state:'prepared'};
+  return {bundleDir:bundle,manifestPath:manifestFile,manifest,manifestSha256:sha256(manifestBytes),state:'prepared',hashedIdentities};
 }
 
 function validateUtf8(bytes,label,{maxBytes=1024*1024,lf=false}={}){
@@ -451,7 +475,7 @@ function validateReceiptArtifacts(receipt){
 export function resolveActiveMobileRuntime({rootDir,allowPreviousIndex=false}={}){
   const root=mobileRuntimeRoot(rootDir),indexFile=activationFile(root),loaded=allowPreviousIndex?loadJson(indexFile,{validate:validActivationIndex}):{...readJsonFile(indexFile),source:'current'};
   const index=loaded.value??(loaded.state==='ok'?loaded.value:null);if(!validActivationIndex(index))throw Error('No verified mobile runtime is active');
-  const bundle=validateMobileRuntimeBundle(path.join(root,'versions',index.current.bundle_id));if(bundle.manifestSha256!==index.current.manifest_sha256)throw Error('Active runtime manifest changed');
+  const bundle=validateMobileRuntimeBundle(path.join(root,'versions',index.current.bundle_id),{seal:readBundleSeal(root,index.current)});if(bundle.manifestSha256!==index.current.manifest_sha256)throw Error('Active runtime manifest changed');
   const receipt=readReceiptBound(root,index.current),privateRoot=validateReceiptArtifacts(receipt.receipt),artifact=name=>receipt.receipt.artifacts[name].path;
   return {root,indexPath:indexFile,indexSource:loaded.source??'current',index,bundleDir:bundle.bundleDir,manifest:bundle.manifest,receipt:receipt.receipt,privateRoot,
     codexRelativePath:bundle.manifest.runtime.codex.path,acpEntryRelativePath:bundle.manifest.runtime.acp.entry_path,catalogRelativePath:receipt.receipt.artifacts.catalog.relative_path,
@@ -475,6 +499,8 @@ export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,
     const index={schema_version:MOBILE_RUNTIME_ACTIVATION_SCHEMA,revision:(current?.revision??0)+1,activated_at:activatedAt,current:pointer,previous:current?.current??null};
     writeIndex(activationFile(root),index,{pretty:true,mode:0o600});return {index,changed:true};
   },reconcile:async()=>({state:'needs-retry',reason:'interrupted-activation-kept-existing-index'})});
+  // The bundle was hashed in full above; its seal lets later resolves skip that.
+  if(result.state==='ran')writeBundleSeal(root,bundle);
   if(result.state!=='ran')return {state:result.state,...result.value};return {state:result.value.changed?'activated':'already-active',index:result.value.index};
 }
 
