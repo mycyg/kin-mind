@@ -13,6 +13,11 @@ const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 const SAFE_PROVIDER=/^[A-Za-z0-9_-]{1,120}$/;
 
+export function sessionReviewCursors(cursors,inputs) {
+  // Assessment turns change the execution snapshot, not their own review cause.
+  return {...cursors,inputs:digest(inputs.filter(i=>i.kind!=='assessment').map(i=>[i.id,i.state,i.hash]))};
+}
+
 export function ownerSessionWork(session,tasks,assessmentToken) {
   const ownAssessment=assessmentToken&&session?.activeMessage?.contextToken===assessmentToken;
   return Boolean((session?.processing&&!ownAssessment)||session?.queue?.length||tasks.length);
@@ -123,7 +128,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const outstanding=inputs.filter(i=>['selected','submitting','unconfirmed'].includes(i.state));
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
     snapshot.cursors={...snapshot.cursors,inputs:digest(inputs.map(i=>[i.id,i.state,i.hash])),tasks:digest(tasks),config:state.configRevision??0};
-    return {...snapshot,tasks,inputs:outstanding,notices:Object.values(state.notices),contactRunning:Boolean(bridge.mindHost?.contactRunning)};
+    return {...snapshot,reviewCursors:sessionReviewCursors(snapshot.cursors,inputs),tasks,inputs:outstanding,notices:Object.values(state.notices),contactRunning:Boolean(bridge.mindHost?.contactRunning)};
   };
   const inspect=async()=>{
     const value=await routing.inspect();
@@ -222,10 +227,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         const {state}=await mindCall('read');const advice=state?.session_advice;
         if(advice&&manager.state.observation&&advice.eventId!==manager.state.lastAdviceEvent){
           manager.state.lastAdviceEvent=advice.eventId;
-          if(advice.snapshotId===manager.state.observation.id)manager.advise(advice.decision,advice.receipt,advice.snapshotId);
-          else if(['elevated','critical'].includes(manager.state.observation.pressure.level)||Object.values(manager.state.requests).some(r=>r.state==='pending')){
-            const key='refresh:'+manager.state.observation.id;if(!manager.state.events[key])manager.state.events[key]={state:'pending',observationId:manager.state.observation.id};
-          }
+          if(advice.snapshotId===manager.state.observation.id)manager.advise(advice.decision,advice.receipt,advice.snapshotId,runtime);
         }
         const result=await manager.tick();manager.state.lastTick={...result,checkedAt:new Date().toISOString()};manager.save('tick');recordStatus({sessionManagement:api.view()});
       }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.name,checkedAt:new Date().toISOString()}});}

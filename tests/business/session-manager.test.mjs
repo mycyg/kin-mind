@@ -6,7 +6,7 @@ import path from 'node:path';
 import {SessionManager} from '../../adapters/session-manager.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
-import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime,startMobileSessions} from '../../adapters/mobile-session-host.mjs';
+import {recoverSessionStore,loadCandidateSession,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
 import {sha256} from '../../adapters/instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
@@ -114,6 +114,66 @@ test('high pressure is compacted first; fifty historical compactions do not auth
 test('idle ticks do not call DS repeatedly and recovery does not repeat compaction',async t=>{
  const f=fixture(t);await f.manager.tick();await f.manager.tick();assert.equal(f.calls.filter(c=>c==='review').length,1);
  await f.advise('compact');await f.manager.tick();const recovered=new SessionManager(f.options);await recovered.tick();assert.equal(f.calls.filter(c=>c==='compact').length,1);
+});
+test('sixty assessment completions do not renew their own review, including after restart',async t=>{
+ const f=fixture(t),inputs=[{id:'owner',kind:'owner',state:'accepted',hash:'owner-text'}];
+ f.context.reviewCursors=sessionReviewCursors(f.context.cursors,inputs);
+ await f.manager.tick();const snapshot=f.manager.state.observation.id;
+ for(let i=0;i<60;i++){
+  inputs.push({id:'assessment-'+i,kind:'assessment',state:'accepted',hash:String(i)});
+  f.context.cursors.inputs='full-execution-cursor-'+i;
+  f.context.reviewCursors=sessionReviewCursors(f.context.cursors,inputs);
+  f.runtime.lastTokenUsage.inputTokens++;
+  f.runtime.serviceTier=i%2?'priority':null;
+  await f.manager.tick();
+  assert.equal(f.manager.state.observation.id,snapshot);
+ }
+ assert.equal(f.manager.state.observation.pressure.inputTokens,70060,'exact live pressure stays available');
+ assert.equal(f.calls.filter(x=>x==='review').length,1);
+ assert.equal(f.manager.advise({action:'defer',reason:'Wait for new evidence',evidenceIds:[]},
+  {model:'deepseek-flash',reasoning:'high'},snapshot).state,'recorded');
+ const restarted=new SessionManager(f.options);assert.equal((await restarted.tick()).state,'defer');
+ assert.equal(f.calls.filter(x=>x==='review').length,1);
+});
+test('owner revisions, task changes, profile changes and new pressure still invalidate advice',async t=>{
+ for(const change of ['owner','task','source','profile','pressure','capacity','compaction']){
+  const f=fixture(t),inputs=[{id:'owner',kind:'owner',state:'accepted',hash:'before'}];
+  f.context.reviewCursors=sessionReviewCursors(f.context.cursors,inputs);
+  f.runtime.lastTokenUsage.inputTokens=30000;
+  await f.advise('keep');const snapshot=f.manager.state.observation.id;
+  if(change==='owner'){inputs[0].hash='corrected';f.context.reviewCursors=sessionReviewCursors(f.context.cursors,inputs);}
+  if(change==='task')f.context.tasks=[{id:'work',inputVersion:2,status:'running'}];
+  if(change==='source')f.context.reviewCursors.linked='new-source-revision';
+  if(change==='profile')f.runtime.serviceTierPreference='fast';
+  if(change==='pressure')f.runtime.lastTokenUsage.inputTokens=70000;
+  if(change==='capacity')f.runtime.modelContextWindow=105000;
+  if(change==='compaction')f.manager.state.compactions.push({id:'new-compact',generation:1,state:'complete',completedAt:f.clock.now});
+  assert.equal((await f.manager.tick()).state,'observing',change);
+  assert.notEqual(f.manager.state.observation.id,snapshot,change);
+  assert.equal(f.calls.filter(x=>x==='review').length,2,change);
+  await f.manager.tick();assert.equal(f.calls.filter(x=>x==='review').length,2,change);
+ }
+});
+test('current-session native advice supports each selected model without switching it',async t=>{
+ for(const [model,provider,reasoning] of [['gpt-6-sol','openai-15m','medium'],['gpt-6-astra','openai-15m','high'],['deepseek-flash','custom-gateway','high']]){
+  const f=fixture(t);Object.assign(f.runtime,{model,modelProvider:provider,reasoningEffort:reasoning,serviceTierPreference:'fast'});
+  await f.manager.observe(f.runtime,f.context);
+  const native={model,provider,reasoning,native_session_id:'old',generation:1,native_turn_id:'final-one',verified_at:'2026-09-24T00:00:00Z'};
+  const receipt={model,reasoning,request_id:'final-one',native_receipt:native};
+  const advice={action:'keep',reason:'Current model completed the judgment',evidenceIds:[]};
+  assert.equal(f.manager.advise(advice,receipt,f.manager.state.observation.id,f.runtime).state,'recorded');
+  for(const bad of [{native_session_id:'other'},{generation:2},{model:'other'},{provider:'other'},{reasoning:'low'},{native_turn_id:null},{verified_at:null}]){
+   assert.throws(()=>f.manager.advise(advice,{...receipt,native_receipt:{...native,...bad}},f.manager.state.observation.id,f.runtime),/native receipt unverified/);
+  }
+  assert.throws(()=>f.manager.advise(advice,{...receipt,request_id:'late-other-turn'},f.manager.state.observation.id,f.runtime),/native receipt unverified/);
+  assert.equal((await f.manager.tick()).state,'keep');assert.equal(f.runtime.model,model);
+ }
+});
+test('review cursor exclusions never remove unsettled assessments from the execution boundary',async t=>{
+ const f=fixture(t),inputs=[{id:'internal',kind:'assessment',state:'unconfirmed',hash:'pending'}];
+ f.context.inputs=inputs;f.context.reviewCursors=sessionReviewCursors(f.context.cursors,inputs);
+ await f.advise('compact');assert.equal((await f.manager.tick()).reason,'input-awaiting-dispatch-or-reconciliation');
+ assert.ok(!f.calls.includes('compact'));assert.equal(f.context.inputs[0].state,'unconfirmed');
 });
 test('successful compression keeps the same logical and native conversation',async t=>{
  const f=fixture(t),binding=f.manager.fence();await f.advise('compact');await f.manager.tick();await f.advise('keep');assert.equal((await f.manager.tick()).state,'keep');assert.deepEqual(f.manager.fence(),binding);assert.ok(!f.calls.includes('create'));
