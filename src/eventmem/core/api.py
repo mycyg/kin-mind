@@ -29,7 +29,7 @@ from .models import (
     SourceInput,
 )
 from .organize import Organizer
-from .responses import RecallResult, RecordResult, SourceResult
+from .responses import ContextRecallResult, RecallResult, RecordResult, SourceResult
 from .scheduler import Scheduler
 from .scheduler import phase as delivery_phase
 
@@ -49,22 +49,6 @@ class RelationRequest(Model):
 class GraphCommand(Model):
     scope: Scope
     request: dict[str, Any]
-
-
-class FeedbackRequest(Model):
-    record_id: str
-    type: Literal[
-        "displayed",
-        "read",
-        "adopted",
-        "verified",
-        "corrected",
-        "unknown",
-        "same_file_observed",
-    ]
-    session: str = ""
-    attributes: dict[str, Any] = Field(default_factory=dict)
-    key: str | None = None
 
 
 class MaintenanceRequest(Model):
@@ -143,17 +127,19 @@ class ModelLeaseHandle(Model):
     ttl_seconds: float = Field(default=90, ge=15, le=300)
 
 
+CHECKPOINT_KEYS = frozenset({
+    "goals",
+    "confirmed_progress",
+    "unverified_results",
+    "blockers",
+    "commitments",
+    "next_entry",
+})
+
+
 def boundary(engine, request):
-    if request.event in {"end", "checkpoint", "compact"} and request.checkpoint:
-        allowed = {
-            "goals",
-            "confirmed_progress",
-            "unverified_results",
-            "blockers",
-            "commitments",
-            "next_entry",
-        }
-        checkpoint = {k: v for k, v in request.checkpoint.items() if k in allowed}
+    checkpoint = {k: v for k, v in request.checkpoint.items() if k in CHECKPOINT_KEYS}
+    if request.event in {"end", "checkpoint", "compact"} and checkpoint:
         source = engine.receive(
             SourceInput(
                 namespace="checkpoint",
@@ -186,30 +172,58 @@ def boundary(engine, request):
                 host_mode=request.host_mode,
             )
         )
+    # What was kept, and only that: a key outside the checkpoint's fields was never saved, and
+    # an empty checkpoint saved nothing (E3-02).
+    saved = bool(checkpoint)
     return {
         "session": request.session,
-        "status": "saved",
-        "checkpoint": request.checkpoint,
+        "status": "saved" if saved else "nothing_saved",
+        "saved": saved,
+        "checkpoint": checkpoint if saved else {},
+        "dropped_keys": sorted(set(request.checkpoint) - CHECKPOINT_KEYS),
     }
 
 
 def credential(root):
-    path = Path(root) / "local-token"
-    if not path.exists():
+    """The local credential every client reads from the store's root. It is never seen half
+    written: a new token is written to a file of its own and put in place whole, under a lock
+    held by whoever is writing it, so two first starts agree on one token. A file that is there
+    but holds nothing is not a credential that admits anyone; it is replaced (E3-01)."""
+    import fcntl
+
+    root = Path(root)
+    path = root / "local-token"
+    with open(root / ".local-token.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            token = path.read_text().strip()
+        except FileNotFoundError:
+            token = ""
+        if token:
+            return token
+        fresh = root / f".local-token.{os.getpid()}.{secrets.token_hex(4)}"
+        fd = os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
             with os.fdopen(fd, "w") as f:
                 f.write(secrets.token_urlsafe(32))
                 f.flush()
                 os.fsync(f.fileno())
-        except FileExistsError:
-            pass
-    return path.read_text().strip()
+            os.replace(fresh, path)
+        finally:
+            fresh.unlink(missing_ok=True)
+        token = path.read_text().strip()
+    if not token:
+        raise RuntimeError("The local credential could not be written")
+    return token
 
 
 def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=True):
     engine = engine or Engine(root or Path.home() / ".memorypalace")
     auth_token = token or credential(engine.db.root)
+    if not auth_token or not auth_token.strip():
+        # An empty credential would compare equal to a request that carries none.
+        raise RuntimeError("MemoryPalace needs a non-empty local credential")
+    expected = auth_token.encode()
     worker = Worker(engine)
     mcp_server = None
     if mcp_enabled:
@@ -229,6 +243,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         )
         if workers:
             thread.start()
+            app.state.worker_thread = thread
         if mcp_server:
             async with mcp_server.session_manager.run():
                 yield
@@ -248,6 +263,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     )
     app.state.engine = engine
     app.state.worker = worker
+    app.state.worker_thread = None
 
     @app.middleware("http")
     async def local_access(request: Request, call_next):
@@ -263,7 +279,9 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
             return JSONResponse({"detail": "Origin is not allowed"}, status_code=403)
         if request.url.path.startswith(("/v1", "/mcp")):
             supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
-            if not secrets.compare_digest(supplied, auth_token):
+            # Compared as bytes: a header with characters outside ASCII is a wrong credential
+            # (401), not a comparison that fails with a server error.
+            if not secrets.compare_digest(supplied.encode(), expected):
                 return JSONResponse(
                     {"detail": "Local credential required"}, status_code=401
                 )
@@ -295,8 +313,18 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
     @app.get("/v1/health", operation_id="health")
-    def health() -> dict:
-        return {"status": "ready", "version": "1.0.0", "schema": 1}
+    def health():
+        """Ready means the background loop is going round as well: reminders, extraction,
+        organising and host replay all run on it, so a service whose loop has stopped is not
+        healthy however well it answers (E2-02, H3-09)."""
+        answer = {"status": "ready", "version": "1.0.0", "schema": 1}
+        if not workers:
+            return answer | {"worker": {"enabled": False}}
+        thread = app.state.worker_thread
+        found = worker.health() | {"enabled": True, "thread_alive": bool(thread and thread.is_alive())}
+        if found["alive"] and found["thread_alive"]:
+            return answer | {"worker": found}
+        return JSONResponse(answer | {"status": "degraded", "worker": found}, status_code=503)
 
     @app.post("/v1/sources", operation_id="receive_source", response_model=SourceResult)
     def receive_source(source: SourceInput) -> dict:
@@ -406,9 +434,14 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
             query,
         )
 
-    @app.post("/v1/recall", operation_id="recall", response_model=RecallResult)
+    @app.post("/v1/recall", operation_id="recall", response_model=RecallResult | ContextRecallResult)
     def recall(request: RecallRequest) -> dict:
-        return engine.recall(request)
+        # A recall over HTTP is somebody looking, from the console or a client: it is not a use
+        # of the memory by Kin, so it strengthens nothing, holds no foreground lease, and calls
+        # a model only when deep mode was asked for (S1-02). A caller that names its session is
+        # accounted to that session's window as before.
+        return engine.recall(request, access_origin="user_query" if request.session else "maintenance",
+                             allow_model=request.mode == "deep")
 
     @app.get(
         "/v1/memories/{record_id}",
@@ -424,18 +457,20 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         budget: int = Query(4000, ge=1, le=32000),
         session: str | None = None,
     ) -> dict:
-        from .models import utc
         from .reading import read_segment
 
+        # The record as stored, whatever the scope's context settings: the console edits what
+        # it reads here, so it is never handed a compressed rendering of it (S1-01).
         return read_segment(
             engine,
             record_id,
-            at=utc(at) if at else None,
-            known_at=utc(known_at) if known_at else None,
+            at=at,
+            known_at=known_at,
             offset=offset,
             length=length,
             budget=budget,
             session=session,
+            original=True,
         )
 
     @app.get("/v1/memories/{record_id}/revisions", operation_id="read_revisions")
@@ -473,16 +508,6 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     def create_relation(request: RelationRequest) -> dict:
         return engine.relate(
             request.subject, request.predicate, request.object, request.attributes
-        )
-
-    @app.post("/v1/feedback", operation_id="record_feedback")
-    def record_feedback(request: FeedbackRequest) -> dict:
-        return engine.feedback(
-            request.record_id,
-            request.type,
-            request.session,
-            request.attributes,
-            request.key,
         )
 
     @app.post("/v1/sessions/boundary", operation_id="session_boundary")
@@ -555,21 +580,38 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.get("/v1/jobs", operation_id="list_jobs")
     def list_jobs(
-        state: str | None = None, cursor: str = "", limit: int = Query(50, ge=1, le=200)
+        state: str | None = None,
+        cursor: str = "",
+        limit: int = Query(50, ge=1, le=200),
+        order: Literal["id", "recent"] = "id",
     ) -> dict:
+        # Ids are hashes, so their order says nothing; `recent` lists the latest change first,
+        # and its cursor carries on from there (S1-16).
+        filters, args = ([" AND state=?"], [state]) if state else ([], [])
         with engine.db.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE id>?"
-                + (" AND state=?" if state else "")
-                + " ORDER BY id LIMIT ?",
-                [cursor] + ([state] if state else []) + [limit + 1],
-            ).fetchall()
+            if order == "recent":
+                if cursor:
+                    at, _, last = cursor.partition("|")
+                    filters.append(" AND (updated_at<? OR (updated_at=? AND id<?))")
+                    args += [at, at, last]
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE 1=1" + "".join(filters)
+                    + " ORDER BY updated_at DESC,id DESC LIMIT ?",
+                    args + [limit + 1],
+                ).fetchall()
+                following = (lambda row: f"{row['updated_at']}|{row['id']}")
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE id>?" + "".join(filters) + " ORDER BY id LIMIT ?",
+                    [cursor] + args + [limit + 1],
+                ).fetchall()
+                following = (lambda row: row["id"])
             return {
                 "items": [
                     dict(r) | {"payload": json.loads(r["payload"])}
                     for r in rows[:limit]
                 ],
-                "cursor": rows[limit - 1]["id"] if len(rows) > limit else None,
+                "cursor": following(rows[limit - 1]) if len(rows) > limit else None,
             }
 
     @app.post("/v1/jobs/{job_id}/{action}", operation_id="control_job")
@@ -738,6 +780,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         table: Literal["policies", "schedules", "outbox"],
         cursor: str = "",
         limit: int = Query(50, ge=1, le=200),
+        order: Literal["id", "recent"] = "id",
     ) -> dict:
         def item(row):
             value = dict(row) | {"data": json.loads(row["data"])}
@@ -745,14 +788,31 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
             label = delivery_phase(row) if table == "outbox" else None
             return value | {"phase": label} if label else value
 
+        # `recent`: schedules by when they are due and deliveries by when they were last
+        # available, latest first (S1-16). Policies have no time of their own.
+        column = {"schedules": "due_at", "outbox": "available"}.get(table) if order == "recent" else None
         with engine.db.connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM {table} WHERE id>? ORDER BY id LIMIT ?",
-                (cursor, limit + 1),
-            ).fetchall()
+            if column:
+                where, args = "", []
+                if cursor:
+                    at, _, last = cursor.partition("|")
+                    value = float(at) if column == "available" else at
+                    where, args = f" WHERE ({column}<? OR ({column}=? AND id<?))", [value, value, last]
+                rows = conn.execute(
+                    f"SELECT * FROM {table}{where} ORDER BY {column} DESC,id DESC LIMIT ?",
+                    args + [limit + 1],
+                ).fetchall()
+                following = (lambda row: f"{row[column]!r}|{row['id']}" if column == "available"
+                             else f"{row[column]}|{row['id']}")
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM {table} WHERE id>? ORDER BY id LIMIT ?",
+                    (cursor, limit + 1),
+                ).fetchall()
+                following = (lambda row: row["id"])
             return {
                 "items": [item(r) for r in rows[:limit]],
-                "cursor": rows[limit - 1]["id"] if len(rows) > limit else None,
+                "cursor": following(rows[limit - 1]) if len(rows) > limit else None,
             }
 
     @app.post("/v1/contact/schedules", operation_id="create_schedule")
@@ -777,9 +837,11 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     # Host-internal: the Node adapters take, renew and return model leases here, because Node
     # never opens SQLite. Not part of the public contract, so a rolled-back service answers 404
-    # and the adapters fall back to their degraded mode. A busy ledger answers 503 within two seconds.
+    # and the adapters fall back to their degraded mode. A busy or unavailable ledger is an
+    # answer, not a failure of the service: it comes back as 200 with its state, the same JSON
+    # the CLI action gives, so the host does not start a second process to ask again (E3-05).
     def lease_answer(answer):
-        return JSONResponse(answer, status_code=503 if answer["state"] in {"busy", "unavailable"} else 200)
+        return JSONResponse(answer, status_code=200)
 
     @app.post("/v1/model-leases/acquire", include_in_schema=False)
     def acquire_model_lease(request: ModelLeaseRequest):

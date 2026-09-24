@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, kind TEXT NOT NULL, unique_
  available REAL NOT NULL, lease_until REAL, owner TEXT, fence INTEGER NOT NULL DEFAULT 0,
  error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS job_claim ON jobs(state,available,lease_until);
+CREATE INDEX IF NOT EXISTS job_recent ON jobs(updated_at);
+CREATE INDEX IF NOT EXISTS job_state_recent ON jobs(state,updated_at);
 CREATE TABLE IF NOT EXISTS job_dependencies(job_id TEXT NOT NULL, dependency_id TEXT NOT NULL,
  PRIMARY KEY(job_id,dependency_id));
 CREATE TABLE IF NOT EXISTS job_recovery(job_id TEXT NOT NULL, command_id TEXT NOT NULL,

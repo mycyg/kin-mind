@@ -38,6 +38,10 @@ ENVIRONMENT_PAUSE = 60
 RETRY_CAP = 300
 # How long the loop backs off after one of its own steps failed.
 LOOP_BACKOFF = 5
+# A worker neither going round nor renewing a job's lease for this long is not alive; one
+# waiting for another process's loop to let go of the store looks again this often.
+HEALTH_STALE = 300
+STANDBY_SECONDS = 5
 # What a model admission wait asks for, as model_lanes.RETRY_SECONDS does.
 RETRY_SECONDS = 30
 # A host receipt that keeps failing is moved aside after this many tries, and one that can
@@ -72,6 +76,53 @@ def purge_text_indexes(conn):
             conn.execute(f"INSERT INTO {table}({table}) VALUES('optimize')")
 
 
+# Records whose text index entry one rebuild step rewrites.
+REBUILD_BATCH = 500
+
+
+def rebuild_step(engine, job, payload):
+    """The text index rebuilt a batch at a time, in the payload's scope when it names one
+    (E3-15). The words are segmented before the write lock is taken, one short transaction
+    writes them, and the next batch is a job of its own. Only the index is rebuilt: a record
+    whose text did not change invalidates nothing derived from it, so no digest, embedding or
+    judgment is redone for it (E2-09)."""
+    from .db import tokenize
+
+    scope = Scope(**payload["scope"]).key() if payload.get("scope") else None
+    after = int(payload.get("after", 0))
+    with engine.db.connect() as conn:
+        rows = conn.execute(
+            "SELECT rowid,id,revision,deleted,data FROM records WHERE rowid>?"
+            + (" AND scope=?" if scope else "") + " ORDER BY rowid LIMIT ?",
+            [after] + ([scope] if scope else []) + [REBUILD_BATCH],
+        ).fetchall()
+        entries = []
+        for row in rows:
+            data = json.loads(row["data"])
+            words = (tokenize(data["title"] + " " + data["content"])
+                     if not row["deleted"] and engine._indexable(conn, data) else None)
+            entries.append((row["rowid"], row["id"], row["revision"], words))
+    base = payload.get("base") or job["unique_key"]
+
+    def apply(conn):
+        for rowid, rid, revision, words in entries:
+            current = conn.execute("SELECT revision,deleted FROM records WHERE rowid=?", (rowid,)).fetchone()
+            if current is None or current["revision"] != revision:
+                continue  # changed since it was read: its own save indexed it
+            conn.execute("DELETE FROM search WHERE rowid=?", (rowid,))
+            if words is not None and not current["deleted"]:
+                conn.execute("INSERT INTO search(rowid,id,tokens) VALUES(?,?,?)", (rowid, rid, words))
+        if len(entries) == REBUILD_BATCH:
+            last = entries[-1][0]
+            engine.enqueue("rebuild", {**payload, "base": base, "after": last}, f"{base}@{last}",
+                           conn=conn, priority=job.get("priority", 100))
+        elif not scope:
+            # The whole store went through: what is left in the index belongs to no record.
+            conn.execute("DELETE FROM search WHERE rowid NOT IN (SELECT rowid FROM records WHERE deleted=0)")
+
+    return apply
+
+
 class Worker:
     def __init__(self, engine, lease_seconds=90):
         self.engine = engine
@@ -79,19 +130,26 @@ class Worker:
         self.lease_seconds = lease_seconds
         self.stopped = threading.Event()
         self.last_maintenance = float("-inf")
-        # The heartbeat: when the loop last went round, and what its last own failure was.
-        # `/v1/health` reads these, so a loop that stopped is visible where the host looks.
+        # The heartbeat: when the loop last went round, when a job it is running last renewed
+        # its lease, and what its last own failure was. `/v1/health` reads these, so a loop
+        # that stopped is visible where the host looks.
         self.last_tick = None
+        self.last_beat = None
         self.failures = 0
         self.last_error = None
+        # Another process's loop holds this store, so this one waits (S1-11).
+        self.standby = False
         self.paused = {}
         # Host receipts that failed for a passing reason: name -> (tries, not before).
         self.spool_failures = {}
 
-    def health(self, *, stale=120):
-        """The worker as the service answers for it: alive, and how long since it went round."""
-        age = None if self.last_tick is None else max(0.0, time.time() - self.last_tick)
-        return {"alive": self.last_tick is not None and age <= stale and not self.stopped.is_set(),
+    def health(self, *, stale=HEALTH_STALE):
+        """The worker as the service answers for it: alive while its loop goes round, or while
+        the job it is running keeps renewing its lease; and how long since either."""
+        beats = [t for t in (self.last_tick, self.last_beat) if t is not None]
+        age = None if not beats else max(0.0, time.time() - max(beats))
+        return {"alive": age is not None and age <= stale and not self.stopped.is_set() and not self.standby,
+                "standby": self.standby,
                 "last_tick_age_seconds": None if age is None else round(age, 1),
                 "loop_failures": self.failures, "last_error": self.last_error}
 
@@ -185,6 +243,7 @@ class Worker:
                         "UPDATE jobs SET lease_until=? WHERE id=?",
                         (time.time() + self.lease_seconds, job["id"]),
                     )
+                self.last_beat = time.time()
             except sqlite3.OperationalError:
                 # A busy database is a reason to try again at the next beat, not to stop
                 # renewing and let a paid result be thrown away when the lease runs out.
@@ -681,17 +740,7 @@ class Worker:
 
             return prepare_communities(engine, Scope(**payload["scope"]))
         if kind == "rebuild":
-
-            def apply(conn):
-                conn.execute("DELETE FROM search")
-                for row in conn.execute(
-                    "SELECT data FROM records WHERE deleted=0"
-                ).fetchall():
-                    data = json.loads(row[0])
-                    engine._index_text(conn, data)
-                    engine._dirty(conn, data)
-
-            return apply
+            return rebuild_step(engine, job, payload)
         if kind in ("build_vectors", "purge_vectors"):
             from .vectors import VectorIndex
 
@@ -713,10 +762,38 @@ class Worker:
             return history_step(engine, payload)
         raise ValueError(f"Unknown job kind: {kind}")
 
+    def hold_store(self):
+        """One background loop per store (S1-11). A second service started on the same root,
+        even for the moment before it finds its port taken, waits here instead of claiming
+        jobs, and takes over when the first one's lock is gone. Returns the held lock, or None
+        once stopped."""
+        import fcntl
+
+        handle = open(self.engine.db.root / "worker.lock", "a")
+        while not self.stopped.is_set():
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.standby = False
+                return handle
+            except BlockingIOError:
+                self.standby = True
+                self.stopped.wait(STANDBY_SECONDS)
+        handle.close()
+        return None
+
     def run(self):
         """The one background loop. Every step is caught on its own: a database that stayed
         locked past its timeout, or one malformed row, used to end the thread for good while
         the service went on answering that it was ready."""
+        held = self.hold_store()
+        if held is None:
+            return
+        try:
+            self._loop()
+        finally:
+            held.close()
+
+    def _loop(self):
         from .scheduler import Scheduler
 
         scheduler = None

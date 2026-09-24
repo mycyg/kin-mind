@@ -7,6 +7,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from .contact_tasks import ContactTaskInput, ContactTasks
 from .models import (
+    ModelMaintenance,
     RecallQuery,
     RecallRequest,
     RevisionInput,
@@ -122,11 +123,6 @@ def create_mcp(engine):
         }
 
     @server.tool()
-    def memory_feedback(record_id: str, type: str, session: str = "") -> dict:
-        """记录 displayed、read、adopted、verified、corrected、unknown 或 same_file_observed 反馈，按实际发生的情况选择。"""
-        return engine.feedback(record_id, type, session)
-
-    @server.tool()
     def session_boundary(request: dict) -> dict:
         """开始、保存检查点、压缩或结束会话；检查点分别保留已确认与未验证状态。"""
         from .api import SessionBoundary, boundary
@@ -145,15 +141,10 @@ def create_mcp(engine):
         )
 
     @server.tool()
-    def request_maintenance(kind: str, scope: Scope, command_id: str) -> dict:
-        """排入增量整理、diary、summary、portrait、self_narrative、prediction 或索引重建。"""
-        from .api import MaintenanceRequest
-
-        request = MaintenanceRequest(kind=kind, scope=scope, command_id=command_id)
+    def request_maintenance(kind: ModelMaintenance, scope: Scope, command_id: str) -> dict:
+        """排入作用域内的增量整理（organize）或 diary、summary、portrait、self_narrative、prediction。索引重建与向量维护只由运维执行。"""
         return {
-            "id": engine.enqueue(
-                request.kind, {"scope": scope.model_dump()}, command_id
-            ),
+            "id": engine.enqueue(kind, {"scope": scope.model_dump()}, command_id),
             "status": "pending",
         }
 
@@ -173,7 +164,7 @@ def create_mcp(engine):
     def list_contact_tasks(
         scope: Scope, policy_ids: list[str], limit: int = 30
     ) -> dict:
-        """读取作用域与所选策略中的任务、当前修订和近期投递状态，每页最多 100 项，按到期时间倒序。发送只以 sent 回执确认。"""
+        """读取作用域与所选策略中的任务、当前修订和近期投递状态及其含义，每页最多 100 项：未结束的在前，按到期时间先后。发送只以 sent 回执确认。"""
         return ContactTasks(engine, scope, policy_ids).list(limit)
 
     @server.tool()

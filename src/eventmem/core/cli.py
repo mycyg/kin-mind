@@ -112,6 +112,17 @@ def parser():
     return root
 
 
+def running(port):
+    """Whether something answers MemoryPalace's health route on this loopback port."""
+    import httpx
+
+    try:
+        httpx.get(f"http://127.0.0.1:{port}/v1/health", timeout=2)
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if args.command == "codex":
@@ -147,6 +158,14 @@ def main(argv=None):
             if args.command == "evaluate"
             else benchmark(args.root, args.output, args.scale)
         )
+    elif args.command == "console" and running(args.port):
+        # A service already answers on this port: open the console on it. Starting another
+        # Engine here would run a second background loop on the same store until the port
+        # turned out to be taken (S1-11).
+        token = (Path(args.root) / "local-token").read_text().strip()
+        webbrowser.open(f"http://127.0.0.1:{args.port}/#token={token}")
+        print(f"MemoryPalace is already running at http://127.0.0.1:{args.port}", file=sys.stderr)
+        return 0
     else:
         engine = Engine(args.root)
         command = args.command

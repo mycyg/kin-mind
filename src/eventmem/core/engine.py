@@ -25,6 +25,10 @@ class Engine:
 
     def __init__(self, root: str | Path):
         self.db = Database(root)
+        from .retrieval import pin_encoding_cache
+
+        # The tokenizer's encoding lives with the store unless the process chose a place.
+        pin_encoding_cache(self.db.root / "cache" / "tiktoken")
         self.cache: dict = {}
         self.cache_lock = threading.RLock()
         self.interactive_until = 0.0
@@ -944,30 +948,10 @@ class Engine:
             ).fetchone()
             return json.loads(row[0]) if row else {}
 
-    def feedback(self, rid, type_, session="", attributes=None, key=None):
-        if type_ not in {
-            "displayed",
-            "read",
-            "adopted",
-            "verified",
-            "corrected",
-            "unknown",
-            "same_file_observed",
-        }:
-            raise ValueError("Unsupported feedback type")
-        with self.db.connect(write=True) as conn:
-            self._get(conn, rid)
-            fid = key or uid("feedback")
-            conn.execute(
-                "INSERT OR IGNORE INTO feedback VALUES(?,?,?,?,?,?)",
-                (fid, rid, session, type_, now(), dumps(attributes or {})),
-            )
-        return {"id": fid, "type": type_}
-
-    def recall(self, request):
+    def recall(self, request, **options):
         from .retrieval import recall
 
-        return recall(self, request)
+        return recall(self, request, **options)
 
     def overview(self):
         with self.db.connect() as conn:
