@@ -180,3 +180,56 @@ def test_owner_contact_preference_is_reversible_and_does_not_change_scores(setup
         "reason": "The owner restored waiting", "wait_for_reply": True})
     assert mind.read()["contact"]["wait_for_reply"] is True
     assert mind.read()["dimensions"] == before["dimensions"]
+
+
+def test_every_ready_wish_is_offered_and_kin_picks(setup):
+    """N11: the draft is offered every ready wish; a send completes only the ones Kin chose."""
+    mind, source, _ = setup
+    wish(mind, source, "first", strength=40, content="Tell her about the tea")
+    wish(mind, source, "second", strength=90, content="Ask about the trip")
+    candidate = mind.contact_candidate()
+    assert candidate["eligible"] and len(candidate["desires"]) == 2
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    assert len(attempt["desire_ids"]) == 2
+    tea = next(d["id"] for d in attempt["desires"] if d["content"] == "Tell her about the tea")
+    with pytest.raises(ValueError):
+        mind.settle_contact(attempt_id=attempt["id"], state="pending", desire_ids=["not-offered"])
+    assert mind.check_contact(attempt["id"], "owner-1", desire_ids=[tea])["eligible"]
+    mind.settle_contact(attempt_id=attempt["id"], state="pending", desire_ids=[tea], text="The tea was lovely")
+    mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="m-1")
+    status = {d["content"]: d["status"] for d in mind.read()["desires"]}
+    assert status == {"Tell her about the tea": "completed", "Ask about the trip": "wanted"}
+
+
+def test_an_unknown_send_holds_only_its_own_wish(setup):
+    """AD2-14: an unknown outcome is reconciled under its own id with a growing interval. Only its
+    wish is held, Kin is told, and the same words are never said again under another id."""
+    mind, source, clock = setup
+    wish(mind, source, "moon", content="Share the moon photo")
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    held = attempt["desire_ids"][0]
+    mind.settle_contact(attempt_id=attempt["id"], state="pending", text="Did you see the moon?")
+    mind.settle_contact(attempt_id=attempt["id"], state="unconfirmed", reason="timeout")
+    assert mind.read()["contact_unconfirmed"][0]["attempt_id"] == attempt["id"]
+    assert mind.contact_candidate()["reason"] == "no-actionable-desire"
+    wish(mind, source, "other", content="Ask how the day went")
+    candidate = mind.contact_candidate()
+    assert candidate["eligible"] and held not in [d["id"] for d in candidate["desires"]]
+    assert candidate["reconcile"] == []
+    clock[0] += timedelta(minutes=6)
+    assert [u["attempt_id"] for u in mind.contact_candidate()["reconcile"]] == [attempt["id"]]
+    mind.settle_contact(attempt_id=attempt["id"], state="unconfirmed", reason="receipt-still-unknown")
+    assert mind.contact_candidate()["reconcile"] == []
+    second = mind.claim_contact(owner_epoch="owner-1")
+    assert mind.check_contact(second["id"], "owner-1", text="Did you  see the moon?")["reason"] == "repeats-unconfirmed-send"
+    assert mind.check_contact(second["id"], "owner-1", text="How was your day?")["eligible"]
+
+
+def test_a_transient_cancel_lets_the_same_wish_be_tried_again(setup):
+    """K1-17: nothing changed, yet the next attempt is a new one, not the finished old one."""
+    mind, source, _ = setup
+    wish(mind, source, "again")
+    first = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=first["id"], state="canceled", reason="Draft or delivery conditions changed")
+    second = mind.claim_contact(owner_epoch="owner-1")
+    assert second["id"] != first["id"] and second["state"] == "drafting"

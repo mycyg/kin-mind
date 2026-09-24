@@ -686,6 +686,7 @@ def appraisal_context(context):
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
         "continuity", "rhythm", "appraisal_summary", "exploration_decisions", "exploration_capabilities",
+        "contact_unconfirmed",
     }}
     state["dimensions"] = {}
     for key, value in original.get("dimensions", {}).items():

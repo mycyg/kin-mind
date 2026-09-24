@@ -150,3 +150,19 @@ test('a contact wait of up to three days is kept; one past either end is taken t
  assert.deepEqual([wait(60),wait(172800),wait(432000)],[300,172800,259200]);
  assert.throws(()=>parseContactDraft(JSON.stringify({text:'An object without an action'})),/contact-draft-invalid-result/);
 });
+test('Kin names the wishes her draft is for; check and pending carry them with the text (N11)',async()=>{
+ const{loop,events}=fixture({draft:async()=>({action:'send',text:'The tea was lovely',desire_ids:['d-tea']})});
+ await loop.tick();
+ const check=events.find(([action])=>action==='check')[1];
+ assert.deepEqual(check.desire_ids,['d-tea']);assert.equal(check.text,'The tea was lovely');
+ const pending=events.find(([action,request])=>action==='settle'&&request.state==='pending')[1];
+ assert.deepEqual(pending.desire_ids,['d-tea']);assert.equal(pending.text,'The tea was lovely');
+});
+test('a send of unknown outcome is checked again under its own id and only then does the tick go on (AD2-14)',async()=>{
+ const events=[];const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-1',isBusy:()=>false,draft:async()=>assert.fail('nothing ready'),send:async()=>assert.fail('must not send'),
+   resume:async candidate=>{events.push(['resume',candidate.attempt_id]);return{state:'unconfirmed',reason:'receipt-unavailable'};},
+   call:async(action,request)=>{events.push([action,request]);if(action==='candidate')return{eligible:false,reason:'no-actionable-desire',reconcile:[{attempt_id:'old',owner_epoch:'owner-1'}]};return request;}});
+ loop.review=async()=>{};await loop.tick();
+ assert.deepEqual(events.find(([action])=>action==='resume'),['resume','old']);
+ const settled=events.at(-1)[1];assert.equal(settled.attempt_id,'old');assert.equal(settled.state,'unconfirmed');assert.equal(settled.reason,'receipt-still-unknown');
+});

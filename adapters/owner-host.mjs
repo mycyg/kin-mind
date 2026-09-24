@@ -82,6 +82,34 @@ export class MindLoop {
     try { this.recordStatus?.({contact:{...result,checkedAt:new Date().toISOString()}}); } catch {}
     return result;
   }
+  /** A resumed attempt's receipt, settled under the attempt's own id. `unknown` answers a receipt
+   * that proves nothing: by default it is returned as is; a send of unknown outcome passes one
+   * that records the check, so the next one waits longer. */
+  async settleResumed(candidate,receipt,{unknown}={}) {
+    if(receipt?.state==='accepted'&&receipt.messageId) {
+      const settled=await this.call('settle',{attempt_id:candidate.attempt_id,state:'accepted',message_id:receipt.messageId,message_ids:receipt.messageIds,partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles});
+      void this.review();return settled;
+    }
+    if(receipt?.state==='needs-review') {
+      if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
+        reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});
+      return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'Review failure crossed the send boundary; reconcile only',
+        failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-review-release-unproven',retry_condition:'reconcile'}});
+    }
+    if(receipt?.state==='canceled') {
+      if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
+        if(candidate.owner_epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
+          reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
+        if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
+          attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
+        return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
+          failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
+      }
+      return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'A possible send has a terminal receipt; reconciliation is required',
+        failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-delivery-canceled-after-boundary',retry_condition:'reconcile'}});
+    }
+    return unknown?await unknown(receipt):{...candidate,delivery:receipt};
+  }
   async contactTick() {
     if(this.closed||this.contactRunning||this.isBusy())return {state:'busy'};
     const eligibility=this.eligibility();
@@ -91,31 +119,16 @@ export class MindLoop {
     try {
       await this.call('reconsider',{owner_epoch:this.ownerEpoch()});
       const candidate=await this.call('candidate',{});
-      if(candidate.reason==='attempt-in-progress'&&['pending','unconfirmed'].includes(candidate.state)&&this.resume) {
-        const receipt=await this.resume(candidate);
-        if(receipt?.state==='accepted'&&receipt.messageId) {
-          const settled=await this.call('settle',{attempt_id:candidate.attempt_id,state:'accepted',message_id:receipt.messageId,message_ids:receipt.messageIds,partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles});
-          void this.review();return settled;
-        }
-        if(receipt?.state==='needs-review') {
-          if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
-            reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});
-          return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'Review failure crossed the send boundary; reconcile only',
-            failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-review-release-unproven',retry_condition:'reconcile'}});
-        }
-        if(receipt?.state==='canceled') {
-          if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0) {
-            if(candidate.owner_epoch!==this.ownerEpoch())return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,
-              reason:'contact-source-changed',failure:{category:'source-changed',stage:'contact-send-boundary',code:'contact-owner-epoch-superseded',retry_condition:'deepseek-decision'}});
-            if(receipt.decision?.action==='abandon'&&typeof receipt.decision.reason==='string')return this.call('settle',{
-              attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,decision:receipt.decision});
-            return this.call('settle',{attempt_id:candidate.attempt_id,state:'canceled',aborted_before_send:true,reason:'contact-review-failed',
-              failure:{category:'contract',stage:'contact-review-contract',code:'contact-canceled-without-semantic-decision',retry_condition:'deepseek-decision'}});
-          }
-          return this.call('settle',{attempt_id:candidate.attempt_id,state:'unconfirmed',reason:'A possible send has a terminal receipt; reconciliation is required',
-            failure:{...failure(receipt),category:'delivery-uncertain',stage:'contact-delivery',code:'contact-delivery-canceled-after-boundary',retry_condition:'reconcile'}});
-        }
-        return {...candidate,delivery:receipt};
+      if(candidate.reason==='attempt-in-progress'&&['pending','unconfirmed'].includes(candidate.state)&&this.resume)
+        return await this.settleResumed(candidate,await this.resume(candidate));
+      // A send of unknown outcome is checked again under its own id when its time comes, one per
+      // tick. It holds only the wishes it carried; every other wish goes on (AD2-14).
+      const due=(candidate.reconcile??[])[0];
+      if(due&&this.resume) {
+        const unconfirmed={...due,state:'unconfirmed'};
+        const reconciled=await this.settleResumed(unconfirmed,await this.resume(unconfirmed),
+          {unknown:()=>this.call('settle',{attempt_id:due.attempt_id,state:'unconfirmed',reason:'receipt-still-unknown'})});
+        if(!candidate.eligible)return reconciled;
       }
       if(!candidate.eligible)return candidate;
       const epoch=this.ownerEpoch();
@@ -134,22 +147,29 @@ export class MindLoop {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:current?(sourceMoved?'draft-source-changed':'draft-failed'):'Draft or delivery conditions changed',
           ...(current?{failure:detail}:{})});
       }
+      // Kin picked among every ready wish the attempt offered; unnamed means all of them (N11).
+      const {desire_ids:named,...semantic}=decision;
+      const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:{};
       const content=decision.action==='send'?decision.text:null;
-      const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch()});
+      const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch(),...chosen,...(typeof content==='string'?{text:content}:{})});
+      if(valid.reason==='repeats-unconfirmed-send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});
+      if(valid.reason==='desire-not-offered')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
+        failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-unknown-desire',retry_condition:'deepseek-decision'})});
       if(this.closed||!valid.eligible||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});
       }
-      if(decision.action!=='send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision});
+      if(decision.action!=='send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision:semantic,...chosen});
       if(typeof content!=='string'||!content.trim())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision'})});
-      await this.call('settle',{attempt_id:attempt.id,state:'pending'});
+      await this.call('settle',{attempt_id:attempt.id,state:'pending',...chosen,text:content});
       // The durable pending write is not a send. Yield safely if context moved.
       if(this.closed||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
           reason:epoch!==this.ownerEpoch()?'contact-source-changed':'Delivery conditions changed before sending'});
       }
       possibleSend=true;
-      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files:attempt.desire?.delivery_artifacts??[],
+      const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
+      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files,
         guard:()=>!this.closed&&!this.isBusy()&&this.eligibility().eligible&&epoch===this.ownerEpoch()});
       if(receipt.state==='needs-review') {
         if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
