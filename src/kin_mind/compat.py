@@ -9,9 +9,12 @@ unrelated version bump keeps a prediction testable; a real change makes it stale
 reason names the ingredient that moved.
 
 `BEHAVIOR_CONTRACT` is declared, never derived: changing a behavior-relevant instruction is a
-decision, not a side effect of editing prose. `tests/test_behavior_chain.py` pins the digest of
-those paragraphs against the contract, so an edit fails until its author chooses — bump the
-contract, because the earlier checks no longer describe this agent, or re-pin, because they do.
+decision, not a side effect of editing prose. Whoever changes what Kin is asked to do bumps it
+when the earlier checks and decisions no longer describe this agent.
+
+The stamp also fences decisions: a wish, a plan step or a method decided under one stamp holds
+while it holds (state.Mind.decision_current), so a deployment that only moves agent_version no
+longer voids them (K1-13, MAIN-RUA-02).
 """
 
 from __future__ import annotations
@@ -84,13 +87,3 @@ def stale_reason(stored, current):
     moved = [name for name in sorted(current["parts"]) if old.get(name) != current["parts"][name]]
     return "compat-changed:" + (",".join(moved) if old else "unstamped")
 
-
-def behavior_prompts():
-    """The instructions a behavioral check is made under: the shared appraisal prompt and the
-    paragraph of every audited section. Imported lazily; this module is on the commit path."""
-    from . import appraisal
-    return (appraisal.SYSTEM, *(appraisal.SECTION_PROMPTS[name] for name in appraisal.AUDIT_SECTIONS))
-
-
-def prompt_digest():
-    return digest(list(behavior_prompts()))

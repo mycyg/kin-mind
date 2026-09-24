@@ -233,3 +233,36 @@ def test_a_transient_cancel_lets_the_same_wish_be_tried_again(setup):
     mind.settle_contact(attempt_id=first["id"], state="canceled", reason="Draft or delivery conditions changed")
     second = mind.claim_contact(owner_epoch="owner-1")
     assert second["id"] != first["id"] and second["state"] == "drafting"
+
+
+def test_the_reviews_of_one_tick_are_one_assessment(setup):
+    """K1-06: internal reviews queued in the same tick are judged in a single assessment."""
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    idle = jobs.enqueue([source("idle-timer")], "synthetic-v1", origin="reflection", stimulus="idle-review")
+    look = jobs.enqueue([source("wish-look")], "synthetic-v1", origin="reflection", stimulus="wish-review")
+    reviewer = FakeReviewer(Appraisal(reason="Looked at both"))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert reviewer.calls == 1
+    assert jobs.status(idle["id"])["state"] == "complete" and jobs.status(look["id"])["state"] == "complete"
+    assert jobs.run_one(reviewer)["state"] == "idle"
+
+
+def test_a_decision_outlives_a_deployment_but_not_a_change_of_what_decides_behaviour(setup):
+    """K1-13, MAIN-RUA-02: the compat stamp, not agent_version, says whether a decision holds."""
+    from kin_mind import compat
+    mind, _, _ = setup
+    with mind.engine.db.connect() as conn:
+        stamped = compat.stamp(mind, conn)
+        assert mind.decision_current(conn, {"compat": stamped}) and mind.decision_current(conn, {})
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        state["agent_version"] = "synthetic-v2"
+        mind._save(conn, state)
+    with mind.engine.db.connect() as conn:
+        assert mind.decision_current(conn, {"compat": stamped})
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('behavior_models',?)",
+                     (json.dumps({"chat": "another-model", "chat_effort": "high"}),))
+    with mind.engine.db.connect() as conn:
+        assert not mind.decision_current(conn, {"compat": stamped})

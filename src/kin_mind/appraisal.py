@@ -60,6 +60,25 @@ REPEATED_FAILURE_LIMIT = 2
 # ephemeral read-only fork, left nothing behind, and is tried again (K1-01).
 TRANSIENT_PATTERN = r"deepseek-(?:network-error|http-(?:5\d\d|429))|native-review-[a-z-]+"
 MAX_TRANSIENT_FAILURES = 8
+# What one tick may hand to a single assessment (K1-06): owner input and results, and the
+# internal reviews. A follow-up, a bootstrap, a migration, maintenance and enrichment keep
+# their own passes.
+INTERACTION_STIMULI = {None, "assistant-result", "runtime-result", "delivery"}
+MERGEABLE_STIMULI = INTERACTION_STIMULI | {"idle-review", "wish-review", "trait-wish-review", "drive-crossing",
+                                           "plan-review", "exploration-result"}
+
+
+def batch_stimulus(stimuli):
+    """The label of a merged assessment: one kind keeps its name, owner input or results make it an
+    interaction batch, internal reviews alone an internal batch. `stimuli` lists every member."""
+    stimuli = set(stimuli)
+    if stimuli == {"delivery"}:
+        return "delivery"
+    if stimuli & INTERACTION_STIMULI:
+        return "interaction-batch"
+    return next(iter(stimuli)) if len(stimuli) == 1 else "internal-batch"
+
+
 # The stimuli whose evidence is new material for memory enrichment (K1-07).
 MATERIAL_STIMULI = {None, "assistant-result", "runtime-result", "delivery", "interaction-batch", "exploration-result"}
 # A host error raised before any model call is the same on every retry (K4-06): it is set
@@ -1300,7 +1319,7 @@ class Appraisals:
             conn.executescript(QUEUE_SCHEMA + REFUSAL_SCHEMA)
 
     def exploration_targets(self, data, refs):
-        if data.get("stimulus") != "exploration-result":
+        if data.get("stimulus") != "exploration-result" and not data.get("exploration_targets"):
             return []
         saved = data.get("exploration_targets")
         if saved is not None:
@@ -1615,12 +1634,19 @@ class Appraisals:
                 (self.mind.scope.key(), time.time(), int(semantic_enabled), 1 if maintenance else 2 if enrichment else 0),
             ).fetchone():
                 return {"state": "busy"}
-            if (semantic_enabled and not data.get("batch_ids") and data.get("stimulus") in {None, "assistant-result", "runtime-result", "delivery"}
+            if (not data.get("batch_ids") and data.get("stimulus") in MERGEABLE_STIMULI
+                    and (semantic_enabled or data.get("stimulus") not in INTERACTION_STIMULI)
                     # A judgment that already committed finishes from its durable
                     # receipt; it must not absorb evidence that commit never saw.
                     and not conn.execute("SELECT 1 FROM commands WHERE id=?", (self.mind._key(row["id"]),)).fetchone()):
-                batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND (json_extract(data,'$.stimulus') IS NULL OR json_extract(data,'$.stimulus') IN ('assistant-result','runtime-result','delivery')) ORDER BY available LIMIT 11",
-                                     (self.mind.scope.key(), time.time(), row["id"])).fetchall()
+                # Everything the tick queued is one assessment: owner input, results, and the
+                # internal reviews (idle, wish, plan, exploration) alike (K1-06, H2a-01, E3-04, K2-04).
+                mergeable = MERGEABLE_STIMULI if semantic_enabled else MERGEABLE_STIMULI - INTERACTION_STIMULI
+                named = sorted(x for x in mergeable if x)
+                batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND ("
+                                     + ("json_extract(data,'$.stimulus') IS NULL OR " if None in mergeable else "")
+                                     + "json_extract(data,'$.stimulus') IN (" + ",".join("?" * len(named)) + ")) ORDER BY available LIMIT 11",
+                                     (self.mind.scope.key(), time.time(), row["id"], *named)).fetchall()
                 ids = list(data["evidence_ids"])
                 stimuli = {data.get("stimulus")}
                 batch_ids = []
@@ -1643,8 +1669,14 @@ class Appraisals:
                         break
                     ids = combined
                     batch_ids.extend(m for m in members if m not in batch_ids and m != row["id"])
-                    stimuli.add(json.loads(child["data"]).get("stimulus"))
-                data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus="delivery" if stimuli == {"delivery"} else "interaction-batch")
+                    child_data = json.loads(child["data"])
+                    stimuli.add(child_data.get("stimulus"))
+                    for target in child_data.get("exploration_targets") or []:
+                        if all(t.get("exploration_id") != target.get("exploration_id") for t in data.get("exploration_targets") or []):
+                            data.setdefault("exploration_targets", []).append(target)
+                if batch_ids:
+                    data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus=batch_stimulus(stimuli),
+                                stimuli=sorted(x or "interaction" for x in stimuli))
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
@@ -1804,17 +1836,20 @@ class Appraisals:
                     # A review answers for its plan's wake-up reasons, so that plan leads the window of 40
                     # however many others are due before it.
                     plans_view = AutonomousPlans(self.mind)
-                    target = plans_view.review_target(row["id"]) if data.get("stimulus") == "plan-review" else None
+                    # Every plan review merged into this assessment answers for its own plan.
+                    members = [row["id"], *data.get("batch_ids", [])] if "plan-review" in set(data.get("stimuli") or [data.get("stimulus")]) else []
+                    targets = [t for t in (plans_view.review_target(j) for j in members) if t]
                     # A follow-up restates the decisions its parent's review had refused, so it leads with
                     # the same plan. It answers for no wake-up reason of its own and registers no version.
-                    lead = target or (plans_view.review_target(data["parent_id"])
+                    lead = (targets[0] if targets else None) or (plans_view.review_target(data["parent_id"])
                                       if data.get("stimulus") == FOLLOW_UP and data.get("parent_id") else None)
                     shown_plans = plans_view.read(limit=40, manifest=True, first=lead and lead["plan_id"])
-                    if target:
-                        # Gone or no longer active: it cannot be shown as the plan under review. The commit
-                        # then registers nothing for it and reopens the reasons this review had taken.
-                        lead = shown_plans["plans"][0] if shown_plans["plans"] else {}
-                        data["plan_review_target"] = {**target, "shown": lead.get("id") == target["plan_id"] and lead.get("status") == "active"}
+                    data.pop("plan_review_targets", None)
+                    if targets:
+                        # Gone or no longer active: it cannot be shown as a plan under review. The commit
+                        # then registers nothing for it and reopens the reasons its review had taken.
+                        active = {p["id"] for p in shown_plans["plans"] if p.get("status") == "active"}
+                        data["plan_review_targets"] = [{**t, "shown": t["plan_id"] in active} for t in targets]
                     # The host's own record of the plan view this attempt shows the model.
                     # Decisions are checked against it at commit, step by step.
                     data["plan_view"] = shown_plans.pop("manifest")
@@ -1987,7 +2022,11 @@ class Appraisals:
                         "wish_updates": [u.model_copy(update={"concern_ids": None}) for u in proposal.wish_updates if u.action != "link"],
                     })
                 effective_version = self.exploration_capabilities.get("version") or (view.get("continuity") or {}).get("version") or (view.get("action_policy") or {}).get("version", data["agent_version"])
-                receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"]}
+                from . import compat
+                with self.engine.db.connect() as conn:
+                    stamped = compat.stamp(self.mind, conn)
+                # Decisions hold while this stamp does, not only until the next deployment (K1-13).
+                receipt = {**receipt, "agent_version": effective_version, "enqueued_agent_version": data["agent_version"], "compat": stamped}
                 data["receipt"] = receipt
                 # Keep the structured judgment for auditing a failed atomic
                 # commit; model reasoning is never part of this record.
@@ -2164,14 +2203,19 @@ class Appraisals:
                                 shown, version=effective_version, job_id=row["id"]))
                         if decisions:
                             section("action_decisions", apply_action_decisions)
-                        if data.get("stimulus") == "plan-review":
-                            target = data.get("plan_review_target") or {}
-                            unshown = target.get("plan_id") if target and not target.get("shown") else None
-                            plans.register_review(conn, [i for i in shown["plans"] if i != unshown], eid + ":plan-view", receipt, effective_version)
-                            if unshown:
-                                # The plan this review was woken for could not be shown, so the review answered
-                                # for none of its reasons: the next tick finds them open.
-                                plans.reopen_wakeups(conn, target)
+                        review_targets = data.get("plan_review_targets") or ([data["plan_review_target"]] if data.get("plan_review_target") else [])
+                        if review_targets or data.get("stimulus") == "plan-review":
+                            unshown = {t["plan_id"] for t in review_targets if not t.get("shown")}
+                            answered = [i for i in shown["plans"] if i not in unshown]
+                            plans.register_review(conn, answered, eid + ":plan-view", receipt, effective_version)
+                            for target in review_targets:
+                                if not target.get("shown"):
+                                    # The plan this review was woken for could not be shown, so the review answered
+                                    # for none of its reasons: the next tick finds them open.
+                                    plans.reopen_wakeups(conn, target)
+                            # Reviews of the same plans queued before this one read them are answered (K2-04).
+                            plans.retire_answered_reviews(conn, answered, before=data["attempt_started_at"], answered_by=row["id"],
+                                                          keep_jobs={row["id"], *data.get("batch_ids", [])})
                     if settings["procedure_learning"] and not historical and not new_interaction:
                         from .procedures import Procedures
 

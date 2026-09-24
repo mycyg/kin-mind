@@ -586,13 +586,24 @@ class Mind(Continuity):
 
         return self._mutate(request, "behavior-policy", apply)
 
+    def decision_current(self, conn, receipt, state=None):
+        """A verified decision holds while what decides Kin's behaviour is unchanged: the approved
+        persona, the behaviour contract, the definitions, the models and the environment (the
+        compat stamp). A deployment that only moves agent_version no longer voids every decision
+        (K1-13, MAIN-RUA-02). A receipt from before stamps holds."""
+        stored = (receipt or {}).get("compat")
+        if not stored:
+            return True
+        from . import compat
+        return compat.holds(stored, compat.stamp(self, conn, state))
+
     def _desire_ready(self, conn, desire, at, *, state=None):
         from .autonomy_schema import enabled
         from .model_runtime import verified_decision
         if enabled(conn, self.scope.key()):
             receipt = desire.get("decision_receipt", {})
             current = state or self._load(conn)
-            if not verified_decision(receipt) or receipt.get("agent_version") != current["agent_version"]:
+            if not verified_decision(receipt) or not self.decision_current(conn, receipt, current):
                 return False
             from .plans import AutonomousPlans
             if not AutonomousPlans(self).linked_ready(conn, desire):

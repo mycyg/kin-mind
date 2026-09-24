@@ -198,6 +198,8 @@ class ActionEvents:
         ):
             return
         with self.mind.engine.db.connect(write=True) as conn:
+            from . import compat
+            current = compat.stamp(self.mind, conn)
             for d in view["desires"]:
                 if d["status"] != "wanted" or d["expired"] or d["needs_review"]:
                     continue
@@ -217,20 +219,21 @@ class ActionEvents:
                     versions
                     and semantic
                     and verified_decision(receipt)
-                    and receipt.get("agent_version") != view["agent_version"]
+                    and receipt.get("compat")
+                    and not compat.holds(receipt["compat"], current)
                 ):
-                    # A wish decided under an earlier version is not ready any more, and nothing
-                    # would ever look at it again. Ask once what to do with it, per wish and
-                    # version, so it is confirmed or dropped rather than silently stranded.
+                    # A wish decided under a configuration that has since changed in what decides
+                    # behaviour is not ready any more. Ask once what to do with it, per wish and
+                    # configuration. A deployment that only moves agent_version asks nothing (K1-13).
                     self.emit(
                         conn,
                         "wish-review",
-                        [d["id"], "agent-version", view["agent_version"]],
+                        [d["id"], "compat", current["key"]],
                         {
                             "desire_id": d["id"],
                             "evidence_ids": [r["record_id"] for r in d["evidence"]],
                             "agent_version": view["agent_version"],
-                            "reason": "The decision behind this wish was made under an earlier version",
+                            "reason": "The decision behind this wish was made before " + compat.stale_reason(receipt["compat"], current),
                         },
                     )
 
@@ -280,12 +283,13 @@ class ActionEvents:
             from .plans import AutonomousPlans
             choices = [d for d in choices if AutonomousPlans(self.mind).linked_ready(conn, d)]
         if view.get("action_policy"):
-            choices = [
-                d
-                for d in choices
-                if verified_decision(d.get("decision_receipt", {}))
-                and (not semantic or d.get("decision_receipt", {}).get("agent_version") == view["agent_version"])
-            ]
+            with self.mind.engine.db.connect() as conn:
+                choices = [
+                    d
+                    for d in choices
+                    if verified_decision(d.get("decision_receipt", {}))
+                    and (not semantic or self.mind.decision_current(conn, d.get("decision_receipt", {})))
+                ]
         if not choices:
             return {"state": "waiting", "reason": "no-exploration-intent"}
         desire = min(choices, key=lambda d: (-d["strength"], d["created_at"], d["id"]))

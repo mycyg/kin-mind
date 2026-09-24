@@ -278,6 +278,25 @@ def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
     past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
     assert past["state"] == "needs-kin"
 
+def test_a_review_retires_the_queued_reviews_it_answered(env):
+    """K2-04: reviews of a plan queued before a review read it are answered by that review;
+    those not yet started are retired instead of paid for again. A started one is left alone."""
+    from kin_mind.appraisal import Appraisals
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    actions = ActionEvents(mind)
+    Appraisals(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        first = plans._emit_review(conn, actions, plan, [plan["id"], "a"], "test", "planning-v1")
+        second = plans._emit_review(conn, actions, plan, [plan["id"], "b"], "test", "planning-v1")
+        conn.execute("UPDATE mind_action_events SET data=json_set(data,'$.job_id','job-running') WHERE id=?", (second,))
+        conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES('job-running',?,'running',0,'{}')", (mind.scope.key(),))
+    clock[0] += timedelta(seconds=5)
+    with mind.engine.db.connect(write=True) as conn:
+        assert plans.retire_answered_reviews(conn, [plan["id"]], before=mind.clock(), answered_by="appraise_x") == [first]
+        states = dict(conn.execute("SELECT id,state FROM mind_action_events WHERE kind='plan-review'").fetchall())
+    assert states == {first: "superseded", second: "pending"}
+
 def test_waiting_plan_rechecks_new_evidence_before_its_distant_review(env):
     mind, plans, source, clock, initial = env
     p=decide(env, create(env), 'wait', next_review_at='2028-01-01T09:00:00+08:00')

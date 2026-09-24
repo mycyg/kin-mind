@@ -91,9 +91,10 @@ class Procedures:
                 raise Conflict("Procedure changed during evaluation", target=identifier,
                                expected=p.expected_revision, actual=previous["revision"])
         version = (json.loads(old[0])["revision"] + 1) if old else 1
+        from . import compat
         result = {**p.model_dump(), "id": identifier, "revision": version, "status": "candidate", "evidence": refs,
                   "command_id": command, "receipt": receipt, "outcomes": outcomes,
-                  "agent_version": self.mind._load(conn)["agent_version"]}
+                  "agent_version": self.mind._load(conn)["agent_version"], "compat": compat.stamp(self.mind, conn)}
         self._save(conn, result)
         record(conn, stamp, command, self.mind.clock())
         if len({o["case_id"] for o in outcomes}) >= 2:
@@ -108,8 +109,12 @@ class Procedures:
         p = self.get(conn, identifier)
         if p["status"] != "active" or not self.mind._fresh(conn, p["evidence"]):
             raise Conflict("Procedure needs review")
-        if p["agent_version"] != self.mind._load(conn)["agent_version"]:
-            raise Conflict("Procedure environment needs review")
+        # A method holds while what decides behaviour is unchanged, not only until the next
+        # deployment (K2-16). One recorded before stamps holds; its environment is checked below.
+        if p.get("compat"):
+            from . import compat
+            if not compat.holds(p["compat"], compat.stamp(self.mind, conn)):
+                raise Conflict("Procedure environment needs review")
         if environment is None:
             row = conn.execute("SELECT data FROM settings WHERE key='execution_environment'").fetchone()
             environment = json.loads(row[0]) if row else {}

@@ -331,8 +331,10 @@ class AutonomousPlans:
                             "agent_version": version}
         plan["last_reviewed_owner_epoch"] = epoch
         plan["next_review_at"] = review_at
-        # tick() compares this with the state's version; change() is not the only reviewer.
+        # The configuration this plan was last decided under.
         plan["agent_version"] = version
+        if (receipt or {}).get("compat"):
+            plan["compat_key"] = receipt["compat"]["key"]
         # Other independent decisions are re-fenced to this atomic plan revision.
         for other in plan["steps"]:
             if other.get("decision"):
@@ -403,21 +405,49 @@ class AutonomousPlans:
         return held
 
     def register_review(self, conn, plan_ids, command, receipt, version=None):
-        """A completed review saw these plans under this configuration.
+        """A completed review saw these plans under this configuration (its compat key).
 
         Held or absent decisions must not leave the plan recorded under a configuration that
         has already reviewed it; the wake-up ledger only keeps that from waking a review twice.
         """
+        from . import compat
         version, registered = version or self.mind._load(conn)["agent_version"], []
+        key = ((receipt or {}).get("compat") or compat.stamp(self.mind, conn))["key"]
         for identifier in plan_ids:
             row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, identifier)).fetchone()
             plan = json.loads(row[0]) if row else None
-            if not plan or plan.get("agent_version") == version:
+            if not plan or plan.get("compat_key") == key:
                 continue
-            previous, plan["agent_version"] = plan.get("agent_version"), version
-            self._record_review(conn, plan, command, "version-seen", {"previous_agent_version": previous, "agent_version": version, "receipt": receipt})
+            previous = plan.get("compat_key")
+            plan.update(agent_version=version, compat_key=key)
+            self._record_review(conn, plan, command, "version-seen", {"previous_compat_key": previous, "compat_key": key,
+                                                                     "agent_version": version, "receipt": receipt})
             registered.append(identifier)
         return registered
+
+    def retire_answered_reviews(self, conn, plan_ids, *, before, answered_by, keep_jobs=()):
+        """K2-04: a plan review that read these plans answered the reviews queued for them before
+        it read them. Those that have not started are retired instead of paying for the same review
+        again; their wake-up reasons stay answered, by this review."""
+        retired = []
+        jobs = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisals'").fetchone()
+        for row in conn.execute("SELECT id,data,created_at FROM mind_action_events WHERE scope=? AND kind='plan-review' AND state IN ('pending','queued')",
+                                (self.scope,)).fetchall():
+            data = json.loads(row["data"])
+            if data.get("plan_id") not in plan_ids or timestamp(row["created_at"]) > timestamp(before):
+                continue
+            job = data.get("job_id")
+            if job in keep_jobs:
+                continue
+            if job and jobs:
+                current = conn.execute("SELECT state,json_extract(data,'$.frozen_memory_context') IS NOT NULL FROM mind_appraisals WHERE id=?", (job,)).fetchone()
+                if current and (current[0] not in {"pending", "batched"} or current[1]):
+                    continue
+                if current:
+                    conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0,data=json_set(data,'$.superseded_by',?) WHERE id=?", (answered_by, job))
+            conn.execute("UPDATE mind_action_events SET state='superseded',data=json_set(data,'$.answered_by',?) WHERE id=?", (answered_by, row["id"]))
+            retired.append(row["id"])
+        return retired
 
     def _dead_reviews(self, conn, plan_id):
         """Review events of this plan that will never read it; the reasons they answered for are open again.
@@ -493,7 +523,8 @@ class AutonomousPlans:
         decision = step.get("decision", {})
         if decision.get("action") != "execute" or decision.get("plan_revision") != plan["revision"]:
             return "decision-required"
-        if decision.get("agent_version") != self.mind._load(conn)["agent_version"]:
+        if not self.mind.decision_current(conn, decision.get("receipt") or {}):
+            # What decides behaviour changed since this decision; a deployment alone does not (K1-13).
             return "configuration-changed"
         if decision.get("owner_epoch") != self.owner_epoch(conn):
             return "new-owner-evidence"
@@ -593,9 +624,11 @@ class AutonomousPlans:
         if not self.mind._fresh(conn, plan["evidence"]):
             reasons.append(["sources", [self._source_state(conn, ref) for ref in plan["evidence"]]])
         if plan.get("last_reviewed_owner_epoch") != epoch:
+            # A plan may be waiting on 小光. The review this wakes is merged into the assessment of
+            # the owner's own message in the same tick, so it costs no evaluation of its own (K2-04).
             reasons.append(["owner_epoch", epoch])
-        if plan.get("agent_version") != version:
-            reasons.append(["agent_version", version])
+        # A deployment no longer wakes every plan (K2-04, K1-13): a ready step whose decision a real
+        # configuration change affects names its own reason below (configuration-changed).
         for step in plan["steps"]:
             reason = self.waiting_reason(conn, plan, step) if step["state"] == "ready" else None
             if reason in REVIEW_REASONS:
@@ -794,7 +827,7 @@ class AutonomousPlans:
                         if decision.get("action") not in {"wait", "abandon"}:
                             continue
                         if (decision.get("plan_revision") != plan["revision"]
-                            or decision.get("agent_version") != state["agent_version"]
+                            or not self.mind.decision_current(conn, decision.get("receipt") or {}, state)
                             or decision.get("owner_epoch") != self.owner_epoch(conn)
                             or not self.mind._fresh(conn, plan["evidence"] + decision["evidence"])):
                             continue
