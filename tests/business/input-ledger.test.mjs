@@ -56,13 +56,13 @@ test('native turns and reply receipts settle owner inputs by their original ids;
   assert.equal(f.router.state.inputs.first.answer,undefined);
   await f.router.observe('reply-choice',{inputId:'first',state:'silent'});
   assert.equal(f.router.state.inputs.first.answer.state,'silent','Kin chose, for this input');
-  // Two messages one native turn carried are answered by its one reply.
+  // Two messages merged into one native prompt before it began are answered by its one reply (CR2-LIFE-04).
   await f.router.dispatch({id:'third',text:'a'},async()=> 'new-turn');
   await f.router.dispatch({id:'fourth',text:'b'},async()=> 'new-turn');
   await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['third','fourth']});
   await f.router.observe('reply-complete',{inputId:'fourth'});
   await f.router.observe('prompt-end',{taskId:null,inputVersion:null,turnFence:0,stopReason:'end_turn'});
-  assert.deepEqual([f.router.state.inputs.third.answer.state,f.router.state.inputs.third.answer.basis],['covered','same-turn']);
+  assert.deepEqual([f.router.state.inputs.third.answer.state,f.router.state.inputs.third.answer.basis],['covered','same-prompt']);
   const summary=f.router.summary({received:[{id:'inbox-only',at:1}]});
   assert.deepEqual([summary.answered,summary.received,summary.historical,summary.frozen],[4,1,0,null]);
   assert.deepEqual(f.router.unsettledInputs({received:[{id:'inbox-only',at:1,processing:true}]}).map(i=>[i.id,i.state,i.inFlight]),[['inbox-only','received',true]]);
