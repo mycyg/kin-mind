@@ -20,6 +20,8 @@ export function nativePressureRuntime(runtime,history) {
 /** How many injection receipts the window keeps. A receipt is looked up right
  * after its own append; older ones only matter while still unsettled. */
 export const RECEIPTS_KEPT=512;
+/** How many identities the legacy pass remembers having searched for. */
+export const LEGACY_MARKERS_KEPT=4096;
 const INJECTION=/kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+/g;
 const INDEXED=/^kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+$/;
 const sha256=value=>createHash('sha256').update(value).digest('hex');
@@ -60,8 +62,17 @@ export class NativeWindow {
     this.state.receipts??={from:this.state.offset,items:[]};
     windows.set(path.resolve(file),this);
   }
-  /** True when a marker missing from the index is missing from the history. */
-  covers(){return this.state.receipts.from===0||Boolean(this.state.receipts.legacy);}
+  /** True when a marker missing from the index is missing from the history: the
+   * index reads the history from its first byte, or the legacy pass searched for
+   * this very marker from there. A pass over a bounded stretch proves nothing about
+   * what lies before it, and a pass for other markers nothing about this one. */
+  covers(marker) {
+    const receipts=this.state.receipts;
+    if(receipts.from===0)return true;
+    return typeof marker==='string'&&receipts.legacy?.markers?.[marker]?.from===0;
+  }
+  /** Every identity left unsettled before the index began has had its legacy pass. */
+  migrated(){return this.state.receipts.from===0||this.state.receipts.legacy?.complete===true;}
   index(entries) {
     const items=this.state.receipts.items;
     for(const entry of entries)if(!items.some(r=>r.o===entry.o&&r.h===entry.h))items.push(entry);
@@ -71,7 +82,7 @@ export class NativeWindow {
   /** The receipt index (interface `nativeWindow.receipts`): by exact text hash or by marker. */
   get receipts() {
     const items=this.state.receipts.items,from=this.state.receipts.from,legacy=this.state.receipts.legacy??null;
-    return {from,legacy,covers:this.covers(),
+    return {from,legacy,covers:this.covers(),migrated:this.migrated(),
       get:hash=>items.findLast(r=>r.h===hash)??null,
       find:({marker,textHash,role}={})=>items.findLast(r=>r.m&&(!marker||r.m.includes(marker))&&(!textHash||r.h===textHash)&&(!role||r.r===role))??null};
   }
@@ -107,16 +118,20 @@ export class NativeWindow {
   }
 }
 
-/** One-time, bounded reconciliation for identities left unsettled before the
- * window indexed receipts: a single pass over at most `maxBytes` of the history
- * before the index begins. What is found is indexed like any other receipt; what
- * is not stays unknown and is never injected again. Afterwards the index answers
- * for the whole history. */
-export async function reconcileLegacyInjections(window,markers,{maxBytes=Infinity,clock=()=>new Date().toISOString()}={}) {
+/** Bounded reconciliation for identities left unsettled before the window indexed
+ * receipts (CR-LIFE-09): one pass over at most `maxBytes` (required, finite) of the
+ * history before the index begins, for the markers given that were not searched
+ * for before. What is found is indexed like any other receipt; what is not stays
+ * unknown and is never injected again. Each marker keeps what was searched for it;
+ * `complete` says the caller has now handed over every identity it holds, and only
+ * then is the window migrated. */
+export async function reconcileLegacyInjections(window,markers,{maxBytes,complete=false,clock=()=>new Date().toISOString()}={}) {
+  if(!Number.isSafeInteger(maxBytes)||maxBytes<0)throw Error('A legacy receipt pass needs an explicit, finite byte budget');
   const receipts=window.state.receipts;
-  if(window.covers())return {state:'covered',found:[],unknown:[]};
-  const wanted=[...new Set((markers??[]).filter(marker=>typeof marker==='string'&&INDEXED.test(marker)))];
-  const end=receipts.from,start=Number.isFinite(maxBytes)?Math.max(0,end-maxBytes):0,found=[];
+  if(receipts.from===0)return {state:'covered',found:[],unknown:[]};
+  const legacy=receipts.legacy&&typeof receipts.legacy.markers==='object'?receipts.legacy:(receipts.legacy={markers:{}});
+  const wanted=[...new Set((markers??[]).filter(marker=>typeof marker==='string'&&INDEXED.test(marker)&&!legacy.markers[marker]))];
+  const end=receipts.from,start=Math.max(0,end-maxBytes),found=[];
   if(wanted.length&&fs.existsSync(window.file)) {
     await readLines(window.file,start,end,(line,at)=>{
       if(!wanted.some(marker=>line.includes(marker)))return;
@@ -125,8 +140,11 @@ export async function reconcileLegacyInjections(window,markers,{maxBytes=Infinit
     });
   }
   window.index(found);
-  const settled=new Set(found.flatMap(r=>r.m));
-  receipts.legacy={checkedAt:clock(),from:start,markers:wanted.length,found:settled.size};
+  const settled=new Set(found.flatMap(r=>r.m)),at=clock();
+  for(const marker of wanted)legacy.markers[marker]={from:start,found:settled.has(marker),at};
+  const kept=Object.keys(legacy.markers);
+  for(const marker of kept.slice(0,Math.max(0,kept.length-LEGACY_MARKERS_KEPT)))delete legacy.markers[marker];
+  legacy.checkedAt=at;if(complete)legacy.complete=true;
   window.save();
   return {state:'reconciled',found:found.map(r=>({markers:r.m,hash:r.h,offset:r.o,at:r.at})),unknown:wanted.filter(marker=>!settled.has(marker))};
 }
@@ -142,7 +160,9 @@ export async function checkpointMarker(file,marker,{textHash,role}={}) {
     await window.poll();
     const hit=window.receipts.find({marker,textHash,role});
     if(hit)return {found:true,at:hit.at,offset:hit.o};
-    if(window.covers())return {found:false,state:'unconfirmed'};
+    // Unknown, never absent. Once the legacy pass is done this reads no history from its
+    // first byte; a checkpoint's own operation state guards what that cannot prove.
+    if(window.covers(marker)||window.migrated())return {found:false,state:'unconfirmed'};
   }
   const lines=createInterface({input:fs.createReadStream(file),crlfDelay:Infinity});
   for await(const line of lines){if(!line.includes(marker))continue;let item;try{item=JSON.parse(line);}catch{continue;}
