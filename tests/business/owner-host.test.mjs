@@ -41,6 +41,37 @@ test('a draft that never started only waits; one that started or cannot be place
  assert.equal((await settleFor({category:'source-changed',stage:'contact-draft-source',code:'contact-runtime-mismatch',retry_condition:'source-change',model_invoked:false})).reason,'draft-source-changed');
  assert.equal((await settleFor({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision',model_invoked:false})).reason,'draft-failed');
 });
+test('the rules between two contacts hold a new contact, never the rest of one under way (CR2-INT-01)',async()=>{
+ let rule='waiting-for-reply',inProgress=true;const asked=[],events=[],resumed=[];
+ const eligibility=within=>{asked.push(within??null);return within?.started||rule===null?{eligible:true}:{eligible:false,reason:rule};};
+ const loop=new MindLoop({call:async(action,req)=>{events.push(action);
+   if(action==='candidate')return inProgress?{eligible:false,reason:'attempt-in-progress',state:'pending',attempt_id:'a1'}:{eligible:true};
+   if(action==='claim')return {id:'a2',state:'drafting'};if(action==='check')return {eligible:true};return req;},
+  eligibility,ownerEpoch:()=>'e1',isBusy:()=>false,draft:async()=>({action:'send',text:'下一次联系'}),
+  send:async request=>{asked.length=0;await request.guard({contact:'a2',started:false});await request.guard({contact:'a2',started:true});return {state:'accepted',messageId:'m2'};},
+  resume:async candidate=>{resumed.push(candidate.attempt_id);return {state:'accepted',messageId:'m1'};}});
+ loop.review=async()=>{};
+ // Waiting for a reply, or inside the gap: the contact already under way is taken up and finished...
+ for(const reason of ['waiting-for-reply','recent-conversation']) {
+  rule=reason;events.length=0;
+  await loop.tick();
+  assert.equal(resumed.at(-1),'a1',reason);
+  assert.equal(events.includes('reconsider'),false,'no wish is woken while a new contact must wait');
+ }
+ // ...and with nothing under way, the next contact waits and nothing is claimed.
+ inProgress=false;events.length=0;
+ const waiting=await loop.tick();
+ assert.deepEqual([waiting.state,waiting.reason],['waiting','recent-conversation']);
+ assert.equal(events.includes('claim'),false);
+ // The switch and the quiet hours hold everything, the rest of a contact included.
+ rule='quiet-hours';inProgress=true;events.length=0;const before=resumed.length;
+ assert.equal((await loop.tick()).reason,'quiet-hours');
+ assert.deepEqual([events,resumed.length],[[],before]);
+ // A new contact's send guard asks the rules about the contact itself.
+ rule=null;inProgress=false;
+ await loop.tick();
+ assert.deepEqual(asked,[{contact:'a2',started:false},{contact:'a2',started:true}]);
+});
 test('draft failures retain nested accounting receipts but never provider prose',async()=>{const error=Error('private provider body');error.failure={category:'model-output',stage:'contact-draft-format',code:'deepseek-incomplete-or-unverified',retry_condition:'deepseek-decision',model_invoked:true,model_receipt:{provider:'deepseek',outcome:'incomplete',prompt:'secret',chunks:[{request_id:'chunk-1',usage:{input_tokens:2},body:'secret'}],schema_repair:{attempts:1,rejected_call:{request_id:'repair-1',outcome:'rejected',prompt:'secret'}}}};const{loop,events}=fixture({draft:async()=>{throw error;}});await loop.tick();const receipt=events.at(-1)[1].failure.model_receipt;assert.equal(receipt.chunks[0].request_id,'chunk-1');assert.equal(receipt.schema_repair.rejected_call.request_id,'repair-1');assert.ok(!JSON.stringify(events.at(-1)[1]).includes('secret'));assert.ok(!JSON.stringify(events.at(-1)[1]).includes('private provider body'));});
 test('new owner message also invalidates a discard decision',async()=>{let f;f=fixture({draft:async()=>{f.change();return{action:'abandon',reason:'outdated'};}});await f.loop.tick();assert.equal(f.events.at(-1)[1].decision,undefined);});
 test('new owner input during a failed draft does not defer the old wish',async()=>{let f;f=fixture({draft:async()=>{f.change();throw Error('canceled');}});await f.loop.tick();assert.equal(f.events.at(-1)[1].reason,'Draft or delivery conditions changed');});

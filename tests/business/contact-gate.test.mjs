@@ -54,3 +54,14 @@ test('a freeze between two bubbles keeps what was sent and holds the rest; a fai
   assert.equal(unknown.state,'unconfirmed');
   assert.deepEqual(failing.router.activityList(),[],'released in finally');
 });
+
+test('the batch asks its rules and its guard about itself: its ID, and whether a bubble of it has begun (CR2-INT-01)',async()=>{
+  const journal=new Map(),asked=[];
+  const batch=createContactBatch({read:id=>structuredClone(journal.get(id)),write:(id,value)=>journal.set(id,structuredClone(value)),
+    eligible:within=>{asked.push(['rules',within]);return true;},send:async request=>({state:'accepted',messageId:'m-'+request.id})});
+  const done=await batch({id:'contact-within',bubbles:['一','二'],channel:'feishu',guard:within=>{asked.push(['guard',within]);return true;}});
+  assert.equal(done.state,'accepted');
+  const fresh={contact:'contact-within',started:false},begun={contact:'contact-within',started:true};
+  assert.deepEqual(asked,[['rules',fresh],['guard',fresh],['rules',fresh],['guard',fresh],['rules',begun],['guard',begun]],
+    'before the review, before the first bubble, and before the second, once the first has begun');
+});
