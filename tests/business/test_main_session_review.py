@@ -85,6 +85,49 @@ def test_a_fork_that_keeps_failing_spends_the_bounded_retries_and_is_set_aside(s
     assert data['error']=='native-review-fork-failed'
 
 
+NEVER_STARTED = [
+    # The ACP names the stage (WS1) and the host passes it on (WS4).
+    {'state': 'waiting', 'reason': 'fork-failed', 'stage': 'not-started', 'detail': 'session-not-loaded', 'model_invoked': False,
+     'receipt': {'fork_thread_id': None, 'native_turn_id': None}},
+    # A host that keeps no stage and says started for every fork (review CR2-INT-06).
+    {'state': 'waiting', 'reason': 'fork-failed', 'detail': 'no-completed-turn', 'model_invoked': True, 'started': True,
+     'receipt': {'fork_thread_id': None, 'native_turn_id': None, 'usage': None}},
+    # The ACP's own answer, as an older host passed it on.
+    {'state': 'failed', 'reason': 'session-not-loaded'},
+]
+
+
+@pytest.mark.parametrize("answer", NEVER_STARTED, ids=["stage", "host-without-stage", "acp-failed"])
+def test_a_fork_that_never_started_only_waits_and_never_counts_towards_setting_it_aside(setup, answer):
+    """CR2-INT-06: a fork that was never made (the session not loaded, no completed turn to fork
+    from) ran no model. However the answer says so, the assessment only waits: no charge, no
+    transient budget spent, and never set aside however often it happens."""
+    from kin_mind.appraisal import MAX_TRANSIENT_FAILURES
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('fork-never-started')], 'synthetic-v1')
+    for _ in range(MAX_TRANSIENT_FAILURES + 2):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job['id'],))
+        assert jobs.run_one(native_provider(mind, lambda request: answer))['state'] == 'pending'
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    data = json.loads(row['data'])
+    assert (row['state'], row['attempts']) == ('pending', 0)
+    assert not data.get('transient_failures') and data['waiting_reason'] == 'fork-unavailable'
+    assert data['admission_waits'] == MAX_TRANSIENT_FAILURES + 2
+
+
+@pytest.mark.parametrize("stage", ["started", "unknown"])
+def test_a_fork_that_started_or_may_have_still_counts(setup, stage):
+    """CR2-INT-06: `started` and `unknown` keep spending the transient budget (CR-MIND-07)."""
+    mind, _, _ = setup
+    answer = {'state': 'waiting', 'reason': 'fork-failed', 'stage': stage, 'model_invoked': stage == 'started',
+              'receipt': {'model': 'gpt-6-astra', 'native_turn_id': 't' if stage == 'started' else None, 'fork_thread_id': 'f'}}
+    with pytest.raises(RuntimeError, match='native-review-fork-failed'):
+        native_provider(mind, lambda request: answer)._native('submit_appraisal', {}, '', {}, 10)
+
+
 def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
     from kin_mind.continuity import ContinuityConfig
     from kin_mind.memory import MemoryContinuity

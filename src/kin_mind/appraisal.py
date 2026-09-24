@@ -44,6 +44,28 @@ APPRAISAL_INPUT_BUDGET = 64000
 # A fork assessment that cannot run yet: the main thread has no finished turn to fork from, or the
 # session is not loaded. Asked again later, never counted as a failure (PROBE).
 FORK_UNAVAILABLE = re.compile(r"no-completed-turn|session-not-loaded|no-rollout|rollout|native-runtime")
+FORK_STAGES = {"not-started", "started", "unknown"}
+
+
+def fork_stage(answer):
+    """How far an assessment fork got (CR2-INT-06): `not-started` (no fork was made and no model
+    ran: the session is not loaded, or no turn has completed yet to fork from), `started` or
+    `unknown`. The owned ACP says so (`stage`, WS1) and the host passes it on unchanged (WS4). From
+    a host that does not, the older signs decide: a failed fork whose reason says none could be
+    made and that names no fork turn has not started; `started`, or a spent receipt, has. Any
+    other answer is not a fork's and gets None."""
+    stage = answer.get("stage")
+    if stage in FORK_STAGES:
+        return stage
+    spent = answer.get("receipt") or {}
+    reason = str(answer.get("reason") or "")
+    said = reason + " " + str(answer.get("detail") or "")
+    if ((answer.get("state") == "failed" or reason.startswith("fork-")) and FORK_UNAVAILABLE.search(said)
+            and not spent.get("native_turn_id") and not spent.get("fork_thread_id")):
+        return "not-started"
+    if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
+        return "started"
+    return None
 # How far ahead the next quiet review may be asked for. The request states the range in the
 # prompt and in the schema, and the host clamps to the same numbers; there is no separate night
 # ceiling any more (K1-03).
@@ -1304,28 +1326,30 @@ class NativeReview(DeepSeek):
         answer = self.exchange({"id": request_id, "name": name, "contract": system, "system": system,
             "context": context, "schema": schema, "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
+        stage = fork_stage(answer) if answer.get("state") in {"waiting", "failed"} else None
+        if stage == "not-started":
+            # CR2-INT-06, one branch for every fork that was never made (the session is not
+            # loaded, no turn has completed to fork from): no model ran, so the assessment is only
+            # asked again later. Not a failure, never charged, never counted towards setting the
+            # row aside, and never sent into the main thread instead (PROBE).
+            raise ModelAdmissionWait("fork-unavailable")
         if answer.get("state") == "waiting":
             spent = answer.get("receipt") or {}
             reason = str(answer.get("reason") or "")
-            if answer.get("model_invoked"):
+            if answer.get("model_invoked") or stage:
                 # A fork that failed, timed out or was interrupted is deferred, not failed (WS4);
                 # what it used is kept from its receipt (PROBE).
                 attempts.record_call(self, name, outcome=reason if spent else "owner-preempted",
                                      model=spent.get("model"), request_id=spent.get("native_turn_id"),
                                      usage=spent.get("usage"), elapsed_ms=round((time.monotonic()-started)*1000),
                                      detail=({"fork_thread_id": spent["fork_thread_id"]} if spent.get("fork_thread_id") else None))
-            if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
-                # CR-MIND-07: this fork ran. It stays deferred and never goes to the main thread, but
-                # it is not "not admitted": it spends the transient-failure budget and its backoff,
-                # and the budget running out sets the row aside like any other outage.
+            if stage in {"started", "unknown"}:
+                # CR-MIND-07: this fork ran, or may have. It stays deferred and never goes to the
+                # main thread, but it is not "not admitted": it spends the transient-failure budget
+                # and its backoff, and the budget running out sets the row aside like any outage.
                 self.failure_receipt = {**spent, **attempts.usage_entry(spent.get("usage")), "outcome": reason or "fork-deferred"}
                 raise RuntimeError("native-review-" + (reason if re.fullmatch(r"fork-[a-z-]{1,40}", reason) else "fork-deferred"))
             raise ModelAdmissionWait(reason or "foreground-active")
-        if answer.get("state") == "failed" and FORK_UNAVAILABLE.search(str(answer.get("reason") or "")):
-            # No finished turn to fork from yet (or the session is not loaded): the assessment
-            # cannot run now and is asked again later. Not Kin's failure, never charged, and never
-            # sent into the main thread instead (PROBE).
-            raise ModelAdmissionWait("fork-unavailable")
         receipt = answer.get("receipt") or {}
         if answer.get("state") != "complete" or not receipt.get("native_turn_id") or receipt.get("model") != self.model:
             self.failure_receipt = {**receipt, **attempts.usage_entry(receipt.get("usage")), "outcome": "native-review-unconfirmed"}
