@@ -131,11 +131,20 @@ export function manifestSummary(manifest) {
       fragments:b.fragments.map(f=>({transport_id:f.transport_id,index:f.index,kind:f.kind,state:f.state}))}))};
 }
 
+/** CR2-LIFE-04: the inputs a reply answered when it was formed, as its request names them. */
+function answeredIds(request) {
+  const ids=Array.isArray(request?.answered_input_ids)?[...new Set(request.answered_input_ids.filter(id=>typeof id==='string'&&/^[\w.:-]{1,200}$/.test(id)))]:[];
+  return ids.length?ids.slice(0,64):null;
+}
+
 export class TransportManifests {
-  /** `onAnswered({groupId,inputId,state})` hears, once per reply group, that the
-   * input it answers was answered: every bubble accepted (`accepted`), or the group
-   * retired by Kin's own choice (`silent`, `merged`). It is a durable side effect:
-   * tried again by later passes, after a restart too, until it returned. */
+  /** `onAnswered({groupId,inputId,answeredInputIds,state})` hears, once per reply
+   * group, that the inputs it answers were answered: every bubble accepted
+   * (`accepted`), or the group retired by Kin's own choice (`silent`, `merged`).
+   * `answeredInputIds` are the inputs the reply answered when it was formed
+   * (CR2-LIFE-04). It is a durable side effect: the group records it only once the
+   * returned promise resolved (the input ledger has it, CR2-LIFE-07); a failure is
+   * tried again under the same group, on a backoff, after a restart too. */
   constructor({directory,clock=()=>Date.now(),contracts={},receipt,emit,cancelShare,review,onOutcome=()=>{},onAnswered=null,role='service',lease={},hooks={},
     sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),retry={}}) {
     Object.assign(this,{directory,clock,contracts,receipt,emit,cancelShare,review,onOutcome,onAnswered,role,hooks,sleep});
@@ -228,6 +237,7 @@ export class TransportManifests {
     if(existing&&existing.bubbles.map(b=>b.bubble_id).join('\0')!==ids.join('\0'))id=(id+'-b'+sha256(ids.join('\0')).slice(0,12)).slice(-160);
     else if(existing&&routingBasis(existing)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
     const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
+      ...(answeredIds(first.request)?{answered_input_ids:answeredIds(first.request)}:{}),
       kind:first.delivery.kind??'reply',work:Boolean(first.request.work),
       ...(Object.hasOwn(first.delivery,'taskId')?{taskId:first.delivery.taskId}:{}),
       ...(Object.hasOwn(first.delivery,'inputVersion')?{inputVersion:first.delivery.inputVersion}:{}),
@@ -553,23 +563,33 @@ export class TransportManifests {
         }
       } catch{bubble.side_effect_failures=tries+1;context.failedEffects.add(bubble.bubble_id);changed=true;}
     }
-    // CR-LIFE-13: the input this group answers is told once the group ended answered,
-    // after its bubbles were reported; a failure is tried again by a later pass.
+    // CR-LIFE-13: the inputs this group answers are told once the group ended answered,
+    // after its bubbles were reported. CR2-LIFE-07: it counts as told only once the
+    // promise resolved, that is once the input ledger has it; a failure keeps it owed
+    // and it is told again under the same group, on a backoff, never given up.
     const answer=this.answerDue(manifest);
-    if(answer&&!context.failedEffects.has(manifest.group_id)) {
-      try{await this.onAnswered(answer);manifest.answered={state:answer.state,at:this.clock()};}
-      catch{manifest.answer_failures=(manifest.answer_failures??0)+1;context.failedEffects.add(manifest.group_id);}
+    if(answer&&!context.failedEffects.has(manifest.group_id)&&!(manifest.answer_retry_at>this.clock())) {
+      try{await this.onAnswered(answer);manifest.answered={state:answer.state,at:this.clock()};delete manifest.answer_retry_at;}
+      catch{
+        const failures=manifest.answer_failures=(manifest.answer_failures??0)+1;
+        manifest.answer_retry_at=this.clock()+Math.min(this.retry.baseMs*2**Math.min(failures-1,16),this.retry.maxMs);
+        manifest.retryAt=Math.max(manifest.retryAt??0,manifest.answer_retry_at);
+        context.failedEffects.add(manifest.group_id);
+      }
       changed=true;
     }
     // A side effect done (or tried) is work: the resume loop counts it against its limit.
     if(changed){context.worked=true;await this.save(manifest,context.lease);}
   }
-  /** The answer event a reply group still owes its input, if any (CR-LIFE-13). */
+  /** The answer event a reply group still owes its inputs, if any (CR-LIFE-13). It is
+   * owed until told: a failed attempt waits for its backoff, it is never dropped
+   * (CR2-LIFE-07). A group from before CR2-LIFE-04 answers only its own input. */
   answerDue(manifest) {
-    if(!this.onAnswered||manifest.answered||manifest.kind!=='reply'||!manifest.reply_id||(manifest.answer_failures??0)>=this.retry.sideEffectAttempts)return null;
+    if(!this.onAnswered||manifest.answered||manifest.kind!=='reply'||!manifest.reply_id)return null;
     const state=manifest.state==='accepted'?'accepted':manifest.state==='retired'&&OWN_CHOICES.includes(manifest.reason)?manifest.reason:null;
     if(!state)return null;
-    return {groupId:manifest.group_id,inputId:manifest.reply_id,state,...(state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
+    return {groupId:manifest.group_id,inputId:manifest.reply_id,answeredInputIds:manifest.answered_input_ids??[manifest.reply_id],state,
+      ...(state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
   }
   /** Side effects that are still due and still worth trying: each bubble's, and the group's answer. */
   owes(manifest) {
