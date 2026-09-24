@@ -10,7 +10,7 @@ import uuid
 from .db import Conflict, Deleted, Missing, digest, dumps
 from .envelopes import current_message
 from .models import RecordInput, Scope, now
-from .providers import NotConfigured, ProviderError, Providers
+from .providers import NotConfigured, ProviderError, Providers, drop_answers, job_answers, keep_answers
 
 # The attribute keys an extracted record may carry. Everything else a model writes there
 # is dropped: `constraint`, `origin_kind`, `self_knowledge`, `completed` and the like steer
@@ -223,23 +223,27 @@ class Worker:
             source_id = json.loads(job["payload"]).get("source_id")
             conn.execute("UPDATE sources SET model='failed' WHERE id=? AND model='pending'", (source_id,))
 
-    def owns(self, conn, job):
+    def owns(self, conn, job, *, late=False):
+        """Whether this run still holds the job. `late` asks only whether anybody took it over:
+        the state, the owner and the fence are this run's, whatever the clock says of the lease."""
         row = conn.execute(
             "SELECT state,owner,fence,lease_until FROM jobs WHERE id=?", (job["id"],)
         ).fetchone()
-        return (
+        return bool(
             row
             and row["state"] == "running"
             and row["owner"] == self.owner
             and row["fence"] == job["fence"]
-            and row["lease_until"] > time.time()
+            and (late or row["lease_until"] > time.time())
         )
 
     def renew(self, job, done):
         while not done.wait(max(0.05, self.lease_seconds / 3)):
             try:
                 with self.engine.db.connect(write=True) as conn:
-                    if not self.owns(conn, job):
+                    # A lease that lapsed while nobody took the job over is renewed at the next
+                    # beat, not given up: the machine slept, the job did not end (CR-MEM-09).
+                    if not self.owns(conn, job, late=True):
                         return
                     conn.execute(
                         "UPDATE jobs SET lease_until=? WHERE id=?",
@@ -260,13 +264,24 @@ class Worker:
         heartbeat.start()
         try:
             from kin_mind.model_runtime import background_calls
-            with background_calls():
+            with background_calls(), job_answers(job) as answers:
                 apply = self.prepare(job)
             with self.engine.db.connect(write=True) as conn:
                 if not self.owns(conn, job):
-                    self.engine_metric(conn, "job_result_discarded", {"kind": job["kind"], "attempts": job["attempts"]})
-                    return True
+                    if not self.owns(conn, job, late=True):
+                        # Taken over: another run holds the job now. What this one paid for stays
+                        # with the job, for that run to use once it asks the very same (CR-MEM-09).
+                        self.engine_metric(conn, "job_result_discarded", {"kind": job["kind"], "attempts": job["attempts"],
+                                                                          "answers_kept": keep_answers(conn, job, answers)})
+                        return True
+                    # The lease ran out while the model answered — a sleeping laptop, a lock held
+                    # too long — and nobody took the job over. Inside this write transaction nobody
+                    # can: the lease is renewed and the paid result committed with it, instead of
+                    # being thrown away and paid for again (CR-MEM-09).
+                    conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (time.time() + self.lease_seconds, job["id"]))
+                    self.engine_metric(conn, "job_lease_late_commit", {"kind": job["kind"], "attempts": job["attempts"]})
                 apply(conn)
+                drop_answers(conn, job["id"])
                 conn.execute(
                     "UPDATE jobs SET state='complete',lease_until=NULL,error=NULL,updated_at=? WHERE id=?",
                     (now(), job["id"]),
@@ -276,7 +291,7 @@ class Worker:
             from kin_mind.model_runtime import ModelAdmissionWait
 
             with self.engine.db.connect(write=True) as conn:
-                if self.owns(conn, job):
+                if self.owns(conn, job, late=True):
                     wait = isinstance(exc, (ModelAdmissionWait, Wait))
                     unbilled = wait or environmental(job["kind"], exc)
                     state = (
@@ -315,6 +330,8 @@ class Worker:
                         ),
                     )
                     self.settled(conn, job, state, error)
+                    if state in ("failed", "canceled"):
+                        drop_answers(conn, job["id"])
         finally:
             done.set()
             heartbeat.join(timeout=1)

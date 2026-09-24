@@ -1,9 +1,12 @@
 """The background worker and its queue: parsing model replies, what a failure costs a job, a loop
 that outlives its own failures, host receipts that cannot be replayed, and the graph index that
-an update no longer scans (E1-01, E2-02, E2-04, E2-05, E2-12, E1-02, E3-17, K4-04, K4-10)."""
+an update no longer scans (E1-01, E2-02, E2-04, E2-05, E2-12, E1-02, E3-17, K4-04, K4-10). A paid
+result is not thrown away because a lease lapsed, and one whose job was taken over is kept for
+the run that took it (CR-MEM-09)."""
 import json
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -243,3 +246,115 @@ def test_a_graph_node_keeps_one_index_row_under_its_own_rowid(tmp_path):
         rows = conn.execute("SELECT rowid,tokens FROM mind_graph_search WHERE id='indexed'").fetchall()
         assert conn.execute("SELECT 1 FROM meta WHERE key=?", (graph_module.SEARCH_ALIGNED,)).fetchone()
     assert [row[0] for row in rows] == [rowid] and "third" in rows[0][1]
+
+
+class PaidModel:
+    """The extraction role over HTTP, answered by a mock transport that counts the calls it was
+    paid for and can act on the queue while it answers, as the world does while a model thinks."""
+
+    def __init__(self, engine, monkeypatch, *, during=None):
+        self.engine, self.calls, self.during = engine, 0, during
+        engine.settings("models", {"extraction": {"endpoint": "https://synthetic.invalid/v1", "model": "synthetic-model",
+                                                  "input_price_per_million": 1, "output_price_per_million": 2}})
+        real = httpx.Client
+
+        def client(*args, **kwargs):
+            return real(*args, **{**kwargs, "transport": httpx.MockTransport(self.answer)})
+
+        monkeypatch.setattr(httpx, "Client", client)
+
+    def answer(self, request):
+        self.calls += 1
+        if self.during:
+            self.during(self.engine)
+        text = json.loads(request.content)["messages"][1]["content"]
+        quote = "prefers tea in the morning" if "prefers tea" in text else "walks every evening"
+        body = {"candidates": [{"kind": "preference", "content": "Tea in the morning", "quote": quote}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(body)}}],
+                                         "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
+
+
+def running_extract(engine):
+    with engine.db.connect() as conn:
+        return conn.execute("SELECT id FROM jobs WHERE kind='extract' AND state='running'").fetchone()[0]
+
+
+def lapse(engine):
+    """The machine slept through the lease while the model answered, and nobody took the job."""
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET lease_until=? WHERE id=?", (time.time() - 5, running_extract(engine)))
+
+
+def metrics(engine, name):
+    with engine.db.connect() as conn:
+        return [json.loads(row[0]) for row in conn.execute("SELECT data FROM metrics WHERE name=?", (name,))]
+
+
+def test_a_result_whose_lease_lapsed_unclaimed_is_committed_not_paid_for_again(engine, monkeypatch):
+    model = PaidModel(engine, monkeypatch, during=lapse)
+    sid = receive(engine, "tea", "The owner prefers tea in the morning.", extract=True)
+    settle(engine)
+    with engine.db.connect() as conn:
+        extracted = conn.execute("SELECT COUNT(*) FROM records WHERE json_extract(data,'$.generated')=1").fetchone()[0]
+        state = conn.execute("SELECT model FROM sources WHERE id=?", (sid,)).fetchone()[0]
+        extract = dict(conn.execute("SELECT state,attempts FROM jobs WHERE kind='extract'").fetchone())
+    assert model.calls == 1 and extracted == 1 and state == "complete"
+    assert extract == {"state": "complete", "attempts": 1}
+    assert len(metrics(engine, "job_lease_late_commit")) == 1 and not metrics(engine, "job_result_discarded")
+    assert len(metrics(engine, "model_cost")) == 1
+
+
+def test_a_result_taken_over_is_kept_for_the_run_that_took_the_job(engine, monkeypatch):
+    def taken(engine):
+        # Another run claimed the job while this one waited for its answer.
+        with engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE jobs SET owner='another-run',fence=fence+1,lease_until=? WHERE id=?",
+                         (time.time() + 90, running_extract(engine)))
+
+    model = PaidModel(engine, monkeypatch, during=taken)
+    sid = receive(engine, "tea", "The owner prefers tea in the morning.", extract=True)
+    worker = Worker(engine)
+    while worker.run_once():
+        pass
+    with engine.db.connect() as conn:
+        kept = conn.execute("SELECT id,result FROM commands WHERE id LIKE 'job-answer:%'").fetchall()
+        assert not conn.execute("SELECT 1 FROM records WHERE json_extract(data,'$.generated')=1").fetchone()
+    assert model.calls == 1 and len(kept) == 1 and sid in kept[0]["result"]
+    assert metrics(engine, "job_result_discarded")[0]["answers_kept"] == 1
+    # The run that took it over lets its lease lapse in turn; this worker claims the job again and
+    # is answered by what was already paid for, since it asks exactly the same.
+    model.during = None
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET lease_until=? WHERE kind='extract'", (time.time() - 5,))
+    while worker.run_once():
+        pass
+    with engine.db.connect() as conn:
+        extracted = conn.execute("SELECT COUNT(*) FROM records WHERE json_extract(data,'$.generated')=1").fetchone()[0]
+        left = conn.execute("SELECT COUNT(*) FROM commands WHERE id LIKE 'job-answer:%'").fetchone()[0]
+        state = conn.execute("SELECT model FROM sources WHERE id=?", (sid,)).fetchone()[0]
+    assert model.calls == 1 and extracted == 1 and state == "complete" and left == 0
+    assert len(metrics(engine, "model_answer_reused")) == 1 and len(metrics(engine, "model_cost")) == 1
+
+
+def test_a_kept_answer_is_used_only_for_the_very_same_request(engine, monkeypatch):
+    def taken(engine):
+        with engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE jobs SET owner='another-run',fence=fence+1,lease_until=? WHERE id=?",
+                         (time.time() + 90, running_extract(engine)))
+
+    model = PaidModel(engine, monkeypatch, during=taken)
+    receive(engine, "tea", "The owner prefers tea in the morning.", extract=True)
+    worker = Worker(engine)
+    while worker.run_once():
+        pass
+    # What the job asks has changed since (here, the model the role names): the kept answer
+    # does not stand for the new request, which is asked and paid for.
+    model.during = None
+    engine.settings("models", {"extraction": {**engine.settings("models")["extraction"], "model": "synthetic-model-2"}})
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE jobs SET lease_until=? WHERE kind='extract'", (time.time() - 5,))
+    while worker.run_once():
+        pass
+    assert model.calls == 2 and not metrics(engine, "model_answer_reused")
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM commands WHERE id LIKE 'job-answer:%'").fetchone()[0] == 0
