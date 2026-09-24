@@ -501,15 +501,46 @@ export function resolveActiveMobileRuntime({rootDir,allowPreviousIndex=false}={}
     baseInstructionsPath:artifact('base'),developerInstructionsPath:artifact('developer'),launcherPath:artifact('launcher'),schemaPath:artifact('schema')};
 }
 
+/** What going back from the active runtime would take, read from the activation
+ * index and the two manifests (CR-RT-03): `rollback` to the previous bundle when its
+ * Codex is the same release or newer, or when the caller passes the decision that an
+ * older one was proven on this thread (`allowDowngrade`); otherwise `forward-fix` --
+ * the current configuration and pointer stay together and the way on is a new
+ * candidate. Decided before anything is restored; nothing is changed here. */
+export function planMobileRuntimeRollback({rootDir,expectedPrevious=null,allowDowngrade=false}={}){
+  const root=mobileRuntimeRoot(rootDir),loaded=readJsonFile(activationFile(root));
+  if(loaded.state!=='ok'||!validActivationIndex(loaded.value))return {state:'forward-fix',reason:'no-valid-activation-index'};
+  const index=loaded.value,current=index.current,previous=index.previous,base={current:current.bundle_id,revision:index.revision,previous:previous?.bundle_id??null};
+  if(!previous)return {...base,state:'forward-fix',reason:'no-previous-runtime'};
+  if(expectedPrevious!==null&&previous.bundle_id!==expectedPrevious)return {...base,state:'forward-fix',reason:'previous-runtime-is-not-the-saved-one'};
+  let from,to;
+  try{
+    const manifest=bundleId=>readJsonStrict(path.join(root,'versions',bundleId,'manifest.json'),'Runtime manifest').runtime?.codex?.version;
+    from=manifest(current.bundle_id);to=manifest(previous.bundle_id);readReceiptBound(root,previous);
+  }catch{return {...base,state:'forward-fix',reason:'previous-runtime-unreadable'};}
+  const order=compareReleases(to,from),plan={...base,from:from??null,to:to??null};
+  if(order===0||order===1)return {...plan,state:'rollback',allowDowngrade:false};
+  if(allowDowngrade===true)return {...plan,state:'rollback',allowDowngrade:true};
+  return {...plan,state:'forward-fix',reason:order===null?'codex-releases-incomparable':'downgrade-unproven'};
+}
+
 /** Promote only a fully verified main-session candidate. The single activation
  * index is authoritative for current and previous; convenience symlinks are
- * intentionally not part of the contract. */
-export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,expectedRevision=null,activatedAt=new Date().toISOString(),writeIndex=writeActivationIndexStrict}){
-  const root=mobileRuntimeRoot(rootDir),receiptBytes=fs.readFileSync(receiptPath),receiptSha256=sha256(receiptBytes),receipt=JSON.parse(receiptBytes),bundle=validateMobileRuntimeBundle(path.join(root,'versions',bundleId));
-  if(receipt.state!=='verified'||receipt.compatible!==true||receipt.stages?.request_verified!==true||receipt.candidate_kind!=='mobile-main-maintenance'||receipt.bundle_id!==bundleId||receipt.bundle?.manifest_sha256!==bundle.manifestSha256)throw Error('Only a verified mobile main runtime can be activated');
-  const canonicalReceipt=path.join(root,'receipts',bundleId,receiptSha256+'.json');if(fs.realpathSync(receiptPath)!==fs.realpathSync(canonicalReceipt))throw Error('Activation receipt is outside the runtime receipt store');
-  validateReceiptArtifacts(receipt);const pointer={bundle_id:bundleId,manifest_sha256:bundle.manifestSha256,receipt_sha256:receiptSha256};
+ * intentionally not part of the contract. The bundle, its receipt and the receipt's
+ * artifacts are checked while the activation lock is held, the lock a reclaim takes
+ * too, so nothing can be removed between the check and the write (CR-RT-04). Once the
+ * index is written the switch has happened: a seal that cannot be written is
+ * reported, never thrown (CR-OPS-10), and the answer carries the rollback plan read
+ * from the new index. */
+export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,expectedRevision=null,activatedAt=new Date().toISOString(),writeIndex=writeActivationIndexStrict,writeSeal=writeBundleSeal}){
+  const root=mobileRuntimeRoot(rootDir);
+  let bundle=null;
   const result=await withPidLock(path.join(root,'activation.lock'),{work:async()=>{
+    const receiptBytes=fs.readFileSync(receiptPath),receiptSha256=sha256(receiptBytes),receipt=JSON.parse(receiptBytes);
+    bundle=validateMobileRuntimeBundle(path.join(root,'versions',bundleId));
+    if(receipt.state!=='verified'||receipt.compatible!==true||receipt.stages?.request_verified!==true||receipt.candidate_kind!=='mobile-main-maintenance'||receipt.bundle_id!==bundleId||receipt.bundle?.manifest_sha256!==bundle.manifestSha256)throw Error('Only a verified mobile main runtime can be activated');
+    const canonicalReceipt=path.join(root,'receipts',bundleId,receiptSha256+'.json');if(fs.realpathSync(receiptPath)!==fs.realpathSync(canonicalReceipt))throw Error('Activation receipt is outside the runtime receipt store');
+    validateReceiptArtifacts(receipt);const pointer={bundle_id:bundleId,manifest_sha256:bundle.manifestSha256,receipt_sha256:receiptSha256};
     const existing=readJsonFile(activationFile(root));if(existing.state!=='missing'&&(existing.state!=='ok'||!validActivationIndex(existing.value)))throw Error('Existing activation index is invalid');
     const current=existing.state==='ok'?existing.value:null;
     if(expectedRevision!==null&&(current?.revision??0)!==expectedRevision)throw Error('Activation revision changed');
@@ -517,14 +548,19 @@ export async function activateMobileRuntimeBundle({rootDir,bundleId,receiptPath,
     const index={schema_version:MOBILE_RUNTIME_ACTIVATION_SCHEMA,revision:(current?.revision??0)+1,activated_at:activatedAt,current:pointer,previous:current?.current??null};
     writeIndex(activationFile(root),index,{pretty:true,mode:0o600});return {index,changed:true};
   },reconcile:async()=>({state:'needs-retry',reason:'interrupted-activation-kept-existing-index'})});
-  // The bundle was hashed in full above; its seal lets later resolves skip that.
-  if(result.state==='ran')writeBundleSeal(root,bundle);
-  if(result.state!=='ran')return {state:result.state,...result.value};return {state:result.value.changed?'activated':'already-active',index:result.value.index};
+  if(result.state!=='ran')return {state:result.state,...result.value};
+  // The bundle was hashed in full above; its seal lets later resolves skip that. It
+  // is only a shortcut: without it every file is hashed again.
+  let seal='written',sealError;
+  try{writeSeal(root,bundle);}catch(error){seal='failed';sealError=String(error?.message??error).slice(0,200);}
+  let rollback;try{rollback=planMobileRuntimeRollback({rootDir});}catch{rollback={state:'forward-fix',reason:'plan-unreadable'};}
+  return {state:result.value.changed?'activated':'already-active',index:result.value.index,seal,...(sealError?{sealError}:{}),rollback};
 }
 
 /** Back to the previous verified runtime. A previous runtime with an older Codex is
  * refused unless `allowDowngrade`: the current one has written the main thread, and an
- * older binary reading it is unproven (N1-09). Prove it on the thread first. */
+ * older binary reading it is unproven (N1-09). Prove it on the thread first.
+ * planMobileRuntimeRollback says beforehand whether this call can succeed. */
 export async function rollbackMobileRuntimeBundle({rootDir,expectedRevision=null,activatedAt=new Date().toISOString(),allowDowngrade=false}){
   const active=resolveActiveMobileRuntime({rootDir});if(!active.index.previous)throw Error('No previous verified mobile runtime is recorded');
   const previous=active.index.previous,receipt=readReceiptBound(active.root,previous);
@@ -553,9 +589,13 @@ export async function mobileRuntimeBundleCli(argv=process.argv.slice(2)){
   else if(command==='rollback')result=await rollbackMobileRuntimeBundle({rootDir:requiredArg(args,'root'),expectedRevision:args['expected-revision']===undefined?null:Number(args['expected-revision']),
     allowDowngrade:args['allow-downgrade']===true});
   else if(command==='status')result=readMobileRuntimeBundleState({rootDir:requiredArg(args,'root')});
+  else if(command==='rollback-plan')result=planMobileRuntimeRollback({rootDir:requiredArg(args,'root'),allowDowngrade:args['allow-downgrade']===true});
   else if(command==='resolve'){const active=resolveActiveMobileRuntime({rootDir:requiredArg(args,'root')});result={state:'verified',bundle_dir:active.bundleDir,codex_path:active.codexPath,acp_entry_path:active.acpEntryPath,index:active.index};}
-  else throw Error('Usage: mobile-runtime-bundle.mjs prepare|verify|activate|rollback|status|resolve');
-  process.stdout.write(JSON.stringify(result,null,2)+'\n');if(result.state==='rejected'||result.state==='invalid')process.exitCode=2;return result;
+  else throw Error('Usage: mobile-runtime-bundle.mjs prepare|verify|activate|rollback|rollback-plan|status|resolve');
+  process.stdout.write(JSON.stringify(result,null,2)+'\n');if(result.state==='rejected'||result.state==='invalid')process.exitCode=2;
+  // A busy or interrupted activation moved nothing; a caller must not read it as a switch.
+  if(['activate','rollback'].includes(command)&&!['activated','already-active'].includes(result.state))process.exitCode=2;
+  return result;
 }
 
 const invoked=process.argv[1]&&pathToFileURL(path.resolve(process.argv[1])).href===import.meta.url;
