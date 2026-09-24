@@ -388,6 +388,16 @@ def entries(conn, scope, limit):
                 raise
             entry["history_error"] = REBUILD_FAILED
         found.append(entry)
+    # A delete is in force from its own transaction. The stored rows are rewritten by a job, in
+    # batches and after compaction, so until the last batch a row may still hold the words: what
+    # is handed back is scrubbed against the store's deletion facts here, the same scrub the
+    # rewrite applies, whatever the job has reached (CR-MEM-03).
+    from .erasure import erased_ids, scrub
+    ids = erased_ids(conn)
+    if ids:
+        for entry in found:
+            entry["request"] = scrub(entry["request"], ids)
+            entry["snapshot"] = scrub(entry["snapshot"], ids)
     return found
 
 

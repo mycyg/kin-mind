@@ -360,3 +360,19 @@ def test_a_context_rendered_from_erased_words_keeps_its_identity_and_is_never_se
     # The same turn asked again is rendered afresh, from what is left.
     again = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1")
     assert MARKER not in json.dumps(again, ensure_ascii=False)
+
+
+def test_a_history_read_is_scrubbed_before_the_rewrite_has_run(system):
+    """CR-MEM-03: the stored rows are rewritten by a job, which may wait behind compaction or a
+    stopped worker; a read of the history meets the delete at once."""
+    mind, memory, source, clock = system
+    secret = source("secret", f"Private {MARKER}")
+    wish(mind, clock, [secret], "secret-wish", f"Remember {MARKER}")
+    rounds(mind, clock, source, 2)
+    mind.engine.delete(secret)
+    history_compaction._set_marker(mind.engine.db, True)  # the rewrite now waits
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_events WHERE instr(data,?)>0", (MARKER,)).fetchone()[0]
+    view = mind.read(history=100)["history"]
+    assert len(view) >= 3 and MARKER not in json.dumps(view, ensure_ascii=False)
+    assert any(erasure.ERASED in json.dumps(entry["request"], ensure_ascii=False) for entry in view)
