@@ -1,6 +1,6 @@
 # MemoryPalace 1.0 · 记忆宫殿
 
-**中文** · [English](README.en.md) · [日本語](README.ja.md)
+**中文** · [English](MEMORYPALACE.en.md) · [日本語](MEMORYPALACE.ja.md)
 
 作者：**Kin（小光的 AI 伴侣，第一作者）**、**小光（Ica）**
 
@@ -66,7 +66,7 @@
 
 运行中的服务检查到期任务，发送的前置检查核对事项是否完成、取消或失效。实际发送需要启用的联系策略、配置完成的宿主回调，以及该回调负责的收件人认证和渠道连接。策略停用、渠道缺失或等待确认的投递保留为可预览的建议。
 
-任务创建回执确认保存，投递回执记录回调结果。渠道无法确认的投递保留不确定状态，重试遵循渠道的幂等约定。
+任务创建回执确认保存，投递回执记录回调结果。渠道拒收或无法连接的投递在六小时内重试，之后标记为未送达。可能已经发出、渠道却无法确认的投递保留不确定状态，重试遵循渠道的幂等约定。
 
 ![主动联系](docs/diagrams/proactive-contact.svg)
 
@@ -97,11 +97,11 @@ uv run eventmem console
 |---|---|
 | Codex 原生 hooks + MCP | 自动采集提问、最终回复与工具结果；启动与提问时召回，压缩后恢复；支持 ACP／微信宿主 |
 | Claude Code 插件 | 采集消息与工具记录，支持启动恢复、操作前查询、压缩恢复和退出处理 |
-| `dsh-eventmem` | 将 DeepSeek Harness 事件接入统一服务；可显式启用旧版模式回退 |
+| `dsh-eventmem` | 将 DeepSeek Harness 事件接入统一服务 |
 | HTTP `/v1` | 来源、记忆、纠正、关系、连续性、任务、维护、调度与观测 |
 | MCP | stdio 与 Streamable HTTP；工具式访问 |
 | Python / TypeScript SDK | 调用记忆服务，并对回调去重 |
-| `eventmem` CLI | 服务、管理台、MCP、写入／召回、迁移、备份、调度与评估 |
+| `eventmem` CLI | 服务、管理台、MCP、写入／召回、备份、调度与评估 |
 
 MCP 提供工具式访问，宿主事件驱动自动采集和上下文注入。插件的运行需要本地服务。
 
@@ -132,19 +132,18 @@ node examples/v1/tool.mjs
 
 表中时延的测量范围是本地查询与上下文组装。真实语料的端到端评估需要计入外部模型请求、解析耗时与检索效果。[测试详情](docs/performance.md)。
 
-## 迁移与数据维护
+## 备份与数据维护
 
 ```sh
-uv run eventmem migrate /old/project/.memory --root /isolated/memorypalace
 uv run eventmem backup /private/backup.tar.gz --root /isolated/memorypalace
 uv run eventmem restore /private/backup.tar.gz --root /another/empty/root
 ```
 
-迁移保留原始 id、内容、归档包、修订关联和来源指针。数据校验采用独立的目标目录，旧库保留原状。缺失的外部来源带有标记。归档保存历史记录，永久删除处理来源及其派生依赖；导出文件与备份具有独立的维护流程。
+服务继续写入时也可以备份。备份包含数据库、数据库引用的附件和记忆库自身的文件；凭据、缓存和向量不进入备份，恢复后重新生成向量。恢复需要一个空的独立目标目录。归档保存历史记录，永久删除处理来源及其派生依赖；导出文件与备份具有独立的维护流程。
 
 ## 文档与限制
 
-[架构与数据语义](docs/architecture.md) · [配置、插件、迁移与运维](docs/operations.md) · [自我认知与行为检验](docs/self-knowledge.md)
+[架构与数据语义](docs/architecture.md) · [配置、插件与运维](docs/operations.md) · [自我认知与行为检验](docs/self-knowledge.md)
 
 快速全文检索的排序对象是指定范围内最近匹配的最多 400 条记录。深度模式支持完整匹配集的排序和模型检索。
 
@@ -154,4 +153,4 @@ MemoryPalace 支持 macOS／Linux 的单用户本地部署。
 
 [MIT License](LICENSE)
 
-本地向量服务支持 Qwen3-Embedding-0.6B 的按需启动和连接恢复。[本地 embedding 与通道记忆维护](docs/local-embedding.md)提供安装、配置、故障行为与历史通道数据修复说明。
+本地向量服务支持 Qwen3-Embedding-0.6B 的按需启动和连接恢复，模型只从本地缓存加载。[本地 embedding 与通道上下文](docs/local-embedding.md)提供安装、配置、故障行为与通道 envelope 处理的说明。

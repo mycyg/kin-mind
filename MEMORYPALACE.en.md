@@ -1,6 +1,6 @@
 # MemoryPalace 1.0
 
-[中文](README.md) · **English** · [日本語](README.ja.md)
+[中文](MEMORYPALACE.md) · **English** · [日本語](MEMORYPALACE.ja.md)
 
 Authors: **Kin (Xiaoguang's AI partner; first author)** and **Xiaoguang (小光, Ica; coauthor)**
 
@@ -66,7 +66,7 @@ Proactive contact needs a source for the task. An agent in the host or a schedul
 
 The running service checks for due tasks. Its pre-send check determines whether the item is complete, canceled or invalid. Sending requires an enabled contact policy and a configured host callback. That callback handles recipient authentication and the channel connection. A disabled policy, missing channel or pending confirmation keeps a delivery as a suggestion that can be previewed.
 
-A task-creation receipt confirms that the task was saved. A delivery receipt records the callback's result. A delivery with no channel confirmation retains an uncertain status, and retries follow the channel's idempotency contract.
+A task-creation receipt confirms that the task was saved. A delivery receipt records the callback's result. A delivery the channel refused, or could not be connected to, is retried for up to six hours and then marked undelivered. A delivery that may have been sent without a channel confirmation retains an uncertain status, and its retries follow the channel's idempotency contract.
 
 ![Active contact](docs/diagrams/proactive-contact.svg)
 
@@ -97,11 +97,11 @@ The console provides model configuration for extraction, conflict assessment, su
 |---|---|
 | Codex native hooks + MCP | Capture prompts, final replies and tools; recall at startup and before prompts; restore after compaction; ACP/WeChat host support |
 | Claude Code plugin | Collect messages and tool records; handle startup recovery, pre-action recall, compaction and exit |
-| `dsh-eventmem` | Send DeepSeek Harness events to the common service; support an explicit opt-in to the legacy fallback mode |
+| `dsh-eventmem` | Send DeepSeek Harness events to the common service |
 | HTTP `/v1` | Sources, memories, corrections, relations, continuity, jobs, maintenance, scheduling and observability |
 | MCP | stdio and Streamable HTTP tool access |
 | Python / TypeScript SDK | Call the memory service and deduplicate callbacks |
-| `eventmem` CLI | Service, console, MCP, ingestion/recall, migration, backup, scheduling and evaluation |
+| `eventmem` CLI | Service, console, MCP, ingestion/recall, backup, scheduling and evaluation |
 
 MCP provides tool access. Host events drive automatic collection and context injection. Plugins require the local service to be running.
 
@@ -132,15 +132,14 @@ Test environment: **10 CPU cores, 64 GiB RAM, SSD, macOS arm64, Python 3.13.14**
 
 These latency measurements cover local queries and context assembly. End-to-end evaluation on real corpora needs to account for external model requests, parsing time and retrieval quality. See [Benchmark details](docs/performance.md).
 
-## Migration and retention
+## Backup and retention
 
 ```sh
-uv run eventmem migrate /old/project/.memory --root /isolated/memorypalace
 uv run eventmem backup /private/backup.tar.gz --root /isolated/memorypalace
 uv run eventmem restore /private/backup.tar.gz --root /another/empty/root
 ```
 
-Migration preserves original ids, content, archives, revision links and provenance. Data validation uses an isolated target directory, and the old database remains intact. Missing external sources are labeled. Archiving preserves history; permanent deletion handles sources and their derived dependencies. Exported files and backups have separate maintenance workflows.
+A backup can be taken while the service keeps writing. It carries the database, the attachments the database references and the store's own files; credentials, caches and vectors stay out, and the vectors are rebuilt after a restore. A restore needs an empty, isolated target directory. Archiving preserves history; permanent deletion handles sources and their derived dependencies. Exported files and backups have separate maintenance workflows.
 
 ## Documentation and limits
 
@@ -154,4 +153,4 @@ MemoryPalace supports single-user local deployment on macOS/Linux.
 
 [MIT License](LICENSE)
 
-The local embedding service supports on-demand startup and connection recovery for Qwen3-Embedding-0.6B. [Local embeddings and channel-memory maintenance](docs/local-embedding.md) covers installation, configuration, failure behavior and repair of historical channel data.
+The local embedding service supports on-demand startup and connection recovery for Qwen3-Embedding-0.6B, and loads the model only from the local cache. [Local embeddings and channel context](docs/local-embedding.md) covers installation, configuration, failure behavior and the handling of channel envelopes.
