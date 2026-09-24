@@ -252,7 +252,7 @@ function validateLocalArtifact(record,privateRoot,label,{json=false,text=false,m
 function requiredScenarioRequirements(descriptor){
   const baseline=[
     {scenario_id:'native_config_load',phase:'native_loaded',outcome:'accepted'},
-    {scenario_id:'new_session',phase:'request_verified',outcome:'accepted',rpc_methods:['thread/start']},
+    {scenario_id:'new_session',phase:'request_verified',outcome:'accepted',rpc_methods:['thread/start','turn/start']},
     {scenario_id:'old_base_resume',phase:'request_verified',outcome:'accepted',rpc_methods:['thread/resume']},
     {scenario_id:'maintenance_promotion_resume',phase:'request_verified',outcome:'accepted',rpc_methods:['thread/resume']},
     {scenario_id:'post_promotion_request',phase:'request_verified',outcome:'accepted',rpc_methods:['turn/start']},
@@ -284,6 +284,11 @@ export function validateMobileRuntimeCandidateDescriptor(descriptor,{bundle,mani
     if(config.value.model_instructions_file!==base.real)throw Error('Runtime config did not retain model_instructions_file');
     if(typeof config.value.developer_instructions!=='string'||sha256(Buffer.from(config.value.developer_instructions))!==descriptor.developer.sha256)throw Error('Runtime config did not retain developer instructions');
     if(config.value.model_catalog_json!==catalog.real)throw Error('Runtime config did not retain model catalog');
+    if(config.value.include_collaboration_mode_instructions!==false||config.value.project_doc_max_bytes!==0||
+      typeof config.value.compact_prompt!=='string'||!config.value.compact_prompt.trim())
+      throw Error('Runtime config did not retain companion instruction settings');
+    if(!Array.isArray(catalog.value.models)||!catalog.value.models.length||catalog.value.models.some(model=>model.use_responses_lite!==false))
+      throw Error('Runtime model catalog did not retain full Responses requests');
   }
   const requirements=requiredScenarioRequirements(descriptor),profiles=Array.isArray(descriptor.expected_profiles)?descriptor.expected_profiles:[];
   for(const requirement of requirements){if(!candidateId(requirement.scenario_id)||!['native_loaded','request_verified'].includes(requirement.phase)||!['accepted','rejected'].includes(requirement.outcome))throw Error('Invalid runtime scenario requirement');}
@@ -319,7 +324,9 @@ function validateObservedRequest(request,requirement,descriptor){
   if(request.config_sha256!==descriptor.runtime.config.sha256||request.catalog_sha256!==descriptor.runtime.catalog.sha256)throw Error('Native request used different config bytes');
   if(typeof request.thread_id!=='string'||!request.thread_id||typeof request.session_id!=='string'||!request.session_id)throw Error('Native request lacks thread identity');
   if(['thread/start','thread/resume','thread/fork'].includes(request.rpc_method)&&(!Array.isArray(request.instruction_sources)||request.instruction_sources_provenance!=='app-server-native'))throw Error('Native instructionSources observation is missing');
-  if(!request.tools||!Number.isSafeInteger(request.tools.definitions)||request.tools.definitions<0||request.tools.calls!==0||request.tools.executions!==0)throw Error('Native proof observed an unexpected tool execution');
+  const tools=request.tools,localTool=requirement.scenario_id==='new_session'&&request.rpc_method==='turn/start';
+  if(!tools||!Number.isSafeInteger(tools.definitions)||tools.definitions<0||tools.calls!==(localTool?1:0)||tools.executions!==(localTool?1:0)||
+    (localTool&&(!hex64(tools.output_sha256)||!hex64(tools.call_id_sha256))))throw Error('Native local tool round trip is missing or unexpected');
 }
 
 function scenarioReceipt(observation,requirement,descriptor,validated,bundle){
@@ -333,20 +340,37 @@ function scenarioReceipt(observation,requirement,descriptor,validated,bundle){
   if(requirement.phase==='request_verified'){
     if(!requests.length||!requirement.rpc_methods.every(method=>requests.some(request=>request.rpc_method===method)))throw Error('Required request proof is missing');for(const request of requests)validateObservedRequest(request,requirement,descriptor);
   }
+  if(requirement.scenario_id==='isolated_compaction_resume'&&(!hex64(observation.compaction?.raw_request_sha256)||
+    observation.compaction.compact_prompt_sha256!==sha256(validated.config.value.compact_prompt)||
+    !Number.isSafeInteger(observation.compaction.provider_requests)||observation.compaction.provider_requests<1))
+    throw Error('Native compaction did not prove the candidate compact_prompt');
   for(const expected of validated.profiles.filter(item=>item.scenario_id===requirement.scenario_id))validateProfile(expected,(observation.profiles??[]).find(item=>item.checkpoint===expected.checkpoint));
   return {scenario_id:requirement.scenario_id,state:requirement.phase==='request_verified'?'request-verified':'native-loaded',
     native_receipt_sha256:observation.native.receipt_sha256,requests:requests.map(request=>({rpc_method:request.rpc_method,raw_request_sha256:request.capture.raw_request_sha256,extraction_receipt_sha256:request.capture.extraction_receipt_sha256,
       base_observed_sha256:request.capture.base.sha256,developer_observed_sha256:request.capture.developer.sha256,base_extraction_basis:request.capture.base.basis,developer_extraction_basis:request.capture.developer.basis,
       turn_sha256:request.turn_sha256,rpc_receipt_sha256:request.rpc_receipt_sha256,thread_id_sha256:sha256(request.thread_id),session_id_sha256:sha256(request.session_id),
-      instruction_sources_sha256:sha256(canonicalJson(request.instruction_sources??[])),tool_definitions:request.tools?.definitions??null,tool_calls:request.tools?.calls??null,tool_executions:request.tools?.executions??null})),
+      instruction_sources_sha256:sha256(canonicalJson(request.instruction_sources??[])),tool_definitions:request.tools?.definitions??null,tool_calls:request.tools?.calls??null,tool_executions:request.tools?.executions??null,
+      supplemental_developer_count:request.capture.supplemental_developer_count??0,
+      supplemental_developer_layers:(request.capture.supplemental_developer_layers??[]).map(layer=>({sha256:layer.sha256,bytes:layer.bytes,preview:layer.preview})),
+      ...(request.tools?.output_sha256?{tool_output_sha256:request.tools.output_sha256,tool_call_id_sha256:request.tools.call_id_sha256}:{})})),
+    ...(observation.compaction?{compaction:{raw_request_sha256:observation.compaction.raw_request_sha256,compact_prompt_sha256:observation.compaction.compact_prompt_sha256,provider_requests:observation.compaction.provider_requests}}:{}),
     profiles:(observation.profiles??[]).map(profile=>({checkpoint:profile.checkpoint,model:profile.model,provider:profile.provider,reasoning_effort:profile.reasoning_effort,
       fast_mode:profile.fast_mode,service_tier_preference:profile.service_tier_preference,actual_service_tier:profile.actual_service_tier,canonical_id:profile.canonical_id,canonical_match:profile.canonical_match}))};
 }
 
-function safeFailureCode(error){const message=String(error?.message??'verification failed');
-  if(message.includes('descriptor'))return 'descriptor-invalid';if(message.includes('manifest')||message.includes('bundle'))return 'bundle-mismatch';
-  if(message.includes('profile')||message.includes('tier')||message.includes('Canonical'))return 'profile-mismatch';if(message.includes('scenario'))return 'scenario-missing';
-  if(message.includes('request')||message.includes('instruction'))return 'request-proof-invalid';if(message.includes('Native')||message.includes('ACP'))return 'native-load-invalid';return 'compatibility-rejected';}
+function runnerFailureDetail(error){
+  if(!Object.hasOwn(error??{},'status')&&!Object.hasOwn(error??{},'stderr'))return null;
+  const stderr=String(error.stderr??''),summary=stderr.split(/\r?\n/).map(line=>line.trim()).find(line=>/^(?:Error|TypeError|RangeError|SyntaxError):/.test(line))??
+    stderr.split(/\r?\n/).map(line=>line.trim()).find(Boolean)??'Native proof runner exited without a diagnostic';
+  return {source:'owned-native-runner',summary:summary.slice(0,800),stderr_sha256:sha256(stderr),exit_code:Number.isInteger(error.status)?error.status:null};
+}
+function safeFailureCode(error){const detail=runnerFailureDetail(error),message=detail?.summary??String(error?.message??'verification failed');
+  if(/compaction|compact_prompt/i.test(message))return 'compaction-proof-invalid';
+  if(/local (?:command|tool)|tool round trip/i.test(message))return 'native-tool-proof-invalid';
+  if(/descriptor/i.test(message))return 'descriptor-invalid';if(/manifest|bundle/i.test(message))return 'bundle-mismatch';
+  if(/profile|tier|Canonical/i.test(message))return 'profile-mismatch';if(/scenario/i.test(message))return 'scenario-missing';
+  if(/request|instruction|collaboration|project AGENTS/i.test(message))return 'request-proof-invalid';
+  if(/Native|ACP/i.test(message)||detail)return 'native-load-invalid';return 'compatibility-rejected';}
 
 function writeReceipt(root,receipt){
   const body=JSON.stringify(receipt,null,2),digest=sha256(body),directory=path.join(root,'receipts',receipt.bundle_id),file=path.join(directory,digest+'.json');
@@ -368,6 +392,10 @@ export function verifyMobileRuntimeBundle({rootDir,bundleId,descriptorPath,runne
     if(proof?.schema_version!==MOBILE_RUNTIME_PROOF_SCHEMA||proof.candidate_id!==descriptor.candidate_id||proof.bundle_manifest_sha256!==bundle.manifestSha256||proof.descriptor_sha256!==descriptorSha256||!Array.isArray(proof.observations))throw Error('Native proof is bound to different candidate bytes');
     const runnerSha256=sha256(fs.readFileSync(TRUSTED_PROOF_RUNNER)),codexSha256=bundle.manifest.files.find(file=>file.path===bundle.manifest.runtime.codex.path)?.sha256;
     if(proof.runner_input_sha256!==runnerInputSha256||proof.producer?.runner_sha256!==runnerSha256||proof.producer?.codex_sha256!==codexSha256||proof.producer?.codex_version!==bundle.manifest.runtime.codex.version||proof.producer?.acp_entry_sha256!==bundle.manifest.runtime.acp.entry_sha256||!String(proof.producer?.acp_version??'').includes(bundle.manifest.runtime.acp.version)||!hex64(proof.producer?.actual_exec_receipt_sha256))throw Error('Trusted proof runner did not execute these runtime bytes');
+    const auxiliary=proof.auxiliary_provider_requests;
+    if(auxiliary?.purpose!=='native-conversation-title'||!Number.isSafeInteger(auxiliary.count)||auxiliary.count<0||!Array.isArray(auxiliary.models)||
+      auxiliary.models.some(item=>typeof item.model!=='string'||!Number.isSafeInteger(item.count)||item.count<1)||
+      auxiliary.models.reduce((sum,item)=>sum+item.count,0)!==auxiliary.count)throw Error('Native auxiliary request classification is missing');
     for(const requirement of validated.requirements){const observation=proof.observations.find(item=>item?.scenario_id===requirement.scenario_id);scenarios.push(scenarioReceipt(observation,requirement,descriptor,validated,bundle));}
     const runtimeSignature={bundle_manifest_sha256:bundle.manifestSha256,codex_sha256:descriptor.runtime.codex_bin.sha256,acp_entry_sha256:descriptor.runtime.acp.entry_sha256,
       acp_package_json_sha256:descriptor.runtime.acp.package_json_sha256,base_sha256:descriptor.base.sha256,developer_sha256:descriptor.developer.sha256,
@@ -375,12 +403,15 @@ export function verifyMobileRuntimeBundle({rootDir,bundleId,descriptorPath,runne
     const artifacts=Object.fromEntries(Object.entries({base:descriptor.base,developer:descriptor.developer,launcher:descriptor.runtime.launcher,config:descriptor.runtime.config,schema:descriptor.runtime.schema,catalog:descriptor.runtime.catalog}).map(([name,value])=>[name,{path:value.realpath,relative_path:path.relative(validated.privateRoot,value.realpath),sha256:value.sha256,bytes:value.bytes}]));
     const receipt={schema_version:MOBILE_RUNTIME_RECEIPT_SCHEMA,candidate_id:descriptor.candidate_id,candidate_kind:descriptor.candidate_kind,bundle_id:bundleId,state:'verified',compatible:true,verified_at:verifiedAt,
       stages:{declared:true,prepared:true,native_loaded:true,request_verified:true},bundle:{manifest_sha256:bundle.manifestSha256},
-      evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runner_sha256:proof.producer.runner_sha256,actual_exec_receipt_sha256:proof.producer.actual_exec_receipt_sha256,runtime_signature_sha256:sha256(canonicalJson(runtimeSignature))},private_root:validated.privateRoot,artifacts,runtime_signature:runtimeSignature,scenarios,reasons:[]};
+      evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runner_sha256:proof.producer.runner_sha256,actual_exec_receipt_sha256:proof.producer.actual_exec_receipt_sha256,runtime_signature_sha256:sha256(canonicalJson(runtimeSignature))},private_root:validated.privateRoot,artifacts,runtime_signature:runtimeSignature,
+      auxiliary_provider_requests:auxiliary,scenarios,reasons:[]};
     return {...receipt,...writeReceipt(root,receipt)};
   }catch(error){
+    const failureDetail=runnerFailureDetail(error);
     const receipt={schema_version:MOBILE_RUNTIME_RECEIPT_SCHEMA,candidate_id:candidateId(descriptor?.candidate_id)?descriptor.candidate_id:(candidateId(bundleId)?bundleId:'unknown'),candidate_kind:descriptor?.candidate_kind??null,bundle_id:bundleId,state:'rejected',compatible:false,verified_at:verifiedAt,
       stages:{declared:Boolean(descriptor),prepared:Boolean(bundle),native_loaded:false,request_verified:false},bundle:{manifest_sha256:bundle?.manifestSha256??null},
-      evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runtime_signature_sha256:null},runtime_signature:null,scenarios,reasons:[safeFailureCode(error)]};
+      evidence:{descriptor_sha256:descriptorSha256,runner_input_sha256:runnerInputSha256,proof_sha256:proofSha256,runtime_signature_sha256:null},runtime_signature:null,scenarios,reasons:[safeFailureCode(error)],
+      ...(failureDetail?{failure_detail:failureDetail}:{})};
     return {...receipt,...writeReceipt(root,receipt)};
   }
 }
