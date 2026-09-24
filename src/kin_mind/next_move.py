@@ -80,8 +80,9 @@ def _decided(conn, event_id):
     """
     prefix, found = event_id + ":decision:", []
     try:
-        rows = conn.execute("SELECT command_id,data FROM mind_plan_history WHERE substr(command_id,1,?)=?"
-                            " ORDER BY command_id", (len(prefix), prefix)).fetchall()
+        # A range on the command id reads its index; ';' is the character after ':' (K1-23).
+        rows = conn.execute("SELECT command_id,data FROM mind_plan_history WHERE command_id>=? AND command_id<?"
+                            " ORDER BY command_id", (prefix, event_id + ":decision;")).fetchall()
     except sqlite3.OperationalError:
         return found
     for row in rows:

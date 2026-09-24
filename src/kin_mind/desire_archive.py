@@ -199,9 +199,12 @@ def _references(conn, scope):
 
     if "mind_contacts" in tables:
         for row in conn.execute(
-            "SELECT json_extract(data,'$.desire_id') FROM mind_contacts WHERE scope=? AND state IN"
+            "SELECT data FROM mind_contacts WHERE scope=? AND state IN"
             " (" + ",".join("?" * len(OPEN_CONTACTS)) + ")", (scope, *OPEN_CONTACTS)):
-            mark(row[0], CONTACT_OPEN)
+            # An attempt offers every ready wish (N11); each one it offered is still open.
+            attempt = json.loads(row[0])
+            for identifier in attempt.get("desire_ids") or [attempt.get("desire_id")]:
+                mark(identifier, CONTACT_OPEN)
     if "mind_action_events" in tables:
         for row in conn.execute(
             "SELECT json_extract(data,'$.desire_id') FROM mind_action_events WHERE scope=? AND state"

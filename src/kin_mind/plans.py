@@ -66,6 +66,16 @@ class AutonomousPlans:
         conn.execute("INSERT INTO mind_plan_history VALUES(?,?,?,?)", (plan["id"], plan["revision"], command, dumps(plan)))
         self.engine.db.bump(conn)
 
+    @staticmethod
+    def _finish(plan):
+        """Completed once every step is. A wish decision still on a step (an abandon that ended the
+        plan) is settled by sync_wishes once more; only such plans are read back (K2-21)."""
+        if plan["status"] != "active" or not all(s["state"] in {"completed", "abandoned"} for s in plan["steps"]):
+            return
+        plan["status"] = "completed"
+        if any(s["actor"] in {"contact", "explore"} and s.get("decision") for s in plan["steps"]):
+            plan["wish_sync"] = "pending"
+
     def owner_epoch(self, conn):
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_runtime_events'").fetchone():
             return 0
@@ -170,7 +180,10 @@ class AutonomousPlans:
                         raise Conflict("Executed or reserved steps cannot be overwritten")
                     updated.append(old)
                 else:
-                    updated.append({**definition, "state": old.get("state", "pending") if old else "pending",
+                    # The host's links outlive a new definition: the wish this step already carries
+                    # stays its wish, so a revision never grows a second one for it (K2-05).
+                    links = {k: old[k] for k in ("desire_id", "strength", "delivery_artifacts") if old and k in old and definition.get(k) is None}
+                    updated.append({**definition, **links, "state": old.get("state", "pending") if old else "pending",
                                     "revision": old.get("revision", 0) + 1 if old else 1,
                                     "owner_status": old.get("owner_status", "proposed") if old else "proposed",
                                     "receipts": old.get("receipts", []) if old else []})
@@ -211,6 +224,54 @@ class AutonomousPlans:
             conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest(raw), dumps(plan)))
             record(conn, stamp, key, self.mind.clock())
             return plan
+
+    def defer_owner_task(self, request):
+        """N10, the plan side. An owner task Kin chose to do later becomes her own plan: the router
+        has released the work lock, and at her `not_before` the plan comes up for her review, where
+        she decides whether and how to return to it. Its source is 小光's own message.
+
+        Returns {"state": "created", "planId"} or, when the plan cannot be written here,
+        {"state": "needs-kin", "reason"}: Kin then keeps it herself (manage_autonomous_plan)."""
+        task_id = str(request.get("task_id") or "").strip()
+        # The router names the task by what was asked (`request`); `goal` is the same field.
+        goal = str(request.get("goal") or request.get("request") or "").strip()
+        reason = str(request.get("reason") or "").strip() or goal
+        try:
+            not_before = local_time(request.get("not_before"))
+        except (TypeError, ValueError):
+            not_before = None
+        if not task_id or not goal:
+            raise ValueError("A deferred task needs its task_id and goal")
+        if not not_before or timestamp(not_before) <= timestamp(self.mind.clock()):
+            return {"state": "needs-kin", "reason": "not-before-not-in-future"}
+        # The router passes its own input ids; a source id passes as it is.
+        named = [str(i) for i in [*(request.get("evidence_ids") or []), *(request.get("input_ids") or [])]]
+        evidence = []
+        with self.engine.db.connect() as conn:
+            if not enabled(conn, self.scope, "autonomous_plans"):
+                return {"state": "needs-kin", "reason": "autonomous-plans-disabled"}
+            inputs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone())
+            for identifier in named:
+                row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
+                                   (self.scope, identifier)).fetchone() if inputs else None
+                if row:
+                    evidence.append(row[0])
+                elif identifier.startswith("src_"):
+                    evidence.append(identifier)
+        evidence = list(dict.fromkeys(evidence))[:24]
+        if not evidence:
+            return {"state": "needs-kin", "reason": "owner-source-unavailable"}
+        try:
+            plan = self.manage({
+                "command_id": "defer-task:" + task_id, "action": "create", "key": "deferred-task:" + task_id,
+                "goal": goal, "motivation": "小光交给我的事，我决定晚点再做", "reason": reason,
+                "evidence_ids": evidence, "next_review_at": not_before,
+                "steps": [{"id": "return", "actor": "contact", "goal": "回到小光交给我的事：" + goal,
+                           "completion": "我已回到这件事，并如实说明做到哪一步", "not_before": not_before,
+                           "owner_request_id": task_id}]})
+        except (Conflict, Missing, ValueError) as error:
+            return {"state": "needs-kin", "reason": ("plan-refused:" + str(error))[:160]}
+        return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"]}
 
     def decide(self, conn, proposal, command, receipt, allowed, *, unchanged_view=False, rebased=False):
         """unchanged_view: the caller proved the step and its basis equal the view the model was shown.
@@ -288,14 +349,15 @@ class AutonomousPlans:
                             "agent_version": version}
         plan["last_reviewed_owner_epoch"] = epoch
         plan["next_review_at"] = review_at
-        # tick() compares this with the state's version; change() is not the only reviewer.
+        # The configuration this plan was last decided under.
         plan["agent_version"] = version
+        if (receipt or {}).get("compat"):
+            plan["compat_key"] = receipt["compat"]["key"]
         # Other independent decisions are re-fenced to this atomic plan revision.
         for other in plan["steps"]:
             if other.get("decision"):
                 other["decision"]["plan_revision"] = plan["revision"]
-        if all(s["state"] in {"completed", "abandoned"} for s in plan["steps"]):
-            plan["status"] = "completed"
+        self._finish(plan)
         self._save(conn, plan, command)
         return plan
 
@@ -360,21 +422,49 @@ class AutonomousPlans:
         return held
 
     def register_review(self, conn, plan_ids, command, receipt, version=None):
-        """A completed review saw these plans under this configuration.
+        """A completed review saw these plans under this configuration (its compat key).
 
         Held or absent decisions must not leave the plan recorded under a configuration that
         has already reviewed it; the wake-up ledger only keeps that from waking a review twice.
         """
+        from . import compat
         version, registered = version or self.mind._load(conn)["agent_version"], []
+        key = ((receipt or {}).get("compat") or compat.stamp(self.mind, conn))["key"]
         for identifier in plan_ids:
             row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, identifier)).fetchone()
             plan = json.loads(row[0]) if row else None
-            if not plan or plan.get("agent_version") == version:
+            if not plan or plan.get("compat_key") == key:
                 continue
-            previous, plan["agent_version"] = plan.get("agent_version"), version
-            self._record_review(conn, plan, command, "version-seen", {"previous_agent_version": previous, "agent_version": version, "receipt": receipt})
+            previous = plan.get("compat_key")
+            plan.update(agent_version=version, compat_key=key)
+            self._record_review(conn, plan, command, "version-seen", {"previous_compat_key": previous, "compat_key": key,
+                                                                     "agent_version": version, "receipt": receipt})
             registered.append(identifier)
         return registered
+
+    def retire_answered_reviews(self, conn, plan_ids, *, before, answered_by, keep_jobs=()):
+        """K2-04: a plan review that read these plans answered the reviews queued for them before
+        it read them. Those that have not started are retired instead of paying for the same review
+        again; their wake-up reasons stay answered, by this review."""
+        retired = []
+        jobs = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisals'").fetchone()
+        for row in conn.execute("SELECT id,data,created_at FROM mind_action_events WHERE scope=? AND kind='plan-review' AND state IN ('pending','queued')",
+                                (self.scope,)).fetchall():
+            data = json.loads(row["data"])
+            if data.get("plan_id") not in plan_ids or timestamp(row["created_at"]) > timestamp(before):
+                continue
+            job = data.get("job_id")
+            if job in keep_jobs:
+                continue
+            if job and jobs:
+                current = conn.execute("SELECT state,json_extract(data,'$.frozen_memory_context') IS NOT NULL FROM mind_appraisals WHERE id=?", (job,)).fetchone()
+                if current and (current[0] not in {"pending", "batched"} or current[1]):
+                    continue
+                if current:
+                    conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0,data=json_set(data,'$.superseded_by',?) WHERE id=?", (answered_by, job))
+            conn.execute("UPDATE mind_action_events SET state='superseded',data=json_set(data,'$.answered_by',?) WHERE id=?", (answered_by, row["id"]))
+            retired.append(row["id"])
+        return retired
 
     def _dead_reviews(self, conn, plan_id):
         """Review events of this plan that will never read it; the reasons they answered for are open again.
@@ -440,7 +530,8 @@ class AutonomousPlans:
         return actions.emit(conn, "plan-review", key, {"plan_id": plan["id"], "plan_revision": plan["revision"], "evidence_ids": sources,
             "agent_version": version, "reason": reason, **extra})
 
-    def waiting_reason(self, conn, plan, step):
+    def waiting_reason(self, conn, plan, step, state=None):
+        """`state`: the mind state a pass has already loaded, so a pass over many steps reads it once (K2-21)."""
         if not enabled(conn, self.scope, "autonomous_plans"):
             return "plans-disabled"
         if plan["status"] != "active":
@@ -450,7 +541,8 @@ class AutonomousPlans:
         decision = step.get("decision", {})
         if decision.get("action") != "execute" or decision.get("plan_revision") != plan["revision"]:
             return "decision-required"
-        if decision.get("agent_version") != self.mind._load(conn)["agent_version"]:
+        if not self.mind.decision_current(conn, decision.get("receipt") or {}, state):
+            # What decides behaviour changed since this decision; a deployment alone does not (K1-13).
             return "configuration-changed"
         if decision.get("owner_epoch") != self.owner_epoch(conn):
             return "new-owner-evidence"
@@ -517,15 +609,18 @@ class AutonomousPlans:
                 usual = [p for p in plans if p["id"] != first]
                 rest = usual[:min(100, max(1, limit)) - 1]
                 taken, plans = len(rest) + (len(usual) < len(plans)), [json.loads(lead[0]), *rest]
+            state = self.mind._load(conn) if plans else None
             for plan in plans:
                 plan["needs_review"] = not self.mind._fresh(conn, plan["evidence"])
                 for step in plan["steps"]:
-                    step["waiting_reason"] = self.waiting_reason(conn, plan, step)
+                    step["waiting_reason"] = self.waiting_reason(conn, plan, step, state)
                 if history:
                     plan["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plan_history WHERE id=? ORDER BY revision", (plan["id"],))]
             # Same snapshot as the plans themselves, so it describes exactly what is returned.
             shown = self.manifest(conn, plans) if manifest else None
-        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == limit else None, "timezone": "Asia/Singapore"}
+        # The page size the query used, not the one asked for (K2-07).
+        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == min(100, max(1, limit)) and not identifier else None,
+                  "timezone": "Asia/Singapore"}
         return {**result, "manifest": shown} if manifest else result
 
     def _source_state(self, conn, ref):
@@ -538,7 +633,7 @@ class AutonomousPlans:
                              (ref["namespace"], ref["source_key"], self.scope, ref["source_id"], ref["source_id"])).fetchone()
         return [ref["record_id"], list(current) if current else None, newer[0] if newer else None, self.mind._fresh(conn, [ref])]
 
-    def _wakeups(self, conn, plan, epoch, version):
+    def _wakeups(self, conn, plan, epoch, version, state=None):
         """Every reason to look at this plan again that is true now, each as a stable key.
 
         A key names the fact itself, never the plan revision or a count of reviews: a review
@@ -550,11 +645,13 @@ class AutonomousPlans:
         if not self.mind._fresh(conn, plan["evidence"]):
             reasons.append(["sources", [self._source_state(conn, ref) for ref in plan["evidence"]]])
         if plan.get("last_reviewed_owner_epoch") != epoch:
+            # A plan may be waiting on 小光. The review this wakes is merged into the assessment of
+            # the owner's own message in the same tick, so it costs no evaluation of its own (K2-04).
             reasons.append(["owner_epoch", epoch])
-        if plan.get("agent_version") != version:
-            reasons.append(["agent_version", version])
+        # A deployment no longer wakes every plan (K2-04, K1-13): a ready step whose decision a real
+        # configuration change affects names its own reason below (configuration-changed).
         for step in plan["steps"]:
-            reason = self.waiting_reason(conn, plan, step) if step["state"] == "ready" else None
+            reason = self.waiting_reason(conn, plan, step, state) if step["state"] == "ready" else None
             if reason in REVIEW_REASONS:
                 reasons.append(["step", step["id"], reason, step["revision"]])
         return reasons
@@ -569,10 +666,11 @@ class AutonomousPlans:
         with self.engine.db.connect(write=True) as conn:
             if not enabled(conn, self.scope, "autonomous_plans"):
                 return emitted
-            epoch, version = self.owner_epoch(conn), self.mind._load(conn)["agent_version"]
+            current = self.mind._load(conn)
+            epoch, version = self.owner_epoch(conn), current["agent_version"]
             for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall():
                 plan = json.loads(row[0])
-                reasons = self._wakeups(conn, plan, epoch, version)
+                reasons = self._wakeups(conn, plan, epoch, version, current)
                 if not reasons:
                     continue
                 answered = dict(conn.execute("SELECT key_digest,event_id FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, plan["id"])).fetchall())
@@ -606,14 +704,21 @@ class AutonomousPlans:
                 return {"state": "waiting", "reason": "user-work-priority"}
             if actor == "create" and not enabled(conn, self.scope, "records"):
                 return {"state": "waiting", "reason": "result-memory-disabled"}
+            # A run whose lease has run out has no executor left: the one that held it lived in a
+            # host that is gone, or lost the claim's answer. It is taken back here, on the next
+            # claim, not only at a start-up that happens to come late enough (K2-01).
+            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND actor=? AND state='running' AND lease_until<=?",
+                                    (self.scope, actor, time.time())).fetchall():
+                self._reclaim(conn, row, "lease-expired")
             active = conn.execute("SELECT id FROM mind_plan_runs WHERE scope=? AND actor=? AND state IN ('running','unconfirmed')", (self.scope, actor)).fetchone()
             if active:
                 return {"state": "waiting", "reason": "executor-reserved", "run_id": active[0]}
             rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active' ORDER BY next_review,id", (self.scope,)).fetchall()
+            state = self.mind._load(conn) if rows else None
             for row in rows:
                 plan = json.loads(row[0])
                 for step in plan["steps"]:
-                    if step["actor"] != actor or self.waiting_reason(conn, plan, step):
+                    if step["actor"] != actor or self.waiting_reason(conn, plan, step, state):
                         continue
                     run_id = "plan_run_" + digest([self.scope, plan["id"], step["id"], step["revision"]])[:32]
                     attempt = {"id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
@@ -634,9 +739,10 @@ class AutonomousPlans:
             plan = self.get(conn, row["plan_id"])
             decision = json.loads(row["data"])["decision"]
             step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
+            # A running step stops when Kin decides otherwise (the plan or the step's decision
+            # changed) or what it rests on moved; a new owner message or a deployment does not
+            # stop it by itself. Kin hears of the message and decides.
             if (plan["status"] != "active" or step.get("decision", {}).get("id") != decision["id"]
-                    or decision["agent_version"] != self.mind._load(conn)["agent_version"]
-                    or decision["owner_epoch"] != self.owner_epoch(conn)
                     or not self.mind._fresh(conn, decision["evidence"]) or not self.mind._fresh(conn, plan["evidence"])):
                 return {"state": "interrupt", "reason": "plan-or-evidence-changed"}
             conn.execute("UPDATE mind_plan_runs SET lease_until=? WHERE id=?", (time.time() + 90, run_id))
@@ -667,7 +773,6 @@ class AutonomousPlans:
             if step.get("run_id") != run_id:
                 raise Conflict("Step has another execution")
             if state == "completed" and (plan["status"] != "active" or step.get("decision", {}).get("id") != run["decision"]["id"]
-                    or run["decision"]["owner_epoch"] != self.owner_epoch(conn)
                     or not self.mind._fresh(conn, run["decision"]["evidence"])):
                 raise Conflict("Completion lost its current decision or evidence")
             run.update(state=state, result=result, finished_at=self.mind.clock())
@@ -677,8 +782,7 @@ class AutonomousPlans:
             step.pop("decision", None)
             step["receipts"].append({"run_id": run_id, "state": state, **result})
             plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
-            if all(s["state"] in {"completed", "abandoned"} for s in plan["steps"]):
-                plan["status"] = "completed"
+            self._finish(plan)
             self._save(conn, plan, "settle:" + run_id)
             return run
 
@@ -700,20 +804,28 @@ class AutonomousPlans:
                 if evidence and row["lease_until"] > time.time():
                     held.append({"id": row["id"], "lease_until": row["lease_until"]})
                     continue
-                run = json.loads(row["data"])
-                # Contact delivery may have happened before the crash. Preserve
-                # uncertainty until the existing transport reconciles receipts.
-                state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
-                run.update(state=state, reason="host-restart", checkpoint_retained=True, fence=row["fence"] + 1)
-                conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, dumps(run), row["id"]))
-                plan = self.get(conn, row["plan_id"])
-                step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
-                step.update(state="unconfirmed" if state == "unconfirmed" else "waiting", revision=step["revision"] + 1)
-                step.pop("decision", None)
-                plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
-                self._save(conn, plan, "recover:" + row["id"])
+                self._reclaim(conn, row, "host-restart")
                 recovered.append(row["id"])
         return {"recovered": recovered, "still_leased": held}
+
+    def _reclaim(self, conn, row, reason):
+        """Take back a run no executor holds any more. The fence moves, so a late answer from the
+        old executor is refused; the step waits for Kin's next decision with the reason in its
+        receipts."""
+        run = json.loads(row["data"])
+        # Contact delivery may have happened before the crash. Preserve
+        # uncertainty until the existing transport reconciles receipts.
+        state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
+        run.update(state=state, reason=reason, checkpoint_retained=True, fence=row["fence"] + 1)
+        conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, dumps(run), row["id"]))
+        plan = self.get(conn, row["plan_id"])
+        step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
+        if step.get("run_id") == row["id"]:
+            step.update(state="unconfirmed" if state == "unconfirmed" else "waiting", revision=step["revision"] + 1)
+            step.pop("decision", None)
+            step.setdefault("receipts", []).append({"run_id": row["id"], "state": state, "reason": reason, "checkpoint_retained": True})
+        plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
+        self._save(conn, plan, "reclaim:" + row["id"])
 
     def migrate_desires(self):
         """Preserve existing identities; migration grants no execution decision."""
@@ -740,18 +852,24 @@ class AutonomousPlans:
             if not enabled(conn, self.scope, "autonomous_plans"):
                 return created
             state = self.mind._load(conn)
-            for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status IN ('active','completed')", (self.scope,)).fetchall():
+            # Completed plans are read only while their last decision's wish is unsettled (K2-21).
+            rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall()
+            rows += conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='completed' "
+                                 "AND json_extract(data,'$.wish_sync')='pending'", (self.scope,)).fetchall()
+            for row in rows:
                 plan = json.loads(row[0])
+                if plan.pop("wish_sync", None):
+                    conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (dumps(plan), plan["id"]))
                 for step in plan["steps"]:
                     decision = step.get("decision", {})
                     if step["actor"] not in {"contact", "explore"} or not decision:
                         continue
-                    ready = not self.waiting_reason(conn, plan, step)
+                    ready = not self.waiting_reason(conn, plan, step, state)
                     if not ready:
                         if decision.get("action") not in {"wait", "abandon"}:
                             continue
                         if (decision.get("plan_revision") != plan["revision"]
-                            or decision.get("agent_version") != state["agent_version"]
+                            or not self.mind.decision_current(conn, decision.get("receipt") or {}, state)
                             or decision.get("owner_epoch") != self.owner_epoch(conn)
                             or not self.mind._fresh(conn, plan["evidence"] + decision["evidence"])):
                             continue
@@ -802,12 +920,13 @@ class AutonomousPlans:
                                    state, "plan-wish-sync", {"desire_ids": created})
         return created
 
-    def linked_ready(self, conn, desire):
+    def linked_ready(self, conn, desire, state=None):
         if not desire.get("plan_id"):
             return True
         plan = self.get(conn, desire["plan_id"])
         step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
-        return bool(step and step.get("decision", {}).get("id") == desire.get("plan_decision_id") and not self.waiting_reason(conn, plan, step))
+        return bool(step and step.get("decision", {}).get("id") == desire.get("plan_decision_id")
+                    and not self.waiting_reason(conn, plan, step, state))
 
     def settle_linked(self, conn, desire, receipt):
         if not desire.get("plan_id"):
@@ -820,6 +939,5 @@ class AutonomousPlans:
         step.update(state="completed" if receipt.get("complete") else "waiting", revision=step["revision"] + 1)
         step.pop("decision", None)
         plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
-        if plan["status"] == "active" and all(s["state"] in {"completed", "abandoned"} for s in plan["steps"]):
-            plan["status"] = "completed"
+        self._finish(plan)
         self._save(conn, plan, "linked:" + receipt["id"])

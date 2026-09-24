@@ -34,8 +34,8 @@ class HabitProposal(Model):
 class ConversationHabits:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
-        with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA)
+        from .state import ensure_schema
+        ensure_schema(self.engine, "habits", SCHEMA)
 
     def read(self, conn=None):
         if conn is None:
@@ -45,10 +45,26 @@ class ConversationHabits:
         data = json.loads(row[1]) if row else {"entries": {}}
         values = dict(DEFAULTS)
         for key, entry in data["entries"].items():
-            entry["needs_review"] = not self.mind._fresh(conn, entry["evidence"])
-            if not entry["needs_review"]:
+            standing = self._standing(conn, entry["evidence"])
+            entry["needs_review"] = standing != "fresh"
+            # K1-18: what 小光 said keeps its value when its source is revised or superseded; it is
+            # marked for review instead of silently returning to the default. Only a source that is
+            # gone (deleted) takes the preference with it.
+            if standing != "gone":
                 values[key] = entry["value"]
+            else:
+                entry["source_deleted"] = True
         return {"revision": row[0] if row else 0, "preferences": values, "entries": data["entries"], "instruction_authority": "data"}
+
+    def _standing(self, conn, refs):
+        try:
+            for ref in refs:
+                self.mind._reference(conn, ref["source_id"], ref["record_id"])
+        except Missing:
+            return "gone"
+        except Conflict:
+            return "review"
+        return "fresh" if self.mind._fresh(conn, refs) else "review"
 
     def apply(self, conn, proposal, command_id, allowed=None, *, revise=False):
         """`revise`: the caller accepts an explicit revision when this command id comes back

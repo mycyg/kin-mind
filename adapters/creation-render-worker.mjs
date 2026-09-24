@@ -7,8 +7,11 @@ import {pathToFileURL} from 'node:url';
 const hash=b=>createHash('sha256').update(b).digest('hex');
 let input='';for await(const chunk of process.stdin)input+=chunk;
 const request=JSON.parse(input);
-const {chromium}=await import(pathToFileURL(process.argv[2]).href);
-const browser=await chromium.launch({headless:true,executablePath:process.argv[3]||undefined,timeout:15000});
+// A browser that cannot start is the host's environment, not the artifact: said so apart (AD2-23).
+let browser;
+try{const {chromium}=await import(pathToFileURL(process.argv[2]).href);
+ browser=await chromium.launch({headless:true,executablePath:process.argv[3]||undefined,timeout:15000});}
+catch{console.log(JSON.stringify({state:'unavailable',reason:'browser-launch-failed'}));process.exit(0);}
 try{
  const root=fs.realpathSync(request.workspace),source=fs.realpathSync(request.path);
  if(!source.startsWith(root+path.sep))throw Error('outside-workspace');

@@ -36,11 +36,33 @@ CREATE INDEX IF NOT EXISTS mind_history ON mind_events(scope,revision DESC);
 CREATE TABLE IF NOT EXISTS mind_contacts(
  id TEXT PRIMARY KEY, scope TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS mind_contact_active ON mind_contacts(scope)
- WHERE state IN ('drafting','pending','unconfirmed');
+ WHERE state IN ('drafting','pending');
 CREATE TABLE IF NOT EXISTS mind_action_events(
  id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,
  state TEXT NOT NULL,data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mind_action_event_state ON mind_action_events(scope,state,created_at);
+CREATE INDEX IF NOT EXISTS mind_action_event_recent ON mind_action_events(scope,created_at,id);
 """
+
+# DDL this process has already run, per database file (K1-23). A replaced file (a restore) is a
+# different inode, so it gets its tables again.
+_SCHEMA_READY = set()
+
+
+def ensure_schema(engine, name, script):
+    """Run a module's DDL once per database file in this process. True when it ran now."""
+    try:
+        stat = engine.db.path.stat()
+        key = (str(engine.db.path), stat.st_ino, stat.st_dev, name)
+    except (OSError, AttributeError):
+        key = None
+    if key in _SCHEMA_READY:
+        return False
+    with engine.db.connect() as conn:
+        conn.executescript(script)
+    if key:
+        _SCHEMA_READY.add(key)
+    return True
 
 
 class Evolution(Model):
@@ -102,6 +124,17 @@ class AffectiveEvent(Model):
         return self
 
 
+# How long Kin may put a contact off (N9): five minutes to three days. A wait past either end is
+# taken to that end and kept, never refused.
+CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
+
+
+def contact_wait_seconds(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+        return max(CONTACT_WAIT_MIN_SECONDS, min(CONTACT_WAIT_MAX_SECONDS, int(round(v))))
+    return v
+
+
 class DesireChange(Model):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
@@ -122,9 +155,10 @@ class DesireChange(Model):
     exploration_id: str | None = Field(default=None, max_length=100)
     reason: str = Field(min_length=1)
     wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
-    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
 
     _time = field_validator("expires_at")(lambda v: utc(v) if v else v)
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
 
     @model_validator(mode="after")
     def shape(self):
@@ -158,7 +192,9 @@ class ContactDecision(Model):
     action: Literal["wait", "abandon"]
     reason: str = Field(min_length=1)
     condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
-    retry_after_seconds: StrictInt = Field(default=1800, ge=300, le=21600)
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
+
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
 
 
 _CONTACT_RECEIPT_STRINGS = {
@@ -238,12 +274,40 @@ def timestamp(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+# A short-term drive runs for four of its half-lives (at most two days), and then it has run its
+# course: the value goes on from where it got to, toward the dimension's own baseline at the
+# dimension's own pace. Nothing is reset, and the end only asks Kin to look again (K1-02).
+MOTIVATION_HALF_LIVES, MOTIVATION_MAX_HOURS = 4, 48
+
+
+def motivation_expiry(entry):
+    motive = entry.get("motivation")
+    if not motive:
+        return None
+    if motive.get("expires_at"):
+        return motive["expires_at"]
+    hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * entry["half_life_hours"])
+    return (timestamp(entry["at"]) + timedelta(hours=hours)).isoformat()
+
+
+def _toward(score, target, half_life_hours, start, end):
+    elapsed = max(0, (timestamp(end) - timestamp(start)).total_seconds())
+    return target + (score - target) * 0.5 ** (elapsed / (half_life_hours * 3600))
+
+
 def project(entry, at):
-    elapsed = max(0, (timestamp(at) - timestamp(entry["at"])).total_seconds())
-    value = entry["target"] + (entry["score"] - entry["target"]) * 0.5 ** (
-        elapsed / (entry["half_life_hours"] * 3600)
-    )
+    until = motivation_expiry(entry)
+    if until and timestamp(at) > timestamp(until):
+        reached = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], until)
+        pace = entry["motivation"].get("base_half_life_hours") or entry["half_life_hours"]
+        value = _toward(reached, entry.get("baseline", entry["target"]), pace, until, at)
+    else:
+        value = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], at)
     return min(100.0, max(0.0, value))
+
+
+# The settings key under which the host names its live contact policy file (K1-03).
+CONTACT_POLICY_SETTING = "kin_mind.contact_policy"
 
 
 class Mind(Continuity):
@@ -260,9 +324,17 @@ class Mind(Continuity):
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
+        if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
+                             + DESIRE_ARCHIVE_SCHEMA):
+            return
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
-                               + DESIRE_ARCHIVE_SCHEMA)
+            index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
+        if index and "unconfirmed" in (index[0] or ""):
+            # AD2-14: the index used to hold every contact behind one send of unknown outcome.
+            # It now covers the attempt in flight; an unknown outcome holds only its own wishes.
+            with self.engine.db.connect(write=True) as conn:
+                conn.execute("DROP INDEX IF EXISTS mind_contact_active")
+                conn.execute("CREATE UNIQUE INDEX mind_contact_active ON mind_contacts(scope) WHERE state IN ('drafting','pending')")
 
     def _load(self, conn):
         row = conn.execute(
@@ -542,6 +614,68 @@ class Mind(Continuity):
 
         return self._mutate(request, "contact-preference", apply)
 
+    def register_contact_policy(self, path):
+        """Name the live contact policy the host applies (its proactive-policy.json). The view reads
+        the owner's current contact constraints there, so the copy kept in the state since the
+        first install (quiet hours 0–9, threshold 75) is never shown as a current constraint
+        (K1-03). Written only when the path changes; returns whether it did."""
+        key, value = CONTACT_POLICY_SETTING + ":" + self.scope.key(), json.dumps({"path": str(path)})
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT data FROM settings WHERE key=?", (key,)).fetchone()
+        if row and row[0] == value:
+            return False
+        with self.engine.db.connect(write=True) as conn:
+            conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, value))
+        return True
+
+    def _live_contact_policy(self, conn):
+        """The registered live policy: None when none is registered, {} when it cannot be read."""
+        row = conn.execute("SELECT data FROM settings WHERE key=?",
+                           (CONTACT_POLICY_SETTING + ":" + self.scope.key(),)).fetchone()
+        if not row:
+            return None
+        from pathlib import Path
+        try:
+            policy = json.loads(Path(json.loads(row[0])["path"]).read_text())
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        return policy if isinstance(policy, dict) else {}
+
+    def _contact_view(self, conn, state):
+        """The contact constraints as the host applies them now (K1-03). The live policy is the
+        source; an owner preference event still decides wait_for_reply; the score threshold is
+        shown only while the legacy score gates decide. Without a registered policy (older stores,
+        direct callers) the stored profile is shown as before."""
+        from .autonomy_schema import legacy_thresholds
+        stored = state["profile"]["contact"]
+        contact = {key: stored.get(key) for key in ("reset_policy", "timezone", "check_seconds")}
+        live = self._live_contact_policy(conn)
+        if live is None:
+            contact.update({key: stored.get(key) for key in ("quiet_start", "quiet_end", "wait_for_reply", "minimum_gap_hours")})
+        else:
+            start, end = live.get("quietStartHour"), live.get("quietEndHour")
+            quiet = all(type(h) is int and 0 <= h <= 23 for h in (start, end)) and start != end
+            contact.update(source="live-policy", enabled=live.get("enabled") is True,
+                           timezone=live.get("timeZone") or stored.get("timezone"),
+                           quiet_start=start if quiet else None, quiet_end=end if quiet else None,
+                           minimum_gap_hours=live.get("minimumGapHours"),
+                           wait_for_reply=live.get("waitForReply") if type(live.get("waitForReply")) is bool else stored.get("wait_for_reply"))
+            if not live:
+                contact["source"] = "live-policy-unreadable"
+        if legacy_thresholds(conn, self.scope.key()):
+            contact["threshold"] = stored.get("threshold")
+        preference = state.get("contact_preference")
+        if preference:
+            contact["wait_for_reply"] = preference["wait_for_reply"]
+            contact["preference"] = {
+                "event_id": preference["event_id"],
+                "configured_at": preference["configured_at"],
+                "reason": preference["reason"],
+                "needs_review": not self._fresh(conn, preference["evidence"]),
+                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
+            }
+        return contact
+
     def configure_behavior(self, request):
         """Install sourced expression/contact policy without changing any score."""
         if request.get("style") not in {"affectionate-direct", "contextual"}:
@@ -565,16 +699,32 @@ class Mind(Continuity):
 
         return self._mutate(request, "behavior-policy", apply)
 
+    def _session_advice(self, conn, state):
+        from . import session_advice as advice_store
+        latest = getattr(advice_store, "latest", None)
+        return latest(conn, self.scope.key(), state) if latest else state.get("session_advice")
+
+    def decision_current(self, conn, receipt, state=None):
+        """A verified decision holds while what decides Kin's behaviour is unchanged: the approved
+        persona, the behaviour contract, the definitions, the models and the environment (the
+        compat stamp). A deployment that only moves agent_version no longer voids every decision
+        (K1-13, MAIN-RUA-02). A receipt from before stamps holds."""
+        stored = (receipt or {}).get("compat")
+        if not stored:
+            return True
+        from . import compat
+        return compat.holds(stored, compat.stamp(self, conn, state))
+
     def _desire_ready(self, conn, desire, at, *, state=None):
         from .autonomy_schema import enabled
         from .model_runtime import verified_decision
         if enabled(conn, self.scope.key()):
             receipt = desire.get("decision_receipt", {})
             current = state or self._load(conn)
-            if not verified_decision(receipt) or receipt.get("agent_version") != current["agent_version"]:
+            if not verified_decision(receipt) or not self.decision_current(conn, receipt, current):
                 return False
             from .plans import AutonomousPlans
-            if not AutonomousPlans(self).linked_ready(conn, desire):
+            if not AutonomousPlans(self).linked_ready(conn, desire, current):
                 return False
         if state is None and (desire.get("exploration_id") or desire.get("concern_revisions")):
             state = self._load(conn)
@@ -598,7 +748,43 @@ class Mind(Continuity):
             and timestamp(desire["expires_at"]) > timestamp(at)
             and self._fresh(conn, desire["evidence"])
             and (not desire.get("concern_revisions") or self._concern_links_fresh(conn, state, desire))
+            and desire["id"] not in self._unconfirmed_desires(conn)
         )
+
+    # Contact attempts. One attempt is in flight at a time (drafting, pending). It offers Kin
+    # every ready wish and she picks which to say (N11). A send whose outcome is unknown is
+    # reconciled under its own id and holds only the wishes it carried (AD2-14).
+    @staticmethod
+    def _offered(attempt):
+        return attempt.get("desire_ids") or [attempt["desire_id"]]
+
+    @staticmethod
+    def _offered_revisions(attempt):
+        return attempt.get("desire_revisions") or {attempt["desire_id"]: attempt["desire_revision"]}
+
+    def _unconfirmed_desires(self, conn):
+        held = set()
+        for row in conn.execute("SELECT data FROM mind_contacts WHERE scope=? AND state='unconfirmed'", (self.scope.key(),)):
+            attempt = json.loads(row[0])
+            held.update(attempt.get("chosen") or [attempt["desire_id"]])
+        return held
+
+    def _unconfirmed_contacts(self, conn, at):
+        """The sends of unknown outcome, as facts for Kin and for the host's reconciliation."""
+        facts = []
+        for row in conn.execute("SELECT id,data FROM mind_contacts WHERE scope=? AND state='unconfirmed' ORDER BY rowid", (self.scope.key(),)):
+            attempt = json.loads(row["data"])
+            facts.append({"attempt_id": row["id"], "desire_ids": attempt.get("chosen") or [attempt["desire_id"]],
+                          "since": attempt.get("unconfirmed_at") or attempt.get("updated_at") or attempt["created_at"],
+                          "excerpt": attempt.get("text_excerpt"), "owner_epoch": attempt.get("owner_epoch"),
+                          "checks": attempt.get("reconcile_checks", 0),
+                          "next_check_at": attempt.get("next_check_at") or at})
+        return facts
+
+    def _repeats_unconfirmed(self, conn, text):
+        wanted = digest(" ".join(str(text).split()))
+        return any(json.loads(row[0]).get("text_digest") == wanted for row in conn.execute(
+            "SELECT data FROM mind_contacts WHERE scope=? AND state='unconfirmed'", (self.scope.key(),)))
 
     def _initiative_value(self, conn, state, at):
         entry = state["dimensions"]["initiative"]
@@ -708,12 +894,27 @@ class Mind(Continuity):
                 "event_id": event_id,
                 "agent_version": request.agent_version,
             }
-            if motivation or previous.get("motivation"):
-                setting = motivation.model_dump() if motivation else previous["motivation"]
+            if motivation:
+                setting = motivation.model_dump()
+                hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * setting["half_life_minutes"] / 60)
                 state["dimensions"][key].update(
                     target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
-                    motivation={**setting, "episode_id": event_id},
+                    motivation={**setting, "episode_id": event_id, "started_at": self.clock(),
+                                "expires_at": (timestamp(self.clock()) + timedelta(hours=hours)).isoformat(),
+                                "base_half_life_hours": spec["half_life_hours"]},
                 )
+            elif previous.get("motivation"):
+                until = motivation_expiry(previous)
+                if timestamp(self.clock()) < timestamp(until):
+                    # The same drive goes on, as the same episode with the same end (K1-02). One that
+                    # has run its course is not carried into a new event: the dimension's own target
+                    # and pace take over from the value it had reached.
+                    setting = previous["motivation"]
+                    state["dimensions"][key].update(
+                        target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
+                        motivation={**setting, "expires_at": until,
+                                    "base_half_life_hours": setting.get("base_half_life_hours") or spec["half_life_hours"]},
+                    )
         state["last_evidence_key"] = evidence_key
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
@@ -847,6 +1048,14 @@ class Mind(Continuity):
             # An explicit wish reassessment also acknowledges current concern revisions.
             links = self._resolve_concern_links(conn, state, desire["concern_ids"])
             desire["concern_revisions"] = links
+        if desire.get("trait_revisions") and request.action in {"start", "resume", "update", "wait"}:
+            # K1-19: Kin looked at this wish again after a trait it rested on moved. It now rests on
+            # the traits as they stand, so it is ready again when she says so.
+            from .trait_refs import current_revisions, record
+            desire["trait_revisions"] = current_revisions(conn, self, desire["trait_revisions"])
+            if desire["trait_revisions"]:
+                record(conn, self.scope.key(), "desire", did, desire["trait_revisions"],
+                       dependent_revision=desire["revision"], at=at)
         desire.update(
             evidence=desire["evidence"] if link_only else refs,
             reason=desire["reason"] if link_only else request.reason,
@@ -1105,16 +1314,7 @@ class Mind(Continuity):
         if ledger:
             # Only the ledger's own switch produces `legacy`; the chain's projection travels beside it.
             traits = {**traits, **ledger.get("legacy", {})}
-        contact = deepcopy(state["profile"]["contact"])
-        preference = state.get("contact_preference")
-        if preference:
-            contact["preference"] = {
-                "event_id": preference["event_id"],
-                "configured_at": preference["configured_at"],
-                "reason": preference["reason"],
-                "needs_review": not self._fresh(conn, preference["evidence"]),
-                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
-            }
+        contact = self._contact_view(conn, state)
         view = {
             "revision": state["revision"],
             "scope": self.scope.model_dump(),
@@ -1122,7 +1322,8 @@ class Mind(Continuity):
             "agent_version": state["agent_version"],
             "profile_version": state["profile_version"],
             "dimensions": values,
-            "session_advice": deepcopy(state.get("session_advice")),
+            # Read where the session registry keeps it now, and from the state for older stores.
+            "session_advice": deepcopy(self._session_advice(conn, state)),
             "desires": desires,
             "traits": traits,
             "contact": contact,
@@ -1132,6 +1333,10 @@ class Mind(Continuity):
             "action_policy": ({**state["action_policy"], "needs_review": not self._fresh(conn, state["action_policy"]["evidence"])} if state.get("action_policy") else None),
             "action_events": [{**json.loads(r["data"]), "id": r["id"], "kind": r["kind"], "state": r["state"]}
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
+            # Sends of unknown outcome, as facts: each may have reached 小光. It is reconciled under
+            # its own id and never said again under another; a new, different contact is Kin's to make.
+            "contact_unconfirmed": [{k: u[k] for k in ("attempt_id", "desire_ids", "excerpt", "since")}
+                                    for u in self._unconfirmed_contacts(conn, at)],
         }
         if ledger:
             # Only what a switch that is on produced: with both off this view is what it was, key for key.
@@ -1173,11 +1378,17 @@ class Mind(Continuity):
                 "unanswered_contact_seconds": max(0, (timestamp(at)-timestamp(last_contact)).total_seconds()) if awaiting else 0,
             }
             result["decision_runtime"] = None
-            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
+            # The latest committed action keeps its receipt in its one schedule row: read there, not
+            # by sorting every appraisal ever queued (K1-11). A store without it falls back.
+            details = None
+            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_action_schedule'").fetchone():
+                row = conn.execute("SELECT data FROM mind_action_schedule WHERE scope=?", (self.scope.key(),)).fetchone()
+                details = (json.loads(row[0]).get("receipt") if row else None) or None
+            if details is None and conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
                 receipt = conn.execute("SELECT json_extract(data,'$.receipt') FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.receipt') IS NOT NULL ORDER BY json_extract(data,'$.receipt.verified_at') DESC LIMIT 1", (self.scope.key(),)).fetchone()
-                if receipt:
-                    details = json.loads(receipt[0])
-                    result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
+                details = json.loads(receipt[0]) if receipt else None
+            if isinstance(details, dict):
+                result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
             # One snapshot per read: the block above neither writes nor mutates it.
             from .exploration_decisions import decision_view
             result["exploration_decisions"] = decision_view(self, conn, state)
@@ -1217,8 +1428,11 @@ class Mind(Continuity):
                     if wait.get("owner_epoch"):
                         replied = bool(owner_epoch and owner_epoch != wait["owner_epoch"])
                     else:
+                        # The owner-interaction terms exactly as rhythm's partial index states them,
+                        # so this reads that index rather than every source (K1-11).
                         replied = bool(conn.execute(
                             "SELECT 1 FROM sources WHERE scope=? AND deleted=0 AND occurred_at>? "
+                            "AND (namespace='kin-owner-input' OR substr(namespace,1,5)='host:') "
                             "AND json_extract(data,'$.authority')='explicit' "
                             "AND json_extract(data,'$.metadata.role')='user' "
                             "AND json_extract(data,'$.metadata.host_event')='message' "
@@ -1254,8 +1468,11 @@ class Mind(Continuity):
             waiting = [{"id": d["id"], "expired": d["expired"], "needs_review": d["needs_review"],
                         **d.get("contact_wait", {"condition": "new_evidence", "reason": d.get("reason", "")})}
                        for d in view["desires"] if d["kind"] == "contact" and d["status"] == "waiting"]
+            at = self.clock()
+            unconfirmed = self._unconfirmed_contacts(conn, at)
+            reconcile = [u for u in unconfirmed if timestamp(u["next_check_at"]) <= timestamp(at)]
             active = conn.execute(
-                "SELECT id,state,data FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending','unconfirmed')",
+                "SELECT id,state,data FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending')",
                 (self.scope.key(),),
             ).fetchone()
             if active:
@@ -1268,27 +1485,29 @@ class Mind(Continuity):
                 }
 
             if self._action_review_pending(conn):
-                return {"eligible": False, "reason": "action-appraisal-pending"}
+                return {"eligible": False, "reason": "action-appraisal-pending", "reconcile": reconcile}
             from .autonomy_schema import legacy_thresholds
             legacy = legacy_thresholds(conn, self.scope.key())
             if legacy and view["dimensions"]["initiative"]["needs_review"]:
-                return {"eligible": False, "reason": "state-needs-review"}
+                return {"eligible": False, "reason": "state-needs-review", "reconcile": reconcile}
             if legacy and view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]:
-                return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting}
+                return {"eligible": False, "reason": "below-threshold", "initiative": view["dimensions"]["initiative"]["value"], "waiting_desires": waiting, "reconcile": reconcile}
             ready = [
-                d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
+                d for d in view["desires"] if self._desire_ready(conn, d, at) and not self._action_review_pending(conn, d)
             ]
             if not ready:
-                return {"eligible": False, "reason": "no-actionable-desire", "waiting_desires": waiting}
-            desire = min(
-                ready, key=lambda d: (-d["strength"], d["created_at"], d["id"])
-            )
+                return {"eligible": False, "reason": "no-actionable-desire", "waiting_desires": waiting, "reconcile": reconcile}
+            # Every ready wish goes to the draft and Kin picks. The strongest leads only the recall.
+            ready.sort(key=lambda d: (-d["strength"], d["created_at"], d["id"]))
             return {
                 "eligible": True,
                 "reason": "draft-required",
                 "revision": state["revision"],
                 "initiative": view["dimensions"]["initiative"]["value"],
-                "desire": desire,
+                "desire": ready[0],
+                "desires": ready,
+                "unconfirmed": unconfirmed,
+                "reconcile": reconcile,
             }
 
     def claim_contact(self, *, owner_epoch):
@@ -1296,11 +1515,11 @@ class Mind(Continuity):
         # store or starting a model. Duplicate triggers cannot acquire another slot.
         with self.engine.db.connect(write=True) as conn:
             existing = conn.execute(
-                "SELECT id FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending','unconfirmed')",
+                "SELECT id FROM mind_contacts WHERE scope=? AND state IN ('drafting','pending')",
                 (self.scope.key(),),
             ).fetchone()
             if existing:
-                raise Conflict("An unresolved contact attempt already exists")
+                raise Conflict("A contact attempt is already in flight", kind="runtime", code="contact-attempt-open")
 
             if self._action_review_pending(conn):
                 raise Conflict("Action appraisal is pending")
@@ -1319,34 +1538,29 @@ class Mind(Continuity):
                 or view["dimensions"]["initiative"]["projected_value"] < view["contact"]["threshold"]))
             ):
                 raise Conflict("The contact threshold or desire is no longer current")
-            desire = min(
-                ready, key=lambda d: (-d["strength"], d["created_at"], d["id"])
-            )
-            aid = (
-                "kin-mind-"
-                + digest(
-                    [
-                        self.scope.key(),
-                        desire["id"],
-                        desire["revision"],
-                        owner_epoch,
-                        state["revision"],
-                    ]
-                )[:40]
-            )
-            previous = conn.execute(
-                "SELECT data FROM mind_contacts WHERE id=?", (aid,)
-            ).fetchone()
-            if previous:
-                return json.loads(previous[0])
+            ready.sort(key=lambda d: (-d["strength"], d["created_at"], d["id"]))
+            desire = ready[0]
+            # The same wishes at the same revisions may be tried again after a transient cancel:
+            # a finished attempt with this identity moves the next one to a new id (K1-17).
+            base = [self.scope.key(), [(d["id"], d["revision"]) for d in ready], owner_epoch, state["revision"]]
+            for sequence in range(1000):
+                aid = "kin-mind-" + digest(base + ([sequence] if sequence else []))[:40]
+                if not conn.execute("SELECT 1 FROM mind_contacts WHERE id=?", (aid,)).fetchone():
+                    break
+            else:
+                raise Conflict("Too many attempts for the same wishes", kind="runtime", code="contact-attempts-exhausted")
             attempt = {
                 "id": aid,
                 "state": "drafting",
                 "owner_epoch": owner_epoch,
                 "desire_id": desire["id"],
                 "desire_revision": desire["revision"],
+                "desire_ids": [d["id"] for d in ready],
+                "desire_revisions": {d["id"]: d["revision"] for d in ready},
                 "created_at": self.clock(),
                 "desire": desire,
+                "desires": ready,
+                "unconfirmed": self._unconfirmed_contacts(conn, self.clock()),
             }
             conn.execute(
                 "INSERT INTO mind_contacts VALUES(?,?,?,?)",
@@ -1354,23 +1568,27 @@ class Mind(Continuity):
             )
             return attempt
 
-    def check_contact(self, attempt_id, owner_epoch):
+    def check_contact(self, attempt_id, owner_epoch, desire_ids=None, text=None):
         with self.engine.db.connect() as conn:
             attempt = self._attempt(conn, attempt_id)
             state = self._load(conn)
-            desire = state["desires"].get(attempt["desire_id"])
+            offered, revisions = self._offered(attempt), self._offered_revisions(attempt)
+            chosen = list(dict.fromkeys(desire_ids)) if desire_ids else offered
+            if set(chosen) - set(offered):
+                return {"eligible": False, "reason": "desire-not-offered", "attempt": attempt}
+            if text is not None and self._repeats_unconfirmed(conn, text):
+                return {"eligible": False, "reason": "repeats-unconfirmed-send", "attempt": attempt}
             view = self._view(conn, state, self.clock())
             value = view["dimensions"]["initiative"]
             from .autonomy_schema import legacy_thresholds
             legacy = legacy_thresholds(conn, self.scope.key())
+            current = [state["desires"].get(i) for i in chosen]
             valid = (
                 attempt["state"] == "drafting"
                 and not (view.get("action_policy") or {}).get("needs_review")
                 and not view["contact"].get("preference", {}).get("needs_review")
                 and attempt["owner_epoch"] == owner_epoch
-                and desire
-                and desire["revision"] == attempt["desire_revision"]
-                and self._desire_ready(conn, desire, self.clock())
+                and all(d and d["revision"] == revisions[d["id"]] and self._desire_ready(conn, d, self.clock()) for d in current)
                 and (not legacy or (not value["needs_review"]
                 and value["projected_value"] >= state["profile"]["contact"]["threshold"]))
             )
@@ -1405,7 +1623,10 @@ class Mind(Continuity):
                 return True
         return False
 
-    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False):
+    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False, desire_ids=None, text=None):
+        """`desire_ids`: the wishes Kin's draft acts on, among those the attempt offered her; unnamed
+        means all of them. `text`: the text about to be sent, kept as a digest and an excerpt so a
+        send of unknown outcome can be recognised and never said again under another id."""
         decision = ContactDecision.model_validate(decision) if decision is not None else None
         failure = ContactFailure.model_validate(failure) if failure is not None else None
         if decision and state != "canceled":
@@ -1420,6 +1641,9 @@ class Mind(Continuity):
             raise ValueError("A platform message ID is required")
         with self.engine.db.connect(write=True) as conn:
             attempt = self._attempt(conn, attempt_id)
+            offered, revisions = self._offered(attempt), self._offered_revisions(attempt)
+            if desire_ids is not None and (not desire_ids or set(desire_ids) - set(offered)):
+                raise ValueError("A draft may act only on the wishes its attempt offered")
             if aborted_before_send and (state != "canceled" or message_id or attempt.get("message_id") or attempt.get("message_ids")):
                 raise ValueError("Only a host-verified wholly unsent batch can be canceled")
             if type(partial) is not bool or type(canceled_bubbles) is not int or canceled_bubbles < 0:
@@ -1434,7 +1658,17 @@ class Mind(Continuity):
                 raise Conflict(
                     "A possible send requires reconciliation, not cancellation"
                 )
+            if state == "pending":
+                attempt["chosen"] = list(dict.fromkeys(desire_ids or offered))
+                if text is not None:
+                    attempt["text_digest"] = digest(" ".join(str(text).split()))
+                    attempt["text_excerpt"] = str(text).strip()[:160]
             attempt.update(state=state, updated_at=self.clock(), reason=reason)
+            if state == "unconfirmed":
+                # Reconciled under its own id with a growing interval: 5 minutes doubling to 6 hours.
+                checks = attempt.get("reconcile_checks", -1) + 1
+                attempt.update(reconcile_checks=checks, unconfirmed_at=attempt.get("unconfirmed_at") or self.clock(),
+                               next_check_at=(timestamp(self.clock()) + timedelta(seconds=min(300 * 2 ** checks, 21600))).isoformat())
             if failure:
                 attempt["failure"] = failure.model_dump(exclude_none=True)
             elif state == "accepted":
@@ -1453,96 +1687,116 @@ class Mind(Continuity):
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-source-changed", "contact-review-failed"}):
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-source-changed", "contact-source-changed", "contact-review-failed", "repeats-unconfirmed-send"}):
                 current = self._load(conn)
-                desire = current["desires"].get(attempt["desire_id"])
-                # An empty draft is a decision to wait, not a failed send. Do not
-                # overwrite a wish that changed while the model was drafting.
-                if desire and desire["revision"] == attempt["desire_revision"] and desire["status"] == "wanted":
+                targets = list(dict.fromkeys(desire_ids or attempt.get("chosen") or offered))
+                # A decision or a failure applies to the wishes it names that are still as drafted.
+                # A wish that changed while the model was drafting keeps its new state.
+                touched = [current["desires"][i] for i in targets if i in current["desires"]
+                           and current["desires"][i]["revision"] == revisions[i] and current["desires"][i]["status"] == "wanted"]
+                if touched:
                     self._retarget(conn, current, self.clock())
                     eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
-                    stranded, review_failures = False, None
-                    if reason == "draft-failed":
-                        failures = desire.get("contact_failures", 0) + 1
-                        desire["contact_failures"] = failures
-                        # Past the third failure the wait needs evidence that may never come. Keep
-                        # the backoff, and let the model decide this wish's fate instead.
-                        stranded = failures >= 3
-                        decision = ContactDecision(action="wait", reason="Draft generation or parsing failed",
-                            condition="time" if failures < 3 else "new_evidence",
-                            retry_after_seconds=300 * failures)
-                        review_failures = failures
-                    elif reason == "contact-review-failed":
-                        failures = desire.get("contact_review_failures", 0) + 1
-                        desire["contact_review_failures"] = failures
-                        stranded, review_failures = True, failures
-                        decision = ContactDecision(action="wait",
-                            reason="The wholly unsent contact batch needs a new DeepSeek decision",
-                            condition="new_evidence")
-                    elif reason in {"draft-source-changed", "contact-source-changed"}:
-                        stranded = True
-                        decision = ContactDecision(action="wait",
-                            reason=("The draft source changed before model execution" if reason == "draft-source-changed"
-                                    else "The owner context changed before the wholly unsent contact could be delivered"),
-                            condition="new_evidence")
-                    decision = decision or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
-                    desire.update(status="abandoned" if decision.action == "abandon" else "waiting", revision=desire["revision"] + 1,
-                                  updated_at=self.clock(), event_id=eid,
-                                  reason=decision.reason)
-                    if decision.action == "wait":
-                        desire["contact_wait"] = self._wait_details(decision, self.clock(), attempt["owner_epoch"])
-                    else:
-                        desire.pop("contact_wait", None)
-                    attempt["decision"] = decision.model_dump()
+                    reviews = []
+                    for desire in touched:
+                        applied, stranded, review_failures = decision, False, None
+                        if reason == "draft-failed":
+                            failures = desire.get("contact_failures", 0) + 1
+                            desire["contact_failures"] = failures
+                            # Past the third failure the wait needs evidence that may never come. Keep
+                            # the backoff, and let the model decide this wish's fate instead.
+                            stranded = failures >= 3
+                            applied = ContactDecision(action="wait", reason="Draft generation or parsing failed",
+                                condition="time" if failures < 3 else "new_evidence",
+                                retry_after_seconds=300 * failures)
+                            review_failures = failures
+                        elif reason == "contact-review-failed":
+                            failures = desire.get("contact_review_failures", 0) + 1
+                            desire["contact_review_failures"] = failures
+                            stranded, review_failures = True, failures
+                            applied = ContactDecision(action="wait",
+                                reason="The wholly unsent contact batch needs a new DeepSeek decision",
+                                condition="new_evidence")
+                        elif reason in {"draft-source-changed", "contact-source-changed"}:
+                            stranded = True
+                            applied = ContactDecision(action="wait",
+                                reason=("The draft source changed before model execution" if reason == "draft-source-changed"
+                                        else "The owner context changed before the wholly unsent contact could be delivered"),
+                                condition="new_evidence")
+                        elif reason == "repeats-unconfirmed-send":
+                            applied = ContactDecision(action="wait",
+                                reason="这条和一次结果未知的发送相同：那次按原编号对账；想说的话换成新的内容再说",
+                                condition="new_evidence")
+                        applied = applied or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
+                        desire.update(status="abandoned" if applied.action == "abandon" else "waiting", revision=desire["revision"] + 1,
+                                      updated_at=self.clock(), event_id=eid,
+                                      reason=applied.reason)
+                        if applied.action == "wait":
+                            desire["contact_wait"] = self._wait_details(applied, self.clock(), attempt["owner_epoch"])
+                        else:
+                            desire.pop("contact_wait", None)
+                        attempt.setdefault("decisions", {})[desire["id"]] = applied.model_dump()
+                        attempt["decision"] = applied.model_dump()
+                        if stranded:
+                            reviews.append((desire, review_failures))
                     conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(attempt), attempt_id))
                     self._retarget(conn, current, self.clock())
                     current["revision"] += 1
                     current["updated_at"] = self.clock()
                     self._save(conn, current)
                     self._history(conn, eid, current, "contact-deferred", attempt)
-                    if stranded:
+                    if reviews:
                         from .actions import ActionEvents
                         failure_view = ({k: v for k, v in attempt.get("failure", {}).items()
                                          if k != "model_receipt"} or None)
-                        ActionEvents(self).emit(conn, "wish-review", [desire["id"], reason, review_failures, attempt_id], {
-                            "desire_id": desire["id"],
-                            "evidence_ids": [r["record_id"] for r in desire["evidence"]],
-                            "agent_version": current["agent_version"],
-                            "reason": ("Drafting this wish failed three times" if reason == "draft-failed"
-                                       else "A wholly unsent contact attempt needs a fresh semantic decision"),
-                            **({"failure": failure_view} if failure_view else {}),
-                        })
+                        for desire, review_failures in reviews:
+                            ActionEvents(self).emit(conn, "wish-review", [desire["id"], reason, review_failures, attempt_id], {
+                                "desire_id": desire["id"],
+                                "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                                "agent_version": current["agent_version"],
+                                "reason": ("Drafting this wish failed three times" if reason == "draft-failed"
+                                           else "A wholly unsent contact attempt needs a fresh semantic decision"),
+                                **({"failure": failure_view} if failure_view else {}),
+                            })
             if state == "accepted":
                 current = self._load(conn)
-                desire = current["desires"][attempt["desire_id"]]
+                chosen = attempt.get("chosen") or [attempt["desire_id"]]
                 from .plans import AutonomousPlans
-                AutonomousPlans(self).settle_linked(conn, desire, {"id": attempt_id,
-                    "complete": not partial, "kind": "delivery", "message_ids": message_ids or [message_id],
-                    "partial": partial, "visibility": "unverified"})
-                desire.update(
-                    status="completed",
-                    delivery={
-                        "state": "partial" if partial else "accepted",
-                        "message_id": message_id,
-                        "message_ids": message_ids or [message_id],
-                        "canceled_bubbles": canceled_bubbles,
-                        "visibility": "unverified",
-                    },
-                    revision=desire["revision"] + 1,
-                    updated_at=self.clock(),
-                )
-                # Acceptance is an execution fact. DeepSeek evaluates satisfaction;
-                # the transport never assigns an emotion score or invents a thought.
-                event_key = "delivery_" + digest([attempt_id, "accepted"])[:32]
-                conn.execute("INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)", (
-                    event_key, self.scope.key(), "delivery", self.clock(), "pending",
-                    dumps({"attempt_id": attempt_id, "desire_id": desire["id"],
-                           "evidence_ids": [r["record_id"] for r in desire["evidence"]],
-                           "message_ids": message_ids or [message_id],
-                           "partial": partial, "canceled_bubbles": canceled_bubbles,
-                           "agent_version": current["agent_version"],
-                           "visibility": "unverified"}),
-                ))
+                delivered = []
+                for identifier in chosen:
+                    desire = current["desires"].get(identifier)
+                    if not desire:
+                        continue
+                    AutonomousPlans(self).settle_linked(conn, desire, {"id": attempt_id,
+                        "complete": not partial, "kind": "delivery", "message_ids": message_ids or [message_id],
+                        "partial": partial, "visibility": "unverified"})
+                    desire.update(
+                        status="completed",
+                        delivery={
+                            "state": "partial" if partial else "accepted",
+                            "message_id": message_id,
+                            "message_ids": message_ids or [message_id],
+                            "canceled_bubbles": canceled_bubbles,
+                            "visibility": "unverified",
+                        },
+                        revision=desire["revision"] + 1,
+                        updated_at=self.clock(),
+                    )
+                    delivered.append(desire)
+                if delivered:
+                    # Acceptance is an execution fact. DeepSeek evaluates satisfaction;
+                    # the transport never assigns an emotion score or invents a thought.
+                    event_key = "delivery_" + digest([attempt_id, "accepted"])[:32]
+                    conn.execute("INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)", (
+                        event_key, self.scope.key(), "delivery", self.clock(), "pending",
+                        dumps({"attempt_id": attempt_id, "desire_id": delivered[0]["id"],
+                               "desire_ids": [d["id"] for d in delivered],
+                               "evidence_ids": list(dict.fromkeys(r["record_id"] for d in delivered for r in d["evidence"])),
+                               "message_ids": message_ids or [message_id],
+                               "partial": partial, "canceled_bubbles": canceled_bubbles,
+                               "agent_version": current["agent_version"],
+                               "visibility": "unverified"}),
+                    ))
                 current["revision"] += 1
                 current["updated_at"] = self.clock()
                 self._save(conn, current)

@@ -7,9 +7,14 @@ CREATE TABLE IF NOT EXISTS mind_plans(
  id TEXT PRIMARY KEY,scope TEXT NOT NULL,revision INTEGER NOT NULL,status TEXT NOT NULL,
  next_review TEXT,updated_at TEXT NOT NULL,data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS mind_plan_due ON mind_plans(scope,status,next_review);
+-- A completed plan whose last decision still has a wish to settle (K2-21): found by index, so the
+-- completed plans that pile up over time are not read again on every review.
+CREATE INDEX IF NOT EXISTS mind_plan_wish_sync ON mind_plans(scope,status,json_extract(data,'$.wish_sync'));
 CREATE TABLE IF NOT EXISTS mind_plan_history(
  id TEXT NOT NULL,revision INTEGER NOT NULL,command_id TEXT NOT NULL,data TEXT NOT NULL,
  PRIMARY KEY(id,revision));
+-- next_move reads the rows one appraisal wrote by command-id prefix (K1-23).
+CREATE INDEX IF NOT EXISTS mind_plan_history_command ON mind_plan_history(command_id);
 CREATE TABLE IF NOT EXISTS mind_plan_runs(
  id TEXT PRIMARY KEY,scope TEXT NOT NULL,plan_id TEXT NOT NULL,step_id TEXT NOT NULL,
  actor TEXT NOT NULL,state TEXT NOT NULL,lease_until REAL NOT NULL,owner TEXT NOT NULL,

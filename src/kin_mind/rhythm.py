@@ -111,23 +111,17 @@ def rhythm_view(entry, at, interactions, *, fresh=True):
     phase = entry["phase"]
     latest = interactions.get("last_owner_at")
     if phase in {"resting", "drowsy"} and latest and stamp(latest) > stamp(entry["at"]):
+        # 小光 wrote after she settled: a fact, not a timer.
         since = max(0, (stamp(at) - stamp(latest)).total_seconds())
         phase = "roused" if since < 1200 else "recovering"
-    elif elapsed >= entry["half_life_minutes"] * 60:
-        if value < 20:
-            phase = "resting"
-        elif value < 40:
-            phase = "drowsy"
-        elif entry["target"] < entry["alertness"]:
-            phase = "settling"
-        elif value >= 70:
-            phase = "awake"
-        else:
-            phase = "recovering"
+    # The phase Kin gave stays hers when its half-life has passed: no timer moves her into or out
+    # of rest. Its end only asks her to look again (review_due; K1-04).
+    review_due = elapsed >= entry["half_life_minutes"] * 60
     return {
         "mode": "interaction-led",
         "status": interactions["sample_status"],
         "phase": phase,
+        "review_due": review_due,
         "proposed_phase": entry["phase"],
         "alertness": round(value, 3),
         "target": entry["target"],

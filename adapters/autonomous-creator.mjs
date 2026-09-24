@@ -20,8 +20,10 @@ export function artifactManifest(directory,artifacts){
   });
 }
 
-/** Independent creation process. No phone binding, channel credentials, MCP,
- * hooks or direct network tools. Only its workspace is writable. */
+/** Independent creation process. No phone binding, MCP, hooks or network. Only its workspace
+ * is writable: /tmp and $TMPDIR are excluded from the sandbox's writable roots too (AD2-22).
+ * Reading is not confined by the sandbox; the instructions ask it to leave channel credentials
+ * alone, and nothing it reads leaves except through its own artifacts. */
 export class AutonomousCreator {
   constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env}){
     Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env});this.child=null;
@@ -43,7 +45,8 @@ export class AutonomousCreator {
     const args=['exec','--ignore-user-config','--ignore-rules','--ephemeral','--skip-git-repo-check','--json','--color','never',
       '--sandbox','workspace-write','--cd',directory,'--model',this.model,'--output-schema',schemaFile,'--output-last-message',lastFile,
       '-c','approval_policy="never"','-c','mcp_servers={}','-c','features.apps=false','-c','features.hooks=false','-c','features.multi_agent=false',
-      '-c','web_search="disabled"','-c','sandbox_workspace_write.network_access=false','-c','model_reasoning_effort='+JSON.stringify(this.reasoning),
+      '-c','web_search="disabled"','-c','sandbox_workspace_write.network_access=false',
+      '-c','sandbox_workspace_write.exclude_slash_tmp=true','-c','sandbox_workspace_write.exclude_tmpdir_env_var=true','-c','model_reasoning_effort='+JSON.stringify(this.reasoning),
       '-c','shell_environment_policy.inherit="none"'];
     if(this.fast)args.push('-c','service_tier="fast"');
     if(this.modelCatalog)args.push('-c','model_catalog_json='+JSON.stringify(this.modelCatalog));
@@ -79,32 +82,54 @@ export class AutonomousCreator {
   }
 }
 
-/** Existing minute loop dispatches one creator; user work preempts it. */
-export function startAutonomousWork({loop,call,creator,ownerEpoch,isBusy,recordStatus=()=>{}}){
-  let running=false,closed=false,controller=null;
+/** Existing minute loop dispatches one creator. A running creation is Kin's own work: a new
+ * owner message does not stop it (she hears of it and decides, through her plan); shutdown,
+ * an explicit stop and a changed plan or decision do. It starts only while the owner's work
+ * is not running. */
+const REVIEW_RETRIES=15,REVIEW_RETRY_MS=20000;
+const pause=ms=>new Promise(resolve=>{setTimeout(resolve,ms);});
+/** A static reason for a stop, never a message text: a worker's failure code, else a generic one. */
+export function stopReason(error){
+  const code=error?.failure?.code??error?.code;
+  return typeof code==='string'&&/^[a-z0-9][a-z0-9-]{0,79}$/.test(code)?code:'creation-executor-failed';
+}
+export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS}){
+  let running=false,closed=false,controller=null,current=null;
   const owner='creator-'+process.pid;
   const tick=async()=>{
-    if(closed||running||isBusy())return;
+    // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
+    if(closed||running||isBusy()||creator.command===null)return;
     running=true;let claimed;
     try{
       claimed=await call('plan-claim',{actor:'create',owner});
       if(claimed.state!=='claimed')return;
-      const epoch=ownerEpoch();controller=new AbortController();
+      controller=new AbortController();
       const run=claimed.run;
+      current={plan_id:claimed.plan.id,goal:claimed.plan.goal,step:claimed.step?.goal,run_id:run.id};
       const result=await creator.run(claimed,{signal:controller.signal,onHeartbeat:async()=>{
-        if(closed||isBusy()||epoch!==ownerEpoch())return {state:'interrupt'};
+        if(closed)return {state:'interrupt'};
         return call('plan-renew',{run_id:run.id,owner,fence:run.fence});
       }});
-      const settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      let settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      // The completion review found no free model slot: the same verified result is offered
+      // again while the lease is kept, instead of the whole creation running again (K2-02).
+      for(let tries=0;settled?.state==='waiting'&&tries<REVIEW_RETRIES&&!closed;tries++){
+        await pause(retryMs);
+        if(closed||(await call('plan-renew',{run_id:run.id,owner,fence:run.fence})).state!=='renewed')break;
+        settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      }
+      if(settled?.state==='waiting')throw Object.assign(Error('completion-review-unavailable'),{code:'completion-review-unavailable'});
       recordStatus({creation:{state:settled.state,plan_id:claimed.plan.id,run_id:run.id}});
       void loop.review();
-    }catch{
-      if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence});}catch{}
-      recordStatus({creation:{state:'needs-review',reason:'creation-executor-failed'}});
+    }catch(error){
+      // The reason travels into the plan's receipt: Kin decides what to do with the step (K2-02).
+      const reason=stopReason(error);
+      if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
+      recordStatus({creation:{state:'needs-review',reason}});
     }
-    finally{running=false;controller=null;}
+    finally{running=false;controller=null;current=null;}
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
   const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();controller?.abort();};
-  return {tick,async close(){closed=true;controller?.abort();await creator.stop();},get running(){return running;}};
+  return {tick,async close(){closed=true;controller?.abort();await creator.stop();},get running(){return running;},get current(){return current;}};
 }

@@ -62,7 +62,8 @@ export function createLeaseClient({request, now = () => Date.now(), setTimer = s
     const proceed = state === 'admitted' || state === 'disabled'
       || (state === 'degraded' && PROCEEDS_WHILE_DEGRADED.has(lane)) || (state === 'wait' && lane === 'foreground');
     const controller = state === 'admitted' && ABORTS_WHEN_LOST.has(lane) ? new AbortController() : null;
-    let timer = null, watchdog = null, confirmedUntil = null, lost = false, expired = false, done = state !== 'admitted';
+    let timer = null, watchdog = null, confirmedUntil = null, lost = false, expired = false, done = state !== 'admitted',
+      releasedDegraded = false;
 
     const schedule = seconds => {
       timer = setTimer(renew, Math.max(1000, (Number(seconds) > 0 ? Number(seconds) : ttl / 3) * 1000));
@@ -119,6 +120,9 @@ export function createLeaseClient({request, now = () => Date.now(), setTimer = s
           ...(expired ? {leaseExpiredUnconfirmed: true} : {})};
       },
       async release() {
+        // A degraded answer may hide an admission whose reply was lost: the same id is
+        // released anyway, and the ledger answers an unknown id as released (AD2-28).
+        if (state === 'degraded' && !releasedDegraded) {releasedDegraded = true; return call('release', {id});}
         if (done) {done = true; return {state};}
         done = true;
         if (timer !== null) {clearTimer(timer); timer = null;}

@@ -191,6 +191,9 @@ class Traits:
                                "('task-result','delivery')", (self.scope, identifier)).fetchone()
             if row:
                 data = json.loads(row[0])
+                from .behavior_chain import settled_task
+                if data.get("verified") is True and not settled_task(conn, self.scope, data):
+                    data = {**data, "verified": False}
                 return {**data, "execution_id": data.get("task_id") or data.get("delivery_id") or identifier}
         return None
 
@@ -217,11 +220,36 @@ class Traits:
                 raise Conflict("Cited material cannot stand for the evidence class it was given",
                                code="trait-evidence-class")
         first = min(refs, key=lambda r: (r["occurred_at"], r["source_id"]))
+        if found == "self_statement":
+            origin = self._diary_origin(conn, first, cache)
+            if origin:
+                return (*origin, [])
         window = self._window(conn, first["occurred_at"], cache)
         # Two ingestions of one utterance are one origin, whatever namespaces carried them.
         root = (root_key(text=self.engine._get(conn, first["record_id"])["content"], window=window)
                 if found == "owner_statement" and window else root_key(source_id=first["source_id"]))
         return (episode_key(window=window) if window else episode_key(root=root)), root, []
+
+    def _diary_origin(self, conn, ref, cache):
+        """A diary is Kin's reading of the material it cites, written later: it belongs to the
+        time of that material, so diaries about one conversation are one episode rather than one
+        each (K1-14). A diary citing nothing still readable belongs to the appraisal that wrote it."""
+        attributes = self.engine._get(conn, ref["record_id"]).get("attributes") or {}
+        if attributes.get("host_event") != "diary":
+            return None
+        cited = []
+        for identifier in list(attributes.get("evidence_ids") or [])[:16]:
+            try:
+                cited.extend(self.mind._evidence(conn, [identifier]))
+            except (Missing, Conflict):
+                continue
+        if not cited:
+            root = root_key(source_id=attributes.get("appraisal_event_id") or ref["source_id"])
+            return episode_key(root=root), root
+        first = min(cited, key=lambda r: (r["occurred_at"], r["source_id"]))
+        window = self._window(conn, first["occurred_at"], cache)
+        root = root_key(source_id=first["source_id"])
+        return (episode_key(window=window) if window else episode_key(root=root)), root
 
     # --- observations ----------------------------------------------------------------------------
 
@@ -373,14 +401,16 @@ class Traits:
         return self._find(conn, first["trait_id"]), identity
 
     def _established(self, conn, trait, decision, support, cache):
-        """Repeated copies are one episode; distinct reflections can support growth."""
-        if decision.basis != "inference":
+        """Repeated copies are one episode; distinct reflections can support growth. Only the
+        owner's own words, checked against the record, stand on one time; every other basis,
+        counter_evidence included, needs two separate episodes (K1-14)."""
+        if decision.basis in {"owner_instruction", "owner_correction"}:
             return
         episodes = [o["episode_key"] for o in
                     self._lookup(conn, [entry.ref for entry in decision.episodes], trait, cache)]
         if (len({o["episode_key"] for o in support}) < 2
                 or len(set(episodes)) < 2):
-            raise Conflict("Establishing on inference needs separate episodes",
+            raise Conflict("Establishing a trait needs separate episodes",
                            code="trait-single-episode", target=trait["id"])
 
     def _owner_words(self, conn, decision, refs, policy):

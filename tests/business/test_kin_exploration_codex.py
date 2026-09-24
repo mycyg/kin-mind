@@ -234,24 +234,49 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
     report = run_codex(fake, topic, tmp_path / "job-altered", **codex_kwargs())
     assert report["state"] == "failed" and report["reason"] == "unbacked-citation"
 
-def _codex_blocked_by_guard():
-    """The hermetic runner refuses native binaries under a protected root (~/.codex among them)."""
-    found = __import__("shutil").which("codex")
-    real = os.path.realpath(found) if found else ""
-    roots = [os.path.realpath(r) for r in os.environ.get("KIN_PROTECTED_ROOTS", "").split(":") if r]
-    return any(real == r or real.startswith(r + os.sep) for r in roots)
+# A stand-in for `codex exec`: no model and no real CLI (item 10). It reads the host's own kin_web
+# server from the -c overrides it was given and drives that reader the way the model would:
+# search, read the page it found, cite the read with its evidence id. The frames it prints are
+# the CLI's JSON events, so the host's parsing, ledger and citation checks all run for real.
+DRIVER = """#!{python}
+import json, os, re, sys
+argv = sys.argv[1:]
+if argv[:1] == ['--version']:
+    sys.stdout.write('codex-cli 0.156.1\\n'); raise SystemExit(0)
+overrides = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
+value = lambda key: next(o.split('=', 1)[1] for o in overrides if o.startswith(key + '='))
+config_file = json.loads(value('mcp_servers.kin_web.args'))[-1]
+sys.path.insert(0, re.search(r'PYTHONPATH="([^"]+)"', value('mcp_servers.kin_web.env')).group(1))
+from kin_mind.web_read import WebReader
+open(os.path.join(os.getcwd(), 'observed.json'), 'w').write(json.dumps({{'argv': argv, 'env': dict(os.environ)}}))
+last = argv[argv.index('--output-last-message') + 1]
+sys.stdin.read()
+reader = WebReader(json.loads(open(config_file).read()))
+def emit(frame):
+    sys.stdout.write(json.dumps(frame) + '\\n'); sys.stdout.flush()
+def call(n, tool, output):
+    emit({{'type': 'item.completed', 'item': {{'id': 'item_%d' % n, 'type': 'mcp_tool_call', 'server': 'kin_web',
+          'tool': tool, 'status': 'completed', 'result': {{'content': [{{'type': 'text', 'text': json.dumps(output)}}]}}}}}})
+emit({{'type': 'thread.started', 'thread_id': 'th_driver'}})
+found = reader.search('probe', max_results=3)
+call(1, 'web_search', {{'state': found['state'], 'evidence_id': found['evidence_id'], 'results': found['results']}})
+page = reader.read_page(found['results'][0]['url'])
+call(2, 'read_page', {{'state': page['state'], 'evidence_id': page['evidence_id'], 'locator': page['locator']}})
+payload = {{'summary': 'The answer is teal.', 'findings': ['The page says teal.'],
+           'sources': [{{'url': page['locator'], 'title': 'Probe Page'}}], 'open_questions': [],
+           'suggested_share': None, 'evidence_map': {{'1': [page['evidence_id']]}}}}
+open(last, 'w').write(json.dumps(payload))
+emit({{'type': 'turn.completed', 'usage': {{'input_tokens': 50, 'output_tokens': 10}}}})
+"""
 
-@pytest.mark.skipif(__import__("shutil").which("codex") is None, reason="codex CLI not installed")
-@pytest.mark.skipif(_codex_blocked_by_guard(), reason="the hermetic guard refuses the installed codex "
-                    "binary under a protected root; run this file outside scripts/test-all.sh")
-def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
-    """W1.6 real-tool case, fully isolated: a stub serves the model AND the web
-    targets; no external network, no real DS call, no phone path."""
+
+def test_tool_round_trip_search_read_cite_with_a_stand_in_cli(tmp_path, monkeypatch):
+    """W1.6 round trip without the real CLI: a stub serves the web targets, the stand-in drives
+    the host's own web reader, and the run uses Kin's Codex home (item 9, item 10)."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
-    requests = []
 
     class Stub(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -269,53 +294,24 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-            parsed = json.loads(body)
-            requests.append(parsed)
-            n = len(requests)
-            outputs = [i for i in parsed.get("input", []) if i.get("type") == "function_call_output"]
-            if n == 1:
-                output = [{"type": "function_call", "id": "fc1", "call_id": "c1",
-                           "name": "web_search", "namespace": "mcp__kin_web",
-                           "arguments": json.dumps({"query": "probe"})}]
-            elif n == 2:
-                output = [{"type": "function_call", "id": "fc2", "call_id": "c2",
-                           "name": "read_page", "namespace": "mcp__kin_web",
-                           "arguments": json.dumps({"url": f"http://127.0.0.1:{self.server.server_address[1]}/page"})}]
-            else:
-                read_output = json.loads(outputs[-1]["output"][1]["text"]) if outputs and isinstance(outputs[-1]["output"], list) else {}
-                evidence_id = read_output.get("evidence_id", "")
-                locator = read_output.get("locator", "")
-                payload = {"summary": "The answer is teal.", "findings": ["The page says teal."],
-                           "sources": [{"url": locator, "title": "Probe Page"}],
-                           "open_questions": [], "suggested_share": None,
-                           "evidence_map": {"1": [evidence_id]} if evidence_id else None}
-                output = [{"type": "message", "role": "assistant",
-                           "content": [{"type": "output_text", "text": json.dumps(payload)}]}]
-            frames = ""
-            for i, item in enumerate(output):
-                frames += 'event: response.output_item.done\ndata: ' + json.dumps({"type": "response.output_item.done", "output_index": i, "item": item}) + '\n\n'
-            frames += 'event: response.completed\ndata: ' + json.dumps({"type": "response.completed", "response": {"id": f"r{n}", "model": "deepseek-flash", "status": "completed", "output": output, "usage": {"input_tokens": 50, "output_tokens": 10, "total_tokens": 60}}}) + '\n\ndata: [DONE]\n\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            self.wfile.write(frames.encode())
-
         def log_message(self, *args):
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Stub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
+    driver = tmp_path / "codex-driver"
+    driver.write_text(DRIVER.format(python=sys.executable))
+    driver.chmod(0o700)
+    kin_home = tmp_path / "kin-codex-home"
+    kin_home.mkdir()
     job = tmp_path / "job"
-    provider = {"id": "deepseek", "name": "DeepSeek", "base_url": base + "/v1",
-                "wire_api": "responses", "env_key": "KIN_TEST_DS_KEY"}
-    report = run_codex("codex", {"question": "What does the probe page say?"}, job,
-                       provider=provider, web={"enabled": True, "search_endpoint": base + "/search",
-                                               "allow_hosts": ["127.0.0.1"]},
-                       budget_seconds=180, **{k: v for k, v in codex_kwargs().items() if k != "provider"})
-    server.shutdown()
+    try:
+        report = run_codex(driver, {"question": "What does the probe page say?"}, job,
+                           web={"enabled": True, "search_endpoint": base + "/search", "allow_hosts": ["127.0.0.1"]},
+                           budget_seconds=60, codex_home=kin_home, executor_source="runtime-bundle", **codex_kwargs())
+    finally:
+        server.shutdown()
     assert report["state"] == "complete", report.get("reason")
     assert report["result"]["summary"] == "The answer is teal."
     states = {r["state"] for r in report["web_observations"]}
@@ -325,10 +321,176 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
     assert citation == observed[0]["locator"] and observed[0]["version"]
     assert report["evidence_coverage"] == {"mapped_claims": 1, "covered_claims": 1}
     assert any(t.get("type") == "mcp_tool_call" and t.get("server") == "kin_web" for t in report["tool_results"])
-    # This test points Codex directly at the stub, so its native MCP namespace
-    # wrapper is expected here. Whether the production gateway flattens that
-    # namespace is not covered by this test. Code mode itself stays off.
-    assert not any(tool.get("type") == "custom" and tool.get("name") == "exec"
-                   for tool in requests[0].get("tools", []))
     # No phone path: the tool surface has no send/message tool.
     assert not any("send" in str(t) or "message" in str(t.get("tool", "")) for t in report["tool_results"])
+    seen = json.loads((job / "observed.json").read_text())
+    assert seen["env"]["CODEX_HOME"] == str(kin_home) and "--ignore-user-config" in seen["argv"]
+    assert not (job / "codex-home").exists()
+
+
+
+def _stub_site():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            port = str(self.server.server_address[1])
+            body = (('<a class="result__a" href="/l/?uddg=http%3A%2F%2F127.0.0.1%3A' + port + '%2Fpage">P</a>')
+                    if self.path.startswith("/search") else
+                    "<html><head><title>Probe Page</title></head><body>The answer is teal.</body></html>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_a_failed_citation_keeps_what_the_run_read_and_its_draft(tmp_path, monkeypatch):
+    """K2-08: one unread citation fails the run, but the page it did read and its draft stay in
+    the checkpoint the next attempt starts from."""
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    server, base = _stub_site()
+    driver = tmp_path / "codex-driver"
+    body = DRIVER.format(python=sys.executable).replace(
+        "'sources': [{'url': page['locator'], 'title': 'Probe Page'}]",
+        "'sources': [{'url': page['locator'], 'title': 'Probe Page'}, {'url': 'https://unread.example/x', 'title': 'Never read'}]")
+    assert "unread.example" in body
+    driver.write_text(body)
+    driver.chmod(0o700)
+    try:
+        report = run_codex(driver, {"question": "What does the probe page say?"}, tmp_path / "job",
+                           web={"enabled": True, "search_endpoint": base + "/search", "allow_hosts": ["127.0.0.1"]},
+                           budget_seconds=60, **codex_kwargs())
+    finally:
+        server.shutdown()
+    assert report["state"] == "failed" and report["reason"] == "unbacked-citation" and report["result"] is None
+    checkpoint = report["checkpoint"]
+    assert checkpoint["partial_findings"]["summary"] == "The answer is teal."
+    read = [entry for entry in checkpoint["sources_used"] if entry["state"] == "observed"]
+    assert read and read[0]["locator"].endswith("/page")
+    assert any("unread.example" in gap for gap in checkpoint["gaps"])
+
+
+def test_a_citation_prefers_what_this_run_read_over_a_carried_receipt():
+    """K4-17: the version read now wins over the checkpoint's older receipt for the same page."""
+    from kin_mind.source_ledger import legitimize
+    old = {"state": "historical", "locator": "https://site.example/a", "version": "v1", "evidence_id": "old"}
+    new = {"state": "observed", "locator": "https://site.example/a", "version": "v2", "evidence_id": "new"}
+    assert legitimize([new, old], "https://site.example/a")["version"] == "v2"
+    assert legitimize([old], "https://site.example/a")["version"] == "v1"
+
+def test_exploration_runs_the_runtime_bundle_codex_not_the_floating_cli(tmp_path):
+    """K2-15, item 9: an explicit native_codex_command wins; else the verified runtime bundle's
+    binary; the legacy command only where no bundle is installed; a changed manifest waits."""
+    import hashlib
+    from kin_mind.codex_executor import native_codex, native_codex_home
+    host = tmp_path / "host"
+    runtime = host / "state" / "mobile-runtime"
+    bundle = runtime / "versions" / "codex-0.156.1-bundle"
+    (bundle / "bin").mkdir(parents=True)
+    (bundle / "bin" / "codex").write_text("#!/bin/sh\n")
+    manifest = json.dumps({"runtime": {"codex": {"path": "bin/codex"}}}).encode()
+    (bundle / "manifest.json").write_bytes(manifest)
+    legacy = {"host_root": str(host), "exploration_command": "/Users/someone/.local/bin/codex"}
+    assert native_codex(legacy) == (legacy["exploration_command"], "legacy-command")
+    (runtime / "activation.json").write_text(json.dumps({"current": {
+        "bundle_id": "codex-0.156.1-bundle", "manifest_sha256": hashlib.sha256(manifest).hexdigest()}}))
+    assert native_codex(legacy) == (str((bundle / "bin" / "codex").resolve()), "runtime-bundle")
+    assert native_codex({**legacy, "native_codex_command": "/fixed/codex"}) == ("/fixed/codex", "configured")
+    (bundle / "manifest.json").write_bytes(manifest + b" ")
+    with pytest.raises(CodexUnavailable):
+        native_codex(legacy)
+    assert native_codex_home(legacy) is None
+    (host / "state" / "codex-home").mkdir()
+    assert native_codex_home(legacy) == host / "state" / "codex-home"
+
+
+def test_a_running_exploration_stops_for_kin_not_for_a_new_message(tmp_path):
+    """N7: a new owner message does not end the run; Kin setting the wish down does."""
+    from kin_mind.exploration import Explorations
+    from kin_mind.memory import MemoryContinuity
+    from kin_mind.state import DesireChange
+
+    _, mind, source = exploration_world(tmp_path)
+    desire = next(iter(mind.read()["desires"]))
+    revision = mind.read()["revision"]
+    mind.manage_desire(DesireChange(command_id="start-wish", agent_version="test-v1", expected_revision=revision,
+                                    evidence_ids=[source], action="start", desire_id=desire["id"], reason="Starting"))
+    stop = Explorations(mind)._stop_when(lambda: False, desire["id"], every=0)
+    MemoryContinuity(mind).ingest({"id": "owner-interjects", "kind": "owner-message", "text": "Hi", "at": mind.clock()})
+    assert stop() is False
+    revision = mind.read()["revision"]
+    mind.manage_desire(DesireChange(command_id="set-down", agent_version="test-v1", expected_revision=revision,
+                                    evidence_ids=[source], action="abandon", desire_id=desire["id"], reason="Kin chose to stop"))
+    assert stop() is True
+    assert Explorations(mind)._stop_when(lambda: True, desire["id"])() is True
+
+
+def test_a_run_whose_worker_died_frees_the_slot_at_the_next_look(tmp_path):
+    """K2-09: a running exploration whose worker the host killed does not block exploration until
+    the next restart; the next status check takes it back and the wish is wanted again."""
+    import time as clock_time
+    from kin_mind.exploration import Explorations
+    from kin_mind.exploration_cadence import ExplorationCadence
+    from kin_mind.state import DesireChange
+    engine, mind, source = exploration_world(tmp_path)
+    desire = next(iter(mind.read()["desires"]))
+    mind.manage_desire(DesireChange(command_id="start", agent_version="test-v1", expected_revision=mind.read()["revision"],
+                                    evidence_ids=[source], action="start", desire_id=desire["id"], reason="Started"))
+    explorer = Explorations(mind)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", ("explore_dead", mind.scope.key(), "running", mind.clock(),
+            json.dumps({"desire_id": desire["id"], "liveness": {"pid": 999999, "started": None, "deadline": clock_time.time() - 1}})))
+        conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", ("explore_old", mind.scope.key(), "interrupted", mind.clock(), "{}"))
+    ExplorationCadence(mind).status()
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_explorations WHERE id='explore_dead'").fetchone()[0] == "interrupted"
+    assert mind.read()["desires"][0]["status"] == "wanted"
+    assert explorer.reclaim_dead() == []
+
+
+def test_the_resident_worker_answers_in_order_and_keeps_long_work_out(tmp_path):
+    """Item 6 (§5.7): one frame per line, answered in order; a long action is refused here, an
+    unreadable frame is answered, and nothing but frames reaches the answer stream."""
+    import io
+    from kin_mind.host import serve
+    _, mind, _ = exploration_world(tmp_path)
+    config = host_config(tmp_path, mind)
+    frames = [{"id": "1", "action": "read", "args": {}, "timeoutMs": 5000},
+              {"id": "2", "action": "explore", "args": {}, "timeoutMs": 5000},
+              {"id": "3", "action": "candidate", "args": {}, "timeoutMs": 5000}]
+    stdin = io.StringIO("".join(json.dumps(f) + "\n" for f in frames) + "not json\n")
+    out = io.StringIO()
+    serve(config, stdin, out)
+    answers = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [a["id"] for a in answers] == ["1", "2", "3", None]
+    assert answers[0]["ok"] and answers[0]["result"]["state"]["revision"] >= 1
+    assert answers[1] == {"id": "2", "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
+    assert answers[2]["ok"] and "eligible" in answers[2]["result"]
+    assert answers[3]["error"]["code"] == "invalid-frame"
+
+
+def test_the_minute_review_asks_the_resident_worker_before_a_process_is_started(tmp_path):
+    """T-14: `review-due` does the minute's bookkeeping in the resident worker and says whether an
+    appraisal is there to run; nothing runs while history compaction owns the store (WS6)."""
+    from kin_mind.appraisal import Appraisals
+    from kin_mind.history import COMPACTING, COMPACTION_MARKER
+    from kin_mind.host import RESIDENT_ACTIONS, dispatch
+    _, mind, _ = exploration_world(tmp_path)
+    config = host_config(tmp_path, mind)
+    assert "review-due" in RESIDENT_ACTIONS and "review" not in RESIDENT_ACTIONS
+    assert dispatch(config, "review-due", {}) == {"state": "idle", "action": False, "enrichment": False}
+    Appraisals(mind).enqueue_maintenance("snapshot-1", "test-v1")
+    assert dispatch(config, "review-due", {"tick": False}) == {"state": "due", "action": True, "enrichment": False}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO meta VALUES(?,1) ON CONFLICT(key) DO UPDATE SET value=1", (COMPACTION_MARKER,))
+    for action in ("review-due", "review"):
+        assert dispatch(config, action, {}) == {"state": "paused", "reason": COMPACTING}

@@ -116,3 +116,47 @@ def test_retry_after_artifact_ingestion_reuses_original_observation(env,tmp_path
     assert settled['state']=='completed'
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM mind_runtime_events WHERE kind='artifact-created'").fetchone()[0]==1
+
+
+def test_a_refused_completion_leaves_no_verified_result_in_memory(env,tmp_path,monkeypatch):
+    """K2-03, K2-18: the plan settles before memory hears of a verified result; when the plan
+    refuses the completion, memory holds the artifacts and no verified task-result."""
+    from kin_mind.plans import AutonomousPlans
+    mind,plans,run,result,config=ready(env,tmp_path)
+    def refuse(self,*args,**kwargs):
+        raise Conflict("Completion lost its current decision or evidence")
+    monkeypatch.setattr(AutonomousPlans,'settle',refuse)
+    with pytest.raises(Conflict):
+        accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Review())
+    with mind.engine.db.connect() as conn:
+        kinds=[r[0] for r in conn.execute("SELECT kind FROM mind_runtime_events")]
+        verified=conn.execute("SELECT COUNT(*) FROM mind_runtime_events WHERE kind='task-result' AND json_extract(data,'$.verified')=1").fetchone()[0]
+    assert 'artifact-created' in kinds and verified==0
+
+
+def test_a_busy_review_slot_keeps_the_run_and_an_incomplete_step_is_a_failure(env,tmp_path):
+    """K2-02: no free model slot for the review returns waiting and the run stays open; a review
+    that finds the step incomplete settles it failed, not interrupted."""
+    from kin_mind.model_lanes import ModelAdmissionWait
+    mind,plans,run,result,config=ready(env,tmp_path)
+    class Busy:
+        def structured(self,*args,**kwargs):raise ModelAdmissionWait('background-capacity')
+    request={'run_id':run['id'],'owner':'worker','fence':1,'result':result}
+    assert accept_result(mind,config,request,Busy())['state']=='waiting'
+    assert plans.read(identifier=run['plan_id'])['plans'][0]['steps'][0]['state']=='running'
+    class Incomplete(Review):
+        def structured(self,*args,**kwargs):
+            decision,receipt=super().structured(*args,**kwargs)
+            return decision.model_copy(update={'complete':False,'step_remaining':['The hands are missing']}),receipt
+    settled=accept_result(mind,config,request,Incomplete())
+    assert settled['state']=='failed' and settled['result']['reason']=='completion-review-incomplete'
+
+
+def test_reruns_of_one_step_are_one_work(env,tmp_path):
+    """K2-20: every run of one plan step files its bytes under the same work."""
+    mind,plans,run,result,config=ready(env,tmp_path)
+    assert accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Review())['state']=='completed'
+    with mind.engine.db.connect() as conn:
+        works={json.loads(r[0])['receipt'].get('work_id') for r in conn.execute("SELECT data FROM mind_runtime_events WHERE kind='artifact-created'")}
+    from kin_mind.memory import MemoryContinuity
+    assert works=={MemoryContinuity(mind)._id('work',['plan-step',run['plan_id'],run['step_id']])}

@@ -1,6 +1,7 @@
 """Durable internal stimuli. A clock crossing queues one appraisal, not a send."""
 
 import json
+from datetime import timedelta
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import SourceInput
@@ -43,8 +44,6 @@ class ActionEvents:
             state["action_policy"] = {
                 "version": request["agent_version"],
                 "trigger": "semantic-decision" if semantic else "affect",
-                "provider": "deepseek-flash",
-                "reasoning": "high",
                 "configured_at": self.mind.clock(),
                 "evidence": refs,
                 "reason": request["reason"],
@@ -82,6 +81,7 @@ class ActionEvents:
         queued = []
         with self.mind.engine.db.connect(write=True) as conn:
             state = self.mind._load(conn)
+            queued.extend(self._due_reviews(conn, state))
             from .autonomy_schema import legacy_thresholds
             if not legacy_thresholds(conn, self.mind.scope.key()):
                 # Scores are context. Only due reviews and new evidence wake DS.
@@ -119,6 +119,51 @@ class ActionEvents:
                     },
                 )
                 queued.append(key)
+        return queued
+
+    def _due_reviews(self, conn, state):
+        """What has run its course asks Kin to look again; nothing is changed for her (K1-02, K1-04).
+        A short-term drive past its end, and a rhythm phase past its half-life with no word from 小光
+        since. Each asks once, keyed by what ended."""
+        from .rhythm import stamp
+        from .state import motivation_expiry, timestamp
+        now = self.mind.clock()
+        queued = []
+        for name in ("initiative", "curiosity"):
+            entry = state["dimensions"].get(name) or {}
+            until = motivation_expiry(entry)
+            if until and timestamp(until) <= timestamp(now) and entry.get("evidence") and self.mind._entry_fresh(conn, entry):
+                queued.append(self.emit(conn, "motivation-review", [name, entry["motivation"].get("episode_id"), until], {
+                    "dimension": name, "ended_at": until, "reason": "This short-term drive has run its course",
+                    "evidence_ids": [r["record_id"] for r in entry["evidence"]], "agent_version": state["agent_version"]}))
+        from .trait_refs import links_fresh
+        for desire in state["desires"].values():
+            # K1-19: a wish that rested on a trait which has since moved is not ready; Kin is asked
+            # once per trait revision set whether it still holds.
+            if desire.get("trait_revisions") and desire["status"] in {"wanted", "waiting"} and not links_fresh(conn, self.mind, desire):
+                queued.append(self.emit(conn, "wish-review", [desire["id"], "trait", sorted(desire["trait_revisions"].items())], {
+                    "desire_id": desire["id"], "reason": "A trait this wish rested on was revised",
+                    "evidence_ids": [r["record_id"] for r in desire.get("evidence", [])], "agent_version": state["agent_version"]}))
+        expired = sorted(d["id"] for d in state["desires"].values()
+                         if d["status"] in {"wanted", "waiting", "in_progress"} and timestamp(d["expires_at"]) <= timestamp(now))
+        if expired:
+            # One question for the wishes whose window closed unsettled; asked again only when that set changes.
+            fresh = []
+            for identifier in expired[:12]:
+                refs = state["desires"][identifier].get("evidence") or []
+                if refs and self.mind._fresh(conn, refs):
+                    fresh.extend(r["record_id"] for r in refs)
+            queued.append(self.emit(conn, "expired-wish-review", [expired], {
+                "desire_ids": expired[:12], "reason": "These wishes passed their window without being settled",
+                "evidence_ids": list(dict.fromkeys(fresh))[:24], "agent_version": state["agent_version"]}))
+        rhythm = state.get("rhythm")
+        if rhythm and rhythm.get("evidence") and rhythm.get("half_life_minutes"):
+            ends = stamp(rhythm["at"]) + timedelta(minutes=rhythm["half_life_minutes"])
+            if ends <= stamp(now) and self.mind._fresh(conn, rhythm["evidence"]):
+                queued.append(self.emit(conn, "rhythm-review", [rhythm.get("event_id"), ends.isoformat()], {
+                    "phase": rhythm.get("phase"), "ended_at": ends.isoformat(),
+                    "reason": "The rhythm phase Kin gave has passed its half-life",
+                    "evidence_ids": [r["record_id"] for r in rhythm["evidence"]], "agent_version": state["agent_version"]}))
         return queued
 
     def drain(self, jobs):
@@ -171,11 +216,14 @@ class ActionEvents:
                 )
                 data.update(job_id=job["id"], source_id=source["id"])
             status = jobs.status(data["job_id"])
+            # An event follows its appraisal to the end: a job set aside or superseded closes it
+            # too, instead of writing it back to `queued` where it held a drain slot for ever (K4-19).
+            ended = {"complete": "complete", "superseded": "superseded", "needs-repair": "needs-review"}
             with self.mind.engine.db.connect(write=True) as conn:
                 conn.execute(
                     "UPDATE mind_action_events SET state=?,data=? WHERE id=?",
                     (
-                        "complete" if status["state"] == "complete" else "queued",
+                        ended.get(status["state"], "queued"),
                         dumps(data),
                         row["id"],
                     ),
@@ -195,6 +243,8 @@ class ActionEvents:
         ):
             return
         with self.mind.engine.db.connect(write=True) as conn:
+            from . import compat
+            current = compat.stamp(self.mind, conn)
             for d in view["desires"]:
                 if d["status"] != "wanted" or d["expired"] or d["needs_review"]:
                     continue
@@ -214,20 +264,21 @@ class ActionEvents:
                     versions
                     and semantic
                     and verified_decision(receipt)
-                    and receipt.get("agent_version") != view["agent_version"]
+                    and receipt.get("compat")
+                    and not compat.holds(receipt["compat"], current)
                 ):
-                    # A wish decided under an earlier version is not ready any more, and nothing
-                    # would ever look at it again. Ask once what to do with it, per wish and
-                    # version, so it is confirmed or dropped rather than silently stranded.
+                    # A wish decided under a configuration that has since changed in what decides
+                    # behaviour is not ready any more. Ask once what to do with it, per wish and
+                    # configuration. A deployment that only moves agent_version asks nothing (K1-13).
                     self.emit(
                         conn,
                         "wish-review",
-                        [d["id"], "agent-version", view["agent_version"]],
+                        [d["id"], "compat", current["key"]],
                         {
                             "desire_id": d["id"],
                             "evidence_ids": [r["record_id"] for r in d["evidence"]],
                             "agent_version": view["agent_version"],
-                            "reason": "The decision behind this wish was made under an earlier version",
+                            "reason": "The decision behind this wish was made before " + compat.stale_reason(receipt["compat"], current),
                         },
                     )
 
@@ -277,12 +328,13 @@ class ActionEvents:
             from .plans import AutonomousPlans
             choices = [d for d in choices if AutonomousPlans(self.mind).linked_ready(conn, d)]
         if view.get("action_policy"):
-            choices = [
-                d
-                for d in choices
-                if verified_decision(d.get("decision_receipt", {}))
-                and (not semantic or d.get("decision_receipt", {}).get("agent_version") == view["agent_version"])
-            ]
+            with self.mind.engine.db.connect() as conn:
+                choices = [
+                    d
+                    for d in choices
+                    if verified_decision(d.get("decision_receipt", {}))
+                    and (not semantic or self.mind.decision_current(conn, d.get("decision_receipt", {})))
+                ]
         if not choices:
             return {"state": "waiting", "reason": "no-exploration-intent"}
         desire = min(choices, key=lambda d: (-d["strength"], d["created_at"], d["id"]))

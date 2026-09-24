@@ -249,6 +249,59 @@ def test_pause_invalidates_running_worker(env):
     plans.manage({"command_id": "pause", "action": "pause", "id": current["id"], "expected_revision": current["revision"], "reason": "Owner needs the computer", "evidence_ids": [initial]})
     assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "interrupt"
 
+def test_owner_message_does_not_interrupt_a_running_step(env):
+    """N7: a new message from the owner reaches Kin; it does not end her running step."""
+    mind, plans, source, clock, initial = env
+    decide(env, create(env))
+    claimed = plans.claim("create", "worker")
+    MemoryContinuity(mind).ingest({"id": "owner-interjects", "kind": "owner-message", "text": "By the way", "at": mind.clock()})
+    assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "renewed"
+    verified = source("verified-clock", authority="operation")
+    run = plans.settle(claimed["run"]["id"], "worker", 1, state="completed", result={"verified": True, "source_id": verified})
+    assert run["state"] == "completed"
+
+def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
+    """N10, plan side: the router released the lock; the task comes back as Kin's plan at her time."""
+    from kin_mind.plans import local_time
+    mind, plans, source, clock, initial = env
+    MemoryContinuity(mind).ingest({"id": "wechat:task-1", "kind": "owner-message", "text": "Sort my photos", "at": mind.clock()})
+    later = (clock[0] + timedelta(hours=3)).isoformat()
+    request = {"task_id": "task-1", "goal": "Sort the photos", "reason": "After dinner", "not_before": later, "input_ids": ["wechat:task-1"]}
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    plan = plans.read(created["planId"])["plans"][0]
+    assert plan["steps"][0]["owner_request_id"] == "task-1" and plan["steps"][0]["actor"] == "contact"
+    assert plan["next_review_at"] == local_time(later)
+    assert plans.defer_owner_task(request) == created
+    unknown = plans.defer_owner_task({**request, "task_id": "task-2", "input_ids": ["wechat:never-seen"]})
+    assert unknown == {"state": "needs-kin", "reason": "owner-source-unavailable"}
+    past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
+    assert past["state"] == "needs-kin"
+    # The router's own call (WS3 plan-deferral): the task text as `request`, its input ids as evidence.
+    MemoryContinuity(mind).ingest({"id": "wechat:task-4", "kind": "owner-message", "text": "Print the tickets", "at": mind.clock()})
+    routed = plans.defer_owner_task({"task_id": "task-4", "request": "Print the tickets", "reason": "Tomorrow morning",
+                                     "not_before": later, "evidence_ids": ["wechat:task-4"]})
+    assert routed["state"] == "created" and routed["plan_id"] == routed["planId"]
+
+def test_a_review_retires_the_queued_reviews_it_answered(env):
+    """K2-04: reviews of a plan queued before a review read it are answered by that review;
+    those not yet started are retired instead of paid for again. A started one is left alone."""
+    from kin_mind.appraisal import Appraisals
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    actions = ActionEvents(mind)
+    Appraisals(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        first = plans._emit_review(conn, actions, plan, [plan["id"], "a"], "test", "planning-v1")
+        second = plans._emit_review(conn, actions, plan, [plan["id"], "b"], "test", "planning-v1")
+        conn.execute("UPDATE mind_action_events SET data=json_set(data,'$.job_id','job-running') WHERE id=?", (second,))
+        conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES('job-running',?,'running',0,'{}')", (mind.scope.key(),))
+    clock[0] += timedelta(seconds=5)
+    with mind.engine.db.connect(write=True) as conn:
+        assert plans.retire_answered_reviews(conn, [plan["id"]], before=mind.clock(), answered_by="appraise_x") == [first]
+        states = dict(conn.execute("SELECT id,state FROM mind_action_events WHERE kind='plan-review'").fetchall())
+    assert states == {first: "superseded", second: "pending"}
+
 def test_waiting_plan_rechecks_new_evidence_before_its_distant_review(env):
     mind, plans, source, clock, initial = env
     p=decide(env, create(env), 'wait', next_review_at='2028-01-01T09:00:00+08:00')
@@ -338,3 +391,123 @@ def test_plan_explanations_are_not_limited_to_twelve_items(env):
     explanations = ['Context explanation ' + str(i) for i in range(20)]
     plan = decide(env, create(env), conditions_met=explanations)
     assert plan['steps'][0]['decision']['conditions_met'] == explanations
+
+
+def test_an_expired_run_is_taken_back_at_the_next_claim(env):
+    """K2-01: a creation whose host vanished no longer reserves the executor until a lucky restart;
+    the next claim takes it back, and the old executor's late answer is refused."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    assert plans.claim("create", "creator-2") == {"state": "waiting", "reason": "executor-reserved", "run_id": run["id"]}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=? WHERE id=?", (0, run["id"]))
+    assert plans.claim("create", "creator-2")["state"] == "waiting"  # the step now needs Kin's new decision
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and step["receipts"][-1]["reason"] == "lease-expired"
+    with pytest.raises(Conflict):
+        plans.renew(run["id"], "creator-1", run["fence"])
+    with pytest.raises(Conflict):
+        plans.settle(run["id"], "creator-1", run["fence"], state="interrupted", result={})
+
+
+def test_the_host_reason_for_a_stop_reaches_the_plan(env):
+    """K2-02: plan-interrupt carries the host's static reason into the step's receipts."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    settled = plans.settle(run["id"], "creator-1", run["fence"], state="interrupted",
+                           result={"checkpoint_retained": True, "reason": "creation-artifact-invalid"})
+    assert settled["result"]["reason"] == "creation-artifact-invalid"
+    assert plans.read(plan["id"])["plans"][0]["steps"][0]["receipts"][-1]["reason"] == "creation-artifact-invalid"
+
+
+def test_a_revised_step_keeps_its_wish_and_the_cursor_counts_the_real_page(env):
+    """K2-05: revising a plan keeps the wish its step carries; K2-07: the cursor follows the
+    page size the query used."""
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    with mind.engine.db.connect(write=True) as conn:
+        stored = plans.get(conn, plan["id"])
+        stored["steps"][0]["desire_id"] = "desire-linked"
+        stored["revision"] += 1
+        plans._save(conn, stored, "link")
+    revised = plans.manage({"command_id": "revise", "id": plan["id"], "expected_revision": stored["revision"], "action": "update",
+                            "reason": "Sharper completion", "evidence_ids": [initial],
+                            "steps": [{"id": "make", "actor": "create", "goal": "Make the clock", "completion": "A verified SVG with hands is saved"}]})
+    assert revised["steps"][0]["desire_id"] == "desire-linked"
+    for index in range(3):
+        create(env, key="more-" + str(index))
+    page = plans.read(limit=500)
+    assert len(page["plans"]) == 4 and page["next_cursor"] is None
+    first = plans.read(limit=2)
+    assert first["next_cursor"] == 2 and len(plans.read(cursor=2, limit=2)["plans"]) == 2
+
+
+@pytest.mark.parametrize("open_questions,step_state", [([], "completed"), (["Which year was it built?"], "waiting")])
+def test_an_exploration_with_open_questions_leaves_its_step_to_kin(env, tmp_path, open_questions, step_state):
+    """K2-10: a finished run completes its step only when nothing is left open; otherwise the
+    step waits with the questions in its receipt and Kin decides at the next review."""
+    from kin_mind.exploration import Explorations
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+    def runner(executable, topic, directory, **kwargs):
+        return {"state": "complete", "partial": False, "attempt": 1,
+                "result": {"summary": "Found the clock's maker", "findings": ["A sourced finding"],
+                           "sources": [{"url": "memory://" + initial, "title": "Owner note"}],
+                           "open_questions": open_questions, "suggested_share": None}}
+    result = Explorations(mind).run("codex", str(tmp_path / "explore"), "planning-v1", runner=runner)
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == step_state
+    assert step["receipts"][-1].get("open_questions", []) == open_questions
+
+def test_a_completed_plan_is_read_for_its_wish_once_and_then_left_out(env):
+    """K2-21: an abandon that ends the plan still settles its wish; afterwards the completed plan
+    is found by index only while flagged, so completed plans are not read on every review."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="contact"))
+    plans.sync_wishes()
+    plan = decide(env, plans.read(plan["id"])["plans"][0], "abandon")
+    assert plan["status"] == "completed" and plan["wish_sync"] == "pending"
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+        stored = json.loads(conn.execute("SELECT data FROM mind_plans WHERE id=?", (plan["id"],)).fetchone()[0])
+        query = conn.execute("EXPLAIN QUERY PLAN SELECT data FROM mind_plans WHERE scope=? AND status='completed' "
+                             "AND json_extract(data,'$.wish_sync')='pending'", (plans.scope,)).fetchall()
+    assert wish["status"] == "abandoned" and "wish_sync" not in stored
+    assert "mind_plan_wish_sync" in " ".join(str(r[-1]) for r in query)
+    assert plans.sync_wishes() == []
+
+
+def test_a_pass_over_many_steps_loads_the_mind_state_once(env, monkeypatch):
+    """K2-21: claim reads the state once for all its steps, not once per step."""
+    mind, plans, source, clock, initial = env
+    for index in range(3):
+        create(env, actor="explore", key="idea-" + str(index))
+    loads = []
+    original = type(mind)._load
+    monkeypatch.setattr(type(mind), "_load", lambda self, conn: loads.append(1) or original(self, conn))
+    assert plans.claim("explore", "worker")["state"] == "waiting"
+    assert len(loads) <= 1
+
+
+def test_a_deployment_leaves_decided_steps_ready_and_wakes_no_plan(env):
+    """T-03 (K1-13, K2-04): moving agent_version keeps a decided step claimable and queues no
+    per-plan review; only a change of what decides behaviour asks again."""
+    mind, plans, source, clock, initial = env
+    actions = ActionEvents(mind)
+    first = decide(env, create(env, actor="explore", key="deploy-a"))
+    second = decide(env, create(env, actor="explore", key="deploy-b"))
+    plans.tick(actions)
+    with mind.engine.db.connect(write=True) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0]
+        state = mind._load(conn)
+        state["agent_version"] = "planning-v2"
+        mind._save(conn, state)
+    assert plans.tick(actions) == []
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0] == before
+    reasons = {p["id"]: p["steps"][0]["waiting_reason"] for p in plans.read()["plans"]}
+    assert reasons[first["id"]] is None and reasons[second["id"]] is None

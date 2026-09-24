@@ -778,7 +778,7 @@ export class MobileRouter {
       }
     } else this.state.actual=runtime;
     if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
-    if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==this.profiles.chat.model)return {outcome:{route:'deferred',reason:'deepseek-not-verified'}};
+    // A proactive contact goes out on the current tier's model, as any turn does (AD1-16).
     record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
     record.plannedTransition=this.state.transition?.id??null;
     this.reservations.set(input.id,{profile:targetProfile,at:this.now()});

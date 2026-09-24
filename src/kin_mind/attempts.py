@@ -133,7 +133,7 @@ def record_call(provider, tool, *, purpose=None, outcome, model=None, request_id
 
 def failure_receipt(call, **extra):
     """The queue row's receipt shape, built from a call record. Kept for operators."""
-    return {"provider": "deepseek", "reasoning": "high", **{k: call[k] for k in
+    return {**{k: call[k] for k in
             ("purpose", "model", "request_id", "elapsed_ms", "usage", "usage_status", "outcome")}, **extra}
 
 
@@ -185,7 +185,10 @@ def record(engine, scope, entry, *, placeholder=False):
     if not entry.get("attempt_token"):
         return None
     with engine.db.connect(write=True) as conn:
-        conn.executescript(LEDGER_SCHEMA)
+        # Statement by statement: executescript would commit this transaction first, and the
+        # ordinal read and the insert below would no longer be one atomic step (K2-17).
+        for statement in filter(None, (part.strip() for part in LEDGER_SCHEMA.split(";"))):
+            conn.execute(statement)
         ordinal = conn.execute(
             "SELECT COUNT(*) FROM mind_appraisal_attempts WHERE scope=? AND appraisal_id=?",
             (scope, entry["appraisal_id"])).fetchone()[0] + 1

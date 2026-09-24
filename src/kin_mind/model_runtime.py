@@ -38,7 +38,9 @@ def request_client(provider, timeout, purpose):
         try:
             yield client
         except httpx.TimeoutException:
-            provider.failure_receipt = {"provider": "deepseek", "model": "deepseek-flash", "reasoning": "high",
+            # What this provider was asked to use, not a fixed label (K2-06).
+            provider.failure_receipt = {"provider": "deepseek", "model": getattr(provider, "model", None),
+                                        "reasoning": getattr(provider, "reasoning", None),
                                         "purpose": purpose, "usage": None, "usage_status": "unknown", "outcome": "timeout"}
             if hasattr(provider, "engine"):
                 provider.engine.db.metric("model_timeout", 1, provider.failure_receipt)

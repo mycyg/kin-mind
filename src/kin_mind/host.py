@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from eventmem.core import Engine
@@ -53,7 +54,10 @@ def dispatch(config, action, request):
     # holds. Any other action only fills a missing value.
     sync_capacity(engine, config, startup=action == "recover")
     mind = Mind(engine, Scope.model_validate(config["scope"]))
-    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory", "procedure-trial"}:
+    if config.get("contact_policy_file"):
+        # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
+        mind.register_contact_policy(config["contact_policy_file"])
+    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory"}:
         from .plans import AutonomousPlans
         from .procedures import Procedures
         plans = AutonomousPlans(mind)
@@ -63,13 +67,21 @@ def dispatch(config, action, request):
             return plans.manage(request)
         if action == "plan-migrate":
             return plans.migrate_desires()
+        if action == "plan-deferral":
+            # The router's deferral pass (WS3) hands over a task Kin chose to do later (N10).
+            return plans.defer_owner_task(request)
         if action == "plan-renew":
             return plans.renew(**request)
         if action == "plan-recover":
             return plans.recover(**request)
         if action == "plan-interrupt":
+            # The host's static reason for stopping goes into the plan's receipt, so Kin sees why
+            # a step stopped instead of one generic phrase (K2-02). Never free text.
+            reason = request.get("reason")
+            if not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", reason):
+                reason = "executor-stopped-before-settlement"
             return plans.settle(request["run_id"], request["owner"], request["fence"], state="interrupted",
-                result={"checkpoint_retained": True, "reason": "executor-stopped-before-settlement"})
+                result={"checkpoint_retained": True, "reason": reason})
         if action == "plan-result":
             from .creation import accept_result
             return accept_result(mind, config, request)
@@ -83,17 +95,13 @@ def dispatch(config, action, request):
             return result
         if action == "procedure-memory":
             return Procedures(mind).read(**request)
-        if action == "procedure-trial":
-            return Procedures(mind).record_trial(**request)
         raise ValueError("Unknown autonomy operation")
     session_context = None
     observation_file = config.get("session_observation_file")
     if observation_file and Path(observation_file).exists():
         session_context = json.loads(Path(observation_file).read_text())
-    from .codex_executor import exploration_capabilities, resolve_computer_exploration
-    capability_computer = resolve_computer_exploration(config)
-    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(
-        config, computer_override=capability_computer),
+    from .codex_executor import exploration_capabilities
+    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(config),
                       session_context=session_context)
     explorer = Explorations(mind)
     cadence = ExplorationCadence(mind)
@@ -158,11 +166,8 @@ def dispatch(config, action, request):
     if action == "session-review":
         if not config.get("adaptive_sessions") or not session_context:
             return {"state": "disabled"}
-        source = engine.receive(SourceInput(namespace="kin-session-maintenance", key=request["id"],
-            session=config["session_id"], scope=mind.scope, authority="operation", kind="observation", extract=False,
-            text="宿主请求检查当前原生会话。依据 session_context 判断压缩与接续；此事件不是用户消息，也不改变情绪和愿望。",
-            metadata={"session_snapshot_id": session_context["id"], "maintenance_only": True}))
-        return jobs.enqueue([source["id"]], config["agent_version"], origin="reflection", stimulus="session-maintenance")
+        # The observed snapshot is the stimulus; nothing is written into memory for a review.
+        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"])
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":
@@ -172,25 +177,6 @@ def dispatch(config, action, request):
     if action == "configure-model-capacity":
         from .model_runtime import configure_capacity
         return configure_capacity(engine, request["limit"])
-    if action == "reply-regenerate":
-        from .reply_review import ReplyReviews
-        provider = DeepSeek.from_engine(engine)
-        provider.timeout = 120
-        with declared("foreground", action):
-            return ReplyReviews(memory.sharing).regenerate(request, provider)
-    if action == "share-preflight-group":
-        from .reply_review import ReplyReviews
-        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
-        if provider:
-            provider.timeout = 120
-        with declared("foreground", action):
-            return ReplyReviews(memory.sharing).preflight(request, provider)
-    if action == "share-preflight":
-        provider = DeepSeek.from_engine(engine) if request.get("allow_model") else None
-        if provider:
-            provider.timeout = 120
-        with declared("foreground", action):
-            return memory.sharing.preflight(request, provider)
     if action == "share-cancel":
         return memory.sharing.cancel(request["draft_id"])
     if action == "reply-references":
@@ -267,9 +253,6 @@ def dispatch(config, action, request):
         if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
             request['receipt_mode'] = True
         return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
-    if action == "memory-window":
-        window = Contexts(mind).window(config["session_id"])
-        return {"epoch":window["epoch"], "used":window["used"], "compact_requested":window["used"]>=10000 and not config.get("adaptive_sessions"), "automatic_background_exhausted":not memory.settings()["native_window_context"] and window["used"]>=12000}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":
@@ -400,15 +383,23 @@ def dispatch(config, action, request):
                 return response
             if not request.get("native_review_profile"):
                 raise RuntimeError("main-session-required")
-            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange)
+            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange,
+                                            used_tokens=request.get("native_review_used_tokens") or 0)
         else:
             return DeepSeek.from_engine(engine)
 
-    if action == "review":
+    def review_pause():
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
-        # The existing minute review queues work; the original host owns execution
-        # and waits for owner tasks. No extra model call is used for the clock.
+        from .history import COMPACTING, compacting
+        with engine.db.connect() as conn:
+            # Every commit is refused while history compaction owns the store (WS6, K3-14): the
+            # minute neither queues nor claims anything until it ends.
+            return {"state": "paused", "reason": COMPACTING} if compacting(conn) else None
+
+    def review_minute(run=None):
+        """The minute's review: queue what is due, run one appraisal when `run` is given, then
+        settle the wishes it decided. No extra model call is used for the clock."""
         actions.crossings()
         from .plans import AutonomousPlans
         plans = AutonomousPlans(mind)
@@ -421,8 +412,7 @@ def dispatch(config, action, request):
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
-        provider = review_provider()
-        result = jobs.run_one(provider, lane="action")
+        result = run() if run else None
         plans.sync_wishes()
         actions.drain(jobs)
         if cadence.status()["state"] == "ready":
@@ -435,6 +425,22 @@ def dispatch(config, action, request):
                 # reach the disk before the rename rather than after it.
                 atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
         return result
+
+    if action == "review-due":
+        # T-14: the resident worker does the minute's bookkeeping and says whether an appraisal is
+        # there to run; the host starts a model process only then. `tick: false` only asks.
+        paused = review_pause()
+        if paused:
+            return paused
+        if request.get("tick", True):
+            review_minute()
+        due = {lane: jobs.runnable(lane) for lane in ("action", "enrichment")}
+        return {"state": "due" if any(due.values()) else "idle", **due}
+    if action == "review":
+        paused = review_pause()
+        if paused:
+            return paused
+        return review_minute(lambda: jobs.run_one(review_provider(), lane="action"))
     if action == "daily":
         provider = review_provider()
         provider.native_attempt = ("daily:" + mind.clock()[:10], config["agent_version"])
@@ -553,6 +559,62 @@ APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "
                  "maintenance-tick", "vector-optimize", "history-compact", "history-restore")
 
 
+# The resident worker's actions (§5.7): short reads and writes on the store, no model call and
+# no long executor. Exploration, creation's completion review, memory preparation and every
+# request that may take a native review keep their own process, executor and lease.
+RESIDENT_ACTIONS = frozenset({
+    "reply-status", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
+    "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
+    "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review",
+    "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
+    "context-delivery-metrics", "configure-habits", "reply-choice", "review-due",
+})
+
+
+def _failure(error):
+    found = classify(error)
+    return {"error": type(error).__name__, "kind": found.kind, **({"code": found.code} if found.code else {})}
+
+
+def serve(config, stdin=None, stdout=None):
+    """The resident worker (§5.7): one request per line, `{id, action, args, timeoutMs}`, answered in
+    order as `{id, ok, result|error}`. Requests run one at a time; the caller owns each timeout and
+    restarts this process when one runs over. Anything a request prints goes to stderr, so the
+    answer stream carries frames only."""
+    import sys
+
+    stdin, out = stdin or sys.stdin, stdout or sys.stdout
+    previous, sys.stdout = sys.stdout, sys.stderr
+    try:
+        while True:
+            line = stdin.readline()
+            if not line:
+                return None
+            if not line.strip():
+                continue
+            try:
+                frame = json.loads(line)
+                identifier, action = frame["id"], frame["action"]
+                args = frame.get("args") or {}
+                if not isinstance(args, dict):
+                    raise TypeError("args")
+            except (ValueError, KeyError, TypeError):
+                reply = {"id": None, "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "invalid-frame"}}
+            else:
+                if action not in RESIDENT_ACTIONS:
+                    reply = {"id": identifier, "ok": False,
+                             "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
+                else:
+                    try:
+                        reply = {"id": identifier, "ok": True, "result": dispatch(config, action, args)}
+                    except Exception as error:  # noqa: BLE001 - one request's failure is its own answer
+                        reply = {"id": identifier, "ok": False, "error": _failure(error)}
+            out.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            out.flush()
+    finally:
+        sys.stdout = previous
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -569,6 +631,13 @@ def main():
         import sys
 
         config = load_config(args.config)
+        # The host's own directory: its state holds the runtime bundle and Kin's Codex home, which
+        # exploration uses unless the configuration names others (K2-15).
+        config.setdefault("host_root", str(Path(args.config).resolve().parent))
+        # The live contact policy sits beside the host's configuration unless it names another.
+        policy = Path(args.config).resolve().with_name("proactive-policy.json")
+        if "contact_policy_file" not in config and policy.exists():
+            config["contact_policy_file"] = str(policy)
         # Before the store opens and before the request is even read: the code this process
         # would run has to be the code the deployment points at. A refusal is a SystemExit,
         # which the handler below cannot turn into a result -- an ordinary exception here
@@ -579,6 +648,8 @@ def main():
         # never acted on: this process is running, so a broken interpreter cannot
         # hurt it, and refusing would remove the one path still able to report it.
         warn_interpreter(config.get("python"))
+        if args.action == "serve":
+            return serve(config)
         # An operator runs these from a terminal, with no request to pipe in.
         raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if args.action in {"review", "daily"} and config.get("main_session_review") else sys.stdin.read())
         request = json.loads(raw) if raw.strip() else {}
@@ -593,9 +664,7 @@ def main():
         # Caller sees an error category, never provider payloads or credentials.
         # Additive: the class stays the caller's contract, the taxonomy tells it
         # whether waiting can help. Static codes only, never the failing payload.
-        found = classify(error)
-        result = {"error": type(error).__name__, "kind": found.kind,
-                  **({"code": found.code} if found.code else {})}
+        result = _failure(error)
     print(json.dumps(result, ensure_ascii=False))
 
 

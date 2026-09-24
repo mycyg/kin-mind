@@ -19,14 +19,16 @@
  *   rewrites finished records, so the youngest-looking file in the outbox can be
  *   the oldest thing in it. A record that carries no usable time of its own has no
  *   age, and something with no age is never old enough to move.
- * - **Planning and moving are different functions.** `plan()` reads and returns;
- *   `apply()` is the only thing that touches a directory. The plan names every
- *   source and every destination, so the report is the thing that happens — and it
- *   can be read, disputed and thrown away before any of it does.
+ * - **This module plans and reports; it moves nothing.** `plan()` reads and returns.
+ *   The mover (`apply`) had no caller and is removed (AD2-13): the readers that would
+ *   have to look in the archive afterwards (the memory event journal's startup
+ *   recovery, work-review evidence) are not handed `{root, archive}`, so a moved
+ *   receipt would read as never written and its delivery be ingested again. A mover
+ *   comes back together with that wiring.
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import {createHash,randomBytes} from 'node:crypto';
+import {createHash} from 'node:crypto';
 import {readJsonFile} from './atomic-json.mjs';
 
 /** States that are never archived, whatever a caller configures. Each one names
@@ -96,13 +98,6 @@ const segments=file=>path.resolve(file).split(path.sep);
 // sibling merely named `..something` does not, and must not be mistaken for one.
 const escapes=rel=>rel===''||rel==='..'||rel.startsWith('..'+path.sep)||path.isAbsolute(rel);
 const within=(child,parent)=>{const rel=path.relative(parent,child);return rel===''||!escapes(rel);};
-
-function syncDirectory(directory) {
-  let fd;
-  try{fd=fs.openSync(directory,'r');fs.fsyncSync(fd);}
-  catch{/* Some filesystems refuse a directory fsync; the rename stays atomic. */}
-  finally{if(fd!==undefined)fs.closeSync(fd);}
-}
 
 /** True for a name this module will not consider under any configuration. */
 export function protectedName(name) {
@@ -519,10 +514,9 @@ const size=bytes=>bytes>=1048576?(bytes/1048576).toFixed(1)+' MB':bytes>=1024?(b
 
 /** The plan as something a person reads before deciding. Every move is named,
  * source and destination, in the order it would happen. */
-export function formatPlan(plan,{documents=null,limit=Infinity,applied=null}={}) {
+export function formatPlan(plan,{documents=null,limit=Infinity}={}) {
   const lines=[];
-  lines.push(applied?`State pruning — ${applied.moved.length} moved, ${applied.skipped.length} left alone`
-    :'State pruning plan — a dry run. Nothing below has moved.');
+  lines.push('State pruning plan — a dry run. Nothing below has moved.');
   lines.push(`Generated ${plan.at}; a record is old enough at ${plan.cutoff} (${Math.round(plan.olderThanMs/DAY)} days).`);
   lines.push('');
   lines.push('Family                       files      bytes    would move');
@@ -558,92 +552,12 @@ export function formatPlan(plan,{documents=null,limit=Infinity,applied=null}={})
     lines.push('Each keeps its own name, one directory over:');
     for(const family of plan.families)if(family.moving)lines.push(`  ${family.directory}\n    →  ${family.archivedDirectory}`);
   }
-  if(applied?.skipped.length) {
-    lines.push('');
-    lines.push('Left alone while applying:');
-    const counts={};
-    for(const skip of applied.skipped)counts[skip.reason]=(counts[skip.reason]??0)+1;
-    for(const [reason,count] of Object.entries(counts).sort((a,b)=>b[1]-a[1]))lines.push(`  ${count} ${reason}`);
-  }
   if(plan.warnings.length) {
     lines.push('');
     lines.push('Warnings:');
     for(const warning of plan.warnings)lines.push(`  - ${warning}`);
   }
   lines.push('');
-  lines.push(applied?'Nothing was deleted; every file above is at its archived path.'
-    :'Nothing has been moved. Only apply(plan,{dryRun:false}) moves anything, and it moves only what is listed above.');
+  lines.push('Nothing has been moved. This module has no mover until the readers look in the archive (AD2-13).');
   return lines.join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Applying: the only code here that changes a directory
-// ---------------------------------------------------------------------------
-
-/** Move one file to its archived path, or explain why it stayed.
- *
- * The source is read again and compared against what was planned, so a record
- * that changed between the report and the decision is left where it is: the
- * argument was had about bytes that no longer exist. An occupied archive slot is
- * never overwritten — that would be the one deletion this module does not do. */
-function moveOne(move) {
-  if(fs.existsSync(move.to))return {state:'skipped',reason:'archive-occupied'};
-  let bytes;
-  try{bytes=fs.readFileSync(move.from);}
-  catch(error){return {state:'skipped',reason:error.code==='ENOENT'?'source-gone':'source-unreadable'};}
-  if(digest(bytes)!==move.sha256)return {state:'skipped',reason:'changed-since-plan'};
-  fs.mkdirSync(path.dirname(move.to),{recursive:true,mode:0o700});
-  try{fs.renameSync(move.from,move.to);}
-  catch(error) {
-    if(error.code!=='EXDEV')throw error;
-    // A different filesystem cannot be renamed into. The bytes land whole under a
-    // name nothing reads, are checked against what was planned, and only then is
-    // the source let go: at no moment do fewer than one copy exist.
-    const staging=move.to+'.'+process.pid+'.'+randomBytes(8).toString('hex')+'.tmp';
-    const fd=fs.openSync(staging,'wx',0o600);
-    try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-    if(digest(fs.readFileSync(staging))!==move.sha256){fs.rmSync(staging,{force:true});return {state:'skipped',reason:'copy-mismatch'};}
-    fs.renameSync(staging,move.to);
-    syncDirectory(path.dirname(move.to));
-    fs.rmSync(move.from,{force:true});
-  }
-  syncDirectory(path.dirname(move.to));syncDirectory(path.dirname(move.from));
-  return {state:'moved'};
-}
-
-/** Carry out a plan. `dryRun` defaults to true, so a caller that has not decided
- * yet has decided nothing: the report comes back and the directories are as they
- * were. Only `{dryRun:false}` moves a file.
- *
- * The plan's own order is obeyed exactly, which is what makes "the record before
- * its receipt" hold at every interruption point rather than only at the end. */
-export function apply(plan,{dryRun=true}={}) {
-  const moved=[],skipped=[];
-  for(const move of plan.moves) {
-    if(dryRun){skipped.push({...move,reason:'dry-run'});continue;}
-    // A pair is only ever as good as its first half: if the record stayed, its
-    // receipt stays too, whatever the plan said a moment ago.
-    if(move.pairedWith&&!moved.some(done=>done.family===move.pairedWith.family&&done.name===move.pairedWith.name))
-      {skipped.push({...move,reason:'paired-record-did-not-move'});continue;}
-    // One file that cannot be moved is one file left where it is, never a pass
-    // that stops half way. The pairing guard above still holds either way: a
-    // receipt only ever follows a record that is already in `moved`.
-    let result;
-    try{result=moveOne(move);}
-    catch(error){result={state:'skipped',reason:error.code??'move-failed'};}
-    if(result.state==='moved')moved.push(move);else skipped.push({...move,reason:result.reason});
-  }
-  return {dryRun,moved,skipped,bytes:moved.reduce((total,move)=>total+move.bytes,0)};
-}
-
-/** Survey, plan, and report. The tick a host runs on a timer: with `dryRun` left
- * alone it reads the directories, writes the report and moves nothing, which is
- * how this ships and how it stays until somebody has read one. */
-export function prunePass({families=[],root,archive,references=[],now=Date.now(),olderThanMs=DEFAULT_AGE_MS,
-  limit=Infinity,dryRun=true,document=null,collections=[]}={}) {
-  const surveyed=survey(families,{root,archive});
-  const made=plan({families:surveyed,references,now,olderThanMs,limit});
-  const documents=document?documentPressure(document,{collections,references,now,olderThanMs}):null;
-  const applied=apply(made,{dryRun});
-  return {plan:made,documents,applied,report:formatPlan(made,{documents,applied:dryRun?null:applied})};
 }

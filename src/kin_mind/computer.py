@@ -20,8 +20,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from eventmem.core.models import now
 
-SECRET_NAME = re.compile(r"^(?:\.env(?:\..*)?|credentials?(?:\..*)?|auth\.json|secrets?(?:\..*)?|id_(?:rsa|ed25519)(?:\.pub)?|.*\.(?:pem|p12|keychain-db))$", re.IGNORECASE)
+SECRET_NAME = re.compile(r"^(?:\.env(?:\..*)?|credentials?(?:\..*)?|auth\.json|secrets?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?:\.pub)?|[._]netrc|local-token|embedding-token|.*\.(?:pem|p12|keychain|keychain-db))$", re.IGNORECASE)
 SECRET_DIRS = {".ssh", ".aws", ".azure", ".gnupg", ".codex", ".kimi-code", "keychains", "cookies", ".git", "node_modules"}
+# Exact authentication files known by where they live (K2-12). Only these files: the rest of
+# their directories stays inside the authorized roots, which are unchanged.
+SECRET_FILES = ((".docker", "config.json"), (".config", "gh", "hosts.yml"))
 SECRET_VALUE = re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|authorization|client[_-]?secret)\b[\s\"']*[:=][\s\"']*)([^\s\"',;}]+)")
 TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._~+/-]{12,})", re.IGNORECASE)
 # What the two rules above miss (E1-06), applied with them by `redact` as one rule set: a secret
@@ -75,7 +78,8 @@ class ComputerReader:
             root = Path(denied).expanduser().resolve()
             if path == root or root in path.parents:
                 raise ValueError("host-execution-material-excluded")
-        if any(p.lower() in SECRET_DIRS or SECRET_NAME.fullmatch(p) for p in path.parts):
+        if (any(p.lower() in SECRET_DIRS or SECRET_NAME.fullmatch(p) for p in path.parts)
+                or any(tuple(p.lower() for p in path.parts[-len(f):]) == f for f in SECRET_FILES)):
             raise ValueError("credential-or-runtime-material-excluded")
         for excluded in self.config.get("exclude_roots", []):
             root = Path(excluded).expanduser().resolve()

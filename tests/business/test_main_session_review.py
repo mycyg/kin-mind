@@ -48,6 +48,18 @@ def test_preemption_records_unknown_usage_without_exhausting_repairs(setup):
     assert calls[0]['outcome']=='owner-preempted'
 
 
+def test_a_deferred_fork_is_a_wait_that_keeps_what_it_used(setup):
+    """WS4: a fork that timed out is deferred, never failed or retried in the main thread; its
+    receipt's usage and fork thread are recorded (PROBE)."""
+    mind,_,_=setup
+    spent={'model':'gpt-6-sol','native_turn_id':'turn-9','fork_thread_id':'fork-3','usage':{'input_tokens':1200,'output_tokens':40}}
+    p=native_provider(mind,lambda request:{'state':'waiting','reason':'fork-timeout','model_invoked':True,'receipt':spent})
+    with attempts.collect(p) as calls:
+        with pytest.raises(ModelAdmissionWait,match='fork-timeout'):p._native('submit_appraisal',{},'',{},10)
+    assert calls[0]['outcome']=='fork-timeout' and calls[0]['request_id']=='turn-9'
+    assert calls[0]['usage_status']!='unknown' and calls[0]['detail']=={'fork_thread_id':'fork-3'}
+
+
 def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
     from kin_mind.continuity import ContinuityConfig
     from kin_mind.memory import MemoryContinuity
@@ -174,22 +186,45 @@ def test_checkpoint_identity_ignores_its_allowance(setup):
     assert 'budgetPlan' not in small['payload'] and small['payload'] == large['payload']
 
 
-def test_native_failure_is_not_replayed_by_the_appraisal_queue(setup):
+def test_a_failed_native_assessment_waits_and_is_tried_again(setup):
+    """K1-01: a main-session assessment that did not complete ran in an ephemeral read-only fork.
+    It is retried after a backoff, not set aside at the first failure."""
     mind, source, _ = setup
     calls=[]
     def exchange(request):
         calls.append(request)
         return {'state':'failed','receipt':{}}
-    jobs=Appraisals(mind);jobs.enqueue([source('native-failure')],'synthetic-v1')
+    jobs=Appraisals(mind);job=jobs.enqueue([source('native-failure')],'synthetic-v1')
     result=jobs.run_one(native_provider(mind,exchange))
-    assert result['state']=='needs-repair' and len(calls)==1
+    assert result['state']=='pending' and result['transient_failures']==1 and len(calls)==1
     assert jobs.run_one(native_provider(mind,exchange))['state']=='idle'
-    assert len(calls)==1
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?",(job['id'],))
+    assert jobs.run_one(native_provider(mind,exchange))['state']=='pending' and len(calls)==2
 
 
-def test_provider_outage_gets_only_three_queue_retries(setup):
+
+def test_a_fork_without_a_finished_turn_waits_uncharged(setup):
+    """PROBE: with no finished turn to fork from, the assessment cannot run now. It waits and is
+    asked again; it is not a failure, not charged, and not sent into the main thread instead."""
+    mind, source, _ = setup
+    calls = []
+    def exchange(request):
+        calls.append(request)
+        return {'state': 'failed', 'reason': 'no-completed-turn', 'receipt': {}}
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('fork-too-early')], 'synthetic-v1')
+    result = jobs.run_one(native_provider(mind, exchange))
+    assert result['state'] != 'needs-repair' and len(calls) == 1
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    assert row['state'] == 'pending' and row['attempts'] == 0
+    assert not json.loads(row['data']).get('transient_failures')
+
+def test_provider_outage_is_retried_for_about_two_hours(setup):
+    """K1-08: eight retries at 1, 2, 4, 8, 16, 30, 30 and 30 minutes, then the row is set aside."""
     mind,_,_=setup; jobs=Appraisals(mind); data={'error':'deepseek-http-503'}
-    assert [jobs._transient_failure(data) for _ in range(4)]==['pending','pending','pending','needs-repair']
+    assert [jobs._transient_failure(data) for _ in range(9)]==['pending']*8+['needs-repair']
 
 
 def test_distinct_reflections_can_support_growth_but_rereading_one_cannot(setup):
@@ -224,3 +259,194 @@ def test_generated_internal_envelopes_do_not_become_public_memory():
     assert not is_public_dialogue({"kind": "assistant-message", "text": "</｜｜DSML｜｜ invoke>"})
     assert is_public_dialogue({"kind": "owner-message", "text": body})
     assert is_public_dialogue({"kind": "assistant-message", "text": "解释 `kin-context:context:id` 是什么。"})
+
+
+def test_kin_chooses_when_to_think_again_within_a_day(setup):
+    """N8: the quiet review is Kin's choice, ten minutes to a day; one past either end is taken
+    to that end, never a failed assessment, and the stored 20..120 range no longer narrows it."""
+    from datetime import timedelta
+    from kin_mind.appraisal import SYSTEM
+    from kin_mind.memory import MemoryContinuity
+    from kin_mind.state import timestamp
+    mind, _, _ = setup
+    assert [Appraisal(reason='r', next_review_minutes=m).next_review_minutes for m in (5, 600, 3000)] == [10, 600, 1440]
+    assert '10到1440' in SYSTEM
+    memory = MemoryContinuity(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        memory.commit_action(conn, [], 'event-n8', 600, {})
+        row = conn.execute('SELECT next_review FROM mind_action_schedule WHERE scope=?', (mind.scope.key(),)).fetchone()
+    assert timestamp(row['next_review']) - timestamp(mind.clock()) >= timedelta(minutes=599)
+
+
+def test_contact_waits_reach_three_days_and_are_clamped_not_refused():
+    """N9: a wait of up to 72 hours is kept; one past either end is taken to that end."""
+    from kin_mind.appraisal import WishUpdate
+    from kin_mind.state import ContactDecision
+    assert ContactDecision(action='wait', reason='r', condition='time', retry_after_seconds=10**6).retry_after_seconds == 259200
+    update = lambda seconds: WishUpdate(desire_id='d', action='wait', reason='r', wait_condition='time',
+                                        retry_after_seconds=seconds).retry_after_seconds
+    assert [update(100), update(172800), update(10**7)] == [300, 172800, 259200]
+
+
+def idle_world(setup):
+    """Operational lanes with an action policy; the bootstrap review is taken as done."""
+    from datetime import timedelta
+    from kin_mind.actions import ActionEvents
+    from kin_mind.memory import MemoryContinuity
+    mind, source, clock = setup
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True, "semantic": True, "idle": True, "operational_lanes": True})
+    actions = ActionEvents(mind)
+    actions.configure({"command_id": "policy", "agent_version": "synthetic-v1", "expected_revision": mind.read()["revision"],
+                       "evidence_ids": [source("policy")], "reason": "The owner allowed autonomous review"})
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_action_events SET state='complete' WHERE kind='bootstrap'")
+    clock[0] += timedelta(minutes=30)
+    assert memory.queue_idle(actions)
+    return mind, memory, actions, clock
+
+
+def test_an_idle_review_set_aside_closes_its_event_and_schedules_the_next(setup):
+    """K4-19 and K1-01: a job that ends needs-repair closes its event instead of holding a drain
+    slot as `queued`, and the idle clock moves on however the idle review ended."""
+    from kin_mind.state import timestamp
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    with mind.engine.db.connect(write=True) as conn:
+        event = conn.execute("SELECT id,data FROM mind_action_events WHERE kind='idle-review'").fetchone()
+        job_id = json.loads(event["data"])["job_id"]
+        conn.execute("UPDATE mind_appraisals SET state='needs-repair' WHERE id=?", (job_id,))
+    actions.drain(jobs)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_action_events WHERE id=?", (event["id"],)).fetchone()[0] == "needs-review"
+        data = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (job_id,)).fetchone()[0])
+    jobs._reschedule_idle(data, memory.settings())
+    assert memory.due() is None
+    with mind.engine.db.connect() as conn:
+        after = conn.execute("SELECT next_review FROM mind_action_schedule WHERE scope=?", (mind.scope.key(),)).fetchone()[0]
+    assert timestamp(after) > timestamp(mind.clock())
+
+
+def test_a_timer_only_review_makes_no_enrichment_call(setup):
+    """K1-07: an idle review whose only evidence is the host's own timer event has nothing to
+    organise, so no enrichment appraisal is queued after it."""
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    reviewer = FakeReviewer(Appraisal(reason="Nothing new, rest a while", next_review_minutes=240))
+    assert jobs.run_one(reviewer, lane="action")["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_appraisals WHERE id LIKE 'enrich_%'").fetchone()[0] == 0
+    assert memory.due() is None
+
+
+def test_the_assessment_budget_leaves_out_what_the_main_session_holds(setup):
+    mind, _, _ = setup
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('models',?)",
+                     (json.dumps({"summary": {"endpoint": "https://api.deepseek.com", "api_key_env": "SYNTHETIC_KEY"}}),))
+    profile = {'model':'gpt-6-astra','modelProvider':'custom','reasoningEffort':'medium','fastMode':'off',
+               'modelContextWindow':128000,'outputReserve':16000,'toolReserve':8000}
+    full = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r)
+    held = NativeReview.from_engine(mind.engine, profile=profile, exchange=lambda r: r, used_tokens=60000)
+    assert full.input_budget == 104000 and held.input_budget == 44000
+
+
+def test_the_assessment_frame_keeps_contract_context_and_schema_apart(setup):
+    """The request for `_kin/assess`: the standing contract (instructions and fixed definitions),
+    the dynamic context, and the schema object, which is never pasted into the input."""
+    mind, source, _ = setup
+    frames = []
+    def exchange(request):
+        frames.append(request)
+        return {'state':'complete','result':{'reason':'Nothing new.'},
+                'receipt':{'native_turn_id':'turn-1','native_session_id':'same-main','model':'gpt-6-astra','provider':'custom','reasoning':'medium','usage':{}}}
+    jobs = Appraisals(mind)
+    jobs.enqueue([source('frame')], 'synthetic-v1')
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
+    frame = frames[0]
+    assert isinstance(frame['schema'], dict) and frame['schema'].get('properties')
+    assert '维度定义' in frame['contract'] and 'definitions' not in frame['context']
+    assert 'next_review_minutes' not in frame['contract'].split('维度定义')[1]
+    assert frame['system'] == frame['contract']
+
+
+
+def test_an_idle_assessment_is_told_it_may_start_something(setup):
+    """K1-05: the contract no longer claims the host raises longing over time, the closing line
+    invites a new thought instead of "leave it empty and move the review", and the install-time
+    provider label is not shown as the model deciding."""
+    mind, source, _ = setup
+    frames = []
+    def exchange(request):
+        frames.append(request)
+        return {'state':'complete','result':{'reason':'Nothing new.'},
+                'receipt':{'native_turn_id':'turn-1','native_session_id':'same-main','model':'gpt-6-astra','provider':'custom','reasoning':'medium','usage':{}}}
+    jobs = Appraisals(mind)
+    jobs.enqueue([source('idle')], 'synthetic-v1')
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
+    contract = frames[0]['contract']
+    assert '自主起念的机会' in contract and '更新复核时间即可' not in contract
+    assert '确定性公式' not in contract and '不会让想念或主动随时间自己上升' in contract
+    policy = frames[0]['context'].get('state', {}).get('action_policy') or {}
+    assert 'provider' not in policy and 'reasoning' not in policy
+
+def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
+    """K1-16: an id the request did not supply is accepted when the turn's tool receipts show a
+    completed read and the record already existed; without a tool read it is not."""
+    mind, source, _ = setup
+    earlier = source('read-by-tool')
+    jobs = Appraisals(mind)
+    class Proposal:
+        def model_dump(self):
+            return {'understanding': {'evidence_ids': [earlier]}}
+    from datetime import datetime, timedelta, timezone
+    started = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    with_tools = {'native_receipt': {'tool_calls': [{'name': 'read_memory', 'ok': True}]}}
+    fetched = jobs._tool_fetched(Proposal(), with_tools, {}, started)
+    assert any(ref['source_id'] == earlier for ref in fetched.values())
+    assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': []}}, {}, started) == {}
+    before = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    assert jobs._tool_fetched(Proposal(), with_tools, {}, before) == {}
+
+
+def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):
+    """K1-11: the latest decision's runtime comes from its one schedule row, not a sort of every appraisal."""
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    assert jobs.run_one(FakeReviewer(Appraisal(reason="Rest a while", next_review_minutes=240)), lane="action")["state"] == "complete"
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_action_schedule SET data=json_set(data,'$.receipt.model','schedule-marker') WHERE scope=?",
+                     (mind.scope.key(),))
+        recent = conn.execute("EXPLAIN QUERY PLAN SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8",
+                              (mind.scope.key(),)).fetchall()
+    assert mind.read()["decision_runtime"]["model"] == "schedule-marker"
+    assert "mind_action_event_recent" in " ".join(str(r[-1]) for r in recent)
+
+
+def test_sixty_quiet_minutes_hold_as_many_assessments_as_kin_asked_for(setup):
+    """T-02: an hour of ticks with no owner message assesses only when Kin's own next review comes
+    due (never more often than the ten-minute floor), each with a bounded input."""
+    from datetime import timedelta
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    sizes = []
+
+    class Measuring(FakeReviewer):
+        def appraise(self, context):
+            sizes.append(len(json.dumps(context, ensure_ascii=False, default=str)))
+            return super().appraise(context)
+
+    reviewer = Measuring(Appraisal(reason="Nothing new; look again in a while", next_review_minutes=10))
+    for _minute in range(60):
+        memory.queue_idle(actions)
+        actions.drain(jobs)
+        jobs.run_one(reviewer, lane="action")
+        clock[0] += timedelta(minutes=1)
+    assert 1 <= reviewer.calls <= 7
+    assert max(sizes) < 40000
