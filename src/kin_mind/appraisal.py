@@ -45,26 +45,33 @@ APPRAISAL_INPUT_BUDGET = 64000
 # session is not loaded. Asked again later, never counted as a failure (PROBE).
 FORK_UNAVAILABLE = re.compile(r"no-completed-turn|session-not-loaded|no-rollout|rollout|native-runtime")
 FORK_STAGES = {"not-started", "started", "unknown"}
+# The host's word for a fork that did not complete (boundaries.runForkAssessment, WS4).
+FORK_ANSWER = re.compile(r"fork-(?:failed|timeout|interrupted)")
 
 
 def fork_stage(answer):
     """How far an assessment fork got (CR2-INT-06): `not-started` (no fork was made and no model
     ran: the session is not loaded, or no turn has completed yet to fork from), `started` or
-    `unknown`. The owned ACP says so (`stage`, WS1) and the host passes it on unchanged (WS4). From
-    a host that does not, the older signs decide: a failed fork whose reason says none could be
-    made and that names no fork turn has not started; `started`, or a spent receipt, has. Any
-    other answer is not a fork's and gets None."""
+    `unknown`. The owned ACP says so (`stage`, WS1) and the host passes it on unchanged (WS4), with
+    the ACP's own reason as `fork_reason` and its error code as `detail`; the host's own deadline
+    is `unknown`. When the ACP named neither its stage nor its turn, the host claims nothing and
+    the older signs decide: a fork whose reasons say none could be made, and that names no fork
+    turn or thread, has not started; one a host says started, has; any other fork that failed,
+    timed out or was interrupted cannot be placed and is `unknown`, so it still counts. An answer
+    that is not a fork's (a freeze, the owner's turn, an ACP that could not be asked) gets None."""
     stage = answer.get("stage")
     if stage in FORK_STAGES:
         return stage
     spent = answer.get("receipt") or {}
     reason = str(answer.get("reason") or "")
-    said = reason + " " + str(answer.get("detail") or "")
+    said = " ".join(str(answer.get(key) or "") for key in ("reason", "fork_reason", "detail"))
     if ((answer.get("state") == "failed" or reason.startswith("fork-")) and FORK_UNAVAILABLE.search(said)
             and not spent.get("native_turn_id") and not spent.get("fork_thread_id")):
         return "not-started"
     if answer.get("started") is True or (answer.get("model_invoked") is True and spent and reason.startswith("fork-")):
         return "started"
+    if answer.get("state") == "waiting" and FORK_ANSWER.fullmatch(reason) and answer.get("started") is not False:
+        return "unknown"
     return None
 # How far ahead the next quiet review may be asked for. The request states the range in the
 # prompt and in the schema, and the host clamps to the same numbers; there is no separate night

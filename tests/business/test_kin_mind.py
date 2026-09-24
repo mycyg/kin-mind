@@ -273,6 +273,40 @@ def test_a_transient_cancel_lets_the_same_wish_be_tried_again(setup):
     assert second["id"] != first["id"] and second["state"] == "drafting"
 
 
+def test_a_draft_that_never_started_only_waits_and_is_never_set_aside(setup):
+    """CR2-INT-06: a draft whose fork was never made ran no model (the host says model_invoked:
+    false, WS4). Its wish waits and is drafted again, five minutes later each time up to half an
+    hour. It is no drafting failure: however often it happens the wish is never set aside and no
+    review is asked for. A draft that did fail still counts."""
+    from kin_mind.state import CONTACT_WAIT_MIN_SECONDS, DRAFT_START_WAIT_MAX_SECONDS, timestamp
+    mind, source, clock = setup
+    wish(mind, source, "unmade", content="Tell her about the rain")
+
+    def raw():
+        with mind.engine.db.connect() as conn:
+            return next(iter(mind._load(conn)["desires"].values()))
+    waits = []
+    for _ in range(8):
+        attempt = mind.claim_contact(owner_epoch="owner-1")
+        assert attempt["state"] == "drafting"
+        mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-not-started",
+                            failure={"category": "model-unavailable", "stage": "contact-draft-model", "code": "fork-draft-failed",
+                                     "retry_condition": "backoff", "model_invoked": False})
+        desire = raw()
+        assert desire["status"] == "waiting" and desire["contact_wait"]["condition"] == "time"
+        assert not desire.get("contact_failures")
+        waits.append((timestamp(desire["contact_wait"]["retry_at"]) - timestamp(desire["contact_wait"]["since"])).total_seconds())
+        clock[0] += timedelta(seconds=waits[-1] + 1)
+        mind.reconsider_contacts(owner_epoch="owner-1")
+        assert raw()["status"] == "wanted"
+    assert waits == [min(DRAFT_START_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS * n) for n in range(1, 9)]
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='wish-review'").fetchone()[0] == 0
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-failed")
+    assert raw()["contact_failures"] == 1 and raw()["contact_start_waits"] == 8
+
+
 def test_the_reviews_of_one_tick_are_one_assessment(setup):
     """K1-06: internal reviews queued in the same tick are judged in a single assessment."""
     mind, source, _ = setup

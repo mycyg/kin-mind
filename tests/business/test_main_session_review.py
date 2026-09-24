@@ -85,25 +85,78 @@ def test_a_fork_that_keeps_failing_spends_the_bounded_retries_and_is_set_aside(s
     assert data['error']=='native-review-fork-failed'
 
 
+# The receipt the host builds for every fork answer (boundaries.forkReceipt): no turn, no thread.
+UNMADE = {'channel': 'fork', 'model': None, 'native_turn_id': None, 'fork_thread_id': None, 'usage': None, 'tool_calls': []}
 NEVER_STARTED = [
-    # The ACP names the stage (WS1) and the host passes it on (WS4).
-    {'state': 'waiting', 'reason': 'fork-failed', 'stage': 'not-started', 'detail': 'session-not-loaded', 'model_invoked': False,
-     'receipt': {'fork_thread_id': None, 'native_turn_id': None}},
-    # A host that keeps no stage and says started for every fork (review CR2-INT-06).
+    # The ACP names the stage (WS1); the host passes it on with its error code in `detail` and
+    # the ACP's own reason in `fork_reason`, and claims no model ran (WS4, h:abd70aa).
+    {'state': 'waiting', 'reason': 'fork-failed', 'stage': 'not-started', 'detail': 'no-completed-turn',
+     'fork_reason': 'no-completed-turn-in-history', 'model_invoked': False, 'started': False, 'receipt': UNMADE},
+    # The ACP named neither its stage nor its turn: the host claims nothing and the older signs decide.
+    {'state': 'waiting', 'reason': 'fork-failed', 'detail': 'session-not-loaded', 'model_invoked': None, 'started': None,
+     'receipt': UNMADE},
+    {'state': 'waiting', 'reason': 'fork-failed', 'fork_reason': 'no-completed-turn', 'model_invoked': None, 'started': None,
+     'receipt': UNMADE},
+    # A host that kept no stage and said started for every fork (review CR2-INT-06).
     {'state': 'waiting', 'reason': 'fork-failed', 'detail': 'no-completed-turn', 'model_invoked': True, 'started': True,
-     'receipt': {'fork_thread_id': None, 'native_turn_id': None, 'usage': None}},
+     'receipt': UNMADE},
     # The ACP's own answer, as an older host passed it on.
     {'state': 'failed', 'reason': 'session-not-loaded'},
 ]
+STARTED_OR_UNKNOWN = [
+    # Only a fork that started ran a model (WS4): its turn is named.
+    ('started', {'state': 'waiting', 'reason': 'fork-failed', 'stage': 'started', 'detail': 'provider-error', 'model_invoked': True,
+                 'started': True, 'receipt': {**UNMADE, 'model': 'gpt-6-astra', 'native_turn_id': 't9', 'fork_thread_id': 'f9'}}),
+    # Asked for, its start never confirmed: the ACP says so, or the host's own deadline passed.
+    ('unknown', {'state': 'waiting', 'reason': 'fork-timeout', 'stage': 'unknown', 'detail': 'timeout', 'model_invoked': None,
+                 'started': None, 'receipt': UNMADE}),
+    ('unknown', {'state': 'waiting', 'reason': 'fork-timeout', 'stage': 'unknown', 'detail': 'host-deadline', 'model_invoked': None,
+                 'started': None, 'receipt': UNMADE}),
+    # No word from the ACP and no sign that none was made: nobody can place it, so it still counts.
+    ('unknown', {'state': 'waiting', 'reason': 'fork-interrupted', 'model_invoked': None, 'started': None, 'receipt': UNMADE}),
+    ('unknown', {'state': 'waiting', 'reason': 'fork-failed', 'detail': 'provider-error', 'model_invoked': None, 'started': None,
+                 'receipt': UNMADE}),
+    # A host that said started for every fork, with a spent receipt.
+    ('started', {'state': 'waiting', 'reason': 'fork-failed', 'model_invoked': True, 'started': True,
+                 'receipt': {**UNMADE, 'model': 'gpt-6-astra', 'native_turn_id': 't', 'fork_thread_id': 'f'}}),
+]
+NOT_A_FORK = [
+    # A freeze refused the fork before it began (CR-MIND-01); the owner's turn came first; the ACP
+    # could not be asked at all; the main session was not there. Each is only a wait, as before.
+    {'state': 'waiting', 'reason': 'dispatch-frozen', 'model_invoked': False},
+    {'state': 'waiting', 'reason': 'owner-preempted', 'model_invoked': True},
+    {'state': 'waiting', 'reason': 'fork-assessment-unavailable', 'model_invoked': None},
+    {'state': 'waiting', 'reason': 'main-session-unavailable'},
+    {'state': 'failed', 'reason': 'native-review-failed'},
+]
 
 
-@pytest.mark.parametrize("answer", NEVER_STARTED, ids=["stage", "host-without-stage", "acp-failed"])
+def test_fork_stage_reads_the_hosts_fields_and_else_the_older_signs():
+    """CR2-INT-06 / CR2-MIND-02, the Python end of the receipt chain: every shape the host sends
+    (h:abd70aa) is placed, and only a fork proven never made is `not-started`."""
+    from kin_mind.appraisal import fork_stage
+    assert [fork_stage(answer) for answer in NEVER_STARTED] == ['not-started'] * len(NEVER_STARTED)
+    assert [fork_stage(answer) for _, answer in STARTED_OR_UNKNOWN] == [stage for stage, _ in STARTED_OR_UNKNOWN]
+    assert [fork_stage(answer) for answer in NOT_A_FORK] == [None] * len(NOT_A_FORK)
+    # A fork that named a turn or a thread was made, whatever its reason says.
+    made = {'state': 'waiting', 'reason': 'fork-failed', 'fork_reason': 'no-completed-turn', 'model_invoked': None,
+            'started': None, 'receipt': {**UNMADE, 'fork_thread_id': 'f1'}}
+    assert fork_stage(made) == 'unknown'
+
+
+@pytest.mark.parametrize("answer", NEVER_STARTED,
+                         ids=["stage", "silent-detail", "silent-fork-reason", "host-said-started", "acp-failed"])
 def test_a_fork_that_never_started_only_waits_and_never_counts_towards_setting_it_aside(setup, answer):
     """CR2-INT-06: a fork that was never made (the session not loaded, no completed turn to fork
-    from) ran no model. However the answer says so, the assessment only waits: no charge, no
-    transient budget spent, and never set aside however often it happens."""
+    from) ran no model. However the answer says so, the assessment only waits: no charge, no call
+    on record, no transient budget spent, and never set aside however often it happens."""
     from kin_mind.appraisal import MAX_TRANSIENT_FAILURES
     mind, source, _ = setup
+    p = native_provider(mind, lambda request: answer)
+    with attempts.collect(p) as calls:
+        with pytest.raises(ModelAdmissionWait, match='fork-unavailable'):
+            p._native('submit_appraisal', {}, '', {}, 10)
+    assert calls == [], 'no model ran, so no call is on record'
     jobs = Appraisals(mind)
     job = jobs.enqueue([source('fork-never-started')], 'synthetic-v1')
     for _ in range(MAX_TRANSIENT_FAILURES + 2):
@@ -118,14 +171,43 @@ def test_a_fork_that_never_started_only_waits_and_never_counts_towards_setting_i
     assert data['admission_waits'] == MAX_TRANSIENT_FAILURES + 2
 
 
-@pytest.mark.parametrize("stage", ["started", "unknown"])
-def test_a_fork_that_started_or_may_have_still_counts(setup, stage):
-    """CR2-INT-06: `started` and `unknown` keep spending the transient budget (CR-MIND-07)."""
+@pytest.mark.parametrize("stage,answer", STARTED_OR_UNKNOWN,
+                         ids=["started", "acp-unknown", "host-deadline", "silent-interrupted", "silent-failed", "host-said-started"])
+def test_a_fork_that_started_or_may_have_still_counts(setup, stage, answer):
+    """CR2-INT-06: `started` and `unknown` keep spending the transient budget (CR-MIND-07): the call
+    is on record with what its receipt shows, and the row is set aside when the budget runs out."""
+    from kin_mind.appraisal import MAX_TRANSIENT_FAILURES
+    mind, source, _ = setup
+    p = native_provider(mind, lambda request: answer)
+    with attempts.collect(p) as calls:
+        with pytest.raises(RuntimeError, match='native-review-' + answer['reason']):
+            p._native('submit_appraisal', {}, '', {}, 10)
+    assert len(calls) == 1 and calls[0]['outcome'] == answer['reason']
+    assert calls[0]['request_id'] == answer['receipt']['native_turn_id']
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('fork-may-have-run-' + stage)], 'synthetic-v1')
+    states = []
+    for _ in range(MAX_TRANSIENT_FAILURES + 1):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job['id'],))
+        states.append(jobs.run_one(native_provider(mind, lambda request: answer))['state'])
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    data = json.loads(row['data'])
+    assert states == ['pending'] * MAX_TRANSIENT_FAILURES + ['needs-repair']
+    assert data['transient_failures'] == MAX_TRANSIENT_FAILURES + 1 and not data.get('admission_waits')
+
+
+@pytest.mark.parametrize("answer", NOT_A_FORK[:4], ids=["dispatch-frozen", "owner-preempted", "acp-unreachable", "no-main-session"])
+def test_an_answer_that_is_not_a_forks_only_waits_as_before(setup, answer):
+    """A wait the host gives before any fork (a freeze, the owner's turn, an ACP it could not ask)
+    is an admission wait under its own reason; only one that says a model ran puts a call on record."""
     mind, _, _ = setup
-    answer = {'state': 'waiting', 'reason': 'fork-failed', 'stage': stage, 'model_invoked': stage == 'started',
-              'receipt': {'model': 'gpt-6-astra', 'native_turn_id': 't' if stage == 'started' else None, 'fork_thread_id': 'f'}}
-    with pytest.raises(RuntimeError, match='native-review-fork-failed'):
-        native_provider(mind, lambda request: answer)._native('submit_appraisal', {}, '', {}, 10)
+    p = native_provider(mind, lambda request: answer)
+    with attempts.collect(p) as calls:
+        with pytest.raises(ModelAdmissionWait, match=answer['reason']):
+            p._native('submit_appraisal', {}, '', {}, 10)
+    assert len(calls) == (1 if answer.get('model_invoked') else 0)
 
 
 def test_committed_diary_is_recallable_once_as_personal_reflection(setup):
