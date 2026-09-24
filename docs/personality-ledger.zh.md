@@ -70,7 +70,7 @@
 | `next_move_audit` | `next_move`、只追加的 `mind_next_moves`，以及——因为 move 的 grounds 是模型在带内唯一一处说出"我为什么在做这件愿望 / 这一步"的地方——这件愿望或这一步依据哪条特征的记录。它仍然不让任何东西就绪：它记下的东西只能让某件事**停止**就绪，永远不能让它就绪。关掉后新的愿望不再获得这条记录，已经有的照旧保留。 |
 | `behavior_chain` | `self_hypothesis`、`prediction_outcomes`、兼容印记、待定的演化提案，以及不调模型的每日合并。关闭后恢复为每天一次模型请求与"同一 agent_version 的评定"——同时也恢复了这一阶段要终结的那种沉默：普通评估给出的 `evolution` 在到达处被丢弃，既不应用、也不留存为提案、也不给出拒绝理由。 |
 | `wish_version_review` | 对决策作于更早智能体版本的愿望，按愿望与版本各发一次 `wish-review`，而不是让它停在未就绪、再也没有人过问。 |
-| `rest_review_window` | 会被接受并保存，默认打开，但没有任何代码读取：下一次安静复核由 Kin 在十分钟到一天之间自己选择，宿主把它限制在这个范围内。`configure-memory` 会校验 `review_rest_max_minutes`（默认 480，取值在 `review_max_minutes` 与 720 之间），它同样不限制任何东西。 |
+| `rest_review_window` | 已退役，不再是设置项。已存配置或 `configure-memory` 调用里如果还带着它或 `review_rest_max_minutes`，不会被拒绝：读取时忽略，下次写入时去掉。下一次安静复核由 Kin 在十分钟到一天之间自己选择，宿主把它限制在这个范围内。 |
 
 另有一个默认关闭的 `legacy_drive_thresholds`，用于恢复固定的 75 分联系与探索门槛，且只在 `semantic_actions` 未开启时生效。无论它开或关，已存的阈值都保持为数字。
 
