@@ -6,7 +6,7 @@ import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {messageIntents} from './mobile-reviewer.mjs';
 import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile} from './codex-models.mjs';
-import {inputSettled,inputInFlight,inputSummary,unsettledView,emptySummary,ownerInput,answered} from './input-ledger.mjs';
+import {inputSettled,inputInFlight,inputSummary,unsettledView,emptySummary,ownerInput,answered,turnRunning,SUBMIT_RETRY_MS} from './input-ledger.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
@@ -110,7 +110,7 @@ export class MobileRouter {
    * Left off, every request and every record is what it was before intents existed. */
   constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
-    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
@@ -124,15 +124,23 @@ export class MobileRouter {
     }else if(this.state.sessionId!==sessionId)throw Error('Router session mismatch');
     this.state.configRevision??=0;this.state.notices??={};this.state.operations??={};this.state.semanticPending??={};this.state.reclassifications??={};
     this.state.executionEpoch??=0;this.state.forceBoundaries??=[];this.state.autoIdleProfile??=clone(ROUTER_PROFILES.chat);
-    for(const operation of Object.values(this.state.operations))if(['submitted','running'].includes(operation.state))operation.state='unconfirmed';
+    const at=now();
+    // A native command cannot outlive the ACP process that ran it: it is interrupted,
+    // never left counting as running work (AD1-03).
+    for(const operation of Object.values(this.state.operations))if(['submitted','running','unconfirmed'].includes(operation.state)){operation.state='interrupted';operation.interruptedAt=at;}
     for(const request of Object.values(this.state.requests))if(request.forceState==='interrupting')request.forceState='unconfirmed';
     for(const notice of Object.values(this.state.notices))if(notice.state==='sending')notice.state='unconfirmed';
     // A classification attempt interrupted mid-call is retried, never concluded.
     for(const entry of Object.values(this.state.semanticPending))if(entry.state==='classifying')entry.state='retry';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
-    const at=now();
     for(const record of Object.values(this.state.inputs)){
-      if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';
+      // An interrupted acceptance cannot safely be replayed; an input that only
+      // reached the in-memory session queue provably never reached the native session.
+      if(record.state==='submitting')record.state='unconfirmed';
+      if(record.state==='preparing')this.notSubmitted(record,'restart-before-submission',{restart:true});
+      if(record.state==='queued')this.notSubmitted(record,'queued-prompt-never-started',{restart:true});
+      // A notice whose send was cut off is looked up by its own id, never sent anew.
+      if(record.ownerNotice?.state==='sending')record.ownerNotice.state='unknown';
       // A native turn cannot outlive the process that ran it.
       if(record.turnStartedAt&&!(record.turnEndedAt>=record.turnStartedAt)){record.turnEndedAt=at;record.stopReason='host-restart';}
     }
@@ -347,7 +355,9 @@ export class MobileRouter {
         if(previous.historical)throw Object.assign(Error('Historical input is not re-run: '+previous.historical.reason),{code:'input-historical'});
         if(previous.state==='failed-before-submit'){
           if(this.frozen())throw frozenError(this.state.freeze.reason);
-          previous.state='selected';this.save('input-preparation-retry',{id:input.id});
+          previous.state='selected';previous.retry={...(previous.retry??{attempts:0}),lastAttemptAt:this.now()};
+          delete previous.reason;delete previous.failureStage;delete previous.ownerNotice;
+          this.save('input-preparation-retry',{id:input.id,attempt:previous.retry.attempts});
         }
         return clone(previous);
       }
@@ -435,9 +445,12 @@ export class MobileRouter {
   /** One bounded ask of the classifier, with its own clock. The longest the call
    * may wait is the caller's; the answer is never rerouted by trigger words. */
   async askClassification(input,{files=[],intents=false,offered=null,runtime=null,wait}) {
+    // The catalog is read before the clock starts, and the clock always has a
+    // listener: a slow catalog can never leave a rejection nobody handles (AD1-05).
+    const availableModels=await this.availableModels(runtime);
     let timer;
     const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
-    const availableModels=await this.availableModels();
+    timeout.catch(()=>{});
     try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.tasks().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{}),...(offered?{interruptedReply:offered.reply}:{})}),timeout]);}
     finally {clearTimeout(timer);}
   }
@@ -488,16 +501,29 @@ export class MobileRouter {
     this.state.recent.push({role:'user',text:input.text,at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
     this.state.recent=this.state.recent.slice(-16);
   }
+  /** Record that nothing of this input reached the native session, with that
+   * evidence and the moment the same id may be tried again (AD1-02, H2a-03). */
+  notSubmitted(record,reason,{restart=false,stage='preparation'}={}) {
+    // Handed only to the in-memory queue is not a submission: the fact is kept apart.
+    if(record.state==='queued'&&record.submissionStartedAt){record.queuedSubmissionAt=record.submissionStartedAt;delete record.submissionStartedAt;}
+    record.state='failed-before-submit';record.failureStage=stage;record.reason=reason;delete record.settledAt;
+    const attempts=(record.retry?.attempts??0)+(restart?0:1),delay=SUBMIT_RETRY_MS[Math.max(0,attempts-1)];
+    record.retry={attempts,evidence:'not-submitted',lastFailureAt:this.now(),...(delay===undefined?{exhausted:true}:{nextAt:this.now()+(restart?0:delay)})};
+    return record.retry;
+  }
   dispatch(input,submit) {
     if(this.inflight.has(input.id))return this.inflight.get(input.id);
     const pending=this.dispatchOnce(input,submit).catch(async error=>{
-      await this.locked(()=>{
+      const retry=await this.locked(()=>{
         const record=this.state.inputs[input.id];
         if(record&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt){
-          record.state='failed-before-submit';record.failureStage='preparation';record.reason=error.message;
-          this.save('input-failed-before-submit',{id:input.id});
+          const retry=this.notSubmitted(record,error.message);
+          this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});return retry;
         }
+        return record?.state==='failed-before-submit'?record.retry:null;
       });
+      // The caller learns that the same id may be tried again, and when.
+      if(retry&&!error.code)Object.assign(error,{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
       throw error;
     }).finally(()=>this.inflight.delete(input.id));
     this.inflight.set(input.id,pending);return pending;
@@ -508,15 +534,18 @@ export class MobileRouter {
     const cutoff=this.now()-(this.state.config.workReviewIntervalMinutes??20)*60000;
     for(const record of Object.values(this.state.inputs)) {
       if(!['selected','preparing'].includes(record.state)||record.submissionStartedAt||this.inflight.has(record.id)||!(record.at<=cutoff))continue;
-      record.state='failed-before-submit';record.failureStage='preparation';record.reason='input-preparation-timeout';
+      this.notSubmitted(record,'input-preparation-timeout');
       this.save('input-failed-before-submit',{id:record.id,reason:record.reason});
     }
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
     if(selected.state==='deferred')return {route:'deferred',reason:selected.reason};
-    if(selected.state==='accepted')return {route:'deduplicated',model:selected.model};
-    if(['semantic-failed','semantic-canceled'].includes(selected.state))return {route:selected.state,reason:selected.reason};
+    if(['accepted','queued','superseded'].includes(selected.state))return {route:'deduplicated',model:selected.model};
+    // A dispatch waits for the coordinator, a switch or a classification, never for
+    // ever: past its deadline nothing has been submitted, and the same id is retried
+    // or reported like any other unsubmitted input.
+    const deadline=this.now()+(this.state.config.dispatchWaitMinutes??20)*60000;
     for(;;) {
       // A semantic wait is settled by its own bounded review — driven here while
       // the caller is still alive, and by the host's pump when it is not.
@@ -524,7 +553,7 @@ export class MobileRouter {
       const outcome=await this.locked(async()=>{
         const record=this.state.inputs[input.id];
         if(record.state==='semantic-pending')return null;
-        if(['semantic-failed','semantic-canceled'].includes(record.state))return {route:record.state,reason:record.reason};
+        if(['accepted','queued','superseded'].includes(record.state))return {route:'deduplicated',model:record.model};
         if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
         let runtime=await this.reconcileTransition(await this.inspect());
         if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment'})||this.tasks().length||this.state.mode==='work'))return {route:'deferred',reason:'owner-work-held'};
@@ -541,23 +570,26 @@ export class MobileRouter {
           // profile is verified. Failure never silently runs it on the old model.
           if(request?.state==='pending')return null;
           if(request?.state!=='applied') {
-            record.state='failed-before-submit';record.failureStage='model-control';
+            // The owner's own control failed and was reported; the work is not re-run on another model.
+            this.notSubmitted(record,'model-control-'+(request?.state??'failed'),{stage:'model-control'});record.retry.exhausted=true;delete record.retry.nextAt;
             this.save('input-failed-before-submit',{id:input.id});
             return {route:'control-failed',state:request?.state,model:runtime.model};
           }
         }
         if(record.route==='work'&&['manual','auto','work'].includes(record.command)&&!record.taskId)record.taskId=this.addTask(input).id;
         if(record.route==='maintenance'&&this.busy(runtime))return null;
-        let targetProfile=record.route==='maintenance'||input.kind==='assessment'?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
+        let targetProfile=record.route==='maintenance'||input.kind==='assessment'||record.unlabeled?runtimeProfile(runtime):this.desiredProfile(runtime,{route:record.route});
         if(input.kind==='assessment'&&(!runtime.known||runtime.profileReady===false))return {route:'deferred',reason:'native-profile-unconfirmed'};
+        // A native runtime that cannot be read, or a switch still being reconciled, is a
+        // wait: nothing has been submitted, and nothing is failed for it (AD1-02).
+        if(!runtime.known||this.state.transition?.state==='unconfirmed'){this.noteWait(record,!runtime.known?'native-runtime-unknown':'switch-unconfirmed');return null;}
         if(record.route==='work'&&this.state.mode!=='manual'&&!this.captureAutomaticReturn(runtime))throw Error('Automatic return profile unverified');
-        if(record.route!=='maintenance'&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
-        targetProfile=await this.resolvedProfile(targetProfile);
+        if(record.route!=='maintenance'&&!record.unlabeled&&(this.tasks().length||this.state.mode==='work')&&this.state.mode!=='manual')targetProfile=clone(ROUTER_PROFILES.work);
+        try {targetProfile=await this.resolvedProfile(targetProfile);}
+        catch(error) {if(/Canonical model provider unavailable|catalog/i.test(String(error?.message))){this.noteWait(record,'model-catalog-unavailable');return null;}throw error;}
         let target=targetProfile.model;
         // A queued work request must not change the provider mid-DeepSeek turn.
         if((!this.verified(runtime,targetProfile)||runtime.profileReady===false)&&this.busy(runtime))return null;
-        if(!runtime.known)throw Error('Native runtime requires reconciliation');
-        if(this.state.transition?.state==='unconfirmed')throw Error('Provider switch requires reconciliation');
         if(!this.verified(runtime,targetProfile)||runtime.profileReady===false) {
           this.startTransition(runtime,targetProfile,record.reason,'input',input.id);this.save('switch-requested');
           try {
@@ -572,28 +604,70 @@ export class MobileRouter {
               const restoredResult=await this.switchTo(this.state.transition.fromProfile),restored=restoredResult.actual;
               if(!this.verified(restored,restoredResult.target))throw Error('restore-unconfirmed');
               this.finishTransition(restored);this.state.transition.state='failed-restored';target=restored.model;targetProfile=restoredResult.target;
-              if(!record.taskId&&!record.command)record.taskId=this.addTask(input).id;
+              // Only work opens work: a chat that ran on the restored profile stays a chat (AD1-04).
+              if(!record.taskId&&!record.command&&record.route==='work')record.taskId=this.addTask(input).id;
               this.save('switch-failed-restored');
             } catch {this.state.transition.state='unconfirmed';this.save('switch-unconfirmed');throw Error('Provider switch requires reconciliation');}
           }
         } else this.state.actual=runtime;
         if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
-        if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
         if(input.kind==='proactive'&&this.state.mode!=='manual'&&target!==ROUTER_MODELS.chat)return {route:'deferred',reason:'deepseek-not-verified'};
-        record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;this.save('input-preparing',{id:input.id});
-        const markSubmitted=()=>{record.state='submitting';record.submissionStartedAt=this.now();this.save('input-submitting',{id:input.id});};
+        record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
+        const markSubmitted=()=>{
+          record.state='submitting';record.submissionStartedAt=this.now();
+          // A native command exists from its submission, never before it (AD1-03).
+          if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
+          this.save('input-submitting',{id:input.id});
+        };
         if(input.submissionProtocol!=='host-boundary-v1')markSubmitted();
         try {
-          const route=await submit({model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
-          if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';this.save('input-superseded',{id:input.id});return{route,model:target};}
-          record.state='accepted';record.acceptedAt=this.now();this.save('input-accepted',{id:input.id});
+          const outcome=await submit({model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch},markSubmitted);
+          const route=typeof outcome==='string'?outcome:outcome?.route;
+          if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';record.settledAt=this.now();this.save('input-superseded',{id:input.id});return{route,model:target};}
+          // Handed only to the session's in-memory queue is not yet native acceptance:
+          // the input is accepted when its prompt begins (H2a-02).
+          if(outcome?.queued===true&&!record.turnStartedAt){record.state='queued';record.queuedAt=this.now();this.save('input-queued',{id:input.id});return {route,model:target,queued:true};}
+          record.state='accepted';record.acceptedAt??=this.now();
+          if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
+          this.save('input-accepted',{id:input.id,route});
           return{route,model:target};
-        } catch(error) {record.state=record.submissionStartedAt?'unconfirmed':'failed-before-submit';record.failureStage=record.submissionStartedAt?'native-submit':'preparation';this.save('input-'+record.state,{id:input.id});throw Error(record.submissionStartedAt?'Input acceptance requires reconciliation':'Input preparation failed before native submission',{cause:error});}
+        } catch(error) {
+          const operation=this.state.operations[record.id];
+          if(record.submissionStartedAt) {
+            record.state='unconfirmed';record.failureStage='native-submit';
+            // The command's own outcome is unknown; it is closed, never left running (AD1-03).
+            if(operation?.state==='submitted')Object.assign(operation,{state:'failed',stopReason:'submit-outcome-unknown',updatedAt:this.now()});
+            this.save('input-unconfirmed',{id:input.id});
+            throw Error('Input acceptance requires reconciliation',{cause:error});
+          }
+          const retry=this.notSubmitted(record,String(error?.message??error));
+          this.save('input-failed-before-submit',{id:input.id,attempt:retry.attempts});
+          throw Object.assign(Error('Input preparation failed before native submission',{cause:error}),{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
+        }
       });
       if(outcome)return outcome;
+      if(this.now()>=deadline)throw Error('dispatch-wait-exceeded:'+(this.state.inputs[input.id]?.waitingReason??'coordinator-busy'));
       await this.waitForIdle();
     }
   }
+  noteWait(record,reason) {
+    if(record.waitingReason===reason)return;
+    record.waitingReason=reason;this.save('input-waiting',{id:record.id,reason});
+  }
+  /** Resolves when a queued input's prompt begins in the native session, or with its
+   * state when the session let it go first or the host is stopping. */
+  awaitAcceptance(inputId) {
+    const record=this.state.inputs[inputId];
+    if(record?.state!=='queued')return Promise.resolve({state:record?.state??'missing'});
+    let entry=this.acceptance.get(inputId);
+    if(!entry){let resolve;const promise=new Promise(r=>{resolve=r;});entry={promise,resolve};this.acceptance.set(inputId,entry);}
+    return entry.promise;
+  }
+  settleAcceptance(inputId,value) {
+    const entry=this.acceptance.get(inputId);if(!entry)return;
+    this.acceptance.delete(inputId);entry.resolve(value);
+  }
+  releaseAcceptance(reason='host-stopping') {for(const id of [...this.acceptance.keys()])this.settleAcceptance(id,{state:'released',reason});}
   /** KIN-ITER-20260918-02: the bounded review of inputs whose classification
    * failed. The SAME input is asked of DeepSeek again — never rescored by trigger
    * words — and a late answer routes only after its version basis, cancel state
@@ -606,31 +680,42 @@ export class MobileRouter {
         const e=this.state.semanticPending[id];
         if(!e||!['pending','retry'].includes(e.state)||e.nextAttemptAt>this.now())return null;
         const record=this.state.inputs[id];
-        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash||(record.conversationId??null)!==e.conversationId||(record.generation??null)!==e.generation) {
-          e.state='superseded';e.updatedAt=this.now();this.save('semantic-review-superseded',{id});return null;
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash) {
+          e.state='superseded';e.updatedAt=this.now();delete e.text;this.save('semantic-review-superseded',{id});return null;
         }
+        if(e.attempts>=e.maxAttempts)return clone({...e,exhausted:true});
         e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});
         return clone(e);
       });
       if(!entry)continue;
       let result=null,failure=null;
-      try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
-        {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
-      catch(error){failure=classificationFailure(error);}
+      if(!entry.exhausted) {
+        try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
+          {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
+        catch(error){failure=classificationFailure(error);}
+      }
       await this.locked(async()=>{
-        const e=this.state.semanticPending[id];if(!e||e.state!=='classifying')return;
+        const e=this.state.semanticPending[id];if(!e||!['classifying','pending','retry'].includes(e.state))return;
         const record=this.state.inputs[id];e.updatedAt=this.now();
+        // With the budget spent the owner's message is still hers: it goes to Kin
+        // unlabelled, on the current profile, instead of ending unanswered (AD1-02).
+        const unlabeled=()=>{
+          e.state='failed';delete e.text;
+          Object.assign(record,{state:'selected',route:'chat',intent:null,unlabeled:true,reason:'classification-unavailable',failureClass:e.failure.class,taskId:null,lateClassifiedAt:this.now()});
+          this.save('input-unlabeled',{id,failure:e.failure.class,attempts:e.attempts});
+        };
         const fail=cls=>{
           e.lastFailure={class:cls,at:this.now()};
-          if(e.attempts>=e.maxAttempts) {
-            e.state='failed';record.state='semantic-failed';record.reason='classification-exhausted';record.failureClass=e.failure.class;
-            this.save('input-semantic-failed',{id,failure:e.failure.class,attempts:e.attempts});
-          } else {e.state='retry';e.nextAttemptAt=this.now()+(e.attempts-1)*15000;this.save('semantic-retry-waiting',{id,attempt:e.attempts,failure:cls});}
+          if(e.attempts>=e.maxAttempts)return unlabeled();
+          e.state='retry';e.nextAttemptAt=this.now()+(e.attempts-1)*15000;this.save('semantic-retry-waiting',{id,attempt:e.attempts,failure:cls});
         };
-        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash){e.state='superseded';this.save('semantic-review-superseded',{id});return;}
+        if(!record||record.state!=='semantic-pending'||record.hash!==e.hash){e.state='superseded';delete e.text;this.save('semantic-review-superseded',{id});return;}
+        if(entry.exhausted)return unlabeled();
         if((this.state.conversationId??null)!==e.conversationId||(this.state.generation??null)!==e.generation) {
-          e.state='superseded';record.state='semantic-canceled';record.reason='generation-changed';
-          this.save('semantic-canceled',{id,reason:'generation-changed'});return;
+          // The session moved on while this was read; the owner's message did not. It is read again in the new one.
+          e.conversationId=this.state.conversationId??null;e.generation=this.state.generation??null;
+          Object.assign(record,{conversationId:e.conversationId,generation:e.generation,nativeThreadId:this.sessionId});
+          e.state='retry';e.nextAttemptAt=this.now();this.save('semantic-rebased',{id,generation:e.generation});return;
         }
         if(failure)return fail(failure);
         const owner=e.kind==='owner',intents=this.classifyIntents&&owner;
@@ -653,7 +738,7 @@ export class MobileRouter {
         Object.assign(record,{state:'selected',route:locked.decision,intent:read.decision,reason:locked.reason,recall:read.recall,command:read.command,
           taskId:locked.task?.id??null,lateClassifiedAt:this.now(),...(read.fileSend?{fileSend:read.fileSend}:{}),...(read.stopIntent?{stop:read.stopIntent}:{}),...(read.profile?{profile:read.profile}:{}),...(['manual','auto','work'].includes(read.command)?{force:read.force}:{})});
         if(!basisSame)record.lateBasis={captured:e.taskVersions,current:Object.fromEntries(this.tasks().map(t=>[t.id,t.inputVersion]))};
-        e.state='classified';e.updatedAt=this.now();
+        e.state='classified';e.updatedAt=this.now();delete e.text;
         this.save('input-classified-late',{id,route:locked.decision,reason:locked.reason,attempts:e.attempts});
       });
     }
@@ -829,6 +914,7 @@ export class MobileRouter {
     this.state.executionEpoch=toEpoch;this.state.forceBoundaries.push(boundary);this.state.forceBoundaries=this.state.forceBoundaries.slice(-32);
     for(const operation of Object.values(this.state.operations))if(['submitted','running','unconfirmed'].includes(operation.state)){operation.state='fenced-unconfirmed';operation.fencedBy=boundary.id;operation.fencedAt=at;}
     for(const input of Object.values(this.state.inputs))if(['submitting','unconfirmed'].includes(input.state)){input.state='fenced-unconfirmed';input.fencedBy=boundary.id;input.fencedAt=at;}
+    if(this.state.turn){for(const id of this.state.turn.inputIds){const input=this.state.inputs[id];if(input?.turnStartedAt&&!(input.turnEndedAt>=input.turnStartedAt)){input.turnEndedAt=at;input.stopReason='owner-force-interrupt';}}delete this.state.turn;}
     if(interruptedTask) {
       if(interruptedTask.completion) {
         const historical={...clone(interruptedTask.completion),turnFence:interruptedTask.completion.turnFence??interruptedTask.executionEpoch,state:'historical-proposal',fencedBy:boundary.id,fencedAt:at};
@@ -982,11 +1068,13 @@ export class MobileRouter {
     return this.locked(async()=>{
       if(this.runtimeRestored)return {state:'restored'};
       let runtime=await this.inspect();
-      if(this.busy(runtime)||Object.values(this.state.inputs).some(i=>['selected','submitting','unconfirmed'].includes(i.state)))return {state:'waiting'};
       runtime=await this.reconcileTransition(runtime);
       if(this.state.transition?.state==='unconfirmed')return {state:'waiting'};
       let target=await this.resolvedProfile(this.desiredProfile(runtime));
       if(!this.verified(runtime,target)){
+        // Only an actual switch waits for work in flight. An unconfirmed input is
+        // reconciled by its own id and never holds the restart profile (AD1-10).
+        if(this.busy(runtime)||Object.values(this.state.inputs).some(inputInFlight))return {state:'waiting'};
         this.startTransition(runtime,target,'Restore persisted mobile routing mode','host-restart');this.save('restart-profile-requested');
         try {const switched=await this.switchTo(target);runtime=switched.actual;target=switched.target;if(!this.verified(runtime,target))throw Error('Restart profile unverified');this.finishTransition(runtime);}
         catch(error){this.state.transition.state='unconfirmed';this.save('restart-profile-unconfirmed');throw error;}
@@ -1054,8 +1142,11 @@ export class MobileRouter {
   observeOperation(inputId,phase,result={}) {
     return this.locked(async()=>{
       const operation=this.state.operations[inputId];if(!operation)throw Error('Unknown native operation');
-      operation.state=phase==='start'?'running':result.stopReason==='end_turn'?'completed':'unconfirmed';
+      // A native command that did not end its turn normally is a terminal failure with
+      // its stop reason kept, never an operation left counting as running (AD1-03).
+      operation.state=phase==='start'?'running':result.stopReason==='end_turn'?'completed':'failed';
       operation.updatedAt=this.now();operation.stopReason=result.stopReason;
+      if(phase==='start')this.turnStarted({inputIds:[inputId]});else this.turnEnded({stopReason:result.stopReason});
       this.save('native-operation-'+phase,{inputId,state:operation.state});
     });
   }
@@ -1108,7 +1199,9 @@ export class MobileRouter {
         const n=this.state.notices[id];
         const before=JSON.stringify([n.state,n.waitingReason,n.nextAction,n.attempts,n.lookups,n.messageId,n.stage]);
         const kind=noticeReceiptClass(receipt);
-        if(kind==='accepted'){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();n.replyRecorded=true;n.nextAction='none';n.stage='settled';}
+        if(kind==='accepted'){n.state='accepted';n.messageId=receipt.messageId;n.acceptedAt=this.now();n.replyRecorded=true;n.nextAction='none';n.stage='settled';
+          const source=this.state.inputs[n.sourceInputId];
+          if(n.kind==='mode-failed'&&source?.state==='failed-before-submit'&&source.failureStage==='model-control')source.ownerNotice={kind:'stopped',id:n.id,state:'accepted',messageId:n.messageId,acceptedAt:n.acceptedAt};}
         else if(kind==='rejected'){n.firstFailure??={class:'receipt-rejected',at:this.now()};n.state='rejected';n.waitingReason='platform-rejected';n.nextAction='none';n.stage='settled';}
         else if(kind==='not-submitted') {
           n.firstFailure??={class:notice.sendNow?'send-not-submitted':'receipt-not-submitted',at:this.now()};
@@ -1135,6 +1228,7 @@ export class MobileRouter {
       const record=this.state.inputs[id];if(!record)continue;
       if(record.state==='queued'){record.state='accepted';record.acceptedAt=at;}
       if(['accepted','submitting'].includes(record.state)){record.turnStartedAt=at;delete record.turnEndedAt;delete record.stopReason;this.progress.set(id,at);}
+      this.settleAcceptance(id,{state:record.state});
     }
     return ids.length>0;
   }
@@ -1175,6 +1269,13 @@ export class MobileRouter {
       if(kind==='prompt-end')this.turnEnded(data);
       if(kind==='delivery'&&data.sourceInputId)this.inputDelivery(data);
       if(kind==='reply-complete'||kind==='reply-choice'){if(this.inputAnswered(kind,data))this.save(kind,{inputId:data.inputId});return;}
+      if(kind==='input-dropped') {
+        // The session let a queued prompt go before it began: provably never submitted.
+        const record=this.state.inputs[data.inputId];
+        if(record?.state==='queued'){this.notSubmitted(record,'session-dropped-before-prompt',{restart:true});this.save('input-failed-before-submit',{id:record.id,reason:record.reason});}
+        this.settleAcceptance(data.inputId,{state:record?.state??'missing'});return;
+      }
+      if(kind==='tool'&&this.state.turn)for(const id of this.state.turn.inputIds)this.progress.set(id,this.now());
       // An explicit null belongs to a no-task/chat turn. It must not be rebound to
       // whichever task happens to be current when a delayed callback arrives.
       const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
@@ -1332,5 +1433,91 @@ export class MobileRouter {
       }
       if(changed)this.save('reconciled');return {state:this.tasks().length?'work-held':'idle'};
     });
+  }
+  /** The watchdog. Every owner input gets an outcome: a retry only on evidence that
+   * the same id never arrived (not submitted, refused by the platform, reconciled as
+   * not received), a reconciliation of an uncertain submission by its original id,
+   * or a system notice to the owner. An input is `failed-notified` only once that
+   * notice itself has a platform receipt. The ports run outside the mutex:
+   * `requeue(id)` puts the durable inbox job back, `reconcileInput(id)` answers
+   * found / not-found / unknown, and `notifyOwner(kind,id)` sends — or, for an id it
+   * already tried, looks up — the one notice for that input. */
+  async watch({notifyOwner=null,reconcileInput=null,requeue=null,sessionBusy=false}={}) {
+    const now=this.now(),stuckMs=(this.state.config.inputStuckMinutes??10)*60000,gapMs=(this.state.config.noticeGapMinutes??10)*60000;
+    const actions=await this.locked(async()=>{
+      this.expireUnsubmittedInputs();
+      const list=[],due=[];let changed=false;
+      for(const record of Object.values(this.state.inputs)) {
+        if(!ownerInput(record)||record.historical||this.inflight.has(record.id))continue;
+        const summary=inputSummary(record),notice=record.ownerNotice;
+        if(['answered','superseded','canceled-by-owner','failed-notified'].includes(summary))continue;
+        // A failed owner control is reported by its own mode notice.
+        if(record.failureStage==='model-control'&&Object.values(this.state.notices).some(n=>n.sourceInputId===record.id&&!['failed','rejected','unresolved','superseded'].includes(n.state)))continue;
+        if(notice) {
+          if(!['sending','exhausted'].includes(notice.state)&&!(notice.nextAt>now)){notice.state='sending';list.push({kind:'notify',id:record.id,notice:notice.kind});changed=true;}
+          continue;
+        }
+        const last=Math.max(this.progress.get(record.id)??0,record.lastDeliveredAt??0,record.turnEndedAt??0,record.acceptedAt??0,record.retry?.lastFailureAt??0,record.at??0);
+        const idle=now-last>=stuckMs;
+        let verdict=null;
+        if(record.state==='failed-before-submit') {
+          if(record.retry&&!record.retry.exhausted&&requeue){if(record.retry.nextAt<=now&&!this.frozen())list.push({kind:'requeue',id:record.id});}
+          else verdict='stopped';
+        } else if(record.state==='queued') {
+          // Only the host's in-memory queue held it: with the session idle and its
+          // prompt never begun, it provably never reached the native session.
+          if(idle&&!sessionBusy){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});changed=true;}
+        } else if(['unconfirmed','fenced-unconfirmed'].includes(record.state)) {
+          if(!record.reconciliation&&reconcileInput)list.push({kind:'reconcile',id:record.id});
+          else verdict='unknown';
+        } else if(record.state==='accepted'&&idle&&!sessionBusy&&!turnRunning(record))verdict=(record.delivered??0)>0?'partial':'unknown';
+        if(verdict)due.push({record,verdict});
+      }
+      // One notice at a time, never two within the gap: the oldest input first.
+      if(due.length&&!(now-this.state.lastOwnerNoticeAt<gapMs)) {
+        const {record,verdict}=due.sort((a,b)=>(a.record.at??0)-(b.record.at??0))[0];
+        record.ownerNotice={kind:verdict,id:'kin-input-notice-'+digest([this.sessionId,record.id,verdict]).slice(0,32),state:'sending',attempts:0,at:now};
+        this.state.lastOwnerNoticeAt=now;list.push({kind:'notify',id:record.id,notice:verdict});changed=true;
+      }
+      if(changed)this.save('input-watch',{notices:list.filter(action=>action.kind==='notify').map(action=>action.id)});
+      return list;
+    });
+    const results=[];
+    for(const action of actions) {
+      if(action.kind==='requeue') {
+        let result;try{result=await requeue(action.id);}catch{result={state:'unavailable'};}
+        await this.locked(async()=>{
+          const record=this.state.inputs[action.id];if(!record||record.state!=='failed-before-submit')return;
+          if(['requeued','pending','processing'].includes(result?.state)){record.retry={...record.retry,requeuedAt:this.now(),nextAt:this.now()+stuckMs};this.save('input-requeued',{id:action.id});}
+          else {record.retry={...record.retry,exhausted:true,requeue:result?.state??'missing'};this.save('input-retry-exhausted',{id:action.id,reason:record.retry.requeue});}
+        });
+        results.push({...action,result:result?.state??null});continue;
+      }
+      if(action.kind==='reconcile') {
+        let result;try{result=await reconcileInput(action.id);}catch{result={state:'unknown'};}
+        await this.locked(async()=>{
+          const record=this.state.inputs[action.id];if(!record||!['unconfirmed','fenced-unconfirmed'].includes(record.state))return;
+          const state=['found','not-found'].includes(result?.state)?result.state:'unknown';
+          record.reconciliation={state,at:this.now()};
+          if(state==='found'){record.state='accepted';record.acceptedAt??=this.now();}
+          else if(state==='not-found'){this.notSubmitted(record,'reconciled-not-received',{restart:true,stage:'reconciliation'});record.retry.evidence='reconciled-not-received';}
+          this.save('input-reconciled',{id:action.id,state});
+        });
+        results.push({...action,result:result?.state??null});continue;
+      }
+      let receipt=null;
+      if(notifyOwner)try{receipt=await notifyOwner(action.notice,action.id);}catch{receipt=null;}
+      await this.locked(async()=>{
+        const record=this.state.inputs[action.id],notice=record?.ownerNotice;if(!notice)return;
+        notice.attempts=(notice.attempts??0)+1;notice.updatedAt=this.now();
+        const kind=notifyOwner?noticeReceiptClass(receipt):'no-port';
+        if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();}
+        else if(notice.attempts>=(kind==='unknown'?NOTICE_LOOKUP_BUDGET:NOTICE_SEND_BUDGET)){notice.state='exhausted';notice.lastReceipt=kind;}
+        else {notice.state=kind;notice.nextAt=this.now()+(kind==='not-submitted'?30000:120000);}
+        this.save('input-notice',{id:action.id,kind:notice.kind,state:notice.state});
+      });
+      results.push({...action,result:notifyOwner?noticeReceiptClass(receipt):'no-port'});
+    }
+    return results;
   }
 }

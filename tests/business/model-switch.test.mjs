@@ -92,17 +92,19 @@ test('a classification failure never manufactures work: the input waits as itsel
   const entry=f.router.state.semanticPending.question;
   assert.deepEqual([entry.failure.class,entry.attempts,entry.maxAttempts,entry.model],['timeout',2,4,'gpt-6-sol']);
   assert.equal(calls,2,'the live dispatch drove the first bounded retry of the same input');
-  // The budget is visible and bounded; after it, an explicit failed state.
+  // The budget is visible and bounded. After it the owner's message is still hers:
+  // it goes to Kin unlabelled, on the current profile, instead of ending unanswered (AD1-02).
   for(const _ of [1,2]){f.router.state.semanticPending.question.nextAttemptAt=0;await f.router.reviewSemanticPending();}
   assert.equal(calls,4);
-  assert.equal(f.router.state.inputs.question.state,'semantic-failed');
-  assert.equal(f.router.state.inputs.question.reason,'classification-exhausted');
+  const exhausted=f.router.state.inputs.question;
+  assert.deepEqual([exhausted.state,exhausted.route,exhausted.unlabeled,exhausted.failureClass,exhausted.taskId],['selected','chat',true,'timeout',null]);
   assert.equal(f.router.state.semanticPending.question.state,'failed');
+  assert.equal(f.router.state.semanticPending.question.text,undefined,'the owner text leaves the retry record once it is settled');
   assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
-  // A redrive never executes it and never asks again: it reports the explicit state.
-  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async()=>assert.fail('never submitted'));
-  assert.equal(outcome.route,'semantic-failed');
-  assert.equal(calls,4);
+  let submitted=0;
+  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async detail=>{submitted++;assert.equal(detail.model,'gpt-6-sol');return 'new-turn';});
+  assert.equal(outcome.route,'new-turn');assert.equal(submitted,1);
+  assert.equal(calls,4,'and it is never classified again');assert.deepEqual(f.switched,[]);
 });
 
 test('uncertain notification reconciles its original ID without another send',async t=>{
@@ -482,12 +484,22 @@ test('new independent work can retry after a prior task was canceled',async t=>{
 });
 
 
-test('profile resolution failure settles the input before any native submission',async t=>{
-  const f=fixture(t,{resolveProfile:async()=>{throw Error('Canonical model provider unavailable');}});
-  await assert.rejects(f.router.dispatch({id:'profile-failed',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async()=>assert.fail('no submission')),/Canonical model provider unavailable/);
+test('an unavailable model catalog is a wait, never a failure of the owner input (AD1-02)',async t=>{
+  let unavailable=2,waits=0;
+  const f=fixture(t,{resolveProfile:async profile=>{if(unavailable-->0)throw Error('Canonical model provider unavailable');return structuredClone(profile);},waitForIdle:async()=>{waits++;}});
+  let submitted=0;
+  const result=await f.router.dispatch({id:'profile-wait',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async(_,started)=>{await started();submitted++;return 'new-turn';});
+  assert.deepEqual([result.route,submitted,waits],['new-turn',1,2]);
+  assert.equal(f.router.state.inputs['profile-wait'].state,'accepted');
+});
+
+test('a preparation failure before submission keeps a bounded retry of the same id',async t=>{
+  const f=fixture(t,{resolveProfile:async()=>{throw Error('profile rejected');}});
+  const error=await f.router.dispatch({id:'profile-failed',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async()=>assert.fail('no submission')).catch(e=>e);
+  assert.match(error.message,/profile rejected/);assert.equal(error.code,'input-not-submitted');assert.equal(error.inputId,'profile-failed');
   const input=f.router.state.inputs['profile-failed'];
-  assert.equal(input.state,'failed-before-submit');assert.equal(input.submissionStartedAt,undefined);
-  assert.equal(input.reason,'Canonical model provider unavailable');assert.equal(f.router.inflight.size,0);
+  assert.deepEqual([input.state,input.submissionStartedAt,input.reason,input.retry.attempts,input.retry.evidence],['failed-before-submit',undefined,'profile rejected',1,'not-submitted']);
+  assert.ok(input.retry.nextAt>input.retry.lastFailureAt);assert.equal(f.router.inflight.size,0);
   assert.equal(new MobileRouter(f.args).state.inputs['profile-failed'].state,'failed-before-submit');
 });
 
