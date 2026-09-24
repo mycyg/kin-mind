@@ -37,34 +37,26 @@ carries the switches that default to **on**:
 | `semantic_cache_v2` | `mind_judgment_cache` and its dependency index | [Kin Mind](kin-mind.md#deepseek-and-memory) |
 | `memory_item_isolation` | Item-level isolation in the memory section, and `mind_memory_unorganized` | [mobile recovery](mobile-recovery.md) |
 | `recall_purpose_policy` | `source_evidence_class`: the reading purpose, the evidence classes and the labels every read surface carries | [architecture](architecture.md#reading-purpose-and-evidence-classes) |
-| `chunked_reply_review` | `mind_reply_review_chunks`: a long reply reviewed chunk by chunk, and the re-review of an unsent remainder | [autonomous planning](autonomous-planning.md#reply-review-admission-waits-and-step-verification) |
 
-Each is independent, and an explicit `false` restores the previous behaviour of
-that part alone. Every table above is new, so code without these features
-ignores it and reads the columns it always read; nothing here adds a column to a
-table that already existed. A rollback leaves the tables in place, and a
-re-enabled switch finds its history. `max_charged_attempts` is a number in the
-same configuration rather than a switch.
+Each is independent, and an explicit `false` turns off that part alone. None of
+them adds a column to a table that already existed, so code without these
+features reads the columns it always read. `mind_model_leases` also serves
+admission with `model_lanes` off; every other table above belongs to its switch
+alone. A rollback leaves the tables in place, and a re-enabled switch finds its
+history. `max_charged_attempts` is a number in the same configuration rather
+than a switch. `configure-memory` also accepts `chunked_reply_review` as a
+boolean; no code reads it.
 
-Two switches belong to the phone host's own configuration rather than to
-`configure-memory`, because the code they govern is a Node adapter and not the
-memory core. Both also default to on:
-
-| Host switch | Covers | Documented in |
-| --- | --- | --- |
-| `transport_manifest` | The durable reply-group manifest: one review, frozen bodies, fragments and receipts | [mobile recovery](mobile-recovery.md#complete-phone-replies) |
-| `reply_tail_decision` | Interrupting a group instead of cancelling it, and deciding its unsent remainder | [mobile routing](mobile-routing.md#the-unsent-rest-of-an-interrupted-reply) |
-
-Several mechanisms documented across these pages deliberately have no switch,
-because each replaces a behaviour that was wrong rather than adding one that is
-optional. The conflict taxonomy that classifies a commit failure adds fields to
-records that already existed. The outbox's single cancel rule, its dispatch
-outside the write transaction and `outbox_channel_contracts` replace a send that
-could report a delivery as canceled while its request was on the network. The
-proactive contact group's single whole-group review, the durability of the
-adapter state files, the bounded work-lock review chunks and the ordering of a
-degraded rerank likewise have none. The evidence isolation migration is not a
-switch either: it is an operator action with its own dry run and undo.
+Several mechanisms documented across these pages have no switch. The conflict
+taxonomy that classifies a commit failure only adds fields to existing records.
+The outbox's single cancel rule, its dispatch outside the write transaction and
+`outbox_channel_contracts` keep a delivery whose request may be on the network
+from being reported as canceled. The durable reply manifest with
+its fragments and receipts, the words of an unsent reply that it owes Kin's next
+turn, the proactive contact group's single local preflight, the durability of
+the adapter state files and the ordering of a degraded rerank have none either.
+The evidence isolation migration is not a switch: it is an operator action with
+its own dry run and undo.
 
 Cooling additionally requires seven full elapsed days, seven consecutive completed
 daily observation receipts, and a fresh `temperature_validation` with critical
@@ -75,8 +67,8 @@ shadow mode after a pause starts a new trial. Observation does not activate rank
 
 ## Event routing and revision
 
-`MemoryAssessment.event_routes` is committed in the existing appraisal
-transaction after source and graph validation. Each proposal includes:
+`MemoryAssessment.event_routes` is committed in the appraisal transaction after
+source and graph validation. Each proposal includes:
 
 - `key`, `action`, `evidence_ids`, `member_ids` and `reason`;
 - `event_id` and `expected_revision` for existing events;
@@ -88,27 +80,29 @@ transaction after source and graph validation. Each proposal includes:
 
 Actions are create, append, link, correct and defer. Explicit continuation includes
 an original quotation and a sourced model judgment of continuity.
-`sourced_continuation` handles natural-language references and remains compatible
-with `explicit_reference`. The model's `identity` decision covers participants, concrete object, continuation
+`sourced_continuation` handles natural-language references and is checked by the
+same rule as `explicit_reference`. The model's `identity` decision covers participants, concrete object, continuation
 and time compatibility, and cites `prior_record_ids`. The host captures their versions before the model
 request and verifies those original versions at commit. The host verifies that the
 quotation exists in the new explicit source and that the prior records belong to
 the current target event. It does not require a matching title or continuation
 keyword. Uncertain/different-event decisions remain deferred even with the same
 title. Same-task binding requires a canonical host task, rather than a shared broad
-topic. Artifact binding requires an actual artifact identity. Weak bindings
-remain deferred. Every member must belong to the authorized evidence scope.
+topic. Artifact binding requires an actual artifact identity. An append or a
+correction whose binding does not hold is deferred; a link can rest on a semantic
+candidate. Every member must belong to the authorized evidence scope.
 
 Membership is an active versioned `part_of` edge. Appending advances the event
 revision. Corrections retain source records and create `corrects` edges. They do
 not silently rewrite original speech or turn inferred records into explicit
 facts. A route has a stable command ID and returns `undo_command_id`, consumable
-by the graph's existing `undo` operation. Undo refuses to overwrite later edits.
+by the graph's `undo` operation. Undo refuses to overwrite later edits.
 
 `split_event` accepts an event ID, its expected revision, a proper subset of
 `member_ids`, a new title, source evidence and command ID. It creates another
-stable event and moves those membership edges. Existing merge/split-inverse/undo
-semantics remain available. Merge aliases retain old event IDs.
+stable event and moves those membership edges. The graph also merges and undoes;
+a bare `split` action is refused and names `split_event` for a division and
+`undo` for a reversal. Merge aliases retain old event IDs.
 
 ## Versioned digests
 
@@ -118,14 +112,14 @@ event and its ancestor topics. A 30-second debounce coalesces message bursts,
 with a five-minute maximum postponement.
 
 The digest contains sourced narrative, conclusions, pending work, corrections
-and unresolved points. Occurrence, receipt and summary times remain distinct.
+and unresolved points. Occurrence, receipt and summary times stay distinct.
 Its input hash includes graph nodes/edges, member revisions, source versions and
 the digest-rule version. A model request runs outside the write transaction;
 the commit compares the complete hash and dirty generation again. A concurrent
 message therefore invalidates the result instead of being overwritten.
 
 A single short source can be projected in full without a model. Multi-source
-summaries use DeepSeek high with the existing 65,536-token ceiling and truncation
+summaries use DeepSeek high with a 65,536-token output ceiling and truncation
 checks. Large evidence sets are prepared in complete sourced batches. Invalid
 citations, truncated output and incomplete preparation never replace the last
 good digest. Every generated unit retains its sources' confirmation basis.
@@ -137,10 +131,10 @@ index supports invalidation without scanning every graph object's JSON.
 
 A summary is built from what happened, so the membership snapshot behind it is an
 experience read. What the [reading purpose](architecture.md#reading-purpose-and-evidence-classes)
-newly removes from that membership enters the input hash together with the rules
-version, so exactly those events become dirty and are written again, while an
-event the older prefix rule already trimmed the same way keeps its signature and
-is not rebuilt for nothing. A derived view is never corrected in place: before a
+removes from that membership beyond the host envelopes enters the input hash
+together with the rules version, so exactly those events become dirty and are
+written again, while an event that loses only host envelopes keeps its signature
+and is not rebuilt for nothing. A derived view is never corrected in place: before a
 rebuild replaces it, the text it replaces is kept in `mind_isolation_archive`
 under the rules version that retired it. While the [evidence isolation](operations.md#evidence-isolation)
 migration is unfinished, a `ready` summary is reported as pending and never
@@ -150,13 +144,15 @@ still being applied.
 ## Retrieval interfaces
 
 `read_continuity_context` / host `memory-context` accept optional
-`mode=auto|light|deep`. Generic `RecallRequest.mode` remains effective through the
-Kin adapter. Ordinary light retrieval uses the existing local path and prepared
-views. Old-event, promise, version, sharing or contradictory-evidence questions
-select the deeper path; an explicit light mode remains local.
+`mode=auto|light|deep`. Generic `RecallRequest.mode` passes through the Kin
+adapter. Ordinary light retrieval uses the local path and prepared views. The
+routing classifier asks for the deeper path when a message needs old events,
+open promises, versions, what was shared or contradictory evidence, and `auto`
+on a read tool is deep; an explicit light mode stays local, and `auto` is
+otherwise light unless the request asks for history.
 
-Deep retrieval combines lexical matches, original user statements, existing
-Qwen vectors and graph neighbors. Every lane asks one policy loaded for the
+Deep retrieval combines lexical matches, original user statements, Qwen vectors
+and graph neighbors. Every lane asks one policy loaded for the
 request, so a legacy host envelope, a role configuration or a self-claim is kept
 out of an experience read and is returned, labelled, to an audit read.
 A graph read applies the same rule to its frontier: a node the purpose does not
@@ -189,20 +185,23 @@ ranking ever answered, the later rounds only reordered the same local evidence i
 order to feed one, so their reshuffling may not demote what the first round led
 with: the first round's leading eight stay in front, and whatever the later
 rounds surfaced follows them. A degraded recall is therefore never ordered worse
-than a recall that asked for no rerank at all. All new DeepSeek calls use high.
-No reasoning trace becomes a memory source.
+than a recall that asked for no rerank at all. Every DeepSeek call on this path
+uses high effort. No reasoning trace becomes a memory source.
 
 Results expose mode used, rounds, candidate/evidence versions, pending IDs,
 digest revisions, degradation reasons and separate retrieval/compression call
-counts. `local_recall_ms` measures candidate lookup, excluding existing affect,
-work-history and context rendering costs. Automatic chat background retains its
-existing 800-token allowance; the existing first-window startup allowance remains.
+counts. `local_recall_ms` measures candidate lookup, excluding affect,
+work-history and context rendering costs. Automatic chat background has an
+800-token allowance, and the first chat context of a session window 2,000; with
+`native_window_context` on, it takes what the selected material needs, up to
+8,000 tokens and the room the native window reports.
 
 `memory_context_read` counts digest/cache use, injection deduplication and missing
 coverage. `event_digest_refreshed` records end-to-end refresh latency.
-`structured_model_usage` records actual provider request IDs and token usage for
-every model call, the main appraisal call included; summary-cache hits and native
-cached-input tokens remain separate measurements. A call the provider reported no
+`structured_model_usage` records the provider request ID and token usage of each
+structured DeepSeek call that returned a body and of the main appraisal call; the
+memory service's own model roles record `model_tokens`, and summary-cache hits and
+native cached-input tokens are separate measurements. A call the provider reported no
 usage for writes `model_usage_unknown` and no token count at all: unreported usage
 is never a zero. That covers timeouts, network errors, HTTP failures, a missing
 tool call and an unverified model. A model role with no configured price reports
@@ -220,20 +219,23 @@ reads use `maintenance`. Reading only an index does not increase memory temperat
 
 ## Maintenance and usage
 
-The existing worker loop schedules jobs, with leases, renewal, retries and commit
+The worker loop schedules jobs, with leases, renewal, retries and commit
 fencing. Priority is source correction, live event digest, topic volumes, thermal
-statistics, then historical backfill. Expiring shared foreground leases stop new
-low-priority claims across independent host processes, while urgent corrections
-remain eligible. The phone host renews its lease from actual session/task state.
-A digest worker is single-flight to limit optional model load.
+statistics, then historical backfill. While any host process holds an unexpired
+shared foreground lease, a worker claims only the kinds that call no paid model —
+embedding, parsing, vector builds, rebuilds and history erasure — and every other
+job, source corrections included, waits for the lease to end. The phone host
+renews its lease from actual session/task state. At most two event digests run
+at once, never two for the same event, to limit optional model load.
 
-The organizer's scheduling eligibility now matches its executor: active,
+The organizer's scheduling eligibility matches its executor: active,
 nondeleted records at the indexed revision. Work deduplication uses eligible
 input versions; unrelated metrics or configuration changes cannot cause empty
 organization loops.
 
 Daily thermal maintenance is due at 03:30 Asia/Singapore. Topic integration is
-due on Wednesday/Sunday at 04:00. Missed slots are picked up while idle. Unchanged
+due on Wednesday/Sunday at 04:00. The most recent missed slot is picked up while
+nobody is interacting. Unchanged
 topic inputs have a completion receipt without another organization job. Leiden
 families supply candidates; only independently evidenced topic membership may
 publish automatic volumes. Relevant candidate families enter the existing
@@ -268,23 +270,16 @@ PYTHONPATH=src python scripts/lifecycle_replay.py \
 The frozen set requires at least 48 cases. Every required source group must be
 reached within eight candidates; exact duplicate channel imports are equivalent,
 including a frozen complete utterance quoted in an ingestion note; generated
-paraphrases are not. Recall metrics measure source retrieval,
-not whether an answer is correct. Evaluate delivered text separately. Fault tests
-cover source correction, concurrent arrival, invalid/truncated model output,
-leases, retries, split/undo, feature fences and access-origin semantics. Existing
-mobile completeness, model notices and shared-session tests remain release gates.
+paraphrases are not. The cases file also carries `frozen_before_retrieval`.
+Recall metrics measure source retrieval, not whether an answer is correct.
+Evaluate delivered text separately.
 
 Rollback disables the lifecycle switches and uses versioned graph undo where
 needed; a switch from either table above is set to `false` on its own, as above.
 Setting `recall_purpose_policy` to false does not delete a classification row or
 a stamp — it stops them being read, so re-enabling it finds the same classes; a
 store whose rows were written by the migration is taken back with that action's
-own `--undo`, and neither step rewrites a legacy record. Setting
-`chunked_reply_review` to false restores the single-call limits, which refuse a
-group over them outright. The phone host's `transport_manifest` and
-`reply_tail_decision` are set in its own configuration; with the first off every
-reply method behaves as it did before the manifest existed, and with only the
-second off an interrupted group is handled by the manifest alone.
+own `--undo`, and neither step rewrites a legacy record.
 Do not restore an old production database over new conversations or receipts.
 Retain the pre-rollout SQLite backup and original source/vector storage. Automatic
 volumes and summaries are derived views; source speech and delivery evidence
@@ -292,15 +287,18 @@ remain canonical.
 
 ## Semantic decisions and host verification
 
-DeepSeek high judges event identity, recall priority and follow-up reading,
-summary content, corrections, affect, exploration direction, sharing intent and
-session-maintenance advice. The existing combined appraisal carries these
-decisions with source references and concise reasons. Sharing preflight also uses
-the supplied model without trigger phrases or a lexical-overlap threshold.
+Model judgments make the semantic decisions, each with source references and a
+concise reason. The combined appraisal decides event identity, corrections,
+affect, exploration direction, sharing intent and session-maintenance advice;
+recall asks for priority and follow-up reading, and a digest for its summary
+content. These are DeepSeek high calls, except that the action lane's appraisal
+runs on the main-session model when the host is configured for it; see
+[Kin Mind](kin-mind.md#deepseek-and-memory).
 
 The host verifies citations, current versions, scope, command identity, actual
 execution/delivery receipts, deadlines, leases, budgets and owner-configured
 hard constraints. Keyword/vector/graph search generates candidates; a similarity
-score does not decide that two experiences are the same event. Fixed 30/90-day
-thermal calculations and contact/work-lock rules remain the owner's configured
-policy, while semantic choices are model judgments with an auditable source.
+score does not decide that two experiences are the same event. The 30/90-day
+thermal tiers are fixed in code and the contact and work-lock rules are the
+owner's configured host policy, while semantic choices are model judgments with
+an auditable source.
