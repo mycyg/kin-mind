@@ -25,7 +25,7 @@ function fixture(t, options={}) {
 const LIVE_MODELS=[
   {id:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEfforts:['high'],defaultReasoningEffort:'high',serviceTiers:['default'],defaultServiceTier:'default'},
   {id:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEfforts:['low','medium','high','xhigh','max'],defaultReasoningEffort:'medium',serviceTiers:[{id:'priority'}],defaultServiceTier:'priority'},
-  {id:'gpt-6-astra',aliases:['ASTRA-6'],provider:'custom-gateway',providerKind:'native',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium',serviceTiers:['default',{id:'priority'}],defaultServiceTier:'default'},
+  {id:'gpt-6-astra',aliases:['GPT‑6 Astra','ASTRA-6'],provider:'custom-gateway',providerKind:'native',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium',serviceTiers:['default',{id:'priority'}],defaultServiceTier:'default'},
 ];
 function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},classify=null,forceSwitch=null}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-profile-routing-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -91,17 +91,19 @@ test('a classification failure never manufactures work: the input waits as itsel
   const entry=f.router.state.semanticPending.question;
   assert.deepEqual([entry.failure.class,entry.attempts,entry.maxAttempts,entry.model],['timeout',2,4,'gpt-6-sol']);
   assert.equal(calls,2,'the live dispatch drove the first bounded retry of the same input');
-  // The budget is visible and bounded; after it, an explicit failed state.
+  // The budget is visible and bounded. After it the owner's message is still hers:
+  // it goes to Kin unlabelled, on the current profile, instead of ending unanswered (AD1-02).
   for(const _ of [1,2]){f.router.state.semanticPending.question.nextAttemptAt=0;await f.router.reviewSemanticPending();}
   assert.equal(calls,4);
-  assert.equal(f.router.state.inputs.question.state,'semantic-failed');
-  assert.equal(f.router.state.inputs.question.reason,'classification-exhausted');
+  const exhausted=f.router.state.inputs.question;
+  assert.deepEqual([exhausted.state,exhausted.route,exhausted.unlabeled,exhausted.failureClass,exhausted.taskId],['selected','chat',true,'timeout',null]);
   assert.equal(f.router.state.semanticPending.question.state,'failed');
+  assert.equal(f.router.state.semanticPending.question.text,undefined,'the owner text leaves the retry record once it is settled');
   assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
-  // A redrive never executes it and never asks again: it reports the explicit state.
-  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async()=>assert.fail('never submitted'));
-  assert.equal(outcome.route,'semantic-failed');
-  assert.equal(calls,4);
+  let submitted=0;
+  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async detail=>{submitted++;assert.equal(detail.model,'gpt-6-sol');return 'new-turn';});
+  assert.equal(outcome.route,'new-turn');assert.equal(submitted,1);
+  assert.equal(calls,4,'and it is never classified again');assert.deepEqual(f.switched,[]);
 });
 
 test('uncertain notification reconciles its original ID without another send',async t=>{
@@ -127,6 +129,8 @@ test('automatic work restores the exact prior full profile only after every open
   const f=profileFixture(t,{initial:{model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'},classify:async input=>({route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}})});
   await f.router.dispatch({id:'multi-work',text:'做两个独立步骤'},async()=> 'new-turn');
   const first=f.router.currentTask(),firstReturn=structuredClone(f.router.state.autoReturnProfile);
+  assert.equal(first.status,'proposed','a work label is only a proposal until Kin takes it on (N5)');
+  await f.router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-first',completedTaskId:first.id,completedInputVersion:first.inputVersion,reason:'I will do both steps'});
   const second={...structuredClone(first),id:'work-second',inputIds:['second'],inputVersion:1,summary:'second step',deliveries:{},tools:{},completion:null,createdAt:f.now()};
   f.router.state.tasks[second.id]=second;f.router.save('synthetic-second-task');
   for(const task of [first,second]){task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};task.stopReason='end_turn';task.turnEndedAt=f.now();task.deliveries['delivery-'+task.id]={state:'accepted',messageId:'m-'+task.id,inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:f.now()};}
@@ -364,11 +368,30 @@ test('explicit deferred mixed control without prior work does not wait on its ow
  assert.equal(f.router.state.requests['owner-mode:deferred-new-work'].state,'applied');assert.equal(f.router.tasks().length,1);
 });
 
-test('control-only interruption schedules the existing handoff after verified model application',async t=>{
+test('control-only interruption leaves the task open as a fact and injects no continuation (N2, AD1-23)',async t=>{
  let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
  const task=f.router.addTask({id:'original',text:'finish original deliverable'});Object.assign(f.runtime,{active:true,nativeStatus:'active'});
  await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
- assert.equal(task.handoff.state,'pending');assert.equal(task.handoff.id,'owner-mode:control-only');assert.equal(f.router.state.requests[task.handoff.id].state,'applied');assert.equal(task.inputVersion,1);
+ assert.equal(task.handoff,undefined,'the host never asks Kin to continue');
+ assert.equal(f.router.state.requests['owner-mode:control-only'].state,'applied');assert.equal(task.inputVersion,1);
+ assert.equal(f.router.tasks().length,1);
+ const [facts]=f.router.workFacts();
+ assert.deepEqual([facts.id,facts.status,Boolean(facts.interruptedBy)],[task.id,'running',true]);
+});
+
+test('an owner force switch keeps a declined outcome instead of resuming the task (AD1-23)',async t=>{
+ let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
+ const task=f.router.addTask({id:'original',text:'finish original deliverable'});
+ f.router.state.inputs.original={id:'original',kind:'owner',state:'accepted',hash:'h',at:1};
+ await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0});
+ await f.router.requestMode({mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:1,sourceInputId:'original',reason:'I will not do the rest',commandId:'decline'});
+ Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+ await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
+ assert.equal(task.handoff,undefined);
+ assert.deepEqual([task.completion.outcome,Boolean(task.completion.interruptedBy),task.completion.state],['declined',true,undefined]);
+ await f.router.observe('delivery',{taskId:task.id,inputVersion:1,turnFence:task.executionEpoch,sourceInputId:'original',id:'refusal',state:'accepted',messageId:'refusal-sent'});
+ await f.router.reconcile();
+ assert.equal(task.status,'canceled');assert.equal(task.outcome,'declined');
 });
 
 test('repeated manual profile keeps active work, tools and pending delivery intact, including restart',async t=>{
@@ -441,16 +464,58 @@ test('a historical canceled task cannot discard another task input after a class
   assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
 });
 
-test('a real stop of the captured task still retires late work classification',async t=>{
+test('late work never extends a task the owner is stopping: it opens its own proposal and is answered (AD1-01)',async t=>{
   let calls=0;
   const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
   const task=f.router.addTask({id:'current-work',text:'edit current article'});
   await f.router.select({id:'pending',text:'append a conclusion'});
   task.cancelRequested=true;
   await f.router.reviewSemanticPending();
-  assert.equal(f.router.state.inputs.pending.state,'semantic-canceled');
-  assert.equal(f.router.state.inputs.pending.reason,'superseded-by-cancel');
-  assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+  const record=f.router.state.inputs.pending;
+  assert.equal(record.state,'selected','the message is dispatched, never retired unanswered');
+  assert.notEqual(record.taskId,task.id);assert.equal(f.router.state.tasks[task.id].inputVersion,1);
+  assert.equal(f.router.state.tasks[record.taskId].status,'proposed');
+});
+
+test('a stop classified late is recorded on its own input and applied only then (AD1-01)',async t=>{
+  let calls=0;
+  const f=fixture(t,{classifyIntents:true,classify:async()=>{if(++calls===1)throw SyntaxError('unreadable');return{route:'work',reason:'owner wants it stopped',stop:'current_task'};}});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'stop-late',text:'别做了'});
+  assert.equal(task.cancelRequested,undefined,'a failed classification decides nothing');
+  await f.router.reviewSemanticPending();
+  const record=f.router.state.inputs['stop-late'];
+  assert.deepEqual([record.state,record.stop?.requested,record.taskId],['selected','current_task',task.id]);
+  assert.equal(task.cancelRequested,true);assert.equal(task.inputVersion,1,'the stop never becomes new work on the task');
+  let submitted=0;
+  await f.router.dispatch({id:'stop-late',text:'别做了'},async()=>{submitted++;return 'steered';});
+  assert.equal(submitted,1,'Kin reads the stop and answers it');
+  await f.router.reconcile();
+  assert.equal(task.status,'canceled');
+});
+
+test('an invalid classification answer can never leave a stop behind (AD1-01)',async t=>{
+  const f=fixture(t,{classifyIntents:true,classify:async()=>({route:'nonsense',stop:'current_task'})});
+  const task=f.router.addTask({id:'current-work',text:'edit current article'});
+  await f.router.select({id:'garbled',text:'hmm'});
+  assert.equal(task.cancelRequested,undefined);assert.equal(f.router.state.inputs.garbled.state,'semantic-pending');
+});
+
+test('classification and host preparation run outside the router mutex, on a checked basis (AD1-06)',async t=>{
+  let release;const gate=new Promise(resolve=>{release=resolve;});
+  const f=fixture(t,{classify:async()=>{await gate;return {route:'chat',reason:'slow'};},waitForIdle:async()=>{}});
+  const dispatching=f.router.dispatch({id:'slow',text:'hello'},async()=> 'new-turn');
+  await new Promise(resolve=>setTimeout(resolve,10));
+  await f.router.observe('tool',{id:'bookkeeping',status:'completed'});
+  assert.equal((await f.router.readRuntime()).actual.model,'gpt-6-sol','bookkeeping and reads go on while the classifier thinks');
+  release();assert.equal((await dispatching).route,'new-turn');
+  let prepared=0,sent=0;
+  const result=await f.router.dispatch({id:'prepared',text:'again',submissionProtocol:'host-boundary-v1'},async(decision,started)=>{
+    // A fence lands while the host prepares its prompt: nothing is sent on the old basis.
+    if(++prepared===1)f.router.state.executionEpoch++;
+    await started();sent++;return 'new-turn';});
+  assert.deepEqual([result.route,prepared,sent],['new-turn',2,1]);
+  assert.equal(f.router.state.inputs.prepared.executionEpoch,f.router.state.executionEpoch);
 });
 
 test('new independent work can retry after a prior task was canceled',async t=>{
@@ -465,12 +530,22 @@ test('new independent work can retry after a prior task was canceled',async t=>{
 });
 
 
-test('profile resolution failure settles the input before any native submission',async t=>{
-  const f=fixture(t,{resolveProfile:async()=>{throw Error('Canonical model provider unavailable');}});
-  await assert.rejects(f.router.dispatch({id:'profile-failed',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async()=>assert.fail('no submission')),/Canonical model provider unavailable/);
+test('an unavailable model catalog is a wait, never a failure of the owner input (AD1-02)',async t=>{
+  let unavailable=2,waits=0;
+  const f=fixture(t,{resolveProfile:async profile=>{if(unavailable-->0)throw Error('Canonical model provider unavailable');return structuredClone(profile);},waitForIdle:async()=>{waits++;}});
+  let submitted=0;
+  const result=await f.router.dispatch({id:'profile-wait',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async(_,started)=>{await started();submitted++;return 'new-turn';});
+  assert.deepEqual([result.route,submitted,waits],['new-turn',1,2]);
+  assert.equal(f.router.state.inputs['profile-wait'].state,'accepted');
+});
+
+test('a preparation failure before submission keeps a bounded retry of the same id',async t=>{
+  const f=fixture(t,{resolveProfile:async()=>{throw Error('profile rejected');}});
+  const error=await f.router.dispatch({id:'profile-failed',kind:'owner',text:'hello',submissionProtocol:'host-boundary-v1'},async()=>assert.fail('no submission')).catch(e=>e);
+  assert.match(error.message,/profile rejected/);assert.equal(error.code,'input-not-submitted');assert.equal(error.inputId,'profile-failed');
   const input=f.router.state.inputs['profile-failed'];
-  assert.equal(input.state,'failed-before-submit');assert.equal(input.submissionStartedAt,undefined);
-  assert.equal(input.reason,'Canonical model provider unavailable');assert.equal(f.router.inflight.size,0);
+  assert.deepEqual([input.state,input.submissionStartedAt,input.reason,input.retry.attempts,input.retry.evidence],['failed-before-submit',undefined,'profile rejected',1,'not-submitted']);
+  assert.ok(input.retry.nextAt>input.retry.lastFailureAt);assert.equal(f.router.inflight.size,0);
   assert.equal(new MobileRouter(f.args).state.inputs['profile-failed'].state,'failed-before-submit');
 });
 
