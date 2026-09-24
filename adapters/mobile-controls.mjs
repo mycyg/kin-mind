@@ -5,6 +5,9 @@ import {runtimeProfile} from './codex-models.mjs';
  * that turn ends unless Kin takes it on. */
 export const TASK_CLOSED=Object.freeze(['completed','canceled','partial','deferred','unclaimed']);
 export const openTask=task=>Boolean(task)&&!TASK_CLOSED.includes(task.status);
+/** Only for a model the live catalog gives no display name (AD1-15). */
+const FALLBACK_NAMES={'deepseek-flash':'DeepSeek Flash','gpt-6-astra':'GPT‑6 Astra','gpt-6-sol':'GPT‑6 Sol','gpt-5.6-sol':'GPT‑5.6 Sol'};
+export const displayName=(model,names=null)=>names?.[model]??FALLBACK_NAMES[model]??model;
 
 export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
   const canonical=runtime.known?runtime.sessionId===sessionId&&runtime.threadId===sessionId&&runtime.nativeSessionId===(state.nativeSessionId??sessionId):null;
@@ -25,10 +28,10 @@ export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
     ...(state.recovery?{recovery:state.recovery}:{})};
 }
 
-export function runtimeReply(view,{pending=false,switched=false}={}) {
+export function runtimeReply(view,{pending=false,switched=false,names=null}={}) {
   const actual=view.actual;
   if(!actual.verified)return '我还在核对当前模型，连接确认后再告诉你。';
-  const model=actual.model==='deepseek-flash'?'DeepSeek Flash':actual.model==='gpt-6-astra'?'GPT‑6 Astra':actual.model==='gpt-6-sol'?'GPT‑6 Sol':actual.model==='gpt-5.6-sol'?'GPT‑5.6 Sol':actual.model;
+  const model=displayName(actual.model,names);
   const mode=view.mode==='manual'?'手动模式':'自动模式';
   if(pending)return '切换正在处理。当前仍是 '+model+(actual.reasoningEffort?'（'+actual.reasoningEffort+'）':'')+'。';
   if(switched)return '已切换到 '+model+(actual.reasoningEffort?' · '+actual.reasoningEffort:'')+(actual.serviceTierPreference==='fast'?' · Fast 配置已开启':'')+'（'+mode+'）。';
