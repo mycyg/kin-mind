@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {ServiceRuntime} from '../../dsh-plugin/lib/service-runtime.js';
 import {Config} from '../../dsh-plugin/lib/config.js';
+import {apply} from '../../dsh-plugin/lib/index.js';
 
 test('plugin orders capture, recall, compact and end; offline messages remain durable',async t=>{
  const root=mkdtempSync(join(tmpdir(),'kin-plugin-'));
@@ -23,4 +24,11 @@ test('plugin orders capture, recall, compact and end; offline messages remain du
  globalThis.fetch=async()=>{throw Error('offline');};
  runtime.message('s','/synthetic-project','assistant','Unverified account',9);await runtime.flush('s');
  assert.equal(readdirSync(join(root,'host-spool')).filter(f=>f.endsWith('.json')).length,1);
+});
+
+test('the plugin runs the service transport only; a config asking for the removed file adapter is refused',()=>{
+ const events=[];
+ apply({on:name=>events.push(name),effect(){},get(){}},Config({}));
+ assert.ok(events.includes('tools/execute')&&events.includes('session/event'));
+ assert.throws(()=>apply({on(){throw Error('a listener was registered');},effect(){},get(){}},Config({legacyMode:true})),/legacyMode was removed/);
 });

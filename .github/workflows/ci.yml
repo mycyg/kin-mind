@@ -19,6 +19,7 @@ jobs:
       core: ${{ steps.paths.outputs.core }}
       node: ${{ steps.paths.outputs.node }}
       clients: ${{ steps.paths.outputs.clients }}
+      plugin: ${{ steps.paths.outputs.plugin }}
       docs: ${{ steps.paths.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -34,10 +35,15 @@ jobs:
           base = os.environ.get('BASE_REF')
           all_checks = os.environ['RUN_ALL'] == 'true' or not base or not base.strip('0')
           files = [] if all_checks else subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines()
+          # The HTTP contract is the Python service's: a change to its routes, models or responses
+          # is a change to what the console and the SDKs are promised, so it runs their checks too.
+          contract = ('src/eventmem/core/api.py','src/eventmem/core/models.py','src/eventmem/core/responses.py')
           checks = {
-            'core': any(p.startswith(('src/','tests/business/','scripts/')) or p in ('pyproject.toml','uv.lock') for p in files),
-            'node': any(p.startswith(('adapters/','tests/business/')) and p.endswith('.mjs') for p in files),
-            'clients': any(p.startswith(('console/','sdk/','dsh-plugin/','tests/clients/','contracts/')) or p in ('pyproject.toml','scripts/build_frontend.py','scripts/check_wheel.py') for p in files),
+            'core': any(p.startswith(('src/','tests/business/','scripts/','contracts/')) or p in ('pyproject.toml','uv.lock') for p in files),
+            'node': any(p.startswith('adapters/') or p.startswith('tests/business/') and p.endswith('.mjs') for p in files),
+            'clients': any(p.startswith(('console/','sdk/','tests/clients/','contracts/','src/eventmem/sdk/')) or p in contract or p in ('pyproject.toml','scripts/build_frontend.py','scripts/check_wheel.py','scripts/generate_contract.py','scripts/serve_fixture.py','tests/business/test_protocols_v1.py') for p in files),
+            # The DeepSeek Harness plugin is a separate public package; nothing Kin deploys uses it.
+            'plugin': any(p.startswith('dsh-plugin/') or p == 'tests/clients/plugin.mjs' for p in files),
             'docs': any(p.endswith('.md') or p.startswith('docs/diagrams/') or p == 'scripts/check-docs.mjs' for p in files),
           }
           if any(p.startswith('.github/workflows/') for p in files): all_checks = True
@@ -57,6 +63,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --frozen --extra dev --extra vector --extra graph
+      - run: uv run python scripts/generate_contract.py --check
       - run: uv run pytest -q tests/business
   node:
     needs: changes
@@ -81,8 +88,11 @@ jobs:
         with:
           python-version: '3.13'
       - run: uv sync --frozen --extra dev --extra vector --extra graph
-      - run: npm ci --prefix dsh-plugin && npm run typecheck --prefix dsh-plugin && npm test --prefix dsh-plugin
-      - run: npm ci --prefix sdk/typescript && npm run build --prefix sdk/typescript && npm test --prefix sdk/typescript
+      - run: uv run python scripts/generate_contract.py --check
+      - run: npm ci --prefix sdk/typescript && npm run generate --prefix sdk/typescript && git diff --exit-code sdk/typescript/src/schema.ts
+      - run: npm run build --prefix sdk/typescript && npm test --prefix sdk/typescript
+      # The TypeScript SDK against the running Python service, the case core skips without a build.
+      - run: uv run pytest -q tests/business/test_protocols_v1.py -k typescript
       - run: uv build
       - run: uv run python scripts/check_wheel.py
       - run: npx --prefix console playwright install --with-deps chromium
@@ -94,6 +104,16 @@ jobs:
           path: |
             console/test-results
             dist/*
+  plugin:
+    needs: changes
+    if: needs.changes.outputs.plugin == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix dsh-plugin && npm run typecheck --prefix dsh-plugin && npm test --prefix dsh-plugin
   docs:
     needs: changes
     if: needs.changes.outputs.docs == 'true'

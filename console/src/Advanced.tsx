@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type Scope } from "./api";
+import { api, save, type Scope } from "./api";
 
 export function FamilyEditor({
   families,
@@ -233,7 +233,8 @@ export function AttachmentPreview({
     [mime, setMime] = useState(""),
     [page, setPage] = useState(locator?.page ?? 1),
     [start, setStart] = useState(locator?.start_seconds ?? 0),
-    [text, setText] = useState("");
+    [text, setText] = useState(""),
+    [unsupported, setUnsupported] = useState(false);
   useEffect(
     () => () => {
       if (url) URL.revokeObjectURL(url);
@@ -243,6 +244,7 @@ export function AttachmentPreview({
   useEffect(() => {
     setUrl("");
     setText("");
+    setUnsupported(false);
     setPage(locator?.page ?? 1);
     setStart(locator?.start_seconds ?? 0);
   }, [source.id]);
@@ -269,8 +271,13 @@ export function AttachmentPreview({
           path: { source_id: source.id },
         });
       }
-      if (type.startsWith("text/")) {
+      setUnsupported(false);
+      if (type.startsWith("text/") || /[/+](json|x-ndjson|xml|yaml|csv)$/.test(type)) {
         setText(new TextDecoder().decode(bytes));
+        return;
+      }
+      if (!/^(image|video|audio)\//.test(type)) {
+        setUnsupported(true);
         return;
       }
       setMime(type);
@@ -311,6 +318,9 @@ export function AttachmentPreview({
       {url && mime.startsWith("video/") && <video src={url} controls />}
       {url && mime.startsWith("audio/") && <audio src={url} controls />}
       {text && <pre>{text}</pre>}
+      {unsupported && (
+        <p className="form-help">这种附件不能在这里预览，请下载原文件查看。</p>
+      )}
     </section>
   );
 }
@@ -319,16 +329,17 @@ export function DataControls({ run, notice }: { run: any; notice: any }) {
   const download = (kind: string) =>
     run(async () => {
       const created = await api.call("create_download", { path: { kind } });
-      const bytes = await api.call("download_export", {
-        path: { name: created.id },
-      });
-      const url = URL.createObjectURL(new Blob([bytes]));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = created.id;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 30000);
-      notice("导出文件已生成");
+      const place = created.details?.path ? `：${created.details.path}` : "";
+      if (created.status !== "ready") {
+        notice(`${created.id} 正在生成，完成后在服务的导出目录里${place}`);
+        return;
+      }
+      // Streamed into a Blob by the browser, never held as one ArrayBuffer by the page.
+      await save(
+        await api.response("download_export", { path: { name: created.id } }),
+        created.id,
+      );
+      notice(`导出文件已生成${place}`);
     });
   return (
     <section className="panel">
@@ -363,13 +374,28 @@ export function DataControls({ run, notice }: { run: any; notice: any }) {
   );
 }
 
+const budgetScenarios = ["tool", "companion", "knowledge"],
+  budgetPhases = ["startup", "passive", "cumulative"];
+const budgetDefault = (s: string, p: string) =>
+  p === "startup"
+    ? s === "companion"
+      ? 4000
+      : 2000
+    : p === "passive"
+      ? s === "companion"
+        ? 512
+        : 256
+      : s === "companion"
+        ? 16000
+        : 12000;
 export function BudgetSettings({ run, notice }: { run: any; notice: any }) {
   const [values, setValues] = useState<any>({});
+  const shown = (s: string, p: string) => values[s]?.[p] ?? budgetDefault(s, p);
   useEffect(() => {
-    void api
-      .call("read_settings", { path: { key: "budgets" } })
-      .then(setValues);
-  }, []);
+    void run(async () =>
+      setValues(await api.call("read_settings", { path: { key: "budgets" } })),
+    );
+  }, [run]);
   return (
     <section className="panel">
       <h2>上下文预算</h2>
@@ -378,29 +404,34 @@ export function BudgetSettings({ run, notice }: { run: any; notice: any }) {
         onSubmit={(e) => {
           e.preventDefault();
           const form = new FormData(e.currentTarget);
-          const result: any = {};
-          for (const scenario of ["tool", "companion", "knowledge"]) {
-            result[scenario] = {};
-            for (const phase of ["startup", "passive", "cumulative"])
-              result[scenario][phase] = Number(
-                form.get(scenario + "-" + phase),
-              );
-          }
+          const edited: [string, string, number][] = [];
+          for (const s of budgetScenarios)
+            for (const p of budgetPhases) {
+              const value = Number(form.get(s + "-" + p));
+              if (value !== shown(s, p)) edited.push([s, p, value]);
+            }
           void run(async () => {
+            // Saving replaces the whole key. Scenarios this form does not show, and changes made
+            // elsewhere since it was read, are kept by starting from the stored value.
+            const next: any = {
+              ...(await api.call("read_settings", { path: { key: "budgets" } })),
+            };
+            for (const [s, p, value] of edited) next[s] = { ...next[s], [p]: value };
             await api.call("configure_settings", {
               path: { key: "budgets" },
-              body: result,
+              body: next,
             });
+            setValues(next);
             notice("上下文预算已保存");
           });
         }}
       >
-        {["tool", "companion", "knowledge"].map((s) => (
+        {budgetScenarios.map((s) => (
           <div className="budget-grid" key={s}>
             <strong>
               {{ tool: "工具协作", companion: "陪伴", knowledge: "知识" }[s]}
             </strong>
-            {["startup", "passive", "cumulative"].map((p) => (
+            {budgetPhases.map((p) => (
               <label key={p}>
                 {
                   {
@@ -415,20 +446,7 @@ export function BudgetSettings({ run, notice }: { run: any; notice: any }) {
                   min="0"
                   max="128000"
                   key={`${s}-${p}-${values[s]?.[p]}`}
-                  defaultValue={
-                    values[s]?.[p] ??
-                    (p === "startup"
-                      ? s === "companion"
-                        ? 4000
-                        : 2000
-                      : p === "passive"
-                        ? s === "companion"
-                          ? 512
-                          : 256
-                        : s === "companion"
-                          ? 16000
-                          : 12000)
-                  }
+                  defaultValue={shown(s, p)}
                 />
               </label>
             ))}
