@@ -6,6 +6,7 @@ import {publicMobileRuntime,runtimeReply} from './mobile-controls.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {messageIntents} from './mobile-reviewer.mjs';
 import {runtimeProfile,profileMatches,normalizeModelCatalog,resolveModelProfile} from './codex-models.mjs';
+import {inputSettled,inputInFlight,inputSummary,unsettledView,emptySummary,ownerInput,answered} from './input-ledger.mjs';
 
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
@@ -31,6 +32,7 @@ export const SEMANTIC_RETRY_BUDGET=4;
  * unknown is looked up at most this many times before it stops polling. */
 export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
+const frozenError=reason=>Object.assign(Error('Dispatch is frozen: '+reason),{code:'dispatch-frozen',retryable:true});
 /** Why a classification attempt failed. The class is recorded, never collapsed
  * into one anonymous catch: timeout / http / parse / unavailable. */
 export function classificationFailure(error) {
@@ -108,9 +110,9 @@ export class MobileRouter {
    * Left off, every request and every record is what it was before intents existed. */
   constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch});
-    this.tail=Promise.resolve();this.inflight=new Map();
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
-    this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4}};
+    this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
     // A quarantined revision is never a silent fresh start: what happened is recorded,
     // and with nothing left to restore the accepted inputs come back from the journal.
@@ -128,8 +130,24 @@ export class MobileRouter {
     // A classification attempt interrupted mid-call is retried, never concluded.
     for(const entry of Object.values(this.state.semanticPending))if(entry.state==='classifying')entry.state='retry';
     // An interrupted acceptance/switch cannot safely be replayed after restart.
-    for(const record of Object.values(this.state.inputs)){if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';}
+    const at=now();
+    for(const record of Object.values(this.state.inputs)){
+      if(record.state==='submitting')record.state='unconfirmed';if(record.state==='preparing')record.state='failed-before-submit';
+      // A native turn cannot outlive the process that ran it.
+      if(record.turnStartedAt&&!(record.turnEndedAt>=record.turnStartedAt)){record.turnEndedAt=at;record.stopReason='host-restart';}
+    }
+    delete this.state.turn;
     if(this.state.transition?.state==='switching')this.state.transition.state='unconfirmed';
+    // KIN-FIX-20260924: records written before the ledger existed have no reply facts.
+    // An accepted one is taken as answered; any other keeps its reason and id as
+    // history and is never acted on, or counted as unsettled, again.
+    if(this.state.ledgerVersion!==2) {
+      for(const record of Object.values(this.state.inputs)) {
+        if(record.state==='accepted')record.answer??={state:'legacy'};
+        else if(!inputInFlight(record)&&record.state!=='superseded')record.historical={at,reason:'pre-ledger:'+record.state};
+      }
+      this.state.ledgerVersion=2;
+    }
     this.save('startup');
   }
   save(kind,detail={}) {
@@ -187,6 +205,52 @@ export class MobileRouter {
   verified(runtime,profile) {
     return runtime.known&&runtime.profileReady!==false&&profileMatches(runtime,profile)&&
       runtime.sessionId===this.sessionId&&runtime.threadId===this.sessionId&&runtime.nativeSessionId===(this.state.nativeSessionId??this.sessionId);
+  }
+  // ---- The input ledger: the one definition of an unsettled input, its eight-state
+  // summary, and the freeze a release or a segment swap puts on new dispatch.
+  /** Every input with no outcome yet, by its original id and fact state. Inbox jobs
+   * the router has not seen yet are named by the host through `received`. */
+  unsettledInputs({received=[]}={}) {
+    const now=this.now(),list=Object.values(this.state.inputs).filter(record=>!inputSettled(record)).map(record=>unsettledView(record,now));
+    for(const job of received)if(!this.state.inputs[job.id])
+      list.push({id:job.id,kind:job.kind??'owner',state:'received',summary:'received',inFlight:job.processing===true,at:job.at??null,ageMs:Number.isFinite(job.at)?Math.max(0,now-job.at):null});
+    return list;
+  }
+  /** Owner inputs in the eight summary states. Records older than the ledger are
+   * counted apart, and the host's own turns are summarised on their own. */
+  summary({received=[]}={}) {
+    const owner=emptySummary(),internal=emptySummary();let historical=0;
+    for(const record of Object.values(this.state.inputs)) {
+      const state=inputSummary(record);
+      if(state==='historical'){historical++;continue;}
+      (ownerInput(record)?owner:internal)[state]++;
+    }
+    for(const job of received)if(!this.state.inputs[job.id])owner.received++;
+    return {...owner,historical,internal,frozen:this.frozen()?clone(this.state.freeze):null};
+  }
+  frozen() {
+    const freeze=this.state.freeze;
+    return Boolean(freeze&&!(Number.isFinite(freeze.until)&&freeze.until<=this.now()));
+  }
+  /** Stop new dispatch — both channels, the mind's turns, handoffs and mode changes
+   * nobody forced — while in-flight work settles. The owner's literal stop and her
+   * own mode commands still act. It survives a restart and lifts itself at `until`,
+   * so a release that fails half way can never leave the owner unanswered for good. */
+  freezeDispatch(reason,{ttlMs=20*60000,by=null}={}) {
+    return this.locked(async()=>{
+      if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
+      const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:20*60000,60000),2*3600000);
+      this.state.freeze={reason:reason.trim().slice(0,200),at:this.frozen()?this.state.freeze.at:this.now(),until:this.now()+ttl,...(by?{by:String(by).slice(0,120)}:{})};
+      this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until});
+      return clone(this.state.freeze);
+    });
+  }
+  thawDispatch(reason='thawed') {
+    return this.locked(async()=>{
+      const previous=this.state.freeze;if(!previous)return {state:'not-frozen'};
+      delete this.state.freeze;this.save('dispatch-thawed',{reason:String(reason).slice(0,200),frozenAt:previous.at});
+      return {state:'thawed',frozenAt:previous.at};
+    });
   }
   async availableModels(runtime=null) {
     try{return normalizeModelCatalog(await this.modelCatalog?.(runtime)??[]);}catch{return [];}
@@ -279,7 +343,12 @@ export class MobileRouter {
         if(previous.recovered)throw Error('Input acceptance requires reconciliation');
         if(previous.hash!==hash)throw Error('Input id reused with different content');
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
-        if(previous.state==='failed-before-submit'){previous.state='selected';this.save('input-preparation-retry',{id:input.id});}
+        // What predates the ledger keeps its reason and id and is never re-run.
+        if(previous.historical)throw Object.assign(Error('Historical input is not re-run: '+previous.historical.reason),{code:'input-historical'});
+        if(previous.state==='failed-before-submit'){
+          if(this.frozen())throw frozenError(this.state.freeze.reason);
+          previous.state='selected';this.save('input-preparation-retry',{id:input.id});
+        }
         return clone(previous);
       }
       // The literal stop is read before any model is asked, and answers on its own when none can be.
@@ -287,6 +356,7 @@ export class MobileRouter {
       const owner=!input.kind||input.kind==='owner';
       const intents=this.classifyIntents&&owner;
       let command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
       const priorTask=this.currentTask();
       if(priorTask?.completion?.outcome==='declined'&&this.declineReady(priorTask,runtime)){
@@ -714,6 +784,7 @@ export class MobileRouter {
       }
       const request=Object.values(this.state.requests).findLast(r=>r.state==='pending'&&['work','auto','manual'].includes(r.mode));
       if(!request)return{state:'pending'};
+      if(this.frozen()&&!request.force)return clone(request);
       await this.applyModeRequest(request,runtime);return clone(request);
     });
   }
@@ -1055,8 +1126,55 @@ export class MobileRouter {
       });
     }
   }
+  // ---- Facts for the ledger: which inputs a native prompt carries, when it ends, and
+  // what of the reply reached the owner.
+  turnStarted(data) {
+    const ids=[...new Set(Array.isArray(data.inputIds)?data.inputIds:[])],at=this.now();
+    this.state.turn={startedAt:at,inputIds:ids};
+    for(const id of ids) {
+      const record=this.state.inputs[id];if(!record)continue;
+      if(record.state==='queued'){record.state='accepted';record.acceptedAt=at;}
+      if(['accepted','submitting'].includes(record.state)){record.turnStartedAt=at;delete record.turnEndedAt;delete record.stopReason;this.progress.set(id,at);}
+    }
+    return ids.length>0;
+  }
+  turnEnded(data) {
+    const turn=this.state.turn,at=this.now();if(!turn)return false;
+    for(const id of turn.inputIds) {
+      const record=this.state.inputs[id];if(!record?.turnStartedAt||record.turnEndedAt>=record.turnStartedAt)continue;
+      record.turnEndedAt=at;record.stopReason=data.stopReason??null;
+      if(!ownerInput(record))record.settledAt??=at;
+    }
+    delete this.state.turn;
+    return true;
+  }
+  /** A bubble answering an input reached the platform, or was refused. */
+  inputDelivery(data) {
+    const record=typeof data.sourceInputId==='string'?this.state.inputs[data.sourceInputId]:null;
+    if(!record)return false;
+    this.progress.set(record.id,this.now());
+    if(data.state==='accepted'&&data.messageId){record.delivered=(record.delivered??0)+1;record.lastDeliveredAt=this.now();return true;}
+    if(['rejected','undeliverable'].includes(data.state)){record.undelivered=(record.undelivered??0)+1;return true;}
+    return false;
+  }
+  /** The whole reply to an owner input reached the platform, or Kin chose not to
+   * reply. Earlier owner inputs already in the session when it came are answered by it. */
+  inputAnswered(kind,data) {
+    const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
+    if(!record)return false;
+    const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return false;
+    const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
+    const basis=record.acceptedAt??at;
+    if(ownerInput(record))for(const other of Object.values(this.state.inputs))
+      if(other!==record&&ownerInput(other)&&other.state==='accepted'&&!answered(other)&&(other.acceptedAt??Infinity)<=basis){other.answer={state:'covered',by:record.id,at};other.settledAt??=at;}
+    return true;
+  }
   observe(kind,data={}) {
     return this.locked(async()=>{
+      if(kind==='prompt-start')this.turnStarted(data);
+      if(kind==='prompt-end')this.turnEnded(data);
+      if(kind==='delivery'&&data.sourceInputId)this.inputDelivery(data);
+      if(kind==='reply-complete'||kind==='reply-choice'){if(this.inputAnswered(kind,data))this.save(kind,{inputId:data.inputId});return;}
       // An explicit null belongs to a no-task/chat turn. It must not be rebound to
       // whichever task happens to be current when a delayed callback arrives.
       const task=Object.hasOwn(data,'taskId')?(data.taskId?this.state.tasks[data.taskId]:null):this.currentTask();
@@ -1207,7 +1325,7 @@ export class MobileRouter {
         const commandId='automatic-restore:'+digest([this.state.revision,this.state.autoReturnProfile]).slice(0,24);
         this.recordModeRequest({commandId,mode:'auto',reason:'All automatic work tasks are settled',notify:true});
       }
-      for(const request of Object.values(this.state.requests))if(request.state==='pending') {
+      if(!this.frozen())for(const request of Object.values(this.state.requests))if(request.state==='pending') {
         if(request.deferUntilSettled&&this.tasks().length)continue;
         const target=request.mode==='manual'?request.profile:request.mode==='work'?ROUTER_PROFILES.work:!this.tasks().length?this.automaticIdleProfile():null;
         if(target&&this.verified(runtime,target)) {await this.applyModeRequest(request,runtime);changed=true;}

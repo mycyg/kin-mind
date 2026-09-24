@@ -7,6 +7,7 @@ import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
+import {holdsSession} from './input-ledger.mjs';
 import {switchCodexModel,runtimeProfile,profileMatches} from './codex-models.mjs';
 import {sameInstructionBinding,verifyCompanionInstructions} from './instruction-evidence.mjs';
 const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -125,7 +126,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const session=bridge.sessionManager.getSession(bridge.ownerId);
     const foreground=ownerSessionWork(session,tasks,bridge.mainAssessment?.token);
     const snapshot=await mindCall('session-snapshot',{pending,tasks,foreground});
-    const outstanding=inputs.filter(i=>['selected','submitting','unconfirmed'].includes(i.state));
+    const outstanding=inputs.filter(holdsSession);
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
     snapshot.cursors={...snapshot.cursors,inputs:digest(inputs.map(i=>[i.id,i.state,i.hash])),tasks:digest(tasks),config:state.configRevision??0};
     return {...snapshot,reviewCursors:sessionReviewCursors(snapshot.cursors,inputs),tasks,inputs:outstanding,notices:Object.values(state.notices),contactRunning:Boolean(bridge.mindHost?.contactRunning)};
