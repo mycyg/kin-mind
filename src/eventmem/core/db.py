@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
@@ -9,10 +10,14 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+# The rows `meta` starts with, written only when missing: an INSERT takes the write lock even when
+# it ignores, and every Engine() used to take it twice here (E2-08). `schema_version` names the
+# backup format family restore() accepts; the structure itself only grows (every statement is
+# IF NOT EXISTS, or an ALTER guarded by a look first), and `structure_digest` says what it is.
+META_DEFAULTS = (("generation", 0), ("schema_version", 1))
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
-INSERT OR IGNORE INTO meta VALUES('generation',0);
-INSERT OR IGNORE INTO meta VALUES('schema_version',1);
 CREATE TABLE IF NOT EXISTS sources(
  id TEXT PRIMARY KEY, namespace TEXT NOT NULL, source_key TEXT NOT NULL, version TEXT NOT NULL,
  scope TEXT NOT NULL, session TEXT NOT NULL, received_at TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -100,6 +105,13 @@ def digest(value) -> str:
     ).hexdigest()
 
 
+def structure_digest(conn) -> str:
+    """What this store's structure is: one digest over every table, index and trigger definition,
+    so two stores, or a store before and after a deploy, can be told apart (E2-08)."""
+    rows = conn.execute("SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name").fetchall()
+    return digest([list(row) for row in rows])[:16]
+
+
 def tokenize(text: str) -> str:
     words = re.findall(r"[a-zA-Z0-9_]+", text)
     code_words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", " ".join(words))
@@ -141,6 +153,21 @@ class Deleted(Conflict):
     pass
 
 
+# Set inside a look that must leave the store as it found it (S1-02).
+_UNRECORDED = contextvars.ContextVar("eventmem_unrecorded", default=False)
+
+
+@contextmanager
+def unrecorded():
+    """A read that records nothing about itself: no telemetry of the memory it looked at is
+    written inside (S1-02). What a model call costs is recorded all the same (`model_*`)."""
+    token = _UNRECORDED.set(True)
+    try:
+        yield
+    finally:
+        _UNRECORDED.reset(token)
+
+
 class Database:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
@@ -154,13 +181,16 @@ class Database:
             initialize(conn)
             from .read_policy import SCHEMA as READ_POLICY_SCHEMA
             conn.executescript(READ_POLICY_SCHEMA)
+            for key, value in META_DEFAULTS:
+                if not conn.execute("SELECT 1 FROM meta WHERE key=?", (key,)).fetchone():
+                    conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, value))
         os.chmod(self.path, 0o600)
 
     @contextmanager
     def connect(self, write=False):
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
+        # No table declares a foreign key; references are kept by engine.delete()'s own cascade.
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
@@ -207,6 +237,8 @@ class Database:
         return key
 
     def metric(self, name, value, data=None):
+        if _UNRECORDED.get() and not name.startswith("model_"):
+            return
         from kin_mind.maintenance import trim_metrics
 
         from .models import now

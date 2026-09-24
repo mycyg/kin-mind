@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -231,6 +232,10 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
     # What this process is running, fixed at start: a health check compares it with the revision
     # the deployment names, and a service that outlived a deployment shows it (H3-05, E2-14).
     source = {"root": str(Path(__file__).resolve().parents[2]), "revision": loaded_revision(), "started_at": now()}
+    # The structure this store has at start, not a constant (E2-08).
+    from .db import structure_digest
+    with engine.db.connect() as conn:
+        schema = structure_digest(conn)
     mcp_server = None
     if mcp_enabled:
         from .mcp import create_mcp
@@ -323,7 +328,7 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         """Ready means the background loop is going round as well: reminders, extraction,
         organising and host replay all run on it, so a service whose loop has stopped is not
         healthy however well it answers (E2-02, H3-09)."""
-        answer = {"status": "ready", "version": "1.0.0", "schema": 1, "source": source}
+        answer = {"status": "ready", "version": "1.0.0", "schema": schema, "source": source}
         if not workers:
             return answer | {"worker": {"enabled": False}}
         thread = app.state.worker_thread
@@ -442,12 +447,13 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
 
     @app.post("/v1/recall", operation_id="recall", response_model=RecallResult | ContextRecallResult)
     def recall(request: RecallRequest) -> dict:
-        # A recall over HTTP is somebody looking, from the console or a client: it is not a use
-        # of the memory by Kin, so it strengthens nothing, holds no foreground lease, and calls
-        # a model only when deep mode was asked for (S1-02). A caller that names its session is
-        # accounted to that session's window as before.
+        # A recall without a session is somebody looking, from the console or a client: it is
+        # not a use of the memory by Kin. It writes nothing — no access, no use, no memory
+        # telemetry, no lease — however often it is retried, and calls a model only when deep
+        # mode was asked for (S1-02). A caller that names its session is accounted to that
+        # session's window as before.
         return engine.recall(request, access_origin="user_query" if request.session else "maintenance",
-                             allow_model=request.mode == "deep")
+                             allow_model=request.mode == "deep", record=bool(request.session))
 
     @app.get(
         "/v1/memories/{record_id}",
@@ -466,18 +472,22 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         from .reading import read_segment
 
         # The record as stored, whatever the scope's context settings: the console edits what
-        # it reads here, so it is never handed a compressed rendering of it (S1-01).
-        return read_segment(
-            engine,
-            record_id,
-            at=at,
-            known_at=known_at,
-            offset=offset,
-            length=length,
-            budget=budget,
-            session=session,
-            original=True,
-        )
+        # it reads here, so it is never handed a compressed rendering of it (S1-01). Without a
+        # session it is a look, and records nothing about itself either (S1-02).
+        from .db import unrecorded
+
+        with unrecorded() if not session else contextlib.nullcontext():
+            return read_segment(
+                engine,
+                record_id,
+                at=at,
+                known_at=known_at,
+                offset=offset,
+                length=length,
+                budget=budget,
+                session=session,
+                original=True,
+            )
 
     @app.get("/v1/memories/{record_id}/revisions", operation_id="read_revisions")
     def read_revisions(

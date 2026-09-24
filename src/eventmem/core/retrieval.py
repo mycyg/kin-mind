@@ -522,10 +522,21 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
     return [docs[rid] for rid in ordered], trace, generation
 
 
-def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_model=None):
+def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_model=None, record=True):
     """`access_origin` says who is reading: the default is a use of the memory somebody waits
-    for; "maintenance" is a look that must not count as one (an HTTP recall from the console).
-    `allow_model` narrows when the kin context may call a model; left out, a search or read may."""
+    for; "maintenance" is a look that must not count as one.
+    `allow_model` narrows when the kin context may call a model; left out, a search or read may.
+    `record=False` is a look that leaves the store as it found it, however often it is repeated:
+    no access, no use, no memory telemetry, no lease (S1-02; the console's recall lab)."""
+    if not record:
+        from .db import unrecorded
+
+        with unrecorded():
+            return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=False)
+    return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=True)
+
+
+def _recall(engine, request, *, access_origin, allow_model, record):
     from kin_mind.context import Contexts, enabled
     if enabled(engine, request.scope):
         from kin_mind.state import Mind
@@ -536,7 +547,7 @@ def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_
             session=request.session or "", budget=request.budget, history=request.history,
             allow_model=explicit if allow_model is None else explicit and allow_model,
             mode="deep" if request.mode == "deep" else "light",
-            recall_purpose=request.recall_purpose, access_origin=access_origin)
+            recall_purpose=request.recall_purpose, access_origin=access_origin, record=record)
         # The context's own shape, complete: its index is what it selected, never records
         # dressed as the other shape's items (E3-20, S1-01).
         return {**result, "items": result.get("index", []), "generation": engine.db.generation(),

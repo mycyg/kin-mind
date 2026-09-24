@@ -735,7 +735,7 @@ class Contexts:
                 "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=()):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True):
         started = time.monotonic()
         if mode not in {"auto", "light", "deep"}:
             raise ValueError("Unknown recall mode")
@@ -747,7 +747,7 @@ class Contexts:
         native_window = settings["native_window_context"]
         automatic_budget = budget is None and native_window
         budget = BUDGETS[purpose] if budget is None else budget
-        if settings["event_lifecycle"] and purpose in {"chat", "work", "read"} and access_origin == "user_query":
+        if record and settings["event_lifecycle"] and purpose in {"chat", "work", "read"} and access_origin == "user_query":
             from .lifecycle import foreground_lease
             foreground_lease(self.engine, self.mind.scope.key(), "read:" + session)
         from .adaptive_recall import host_envelope, select_mode
@@ -885,7 +885,8 @@ class Contexts:
             "context_deduplicated": sum(window["seen"].get(i["id"]) == i["revision"] for i in unique.values()) if not explicit else 0,
             "omitted_count": len(packed["omitted_ids"]), "pending_count": len(packed["pending_ids"]),
             "degraded_reasons": packed.get("degraded_reasons", []), "tokens": packed["tokens"]})
-        if explicit and (settings["temperature_shadow"] or settings["usage_reinforcement"]):
+        # A look that records nothing (S1-02) reads exactly as a use would, and is not one.
+        if record and explicit and (settings["temperature_shadow"] or settings["usage_reinforcement"]):
             for item in packed["index"]:
                 if item["id"] in packed["covered_ids"]:
                     self.memory.access(session, item["id"], str(item["revision"]), item["depth"],
