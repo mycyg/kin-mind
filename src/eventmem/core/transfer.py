@@ -1,15 +1,55 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
 import tarfile
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 
-from .db import Conflict, digest, dumps
+from .db import Conflict, dumps
 from .engine import Engine
 from .models import RecordInput, Scope, SourceInput
+
+# What a store holds outside its database that nothing rebuilds from it: the persona's
+# canonical text, Kin's self-knowledge, the versions of configuration and persona, and the
+# archives history compaction moved old events into. A backup carries them; credentials,
+# locks, caches and vectors (re-embedded after a restore) stay out (E2-09).
+STORE_FILES = ("persona-policy.json", "kin-self-knowledge.json")
+STORE_FOLDERS = ("configuration-versions", "persona-versions", "archive")
+CHUNK = 1024 * 1024
+
+
+def file_digest(path):
+    """A file's SHA-256, read a chunk at a time: a backup never holds a whole database in
+    memory to hash it (S1-13)."""
+    found = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            found.update(chunk)
+    return found.hexdigest()
+
+
+def store_files(root):
+    """The STORE_FILES and the files under STORE_FOLDERS that exist, as paths relative to the
+    root. Links are never followed or copied."""
+    root = Path(root)
+    found = [name for name in STORE_FILES if (root / name).is_file() and not (root / name).is_symlink()]
+    for name in STORE_FOLDERS:
+        folder = root / name
+        if folder.is_dir() and not folder.is_symlink():
+            found += sorted(path.relative_to(root).as_posix() for path in folder.rglob("*")
+                            if path.is_file() and not path.is_symlink())
+    return found
+
+
+def store_file_name(name):
+    """Whether a backup entry is one of the store's own files."""
+    parts = PurePosixPath(name).parts
+    return (name in STORE_FILES or (len(parts) >= 2 and parts[0] in STORE_FOLDERS)) and not any(
+        part in {"", ".", ".."} for part in parts)
 
 
 def migrate(legacy: Path, target: Path, scope: Scope):
@@ -195,23 +235,31 @@ def backup(engine, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="memorypalace-backup-") as temp:
         snapshot = Path(temp)
-        with engine.db.connect(write=True):
-            source = sqlite3.connect(engine.db.path)
-            target = sqlite3.connect(snapshot / "memory.sqlite3")
+        # SQLite's online backup in one step reads one consistent snapshot of the store.
+        # Nothing takes the write lock: every other writer carries on meanwhile (S1-13).
+        source = sqlite3.connect(engine.db.path, timeout=30)
+        target = sqlite3.connect(snapshot / "memory.sqlite3")
+        try:
             source.backup(target)
+        finally:
             source.close()
-            try:
-                blobs = _referenced_blobs(target)
-            finally:
-                target.close()
+        try:
+            blobs = _referenced_blobs(target)
+        finally:
+            target.close()
         (snapshot / "blobs").mkdir()
         for key in blobs:
             blob = engine.db.blobs / key
             if blob.is_symlink() or not blob.is_file():
                 raise ValueError(f"Missing stored attachment {key}")
             shutil.copyfile(blob, snapshot / "blobs" / key)
+        extras = store_files(engine.db.root)
+        for name in extras:
+            copy = snapshot / name
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(engine.db.root / name, copy)
         manifest = {
-            p.relative_to(snapshot).as_posix(): digest(p.read_bytes())
+            p.relative_to(snapshot).as_posix(): file_digest(p)
             for p in snapshot.rglob("*")
             if p.is_file()
         }
@@ -227,7 +275,9 @@ def backup(engine, output: Path):
     return {
         "path": str(output),
         "files": len(manifest),
-        "indexes": "Rebuildable and excluded",
+        "store_files": len(extras),
+        "bytes": output.stat().st_size,
+        "indexes": "Rebuilt and re-embedded after a restore",
         "credentials": "Excluded",
     }
 
@@ -274,6 +324,7 @@ def restore(archive_path: Path, target: Path):
                 or ".." in relative.parts
                 or not (
                     name == "memory.sqlite3"
+                    or store_file_name(name)
                     or (
                         len(relative.parts) == 2
                         and relative.parts[0] == "blobs"
@@ -286,7 +337,7 @@ def restore(archive_path: Path, target: Path):
             path = (stage / name).resolve()
             if (
                 not path.is_relative_to(stage.resolve())
-                or digest(path.read_bytes()) != expected
+                or file_digest(path) != expected
             ):
                 raise ValueError("Backup checksum mismatch")
         actual = {
@@ -320,6 +371,9 @@ def restore(archive_path: Path, target: Path):
                 (stage / name).unlink()
         (stage / "manifest.json").unlink()
         engine = Engine(stage)
+        # Every restore is its own: a backup taken from a restored store already holds the
+        # previous restore's jobs as complete, and they would not run again under their keys.
+        stamp = uuid.uuid4().hex
         with engine.db.connect(write=True) as conn:
             conn.execute(
                 "UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL WHERE state='running'"
@@ -328,7 +382,8 @@ def restore(archive_path: Path, target: Path):
             conn.execute(
                 "UPDATE vector_indexes SET data=json_set(data,'$.state','pending')"
             )
-        engine.enqueue("rebuild", {}, "restore-rebuild")
+            embeddings = requeue_embeddings(engine, conn, stamp)
+        engine.enqueue("rebuild", {}, f"restore-rebuild:{stamp}")
         if target.exists():
             if not target.is_dir() or any(target.iterdir()):
                 raise Conflict("Restore target became nonempty")
@@ -341,8 +396,27 @@ def restore(archive_path: Path, target: Path):
         "path": str(target),
         "status": "restored",
         "rebuild": "queued",
+        "embeddings": embeddings,
         "contacts": "Prior sending state requires reconciliation",
     }
+
+
+def requeue_embeddings(engine, conn, stamp):
+    """The vectors are not in a backup, so every record the index holds is embedded again after
+    a restore. Its earlier embed jobs are complete in the restored store and would never run a
+    second time under their own keys, which left semantic recall empty for good (E2-09)."""
+    queued = 0
+    for row in conn.execute("SELECT data FROM records WHERE deleted=0").fetchall():
+        data = json.loads(row[0])
+        if not engine._indexable(conn, data):
+            continue
+        payload = {"record_id": data["id"], "revision": data["revision"]}
+        engine.enqueue("embed", payload, f"embed:{data['id']}:{data['revision']}:{stamp}", conn=conn)
+        if data.get("locator", {}).get("type") in {"image", "keyframe"}:
+            engine.enqueue("visual_embed", payload, f"visual-embed:{data['id']}:{data['revision']}:{stamp}",
+                           conn=conn)
+        queued += 1
+    return queued
 
 
 def export_records(engine, output: Path):

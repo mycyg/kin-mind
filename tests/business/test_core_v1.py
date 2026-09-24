@@ -299,7 +299,7 @@ def test_restore_requires_database_and_publishes_only_after_recovery(engine, tmp
     original = Engine.enqueue
 
     def interrupted(self, kind, payload, key, *args, **kwargs):
-        if key == "restore-rebuild":
+        if key.startswith("restore-rebuild"):
             raise RuntimeError("interrupted before publication")
         return original(self, kind, payload, key, *args, **kwargs)
 
@@ -312,7 +312,7 @@ def test_restore_requires_database_and_publishes_only_after_recovery(engine, tmp
     with Engine(target).db.connect() as conn:
         assert conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()[0] == "pending"
         assert conn.execute("SELECT state FROM outbox WHERE id='outbox_1'").fetchone()[0] == "uncertain"
-        assert conn.execute("SELECT state FROM jobs WHERE unique_key='restore-rebuild'").fetchone()[0] == "pending"
+        assert conn.execute("SELECT state FROM jobs WHERE unique_key LIKE 'restore-rebuild:%'").fetchone()[0] == "pending"
 
 
 def test_migrate_prefers_thawed_event_over_retained_archive_copy(tmp_path):
