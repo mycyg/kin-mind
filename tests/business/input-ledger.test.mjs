@@ -92,6 +92,20 @@ test('a freeze holds new dispatch, survives a restart and lifts itself, but neve
   await assert.rejects(()=>restarted.freezeDispatch(''),/reason/);
 });
 
+test('a migration may ask for its freeze again while it drains; nothing changes, and it lifts after two hours',async t=>{
+  const f=fixture(t);
+  const first=await f.router.freezeDispatch('kin-home-migration',{migrationId:'m1'});
+  assert.equal(first.until-first.at>=2*3600000-5,true,'two hours unless asked otherwise');
+  const revision=f.router.state.revision;
+  assert.deepEqual(await f.router.freezeDispatch('kin-home-migration',{migrationId:'m1'}),first);
+  assert.equal(f.router.state.revision,revision,'a repeated freeze writes nothing');
+  const release=await f.router.freezeDispatch('release',{migrationId:'deploy-7'});
+  assert.equal(release.at,first.at,'another reason refreshes the freeze without restarting its clock');
+  assert.deepEqual(await f.router.thawDispatch('kin-home-migration',{migrationId:'m1'}),{state:'thawed',frozenAt:first.at,migrationId:'deploy-7'});
+  await f.router.freezeDispatch('kin-home-migration',{migrationId:'m2'});
+  f.clock.now+=2*3600000;assert.equal(f.router.frozen(),false);
+});
+
 test('a freeze holds mode changes nobody forced',async t=>{
   const f=fixture(t);
   await f.router.freezeDispatch('release');

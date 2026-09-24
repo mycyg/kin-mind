@@ -32,6 +32,8 @@ export const SEMANTIC_RETRY_BUDGET=4;
  * unknown is looked up at most this many times before it stops polling. */
 export const NOTICE_SEND_BUDGET=5;
 export const NOTICE_LOOKUP_BUDGET=10;
+/** How long a freeze nobody lifts holds new dispatch. */
+export const FREEZE_TTL_MS=2*3600000;
 const frozenError=reason=>Object.assign(Error('Dispatch is frozen: '+reason),{code:'dispatch-frozen',retryable:true});
 /** Why a classification attempt failed. The class is recorded, never collapsed
  * into one anonymous catch: timeout / http / parse / unavailable. */
@@ -242,22 +244,26 @@ export class MobileRouter {
   }
   /** Stop new dispatch — both channels, the mind's turns, handoffs and mode changes
    * nobody forced — while in-flight work settles. The owner's literal stop and her
-   * own mode commands still act. It survives a restart and lifts itself at `until`,
-   * so a release that fails half way can never leave the owner unanswered for good. */
-  freezeDispatch(reason,{ttlMs=20*60000,by=null}={}) {
+   * own mode commands still act. It survives a restart and lifts itself at `until`
+   * (two hours unless asked otherwise), so a release or migration that is lost half
+   * way can never leave the owner unanswered for good. Asking again for the same
+   * migration changes nothing, so a caller may poll it while it drains. */
+  freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null}={}) {
     return this.locked(async()=>{
       if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
-      const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:20*60000,60000),2*3600000);
-      this.state.freeze={reason:reason.trim().slice(0,200),at:this.frozen()?this.state.freeze.at:this.now(),until:this.now()+ttl,...(by?{by:String(by).slice(0,120)}:{})};
-      this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until});
+      const current=this.frozen()?this.state.freeze:null,id=migrationId?String(migrationId).slice(0,120):null;
+      if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id)return clone(current);
+      const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:FREEZE_TTL_MS,60000),12*3600000);
+      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{})};
+      this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until,...(id?{migrationId:id}:{})});
       return clone(this.state.freeze);
     });
   }
-  thawDispatch(reason='thawed') {
+  thawDispatch(reason='thawed',{migrationId=null}={}) {
     return this.locked(async()=>{
       const previous=this.state.freeze;if(!previous)return {state:'not-frozen'};
-      delete this.state.freeze;this.save('dispatch-thawed',{reason:String(reason).slice(0,200),frozenAt:previous.at});
-      return {state:'thawed',frozenAt:previous.at};
+      delete this.state.freeze;this.save('dispatch-thawed',{reason:String(reason).slice(0,200),frozenAt:previous.at,...(migrationId?{migrationId:String(migrationId).slice(0,120)}:{})});
+      return {state:'thawed',frozenAt:previous.at,...(previous.migrationId?{migrationId:previous.migrationId}:{})};
     });
   }
   async availableModels(runtime=null) {
