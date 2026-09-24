@@ -461,3 +461,33 @@ def test_an_exploration_with_open_questions_leaves_its_step_to_kin(env, tmp_path
     step = plans.read(plan["id"])["plans"][0]["steps"][0]
     assert step["state"] == step_state
     assert step["receipts"][-1].get("open_questions", []) == open_questions
+
+def test_a_completed_plan_is_read_for_its_wish_once_and_then_left_out(env):
+    """K2-21: an abandon that ends the plan still settles its wish; afterwards the completed plan
+    is found by index only while flagged, so completed plans are not read on every review."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="contact"))
+    plans.sync_wishes()
+    plan = decide(env, plans.read(plan["id"])["plans"][0], "abandon")
+    assert plan["status"] == "completed" and plan["wish_sync"] == "pending"
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+        stored = json.loads(conn.execute("SELECT data FROM mind_plans WHERE id=?", (plan["id"],)).fetchone()[0])
+        query = conn.execute("EXPLAIN QUERY PLAN SELECT data FROM mind_plans WHERE scope=? AND status='completed' "
+                             "AND json_extract(data,'$.wish_sync')='pending'", (plans.scope,)).fetchall()
+    assert wish["status"] == "abandoned" and "wish_sync" not in stored
+    assert "mind_plan_wish_sync" in " ".join(str(r[-1]) for r in query)
+    assert plans.sync_wishes() == []
+
+
+def test_a_pass_over_many_steps_loads_the_mind_state_once(env, monkeypatch):
+    """K2-21: claim reads the state once for all its steps, not once per step."""
+    mind, plans, source, clock, initial = env
+    for index in range(3):
+        create(env, actor="explore", key="idea-" + str(index))
+    loads = []
+    original = type(mind)._load
+    monkeypatch.setattr(type(mind), "_load", lambda self, conn: loads.append(1) or original(self, conn))
+    assert plans.claim("explore", "worker")["state"] == "waiting"
+    assert len(loads) <= 1

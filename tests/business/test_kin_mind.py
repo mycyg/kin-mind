@@ -516,3 +516,27 @@ def test_a_session_review_is_asked_about_its_snapshot_and_writes_no_memory_sourc
     assert carried and carried[0]["snapshotId"] == "snapshot-7"
     with mind.engine.db.connect() as conn:
         assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-session-maintenance'").fetchone()
+
+
+def test_the_schema_is_created_once_per_store_per_process(setup, tmp_path):
+    """K1-23: constructing the mind again does not rerun its DDL; a replaced store gets it again."""
+    from eventmem.core import Engine
+    from kin_mind import state as state_module
+    mind, _source, _clock = setup
+    Appraisals(mind)
+    calls = []
+    original = state_module.ensure_schema
+    def counting(engine, name, script):
+        ran = original(engine, name, script)
+        calls.append((name, ran))
+        return ran
+    state_module.ensure_schema, saved = counting, state_module.ensure_schema
+    try:
+        Mind(mind.engine, mind.scope)
+        Appraisals(mind)
+        fresh = Mind(Engine(tmp_path / "other"), mind.scope)
+    finally:
+        state_module.ensure_schema = saved
+    assert calls[:-1] and all(ran is False for _name, ran in calls[:-1]) and calls[-1] == ("mind", True)
+    with fresh.engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_action_event_state'").fetchone()

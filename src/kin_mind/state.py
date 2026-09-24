@@ -40,7 +40,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS mind_contact_active ON mind_contacts(scope)
 CREATE TABLE IF NOT EXISTS mind_action_events(
  id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,
  state TEXT NOT NULL,data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mind_action_event_state ON mind_action_events(scope,state,created_at);
+CREATE INDEX IF NOT EXISTS mind_action_event_recent ON mind_action_events(scope,created_at,id);
 """
+
+# DDL this process has already run, per database file (K1-23). A replaced file (a restore) is a
+# different inode, so it gets its tables again.
+_SCHEMA_READY = set()
+
+
+def ensure_schema(engine, name, script):
+    """Run a module's DDL once per database file in this process. True when it ran now."""
+    try:
+        stat = engine.db.path.stat()
+        key = (str(engine.db.path), stat.st_ino, stat.st_dev, name)
+    except (OSError, AttributeError):
+        key = None
+    if key in _SCHEMA_READY:
+        return False
+    with engine.db.connect() as conn:
+        conn.executescript(script)
+    if key:
+        _SCHEMA_READY.add(key)
+    return True
 
 
 class Evolution(Model):
@@ -302,9 +324,10 @@ class Mind(Continuity):
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
+        if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
+                             + DESIRE_ARCHIVE_SCHEMA):
+            return
         with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
-                               + DESIRE_ARCHIVE_SCHEMA)
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
         if index and "unconfirmed" in (index[0] or ""):
             # AD2-14: the index used to hold every contact behind one send of unknown outcome.
@@ -701,7 +724,7 @@ class Mind(Continuity):
             if not verified_decision(receipt) or not self.decision_current(conn, receipt, current):
                 return False
             from .plans import AutonomousPlans
-            if not AutonomousPlans(self).linked_ready(conn, desire):
+            if not AutonomousPlans(self).linked_ready(conn, desire, current):
                 return False
         if state is None and (desire.get("exploration_id") or desire.get("concern_revisions")):
             state = self._load(conn)
@@ -1355,11 +1378,17 @@ class Mind(Continuity):
                 "unanswered_contact_seconds": max(0, (timestamp(at)-timestamp(last_contact)).total_seconds()) if awaiting else 0,
             }
             result["decision_runtime"] = None
-            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
+            # The latest committed action keeps its receipt in its one schedule row: read there, not
+            # by sorting every appraisal ever queued (K1-11). A store without it falls back.
+            details = None
+            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_action_schedule'").fetchone():
+                row = conn.execute("SELECT data FROM mind_action_schedule WHERE scope=?", (self.scope.key(),)).fetchone()
+                details = (json.loads(row[0]).get("receipt") if row else None) or None
+            if details is None and conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
                 receipt = conn.execute("SELECT json_extract(data,'$.receipt') FROM mind_appraisals WHERE scope=? AND json_extract(data,'$.receipt') IS NOT NULL ORDER BY json_extract(data,'$.receipt.verified_at') DESC LIMIT 1", (self.scope.key(),)).fetchone()
-                if receipt:
-                    details = json.loads(receipt[0])
-                    result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
+                details = json.loads(receipt[0]) if receipt else None
+            if isinstance(details, dict):
+                result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
             # One snapshot per read: the block above neither writes nor mutates it.
             from .exploration_decisions import decision_view
             result["exploration_decisions"] = decision_view(self, conn, state)
@@ -1399,8 +1428,11 @@ class Mind(Continuity):
                     if wait.get("owner_epoch"):
                         replied = bool(owner_epoch and owner_epoch != wait["owner_epoch"])
                     else:
+                        # The owner-interaction terms exactly as rhythm's partial index states them,
+                        # so this reads that index rather than every source (K1-11).
                         replied = bool(conn.execute(
                             "SELECT 1 FROM sources WHERE scope=? AND deleted=0 AND occurred_at>? "
+                            "AND (namespace='kin-owner-input' OR substr(namespace,1,5)='host:') "
                             "AND json_extract(data,'$.authority')='explicit' "
                             "AND json_extract(data,'$.metadata.role')='user' "
                             "AND json_extract(data,'$.metadata.host_event')='message' "

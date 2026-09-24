@@ -1365,8 +1365,8 @@ class Appraisals:
         self.session_context = session_context
         self.memory = MemoryContinuity(mind)
         self.audit_handlers = audit_handlers()
-        with self.engine.db.connect() as conn:
-            conn.executescript(QUEUE_SCHEMA + REFUSAL_SCHEMA)
+        from .state import ensure_schema
+        ensure_schema(self.engine, "appraisals", QUEUE_SCHEMA + REFUSAL_SCHEMA)
 
     def exploration_targets(self, data, refs):
         if data.get("stimulus") != "exploration-result" and not data.get("exploration_targets"):

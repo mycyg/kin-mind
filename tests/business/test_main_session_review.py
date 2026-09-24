@@ -364,3 +364,19 @@ def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
     assert jobs._tool_fetched(Proposal(), {'native_receipt': {'tool_calls': []}}, {}, started) == {}
     before = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     assert jobs._tool_fetched(Proposal(), with_tools, {}, before) == {}
+
+
+def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):
+    """K1-11: the latest decision's runtime comes from its one schedule row, not a sort of every appraisal."""
+    from test_kin_mind import FakeReviewer
+    mind, memory, actions, clock = idle_world(setup)
+    jobs = Appraisals(mind)
+    actions.drain(jobs)
+    assert jobs.run_one(FakeReviewer(Appraisal(reason="Rest a while", next_review_minutes=240)), lane="action")["state"] == "complete"
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_action_schedule SET data=json_set(data,'$.receipt.model','schedule-marker') WHERE scope=?",
+                     (mind.scope.key(),))
+        recent = conn.execute("EXPLAIN QUERY PLAN SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8",
+                              (mind.scope.key(),)).fetchall()
+    assert mind.read()["decision_runtime"]["model"] == "schedule-marker"
+    assert "mind_action_event_recent" in " ".join(str(r[-1]) for r in recent)

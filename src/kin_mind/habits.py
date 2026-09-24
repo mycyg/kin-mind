@@ -34,8 +34,8 @@ class HabitProposal(Model):
 class ConversationHabits:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
-        with self.engine.db.connect() as conn:
-            conn.executescript(SCHEMA)
+        from .state import ensure_schema
+        ensure_schema(self.engine, "habits", SCHEMA)
 
     def read(self, conn=None):
         if conn is None:
