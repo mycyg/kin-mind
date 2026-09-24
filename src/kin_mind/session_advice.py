@@ -67,8 +67,9 @@ findings 的 sourceId 必须是用户原话的来源，quote 必须与原文逐�
 依据不足时改为 keep、recall、compact 或 defer，不要编造观测编号。只调用工具提交修正后的建议，不输出推理过程。"""
 
 
-def advice_record(proposal, context, receipt, event_id):
-    """Validates before anything is built: a refusal leaves no partial record behind."""
+def advice_record(proposal, context, receipt, event_id, request_id=None):
+    """Validates before anything is built: a refusal leaves no partial record behind. The
+    host's review attempt, when there was one, is named in the record it answers."""
     if proposal is None or not context:
         return None
     known = {entry["id"] for entry in context.get("evidence", [])}
@@ -87,7 +88,7 @@ def advice_record(proposal, context, receipt, event_id):
         if not any(entry.get("at", 0) > compact["completedAt"] and not entry.get("needsReview") and not entry.get("resolved") for entry in evidence):
             raise AdviceRejected("post-compaction-evidence-missing", "Session advice needs post-compaction evidence")
     return {"decision": proposal.model_dump(), "snapshotId": context["id"], "generation": context["binding"]["generation"],
-            "receipt": receipt, "eventId": event_id}
+            "receipt": receipt, "eventId": event_id, **({"requestId": request_id} if request_id else {})}
 
 
 def repair_input(proposal, context, problem):
