@@ -7,11 +7,11 @@ const lastReplyMarker = '// KIN_LAST_REPLY_CACHE_V1';
 const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
-const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V1';
+const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
 const assessmentMarker = '// KIN_ASSESS_V1';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
-const inputStatusMarker = '// KIN_INPUT_STATUS_V1';
+const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
 const toolProbeMarker = '// KIN_TOOL_PROBE_V1';
 export const KIN_OWNED_ACP_MARKERS = Object.freeze([marker, lastReplyMarker, compactionMarker, compactionReceiptMarker,
   sessionMarker, inputIdentityMarker, inputStatusMarker, assessmentMarker, toolProbeMarker, retriesMarker, utf8Marker]);
@@ -265,9 +265,18 @@ export function patchSessionRuntime(source) {
 
 /** A prompt or steer request may carry `_meta.kinInputId`, the host's ledger id
  * for that input. It reaches the native turn as `clientUserMessageId`, for
- * correlation only: it is not a deduplication guarantee. */
+ * correlation only: it is not a deduplication guarantee.
+ *
+ * `_kin/runtime` says so as `inputCorrelation: true`, for every session (CR2-INT-02):
+ * an input this ACP takes with an id is written to its native thread's history as
+ * that user message's `clientId`, and the pinned app-server keeps it across a restart
+ * (the opt-in native proof in mobile-owned-acp.integration.test.mjs). The host records
+ * the bit with each submission; an ACP without it makes no such promise, so an input it
+ * took is never reconciled as absent. */
 export function patchKinInputIdentity(source) {
   if (source.includes(inputIdentityMarker)) throw Error(`Codex ACP source already carries ${inputIdentityMarker}`);
+  source = replaceOnce(source, '  async kinRuntime(sessionId) {\n    const state = this.sessions.get(sessionId);',
+    '  async kinRuntime(sessionId) {\n    return { ...(await this.kinRuntimeState(sessionId)), inputCorrelation: true };\n  }\n  async kinRuntimeState(sessionId) {\n    const state = this.sessions.get(sessionId);', 'ACP input correlation capability');
   source = helpers(source, `function kinInputMeta(params) {
   const id = params?._meta?.kinInputId;
   return typeof id === "string" && id.length > 0 && id.length <= 200 ? { kinInputId: id } : void 0;
@@ -289,20 +298,31 @@ function kinClientUserMessageId(params) {
 }
 
 /** `_kin/input-status`: did an input the host sent with `_meta.kinInputId` reach the
- * native thread? For the watchdog's reconciliation by original id. `found`: a user
- * message of the thread carries the id as its clientId (a turn this ACP saw, or the
- * native history), a prompt or steer carrying it is still being handled here, or a
- * steer the native side accepted waits in the running turn (it is recorded only
- * when the model takes it up). `not-found`: the whole history was read and no user
- * message carries it -- every page in the documented shape (a data array and an
- * explicit null or next cursor), every turn with its id, status and items, and each
- * one's itemsView explicitly "full" (CR-RT-05). Anything else is `unknown` (the
- * session is not loaded here, the thread has no persisted turn yet, a page or turn
- * is missing a field or contradicts itself, the history could not be read in full or
- * in time), because not-found makes the host send the input again. Checked against
- * the pinned 0.156.1: user messages keep clientId across an app-server restart, the
- * running turn is listed, a steered message appears once it is taken up, and every
- * page carries nextCursor (null at the end) and every turn its itemsView. */
+ * native thread it was submitted to? For the watchdog's reconciliation by original id.
+ * The thread is the one `sessionId` names -- the host passes the thread the input went
+ * to, which need not be the current session -- and nothing here ever looks at another
+ * one (CR2-INT-02). It need not be loaded here: its stored history is read without
+ * opening it. Every answer is `{state, sessionId, complete, ...}`: `sessionId` is the
+ * thread read, `complete` whether its whole history was read.
+ *
+ * `found`: a user message of the thread carries the id as its clientId (a turn this
+ * ACP saw, or the native history), a prompt or steer carrying it is still being
+ * handled here, or a steer the native side accepted waits in the running turn (it is
+ * recorded only when the model takes it up). `not-found`, always with `complete:
+ * true`: this thread's whole history was read and no user message carries it -- every
+ * page in the documented shape (a data array and an explicit null or next cursor),
+ * every turn with its id, status and items, and each one's itemsView explicitly "full"
+ * (CR-RT-05). Anything else is `unknown`, because not-found lets the host send the
+ * input again: the thread cannot be read (`native-history-unavailable`), is not loaded
+ * here and cannot be read without opening it (`thread-not-readable`), a later page
+ * fails (`native-history-interrupted`) or runs out of time, or a page or turn is
+ * missing a field or contradicts itself. A thread with no persisted turn yet has no
+ * history to read. Not-found proves absence only for an input the submitting ACP
+ * wrote with its id (`inputCorrelation` in `_kin/runtime`); the host keeps that bit.
+ * Checked against the pinned 0.156.1: user messages keep clientId across an app-server
+ * restart, the history of a thread that is not loaded can be listed, the running turn
+ * is listed, a steered message appears once it is taken up, and every page carries
+ * nextCursor (null at the end) and every turn its itemsView. */
 export function patchKinInputStatus(source) {
   if (source.includes(inputStatusMarker)) throw Error(`Codex ACP source already carries ${inputStatusMarker}`);
   for (const helper of ['function kinClientUserMessageId(', 'function kinOwnThread(', 'function kinWithin('])
@@ -350,39 +370,48 @@ function kinSteerAccepted(state, params) {
 `, 'ACP input status helpers');
   const method = `
   async kinInputStatus(params) {
-    const sessionId = params?.sessionId, inputId = params?.inputId;
-    if (typeof inputId !== "string" || !inputId || inputId.length > 200) return { state: "unknown", reason: "invalid-input-id" };
+    const sessionId = typeof params?.sessionId === "string" && params.sessionId ? params.sessionId : null, inputId = params?.inputId;
+    // Every answer names the thread it read and whether that thread's whole history was
+    // read. Only that thread: nothing falls back to the current session (CR2-INT-02).
+    let complete = false;
+    const answer = (value) => ({ ...value, sessionId, complete });
+    if (!sessionId) return answer({ state: "unknown", reason: "invalid-session-id" });
+    if (typeof inputId !== "string" || !inputId || inputId.length > 200) return answer({ state: "unknown", reason: "invalid-input-id" });
     const state = this.sessions.get(sessionId);
-    if (!state) return { state: "unknown", reason: "session-not-loaded" };
     const local = () => {
-      if (state.kinSeenInputIds?.has(inputId)) return "turn";
+      if (state?.kinSeenInputIds?.has(inputId)) return "turn";
       if (this.kinPendingInputs?.has(kinPendingKey(sessionId, inputId))) return "pending";
-      const turnId = state.kinSteered?.get(inputId);
+      const turnId = state?.kinSteered?.get(inputId);
       return turnId && state.kinTurn?.status === "inProgress" && state.kinTurn.turnId === turnId ? "steered" : null;
     };
     let source = local();
-    if (source) return { state: "found", source };
+    if (source) return answer({ state: "found", source });
     const deadline = Date.now() + Math.min(Math.max(Number(params.timeoutMs) || 20000, 1000), 120000);
     const api = this.codexAcpClient.appServerClient, cursors = new Set();
-    let cursor = null, complete = true;
+    let cursor = null, full = true, pages = 0;
     try {
       do {
+        // A list read opens nothing: a thread that is not loaded here stays closed.
         const page = await kinWithin(api.threadTurnsList({ threadId: sessionId, cursor, limit: 50, sortDirection: "desc", itemsView: "full" }), deadline, "timeout");
+        pages++;
         for (const turn of Array.isArray(page?.data) ? page.data : [])
-          if (Array.isArray(turn?.items) && turn.items.some((item) => item?.type === "userMessage" && item.clientId === inputId)) return { state: "found", source: "native", turnId: turn.id };
-        if (!kinHistoryPage(page)) return { state: "unknown", reason: "native-history-malformed" };
-        if (page.data.some((turn) => turn.itemsView !== "full")) complete = false;
+          if (Array.isArray(turn?.items) && turn.items.some((item) => item?.type === "userMessage" && item.clientId === inputId)) return answer({ state: "found", source: "native", turnId: turn.id });
+        if (!kinHistoryPage(page)) return answer({ state: "unknown", reason: "native-history-malformed" });
+        if (page.data.some((turn) => turn.itemsView !== "full")) full = false;
         cursor = page.nextCursor;
-        if (cursor !== null && (cursors.has(cursor) || cursors.size >= 200)) return { state: "unknown", reason: "native-history-incomplete" };
+        if (cursor !== null && (cursors.has(cursor) || cursors.size >= 200)) return answer({ state: "unknown", reason: "native-history-incomplete" });
         if (cursor !== null) cursors.add(cursor);
       } while (cursor !== null);
     } catch (error) {
-      return { state: "unknown", reason: String(error?.message ?? error) === "timeout" ? "native-history-timeout" : "native-history-unavailable" };
+      if (String(error?.message ?? error) === "timeout") return answer({ state: "unknown", reason: "native-history-timeout" });
+      // The first page says whether the thread can be read at all; a later one broke the read off.
+      return answer({ state: "unknown", reason: pages ? "native-history-interrupted" : state ? "native-history-unavailable" : "thread-not-readable" });
     }
+    complete = full;
     // An input that arrived while the history was read came through this ACP.
     source = local();
-    if (source) return { state: "found", source };
-    return complete ? { state: "not-found" } : { state: "unknown", reason: "native-history-incomplete" };
+    if (source) return answer({ state: "found", source });
+    return full ? answer({ state: "not-found" }) : answer({ state: "unknown", reason: "native-history-incomplete" });
   }
 `;
   source = replaceOnce(source, '  async kinLastReply(sessionId) {', method + '\n  async kinLastReply(sessionId) {', 'ACP input status extension');
