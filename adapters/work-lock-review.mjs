@@ -50,7 +50,10 @@ export class WorkLockReview {
   }
   /** Why no summary is due now, or null. */
   waiting(task,runtime) {
-    if(task.completion?.outcome&&task.completion.state!=='historical-proposal')return 'kin-declared-outcome';
+    // A declaration whose report is still unproven past the report wait goes back to Kin
+    // as facts; the lock stays until the report is proven or she declares otherwise
+    // (CR-LIFE-11, CR-MIND-02).
+    if(task.completion?.outcome&&task.completion.state!=='historical-proposal'&&!this.router.declarationStalled?.(task,runtime))return 'kin-declared-outcome';
     if(task.status==='proposed')return 'proposal-not-taken-on';
     if(task.cancelRequested)return 'owner-cancel-pending';
     if(this.router.busy(runtime))return 'native-work-active-or-unknown';
