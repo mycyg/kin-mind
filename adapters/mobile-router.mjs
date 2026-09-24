@@ -30,6 +30,8 @@ const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
 export const NOTICE_ROUND_REST_MS=Object.freeze([30*60000,2*3600000,6*3600000]);
 /** An input proven unsent goes back to the inbox at most this many times (CR-LIFE-03). */
 export const REQUEUE_BUDGET=3;
+/** How often an input went back to its inbox, across every attempt (CR2-LIFE-05). */
+const requeuesOf=record=>Number.isSafeInteger(record?.requeues)?record.requeues:record?.retry?.requeues??0;
 /** A deferral whose plan port could not answer is asked again after these waits, then left to Kin (CR-MIND-03). */
 export const DEFERRAL_PLAN_RETRY_MS=Object.freeze([60000,5*60000,15*60000,3600000,3*3600000]);
 /** The channels an input may arrive on, kept as its receipt fact (CR-LIFE-17). */
@@ -88,6 +90,9 @@ export function readCarryover(stateFile) {
  * `archive/router-YYYY-MM.jsonl` beside the state file, never deleted (AD1-08). */
 export const HOT_LIMITS=Object.freeze({inputs:200,internal:24,tasks:32,requests:64,notices:64,history:64,journalBytes:8*1024*1024});
 const frozenError=reason=>Object.assign(Error('Dispatch is frozen: '+reason),{code:'dispatch-frozen',retryable:true});
+/** A dispatch withdrawn before submission: provably not submitted, so the same id may be tried again. */
+const withdrawnError=(record,cause)=>Object.assign(Error('Input dispatch was withdrawn before native submission: '+record.withdrawn.reason,cause?{cause}:undefined),
+  {code:'input-not-submitted',inputId:record.id,retryAt:record.retry?.nextAt??null,retryExhausted:Boolean(record.retry?.exhausted)});
 /** Why a classification attempt failed. The class is recorded, never collapsed
  * into one anonymous catch: timeout / http / parse / unavailable. */
 export function classificationFailure(error) {
@@ -110,9 +115,29 @@ export function noticeReceiptClass(receipt) {
   if(receipt.state==='pending'&&receipt.submissionStarted===false)return 'not-submitted';
   return 'unknown';
 }
-/** Whether the next call for a notice may start a physical send: it never began, or
- * its receipt proved nothing reached the platform. A begun one is only looked up. */
-export const noticeMayStart=notice=>!notice.lastReceipt||['not-submitted','no-port'].includes(notice.lastReceipt);
+/** The rests before a notice the platform refused outright is sent again under its own
+ * id; past them it is only looked up (CR2-LIFE-06). */
+export const NOTICE_REJECT_RETRY_MS=Object.freeze([10*60000,3600000,6*3600000]);
+/** What a lookup by original id proves (CR2-INT-02). `found` anywhere is receipt. `not-found`
+ * proves an input never arrived only when the whole history of the very thread it was
+ * submitted to was read, by a runtime that recorded input ids when it was submitted; any
+ * other answer — an older runtime, another thread, a partial read, no record of the
+ * submission — stays unknown: looked up again, never submitted again. */
+export function reconciliationState(result,submit) {
+  if(result?.state==='found')return {state:'found'};
+  const reason=typeof result?.reason==='string'?result.reason.slice(0,80):null;
+  if(result?.state!=='not-found')return {state:'unknown',...(reason?{reason}:{})};
+  if(!submit)return {state:'unknown',reason:'no-submission-record'};
+  if(submit.correlation!==true)return {state:'unknown',reason:'runtime-without-input-correlation'};
+  if(result.complete!==true)return {state:'unknown',reason:'history-not-read-in-full'};
+  if(typeof result.sessionId!=='string'||result.sessionId!==submit.sessionId)return {state:'unknown',reason:'not-the-submitted-thread'};
+  return {state:'not-found'};
+}
+/** Whether the next call for a notice may start a physical send: it never began, its
+ * receipt proved nothing reached the platform, or the platform refused it and its bounded
+ * retries are not spent. A begun one whose outcome is unknown is only looked up. */
+export const noticeMayStart=notice=>!notice.lastReceipt||['not-submitted','no-port'].includes(notice.lastReceipt)||
+  notice.lastReceipt==='rejected'&&(notice.rejections??0)<=NOTICE_REJECT_RETRY_MS.length;
 export function recentConversation(items) {
   const counts={user:0,assistant:0};
   return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
@@ -136,6 +161,18 @@ export function modeCommand(text) {
   if (value==='/mode work') return 'work';
   if (value==='/mode auto') return 'auto';
   return null;
+}
+/** The owner's literal stop, read from the whole message. */
+export const STOP_LITERAL=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/;
+/** The owner's literal command, when a whole message is nothing else: her stop, a mode
+ * command, or a native command such as `/compact`. The router reads each only from a
+ * message of its own, so the durable inbox never batches one with other words
+ * (CR2-LIFE-09). */
+export function literalCommand(text,{attachments=[]}={}) {
+  const value=typeof text==='string'?text.trim():'';
+  if(STOP_LITERAL.test(value))return 'stop';
+  if(Array.isArray(attachments)&&attachments.length)return null;
+  return modeCommand(value)??(value==='/compact'?'compact':null);
 }
 /** Every durable adapter state file is written through here: a temporary name no
  * other writer can share, fsync before the rename, and — for the files that must
@@ -169,11 +206,13 @@ export class MobileRouter {
    * Left off, every request and every record is what it was before intents existed.
    * `profiles` are the host's configured chat and work routing profiles; `hotLimits`
    * narrows what the state file keeps (see HOT_LIMITS). */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null}) {
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null,runtimeId=null}) {
     Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn});
+    // The runtime bundle this host runs, named on every submission it makes (CR2-INT-02).
+    this.runtimeId=typeof runtimeId==='string'&&runtimeId?runtimeId.slice(0,120):null;
     this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
     this.profiles=Object.freeze({chat:Object.freeze({...ROUTER_PROFILES.chat,...profiles?.chat}),work:Object.freeze({...ROUTER_PROFILES.work,...profiles?.work})});
-    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();this.activities=new Map();this.watching=false;
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();this.deadlines=new Map();this.activities=new Map();this.watching=false;
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
@@ -305,7 +344,9 @@ export class MobileRouter {
     for(const record of excess)if(!referenced.has(record.id)&&!this.inflight.has(record.id)){
       move('input',record.id,record);delete this.state.inputs[record.id];delete this.state.semanticPending[record.id];this.archivedIds.add(record.id);movedIds.push(record.id);
     }
-    const closed=Object.values(this.state.tasks).filter(t=>!open(t));
+    // A deferral whose plan is not made yet, or whose failure Kin has not been told, is
+    // still scheduled: it stays until that is done (CR2-LIFE-11).
+    const closed=Object.values(this.state.tasks).filter(t=>!open(t)&&!deferralOwed(t));
     for(const task of closed.slice(0,Math.max(0,closed.length-limits.tasks))){move('task',task.id,task);delete this.state.tasks[task.id];}
     const settledNotice=n=>['accepted','rejected','failed','superseded','suppressed','unresolved'].includes(n.state);
     const kept=new Set([...Object.values(this.state.tasks).flatMap(t=>[t.handoff?.id,t.completion?.commandId,t.acceptedBy]),
@@ -340,7 +381,7 @@ export class MobileRouter {
    * since it may be Kin's own. Like any unconfirmed input they never hold the restart
    * profile (AD1-10). */
   restoreLedger() {
-    let ids=[];const kinds=new Map();
+    let ids=[];const kinds=new Map(),submits=new Map();
     try {
       const journal=this.file+'.events.jsonl',size=fs.statSync(journal).size,from=Math.max(0,size-LEDGER_TAIL_BYTES),handle=fs.openSync(journal,'r');
       let body='';
@@ -350,11 +391,12 @@ export class MobileRouter {
           const event=JSON.parse(line);
           if(!String(event?.kind).startsWith('input-')||typeof event.id!=='string')return null;
           if(typeof event.inputKind==='string'&&INPUT_KIND.test(event.inputKind))kinds.set(event.id,event.inputKind);
+          if(event.kind==='input-submitting'&&typeof event.submit?.sessionId==='string')submits.set(event.id,{sessionId:event.submit.sessionId,runtime:typeof event.submit.runtime==='string'?event.submit.runtime:null,correlation:event.submit.correlation===true});
           return event.id;
         } catch {return null;}
       }).filter(Boolean))];
     } catch {/* No journal: this router never accepted anything here. */}
-    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',at:this.now()};
+    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',...(submits.has(id)?{submit:submits.get(id)}:{}),at:this.now()};
     return ids.length;
   }
   locked(fn) {
@@ -615,12 +657,21 @@ export class MobileRouter {
   }
   cancelTask(task,at=this.now()) {
     task.status='canceled';task.canceledAt=at;task.outcome='owner-canceled';
-    for(const id of task.inputIds){const record=this.state.inputs[id];if(record&&ownerInput(record)&&!answered(record)&&task.cancelSourceInputId!==id){record.canceledBy=task.cancelSourceInputId??'owner-stop';record.settledAt??=at;}}
+    for(const id of task.inputIds){
+      const record=this.state.inputs[id];if(!record||task.cancelSourceInputId===id)continue;
+      if(ownerInput(record)&&!answered(record)){record.canceledBy=task.cancelSourceInputId??'owner-stop';record.settledAt??=at;}
+      // Not submitted yet: it loses its reservation and its right to submit (CR2-LIFE-01).
+      if(['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,task.cancelSourceInputId??'owner-stop');
+    }
   }
   /** The owner's stop, from the literal command or from a classifier that actually
    * answered: recorded on the stop input itself, applied to the tasks it names. */
   applyStop(inputId,stop) {
-    for(const task of this.tasks())if(!stop.taskIds||stop.taskIds.includes(task.id)){task.cancelRequested=true;task.cancelSourceInputId=inputId;}
+    for(const task of this.tasks())if(!stop.taskIds||stop.taskIds.includes(task.id)){
+      task.cancelRequested=true;task.cancelSourceInputId=inputId;
+      // What the stopped work has not submitted yet loses its reservation and its right to submit (CR2-LIFE-01).
+      for(const id of task.inputIds){const record=this.state.inputs[id];if(record&&id!==inputId&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,inputId);}
+    }
   }
   /** The mind's own turns wait for the owner's work and for a coordinator that is busy. */
   internalHeld(runtime,kind) {
@@ -643,16 +694,17 @@ export class MobileRouter {
         if(['submitting','unconfirmed'].includes(previous.state))throw Error('Input acceptance requires reconciliation');
         // What predates the ledger keeps its reason and id and is never re-run.
         if(previous.historical)throw Object.assign(Error('Historical input is not re-run: '+previous.historical.reason),{code:'input-historical'});
-        if(previous.state==='failed-before-submit'){
+        // What the owner's stop withdrew stays withdrawn (CR2-LIFE-01).
+        if(previous.state==='failed-before-submit'&&!previous.canceledBy){
           if(this.frozen())throw frozenError(this.state.freeze.reason);
           previous.state='selected';previous.retry={...(previous.retry??{attempts:0}),lastAttemptAt:this.now()};
-          delete previous.reason;delete previous.failureStage;delete previous.ownerNotice;
+          delete previous.reason;delete previous.failureStage;delete previous.ownerNotice;delete previous.withdrawn;
           this.save('input-preparation-retry',{id:input.id,attempt:previous.retry.attempts});
         }
         return {record:clone(previous)};
       }
       // The literal stop is read before any model is asked, and answers on its own when none can be.
-      const stop=/^(?:停止任务|取消当前任务|\/停|\/acp-cancel)[!！。~～\s]*$/.test(input.text.trim());
+      const stop=STOP_LITERAL.test(input.text.trim());
       const command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
@@ -711,7 +763,9 @@ export class MobileRouter {
       const intake=intakeOnly(this.state.inputs[input.id])?this.state.inputs[input.id]:null;
       if(this.state.inputs[input.id]&&!intake)return clone(this.state.inputs[input.id]);
       const now=this.now();
-      const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt:receiptTime(input.receivedAt,now),
+      // When the host first received it is recorded once; routing never moves it later (CR2-LIFE-08).
+      const firstReceivedAt=Math.min(receiptTime(input.receivedAt,now),Number.isFinite(intake?.firstReceivedAt)?intake.firstReceivedAt:Infinity);
+      const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt,
         ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),
         ...(intake?.retry?{retry:clone(intake.retry)}:{})};
       if(semanticFailure) {
@@ -813,7 +867,9 @@ export class MobileRouter {
   notSubmitted(record,reason,{restart=false,stage='preparation'}={}) {
     // Handed only to the in-memory queue is not a submission: the fact is kept apart.
     if(record.state==='queued'&&record.submissionStartedAt){record.queuedSubmissionAt=record.submissionStartedAt;delete record.submissionStartedAt;}
-    record.state='failed-before-submit';record.failureStage=stage;record.reason=reason;delete record.settledAt;
+    // How often it went back to its inbox counts across attempts; this attempt's evidence is its own (CR2-LIFE-05).
+    record.requeues=requeuesOf(record);if(!record.requeues)delete record.requeues;
+    record.state='failed-before-submit';record.failureStage=stage;record.reason=reason;if(!record.canceledBy)delete record.settledAt;
     const attempts=(record.retry?.attempts??0)+(restart?0:1),delay=SUBMIT_RETRY_MS[Math.max(0,attempts-1)];
     record.retry={attempts,evidence:'not-submitted',lastFailureAt:this.now(),...(delay===undefined?{exhausted:true}:{nextAt:this.now()+(restart?0:delay)})};
     return record.retry;
@@ -835,27 +891,63 @@ export class MobileRouter {
       // The caller learns that the same id may be tried again, and when.
       if(retry&&!error.code)Object.assign(error,{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
       throw error;
-    }).finally(()=>{this.inflight.delete(input.id);this.reservations.delete(input.id);});
+    }).finally(()=>{this.inflight.delete(input.id);this.reservations.delete(input.id);this.deadlines.delete(input.id);});
     this.inflight.set(input.id,pending);return pending;
   }
-  /** Called under the router mutex by the existing minute review. A live dispatch
-   * owns its wait; a submitted input owns its original reconciliation identity. */
+  /** Called under the router mutex by the existing minute review. A submitted input owns
+   * its original reconciliation identity. A live dispatch is held to its own deadline even
+   * while its preparation hangs: past it, the submission it has not made is withdrawn and a
+   * late one is refused (CR2-LIFE-03). */
   expireUnsubmittedInputs() {
-    const cutoff=this.now()-(this.state.config.workReviewIntervalMinutes??20)*60000;
+    const now=this.now(),cutoff=now-(this.state.config.workReviewIntervalMinutes??20)*60000;
     for(const record of Object.values(this.state.inputs)) {
-      if(!['selected','preparing'].includes(record.state)||record.submissionStartedAt||this.inflight.has(record.id)||!(record.at<=cutoff))continue;
+      if(!['selected','preparing'].includes(record.state)||record.submissionStartedAt)continue;
+      if(this.inflight.has(record.id)) {
+        const deadline=this.deadlines.get(record.id);
+        if(Number.isFinite(deadline)&&now>=deadline)this.withdrawDispatch(record,'dispatch-wait-exceeded');
+        continue;
+      }
+      if(!(record.at<=cutoff))continue;
       this.notSubmitted(record,'input-preparation-timeout');
       this.save('input-failed-before-submit',{id:record.id,reason:record.reason});
     }
+  }
+  /** Who stopped this input before it was submitted: the owner's stop that canceled it, or
+   * the stop asked for the task it was given to (CR2-LIFE-01). The stop itself is not one. */
+  stoppedBy(record) {
+    if(!record||record.submissionStartedAt)return null;
+    if(record.canceledBy)return record.canceledBy;
+    const task=record.taskId?this.state.tasks[record.taskId]:null;
+    if(!task||!task.inputIds?.includes(record.id)||task.cancelSourceInputId===record.id)return null;
+    return task.cancelRequested||task.status==='canceled'?task.cancelSourceInputId??'owner-stop':null;
+  }
+  /** A dispatch that may no longer submit: the owner stopped it, or it outlived its
+   * deadline. Its reservation goes and a late submission is refused; nothing of it
+   * reached the native session (CR2-LIFE-01, CR2-LIFE-03). */
+  withdrawDispatch(record,reason,{stage='dispatch'}={}) {
+    this.reservations.delete(record.id);
+    if(record.submissionStartedAt||record.withdrawn||!['semantic-pending','selected','preparing','failed-before-submit'].includes(record.state))return false;
+    if(record.state!=='failed-before-submit')this.notSubmitted(record,reason,{stage});
+    record.withdrawn={reason,at:this.now()};
+    this.save('input-dispatch-withdrawn',{id:record.id,reason});
+    return true;
+  }
+  /** The owner's stop reached an input before submission: it is canceled by her, and withdrawn. */
+  cancelBeforeSubmission(record,stoppedBy) {
+    record.canceledBy??=stoppedBy;record.settledAt??=this.now();
+    return this.withdrawDispatch(record,'canceled-by-owner',{stage:'owner-stop'});
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
     if(selected.state==='deferred')return {route:'deferred',reason:selected.reason};
     if(['accepted','queued','superseded'].includes(selected.state))return {route:'deduplicated',model:selected.model};
+    if(selected.canceledBy&&!selected.submissionStartedAt&&selected.state==='failed-before-submit')return {route:'canceled-by-owner'};
     // A dispatch waits for the coordinator, a switch or a classification, never for
     // ever: past its deadline nothing has been submitted, and the same id is retried
-    // or reported like any other unsubmitted input.
+    // or reported like any other unsubmitted input. The watchdog holds it to the same
+    // deadline while a preparation hangs (CR2-LIFE-03).
     const deadline=this.now()+(this.state.config.dispatchWaitMinutes??20)*60000;
+    this.deadlines.set(input.id,deadline);
     for(;;) {
       // A semantic wait is settled by its own bounded review — driven here while
       // the caller is still alive, and by the host's pump when it is not.
@@ -875,8 +967,12 @@ export class MobileRouter {
    * one has been handed to the session. */
   async planDispatch(input) {
     const record=this.state.inputs[input.id];
-    if(record.state==='semantic-pending')return {wait:true};
     if(['accepted','queued','superseded'].includes(record.state))return {outcome:{route:'deduplicated',model:record.model}};
+    // The owner's stop, or its own deadline, took this dispatch's right to submit (CR2-LIFE-01, CR2-LIFE-03).
+    const stopped=this.stoppedBy(record);
+    if(stopped){this.cancelBeforeSubmission(record,stopped);return {outcome:{route:'canceled-by-owner'}};}
+    if(record.withdrawn)throw withdrawnError(record);
+    if(record.state==='semantic-pending')return {wait:true};
     if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
     let runtime=await this.reconcileTransition(await this.inspect());
     if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment',internal:true})||this.openWork().length||this.state.mode==='work'))return {outcome:{route:'deferred',reason:'owner-work-held'}};
@@ -940,11 +1036,13 @@ export class MobileRouter {
     } else this.state.actual=runtime;
     if(record.route==='work'&&!record.taskId&&!record.command&&this.currentTask())record.taskId=this.currentTask().id;
     // A proactive contact goes out on the current tier's model, as any turn does (AD1-16).
-    record.state='preparing';record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
+    record.state='preparing';record.planAt=this.now();record.model=target;record.executionEpoch=this.state.executionEpoch;delete record.waitingReason;this.save('input-preparing',{id:input.id});
     record.plannedTransition=this.state.transition?.id??null;
     this.reservations.set(input.id,{profile:targetProfile,at:this.now()});
     return {decision:{model:target,profile:targetProfile,taskId:record.taskId,intent:record.intent,reason:record.reason,command:record.command,inputId:record.id,
-      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch,...(record.interrupt?{newTurn:true}:{})}};
+      inputVersion:record.taskId?this.state.tasks[record.taskId].inputVersion:null,turnFence:this.state.executionEpoch,...(record.interrupt?{newTurn:true}:{})},
+      // Where it goes and whether that runtime records input ids, for any later lookup (CR2-INT-02).
+      submit:{sessionId:this.sessionId,runtime:this.runtimeId,correlation:runtime.inputCorrelation===true}};
   }
   /** Phase two: the host prepares its prompt outside the mutex (AD1-06), then marks
    * the submission under it, re-checking the basis the dispatch was planned on. */
@@ -952,15 +1050,21 @@ export class MobileRouter {
     let marking=null;
     const markSubmitted=()=>marking??=this.locked(async()=>{
       const record=this.state.inputs[input.id];
+      // The last check before anything is sent: the owner's stop, or the dispatch's own
+      // deadline, took its right to submit (CR2-LIFE-01, CR2-LIFE-03).
+      const stopped=this.stoppedBy(record);
+      if(stopped){this.cancelBeforeSubmission(record,stopped);throw Object.assign(Error('Input canceled by the owner before submission'),{code:'input-canceled',inputId:input.id});}
+      if(record.withdrawn)throw withdrawnError(record);
       // Any provider change since the plan means planning again, never submitting on a stale basis.
       if(record.state!=='preparing'||record.executionEpoch!==this.state.executionEpoch||(this.state.transition?.id??null)!==record.plannedTransition||this.state.transition?.state==='switching')
         throw Object.assign(Error('dispatch-basis-changed'),{dispatchRetry:true});
       record.state='submitting';record.submissionStartedAt=this.now();
+      record.submit={sessionId:plan.submit?.sessionId??this.sessionId,runtime:plan.submit?.runtime??this.runtimeId,correlation:plan.submit?.correlation===true,at:record.submissionStartedAt};
       // A new submission is reconciled on its own; what an earlier one proved is kept as history.
       if(record.reconciliation){record.priorReconciliations=[...(record.priorReconciliations??[]),record.reconciliation].slice(-4);delete record.reconciliation;}
       // A native command exists from its submission, never before it (AD1-03).
       if(record.command==='compact')this.state.operations[record.id]={inputId:record.id,kind:'compact',state:'submitted',at:this.now()};
-      this.save('input-submitting',{id:input.id});
+      this.save('input-submitting',{id:input.id,submit:record.submit});
     });
     if(input.submissionProtocol!=='host-boundary-v1')await markSubmitted().catch(()=>{});
     let outcome,failure=null;
@@ -972,6 +1076,8 @@ export class MobileRouter {
       this.reservations.delete(input.id);
       const record=this.state.inputs[input.id],target=plan.decision.model;
       if(failure) {
+        if(failure.code==='input-canceled'&&record.canceledBy&&!record.submissionStartedAt)return {route:'canceled-by-owner',model:target};
+        if(record.withdrawn&&!record.submissionStartedAt)throw withdrawnError(record,failure);
         if(failure.dispatchRetry&&record.state==='preparing'){record.state='selected';this.save('input-dispatch-replanned',{id:input.id});return {retry:true};}
         const operation=this.state.operations[record.id];
         if(record.submissionStartedAt&&record.state==='submitting') {
@@ -1584,6 +1690,9 @@ export class MobileRouter {
           }
           return {...clone(n),lookupOnly:true};
         }
+        // A freeze starts no send: the notice stays as it is, costing no attempt; a lookup
+        // of one already begun (above) goes on (CR2-LIFE-02).
+        if(this.frozen())return null;
         // A reconcile-able id and stage are durable BEFORE any failable preparation.
         n.stage='preparing';n.updatedAt=this.now();this.save('notice-preparing',{id});
         const runtime=await this.inspect();const view=publicMobileRuntime(this.state,runtime,this.sessionId);
@@ -1597,18 +1706,24 @@ export class MobileRouter {
         }
         if(n.state==='retry'&&n.kind!=='model-switched'){delete n.text;delete n.runtime;}
         n.text??=runtimeReply(view,{pending:n.kind==='mode-pending',switched:n.kind==='mode-applied',names:this.modelNames});
+        // The send passes the same activity gate as every other send to her, in the same step
+        // that marks it sending, so no freeze reports idle while it starts (CR2-LIFE-02).
+        const gate=this.beginActivity({kind:'notice',id});
+        if(!gate.ok){n.stage='held';n.updatedAt=this.now();this.save('notice-held',{id,reason:gate.reason});return null;}
         // Whatever else the message recalls, this is the model it names as the current one.
         if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
-        this.save('notice-sending',{id});return {...clone(n),sendNow:true};
+        this.save('notice-sending',{id});return {...clone(n),sendNow:true,gate};
       });
       if(!notice)continue;
       let receipt;
+      try {
       if(notice.sendNow) {
         try {receipt=await send({id,text:notice.text,kind:'runtime-status',sourceInputId:notice.sourceInputId,notificationSubscribers:notice.subscriberIds??[]});}
         catch {receipt=null;}
         // Any non-accepted send outcome is settled from the outbox ground truth.
         if(noticeReceiptClass(receipt)!=='accepted')receipt=await lookup(id).catch(()=>null)??receipt;
       } else receipt=await lookup(id).catch(()=>null);
+      } finally {notice.gate?.release();}
       await this.locked(async()=>{
         const n=this.state.notices[id];
         const before=JSON.stringify([n.state,n.waitingReason,n.nextAction,n.attempts,n.lookups,n.messageId,n.stage]);
@@ -1684,17 +1799,24 @@ export class MobileRouter {
     return false;
   }
   /** The whole reply to an owner input reached the platform, or Kin chose not to
-   * reply. It answers the input it names and, for a reply, the inputs that were merged
-   * into the same native turn; an earlier input is never answered by time alone
-   * (CR-LIFE-06). */
+   * reply. It settles the input its reply group belongs to and the inputs the group
+   * says it answered when the reply was formed (`answeredInputIds`: those merged into its
+   * turn before it began, or steered in before the reply formed); nothing else. Sharing
+   * the turn, or its start time, is no evidence: an input steered in after the reply
+   * formed is still owed its own answer (CR-LIFE-06, CR2-LIFE-04). A group from before
+   * the list existed answers only its own input. Returns the ids it settled. */
   inputAnswered(kind,data) {
     const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
-    if(!record)return false;
-    const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return false;
+    if(!record)return null;
+    const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return null;
     const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
-    if(state==='accepted'&&ownerInput(record)&&Number.isFinite(record.turnStartedAt))for(const other of Object.values(this.state.inputs))
-      if(other!==record&&ownerInput(other)&&other.state==='accepted'&&!answered(other)&&other.turnStartedAt===record.turnStartedAt){other.answer={state:'covered',by:record.id,basis:'same-turn',at};other.settledAt??=at;}
-    return true;
+    const settled=[record.id];
+    if(ownerInput(record))for(const id of new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'))) {
+      const other=id===record.id?null:this.state.inputs[id];
+      if(!other||!ownerInput(other)||other.state!=='accepted'||answered(other))continue;
+      other.answer={state:state==='accepted'?'covered':state,by:record.id,basis:'answered-input-ids',at};other.settledAt??=at;settled.push(id);
+    }
+    return settled;
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
@@ -1702,7 +1824,7 @@ export class MobileRouter {
       if(kind==='prompt-start')dirty=this.turnStarted(data)||dirty;
       if(kind==='prompt-end')dirty=this.turnEnded(data)||dirty;
       if(kind==='delivery'&&data.sourceInputId)dirty=this.inputDelivery(data)||dirty;
-      if(kind==='reply-complete'||kind==='reply-choice'){if(this.inputAnswered(kind,data))this.save(kind,{inputId:data.inputId});return;}
+      if(kind==='reply-complete'||kind==='reply-choice'){const settled=this.inputAnswered(kind,data);if(settled)this.save(kind,{inputId:data.inputId,...(settled.length>1?{covered:settled.slice(1)}:{})});return settled;}
       if(kind==='input-dropped') {
         // The session let a queued prompt go before it began: provably never submitted.
         const record=this.state.inputs[data.inputId];
@@ -2038,16 +2160,26 @@ export class MobileRouter {
       const list=[],due=[];let changed=false;
       // At most one notice starts a send in a pass, and only past the gap since the last one that did.
       let starting=this.frozen()||now-(this.state.lastOwnerNoticeAt??-Infinity)<gapMs;
+      // Counted when it is handed out, so a quick retake cannot lose the count (CR2-LIFE-05).
+      const handOutRequeue=record=>{record.requeues=requeuesOf(record)+1;record.retry.requeuedAt=now;record.retry.nextAt=now+stuckMs;changed=true;list.push({kind:'requeue',id:record.id});};
       for(const record of Object.values(this.state.inputs)) {
-        if(record.historical||this.inflight.has(record.id))continue;
+        if(record.historical)continue;
+        // A live dispatch only keeps the same id from being submitted twice: nothing requeues
+        // or looks it up meanwhile, but its stall is judged like any other (CR2-LIFE-03).
+        const inflight=this.inflight.has(record.id);
         // An internal input whose submission is unknown (a handoff's continuation, the mind's
         // turns) is looked up by its id like the owner's, and nobody is told (WS8 #2).
         if(!ownerInput(record)) {
+          if(inflight)continue;
           const reconciliation=record.reconciliation,retry=record.retry;
           if(['unconfirmed','fenced-unconfirmed'].includes(record.state)&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
           // A restored input of unknown kind proven never received goes back to the inbox it
-          // may have come from, under its own id; with no job there it stops, and nobody is told.
-          else if(record.kind==='unknown'&&record.state==='failed-before-submit'&&retry&&!retry.exhausted&&requeue&&(retry.requeues??0)<REQUEUE_BUDGET&&retry.nextAt<=now&&!this.frozen())list.push({kind:'requeue',id:record.id});
+          // may have come from, under its own id; with no job there, or its budget spent, it
+          // stops, and nobody is told.
+          else if(record.kind==='unknown'&&record.state==='failed-before-submit'&&retry&&!retry.exhausted) {
+            if(requeue&&requeuesOf(record)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())handOutRequeue(record);}
+            else {retry.exhausted=true;retry.requeue??='budget';changed=true;}
+          }
           continue;
         }
         const summary=inputSummary(record),notice=record.ownerNotice;
@@ -2060,23 +2192,31 @@ export class MobileRouter {
           if(!mayStart||!starting){if(mayStart)starting=true;notice.state='sending';list.push({kind:'notify',id:record.id,notice:notice.kind,mayStart,previous:notice.lastReceipt??null});changed=true;}
         }
         const last=Math.max(this.progress.get(record.id)??0,record.lastDeliveredAt??0,record.turnEndedAt??0,record.turnStartedAt??0,record.acceptedAt??0,
-          record.queuedAt??0,record.retry?.requeuedAt??0,record.retry?.lastFailureAt??0,record.at??0);
+          record.queuedAt??0,record.retry?.requeuedAt??0,record.retry?.lastFailureAt??0,record.planAt??0,this.state.semanticPending[record.id]?.updatedAt??0,record.at??0);
         const idle=now-last>=stuckMs;
         let verdict=null;
-        if(record.state==='failed-before-submit') {
+        if(['semantic-pending','selected','preparing'].includes(record.state)) {
+          // Still waiting before submission — for a classification, the coordinator, a switch
+          // or its own preparation. Past the stall limit she is told it has not gone through.
+          if(idle)verdict='stopped';
+        } else if(record.state==='submitting') {
+          if(idle)verdict='unknown';
+        } else if(record.state==='failed-before-submit') {
           const retry=record.retry;
-          // Back to the inbox only on evidence, and only so many times (CR-LIFE-03).
-          if(retry&&!retry.exhausted&&requeue&&(retry.requeues??0)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())list.push({kind:'requeue',id:record.id});}
+          // Back to the inbox only on evidence, and only so many times across every attempt
+          // (CR-LIFE-03, CR2-LIFE-05); a dispatch that has not let go is not requeued.
+          if(inflight){if(idle)verdict='stopped';}
+          else if(retry&&!retry.exhausted&&requeue&&requeuesOf(record)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())handOutRequeue(record);}
           else {if(retry&&!retry.exhausted){retry.exhausted=true;retry.requeue??='budget';changed=true;}verdict='stopped';}
         } else if(record.state==='queued') {
           // Only the host's in-memory queue held it. With the session idle and its prompt
           // never begun it provably never arrived; behind a busy or hung turn it may still
           // begin, so it is not resubmitted, but the owner is told.
-          if(idle&&!sessionBusy){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});this.settleAcceptance(record.id,{state:record.state});changed=true;}
+          if(idle&&!sessionBusy&&!inflight){this.notSubmitted(record,'queued-prompt-never-started',{restart:true});this.settleAcceptance(record.id,{state:record.state});changed=true;}
           else if(idle)verdict='unknown';
         } else if(['unconfirmed','fenced-unconfirmed'].includes(record.state)) {
           const reconciliation=record.reconciliation;
-          if(reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
+          if(!inflight&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
           if(reconciliation)verdict='unknown';
         } else if(record.state==='accepted') {
           if(record.operationFailed)verdict='stopped';
@@ -2106,18 +2246,23 @@ export class MobileRouter {
       if(action.kind==='requeue') {
         let result;try{result=await requeue(action.id);}catch{result={state:'unavailable'};}
         await this.locked(async()=>{
-          const record=this.state.inputs[action.id];if(!record||record.state!=='failed-before-submit')return;
-          if(['requeued','pending','processing'].includes(result?.state)){record.retry={...record.retry,requeues:(record.retry.requeues??0)+1,requeuedAt:this.now(),nextAt:this.now()+stuckMs};this.save('input-requeued',{id:action.id,requeues:record.retry.requeues});}
-          else {record.retry={...record.retry,exhausted:true,requeue:result?.state??'missing'};this.save('input-retry-exhausted',{id:action.id,reason:record.retry.requeue});}
+          const record=this.state.inputs[action.id];if(!record)return;
+          if(['requeued','pending','processing'].includes(result?.state)){this.save('input-requeued',{id:action.id,requeues:requeuesOf(record)});return;}
+          // Nowhere to go back to: this attempt stops (the count was taken when it was handed out).
+          if(record.state!=='failed-before-submit')return;
+          record.retry={...record.retry,exhausted:true,requeue:result?.state??'missing'};this.save('input-retry-exhausted',{id:action.id,reason:record.retry.requeue});
         });
         results.push({...action,result:result?.state??null});continue;
       }
       if(action.kind==='reconcile') {
-        let result;try{result=await reconcileInput(action.id);}catch{result={state:'unknown'};}
+        // Looked up on the thread it was submitted to, never on whatever is current now (CR2-INT-02).
+        const submit=this.state.inputs[action.id]?.submit??null;
+        let result;try{result=await reconcileInput(action.id,{sessionId:submit?.sessionId??null});}catch{result={state:'unknown'};}
         await this.locked(async()=>{
           const record=this.state.inputs[action.id];if(!record||!['unconfirmed','fenced-unconfirmed'].includes(record.state))return;
-          const state=['found','not-found'].includes(result?.state)?result.state:'unknown';
-          record.reconciliation={state,at:this.now()};
+          const read=reconciliationState(result,record.submit);
+          const state=read.state;
+          record.reconciliation={state,at:this.now(),...(read.reason?{reason:read.reason}:{})};
           // A record restored from the journal is settled by its lookup like any other (WS8 #3).
           if(state!=='unknown'&&record.recovered){delete record.recovered;record.restored='journal';}
           if(state==='found'){record.state='accepted';record.acceptedAt??=this.now();}
@@ -2153,6 +2298,13 @@ export class MobileRouter {
         // Only a send that started uses the gap, from when it started (CR-LIFE-16).
         if(action.mayStart&&['accepted','rejected','unknown'].includes(kind))this.state.lastOwnerNoticeAt=startedAt;
         if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();}
+        else if(kind==='rejected'&&action.mayStart) {
+          // Refused outright, so nothing reached her: the same notice goes again after a
+          // bounded rest; once the rests are spent it is only looked up (CR2-LIFE-06).
+          notice.rejections=(notice.rejections??0)+1;notice.state='rejected';notice.attempts=0;
+          const rest=NOTICE_REJECT_RETRY_MS[notice.rejections-1];
+          notice.nextAt=this.now()+(rest??NOTICE_ROUND_REST_MS[Math.min((notice.round=(notice.round??0)+1),NOTICE_ROUND_REST_MS.length)-1]);
+        }
         else if(notice.attempts>=(kind==='not-submitted'||kind==='no-port'?NOTICE_SEND_BUDGET:NOTICE_LOOKUP_BUDGET)) {
           // The round ends; the notice does not. It rests, then is tried again (proven
           // unsent) or looked up again (begun) under the same identity (CR-LIFE-05).
@@ -2191,6 +2343,8 @@ export class MobileRouter {
  * (CR-LIFE-02), or restored from the journal and proven never received (WS8 #3). A replay
  * routes it afresh and keeps the retries it already used. */
 function intakeOnly(record){return Boolean((record?.intake||record?.restored)&&!record.route&&['preparing','failed-before-submit'].includes(record.state));}
+/** A deferred task the router still owes its plan to, or owes Kin its failure. */
+function deferralOwed(task){const plan=task.deferral?.plan;return task.status==='deferred'&&(plan?.state==='pending'||plan?.state==='needs-kin'&&!plan.toldAt);}
 /** A task keeps a bounded history of replaced and late entries (AD1-08). */
 function trim(task,key,limit=64) {
   const entries=Object.entries(task[key]??{});

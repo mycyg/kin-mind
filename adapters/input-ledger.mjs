@@ -59,11 +59,17 @@ export function inputSummary(record) {
 /** True when this input needs nothing more from the host. Anything still in flight
  * is unsettled whatever else is known about it. Internal inputs (the mind's own
  * turns) settle when they leave the native session: their failures are the mind's
- * to retry, and no owner notice is ever owed for them. */
+ * to retry, and no owner notice is ever owed for them. Owing her no notice is not
+ * being settled, though: one whose submission is still to be looked up by its own id,
+ * or (restored, of unknown kind) still on its way back to an inbox, stays (CR2-LIFE-10). */
 export function inputSettled(record) {
   if(!record)return true;
   if(inputInFlight(record))return false;
-  if(!ownerInput(record))return true;
+  if(!ownerInput(record)) {
+    if(record.historical)return true;
+    if(record.recovered||['unconfirmed','fenced-unconfirmed'].includes(record.state))return false;
+    return !(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.retry?.exhausted);
+  }
   return ['answered','failed-notified','superseded','canceled-by-owner','historical'].includes(inputSummary(record));
 }
 
