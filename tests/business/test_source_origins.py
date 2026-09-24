@@ -1,13 +1,14 @@
 """The supplementary origin of a source (K4-12, K4-13, K4-14, K4-16, E3-06, T-16): six kinds over
 the existing source identity, one table read by recall, the graph's writer and the evidence
-predicates alike."""
+predicates alike. What is derived from sources of more than one kind keeps every one's nature, up
+to what recall shows (CR-MEM-08)."""
 import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from eventmem.core import Engine
-from eventmem.core.models import RecallRequest, Scope, SourceInput
+from eventmem.core.models import RecallRequest, RecordInput, Scope, SourceInput
 from eventmem.core.read_policy import (
     ORIGIN_KINDS,
     ORIGINS_FILE,
@@ -154,3 +155,54 @@ def test_a_stalled_isolation_migration_is_finished_on_the_maintenance_tick(syste
     assert not ReadPolicy.load(engine, mind.scope).strict
     # Settled: the tick leaves it alone from now on.
     assert isolation_migration.resume_stalled(engine, now=20_000) == []
+
+
+def test_a_summary_of_mixed_sources_keeps_every_sources_nature_up_to_recall(system):
+    mind, memory, source, clock = system
+    engine = mind.engine
+    owner = source("kin-owner-input", "owner-sea", "我们周末去看海吧", authority="explicit",
+                   metadata={"role": "user", "host_event": "message"})
+    thought = source("kin-reflection", "diary-sea", "小Kin自己琢磨的：看海那天也许会下雨",
+                     metadata={"role": "assistant", "basis": "internal_thought", "internal": True})
+    page = source("kin-web-observation", "page-sea", '{"excerpt": "潮汐预报：周六 06:12 低潮"}', authority="document",
+                  metadata={"host_event": "web-observation"})
+
+    def summary(key, sids, text):
+        return engine.get(engine.add_record(RecordInput(
+            kind="summary", content=text, scope=mind.scope, source_ids=sids,
+            evidence_ids=[root(engine, sid)["id"] for sid in sids], generated=True, confirmation="inferred"), key)["id"])
+
+    partly = summary("owner-and-thought", [owner, thought], "看海汇总甲：周末去看海，那天也许会下雨")
+    both = summary("thought-and-page", [thought, page], "看海汇总乙：也许会下雨，周六清晨低潮")
+    turned = summary("page-and-thought", [page, thought], "看海汇总丙：周六清晨低潮，也许会下雨")
+    policy = ReadPolicy.load(engine, mind.scope, "experience_recall")
+    # The owner's words and Kin's own reflection: partly Kin's thought, never plain experience.
+    found = policy.classify(partly)
+    assert (found.kind, found.label, found.labels, found.mixed) == ("experience", "kin_thought", ("kin_thought",), True)
+    assert policy.present(partly, {}) == {"evidence_label": "kin_thought", "evidence_labels": ["kin_thought"],
+                                          "evidence_mixed": True}
+    assert policy.prefix(partly) == "[partly kin_thought] "
+    assert not owner_statement(partly, policy)
+    # A thought and a web page: both named, whichever source came first.
+    for record in (both, turned):
+        assert policy.label(record) == "external_material+kin_thought"
+        assert policy.present(record, {}) == {"evidence_label": "external_material+kin_thought",
+                                              "evidence_labels": ["external_material", "kin_thought"]}
+    # One kind of material reads as that kind, as before.
+    assert policy.present(root(engine, thought), {}) == {"evidence_label": "kin_thought"}
+    assert policy.present(root(engine, owner), {}) == {}
+
+    # Up to recall: the lines and the items say it ...
+    found = engine.recall(RecallRequest(query="看海汇总", scope=mind.scope, limit=40, budget=4000))
+    shown = {item["id"]: item for item in found["items"]}
+    assert shown[partly["id"]]["evidence_labels"] == ["kin_thought"] and shown[partly["id"]]["evidence_mixed"] is True
+    assert shown[both["id"]]["evidence_label"] == shown[turned["id"]]["evidence_label"] == "external_material+kin_thought"
+    assert f"[{partly['id']} r1 summary active] [partly kin_thought] " in found["text"]
+    # ... and so does the item Kin's own context renders for each record.
+    from kin_mind.context import Contexts
+
+    contexts = Contexts(mind)
+    facts = {record["id"]: contexts.record_item(record, policy=policy)["facts"] for record in (partly, both, turned)}
+    assert facts[partly["id"]]["evidence_labels"] == ["kin_thought"] and facts[partly["id"]]["evidence_mixed"] is True
+    assert facts[both["id"]]["evidence_labels"] == facts[turned["id"]]["evidence_labels"] == ["external_material", "kin_thought"]
+    assert json.loads(contexts._line(contexts.record_item(partly, policy=policy)))["facts"]["evidence_label"] == "kin_thought"

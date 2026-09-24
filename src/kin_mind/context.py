@@ -11,7 +11,7 @@ from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallRequest
-from eventmem.core.read_policy import ReadPolicy
+from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
 
 from .computer import redact
@@ -434,8 +434,8 @@ class Contexts:
                         found = policy.classify(record)
                         if found.kind != "experience":
                             basis = facts["basis"] = found.kind
-                        elif found.label:
-                            facts["evidence_label"] = found.label
+                        else:
+                            facts.update(label_facts(found))
                 if fallback:
                     text = "\n".join(fallback)
             facts["relations"] = [{k: e.get(k) for k in ("id", "subject", "object", "predicate", "layer", "basis", "role", "reason")} for e in related[:8]]
@@ -559,7 +559,7 @@ class Contexts:
         return {"id": record["id"], "revision": record["revision"], "text": record["content"],
                 "basis": record["confirmation"] if found.kind == "experience" else found.kind,
                 "facts": {"status": record["status"], "valid_from": record["valid_from"], "valid_until": record.get("valid_until"),
-                          **({"evidence_label": found.label} if found.kind == "experience" and found.label else {})},
+                          **label_facts(found)},
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
     def _overview_key(self, item):
