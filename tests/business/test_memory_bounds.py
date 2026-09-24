@@ -1,7 +1,8 @@
 """Bounds the memory layer keeps.
 
 A disclosure only summarises a share the assessment's own sources reach (K3-02). A date is cut at
-the owner's midnight, and a continued recall round searches nothing again (K3-16). A reflection
+the owner's midnight, and a continued recall round searches nothing again (K3-16); a main-session
+provider is never copied into a ranking thread (K1-12). A reflection
 names no owner and no role, and one kept under the old wording is returned as it is (K1-21, K3-03).
 Nothing is claimed or paid for while history compaction holds the store, and what compaction alone
 set aside goes back to the queue with the marker (K3-14). Frequency ranking is gated on the
@@ -106,6 +107,22 @@ def test_a_continued_round_searches_nothing_again(world, monkeypatch):
     found, info = AdaptiveRecall(Contexts(mind)).collect("看海的计划", mode="deep", allow_model=True, provider=ranker)
     assert ranker.calls >= 2 and info["rounds"] >= 2
     assert len(searched) == 1  # the follow-up round went on from the pool it had
+
+
+def test_a_main_session_provider_is_never_copied_into_a_ranking_thread(world, monkeypatch):
+    from kin_mind.appraisal import NativeReview
+
+    engine, mind, memory = world
+    for n in range(2):
+        owner(engine, f"sea-{n}", f"看海的计划第{n}步", f"2026-09-1{n}T10:00:00+00:00")
+
+    def no_embedding(*args, **kwargs):
+        raise RuntimeError("no embedding service in this test")
+
+    monkeypatch.setattr("eventmem.core.providers.Providers.embed", no_embedding)
+    native = NativeReview.__new__(NativeReview)  # never asked: the ranking refuses it first (K1-12)
+    found, info = AdaptiveRecall(Contexts(mind)).collect("看海的计划", mode="deep", allow_model=True, provider=native)
+    assert found and "rerank:RuntimeError" in info["degraded_reasons"] and info["model_requests"] == 0
 
 
 def test_a_reflection_names_no_owner_and_an_earlier_one_stays_as_kept(world):

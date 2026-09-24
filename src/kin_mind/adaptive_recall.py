@@ -150,7 +150,12 @@ class AdaptiveRecall:
 
     def _rank(self, provider, payload, deadline, info):
         """One reranking request against a prepared candidate set, inside the caller's deadline."""
-        from .appraisal import DeepSeek
+        from .appraisal import DeepSeek, NativeReview
+        if isinstance(provider, NativeReview):
+            # A main-session provider numbers its requests and speaks one frame at a time over the
+            # host's pipe: a copy in a helper thread would repeat a request id and race the pipe.
+            # The ranking is optional; the caller keeps its local evidence (K1-12).
+            raise RuntimeError("native-provider-cannot-rank")
         request_provider = copy.copy(provider) if isinstance(provider, DeepSeek) else provider
         request_provider.timeout = min(30, deadline - time.monotonic())
         request_provider.absolute_deadline = time.monotonic() + request_provider.timeout
