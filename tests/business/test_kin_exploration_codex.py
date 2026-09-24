@@ -295,3 +295,23 @@ def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
                    for tool in requests[0].get("tools", []))
     # No phone path: the tool surface has no send/message tool.
     assert not any("send" in str(t) or "message" in str(t.get("tool", "")) for t in report["tool_results"])
+
+def test_a_running_exploration_stops_for_kin_not_for_a_new_message(tmp_path):
+    """N7: a new owner message does not end the run; Kin setting the wish down does."""
+    from kin_mind.exploration import Explorations
+    from kin_mind.memory import MemoryContinuity
+    from kin_mind.state import DesireChange
+
+    _, mind, source = exploration_world(tmp_path)
+    desire = next(iter(mind.read()["desires"]))
+    revision = mind.read()["revision"]
+    mind.manage_desire(DesireChange(command_id="start-wish", agent_version="test-v1", expected_revision=revision,
+                                    evidence_ids=[source], action="start", desire_id=desire["id"], reason="Starting"))
+    stop = Explorations(mind)._stop_when(lambda: False, desire["id"], every=0)
+    MemoryContinuity(mind).ingest({"id": "owner-interjects", "kind": "owner-message", "text": "Hi", "at": mind.clock()})
+    assert stop() is False
+    revision = mind.read()["revision"]
+    mind.manage_desire(DesireChange(command_id="set-down", agent_version="test-v1", expected_revision=revision,
+                                    evidence_ids=[source], action="abandon", desire_id=desire["id"], reason="Kin chose to stop"))
+    assert stop() is True
+    assert Explorations(mind)._stop_when(lambda: True, desire["id"])() is True

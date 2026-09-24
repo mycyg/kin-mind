@@ -37,7 +37,7 @@ from urllib.parse import unquote, urlparse
 
 from pydantic import Field, field_validator
 
-from eventmem.core.db import Conflict, digest, dumps
+from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, SourceInput
 
 from . import liveness
@@ -182,6 +182,41 @@ class Explorations:
                 )
             ]
 
+    def _stop_when(self, canceled, desire_id, *, every=15):
+        """The run stops for the host's own stop (shutdown) or for Kin's decision, never for a
+        new owner message by itself: the wish it serves is no longer in progress, its plan step
+        was decided again, or the owner paused exploration. Read at most every `every` seconds."""
+        checked = [0.0, False]
+
+        def withdrawn():
+            with self.engine.db.connect() as conn:
+                desire = self.mind._load(conn)["desires"].get(desire_id)
+                if not desire or desire["status"] != "in_progress":
+                    return True
+                if desire.get("plan_id"):
+                    from .plans import AutonomousPlans
+                    try:
+                        plan = AutonomousPlans(self.mind).get(conn, desire["plan_id"])
+                    except Missing:
+                        return True
+                    step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
+                    if plan["status"] != "active" or not step or (step.get("decision") or {}).get("id") != desire.get("plan_decision_id"):
+                        return True
+            from .habits import ConversationHabits
+            return bool(ConversationHabits(self.mind).read()["preferences"].get("exploration_paused"))
+
+        def stop():
+            if canceled():
+                return True
+            if time.monotonic() - checked[0] >= every:
+                checked[0] = time.monotonic()
+                try:
+                    checked[1] = withdrawn()
+                except Exception:  # noqa: BLE001 - an unreadable store is not a decision to stop
+                    checked[1] = False
+            return checked[1]
+        return stop
+
     def run(
         self, executable, directory, agent_version, *, canceled=lambda: False,
         model=None, runner=None, brief=None, budget_seconds=1200, desire_id=None, computer=None, web=None,
@@ -267,7 +302,7 @@ class Explorations:
             reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"])
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
-                budget_seconds=budget_seconds, canceled=canceled, model=model, **options)
+                budget_seconds=budget_seconds, canceled=self._stop_when(canceled, desire["id"]), model=model, **options)
             output = normalize_execution_report(output)
             data.update(output)
             state = output["state"]

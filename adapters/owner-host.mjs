@@ -51,7 +51,8 @@ export class MindLoop {
   }
   close() {this.closed=true;clearInterval(this.timer);this.stopExploration?.();}
   async ingest(input) {
-    this.stopExploration?.();
+    // A new owner message does not stop Kin's own exploration or creation: she hears of
+    // it and decides. Only shutdown (close) and an explicit stop do.
     const result=await this.call('ingest',input);
     void this.review();
     return result;

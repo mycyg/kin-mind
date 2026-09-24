@@ -79,9 +79,12 @@ export class AutonomousCreator {
   }
 }
 
-/** Existing minute loop dispatches one creator; user work preempts it. */
-export function startAutonomousWork({loop,call,creator,ownerEpoch,isBusy,recordStatus=()=>{}}){
-  let running=false,closed=false,controller=null;
+/** Existing minute loop dispatches one creator. A running creation is Kin's own work: a new
+ * owner message does not stop it (she hears of it and decides, through her plan); shutdown,
+ * an explicit stop and a changed plan or decision do. It starts only while the owner's work
+ * is not running. */
+export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{}}){
+  let running=false,closed=false,controller=null,current=null;
   const owner='creator-'+process.pid;
   const tick=async()=>{
     if(closed||running||isBusy())return;
@@ -89,10 +92,11 @@ export function startAutonomousWork({loop,call,creator,ownerEpoch,isBusy,recordS
     try{
       claimed=await call('plan-claim',{actor:'create',owner});
       if(claimed.state!=='claimed')return;
-      const epoch=ownerEpoch();controller=new AbortController();
+      controller=new AbortController();
       const run=claimed.run;
+      current={plan_id:claimed.plan.id,goal:claimed.plan.goal,step:claimed.step?.goal,run_id:run.id};
       const result=await creator.run(claimed,{signal:controller.signal,onHeartbeat:async()=>{
-        if(closed||isBusy()||epoch!==ownerEpoch())return {state:'interrupt'};
+        if(closed)return {state:'interrupt'};
         return call('plan-renew',{run_id:run.id,owner,fence:run.fence});
       }});
       const settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
@@ -102,9 +106,9 @@ export function startAutonomousWork({loop,call,creator,ownerEpoch,isBusy,recordS
       if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence});}catch{}
       recordStatus({creation:{state:'needs-review',reason:'creation-executor-failed'}});
     }
-    finally{running=false;controller=null;}
+    finally{running=false;controller=null;current=null;}
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
   const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();controller?.abort();};
-  return {tick,async close(){closed=true;controller?.abort();await creator.stop();},get running(){return running;}};
+  return {tick,async close(){closed=true;controller?.abort();await creator.stop();},get running(){return running;},get current(){return current;}};
 }

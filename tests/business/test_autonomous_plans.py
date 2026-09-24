@@ -249,6 +249,17 @@ def test_pause_invalidates_running_worker(env):
     plans.manage({"command_id": "pause", "action": "pause", "id": current["id"], "expected_revision": current["revision"], "reason": "Owner needs the computer", "evidence_ids": [initial]})
     assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "interrupt"
 
+def test_owner_message_does_not_interrupt_a_running_step(env):
+    """N7: a new message from the owner reaches Kin; it does not end her running step."""
+    mind, plans, source, clock, initial = env
+    decide(env, create(env))
+    claimed = plans.claim("create", "worker")
+    MemoryContinuity(mind).ingest({"id": "owner-interjects", "kind": "owner-message", "text": "By the way", "at": mind.clock()})
+    assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "renewed"
+    verified = source("verified-clock", authority="operation")
+    run = plans.settle(claimed["run"]["id"], "worker", 1, state="completed", result={"verified": True, "source_id": verified})
+    assert run["state"] == "completed"
+
 def test_waiting_plan_rechecks_new_evidence_before_its_distant_review(env):
     mind, plans, source, clock, initial = env
     p=decide(env, create(env), 'wait', next_review_at='2028-01-01T09:00:00+08:00')

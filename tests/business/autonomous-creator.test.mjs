@@ -32,6 +32,16 @@ test('isolated worker uses configured model and returns native and artifact rece
 });
 test('user work prevents claims and failed result review releases only its own finished run',async()=>{
  const calls=[];let busy=true;const loop={tick:async()=>{},review:()=>{}};
- const worker=startAutonomousWork({loop,isBusy:()=>busy,ownerEpoch:()=>1,creator:{run:async()=>({state:'produced'}),stop(){}},call:async(action)=>{calls.push(action);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:1},plan:{id:'p'}};if(action==='plan-result')throw Error('timeout');}});
+ const worker=startAutonomousWork({loop,isBusy:()=>busy,creator:{run:async()=>({state:'produced'}),stop(){}},call:async(action)=>{calls.push(action);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:1},plan:{id:'p'}};if(action==='plan-result')throw Error('timeout');}});
  await worker.tick();assert.equal(calls.length,0);busy=false;await worker.tick();assert.deepEqual(calls,['plan-claim','plan-result','plan-interrupt']);worker.close();
+});
+test('a running creation keeps its lease when 小光 writes; only a close interrupts it (N7)',async()=>{
+ const calls=[];let busy=false,seen=null;const loop={tick:async()=>{},review:()=>{}};
+ const worker=startAutonomousWork({loop,isBusy:()=>busy,creator:{stop(){},run:async(claimed,{onHeartbeat})=>{
+   busy=true;seen=worker.current;const renewed=await onHeartbeat();assert.equal(renewed.state,'renewed');return {state:'interrupted'};}},
+  call:async(action)=>{calls.push(action);if(action==='plan-claim')return{state:'claimed',run:{id:'r',fence:1},plan:{id:'p',goal:'A small clock'},step:{goal:'Draw it'}};if(action==='plan-renew')return{state:'renewed'};return{};}});
+ await worker.tick();
+ assert.deepEqual(seen,{plan_id:'p',goal:'A small clock',step:'Draw it',run_id:'r'});
+ assert.ok(calls.includes('plan-renew'));assert.equal(worker.current,null);
+ await worker.close();
 });

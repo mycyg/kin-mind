@@ -139,3 +139,8 @@ for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
   assert.equal((await loop.tick()).state,'accepted');assert.equal(claims,2);assert.equal(sends,1);
  });
 }
+test('a new owner message does not stop background exploration (N7); closing does',async()=>{
+ let stops=0;const{loop}=fixture({stopExploration:()=>{stops++;}});
+ await loop.ingest({id:'owner-hi',text:'hi'});assert.equal(stops,0);
+ loop.close();assert.equal(stops,1);
+});

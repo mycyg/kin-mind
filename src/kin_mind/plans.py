@@ -634,9 +634,10 @@ class AutonomousPlans:
             plan = self.get(conn, row["plan_id"])
             decision = json.loads(row["data"])["decision"]
             step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
+            # A running step stops when Kin decides otherwise (the plan or the step's decision
+            # changed) or what it rests on moved; a new owner message or a deployment does not
+            # stop it by itself. Kin hears of the message and decides.
             if (plan["status"] != "active" or step.get("decision", {}).get("id") != decision["id"]
-                    or decision["agent_version"] != self.mind._load(conn)["agent_version"]
-                    or decision["owner_epoch"] != self.owner_epoch(conn)
                     or not self.mind._fresh(conn, decision["evidence"]) or not self.mind._fresh(conn, plan["evidence"])):
                 return {"state": "interrupt", "reason": "plan-or-evidence-changed"}
             conn.execute("UPDATE mind_plan_runs SET lease_until=? WHERE id=?", (time.time() + 90, run_id))
@@ -667,7 +668,6 @@ class AutonomousPlans:
             if step.get("run_id") != run_id:
                 raise Conflict("Step has another execution")
             if state == "completed" and (plan["status"] != "active" or step.get("decision", {}).get("id") != run["decision"]["id"]
-                    or run["decision"]["owner_epoch"] != self.owner_epoch(conn)
                     or not self.mind._fresh(conn, run["decision"]["evidence"])):
                 raise Conflict("Completion lost its current decision or evidence")
             run.update(state=state, result=result, finished_at=self.mind.clock())
