@@ -31,8 +31,9 @@ const FENCE_OPEN=/^[ \t]*(`{3,}|~{3,})(.*)$/,FENCE_CLOSE=/^[ \t]*(`{3,}|~{3,})[ 
 /** Code fences as [start,end) ranges, by the CommonMark rule: a fence closes on
  * a bare line of the same character, at least as long as the one that opened
  * it; an unclosed fence runs to the end. A fenced block inside a longer fence
- * therefore stays one atom. */
-function fences(text) {
+ * therefore stays one atom. The one fence rule of the reply path: bubbles
+ * (`chat-bubbles.mjs`) and fragments read code the same way (AD2-08). */
+export function fences(text) {
   const ranges=[];let open=null,position=0;
   for(const line of text.split('\n')) {
     const body=line.endsWith('\r')?line.slice(0,-1):line,marker=body.match(open?FENCE_CLOSE:FENCE_OPEN);
