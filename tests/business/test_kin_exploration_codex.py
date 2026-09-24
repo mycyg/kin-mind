@@ -2,11 +2,23 @@ import json
 
 import os
 
-import shutil
+import sys
+
+import time
+
+from pathlib import Path
 
 import pytest
 
-from kin_mind.codex_executor import codex_env, run_codex
+from kin_mind.codex_executor import (
+    _mcp_result_metadata,
+    codex_argv,
+    codex_env,
+    codex_final_result,
+    codex_prompt,
+    findings_schema,
+    run_codex,
+)
 
 from kin_mind.exploration import CodexUnavailable
 
@@ -140,6 +152,8 @@ RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_
 ALLOWED_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE",
                "CODEX_HOME", "KIN_TEST_DS_KEY"}
 
+SRC = Path(__file__).resolve().parents[2] / "src"
+
 HOST_SECRETS = {"DEEPSEEK_API_KEY": "host-only", "OPENAI_API_KEY": "host-only",
                 "FEISHU_APP_SECRET": "host-only", "EVENTMEM_API_KEY": "host-only"}
 
@@ -165,13 +179,6 @@ def test_the_exploration_child_sees_only_its_allowlisted_environment(tmp_path, m
     assert set(observed["env"]) - RUNTIME_ADDED - carried <= ALLOWED_ENV
     assert not set(observed["env"]) & set(HOST_SECRETS)
     assert observed["env"]["KIN_TEST_DS_KEY"] == "provider-key"
-
-def _codex_blocked_by_guard():
-    """The hermetic runner refuses native binaries under a protected root (~/.codex among them)."""
-    found = shutil.which("codex")
-    real = os.path.realpath(found) if found else ""
-    roots = [os.path.realpath(r) for r in os.environ.get("KIN_PROTECTED_ROOTS", "").split(":") if r]
-    return any(real == r or real.startswith(r + os.sep) for r in roots)
 
 def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path, monkeypatch):
     """C7-regression: the executor path never touches the shared-session registry."""
@@ -227,7 +234,14 @@ def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch)
     report = run_codex(fake, topic, tmp_path / "job-altered", **codex_kwargs())
     assert report["state"] == "failed" and report["reason"] == "unbacked-citation"
 
-@pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not installed")
+def _codex_blocked_by_guard():
+    """The hermetic runner refuses native binaries under a protected root (~/.codex among them)."""
+    found = __import__("shutil").which("codex")
+    real = os.path.realpath(found) if found else ""
+    roots = [os.path.realpath(r) for r in os.environ.get("KIN_PROTECTED_ROOTS", "").split(":") if r]
+    return any(real == r or real.startswith(r + os.sep) for r in roots)
+
+@pytest.mark.skipif(__import__("shutil").which("codex") is None, reason="codex CLI not installed")
 @pytest.mark.skipif(_codex_blocked_by_guard(), reason="the hermetic guard refuses the installed codex "
                     "binary under a protected root; run this file outside scripts/test-all.sh")
 def test_real_tool_round_trip_search_read_cite(tmp_path, monkeypatch):
