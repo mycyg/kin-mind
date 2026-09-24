@@ -1,0 +1,73 @@
+{
+  "version": "source-origins-v1",
+  "about": "What kind of thing a source is, over and above who wrote it. Read by eventmem.core.read_policy (classification at receipt and at read) and kin_mind.evidence_classes (never_evidence); exported for hosts. A namespace pattern ending in * is a prefix. The owner's own explicit turns are experience whatever namespace carries them; an operator's private registry is consulted before this table.",
+  "kinds": {
+    "host_maintenance": {
+      "class": "host_envelope",
+      "label": null,
+      "experience_recall": false,
+      "evidence": false,
+      "indexed": false,
+      "meaning": "The host's own bookkeeping written back as a source: maintenance requests, internal events, receipts. Evidence of nothing, recalled by nothing but audit."
+    },
+    "synthetic_example": {
+      "class": "synthetic_example",
+      "label": null,
+      "experience_recall": false,
+      "evidence": false,
+      "indexed": true,
+      "meaning": "Made-up samples: role examples, fixtures, demonstrations. Never something that happened."
+    },
+    "configuration": {
+      "class": "role_configuration",
+      "label": null,
+      "experience_recall": false,
+      "evidence": true,
+      "indexed": true,
+      "meaning": "Settings and role or persona texts. Shown in the self-knowledge view, never recalled as shared experience."
+    },
+    "kin_thought": {
+      "class": "experience",
+      "label": "kin_thought",
+      "experience_recall": true,
+      "evidence": true,
+      "indexed": true,
+      "meaning": "Kin's own diary and reflections. Recalled, and always shown as Kin's thought, never as what the owner said or as a confirmed fact."
+    },
+    "observation": {
+      "class": "experience",
+      "label": "observation",
+      "experience_recall": true,
+      "evidence": true,
+      "indexed": true,
+      "meaning": "What Kin actually observed while exploring or using the computer. Recalled as an observation."
+    },
+    "external_excerpt": {
+      "class": "experience",
+      "label": "external_material",
+      "experience_recall": true,
+      "evidence": true,
+      "indexed": true,
+      "meaning": "Text Kin read from outside (web pages). Recalled as external material, never as the owner's words or Kin's own view."
+    }
+  },
+  "namespaces": {
+    "kin-session-maintenance": "host_maintenance",
+    "mind-internal-event": "host_maintenance",
+    "mind-internal-event:*": "host_maintenance",
+    "kin.desktop_receipts": "host_maintenance",
+    "role-configuration": "configuration",
+    "role-configuration:*": "configuration",
+    "persona-configuration": "configuration",
+    "persona-configuration:*": "configuration",
+    "synthetic-example": "synthetic_example",
+    "synthetic-example:*": "synthetic_example",
+    "kin-reflection": "kin_thought",
+    "kin-exploration": "observation",
+    "kin-computer-observation": "observation",
+    "kin-web-observation": "external_excerpt"
+  },
+  "metadata": {
+    "maintenance_only": "host_maintenance"
+  }
+}

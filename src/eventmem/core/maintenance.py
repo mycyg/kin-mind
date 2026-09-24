@@ -6,45 +6,45 @@ from .db import Missing, digest
 from .engine import uid
 
 
+def erase_set(conn, object_id):
+    """What deleting `object_id` erases, as (record ids, source ids). The delete and its preview
+    both ask here, so the set a console shows is the set that goes.
+
+    A source takes every record that cites it, and each record takes what was built on it —
+    records that name it as evidence and its parts — and so on down. A record takes its own
+    raw sources too, because their bytes hold the same words. What a record does not take is a
+    source it cites only through the records it was written from: a narrative or a summary cites
+    the sources of the conversations it summarised, and deleting the summary is not deleting
+    the owner's messages it was written about."""
+    if object_id.startswith("src_"):
+        sources, pending = {object_id}, {object_id}
+    else:
+        own = {r[0] for r in conn.execute("SELECT source_id FROM evidence WHERE record_id=?", (object_id,))}
+        cited = {r[0] for r in conn.execute(
+            "SELECT e.source_id FROM dependencies d JOIN evidence e ON e.record_id=d.evidence_id"
+            " WHERE d.record_id=?", (object_id,))}
+        sources, pending = own - cited, {object_id}
+    for sid in sources:
+        pending.update(r[0] for r in conn.execute("SELECT record_id FROM evidence WHERE source_id=?", (sid,)))
+    records = set()
+    while pending:
+        current = pending.pop()
+        if current in records:
+            continue
+        records.add(current)
+        pending.update(r[0] for r in conn.execute(
+            "SELECT record_id FROM dependencies WHERE evidence_id=?", (current,)))
+        pending.update(r[0] for r in conn.execute("SELECT id FROM records WHERE parent_id=?", (current,)))
+    return records, sources
+
+
 def deletion_preview(engine, object_id):
     with engine.db.connect() as conn:
-        sources = (
-            {object_id}
-            if object_id.startswith("src_")
-            else {
-                r[0]
-                for r in conn.execute(
-                    "SELECT source_id FROM evidence WHERE record_id=?", (object_id,)
-                )
-            }
-        )
-        pending = {object_id}
-        for sid in sources:
-            pending.update(
-                r[0]
-                for r in conn.execute(
-                    "SELECT record_id FROM evidence WHERE source_id=?", (sid,)
-                )
-            )
-        records = set()
-        while pending:
-            rid = pending.pop()
-            if rid in records:
-                continue
-            if conn.execute("SELECT 1 FROM records WHERE id=?", (rid,)).fetchone():
-                records.add(rid)
-            pending.update(
-                r[0]
-                for r in conn.execute(
-                    "SELECT record_id FROM dependencies WHERE evidence_id=?", (rid,)
-                )
-            )
-            pending.update(
-                r[0]
-                for r in conn.execute(
-                    "SELECT id FROM records WHERE parent_id=?", (rid,)
-                )
-            )
+        closure, sources = erase_set(conn, object_id)
+        records = {rid for rid in closure
+                   if conn.execute("SELECT 1 FROM records WHERE id=?", (rid,)).fetchone()}
+        sources = {sid for sid in sources
+                   if conn.execute("SELECT 1 FROM sources WHERE id=?", (sid,)).fetchone()}
         if not records and not sources:
             raise Missing(object_id)
     return {
@@ -53,7 +53,7 @@ def deletion_preview(engine, object_id):
         "source_count": len(sources),
         "record_ids": sorted(records)[:100],
         "source_ids": sorted(sources),
-        "effect": "Erase original sources and dependent records, revisions, indexes, caches and attachments. Existing external backups must be managed separately.",
+        "effect": "Erase original sources and dependent records, revisions, indexes, caches, the mind's derived text and state history, and attachments. A derived summary is erased without the sources it cites. Existing external backups and history archives keep their copies; a history restore takes erased words out again.",
     }
 
 

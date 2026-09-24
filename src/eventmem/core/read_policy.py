@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import threading
+from pathlib import Path
 from typing import NamedTuple
 
 from .models import Scope
@@ -89,6 +90,26 @@ NAMESPACE_REGISTRY = (
     ("synthetic-example", "synthetic_example"),
     ("synthetic-example:*", "synthetic_example"),
 )
+
+# The supplementary origin of a source: what kind of thing it is, over and above who wrote it.
+# Six kinds in one table, `source-origins.json` beside this module, which the hosts read too.
+# Three kinds are never experience (host maintenance, synthetic examples, configuration); three
+# are experience that keeps its nature as a label (Kin's thoughts, observations, external
+# material). A registry rule, public or private, is asked first; the owner's own explicit turns
+# stay experience whatever namespace carries them.
+ORIGINS_FILE = Path(__file__).with_name("source-origins.json")
+_ORIGINS = json.loads(ORIGINS_FILE.read_text(encoding="utf-8"))
+ORIGINS_VERSION = _ORIGINS["version"]
+ORIGIN_KINDS = {kind: (entry["class"], entry["label"]) for kind, entry in _ORIGINS["kinds"].items()}
+ORIGIN_NAMESPACES = tuple(sorted(_ORIGINS["namespaces"].items(),
+                                 key=lambda rule: (rule[0].endswith("*"), -len(rule[0]), rule[0])))
+ORIGIN_METADATA = tuple(_ORIGINS["metadata"].items())
+ORIGIN_LABELS = frozenset(label for _, label in ORIGIN_KINDS.values() if label)
+# Kinds whose root record is kept out of the text index and the organise queue: nothing reads
+# them as memory, and a thousand identical maintenance notes crowded every lexical recall.
+UNINDEXED_ORIGINS = frozenset(kind for kind, entry in _ORIGINS["kinds"].items() if not entry["indexed"])
+RULE_ORIGIN = "origin-"
+HOST_MAINTENANCE = "host_maintenance"
 
 # Whole-message envelopes a legacy transport stored as owner turns. One definition for every
 # reader: recall, the adaptive lanes, the light context path and the event snapshot.
@@ -153,6 +174,42 @@ PLAIN = Found("experience", None, "")
 
 def _matches(namespace, pattern):
     return namespace.startswith(pattern[:-1]) if pattern.endswith("*") else namespace == pattern
+
+
+def origin_of(namespace, metadata=None):
+    """The origin kind the table gives a source, or None for one it says nothing about."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for key, kind in ORIGIN_METADATA:
+        if metadata.get(key) is True:
+            return kind
+    return next((kind for pattern, kind in ORIGIN_NAMESPACES if _matches(namespace or "", pattern)), None)
+
+
+def origin_found(kind):
+    """The class and label an origin kind reads as, under the rule that names it."""
+    cls, label = ORIGIN_KINDS[kind]
+    return Found(cls, label, RULE_ORIGIN + kind)
+
+
+def origin_of_rule(rule):
+    """The origin kind a stored rule names, or None."""
+    return rule[len(RULE_ORIGIN):] if isinstance(rule, str) and rule.startswith(RULE_ORIGIN) \
+        and rule[len(RULE_ORIGIN):] in ORIGIN_KINDS else None
+
+
+def _row(cls, rule):
+    """A stored classification row as the policy reads it: the label is the rule's to say."""
+    origin = origin_of_rule(rule)
+    label = REQUEST_LABEL if rule == RULE_REQUEST else ORIGIN_KINDS[origin][1] if origin else None
+    return Found(cls, label, rule)
+
+
+def host_maintenance(source):
+    """Whether a source — a row, or an evidence reference carrying namespace and metadata — is
+    the host's own bookkeeping. The one definition of an internal event, for every reader."""
+    if not isinstance(source, dict):
+        return True
+    return origin_of(source.get("namespace") or "", source.get("metadata")) == HOST_MAINTENANCE
 
 
 def proposed_rules(namespaces):
@@ -228,7 +285,10 @@ def source_rule(namespace, metadata, authority, *, source_id=None, approved=(), 
         return Found(declared, None, RULE_DECLARED)
     if found:
         return found
-    return Found(kind, None, rule) if kind is not None else None
+    if kind is not None:
+        return Found(kind, None, rule)
+    origin = origin_of(namespace, metadata)
+    return origin_found(origin) if origin else None
 
 
 def _persona_stamp(engine):
@@ -298,7 +358,7 @@ def _load_snapshot(engine, conn, scope, rules=None):
     stored = {}
     try:
         for row in conn.execute("SELECT source_id,class,rule FROM source_evidence_class WHERE scope IN (?,?)", scopes):
-            stored[row["source_id"]] = Found(row["class"], REQUEST_LABEL if row["rule"] == RULE_REQUEST else None, row["rule"])
+            stored[row["source_id"]] = _row(row["class"], row["rule"])
     except sqlite3.OperationalError:
         # A database this schema has not reached: every source is classified on the fly.
         pass
@@ -355,6 +415,41 @@ def _switch(conn, scope_key):
     from kin_mind.autonomy_schema import optimized
 
     return optimized(conn, scope_key, SWITCH)
+
+
+def enabled_for(conn, scope_key):
+    """Whether purpose-typed reads are switched on for this scope: the one switch every
+    classification-dependent writer asks too."""
+    return _switch(conn, scope_key)
+
+
+# Classes a graph item may not mix with experience (K4-13): they are what the isolation migration
+# moves out of a node's evidence, and the graph's writer keeps them out from then on.
+ISOLATED = ("role_configuration", "synthetic_example", "host_envelope")
+
+
+def ref_classes(engine, conn, scope, refs):
+    """The class of each evidence reference, from its source's own classification row, else
+    classified on the fly from the namespace, metadata and authority the reference carries.
+
+    For a writer inside its own transaction: it reads the rows of these sources only, never the
+    whole snapshot a read policy loads."""
+    scope = scope if isinstance(scope, Scope) else Scope.model_validate(scope)
+    ids = sorted({r["source_id"] for r in refs if isinstance(r, dict) and r.get("source_id")})
+    stored = {}
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        try:
+            for row in conn.execute(f"SELECT source_id,class,rule FROM source_evidence_class WHERE source_id IN ({marks})"
+                                    " AND scope IN (?,?)", [*ids, scope.key(), _shared(scope).key()]):
+                stored[row["source_id"]] = _row(row["class"], row["rule"])
+        except sqlite3.OperationalError:
+            pass
+    rules, approved = registry(engine, conn), approved_sources(engine, scope, conn)
+    return [stored.get(r.get("source_id")) or source_rule(
+                r.get("namespace") or "", r.get("metadata"), r.get("authority"), source_id=r.get("source_id"),
+                approved=approved, rules=rules) or PLAIN
+            if isinstance(r, dict) else PLAIN for r in refs]
 
 
 def migration_state(conn, scope_key):
@@ -478,8 +573,8 @@ class ReadPolicy:
             return self._combine([f or PLAIN for f in behind])
         if stamp in NON_EXPERIENCE:
             return Found(stamp, None, RULE_STAMP)
-        if stamp == REQUEST_LABEL:
-            return Found("experience", REQUEST_LABEL, RULE_STAMP)
+        if stamp == REQUEST_LABEL or stamp in ORIGIN_LABELS:
+            return Found("experience", stamp, RULE_STAMP)
         return next((f for f in behind if f), PLAIN)
 
     def refusal(self, record, history=False):
@@ -578,6 +673,13 @@ def stamp_source(engine, conn, sid, source, text):
     """Classify a source as it is received, inside the receipt's transaction. The row and the
     stamp belong to the first revision, so nothing that exists is rewritten. Returns the value
     for the root record's `origin_kind`, or None. A receipt never fails over its label."""
+    found = classify_receipt(engine, conn, sid, source, text)
+    return (found.label or found.kind) if found else None
+
+
+def classify_receipt(engine, conn, sid, source, text):
+    """`stamp_source`, answering with the classification itself: the receipt also needs to know
+    whether the root record is indexed at all."""
     try:
         found = source_rule(source.namespace, source.metadata, source.authority, source_id=sid,
                             approved=approved_sources(engine, source.scope, conn), rules=registry(engine, conn), text=text,
@@ -586,9 +688,14 @@ def stamp_source(engine, conn, sid, source, text):
             return None
         conn.execute("INSERT OR REPLACE INTO source_evidence_class VALUES(?,?,?,?,?)",
                      (source.scope.key(), sid, found.kind, found.rule, RULES_VERSION))
-        return found.label or found.kind
+        return found
     except sqlite3.Error:
         return None
+
+
+def indexed(found):
+    """Whether a receipt classified as `found` puts its root record in the text index."""
+    return not (found and origin_of_rule(found.rule) in UNINDEXED_ORIGINS)
 
 
 def proposed_policy(engine, conn, scope, rows, purpose="experience_recall", *, rules=None, state=None):
@@ -597,7 +704,7 @@ def proposed_policy(engine, conn, scope, rows, purpose="experience_recall", *, r
     live = _load_snapshot(engine, conn, scope, rules)
     stored = dict(live.rows)
     for row in rows:
-        stored[row["source_id"]] = Found(row["class"], REQUEST_LABEL if row["rule"] == RULE_REQUEST else None, row["rule"])
+        stored[row["source_id"]] = _row(row["class"], row["rule"])
     return ReadPolicy(purpose, True, _Snapshot(stored, live.derived, live.rules, live.approved, live.prefixes), state)
 
 

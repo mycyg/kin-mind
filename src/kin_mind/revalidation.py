@@ -453,8 +453,13 @@ OBJECT_CLASSES = (("graph_", "graph"), ("explore_", "graph"), ("plan_", "plans")
                   ("mem_", "sources"), ("src_", "sources"))
 
 
-def _resets(proposal, name, key, paths, revision, plan_revision=None):
-    """(path of an expectation inside the stored proposal, its current value) for one moved object."""
+def _resets(proposal, name, key, paths, revision, plan_revision=None, *, owner_held=False):
+    """(path of an expectation inside the stored proposal, its current value) for one moved object.
+
+    `owner_held`: the object's current version rests on the owner's explicit word (a graph node
+    written with explicit basis, a conversation habit). A light `keep` then resets nothing for
+    its content, so an inferred proposal made before the owner's correction can only be adjusted,
+    withdrawn or judged again, never written over it (K4-11)."""
     found, route = [], False
     for path in paths:
         if len(path) < 2:
@@ -464,8 +469,11 @@ def _resets(proposal, name, key, paths, revision, plan_revision=None):
             # Decisions need none: the commit fences each one by the rebuilt plan view, which a light
             # attempt only reaches once every moved step it decides on was answered for.
             found.append(([*path, "expected_revision"], plan_revision))
-        elif (name == "procedures" and holder == "procedure_candidates") or (name == "graph" and holder == "nodes" and item.get("id") == key):
+        elif name == "procedures" and holder == "procedure_candidates":
             found.append(([*path, "expected_revision"], revision))
+        elif name == "graph" and holder == "nodes" and item.get("id") == key:
+            if not owner_held:
+                found.append(([*path, "expected_revision"], revision))
         elif name == "traits" and holder == "trait_decisions" and item.get("trait_id") == key:
             # The ledger's own compare-and-swap, reset like every other one: only for the entry the
             # model said still stands, and the commit checks the material again regardless.
@@ -476,7 +484,7 @@ def _resets(proposal, name, key, paths, revision, plan_revision=None):
                 found.append(([*path, "expected_revision"], revision))
             if item.get("thread_id") == key:
                 found.append(([*path, "expected_thread_revision"], revision))
-    if name == "habits" and ["habits"] in paths:
+    if name == "habits" and ["habits"] in paths and not owner_held:
         found.append((["habits", "expected_revision"], revision))
     return [r for r in found if r[1] is not None], route
 
@@ -502,6 +510,16 @@ def conflict_list(jobs, stored, proposal, old, new, *, changes, stale, owner_mov
                                    "valid_evidence": _valid_evidence(list(after.values()) if target.endswith(":*") and after else [after], citable)},
                         "paths": paths, "resets": list(resets)})
 
+    def owner_held(conn, name, key):
+        if name == "habits":
+            return True
+        if name == "graph":
+            try:
+                return jobs.memory.graph.get(conn, key).get("basis") == "explicit"
+            except Missing:
+                return False
+        return False
+
     with jobs.engine.db.connect() as conn:
         for change in changes:
             name, key, entry = change["class"], change["object"], change["after"] or {}
@@ -510,7 +528,8 @@ def conflict_list(jobs, stored, proposal, old, new, *, changes, stale, owner_mov
                 grouped.setdefault(name, []).append((key, _before(jobs, conn, change, old), _after(jobs, conn, change, shown)))
                 continue
             resets, route = _resets(proposal, name, key, paths, entry.get("revision"),
-                                    (plans.get(key.partition("/")[0]) or {}).get("plan_revision"))
+                                    (plans.get(key.partition("/")[0]) or {}).get("plan_revision"),
+                                    owner_held=owner_held(conn, name, key))
             add("event-route" if route else name, name + ":" + key, _before(jobs, conn, change, old), _after(jobs, conn, change, shown), paths, resets)
         for ref in stale:
             paths = _fragments(proposal, "sources", ref["record_id"], {ref["source_id"]})
@@ -526,7 +545,8 @@ def conflict_list(jobs, stored, proposal, old, new, *, changes, stale, owner_mov
             # The conflicting object was never part of the view, so no manifest entry describes it:
             # the commit's own static facts and the history tables do.
             paths = _fragments(proposal, name, target, {target})
-            resets, route = _resets(proposal, name, target, paths, stored.conflict.get("actual"), stored.conflict.get("actual"))
+            resets, route = _resets(proposal, name, target, paths, stored.conflict.get("actual"), stored.conflict.get("actual"),
+                                    owner_held=owner_held(conn, name, target))
             facts = {k: stored.conflict.get(k) for k in ("code", "expected", "actual")}
             before = _history(conn, "mind_graph_revisions", target, stored.conflict.get("expected")) if name == "graph" else None
             try:

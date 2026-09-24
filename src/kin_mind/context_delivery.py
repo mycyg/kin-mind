@@ -14,6 +14,11 @@ CREATE INDEX IF NOT EXISTS mind_context_delivery_pending ON mind_context_deliver
 """
 
 
+# A prepared context not begun within this long never will be: the host prepares and begins in
+# one pass, and one it deferred is prepared again under its next event.
+ABANDONED_SECONDS = 86400
+
+
 def text_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -58,11 +63,27 @@ class ContextDelivery:
         with self.db.connect(write=True) as conn:
             if self.ctx.window(session, conn)['epoch'] != epoch:
                 raise Conflict('Context window changed during preparation')
+            self._settle_old(conn, session, epoch)
             try:
                 return self.view(self._get(conn, session, epoch, identifier))
             except Missing:
                 self._put(conn, value)
         return self.view(value)
+
+    def _settle_old(self, conn, session, epoch):
+        """Deliveries that can no longer arrive end as `stale`, the terminal state begin() already
+        gives one whose window moved (DB1-12): whatever an earlier window of this session left
+        unaccepted, and a prepared one never begun within ABANDONED_SECONDS. A late native
+        receipt is still acknowledged, as a historical one."""
+        conn.execute("UPDATE mind_context_deliveries SET state='stale',data=json_set(data,'$.state','stale','$.stale_reason','window-moved') "
+                     "WHERE scope=? AND session=? AND epoch<>? AND state IN ('prepared','sending','unconfirmed')",
+                     (self.scope, session, epoch))
+        from datetime import timedelta
+        from .state import timestamp
+        cutoff = (timestamp(self.ctx.mind.clock()) - timedelta(seconds=ABANDONED_SECONDS)).isoformat()
+        conn.execute("UPDATE mind_context_deliveries SET state='stale',data=json_set(data,'$.state','stale','$.stale_reason','never-begun') "
+                     "WHERE scope=? AND session=? AND state='prepared' AND julianday(at)<julianday(?)",
+                     (self.scope, session, cutoff))
 
     @staticmethod
     def view(value):
@@ -95,8 +116,13 @@ class ContextDelivery:
             return self.view(value)
 
     def pending(self, session):
+        """What may still be in this window's native history, oldest first. An earlier window's
+        leftovers are not: they would lead the list for ever and be searched for on every
+        delivery (DB1-12)."""
         with self.db.connect() as conn:
-            rows = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND state IN ('sending','unconfirmed') ORDER BY at LIMIT 16", (self.scope, session)).fetchall()
+            epoch = self.ctx.window(session, conn)['epoch']
+            rows = conn.execute("SELECT data FROM mind_context_deliveries WHERE scope=? AND session=? AND epoch=? AND state IN ('sending','unconfirmed') ORDER BY at LIMIT 16",
+                                (self.scope, session, epoch)).fetchall()
         return [self.view(json.loads(row[0])) for row in rows]
 
     def acknowledge(self, session, epoch, id, *, actual_session, marker, text_hash, verified=False, native_at=None):

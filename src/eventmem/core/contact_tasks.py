@@ -9,7 +9,7 @@ from pydantic import Field, field_validator
 
 from .db import Conflict, Missing, digest
 from .models import ContactPolicy, Model, ScheduleInput, Scope, SourceInput, utc
-from .scheduler import Scheduler
+from .scheduler import Scheduler, describe
 
 
 class ContactTaskInput(Model):
@@ -157,20 +157,24 @@ class ContactTasks:
             raise ValueError("limit must be between 1 and 100")
         placeholders = ",".join("?" for _ in self.policy_ids)
         with self.engine.db.connect() as conn:
+            # Unfinished tasks first, the soonest due first: a far-off recurring reminder
+            # no longer pushes today's out of the page (E3-13).
             rows = conn.execute(
                 f"SELECT s.* FROM schedules s JOIN records r ON r.id=s.record_id "
                 f"WHERE s.policy_id IN ({placeholders}) AND r.scope=? AND r.deleted=0 "
-                "ORDER BY s.due_at DESC,s.id LIMIT ?",
+                "ORDER BY s.state IN ('complete','canceled'),s.due_at,s.id LIMIT ?",
                 (*self.policy_ids, self.scope.key(), limit),
             ).fetchall()
             items = []
             for row in rows:
                 _, record = self._owned(conn, row["id"])
                 config = json.loads(row["data"])
-                deliveries = conn.execute(
-                    "SELECT id,state FROM outbox WHERE schedule_id=? ORDER BY available DESC,id LIMIT 3",
+                # Each delivery with what it means: sent, never sent, or possibly sent and to
+                # be reconciled before anything is said about it or asked again.
+                deliveries = [describe(delivery) for delivery in conn.execute(
+                    "SELECT id,state,attempts,data FROM outbox WHERE schedule_id=? ORDER BY available DESC,id LIMIT 3",
                     (row["id"],),
-                ).fetchall()
+                ).fetchall()]
                 items.append(
                     {
                         "id": row["id"],
@@ -182,7 +186,7 @@ class ContactTasks:
                         "due_at": row["due_at"],
                         "recurrence": config["recurrence"],
                         "source_ids": record["source_ids"],
-                        "deliveries": [dict(delivery) for delivery in deliveries],
+                        "deliveries": deliveries,
                     }
                 )
         return {"items": items}

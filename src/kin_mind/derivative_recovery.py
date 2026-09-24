@@ -1,10 +1,10 @@
 """Targeted recovery of missing derived state: vectors and event digests.
 
-`Worker.claim` never takes `failed` rows, so a record whose embed job exhausted its
-attempts keeps its canonical text but loses the derived vector, and an event whose
-digest job failed keeps a `failed` digest that the scheduler will not pick up again
-(`schedule` only looks at `dirty`). The originals are intact; what is missing is
-derived and reproducible.
+`Worker.claim` never takes `failed` rows. Since the queue stopped charging a job for
+an environment that is down (jobs.ENVIRONMENTAL_ERRORS) and `lifecycle.schedule` retries
+failed digests after a cooldown, a gap left today closes by itself; this module is for
+what was left before, and for an operator who wants a reviewed, bounded pass over it.
+The originals are intact; what is missing is derived and reproducible.
 
 A dry run enumerates the gap fresh; apply intersects that fresh view with an exact,
 reviewed manifest and binds one bounded selection to its command id. Recovery then
@@ -23,7 +23,7 @@ import uuid
 from collections import defaultdict
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.jobs import Worker
+from eventmem.core.jobs import ENVIRONMENTAL_ERRORS, Worker
 from eventmem.core.models import Scope, now
 
 from .attempts import token_counts
@@ -33,17 +33,9 @@ from .lifecycle import mark_dirty
 #: else (superseded/retracted/refuted/archived/deleted) is history, not fact.
 CURRENT_STATUSES = {"active", "unverified"}
 
-#: Stored `jobs.error` strings that indict the environment, not the item. One item
-#: failing this way predicts the next; the batch stops instead of burning attempts.
-ENVIRONMENTAL_ERRORS = frozenset({
-    "FileNotFoundError",
-    "ConnectError",
-    "ReadError",
-    "RemoteProtocolError",
-    "TimeoutException",
-    "ConnectTimeout",
-    "ReadTimeout",
-})
+#: Stored `jobs.error` strings that indict the environment, not the item, are the
+#: queue's own list (eventmem.core.jobs.ENVIRONMENTAL_ERRORS): one item failing this way
+#: predicts the next, and the batch stops instead of burning attempts.
 
 #: Recovery of historical gaps yields to fresh work. `historical-backfill` digests
 #: already run at 200; recovered work is the same kind of traffic. Anything above
@@ -349,6 +341,19 @@ def inspect_other_failures(conn) -> dict:
     }
 
 
+def cascade(conn, digests) -> int:
+    """How many digests besides the targets a recovery makes dirty: `mark_dirty` carries each
+    target up its `part_of` ancestors, and each of those is recomputed too (K4-05)."""
+    from .lifecycle import ancestors
+
+    extra = set()
+    for entry in digests:
+        if entry.get("action") == "recover":
+            scope = Scope(**entry["scope"]).key()
+            extra.update((scope, a) for a in ancestors(conn, scope, [entry["event_id"]]) if a != entry["event_id"])
+    return len(extra)
+
+
 def plan(conn, vector_revisions=None) -> dict:
     embeds = inspect_embeds(conn, vector_revisions)
     digests = inspect_digests(conn)
@@ -366,6 +371,7 @@ def plan(conn, vector_revisions=None) -> dict:
             "digest_events": len(digests),
             "digest_recover": sum(1 for e in digests if e["action"] == "recover"),
             "digest_skip": sum(1 for e in digests if e["action"] == "skip"),
+            "digest_ancestors_recomputed": cascade(conn, digests),
         },
     }
 

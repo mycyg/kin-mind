@@ -19,7 +19,6 @@ COMMANDS = {
     "memory",
     "correct",
     "worker",
-    "migrate",
     "backup",
     "restore",
     "export",
@@ -95,9 +94,6 @@ def parser():
                 "--transport", choices=["stdio", "streamable-http"], default="stdio"
             )
             p.add_argument("--port", type=int, default=8319)
-        elif command == "migrate":
-            p.add_argument("legacy", type=Path)
-            p.add_argument("--scope", default="{}")
         elif command in {"backup", "restore", "export"}:
             p.add_argument("path", type=Path)
         elif command == "api":
@@ -110,6 +106,17 @@ def parser():
             p.add_argument("--scale", choices=["smoke", "full"], default="smoke")
             p.add_argument("--dataset", type=Path)
     return root
+
+
+def running(port):
+    """Whether something answers MemoryPalace's health route on this loopback port."""
+    import httpx
+
+    try:
+        httpx.get(f"http://127.0.0.1:{port}/v1/health", timeout=2)
+        return True
+    except httpx.HTTPError:
+        return False
 
 
 def main(argv=None):
@@ -130,15 +137,10 @@ def main(argv=None):
             scenario=args.scenario,
             remove=args.action == "uninstall",
         )
-    elif args.command in {"migrate", "restore"}:
-        from .models import Scope
-        from .transfer import migrate, restore
+    elif args.command == "restore":
+        from .transfer import restore
 
-        result = (
-            migrate(args.legacy, args.root, Scope.model_validate_json(args.scope))
-            if args.command == "migrate"
-            else restore(args.path, args.root)
-        )
+        result = restore(args.path, args.root)
     elif args.command in {"evaluate", "benchmark"}:
         from .evaluation import benchmark, evaluate
 
@@ -147,6 +149,14 @@ def main(argv=None):
             if args.command == "evaluate"
             else benchmark(args.root, args.output, args.scale)
         )
+    elif args.command == "console" and running(args.port):
+        # A service already answers on this port: open the console on it. Starting another
+        # Engine here would run a second background loop on the same store until the port
+        # turned out to be taken (S1-11).
+        token = (Path(args.root) / "local-token").read_text().strip()
+        webbrowser.open(f"http://127.0.0.1:{args.port}/#token={token}")
+        print(f"MemoryPalace is already running at http://127.0.0.1:{args.port}", file=sys.stderr)
+        return 0
     else:
         engine = Engine(args.root)
         command = args.command

@@ -25,9 +25,30 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS outbox_channel_contracts(
 
 CLAIM_LEASE = 30  # seconds a claim holds a 'ready'/'retry' row; nothing is sent yet
 DISPATCH_LEASE = 30  # seconds a 'sending' row may wait for its receipt
+# Attempts a possibly-sent row gets when no delivery window can be read off it (rows an older
+# build queued). Every other row is bounded by its window.
 MAX_ATTEMPTS = 5
+# How long after it was queued a delivery is still worth making. Within it, a row nothing can
+# have been sent for — every attempt refused, or the connection never made — is tried again
+# however often that takes, and so is one on a declared and verified idempotent channel, whose
+# receiver keys its effect by the delivery id. A host restarting or a send lease briefly held
+# used to exhaust five attempts in half a minute and park the reminder for good (E2-01, E3-12).
+DELIVERY_WINDOW = 6 * 3600
+RETRY_CAP = 300  # the longest wait between two attempts
 HTTP_TIMEOUT = 5
-UNSENT_KEYS = ("attempts", "claim", "dispatch")  # bookkeeping, never part of a body
+UNSENT_KEYS = ("attempts", "claim", "dispatch", "gave_up")  # bookkeeping, never part of a body
+# What each delivery state means to a reader that decides whether to say it was done or to
+# ask again. Static text: the model reads it through the task tools (E3-13).
+MEANINGS = {
+    "suggested": "等待确认，尚未发送",
+    "ready": "已排队，尚未发送",
+    "retry": "尚未确认送达，稍后会自动重试",
+    "sending": "正在发送，请求可能已在网络上",
+    "sent": "渠道已接收",
+    "acknowledged": "已确认送达",
+    "uncertain": "可能已经发出，结果未知；再次发送前需要核对",
+    "canceled": "没有发出",
+}
 
 
 def post(url, body, headers):
@@ -116,6 +137,34 @@ def phase(row):
     return "dispatching" if row["state"] == "sending" and dispatched else None
 
 
+def describe(row):
+    """A delivery as a reader should take it: its state, its derived phase, whether anything
+    can have reached the channel, and what that means in words (E3-13)."""
+    data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
+    attempts = row["attempts"] if "attempts" in row.keys() else 0
+    dispatch = data.get("dispatch") or {}
+    never_sent = row["state"] in ("suggested", "ready") or (
+        row["state"] in ("retry", "uncertain", "canceled")
+        and (not dispatch or dispatch.get("refused_through") == attempts))
+    found = {"id": row["id"], "state": row["state"], "phase": phase(row), "attempts": attempts,
+             "never_sent": bool(never_sent), "meaning": MEANINGS.get(row["state"], row["state"])}
+    if data.get("gave_up"):
+        found["meaning"] = "没有发出：投递时段内渠道一直拒收或连接不上，已停止重试"
+        found["gave_up_at"] = data["gave_up"].get("at")
+    elif row["state"] == "uncertain" and never_sent:
+        found["meaning"] = "没有发出（每次都被拒收），已停止自动重试"
+    return found
+
+
+def window_open(data, now, attempts):
+    """Whether a delivery is still inside the window in which it is worth making."""
+    try:
+        created = datetime.fromisoformat(data["created_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return attempts < MAX_ATTEMPTS
+    return now < created + DELIVERY_WINDOW
+
+
 class Scheduler:
     def __init__(self, engine, *, clock=None, transport=None):
         self.engine = engine
@@ -135,7 +184,12 @@ class Scheduler:
         row = conn.execute(
             "SELECT data FROM policies WHERE id=?", (policy_id,)
         ).fetchone()
-        return ContactPolicy.model_validate_json(row[0]) if row else None
+        try:
+            return ContactPolicy.model_validate_json(row[0]) if row else None
+        except ValueError:
+            # A policy row that no longer validates is no policy: its schedules pause
+            # instead of failing every tick of the loop that serves all the others.
+            return None
 
     def _verified(self, conn, channel):
         row = conn.execute(
@@ -324,7 +378,7 @@ class Scheduler:
             # A send that outlived its lease has an unknown outcome. It goes out again
             # on its own only over a declared and verified idempotent channel.
             stale = conn.execute(
-                "SELECT o.id,o.attempts,s.policy_id FROM outbox o LEFT JOIN schedules s ON s.id=o.schedule_id WHERE o.state='sending' AND o.lease_until<?",
+                "SELECT o.id,o.attempts,o.data,o.schedule_id,s.policy_id FROM outbox o LEFT JOIN schedules s ON s.id=o.schedule_id WHERE o.state='sending' AND o.lease_until<?",
                 (self.clock(),),
             ).fetchall()
             for row in stale:
@@ -333,21 +387,31 @@ class Scheduler:
                     policy
                     and policy.channel
                     and policy.idempotent_channel
-                    and row["attempts"] < MAX_ATTEMPTS
+                    and window_open(json.loads(row["data"]), self.clock(), row["attempts"])
                     and self._verified(conn, policy.channel)
                 )
-                conn.execute(
+                changed = conn.execute(
                     "UPDATE outbox SET state=?,lease_until=NULL WHERE id=? AND state='sending'",
                     ("retry" if retry else "uncertain", row["id"]),
-                )
+                ).rowcount
+                if changed and not retry and policy:
+                    # Possibly sent and not to be sent again: this occurrence is over, and a
+                    # recurring reminder goes on to its next one.
+                    schedule = conn.execute("SELECT * FROM schedules WHERE id=?", (row["schedule_id"],)).fetchone()
+                    if schedule:
+                        self._complete_schedule(conn, schedule, policy, stamp, row["id"], delivered=False)
             for schedule in conn.execute(
                 "SELECT * FROM schedules WHERE state='scheduled' AND due_at<=? ORDER BY due_at LIMIT 100",
                 (stamp,),
             ).fetchall():
-                row = conn.execute(
-                    "SELECT data FROM policies WHERE id=?", (schedule["policy_id"],)
-                ).fetchone()
-                policy = ContactPolicy.model_validate_json(row[0])
+                policy = self._policy(conn, schedule["policy_id"])
+                if policy is None:
+                    conn.execute(
+                        "UPDATE schedules SET state='paused',revision=revision+1,"
+                        "data=json_set(data,'$.paused_reason','policy-unavailable') WHERE id=?",
+                        (schedule["id"],),
+                    )
+                    continue
                 record, reason = self._eligible(conn, schedule, policy, stamp)
                 if not record:
                     conn.execute(
@@ -590,13 +654,17 @@ class Scheduler:
 
     def send(self, request):
         """The network call, with no transaction open: writers and cancels commit while
-        the channel answers. A 4xx is a definite refusal. A 5xx, a timeout or a network
-        error leaves the outcome unknown."""
+        the channel answers. A 4xx is a definite refusal, and so is a connection that was
+        never made — the host restarting, its port closed — because no byte of the request
+        left. A 5xx, a read timeout or a connection lost mid-request leaves the outcome
+        unknown."""
         try:
             response = self.transport(
                 request["channel"], request["body"], request["headers"]
             )
             status = response.status_code
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            return {"outcome": "refused", "status": None, "echoed": False}
         except Exception:
             return {"outcome": "unknown", "status": None, "echoed": False}
         if 200 <= status < 300:
@@ -654,8 +722,13 @@ class Scheduler:
                 )
                 if not wanted:
                     state = "canceled" if clean else "uncertain"
-                elif resend and attempts < MAX_ATTEMPTS:
+                elif resend and window_open(data, self.clock(), attempts):
                     state = "retry"
+                elif clean:
+                    # Never sent, and its window has closed: given up on, and saying so,
+                    # rather than parked as possibly sent.
+                    state = "canceled"
+                    data["gave_up"] = {"at": stamp, "reason": "undelivered-within-window"}
                 else:
                     state = "uncertain"
             data.setdefault("attempts", []).append(
@@ -669,13 +742,23 @@ class Scheduler:
             conn.execute(
                 "UPDATE outbox SET state=?,data=?,lease_until=NULL,available=? WHERE "
                 + guard,
-                (state, dumps(data), self.clock() + min(300, 2**attempts), *key),
+                (state, dumps(data), self.clock() + min(RETRY_CAP, 2 ** min(attempts, 9)), *key),
             )
             if state == "sent" and policy:
                 self._complete_schedule(conn, schedule, policy, stamp, row["id"])
+            elif state in ("uncertain", "canceled") and policy and schedule is not None:
+                # This occurrence is over without a delivery; a recurring reminder still goes
+                # on to its next one instead of staying queued for good.
+                self._complete_schedule(conn, schedule, policy, stamp, row["id"], delivered=False)
+            if data.get("gave_up"):
+                conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('reminder_undelivered',1,?,?)",
+                             (stamp, dumps({"attempts": attempts})))
         return state
 
-    def _complete_schedule(self, conn, schedule, policy, stamp, delivery_id):
+    def _complete_schedule(self, conn, schedule, policy, stamp, delivery_id, *, delivered=True):
+        """The occurrence `delivery_id` is over. Delivered, a one-time schedule is complete;
+        not delivered, it stays queued with its delivery's outcome for someone to act on. A
+        recurring schedule moves on to its next occurrence either way."""
         config = json.loads(schedule["data"])
         current_id = (
             "delivery_"
@@ -687,10 +770,11 @@ class Scheduler:
         if schedule["state"] != "queued" or current_id != delivery_id:
             return
         if config["recurrence"] == "none":
-            conn.execute(
-                "UPDATE schedules SET state='complete',revision=revision+1 WHERE id=?",
-                (schedule["id"],),
-            )
+            if delivered:
+                conn.execute(
+                    "UPDATE schedules SET state='complete',revision=revision+1 WHERE id=?",
+                    (schedule["id"],),
+                )
             return
         local = datetime.fromisoformat(stamp).astimezone(ZoneInfo(policy.timezone))
         due = datetime.fromisoformat(schedule["due_at"]).astimezone(

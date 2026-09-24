@@ -26,6 +26,25 @@ class ContactPolicy(TypedDict, total=False):
     triggers: list[Literal['reminder', 'commitment', 'anniversary', 'checkin', 'greeting']]
     allowed_kinds: list[Literal['episode', 'fact', 'state', 'preference', 'procedure', 'relationship', 'commitment', 'reminder', 'prediction', 'diary', 'summary', 'portrait', 'self_narrative', 'knowledge', 'checkpoint', 'observation']]
 
+class ContextIndexItem(TypedDict, total=False):
+    id: Required[str]
+    revision: int | str | None
+    depth: str | None
+
+class ContextRecallResult(TypedDict, total=False):
+    state: Required[str]
+    items: Required[list[ContextIndexItem]]
+    index: Required[list[ContextIndexItem]]
+    text: Required[str]
+    tokens: Required[int]
+    budget: int | None
+    accounts: Required[dict[str, int]]
+    generation: Required[int]
+    latency_ms: Required[float]
+    cursor: int | str | None
+    session_used: int
+    instruction_authority: Required[str]
+
 class CreateRecord(TypedDict, total=False):
     record: Required[RecordInput]
     command_id: Required[str]
@@ -43,13 +62,6 @@ class FamilyCreate(TypedDict, total=False):
     title: Required[str]
     members: Required[list[str]]
     kind: Literal['family', 'volume']
-
-class FeedbackRequest(TypedDict, total=False):
-    record_id: Required[str]
-    type: Required[Literal['displayed', 'read', 'adopted', 'verified', 'corrected', 'unknown', 'same_file_observed']]
-    session: str
-    attributes: dict[str, Any]
-    key: str | None
 
 class GraphCommand(TypedDict, total=False):
     scope: Required[Scope]

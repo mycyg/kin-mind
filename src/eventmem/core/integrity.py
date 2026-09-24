@@ -410,3 +410,43 @@ def interpreter_message(report):
                       f"  configured: {report.get('configured')}",
                       f"  state: {report.get('state')}",
                       f"  running now: {report.get('running')}"])
+
+
+def loaded_revision(start=None):
+    """The commit the running source was checked out at, read from the repository's own files
+    (git is never run), or None when there is no repository to read.
+
+    A process reports it once, at start, so a health check can compare what is running with
+    the revision the configuration names; a process that outlived a deployment is then seen
+    as such instead of passing a path check (H3-05, E2-14)."""
+    here = Path(start or __file__).resolve()
+    for folder in (here, *here.parents):
+        git = folder / ".git"
+        try:
+            if git.is_file():
+                # A linked worktree: `.git` names the directory that holds its HEAD.
+                text = git.read_text().strip()
+                if not text.startswith("gitdir:"):
+                    return None
+                git = (folder / text[len("gitdir:"):].strip()).resolve()
+            if not git.is_dir():
+                continue
+            head = (git / "HEAD").read_text().strip()
+            if not head.startswith("ref:"):
+                return head or None
+            ref = head[len("ref:"):].strip()
+            common = git
+            if (git / "commondir").is_file():
+                common = (git / (git / "commondir").read_text().strip()).resolve()
+            for base in (git, common):
+                if (base / ref).is_file():
+                    return (base / ref).read_text().strip() or None
+            for base in (git, common):
+                if (base / "packed-refs").is_file():
+                    for line in (base / "packed-refs").read_text().splitlines():
+                        if line.endswith(" " + ref):
+                            return line.split(" ", 1)[0]
+            return None
+        except OSError:
+            return None
+    return None
