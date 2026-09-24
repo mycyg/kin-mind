@@ -130,6 +130,8 @@ test('automatic work restores the exact prior full profile only after every open
   const f=profileFixture(t,{initial:{model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'},classify:async input=>({route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}})});
   await f.router.dispatch({id:'multi-work',text:'做两个独立步骤'},async()=> 'new-turn');
   const first=f.router.currentTask(),firstReturn=structuredClone(f.router.state.autoReturnProfile);
+  assert.equal(first.status,'proposed','a work label is only a proposal until Kin takes it on (N5)');
+  await f.router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-first',completedTaskId:first.id,completedInputVersion:first.inputVersion,reason:'I will do both steps'});
   const second={...structuredClone(first),id:'work-second',inputIds:['second'],inputVersion:1,summary:'second step',deliveries:{},tools:{},completion:null,createdAt:f.now()};
   f.router.state.tasks[second.id]=second;f.router.save('synthetic-second-task');
   for(const task of [first,second]){task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};task.stopReason='end_turn';task.turnEndedAt=f.now();task.deliveries['delivery-'+task.id]={state:'accepted',messageId:'m-'+task.id,inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:f.now()};}
@@ -383,11 +385,30 @@ test('explicit deferred mixed control without prior work does not wait on its ow
  assert.equal(f.router.state.requests['owner-mode:deferred-new-work'].state,'applied');assert.equal(f.router.tasks().length,1);
 });
 
-test('control-only interruption schedules the existing handoff after verified model application',async t=>{
+test('control-only interruption leaves the task open as a fact and injects no continuation (N2, AD1-23)',async t=>{
  let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
  const task=f.router.addTask({id:'original',text:'finish original deliverable'});Object.assign(f.runtime,{active:true,nativeStatus:'active'});
  await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
- assert.equal(task.handoff.state,'pending');assert.equal(task.handoff.id,'owner-mode:control-only');assert.equal(f.router.state.requests[task.handoff.id].state,'applied');assert.equal(task.inputVersion,1);
+ assert.equal(task.handoff,undefined,'the host never asks Kin to continue');
+ assert.equal(f.router.state.requests['owner-mode:control-only'].state,'applied');assert.equal(task.inputVersion,1);
+ assert.equal(f.router.tasks().length,1);
+ const [facts]=f.router.workFacts();
+ assert.deepEqual([facts.id,facts.status,Boolean(facts.interruptedBy)],[task.id,'running',true]);
+});
+
+test('an owner force switch keeps a declined outcome instead of resuming the task (AD1-23)',async t=>{
+ let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
+ const task=f.router.addTask({id:'original',text:'finish original deliverable'});
+ f.router.state.inputs.original={id:'original',kind:'owner',state:'accepted',hash:'h',at:1};
+ await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0});
+ await f.router.requestMode({mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:1,sourceInputId:'original',reason:'I will not do the rest',commandId:'decline'});
+ Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+ await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
+ assert.equal(task.handoff,undefined);
+ assert.deepEqual([task.completion.outcome,Boolean(task.completion.interruptedBy),task.completion.state],['declined',true,undefined]);
+ await f.router.observe('delivery',{taskId:task.id,inputVersion:1,turnFence:task.executionEpoch,sourceInputId:'original',id:'refusal',state:'accepted',messageId:'refusal-sent'});
+ await f.router.reconcile();
+ assert.equal(task.status,'canceled');assert.equal(task.outcome,'declined');
 });
 
 test('repeated manual profile keeps active work, tools and pending delivery intact, including restart',async t=>{
@@ -460,7 +481,7 @@ test('a historical canceled task cannot discard another task input after a class
   assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
 });
 
-test('late work never extends a task the owner is stopping: it opens work of its own and is answered (AD1-01)',async t=>{
+test('late work never extends a task the owner is stopping: it opens its own proposal and is answered (AD1-01)',async t=>{
   let calls=0;
   const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
   const task=f.router.addTask({id:'current-work',text:'edit current article'});
@@ -470,7 +491,7 @@ test('late work never extends a task the owner is stopping: it opens work of its
   const record=f.router.state.inputs.pending;
   assert.equal(record.state,'selected','the message is dispatched, never retired unanswered');
   assert.notEqual(record.taskId,task.id);assert.equal(f.router.state.tasks[task.id].inputVersion,1);
-  assert.ok(f.router.state.tasks[record.taskId],'it has work of its own');
+  assert.equal(f.router.state.tasks[record.taskId].status,'proposed');
 });
 
 test('a stop classified late is recorded on its own input and applied only then (AD1-01)',async t=>{

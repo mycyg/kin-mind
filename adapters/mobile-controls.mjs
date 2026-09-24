@@ -1,5 +1,11 @@
 import {runtimeProfile} from './codex-models.mjs';
 
+/** A task holds the work lock until it is one of these. A `proposed` task is open:
+ * a request labelled work keeps its own turn on the work profile, and lapses when
+ * that turn ends unless Kin takes it on. */
+export const TASK_CLOSED=Object.freeze(['completed','canceled','partial','deferred','unclaimed']);
+export const openTask=task=>Boolean(task)&&!TASK_CLOSED.includes(task.status);
+
 export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
   const canonical=runtime.known?runtime.sessionId===sessionId&&runtime.threadId===sessionId&&runtime.nativeSessionId===(state.nativeSessionId??sessionId):null;
   const profile=runtimeProfile(runtime);
@@ -12,7 +18,7 @@ export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {
   return {mode:state.mode,requestedMode:state.requestedMode??null,exitRequested:state.exitRequested,actual,sessionId,conversationId:state.conversationId,generation:state.generation,executionEpoch:state.executionEpoch??0,nativeSessionId:state.nativeSessionId??sessionId,lastTransition,
     // Compatibility alias; actual remains the only current-model evidence.
     transition:lastTransition,
-    tasks:Object.values(state.tasks).filter(t=>!['completed','canceled'].includes(t.status)).map(t=>({id:t.id,status:t.status,summary:t.summary,inputVersion:t.inputVersion,completionRequested:Boolean(t.completion),...(t.completion?.outcome?{taskOutcome:t.completion.outcome}:{}),handoff:t.handoff?.state})),
+    tasks:Object.values(state.tasks).filter(openTask).map(t=>({id:t.id,status:t.status,summary:t.summary,inputVersion:t.inputVersion,completionRequested:Boolean(t.completion),...(t.completion?.outcome?{taskOutcome:t.completion.outcome}:{}),handoff:t.handoff?.state})),
     requests:Object.values(state.requests).slice(-8).map(({hash,sourceHash,...r})=>r),
     notifications:Object.values(state.notices??{}).slice(-8).map(({text,...n})=>n),
     // What became of a damaged state file, if one was ever found: codes, counts and names only.
