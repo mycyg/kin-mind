@@ -104,17 +104,12 @@ def kept(conn, data):
     wrote from them. So whatever the copy names that the store has deleted since (the tombstone is
     the deletion fact) is taken out by the erase's own rule, `erasure.scrub`: the words go, the
     references become tombstone references, and identities, states, error codes, usage and the
-    attempt token stay. A copy that names nothing deleted is written as it is."""
-    from eventmem.core.db import NAMED
+    attempt token stay. A copy that names nothing deleted is written as it is. The row names every
+    source its model was shown as `evaluated_sources`, recall-only ones included, so one of them
+    deleted takes every word the model wrote from it (CR5-MM-01)."""
+    from .erasure import drop_deleted
 
-    from .erasure import scrub
-    named = sorted(set(NAMED.findall(dumps(data))))
-    erased = set()
-    for start in range(0, len(named), 500):
-        page = named[start:start + 500]
-        erased.update(row[0] for row in conn.execute(
-            "SELECT key FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
-    return scrub(data, frozenset(erased)) if erased else data
+    return drop_deleted(conn, data)
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -2180,6 +2175,13 @@ class Appraisals:
                 # Its sources that are still current are merged back, so the moving dialogue window and
                 # what the fork read with its tools can neither remove nor authorize different evidence.
                 stored = revalidation.candidate(data, historical)
+                if stored and any(isinstance(ref, dict) and ref.get("erased") for ref in [*stored.sources, *(data.get("evaluated_sources") or [])]):
+                    # Something the stored proposal's model was shown has been deleted since, and the delete
+                    # took its words: it is neither reused nor put to a light question (CR5-MM-01).
+                    revalidation.forget(data)
+                    if stored.origin == "seed":
+                        data["seed_rejected"] = True
+                    stored = None
                 if stored:
                     lighting = stored.origin == "reuse"
                     light = revalidation.resume(self, provider, row, data, model_context, stored, manifest=manifest, semantic_refs=semantic_refs,
@@ -2313,8 +2315,10 @@ class Appraisals:
                     if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
                         stale = next((r["source_id"] for r in refs if not self.mind._fresh(conn, [r])), None)
                         raise Conflict("Evaluated sources changed before commit", target=stale)
-                    used_evidence = {identifier for items in (proposal.memory.notes, proposal.memory.links, proposal.memory.graph.nodes, proposal.memory.graph.edges, proposal.memory.event_routes) for item in items for identifier in item.evidence_ids}
-                    moved = next((ref for ref in semantic_refs.values() if {ref["source_id"], ref["record_id"]} & used_evidence and not self.mind._fresh(conn, [ref])), None)
+                    # Every source the model was shown, not only the ones the proposal cites: one read for
+                    # recall alone can still have been written from, so one deleted or changed while the
+                    # model answered stops the commit, and the retry is shown what is there (CR5-MM-01).
+                    moved = next((ref for ref in semantic_refs.values() if not self.mind._fresh(conn, [ref])), None)
                     if moved:
                         raise Conflict("Referenced semantic evidence changed before commit",
                                        target=moved["record_id"], expected=moved["revision"])

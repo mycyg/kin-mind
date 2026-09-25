@@ -48,6 +48,8 @@ def apply_decisions(mind, conn, state, proposals, event, receipt, stimulus):
             # only a small evidence window was sent to the reviewer.
             provenance = mind._evidence(conn, [*event.evidence_ids, *result.get("observation_ids", []),
                                               *([result["source_id"]] if result.get("source_id") else [])])
+        # What the decision was written from, beside every copy of its words (CR5-MM-01).
+        written_from = sorted({ref[key] for ref in provenance for key in ("source_id", "record_id")})
         decisions[proposal.exploration_id] = {
             **proposal.model_dump(), "revision": (previous or {}).get("revision", 0) + 1,
             "updated_at": mind.clock(), "event_id": event.command_id,
@@ -58,10 +60,11 @@ def apply_decisions(mind, conn, state, proposals, event, receipt, stimulus):
                 if desire.get("exploration_id") != proposal.exploration_id or desire["status"] in {"completed", "abandoned"}:
                     continue
                 desire.update(status="abandoned" if proposal.decision == "keep" else "waiting",
-                              revision=desire["revision"] + 1, updated_at=mind.clock(), reason=proposal.reason)
+                              revision=desire["revision"] + 1, updated_at=mind.clock(), reason=proposal.reason,
+                              reason_evidence_ids=written_from)
                 if proposal.decision == "defer":
                     desire["contact_wait"] = {"condition": "new_evidence", "reason": proposal.reconsider_when,
-                                              "since": mind.clock()}
+                                              "since": mind.clock(), "reason_evidence_ids": written_from}
 
 
 def decision_view(mind, conn, state):

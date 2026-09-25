@@ -559,7 +559,11 @@ class Mind(Continuity):
                 state["agent_version"] = payload["agent_version"]
                 self._save(conn, state)
                 self._history(conn, event_id, state, kind, payload)
-                return dict(event_id=event_id, revision=state["revision"], **result)
+                receipt = dict(event_id=event_id, revision=state["revision"], **result)
+                # The stored receipt keeps what was committed, words included: it names what the
+                # event rests on, so a delete of that finds it and takes it (CR5-MM-01).
+                receipt.setdefault("rests_on", sorted(payload.get("evidence_ids") or []))
+                return receipt
 
             return self.engine.command(
                 conn, self._key(payload["command_id"]), payload, run, stamp=stamp
@@ -1102,6 +1106,9 @@ class Mind(Continuity):
             if desire["trait_revisions"]:
                 record(conn, self.scope.key(), "desire", did, desire["trait_revisions"],
                        dependent_revision=desire["revision"], at=at)
+        if not link_only:
+            # A reason of its own replaces a copied one, and what that was written from (CR5-MM-01).
+            desire.pop("reason_evidence_ids", None)
         desire.update(
             evidence=desire["evidence"] if link_only else refs,
             reason=desire["reason"] if link_only else request.reason,
