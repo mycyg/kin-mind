@@ -1,0 +1,287 @@
+[
+ {
+  "name": "what names or classifies something stays: ids, codes, names, times, hashes, numbers, locators",
+  "value": {
+   "id": "explore_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+   "state": "timed-out",
+   "model": "deepseek-flash",
+   "attempt": 2,
+   "partial": true,
+   "at": "2026-09-26T01:02:03.456+00:00",
+   "path": "/Users/kin/state/exploration/explore_a1b2c3d4e5f60718293a4b5c6d7e8f90/result-1.json",
+   "url": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+   "page": "https://example.org/a/b",
+   "sha256": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+   "none": null,
+   "request_id": "req-1",
+   "turn": "019a7c3e-5f21-7b40-9c3d-2e8f4a6b1c90",
+   "version": "codex@0.156.1",
+   "empty": "",
+   "dashes": "--",
+   "reason": "draft-sources-deleted",
+   "tool_name": "kin_memory.read_memory"
+  },
+  "expected": {
+   "id": "explore_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+   "state": "timed-out",
+   "model": "deepseek-flash",
+   "attempt": 2,
+   "partial": true,
+   "at": "2026-09-26T01:02:03.456+00:00",
+   "path": "/Users/kin/state/exploration/explore_a1b2c3d4e5f60718293a4b5c6d7e8f90/result-1.json",
+   "url": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+   "page": "https://example.org/a/b",
+   "sha256": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+   "none": null,
+   "request_id": "req-1",
+   "turn": "019a7c3e-5f21-7b40-9c3d-2e8f4a6b1c90",
+   "version": "codex@0.156.1",
+   "empty": "",
+   "dashes": "--",
+   "reason": "draft-sources-deleted",
+   "tool_name": "kin_memory.read_memory"
+  }
+ },
+ {
+  "name": "percent-encoding carries words: a URL or a name with it is text",
+  "value": {
+   "page": "https://zh.wikipedia.org/wiki/%E7%8C%AB",
+   "file": "notes%20from%20the%20harbour.txt",
+   "encoded": "%E5%A5%B9",
+   "memory": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+  },
+  "expected": {
+   "page": "[已删除]",
+   "file": "[已删除]",
+   "encoded": "[已删除]",
+   "memory": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+  }
+ },
+ {
+  "name": "a single word is text, whatever separators stand at its ends and whatever its case",
+  "value": {
+   "title": "Harbour",
+   "query": "probe",
+   "excerpt": "P",
+   "note": "harbour.",
+   "tag": "-divorce-",
+   "slash": "/harbour/",
+   "camel": "ValueError",
+   "upper": "HARBOUR",
+   "hash_tag": "#harbour"
+  },
+  "expected": {
+   "title": "[已删除]",
+   "query": "[已删除]",
+   "excerpt": "[已删除]",
+   "note": "[已删除]",
+   "tag": "[已删除]",
+   "slash": "[已删除]",
+   "camel": "[已删除]",
+   "upper": "[已删除]",
+   "hash_tag": "[已删除]"
+  }
+ },
+ {
+  "name": "a single word stays in a field the host, the mind or an executor fills: every code field",
+  "value": {
+   "state": "running",
+   "status": "reported",
+   "result_state": "observed",
+   "stage": "started",
+   "outcome": "succeeded",
+   "channel": "fork",
+   "provider": "deepseek",
+   "model": "synthetic",
+   "reasoning": "high",
+   "executor": "codex",
+   "backend": "codex",
+   "adapter": "cua",
+   "server": "memorypalace",
+   "tool": "observe",
+   "kind": "file",
+   "type": "search",
+   "item_type": "reasoning",
+   "content_type": "text",
+   "class": "Conflict",
+   "code": "timeout",
+   "category": "contract",
+   "error": "ValueError",
+   "error_tags": [
+    "timeout",
+    "permission"
+   ],
+   "retry_condition": "backoff",
+   "authority": "explicit",
+   "basis": "observed",
+   "actor": "unknown",
+   "role": "user",
+   "origin": "reflection",
+   "tier": "A",
+   "lane": "action",
+   "stimulus": "idle",
+   "waiting_reason": "admission",
+   "repair_reason": "manual",
+   "reason_withheld": "withheld"
+  },
+  "expected": {
+   "state": "running",
+   "status": "reported",
+   "result_state": "observed",
+   "stage": "started",
+   "outcome": "succeeded",
+   "channel": "fork",
+   "provider": "deepseek",
+   "model": "synthetic",
+   "reasoning": "high",
+   "executor": "codex",
+   "backend": "codex",
+   "adapter": "cua",
+   "server": "memorypalace",
+   "tool": "observe",
+   "kind": "file",
+   "type": "search",
+   "item_type": "reasoning",
+   "content_type": "text",
+   "class": "Conflict",
+   "code": "timeout",
+   "category": "contract",
+   "error": "ValueError",
+   "error_tags": [
+    "timeout",
+    "permission"
+   ],
+   "retry_condition": "backoff",
+   "authority": "explicit",
+   "basis": "observed",
+   "actor": "unknown",
+   "role": "user",
+   "origin": "reflection",
+   "tier": "A",
+   "lane": "action",
+   "stimulus": "idle",
+   "waiting_reason": "admission",
+   "repair_reason": "manual",
+   "reason_withheld": "withheld"
+  }
+ },
+ {
+  "name": "a single word stays where it names a key of the same document, and only there",
+  "value": {
+   "values": {
+    "curiosity": 60
+   },
+   "dropped_fields": [
+    "curiosity",
+    "harbour"
+   ],
+   "note": "state"
+  },
+  "expected": {
+   "values": {
+    "curiosity": 60
+   },
+   "dropped_fields": [
+    "curiosity",
+    "[已删除]"
+   ],
+   "note": "[已删除]"
+  }
+ },
+ {
+  "name": "an email address is text, wherever it stands; a package or a version with @ stays",
+  "value": {
+   "contact": "alice@example.com",
+   "link": "mailto:alice@example.com",
+   "url": "https://bob@example.org/x",
+   "version": "codex@0.156.1",
+   "package": "@openai/codex",
+   "handle": "@kin_mind"
+  },
+  "expected": {
+   "contact": "[已删除]",
+   "link": "[已删除]",
+   "url": "[已删除]",
+   "version": "codex@0.156.1",
+   "package": "@openai/codex",
+   "handle": "@kin_mind"
+  }
+ },
+ {
+  "name": "a sentence, anything outside ASCII, a query string or a long string is text",
+  "value": {
+   "summary": "They walked the harbour.",
+   "note": "她说 wrenfield",
+   "search": "https://example.org/s?q=her+cat",
+   "long": "x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1x1",
+   "findings": [
+    "one two",
+    "3",
+    "mem_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+   ],
+   "sources": [
+    {
+     "url": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+     "title": "A title"
+    },
+    {
+     "url": "https://example.org/a/b",
+     "title": "Harbour"
+    }
+   ]
+  },
+  "expected": {
+   "summary": "[已删除]",
+   "note": "[已删除]",
+   "search": "[已删除]",
+   "long": "[已删除]",
+   "findings": [
+    "[已删除]",
+    "3",
+    "mem_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+   ],
+   "sources": [
+    {
+     "url": "memory://src_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+     "title": "[已删除]"
+    },
+    {
+     "url": "https://example.org/a/b",
+     "title": "[已删除]"
+    }
+   ]
+  }
+ },
+ {
+  "name": "a list is judged by the field that holds it; a code field keeps its one-word codes and loses its words",
+  "value": {
+   "error_tags": [
+    "timeout",
+    "rate limit",
+    "429",
+    "harbour."
+   ],
+   "stimuli": [
+    "idle",
+    "idle-review"
+   ]
+  },
+  "expected": {
+   "error_tags": [
+    "timeout",
+    "[已删除]",
+    "429",
+    "harbour."
+   ],
+   "stimuli": [
+    "[已删除]",
+    "idle-review"
+   ]
+  }
+ },
+ {
+  "name": "a whole document that is a single word is text; its keys are never touched",
+  "value": "harbour",
+  "expected": "[已删除]"
+ }
+]

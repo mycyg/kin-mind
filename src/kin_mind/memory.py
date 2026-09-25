@@ -274,6 +274,12 @@ def index_node(conn, rowid, node):
         conn.execute("INSERT INTO mind_memory_search(id,tokens) VALUES(?,?)", (node["id"], tokenize(search_text(node))))
 
 
+def member_title(record):
+    """The title eventmem's organize gives a family whose first member is `record`: its topic, else
+    its title (eventmem/core/organize.py)."""
+    return str((record.get("attributes") or {}).get("topic") or record.get("title") or "Topic")[:200]
+
+
 def align_search(conn):
     """Rebuild the memory index with the nodes' own rowids, once."""
     conn.execute("DELETE FROM mind_memory_search")
@@ -663,7 +669,7 @@ class MemoryContinuity:
                         "ORDER BY revision DESC,id LIMIT 4", [self.scope.key(), *anchors]).fetchall()
                     for row in families:
                         family = json.loads(row[0])
-                        members = []
+                        members, titles = [], []
                         for rid in family["members"][:12]:
                             try:
                                 refs = self.mind._evidence(conn, [rid])
@@ -677,8 +683,16 @@ class MemoryContinuity:
                             excerpt, partial = evidence_excerpt(record["content"], query, budget=250)
                             members.append({"id": rid, "revision": record["revision"], "basis": policy.basis(record),
                                 "text": excerpt, "excerpt_only": partial, "occurred_at": record["valid_from"]})
+                            titles.append(member_title(record))
                         if len(members) >= 2:
-                            topic_candidates.append({"id": family["id"], "revision": family["revision"], "title": family["title"],
+                            # The family's title is one member's words, and deleting that member takes the
+                            # family from the store. A copy -- the one a queue row keeps frozen for its retry
+                            # -- names only the members it lists, so it takes a title only from them: the
+                            # family's where a listed member has it, else the first listed member's. A member
+                            # left out (not current, hidden from this read, past the first 12) lends none
+                            # (CL7B-MM-03).
+                            title = family["title"] if family["title"] in titles else titles[0]
+                            topic_candidates.append({"id": family["id"], "revision": family["revision"], "title": title,
                                 "candidate_only": True, "members": members, "omitted_count": len(family["members"]) - len(members)})
         return {"cursor": cursor["seq"], "through_seq": pending[-1]["seq"] if pending else cursor["seq"],
                 "graph_candidates": graph_context,
