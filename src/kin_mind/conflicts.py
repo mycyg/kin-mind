@@ -56,6 +56,8 @@ REGISTRY = {
     "Appraisal lease no longer owns this proposal": ("runtime", "lease-lost", "block"),
     "Evaluated sources changed before commit": ("runtime", "root-evidence-changed", "block"),
     "Referenced semantic evidence changed before commit": ("runtime", "cited-evidence-changed", "reuse"),
+    # The proposal may repeat the words of what was deleted: never reused, asked again in full (CL6-MM-03).
+    "Something the model was shown has been deleted": ("runtime", "shown-deleted", "block"),
     "Referenced interaction changed during evaluation": ("runtime", "cited-evidence-changed", "reuse"),
     "Recent interaction source needs review": ("runtime", "reference-needs-review", "reuse"),
     "Referenced graph identity changed during evaluation": ("runtime", "graph-node-changed", "reuse"),

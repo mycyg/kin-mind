@@ -819,8 +819,9 @@ class MemoryContinuity:
 
         It is a derived source: it rests on the evidence it cites and on what the appraisal was
         about, which become its dependencies, and it was written from everything the appraisal was
-        shown (`evaluated_sources`, refs at the versions read). All of it is checked where it is
-        stored; one deleted or changed since, and it is not kept (CR5-MM-02).
+        shown (`evaluated_sources`, refs at the versions read, and `evaluated_ids`, what the rest of
+        its context named). All of it is checked where it is stored; one deleted or changed since,
+        and it is not kept (CR5-MM-02, CL6-MM-03).
         """
         understanding = (result.get("proposal") or {}).get("understanding")
         if not understanding or understanding.get("basis") != "internal_thought":
@@ -840,6 +841,7 @@ class MemoryContinuity:
         # no role; `basis: internal_thought` is what tells the two apart (K1-21, K3-03).
         derived_from = list(dict.fromkeys([*understanding.get("evidence_ids", []), *(result.get("rests_on") or [])]))
         shown = [ref for ref in result.get("evaluated_sources") or [] if isinstance(ref, dict)]
+        shown += [identifier for identifier in result.get("evaluated_ids") or [] if isinstance(identifier, str)]
         try:
             return self._reflect(result, understanding, event, derived_from, shown)
         except Conflict as error:

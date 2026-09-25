@@ -25,7 +25,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, judgment_cache, revalidation
+from . import attempts, erasure, judgment_cache, revalidation
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
@@ -2159,6 +2159,11 @@ class Appraisals:
                     for plan in model_context.get("autonomy_context", {}).get("plans", {}).get("plans", []):
                         if not plan["needs_review"]:
                             semantic_refs.update({ref["record_id"]: ref for ref in plan["evidence"]})
+                    # Everything else the model is shown was written from sources too -- the mind's state
+                    # (wishes, concerns, decisions, understanding), methods, the entries marked for review
+                    # that stay in its context: named by what the store holds now, so the commit and the
+                    # reflection are checked against them and the queue row names them (CL6-MM-03).
+                    shown_ids = erasure.shown_ids(conn, model_context)
                 provider.section_isolation = isolation
                 provider.audit_sections = audited
                 provider.review_max_minutes = review_max
@@ -2177,9 +2182,14 @@ class Appraisals:
                 # Its sources that are still current are merged back, so the moving dialogue window and
                 # what the fork read with its tools can neither remove nor authorize different evidence.
                 stored = revalidation.candidate(data, historical)
-                if stored and any(isinstance(ref, dict) and ref.get("erased") for ref in [*stored.sources, *(data.get("evaluated_sources") or [])]):
+                if stored:
+                    with self.engine.db.connect() as conn:
+                        shown_gone = erasure.tombstoned(conn, data.get("evaluated_ids") or ())
+                if stored and (shown_gone or any(isinstance(ref, dict) and ref.get("erased")
+                                                 for ref in [*stored.sources, *(data.get("evaluated_sources") or [])])):
                     # Something the stored proposal's model was shown has been deleted since, and the delete
-                    # took its words: it is neither reused nor put to a light question (CR5-MM-01).
+                    # took its words: it is neither reused nor put to a light question (CR5-MM-01). What it
+                    # was shown besides its sources is named by `evaluated_ids` (CL6-MM-03).
                     revalidation.forget(data)
                     if stored.origin == "seed":
                         data["seed_rejected"] = True
@@ -2244,7 +2254,9 @@ class Appraisals:
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal_record(proposal), receipt=receipt,
-                            evaluated_sources=list(semantic_refs.values()))
+                            evaluated_sources=list(semantic_refs.values()),
+                            # A stored proposal was written from what its own attempt was shown as well.
+                            evaluated_ids=sorted(set(shown_ids) | set(data.get("evaluated_ids") or () if light else ())))
                 if manifest:
                     # The manifest this proposal rests on: this attempt's, unless the proposal was reused
                     # without a question and so still rests on what its own model call was shown.
@@ -2324,6 +2336,13 @@ class Appraisals:
                     if moved:
                         raise Conflict("Referenced semantic evidence changed before commit",
                                        target=moved["record_id"], expected=moved["revision"])
+                    # And the rest it was shown, by the sources and records it names. A delete took their
+                    # words out of the state while the model answered, and the answer may repeat them.
+                    # Only a deletion stops the commit: the state's own entries keep older versions of
+                    # what they cite all the time, and a revision is not a delete (CL6-MM-03).
+                    gone = erasure.tombstoned(conn, data.get("evaluated_ids") or ())
+                    if gone:
+                        raise Conflict("Something the model was shown has been deleted", target=min(gone))
                     # What this commit attempt refuses or holds. It is written to the queue row as it happens, so
                     # a commit that then fails as a whole still leaves the refusals as feedback for its retry.
                     rejected, held, blocked = [], [], {}
@@ -2624,7 +2643,9 @@ class Appraisals:
                             enrichment_data = {"evidence_ids": data["evidence_ids"], "agent_version": effective_version,
                                 "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
                                 "seed_memory": seed, "seed_receipt": receipt,
-                                "seed_sources": list(semantic_refs.values())}
+                                "seed_sources": list(semantic_refs.values()),
+                                # The seed was written from everything its parent's model was shown (CL6-MM-03).
+                                "evaluated_ids": data.get("evaluated_ids") or []}
                             conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
                                 (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
                     elif memory_context:
@@ -2719,7 +2740,8 @@ class Appraisals:
                 else:
                     data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
             # What the appraisal was shown goes with the result: the reflection is written from it (CR5-MM-02).
-            self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or []})
+            self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or [],
+                                             "evaluated_ids": data.get("evaluated_ids") or []})
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.

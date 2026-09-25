@@ -64,10 +64,12 @@ CODED_TEXT = frozenset({"target"})
 CODED_LISTS = frozenset({"verification_gaps"})
 # `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
 # sources included: a queue row or a run that names one of them erased loses every word the model or
-# the executor wrote (CR5-MM-01).
+# the executor wrote (CR5-MM-01). `evaluated_ids` is the rest of what an appraisal's model was shown --
+# the mind's state, methods, entries marked for review -- by the sources and records it names
+# (CL6-MM-03).
 REF_LISTS = ("evidence", "resolution_evidence", "refs", "evaluated_sources")
 ID_LISTS = ("evidence_ids", "source_ids", "record_ids", "input_ids", "result_ids", "member_ids",
-            "evaluated_continuity")
+            "evaluated_continuity", "evaluated_ids")
 # A field copied from elsewhere names what it was written from beside it, as `<field>_evidence_ids`:
 # an erase takes that field's words, and only that field's (CR5-MM-01).
 FIELD_EVIDENCE = "_evidence_ids"
@@ -212,13 +214,34 @@ def drop_deleted(conn, value):
     that names nothing deleted comes back as it is (CR4-MM-02, CR5-MM-01)."""
     from eventmem.core.db import NAMED
 
-    named = sorted(set(NAMED.findall(dumps(value))))
-    erased = set()
-    for start in range(0, len(named), 500):
-        page = named[start:start + 500]
+    erased = tombstoned(conn, NAMED.findall(dumps(value)))
+    return scrub(value, frozenset(erased)) if erased else value
+
+
+def tombstoned(conn, ids):
+    """Those of `ids` the store holds a deletion fact for."""
+    ids, erased = sorted(set(ids)), set()
+    for start in range(0, len(ids), 500):
+        page = ids[start:start + 500]
         erased.update(row[0] for row in conn.execute(
             "SELECT key FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
-    return scrub(value, frozenset(erased)) if erased else value
+    return erased
+
+
+def shown_ids(conn, value):
+    """Every source and record `value` names that the store holds now: all a model shown `value`
+    may have written from, beyond the references it is asked about -- the mind's state, methods,
+    entries marked for review. What it wrote is committed and kept only while none of them has
+    been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03)."""
+    from eventmem.core.db import NAMED
+
+    named, held = sorted(set(NAMED.findall(dumps(value)))), set()
+    for start in range(0, len(named), 500):
+        page = named[start:start + 500]
+        marks = ",".join("?" * len(page))
+        held.update(row[0] for row in conn.execute(f"SELECT id FROM records WHERE deleted=0 AND id IN ({marks})", page))
+        held.update(row[0] for row in conn.execute(f"SELECT id FROM sources WHERE deleted=0 AND id IN ({marks})", page))
+    return sorted(held)
 
 
 def drop_refs(value, ids):
