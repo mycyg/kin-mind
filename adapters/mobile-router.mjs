@@ -49,6 +49,15 @@ export const DEFERRAL_PLAN_RETRY_MS=Object.freeze([60000,5*60000,15*60000,360000
 const INPUT_CHANNELS=new Set(['feishu','wechat','desktop-handoff','cli']);
 /** An input's kind as the journal may name it (owner, handoff, work-result, the mind's own…). */
 const INPUT_KIND=/^[a-z][a-z-]{0,39}$/;
+/** How far an input had got when the owner's stop settled it as hers, as the journal keeps it
+ * beside the stop that did it: `preparation` — before native submission; `host-queue` —
+ * handed only to the host's queue, its prompt not begun; `prompt-start` — refused where its
+ * prompt would begin; `native-session` — it had reached, or may have reached, the native
+ * session. A restore from the journal alone brings each back canceled (§0: an explicit
+ * stop always stands). */
+export const CANCEL_SCOPES=Object.freeze(['preparation','host-queue','prompt-start','native-session']);
+/** What the journal keeps of the owner's stop on an input: which stop, and how far it had got. */
+const cancelFacts=(record,scope)=>({canceledBy:record.canceledBy,scope,...(scope==='native-session'?{state:record.state}:{})});
 /** When the host first received an input: its own receipt time, never in the future and
  * never refreshed by a retry (CR-LIFE-18). */
 function receiptTime(value,now) {
@@ -404,9 +413,11 @@ export class MobileRouter {
    * that id is routed afresh (WS8 #3). An id an older journal did not say the kind of
    * comes back as kind `unknown`: it is only looked up by its id and never told about,
    * since it may be Kin's own. Like any unconfirmed input they never hold the restart
-   * profile (AD1-10). */
+   * profile (AD1-10). An input the journal says the owner's stop settled comes back as
+   * that — canceled by the same stop, under its own id — and is never looked up, requeued
+   * or routed again (§0). */
   restoreLedger() {
-    let ids=[];const kinds=new Map(),submits=new Map();
+    let ids=[];const kinds=new Map(),submits=new Map(),canceled=new Map();
     try {
       const journal=this.file+'.events.jsonl',size=fs.statSync(journal).size,from=Math.max(0,size-LEDGER_TAIL_BYTES),handle=fs.openSync(journal,'r');
       let body='';
@@ -417,11 +428,18 @@ export class MobileRouter {
           if(!String(event?.kind).startsWith('input-')||typeof event.id!=='string')return null;
           if(typeof event.inputKind==='string'&&INPUT_KIND.test(event.inputKind))kinds.set(event.id,event.inputKind);
           if(event.kind==='input-submitting'&&typeof event.submit?.sessionId==='string')submits.set(event.id,{sessionId:event.submit.sessionId,runtime:typeof event.submit.runtime==='string'?event.submit.runtime:null,correlation:event.submit.correlation===true});
+          // The stop that canceled it is its first; how far it had got is its latest word.
+          if(typeof event.canceledBy==='string'&&event.canceledBy&&CANCEL_SCOPES.includes(event.scope))
+            canceled.set(event.id,{canceledBy:canceled.get(event.id)?.canceledBy??event.canceledBy.slice(0,200),scope:event.scope,state:typeof event.state==='string'?event.state:null});
           return event.id;
         } catch {return null;}
       }).filter(Boolean))];
     } catch {/* No journal: this router never accepted anything here. */}
-    for(const id of ids)this.state.inputs[id]??={id,state:'unconfirmed',recovered:true,kind:kinds.get(id)??'unknown',...(submits.has(id)?{submit:submits.get(id)}:{}),at:this.now()};
+    for(const id of ids) {
+      if(this.state.inputs[id])continue;
+      const kind=kinds.get(id)??'unknown',submit=submits.get(id),cancel=canceled.get(id);
+      this.state.inputs[id]=cancel?restoredCancel(id,kind,cancel,this.now(),submit):{id,state:'unconfirmed',recovered:true,kind,...(submit?{submit}:{}),at:this.now()};
+    }
     return ids.length;
   }
   locked(fn) {
@@ -682,21 +700,33 @@ export class MobileRouter {
     for(const task of this.tasks())if(task.cancelRequested&&task.cancelSourceInputId===record.id)this.cancelTask(task,at);
     for(const id of record.interrupt?.turnInputIds??[]) {
       const other=this.state.inputs[id];
-      if(other&&ownerInput(other)&&other.state==='accepted'&&!answered(other)&&!other.canceledBy){other.canceledBy=record.id;other.settledAt??=at;}
+      if(other&&ownerInput(other)&&other.state==='accepted'&&!answered(other))this.cancelSettled(other,record.id,at);
     }
   }
   cancelTask(task,at=this.now()) {
     task.status='canceled';task.canceledAt=at;task.outcome='owner-canceled';
-    const queued=[];
+    const queued=[],by=task.cancelSourceInputId??'owner-stop';
     for(const id of task.inputIds){
       const record=this.state.inputs[id];if(!record||task.cancelSourceInputId===id)continue;
-      if(ownerInput(record)&&!answered(record)){record.canceledBy=task.cancelSourceInputId??'owner-stop';record.settledAt??=at;}
       // Not submitted yet: it loses its reservation and its right to submit (CR2-LIFE-01).
-      if(['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,task.cancelSourceInputId??'owner-stop');
+      if(['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,by);
       // Waiting in the host's queue, its prompt not begun: taken back by its own id (CR3-FLOW-02).
       else if(record.state==='queued'&&!record.turnStartedAt)queued.push(record);
+      // Anything else of hers still unanswered is settled as hers.
+      else if(ownerInput(record)&&!answered(record))this.cancelSettled(record,by,at);
     }
-    this.withdrawQueuedWork(queued,task.cancelSourceInputId??'owner-stop');
+    this.withdrawQueuedWork(queued,by);
+  }
+  /** The owner's stop settles an input as hers where there is no dispatch to withdraw: its
+   * turn was cut, its submission is unknown, or it had already failed before submission.
+   * The first stop to reach it stays its receipt, and the journal keeps it with how far the
+   * input had got, so a restore from the journal alone keeps it too. */
+  cancelSettled(record,stoppedBy,at=this.now()) {
+    if(record.canceledBy||record.historical||record.state==='superseded')return false;
+    record.canceledBy=stoppedBy;record.settledAt??=at;
+    const scope=['accepted','submitting','unconfirmed','fenced-unconfirmed'].includes(record.state)?'native-session':'preparation';
+    this.save('input-canceled',{id:record.id,...cancelFacts(record,scope)});
+    return true;
   }
   /** The owner's stop, from the literal command or from a classifier that actually
    * answered: recorded on the stop input itself, applied to the tasks it names. */
@@ -726,7 +756,7 @@ export class MobileRouter {
     try {taken=this.withdrawQueued?.(records.map(record=>record.id))??[];} catch {taken=[];}
     for(const record of records) {
       record.withdrawn.fromQueue=taken.includes(record.id);
-      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',stage:'host-queue',fromQueue:record.withdrawn.fromQueue});
+      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',...cancelFacts(record,'host-queue'),fromQueue:record.withdrawn.fromQueue});
     }
   }
   /** An input handed to the host's queue, its prompt not begun, that the owner's stop
@@ -757,7 +787,7 @@ export class MobileRouter {
     if(!stopped.length)return null;
     for(const record of stopped.filter(handing)) {
       this.cancelQueued(record,this.stopOf(record),'prompt-start');
-      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',stage:'prompt-start'});
+      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',...cancelFacts(record,'prompt-start')});
     }
     const carried=records.filter(record=>!stopped.includes(record)&&handing(record));
     for(const record of carried) {
@@ -1031,13 +1061,17 @@ export class MobileRouter {
     if(record.submissionStartedAt||record.withdrawn||!['semantic-pending','selected','preparing','failed-before-submit'].includes(record.state))return false;
     if(record.state!=='failed-before-submit')this.notSubmitted(record,reason,{stage});
     record.withdrawn={reason,at:this.now()};
-    this.save('input-dispatch-withdrawn',{id:record.id,reason});
+    this.save('input-dispatch-withdrawn',{id:record.id,reason,...(reason==='canceled-by-owner'&&record.canceledBy?cancelFacts(record,'preparation'):{})});
     return true;
   }
-  /** The owner's stop reached an input before submission: it is canceled by her, and withdrawn. */
+  /** The owner's stop reached an input before submission: it is canceled by her, and withdrawn.
+   * One withdrawn already (its deadline passed) has the stop journaled on its own. */
   cancelBeforeSubmission(record,stoppedBy) {
+    const first=!record.canceledBy;
     record.canceledBy??=stoppedBy;record.settledAt??=this.now();
-    return this.withdrawDispatch(record,'canceled-by-owner',{stage:'owner-stop'});
+    const withdrawn=this.withdrawDispatch(record,'canceled-by-owner',{stage:'owner-stop'});
+    if(!withdrawn&&first)this.save('input-canceled',{id:record.id,...cancelFacts(record,'preparation')});
+    return withdrawn;
   }
   async dispatchOnce(input,submit) {
     const selected=await this.select(input);
@@ -2265,7 +2299,7 @@ export class MobileRouter {
   intakeFailed(id,reason,{since=0}={}) {
     return this.locked(async()=>{
       const record=this.state.inputs[id];
-      if(!record||this.inflight.has(id)||record.submissionStartedAt||!['selected','preparing','failed-before-submit'].includes(record.state))return record?clone(record):null;
+      if(!record||this.inflight.has(id)||record.submissionStartedAt||record.canceledBy||!['selected','preparing','failed-before-submit'].includes(record.state))return record?clone(record):null;
       if(record.state==='failed-before-submit'&&(record.retry?.lastFailureAt??-Infinity)>=since)return clone(record);
       const retry=this.notSubmitted(record,reason);
       this.save('input-failed-before-submit',{id,reason,attempt:retry.attempts});
@@ -2481,8 +2515,18 @@ export class MobileRouter {
 }
 /** A record that names an input and nothing more, never routed: made by the host on intake
  * (CR-LIFE-02), or restored from the journal and proven never received (WS8 #3). A replay
- * routes it afresh and keeps the retries it already used. */
-function intakeOnly(record){return Boolean((record?.intake||record?.restored)&&!record.route&&['preparing','failed-before-submit'].includes(record.state));}
+ * routes it afresh and keeps the retries it already used. One the owner's stop settled is
+ * never that: it stays hers. */
+function intakeOnly(record){return Boolean((record?.intake||record?.restored)&&!record.route&&!record.canceledBy&&['preparing','failed-before-submit'].includes(record.state));}
+/** An input the journal says the owner's stop settled, restored as that: canceled by the same
+ * stop under its own id. What never reached the native session comes back known unsubmitted;
+ * what had, or may have, keeps that (accepted, or its submission unknown) — and is never
+ * looked up again, since nothing of it is to be sent or told any more. */
+function restoredCancel(id,kind,{canceledBy,scope,state},at,submit) {
+  const base={id,kind,canceledBy,cancelScope:scope,settledAt:at,restored:'journal',at};
+  if(scope==='native-session')return {...base,state:state==='accepted'?'accepted':'unconfirmed',...(submit?{submit}:{})};
+  return {...base,state:'failed-before-submit',reason:'canceled-by-owner',failureStage:scope,withdrawn:{reason:'canceled-by-owner',at,stage:scope}};
+}
 /** A deferred task the router still owes its plan to, or owes Kin its failure. */
 function deferralOwed(task){const plan=task.deferral?.plan;return task.status==='deferred'&&(plan?.state==='pending'||plan?.state==='needs-kin'&&!plan.toldAt);}
 /** A task keeps a bounded history of replaced and late entries (AD1-08). */

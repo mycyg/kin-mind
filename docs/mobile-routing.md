@@ -171,6 +171,16 @@ still referenced stays. An ID index answers a replay of an archived input as a
 duplicate instead of running it again, and the append-only event journal moves to
 the same directory past 8 MiB.
 
+When neither the state file nor its previous revision can be read, the ledger is
+rebuilt from the tail of that journal: each input comes back by its ID and kind as
+`unconfirmed`, and nothing is done with it until the watchdog has looked it up by its
+ID. The owner's stop is the exception, because it always stands. Every event that
+records it names the stop and how far the input had got — `preparation`,
+`host-queue`, `prompt-start` or `native-session` — and an input the journal says she
+stopped comes back canceled by that same stop under its own ID. It is never looked up,
+requeued, routed again or told about; a replay of it is answered as canceled (or, if
+it had reached the native session, as a duplicate).
+
 ## Runtime controls and native maintenance
 
 The classifier returns `chat`, `work` or `control`. Control intentions are `status`,
