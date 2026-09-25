@@ -225,7 +225,9 @@ terminal; or not submitted — no outbox record, or one that proves nothing reac
 platform — which sends the same ID again under a bounded budget that survives
 restarts. Anything else leaves the submission unknown: the original ID is only looked
 up, never resent, and after a bounded number of lookups the notice stops polling as
-`unresolved`. Exhaustion is a state with a reason, never permanent polling. A settle
+`unresolved`. Exhaustion is a state with a reason, never permanent polling. A send
+starts only past the activity gate; if the ledger cannot be written after that, the
+permit is let go and the notice waits, not submitted, under its own ID. A settle
 that would change nothing writes nothing. Notification receipts are separate from
 task delivery receipts. Host integrations must guard provider changes for the
 duration of the send and must bypass task-delivery accounting for these non-task

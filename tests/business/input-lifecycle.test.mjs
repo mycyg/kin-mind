@@ -695,3 +695,23 @@ test('the owner\'s stop takes her stopped work out of the host\'s queue by its o
   assert.deepEqual(k.queue,['stop']);
   assert.deepEqual([late.router.state.inputs.w.canceledBy,late.router.state.inputs.w.withdrawn.stage,late.router.state.inputs.w.withdrawn.fromQueue],['stop','host-queue',true]);
 });
+
+test('a runtime notice whose write fails before its send lets the permit go and waits, unsent, under its own id (CR3-FLOW-09)',async t=>{
+  const f=fixture(t);
+  f.router.state.notices.n1={id:'n1',kind:'mode-failed',text:'切换没有成功。',state:'pending',attempts:0,sourceInputId:null};
+  const sent=[];const send=async request=>{sent.push(request.id);return {state:'accepted',messageId:'m-'+request.id};};
+  const save=f.router.save;
+  f.router.save=function(kind,detail){if(kind==='notice-sending')throw Error('disk full');return save.call(this,kind,detail);};
+  await assert.rejects(f.router.flushNotices({send,lookup:async()=>assert.fail('nothing was sent, so nothing is looked up')}),/disk full/);
+  assert.deepEqual(f.router.activityList(),[],'the permit is let go');
+  assert.equal(f.router.busy(f.runtime),false,'nothing holds busy or the drain');
+  const n=f.router.state.notices.n1;
+  assert.deepEqual([n.id,n.state,n.attempts,n.stage,n.nextAction],['n1','pending',0,'not-submitted','resend-same-id'],'not submitted, under its own id, no attempt spent');
+  assert.deepEqual(sent,[]);
+  f.router.save=save;
+  f.clock.now+=MINUTE;
+  await f.router.flushNotices({send,lookup:async id=>({state:'accepted',messageId:'m-'+id})});
+  assert.deepEqual(sent,['n1'],'taken up again under the same id once the write succeeds');
+  assert.deepEqual([f.router.state.notices.n1.state,f.router.state.notices.n1.attempts],['accepted',1]);
+  assert.deepEqual(f.router.activityList(),[]);
+});

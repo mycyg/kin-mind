@@ -1828,9 +1828,21 @@ export class MobileRouter {
         // that marks it sending, so no freeze reports idle while it starts (CR2-LIFE-02).
         const gate=this.beginActivity({kind:'notice',id});
         if(!gate.ok){n.stage='held';n.updatedAt=this.now();this.save('notice-held',{id,reason:gate.reason});return null;}
-        // Whatever else the message recalls, this is the model it names as the current one.
-        if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
-        this.save('notice-sending',{id});return {...clone(n),sendNow:true,gate};
+        // From the permit on, every step before the send is covered: a write that fails lets
+        // the permit go, and the notice — nothing of it sent — waits under its own id to be
+        // taken up again, its attempts as they were (CR3-FLOW-09).
+        const before=clone(n);let handed=false;
+        try {
+          // Whatever else the message recalls, this is the model it names as the current one.
+          if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
+          this.save('notice-sending',{id});
+          const handing={...clone(n),sendNow:true,gate};handed=true;return handing;
+        } catch(error) {
+          for(const key of Object.keys(n))delete n[key];
+          Object.assign(n,before,{stage:'not-submitted',waitingReason:'not-submitted-save-failed',nextAction:'resend-same-id',
+            nextAttemptAt:this.now()+2000*Math.max(1,before.attempts??1),updatedAt:this.now()});
+          throw error;
+        } finally {if(!handed)gate.release();}
       });
       if(!notice)continue;
       let receipt;
