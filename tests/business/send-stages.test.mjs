@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {submitPayload,platformErrorCode} from '../../adapters/send-stages.mjs';
-import {classifyReceipt,normalizeReceipt,fileReceipts} from '../../adapters/channel-contract.mjs';
+import {classifyReceipt,normalizeReceipt,fileReceipts,feishuAnswer,wechatAnswer} from '../../adapters/channel-contract.mjs';
 import {createFakeTransport,createFakePlatform} from './helpers/fake-transport.mjs';
 
 // The stages are the sender's evidence for what a failure means: before `message-submitting`
@@ -81,7 +81,9 @@ test('only a platform error code is a refusal: an answer without a usable code, 
     const {seen,checkpoint}=stages();
     await assert.rejects(submitPayload({uuid:'u',checkpoint,create:async()=>answer}),
       error=>error.code==='PLATFORM_ANSWER_UNKNOWN'&&!('platformCode' in error),JSON.stringify(answer)??'undefined');
-    assert.deepEqual(seen.map(s=>[s.stage,s.submissionStarted]),[['message-submitting',true]]);
+    assert.deepEqual(seen.filter(s=>s.stage).map(s=>[s.stage,s.submissionStarted]),[['message-submitting',true]]);
+    // A message ID the unknown answer named is kept beside it, as evidence (CL6-FLOW-01).
+    assert.deepEqual(seen.filter(s=>s.answer).map(s=>s.answer),answer?.data?[{status:200,reason:'api-code-unreadable',code:null,messageId:'om_x'}]:[]);
   }
   // A whole number other than zero is the platform's refusal, whatever its sign.
   for(const code of [230002,99991663,-1]) {
@@ -133,4 +135,62 @@ test('the test transport keeps the refusal rule on both flavours: a coded refusa
       assert.deepEqual([platform.calls.length,platform.delivered.length],[2,1],'the uncoded answer landed, and nothing went twice');
     }
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+// What the Feishu SDK throws for an answer outside 2xx: its HTTP client's error, as it came, with the
+// answer on it -- the status, and the body parsed from JSON (@larksuiteoapi/node-sdk 1.73.3 over axios 1.20.0).
+const httpError=(status,data)=>Object.assign(Error('Request failed with status code '+status),{name:'AxiosError',code:status<500?'ERR_BAD_REQUEST':'ERR_BAD_RESPONSE',response:{status,data}});
+
+test('an answer that names a message and refuses it as well is unknown, never a refusal, and the message ID it named stays on the receipt (CL6-FLOW-01)',async()=>{
+  for(const [label,create,status,code,messageId] of [
+    ['2xx, code and message ID',async()=>({code:230002,msg:'bot not in chat',data:{message_id:'om_c1'}}),200,230002,'om_c1'],
+    ['400, code and message ID',async()=>{throw httpError(400,{code:230001,data:{message_id:'om_c2'}});},400,230001,'om_c2'],
+    ['429, code 0 and message ID',async()=>{throw httpError(429,{code:0,data:{message_id:'om_c3'}});},429,null,'om_c3'],
+  ]) {
+    const {seen,checkpoint}=stages();
+    await assert.rejects(submitPayload({uuid:'u',checkpoint,create}),
+      error=>error.code==='PLATFORM_ANSWER_UNKNOWN'&&error.reason==='contradictory-answer'&&!('platformCode' in error),label);
+    assert.deepEqual(seen,[{stage:'message-submitting',submissionStarted:true},{answer:{status,reason:'contradictory-answer',code,messageId}}],label);
+  }
+  // The same rule on both channels, read straight from the contract.
+  assert.deepEqual(feishuAnswer({status:200,body:{code:230002,data:{message_id:'om_1'}}}),{state:'unknown',reason:'contradictory-answer',code:230002,messageId:'om_1'});
+  assert.deepEqual(feishuAnswer({status:200,body:{code:230002,data:{}}}),{state:'rejected',reason:'api-230002',code:230002});
+  for(const [status,body] of [[200,{ret:-2,message_id:'123'}],[200,{errcode:40001,message_id:9}],[413,{ret:0,message_id:'9'}],[400,{message_id:'9'}]])
+    assert.deepEqual(wechatAnswer({status,body}),{state:'unknown',reason:'contradictory-answer'},JSON.stringify([status,body]));
+  // Only a real server message ID contradicts a refusal: zero, a fraction or words are no message.
+  for(const message_id of ['0','abc',0,1.5,-3,''])
+    assert.equal(wechatAnswer({status:200,body:{ret:-2,message_id}}).state,'rejected',JSON.stringify(message_id));
+  // A 5xx is unknown for its status before anything its body says.
+  assert.deepEqual(wechatAnswer({status:502,body:{ret:-1,message_id:'9'}}),{state:'unknown',reason:'http-502'});
+  // A status that is not a whole number refuses nothing, on either channel.
+  for(const status of ['400',400.5,null,undefined]) {
+    assert.equal(feishuAnswer({status,body:{code:230001}}).state,'unknown',String(status));
+    assert.equal(wechatAnswer({status,body:{}}).state,'unknown',String(status));
+  }
+});
+
+test('a Feishu HTTP error is judged by the answer on it, as WeChat is: a 4xx other than 409 with the platform code is a refusal, anything else stays the unknown it came as',async()=>{
+  // Refusals: the SDK threw, and the answer on the error proves the platform refused the message.
+  for(const [status,code] of [[400,230001],[400,99992402],[403,230002],[429,99991400],[404,-1]]) {
+    const {seen,checkpoint}=stages();
+    await assert.rejects(submitPayload({uuid:'u',checkpoint,create:async()=>{throw httpError(status,{code,msg:'refused'});}}),
+      error=>error.code==='PLATFORM_REJECTED'&&error.platformCode===code,`${status} ${code}`);
+    assert.deepEqual(seen.map(s=>s.stage),['message-submitting']);
+  }
+  // Unknown: the error goes on as it came -- the sender records it the way it records a timeout.
+  for(const [label,data,status] of [['409 with a code',{code:230001},409],['500 with a code',{code:230001},500],['502 from a proxy','<html>Bad Gateway</html>',502],
+    ['400 without a code',{msg:'bad request'},400],['400 with a code in words',{code:'230001'},400],['400 with a fraction',{code:1.5},400],
+    ['400 read as text','Bad Request',400],['400 with no body',undefined,400],['a status nobody can read',{code:230001},'400']]) {
+    const {seen,checkpoint}=stages(),error=httpError(status,data);
+    await assert.rejects(submitPayload({uuid:'u',checkpoint,create:async()=>{throw error;}}),thrown=>thrown===error,label);
+    assert.deepEqual(seen.map(s=>s.stage),['message-submitting'],label);
+  }
+  // No answer at all: a timeout, a lost connection.
+  for(const error of [Object.assign(Error('timeout of 12000ms exceeded'),{name:'AxiosError',code:'ECONNABORTED'}),Object.assign(Error('socket hang up'),{code:'ECONNRESET'}),
+    Object.assign(Error('odd'),{response:null}),Object.assign(Error('odd'),{response:'text'})])
+    await assert.rejects(submitPayload({uuid:'u',checkpoint:stages().checkpoint,create:async()=>{throw error;}}),thrown=>thrown===error,error.message);
+  // A 5xx that names a message: unknown, as it came, and the message ID it named stays on the receipt.
+  const {seen,checkpoint}=stages(),error=httpError(503,{code:1,data:{message_id:'om_5xx'}});
+  await assert.rejects(submitPayload({uuid:'u',checkpoint,create:async()=>{throw error;}}),thrown=>thrown===error);
+  assert.deepEqual(seen[1],{answer:{status:503,reason:'http-503',code:null,messageId:'om_5xx'}});
 });
