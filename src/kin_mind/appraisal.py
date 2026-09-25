@@ -2240,6 +2240,9 @@ class Appraisals:
                     # A receipt cut short (`truncated`) does not name all its fork read, so nothing can
                     # say all of that still stands: such a proposal is asked again in full (CL6D-MM-01).
                     shown_gone = shown_gone or erasure.reads_truncated(stored.receipt)
+                    # Words a delete took from the stored proposal itself leave nothing to take up
+                    # again: it is judged afresh, whichever erase took them.
+                    shown_gone = shown_gone or erasure.ERASED in dumps(stored.proposal)
                 if stored and (shown_gone or any(isinstance(ref, dict) and ref.get("erased")
                                                  for ref in [*stored.sources, *(data.get("evaluated_sources") or [])])):
                     # Something the stored proposal's model was shown has been deleted since, and the delete
@@ -2327,7 +2330,8 @@ class Appraisals:
                 if missing_targets and self.exploration_capabilities.get("decisions"):
                     if hasattr(provider, "repair_sharing") and not data.get("sharing_repair_attempted"):
                         data["sharing_repair_attempted"] = True
-                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt})
+                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt,
+                                                                         "tombstone_mark": data["tombstone_mark"]})
                         with self.engine.db.connect(write=True) as conn:
                             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
@@ -3106,7 +3110,9 @@ class DailyReview:
                 # now, or deleted since the review began -- the context was put together after its
                 # mark, and one deleted while the model answered is held no longer (CL6E-MM-02).
                 evaluated = sorted(set(erasure.shown_ids(conn, context, since=mark)) | set(erasure.tool_read_ids(conn, receipt, since=mark)))
-            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown, "evaluated_ids": evaluated}
+            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown, "evaluated_ids": evaluated,
+                    # Where it began, for a later erase that passes earlier deletes (erasure.read_by).
+                    "tombstone_mark": mark}
             if proposal.evolution:
                 event = AffectiveEvent(
                     command_id="daily:" + day,

@@ -222,35 +222,74 @@ def _receipt(key):
     return isinstance(key, str) and (key == "receipt" or key.endswith("_receipt"))
 
 
-def read_by(value, ids):
+def _began(value, key=None):
+    """The `tombstone_mark` the call behind the receipt `value[key]` began at, where `value` keeps
+    one: beside that receipt (`seed_receipt`, `seed_tombstone_mark`), else the row's or the part's own."""
+    for name in ([key[:-len("receipt")] + "tombstone_mark"] if key and key != "receipt" else []) + ["tombstone_mark"]:
+        mark = value.get(name)
+        if isinstance(mark, int) and not isinstance(mark, bool):
+            return mark
+    return None
+
+
+def read_by(value, ids, after=None, inherited=None):
     """Whether a receipt `value` keeps at its own top level -- `receipt`, `seed_receipt`,
-    `draft_receipt` -- says a tool returned any of `ids` to the model."""
-    return any(_receipt(key) and isinstance(item, (dict, list)) and any(i in ids for i in read_ids(item))
-               for key, item in value.items())
+    `draft_receipt` -- says a tool returned any of `ids` to the model. `after(mark)`: those of `ids`
+    deleted after `mark`. Given, a receipt counts only what was deleted after its call began (`_began`,
+    else `inherited`, the mark of the row a part is in): what was deleted before, a tool could return
+    only as a tombstone reference, with no words (CL6E-MM-02). The repair's reerase is the one erase
+    that passes deletes so early; a row without a mark counts them all."""
+    for key, item in value.items():
+        if not (_receipt(key) and isinstance(item, (dict, list))):
+            continue
+        mark = _began(value, key) if after else None
+        mark = inherited if mark is None else mark
+        counted = ids if after is None or mark is None else after(mark)
+        if any(i in counted for i in read_ids(item)):
+            return True
+    return False
 
 
-def scrub_process(value, ids):
+def scrub_process(value, ids, *, after=None):
     """A process row (`PROCESS_TABLES`) with the words of everything resting on `ids` taken out: by
     its references, as `scrub` takes them, and by what its model read with its tools, as its own
     receipts say -- the whole row for the row's receipts, a stored proposal or a rejected result for
-    theirs. What an earlier run already took out is left as it is (CL6D-MM-01, CL6E-MM-01)."""
+    theirs. What an earlier run already took out is left as it is (CL6D-MM-01, CL6E-MM-01).
+    `after`: see `read_by`."""
     if not isinstance(value, dict):
         return scrub(value, ids)
-    if read_by(value, ids):
+    if read_by(value, ids, after):
         return scrub(value, ids, erase=True)
-    out = value
+    row, out = _began(value), value
     for key in PROCESS_PARTS:
         part = value.get(key)
-        if isinstance(part, dict) and read_by(part, ids):
+        if isinstance(part, dict) and read_by(part, ids, after, row):
             new = scrub(part, ids, erase=True)
         elif isinstance(part, list):
-            new = [scrub(item, ids, erase=True) if isinstance(item, dict) and read_by(item, ids) else item for item in part]
+            new = [scrub(item, ids, erase=True) if isinstance(item, dict) and read_by(item, ids, after, row) else item
+                   for item in part]
             new = part if all(a is b for a, b in zip(new, part)) else new
         else:
             continue
         if new is not part:
             out = {**out, key: new}
     return scrub(out, ids)
+
+
+def _deleted_after(conn, ids):
+    """`after(mark)` for `read_by`: those of `ids` deleted after `mark` -- tombstones are in the
+    order of the deletes -- and any the store keeps no deletion fact for, as if deleted now."""
+    ordered, stamps, found = sorted(i for i in ids if isinstance(i, str)), {}, {}
+    for start in range(0, len(ordered), 500):
+        page = ordered[start:start + 500]
+        stamps.update((row[0], row[1]) for row in conn.execute(
+            "SELECT key,rowid FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
+
+    def after(mark):
+        if mark not in found:
+            found[mark] = frozenset(i for i in ordered if stamps.get(i, mark + 1) > mark)
+        return found[mark]
+    return after
 
 
 def _blank(value):
@@ -573,13 +612,18 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
 
 
 def _plain(conn, table, ids, changed_ids=None, *, write=True, keys=None):
-    changed = 0
+    changed, after = 0, None
     for row in mentions(conn, table, ids):
         try:
             data = json.loads(row["data"])
         except ValueError:
             continue
-        new = scrub_process(data, ids) if table in PROCESS_TABLES else scrub(data, ids)
+        if table in PROCESS_TABLES:
+            # What a row's model read counts from where its call began (CL6E-MM-02).
+            after = after or _deleted_after(conn, ids)
+            new = scrub_process(data, ids, after=after)
+        else:
+            new = scrub(data, ids)
         if new is data:
             continue
         changed += 1

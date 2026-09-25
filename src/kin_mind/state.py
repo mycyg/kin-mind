@@ -1651,6 +1651,11 @@ class Mind(Continuity):
                 # How far the deletes went when the draft could begin: what its tools read past what
                 # the host's receipt names is anything deleted after this (CL6D-MM-01).
                 "tombstone_mark": erasure.tombstone_mark(conn),
+                # What its draft was shown, named from the claim on: nothing yet. Settled after a
+                # draft, the row names all of it (`_draft_read`); the words a draft wrote come only
+                # then. A row that never names it is one of a release before this one's, whose words
+                # any delete takes (erasure.UNNAMED, CL6D-MM-04) -- this row is not.
+                "evaluated_ids": [],
             }
             conn.execute(
                 "INSERT INTO mind_contacts VALUES(?,?,?,?)",

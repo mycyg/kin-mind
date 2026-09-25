@@ -39,6 +39,17 @@ pytest_plugins = ('test_kin_mind', 'test_autonomous_plans')
 MARKER = "brambleton"
 
 
+def reerase(mind):
+    """The repair's reerase, as a release runs it with the services stopped: every delete there ever
+    was, through every layer again (eventmem.core.repair). What a row's model read counts only from
+    where its call began, there too."""
+    from eventmem.core import repair
+
+    root = mind.engine.db.root
+    repair.run(root, steps=("reerase",))
+    return repair.run(root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
+
+
 def state_ids(mind):
     """What the host names beside a draft with the memory context off, the default: every id of the
     state as read (mind-host.mjs `contactDraft`, `shown`)."""
@@ -74,6 +85,10 @@ def test_a_delete_from_before_the_claim_stops_no_draft_though_the_state_still_na
                                draft_receipt=fork_receipt(old_source, seen_record))
     assert kept["state"] == "pending", kept.get("reason")
     assert not {old_source, seen_source, seen_record} & set(kept["evaluated_ids"])
+    assert contact_row(mind, again["id"])[1]["text_excerpt"] == "周末爬山累吗"
+    # Both deletes were made before this claim: the reerase, which passes every delete, takes
+    # nothing of it for what its fork read.
+    reerase(mind)
     assert contact_row(mind, again["id"])[1]["text_excerpt"] == "周末爬山累吗"
 
 
@@ -143,6 +158,8 @@ def test_an_appraisal_shown_an_earlier_delete_by_the_state_and_its_tools_commits
     assert not {said, said_record} & set(data["evaluated_ids"])
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone(), "the reflection is kept"
+    reerase(mind)
+    assert queue_row(mind, job["id"])[2]["proposed_result"]["reason"] == "散步很舒服", "the reerase counts from the attempt too"
 
 
 def test_a_source_the_state_named_deleted_while_the_context_is_put_together_stops_the_commit(setup, monkeypatch):
@@ -261,6 +278,10 @@ def test_a_daily_review_whose_fork_read_an_earlier_delete_records_its_change(set
     assert reviewed["state"] == "complete" and reviewed["reason"] == "更想去查证", reviewed.get("error")
     assert "reason_withheld" not in reviewed and not {said, said_record} & set(reviewed["evaluated_ids"])
     assert mind.read()["dimensions"]["curiosity"]["baseline"] == baseline + 2, "the change was recorded"
+    reerase(mind)
+    with mind.engine.db.connect() as conn:
+        row = json.loads(conn.execute("SELECT data FROM mind_daily_reviews WHERE day=?", (reviewed["day"],)).fetchone()[0])
+    assert row["reason"] == "更想去查证", "the reerase counts from where the review began too"
 
 
 def explore_again(env, tmp_path, key):
