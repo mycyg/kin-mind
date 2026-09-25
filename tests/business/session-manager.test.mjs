@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {SessionManager,commitRegistryMigration} from '../../adapters/session-manager.mjs';
+import {SessionManager,commitRegistryMigration,MAINTENANCE_ACTIVITY} from '../../adapters/session-manager.mjs';
+import {MobileRouter,ACTIVITY_KINDS} from '../../adapters/mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
 import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateCatalogFile,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
@@ -18,19 +19,21 @@ const verifiedProfileReceipt=(profile,binding=providerBinding(profile))=>({verif
 function fixture(t){
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-sessions-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
  const clock={now:20000000},runtime={known:true,threadId:'old',sessionId:'old',nativeSessionId:'old',model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',nativeStatus:'idle',modelContextWindow:100000,lastTokenUsage:{inputTokens:70000}};
- const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[],candidateRequests=[];
+ const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[],candidateRequests=[],loads=[];
  const config={...SESSION_DEFAULTS,prepare:true,rotate:true};
  const options={file:path.join(dir,'registry.json'),binding:{threadId:'old',nativeSessionId:'old',conversationId:'logical'},coordinator:{locked:f=>f()},inspect:async()=>({...runtime}),collect:async()=>structuredClone(context),now:()=>clock.now,config,lease:false,
   checkpoint:async(c,b)=>({id:'cp:'+c.cursors.input,conversationId:b.conversationId,generation:b.generation,configVersion:c.configVersion,cursors:c.cursors,complete:true,tokens:100,sourceRevisions:{u:1,a:1},items:[{id:'u',revision:1,role:'user',text:'蓝色机器人叫云朵。'},{id:'a',revision:1,role:'assistant',text:'你要云朵的方形贴纸吗？'}],pendingQuestions:[{sourceId:'a',target:'云朵的方形贴纸'}]}),
   compact:async id=>{calls.push('compact');runtime.lastTokenUsage.inputTokens=10000;return {completed:true,actual_session:'old',operationId:id,at:new Date(clock.now).toISOString()};},ackCompact:async()=>calls.push('ack'),
   createCandidate:async request=>{calls.push('create');candidateRequests.push(structuredClone(request));return {threadId:'new',nativeSessionId:'new',profile:structuredClone(request.profile),providerBinding:providerBinding(request.profile)};},injectCandidate:async()=>{calls.push('inject');return {verified:true};},verifyCandidate:async({checkpoint,profile,providerBinding:binding})=>({checkpointId:checkpoint.id,...verifiedProfileReceipt(profile,binding)}),
+  // Loading a candidate again asks no model (NativeCandidate.load): recorded apart from the calls.
+  loadCandidate:async request=>{loads.push(request.threadId);},
   promote:async()=>{calls.push('promote');return {verified:true,threadId:'new'};},
   // The mind answers with the job it holds for the attempt it was asked about.
   reviewRequested:async request=>{calls.push('review');return {id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.cause};}};
  const manager=new SessionManager(options);
  const advise=async(action,evidenceIds=[])=>{await manager.observe(runtime,context);return manager.advise({action,reason:'Synthetic review',evidenceIds,compactionId:manager.state.compactions.at(-1)?.id},{model:'deepseek-flash',reasoning:'high'},manager.state.observation.id);};
  const degraded=()=>{clock.now+=2000000;manager.evidence({id:'failure',sourceId:'owner-correction',revision:1,kind:'reference-error',basis:'owner-statement',at:clock.now});};
- return {manager,options,clock,runtime,context,calls,candidateRequests,advise,degraded,dir};
+ return {manager,options,clock,runtime,context,calls,candidateRequests,loads,advise,degraded,dir};
 }
 test('pressure uses current input, verified window and output reserve; cumulative use is irrelevant',()=>{
  const p=windowPressure({modelContextWindow:100000,lastTokenUsage:{inputTokens:30000,totalTokens:999999999},totalTokenUsage:{totalTokens:1e12}});
@@ -610,3 +613,214 @@ test('each review attempt is its own job in the mind, and only the job the mind 
  assert.deepEqual([event.state,event.answer.requestId],['answered',id(2)],'the judgment names the attempt it answers');
 });
 
+// CL6-FLOW-02: session maintenance under the router's freeze. The router is the one the host runs,
+// as the manager's coordinator; no model is called.
+function withRouter(f) {
+ const router=new MobileRouter({file:path.join(f.dir,'router.json'),sessionId:'old',inspect:async()=>({...f.runtime}),now:()=>f.clock.now,
+  classify:async()=>({route:'chat',reason:'synthetic'}),switchModel:async()=>{throw Error('no switch in this test');},waitForIdle:async()=>{throw Error('waiting');}});
+ f.manager.coordinator=f.options.coordinator=router;
+ return router;
+}
+const until=async(check,what)=>{for(let i=0;i<400&&!check();i++)await new Promise(resolve=>setTimeout(resolve,5));assert.ok(check(),what);};
+const inFlight=router=>router.activityList().map(activity=>[activity.kind,activity.id.split(':')[0]]);
+const FREEZES=[['release',router=>router.freezeDispatch('kin-deploy release-1'),router=>router.thawDispatch('released')],
+ ['migration',router=>router.freezeDispatch('kin-home-migration',{migrationId:'m-1'}),router=>router.thawDispatch('kin-home-migration',{migrationId:'m-1'})],
+ ['hold',router=>router.freezeDispatch('kin-deploy release-2',{hold:true}),router=>router.thawDispatch('released')]];
+
+test('a compaction the judgment asks for starts under no freeze -- a release\'s, a migration\'s or a hold -- and runs after the thaw (CL6-FLOW-02)',async t=>{
+ assert.ok(ACTIVITY_KINDS.includes(MAINTENANCE_ACTIVITY));
+ for(const [kind,freeze,thaw] of FREEZES) {
+  const f=fixture(t),router=withRouter(f),built=[];
+  const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{built.push('checkpoint');return build(...args);};
+  await f.advise('compact');
+  await freeze(router);
+  // A hold does not lift itself at its end; the others are still within theirs.
+  for(let i=0;i<3;i++){minutes(f,kind==='hold'?90:1);assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'},kind);}
+  assert.deepEqual([built,f.calls.filter(c=>c==='compact'),inFlight(router)],[[],[],[]],kind+': no checkpoint, no compaction, nothing counted');
+  assert.equal(f.manager.state.sessionAdvice.action,'compact',kind+': the judgment stands');
+  await thaw(router);
+  assert.equal((await f.manager.tick()).state,'complete',kind+': carried out after the thaw');
+  assert.deepEqual([built.length,f.calls.filter(c=>c==='compact').length,inFlight(router)],[1,1,[]],kind);
+ }
+});
+
+test('a freeze that comes while a compaction\'s checkpoint is built lets the build finish, counted for the drain, and holds the compaction (CL6-FLOW-02)',async t=>{
+ const f=fixture(t),router=withRouter(f);let finish;const building=new Promise(resolve=>{finish=resolve;});
+ const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{await building;return build(...args);};
+ await f.advise('compact');
+ const ticking=f.manager.tick();
+ await until(()=>inFlight(router).length>0,'the compaction has started');
+ await router.freezeDispatch('kin-home-migration',{migrationId:'m-1'});
+ assert.deepEqual(inFlight(router),[[MAINTENANCE_ACTIVITY,'compaction']],'the drain counts the checkpoint being built');
+ assert.equal(router.busy(f.runtime),false,'and it does not hold her conversation');
+ finish();
+ assert.deepEqual(await ticking,{state:'waiting',reason:'dispatch-frozen'});
+ assert.deepEqual([f.calls.filter(c=>c==='compact'),inFlight(router),f.manager.state.compactions],[[],[],[]],'no compaction was started');
+ await router.thawDispatch('kin-home-migration',{migrationId:'m-1'});
+ assert.equal((await f.manager.tick()).state,'complete');
+ assert.equal(f.calls.filter(c=>c==='compact').length,1);
+});
+
+test('a handover the judgment asks for opens no candidate under a freeze, and goes on after the thaw (CL6-FLOW-02)',async t=>{
+ const f=fixture(t),router=withRouter(f),started=[];
+ await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+ f.context.cursors.input++;// the handover builds a checkpoint of its own
+ for(const [name,key] of [['checkpoint','checkpoint'],['create','createCandidate'],['inject','injectCandidate'],['verify','verifyCandidate']]){const fn=f.manager[key];f.manager[key]=async(...args)=>{started.push(name);return fn(...args);};}
+ await router.freezeDispatch('kin-deploy release-1',{hold:true});
+ minutes(f,180);
+ assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'});
+ assert.deepEqual([started,f.manager.state.candidate??null,f.manager.fence().generation,inFlight(router)],[[],null,1,[]],
+  'no checkpoint and no candidate: nothing was built, created, injected or checked');
+ assert.equal(f.manager.state.sessionAdvice.action,'rotate','the judgment stands');
+ await router.thawDispatch('released');
+ assert.equal((await f.manager.tick()).state,'complete');
+ assert.deepEqual([started,f.calls.filter(c=>c==='promote').length,f.manager.fence().generation],[['checkpoint','create','inject','verify'],1,2]);
+});
+
+test('a freeze that comes during any step of a candidate lets that step finish, counted for the drain, and starts no other; after the thaw it goes on and is promoted (CL6-FLOW-02)',async t=>{
+ for(const [step,reached] of [['checkpoint',null],['create','created'],['inject','injected'],['verify','ready']]) {
+  const f=fixture(t),router=withRouter(f);
+  await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+  f.context.cursors.input++;// the handover builds a checkpoint of its own
+  const started=[];let resume;const running=new Promise(resolve=>{resume=resolve;});
+  const hook=(name,fn)=>async(...args)=>{started.push(name);if(name===step)await running;return fn(...args);};
+  for(const [name,key] of [['checkpoint','checkpoint'],['create','createCandidate'],['inject','injectCandidate'],['verify','verifyCandidate']])f.manager[key]=hook(name,f.manager[key]);
+  const ticking=f.manager.tick();
+  await until(()=>started.includes(step),step+' has started');
+  await router.freezeDispatch('kin-home-migration',{migrationId:'m-1'});
+  assert.deepEqual(inFlight(router),[[MAINTENANCE_ACTIVITY,'rotation']],step+': the drain counts the candidate while the step runs');
+  assert.equal(router.busy(f.runtime),false,step+': it runs in its own app-server and holds nothing of her conversation');
+  resume();
+  assert.deepEqual(await ticking,{state:'waiting',reason:'dispatch-frozen'},step);
+  assert.deepEqual([started.at(-1),f.manager.state.candidate?.state??null,inFlight(router),f.calls.includes('promote'),f.manager.fence().generation],[step,reached,[],false,1],
+   step+': it finished, no step after it started, and the binding a migration read is the binding');
+  const steps=started.length;minutes(f,1);
+  assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'},step);
+  assert.equal(started.length,steps,step+': frozen, the next minute starts nothing');
+  await router.thawDispatch('kin-home-migration',{migrationId:'m-1'});
+  assert.equal((await f.manager.tick()).state,'complete',step+': after the thaw it goes on from the state it reached');
+  assert.deepEqual([f.manager.fence().generation,f.calls.filter(c=>c==='create').length,f.calls.filter(c=>c==='promote').length,inFlight(router)],[2,1,1,[]],step);
+ }
+});
+
+test('under a freeze the minute tick prepares no checkpoint -- neither the rolling one nor the recovery one -- and after the thaw it does (CL6-FLOW-02)',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-session-freeze-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ fs.mkdirSync(path.join(root,'conversation'),{recursive:true});fs.mkdirSync(path.join(root,'state'),{recursive:true});
+ fs.writeFileSync(path.join(root,'conversation/AGENTS.md'),'Synthetic persona\n');
+ const runtime={known:true,threadId:'main',sessionId:'main',nativeSessionId:'main',nativeStatus:'idle',active:false,backgroundTasks:0,model:'deepseek-flash',modelProvider:'custom-gateway',
+  providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',modelContextWindow:100000,lastTokenUsage:{inputTokens:20000}};
+ const router=new MobileRouter({file:path.join(root,'state/mobile-router.json'),sessionId:'main',inspect:async()=>({...runtime}),
+  classify:async()=>({route:'chat',reason:'synthetic'}),switchModel:async()=>{throw Error('no switch in this test');},waitForIdle:async()=>{throw Error('waiting');}});
+ await router.freezeDispatch('kin-deploy release-1');
+ const built=[],status=[];
+ const mindCall=async(action,request)=>{
+  if(action==='session-snapshot')return {configVersion:'persona-v1',cursors:{public:'p'},items:[],invalidatedSources:[],sourceRevisions:{},scope:{},shared:{},manifestVersion:'continuity-manifest-v1'};
+  if(action==='session-checkpoint'){built.push(request.shadow?'rolling':request.allow_model===false?'model-free':'recovery');return {id:'cp:'+built.length,complete:true,tokens:100};}
+  if(action==='session-review')return {id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.snapshotId};
+  throw Error('unexpected mind call '+action);};
+ const bridge={ownerId:'owner',sessionManager:{getSession:()=>({processing:false,queue:[]})},
+  mobileRouting:{router,gateway:{token:'synthetic'},inspect:async()=>({...runtime}),ensureSession:async()=>({agentInfo:{connection:{extMethod:async()=>({})}}})}};
+ const config={adaptive_sessions:true,companion_instructions:{enabled:false},session_management:{observe:true,compact:true,prepare:false,rotate:false}};
+ const api=await startMobileSessions({bridge,root,config,mindCall,recordStatus:value=>{if(value.sessionManagement)status.push(value.sessionManagement);}});
+ t.after(()=>api.close());
+ await until(()=>status.length>0,'the first tick has run');
+ assert.equal(typeof api.manager.loadCandidate,'function','a standing check is reused only through the candidate\'s model-free load');
+ // What a native compaction leaves for the next minute: a recovery checkpoint to prepare.
+ Object.assign(api.manager.state,{restoreRequired:true,restorePending:false});
+ await api.tick();
+ assert.deepEqual([built,inFlight(router)],[[],[]],'frozen: no checkpoint was built, and nothing is counted');
+ assert.deepEqual([api.manager.state.rollingCheckpoint??null,api.manager.state.restorePending],[null,false]);
+ await router.thawDispatch('released');
+ await api.tick();
+ assert.deepEqual(built.sort(),['recovery','rolling'],'after the thaw the first tick prepares both');
+ assert.deepEqual([api.manager.state.restorePending,Boolean(api.manager.state.rollingCheckpoint),inFlight(router)],[true,true,[]]);
+});
+
+// CL6-FLOW-02 follow-up: a ready candidate's check -- a model turn in its app-server -- was made again
+// at every minute its judgment stood. It is made once for what it proves, and a failed one waits.
+const countChecks=f=>{const checks=[],verify=f.manager.verifyCandidate;f.manager.verifyCandidate=async args=>{checks.push(f.clock.now);return verify(args);};return checks;};
+const rotationDue=async(f,action)=>{await f.advise('compact');await f.manager.tick();f.degraded();await f.advise(action,['failure']);};
+
+test('a ready candidate is checked once, not at every minute its judgment stands (CL6-FLOW-02 follow-up)',async t=>{
+ for(const variant of ['prepare','rotate-off','promotion-waiting']) {
+  const f=fixture(t);
+  if(variant==='rotate-off')f.manager.configure({id:'rotate-off',sourceId:'synthetic',reason:'synthetic',expectedRevision:0,changes:{rotate:false}});
+  await rotationDue(f,variant==='prepare'?'prepare':'rotate');
+  const checks=countChecks(f);
+  // Her turn is running: the promotion waits for a safe boundary, minute after minute.
+  if(variant==='promotion-waiting')f.runtime.active=1;
+  assert.equal((await f.manager.tick()).state,variant==='promotion-waiting'?'waiting':'ready',variant);
+  const revision=f.manager.state.revision;
+  for(let i=0;i<30;i++){minutes(f,1);await f.manager.tick();}
+  assert.deepEqual([checks.length,f.loads.length,f.manager.state.revision],[1,30,revision],
+   variant+': one check in thirty minutes; each minute the candidate is only loaded again, which asks no model, and nothing is written');
+  if(variant==='promotion-waiting'){
+   f.runtime.active=0;
+   assert.equal((await f.manager.tick()).state,'complete');
+   assert.deepEqual([checks.length,f.manager.fence().generation],[1,2],'promoted on the check that stands');
+  }
+ }
+});
+
+test('the check is made again once the binding, its generation, the configuration revision or the candidate changes, and after six hours (CL6-FLOW-02 follow-up)',async t=>{
+ for(const change of ['binding','generation','configuration','candidate','hours']) {
+  const f=fixture(t);await rotationDue(f,'prepare');const checks=countChecks(f);
+  await f.manager.tick();minutes(f,1);await f.manager.tick();
+  assert.equal(checks.length,1,change+': it stands');
+  if(change==='binding'||change==='generation') {
+   const moved=change==='binding'?{threadId:'old-renewed',nativeSessionId:'old-renewed'}:{generation:2};
+   Object.assign(f.manager.state.binding,moved);Object.assign(f.manager.state.segments.at(-1),moved);f.manager.save('synthetic-binding');
+   // A new generation has its own compaction and its own evidence before a handover is due again.
+   if(change==='generation'){f.manager.state.compactions.push({id:'compact-g2',state:'complete',generation:2,completedAt:f.clock.now});
+    f.manager.evidence({id:'failure-g2',sourceId:'owner-correction',revision:1,kind:'reference-error',basis:'owner-statement',at:f.clock.now+1});}
+   minutes(f,1);await f.advise('prepare',[change==='generation'?'failure-g2':'failure']);
+  }
+  if(change==='configuration'){f.manager.configure({id:'pressure',sourceId:'synthetic',reason:'synthetic',expectedRevision:0,changes:{preparePressure:0.7}});await f.advise('prepare',['failure']);}
+  // New dialogue: a new checkpoint retires the candidate, and the next one is created and checked.
+  if(change==='candidate'){f.context.cursors.input++;minutes(f,1);assert.equal((await f.manager.tick()).reason,'candidate-checkpoint-changed');}
+  if(change==='hours'){minutes(f,6*60-2);await f.manager.tick();assert.equal(checks.length,1,'still standing a minute before six hours');}
+  minutes(f,1);
+  assert.equal((await f.manager.tick()).state,'ready',change);
+  assert.equal(checks.length,2,change+': checked again');
+ }
+});
+
+test('a failed check waits, doubling from five minutes, instead of being made every minute; a new judgment of Kin\'s is tried at once (CL6-FLOW-02 follow-up)',async t=>{
+ const f=fixture(t);await rotationDue(f,'prepare');
+ const start=f.clock.now,checks=[],verify=f.manager.verifyCandidate;let outcome='unverified';
+ f.manager.verifyCandidate=async args=>{checks.push((f.clock.now-start)/60000);if(outcome==='throw')throw Error('candidate app-server gone');
+  const receipt=await verify(args);return outcome==='pass'?receipt:{...receipt,verified:false};};
+ assert.equal((await f.manager.tick()).reason,'candidate-continuity-unverified');
+ const reasons=new Set();
+ for(let i=0;i<60;i++){minutes(f,1);reasons.add((await f.manager.tick()).reason);}
+ assert.deepEqual(checks,[0,5,15,35],'in an hour: at 0, then after 5, 10 and 20 minutes');
+ assert.ok(reasons.has('candidate-check-backoff'));
+ assert.equal(f.manager.state.candidate.state,'waiting');
+ // Her new judgment is tried at once, and its own failures wait from five minutes again.
+ await f.advise('prepare',['failure']);await f.manager.tick();
+ assert.deepEqual(checks.slice(4),[60]);
+ // A check that throws waits the same way.
+ outcome='throw';minutes(f,5);
+ await assert.rejects(f.manager.tick(),/app-server gone/);
+ minutes(f,1);assert.equal((await f.manager.tick()).reason,'candidate-check-backoff');
+ assert.deepEqual(checks.slice(4),[60,65]);
+ // Passed, it stands.
+ outcome='pass';minutes(f,9);
+ assert.equal((await f.manager.tick()).state,'ready');
+ for(let i=0;i<30;i++){minutes(f,1);await f.manager.tick();}
+ assert.deepEqual(checks.slice(4),[60,65,75]);
+});
+
+test('a check that stands is used only once the candidate loads again under the same launch; a changed launch is not promoted, and not retried every minute (CL6-FLOW-02 follow-up)',async t=>{
+ const f=fixture(t);await rotationDue(f,'rotate');const checks=countChecks(f);
+ // Checked; the promotion waits while her turn runs.
+ f.runtime.active=1;assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'native-or-delivery-busy'});
+ // Its instructions changed meanwhile (a release): loading it again is refused (NativeCandidate.load).
+ f.manager.loadCandidate=async()=>{throw Error('Candidate instruction binding changed');};
+ f.runtime.active=0;minutes(f,1);
+ await assert.rejects(f.manager.tick(),/instruction binding changed/);
+ assert.deepEqual([f.calls.includes('promote'),f.manager.fence().generation,f.manager.state.candidate.state,checks.length],[false,1,'waiting',1],
+  'nothing committed, and no model asked');
+ minutes(f,1);assert.equal((await f.manager.tick()).reason,'candidate-check-backoff');
+ assert.equal(checks.length,1);
+});

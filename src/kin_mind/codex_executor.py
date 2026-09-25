@@ -1238,7 +1238,9 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
         raise ValueError("exploration_max_running > 1 is not supported: the exploration "
                          "store admits one running worker per scope")
     try:
-        version = codex_cli_version(command)
+        # The explore worker's first process for the run: it carries the run's mark like the rest
+        # (CR5-MM-03, CL6-MM-09); `run_codex` does not ask again once it has the version.
+        version = codex_cli_version(command, execution_env=worker_groups.execution_env())
     except CodexUnavailable as error:
         return {"state": "waiting", "reason": "exploration-executor-unavailable",
                 "detail": error.reason, "backend": "codex"}

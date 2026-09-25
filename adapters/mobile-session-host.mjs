@@ -190,6 +190,9 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     // The attempt travels to the mind's queue key and comes back in its answer (CR-RT-08).
     reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id,snapshotId:event.cause,attempt:event.attempt});},
     createCandidate:request=>native.create(request),injectCandidate:request=>native.inject(request),verifyCandidate:request=>native.verify(request),
+    // A check that stands is not repeated; the candidate is loaded again (no model turn), which
+    // refuses a changed provider, instruction binding or resumed profile.
+    loadCandidate:request=>native.load(request),
     closeCandidate:()=>native.close(),
     reconcileCandidate:async candidate=>candidate.native.path&&fs.existsSync(candidate.native.path)&&(await checkpointMarker(candidate.native.path,'kin-checkpoint:'+candidate.injectionId)).found,
     validateEvidence:async evidence=>(await mindCall('session-validate',{checkpoint:{sourceDependencies:evidence.flatMap(e=>e.dependencies??[])}})).valid,
@@ -220,7 +223,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     return result;
   };
   router.state.conversationId=manager.fence().conversationId;router.state.generation=manager.fence().generation;router.state.nativeSessionId=manager.fence().nativeSessionId;router.save('logical-conversation-bound');
-  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
+  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state,checkedAt:s.candidate.checked?.at??null,checkRetryAt:s.candidate.checkRetry?.nextAt??null}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
     deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
@@ -248,16 +251,18 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         // owner notifications are unconfirmed; the prepared artifacts carry the
         // annotation. Compaction, injection and promotion keep the strict boundary.
         const preparation=safeReadOnlyPreparation({...snapshot,runtime});
-        if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe){
+        // CL6-FLOW-02: a checkpoint is maintenance -- the recovery one may ask DS -- so under a
+        // freeze neither starts; the first tick after the thaw prepares them.
+        if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe)await manager.maintained('restore-checkpoint',async()=>{
           const {checkpoint:cp}=await manager.preparedCheckpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
           if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
-        }
+        });
         if(snapshot.manifestVersion&&preparation.safe){
           const key=digest(snapshot.cursors);
-          if(manager.state.rollingCursor!==key){
+          if(manager.state.rollingCursor!==key)await manager.maintained('rolling-checkpoint',async()=>{
             const cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
-          }
+          });
         }
         // The judgment arrives with the snapshot the tick reads anyway (K3-04, DB1-03).
         const result=await manager.tick({runtime,context:snapshot}),{checkedAt,...previous}=manager.state.lastTick??{};

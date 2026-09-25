@@ -77,6 +77,10 @@ export class AutonomousCreator {
     let child=null,timer=null,heartbeat=null;
     try{
       child=this.spawnImpl(this.command,args,{cwd:directory,env,stdio:['pipe','pipe','pipe'],detached:true});this.child=child;
+      // The CLI leads a group of its own, as a mind worker does: what it starts there without a
+      // session of its own is the step's, and what is left there once the CLI has exited is ended
+      // with the step -- found or not before the CLI went (CL6-MM-09).
+      execution.runsIn(child.pid);child.once('exit',()=>execution.workerExited());
       execution.track();
       signal?.addEventListener('abort',terminate,{once:true});
       timer=setTimeout(terminate,timeoutMs);
