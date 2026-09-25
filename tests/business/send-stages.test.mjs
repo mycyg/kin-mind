@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {submitPayload,platformErrorCode} from '../../adapters/send-stages.mjs';
+import {classifyReceipt,normalizeReceipt,fileReceipts} from '../../adapters/channel-contract.mjs';
+import {createFakeTransport,createFakePlatform} from './helpers/fake-transport.mjs';
 
 // The stages are the sender's evidence for what a failure means: before `message-submitting`
 // nothing can have reached the platform, so the same UUID may be sent again.
@@ -84,4 +89,48 @@ test('only a platform error code is a refusal: an answer without a usable code, 
       error=>error.code==='PLATFORM_REJECTED'&&error.platformCode===code);
   }
   assert.deepEqual([0,230002,-1,'230002',1.5,null,undefined,Number.MAX_SAFE_INTEGER+2].map(platformErrorCode),[false,true,true,false,false,false,false,false]);
+});
+
+test('a refusal an earlier sender wrote without a platform error code reads as unknown, never as a refusal (CR5-FLOW-02)',async()=>{
+  // What the Feishu sender wrote for PLATFORM_REJECTED before the rule: `platformCode` only
+  // when the answer had one it could print, and nothing when the code was missing.
+  const legacy={id:'kin-legacy',state:'rejected',stage:'platform-rejected',submissionStarted:true,submittedAt:'2026-09-20T00:00:00.000Z',
+    checkedAt:'2026-09-20T00:00:01.000Z',errorCode:'PLATFORM_REJECTED',errorName:'Error'};
+  for(const unproven of [legacy,{...legacy,platformCode:'230002'},{...legacy,platformCode:1.5},{...legacy,platformCode:true}]) {
+    assert.equal(classifyReceipt(unproven),'unknown',JSON.stringify(unproven.platformCode));
+    const read=normalizeReceipt(unproven);
+    assert.deepEqual([read.state,read.refusal,read.reason,read.submissionStarted],['unconfirmed','unproven','platform-rejected',true]);
+    assert.equal(classifyReceipt(read),'unknown','read again, it is still unknown');assert.equal(normalizeReceipt(read).refusal,'unproven');
+  }
+  // With a platform error code it is the platform's refusal, as it was.
+  for(const platformCode of [230002,-1]) {
+    const proven={...legacy,platformCode};
+    assert.equal(classifyReceipt(proven),'rejected');assert.equal(normalizeReceipt(proven).state,'rejected');assert.equal(normalizeReceipt(proven).refusal,undefined);
+  }
+  // Read from the outbox the way every consumer reads it.
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-legacy-refusal-'));
+  try {
+    fs.writeFileSync(path.join(dir,'kin-legacy.json'),JSON.stringify(legacy));
+    fs.writeFileSync(path.join(dir,'kin-coded.json'),JSON.stringify({...legacy,id:'kin-coded',platformCode:230002}));
+    const read=fileReceipts([dir]);
+    assert.equal(classifyReceipt(await read('kin-legacy')),'unknown');
+    assert.equal(classifyReceipt(await read('kin-coded')),'rejected');
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('the test transport keeps the refusal rule on both flavours: a coded refusal carries its code, an uncoded answer stays unknown (CR5-FLOW-02)',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-fake-refusal-'));
+  try {
+    for(const flavour of ['feishu','wechat']) {
+      const platform=createFakePlatform(),transport=createFakeTransport({directory:path.join(dir,flavour),platform,flavour});
+      platform.script('reject');
+      await assert.rejects(transport.send({id:'kin-refused',text:'一句话'}),error=>error.code==='PLATFORM_REJECTED');
+      assert.equal(classifyReceipt(await transport.receipt('kin-refused')),'rejected',flavour);
+      platform.script('uncoded');
+      await assert.rejects(transport.send({id:'kin-uncoded',text:'一句话'}),error=>error.code==='PLATFORM_ANSWER_UNKNOWN');
+      assert.equal(classifyReceipt(await transport.receipt('kin-uncoded')),'unknown',flavour);
+      await assert.rejects(transport.send({id:'kin-uncoded',text:'一句话'}),error=>error.code==='KIN_SEND_NEEDS_RECONCILE');
+      assert.deepEqual([platform.calls.length,platform.delivered.length],[2,1],'the uncoded answer landed, and nothing went twice');
+    }
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });
