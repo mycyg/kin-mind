@@ -32,9 +32,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from eventmem.core.db import named_in
 from eventmem.core.models import Scope
 from eventmem.core.persona import load_persona
-from eventmem.core.read_policy import _IDENTIFIER
 
 from .codex_executor import protected_roots, reader_settings
 from .computer import ComputerReader
@@ -99,7 +99,7 @@ def persona_approval(config):
         for field in APPROVAL_FIELDS:
             if field in approved and approved.get(field) != policy.get(field):
                 problems.append("approval-record-differs:" + field)
-        named = sorted({i for field in APPROVED_SOURCE_FIELDS for i in _IDENTIFIER.findall(json.dumps(policy.get(field, "")))})
+        named = sorted({i for field in APPROVED_SOURCE_FIELDS for i in named_in(policy.get(field, ""))})
         if not named:
             problems.append("approved-source-missing")
         database = root / "memory.sqlite3"

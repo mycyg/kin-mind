@@ -90,14 +90,13 @@ FIELD_EVIDENCE = "_evidence_ids"
 # context labels by the record's id -- an event's `identity_evidence`, a topic candidate's `members`
 # (memory.py) -- which a queue row keeps frozen for its retry, however much later that comes. It goes
 # with the record, at the delete (CL7B-MM-03). Only the store's records and sources are ever erased
-# (`IDENTIFIER`), so an `id` matches nothing but a copy of one: never a wish, a plan or a family (a
+# (`db.NAMED`), so an `id` matches nothing but a copy of one: never a wish, a plan or a family (a
 # graph node that projects a record takes its id, and names it in `record_ids` besides).
 ID_KEYS = ("source_id", "record_id", "id")
 # A topic candidate copies a family of records, titled by one of them, and the store deletes the family
 # with any of its members (`Engine.delete`): the copy goes with any member it shows (CL7B-MM-03).
 MEMBER_LISTS = ("members",)
 TOMBSTONE_KEYS = ("source_id", "record_id", "hash", "revision", "authority")
-IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
 # Graph kinds whose words are a claim the model wrote from its evidence: they go whenever any of
 # that evidence does. Other nodes keep their words while evidence of theirs remains.
 CLAIM_KINDS = frozenset({"finding", "association"})
