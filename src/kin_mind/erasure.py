@@ -424,11 +424,11 @@ def tool_read_ids(conn, receipt):
 
 
 def reads_truncated(receipt):
-    """Whether a receipt says a fork turn read more than it names: the host keeps 64 tool calls a
-    turn and 100 ids a call -- the owned ACP stops there itself -- and marks a turn that reached
-    either `truncated` (boundaries.mjs `forkReceipt`), wherever the receipt carries one. What was
-    read past them is named nowhere, so no check by id can clear it; `deleted_since` can
-    (CL6D-MM-01)."""
+    """Whether a receipt says a fork turn read more than it names: the host keeps 64 tool calls,
+    1000 ids a call and 2000 a turn, and marks `truncated` a turn it cut or whose calls the owned
+    ACP says it could not read whole (boundaries.mjs `forkReceipt`), wherever the receipt carries
+    one. What was read past them is named nowhere, so no check by id can clear it; `deleted_since`
+    can (CL6D-MM-01, CL6E-MM-04)."""
     def walk(value):
         if isinstance(value, dict):
             if isinstance(value.get("tool_calls"), list) and value.get("truncated") is True:
