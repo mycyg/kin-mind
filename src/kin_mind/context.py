@@ -126,21 +126,41 @@ class Contexts:
         with self.engine.db.connect() as connection:
             return self._current_in(connection, item, policy)
 
+    @staticmethod
+    def _words(value):
+        """The words in a rendered structure — its texts and summaries — without the identifier
+        lists beside them: an omitted or indexed id names a source, it does not repeat it."""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("text", "summary", "rendered_text") and isinstance(item, str):
+                    yield item
+                else:
+                    yield from Contexts._words(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from Contexts._words(item)
+
+    def _still(self, conn, items, policy, *texts):
+        """Whether words rendered from `items` may be kept now: every item current by the rule a
+        reader applies, and no source or record the items or `texts` name deleted. Asked on the
+        connection of the write that would keep them, so no delete can come in between
+        (CR3-MM-03, CR4-MM-01)."""
+        state = None
+        for item in items:
+            if state is None and "state_dependency" in item:
+                state = self.mind._load(conn)
+            if not self._current_in(conn, item, policy, state=state):
+                return False
+        return not tombstoned(conn, *texts, *(dumps(item) for item in items))
+
     def _keep(self, key, value, depends, policy):
         """Keep one compression only while what it was made from is still what a read may see,
-        checked in the write transaction that keeps it: every input current by the rule a reader
-        applies, and nothing the inputs or the answer name deleted. A source deleted or revised
-        while the model was answering leaves no row behind; its call's cost is all that stays,
-        already recorded by the call (CR3-MM-03). False when nothing was kept."""
+        checked in the write transaction that keeps it. A source deleted or revised while the
+        model was answering leaves no row behind; its call's cost is all that stays, already
+        recorded by the call (CR3-MM-03). False when nothing was kept."""
         text = dumps(value)
         with self.engine.db.connect(write=True) as conn:
-            state = None
-            for item in depends:
-                if state is None and "state_dependency" in item:
-                    state = self.mind._load(conn)
-                if not self._current_in(conn, item, policy, state=state):
-                    return False
-            if tombstoned(conn, text, *(dumps(item) for item in depends)):
+            if not self._still(conn, depends, policy, *self._words(value)):
                 return False
             conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)",
                          (key, self.mind.scope.key(), text, self.mind.clock()))
@@ -413,6 +433,14 @@ class Contexts:
                 return result
             except Exception as error:  # noqa: BLE001 - worker boundary, redacted failure type only
                 failure = str(error) if isinstance(error, RuntimeError) and re.fullmatch(r"deepseek-[a-z0-9-]+", str(error)) else type(error).__name__
+                # The call took its time. The originals stand in for it only as they are now: one
+                # deleted or revised meanwhile is left out, never rendered from before (CR4-MM-01).
+                with self.engine.db.connect() as conn:
+                    fresh = {i["id"] for i in items if self._still(conn, [i], policy)}
+                if len(fresh) < len(items):
+                    stale_ids = [*stale_ids, *(i["id"] for i in items if i["id"] not in fresh)]
+                    items = [i for i in items if i["id"] in fresh]
+                    source = {i["id"]: i for i in items}
         else:
             failure = refused or ("deferred" if not allow_model else "budget")
         lines, covered = [], []
@@ -991,6 +1019,11 @@ class Contexts:
                 refund = (stored or {}).get("tokens", 0)
                 if current["epoch"] != window["epoch"] or (not native_window and current["used"] - refund + packed["tokens"] > 12000):
                     raise Conflict("Context window changed; rebuild before injection")
+                # A receipt keeps the words it rendered: only while what they came from is still
+                # there, checked in this write. A source deleted since the build leaves nothing of
+                # it behind; the caller builds again (CR4-MM-01).
+                if event_id and not self._still(conn, [i for i in selected if i["id"] in packed["covered_ids"]], policy, *self._words(packed)):
+                    raise Conflict("Context sources changed; rebuild before injection")
                 current["used"] += packed["tokens"] - refund
                 for i in selected:
                     if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]:
