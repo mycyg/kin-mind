@@ -34,3 +34,22 @@ test('a platform refusal and an answer without a message id are told apart',asyn
   assert.equal(await submitPayload({uuid:'u',checkpoint:text.checkpoint,create:async()=>({code:0,data:{message_id:'om_2'}})}),'om_2');
   assert.deepEqual(text.seen.map(s=>s.stage),['message-submitting']);
 });
+
+test('a send asks before its upload and before its message request, and stopping there submits nothing (CR3-FLOW-04)',async()=>{
+  const asked=[];
+  const {seen,checkpoint}=stages();
+  assert.equal(await submitPayload({media:{name:'a.png'},uuid:'u',checkpoint,beforeSubmit:stage=>asked.push(stage),
+    upload:async()=>({file_key:'fk'}),create:async()=>({code:0,data:{message_id:'om_3'}})}),'om_3');
+  assert.deepEqual(asked,['upload','message']);
+  assert.deepEqual(seen.map(s=>s.stage),['uploading','uploaded','message-submitting']);
+  // Stopped before the message request (an admission lost during the upload): uploaded, never submitted.
+  for(const [refuse,expected] of [['upload',[]],['message',['uploading','uploaded']]]) {
+    const run=stages();let created=false,uploaded=false;
+    await assert.rejects(submitPayload({media:{name:'b.png'},uuid:'u',checkpoint:run.checkpoint,
+      beforeSubmit:stage=>{if(stage===refuse)throw Object.assign(Error('lost'),{code:'KIN_SEND_ADMISSION_LOST'});},
+      upload:async()=>{uploaded=true;return {file_key:'fk'};},create:async()=>{created=true;return {code:0,data:{message_id:'om_4'}};}}),
+      error=>error.code==='KIN_SEND_ADMISSION_LOST');
+    assert.equal(created,false);assert.equal(uploaded,refuse==='message');
+    assert.deepEqual(run.seen.map(s=>s.stage),expected);assert.ok(run.seen.every(s=>s.submissionStarted===false));
+  }
+});
