@@ -62,7 +62,7 @@ export class WorkLockReview {
   }
   async tick() {
     if(this.closed||this.running)return {state:'busy'};
-    this.running=true;let attempt;
+    this.running=true;let attempt,gate=null;
     try {
       const snapshot=await this.router.locked(async()=>{
         const task=this.router.tasks().filter(item=>item.requiresDelivery!==false).at(-1);
@@ -82,10 +82,18 @@ export class WorkLockReview {
       const repeats=previous?.state==='told'?(previous.repeats??0)+1:(previous?.repeats??0);
       attempt={id,taskId:snapshot.task.id,inputVersion:snapshot.task.inputVersion,key:snapshot.key,checkedAt:this.now(),repeats,
         lane:REVIEWER_LANES.summarizeWork,purpose:REVIEWER_PURPOSES.summarizeWork};
+      // The summary is a model call beside her conversation. It passes the gate every such
+      // call passes, before anything is read, spent or counted for it: a freeze refuses it and
+      // it comes back soon; the drain counts it until the call has ended. Its lane is asked
+      // at the call itself (CR3-FLOW-01).
+      gate=this.router.beginActivity({kind:'work-summary',id});
+      if(!gate.ok){gate=null;return this.save({...attempt,state:'waiting',reason:'dispatch-frozen',retryAt:this.now()+this.skipRetryMs});}
       const evidence=await this.collect(snapshot);
       if(this.closed)return {state:'closed'};
       attempt=this.save({...attempt,state:'summarizing'});
-      const result=await this.summarize(evidence.input);
+      let result;
+      try {result=await this.summarize(evidence.input);}
+      finally {gate.release();gate=null;}
       const receipt={model:result.receipt?.model??null,requestId:result.receipt?.requestId??null,verifiedAt:result.receipt?.verifiedAt??null};
       const recorded=await this.router.locked(async()=>{
         const task=this.router.state.tasks[snapshot.task.id];
@@ -100,6 +108,6 @@ export class WorkLockReview {
       // A refused lane is not a failure and costs no summary: it comes back soon.
       if(error?.leaseSkipped)return attempt?this.save({...attempt,state:'waiting',reason:'work-summary-lane-unavailable',retryAt:this.now()+this.skipRetryMs}):{state:'waiting',reason:'work-summary-lane-unavailable'};
       return attempt?this.save({...attempt,state:'failed',reason:String(error?.message??error).slice(0,160),retryAt:this.now()+this.retryMs}):{state:'waiting',reason:'work-evidence-unavailable'};
-    } finally {this.running=false;}
+    } finally {gate?.release();this.running=false;}
   }
 }

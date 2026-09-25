@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
+import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,ACTIVITY_KINDS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
 import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
+import {MobileAudit} from '../../adapters/mobile-audit.mjs';
 
 const MINUTE=60000,HOUR=3600000;
 function fixture(t,options={}) {
@@ -564,4 +565,182 @@ test('not-found proves an input never arrived only on its own thread, from a run
   await g.router.watch({reconcileInput:async(id,options)=>{asked.push(options.sessionId);return {state:'not-found',complete:true,sessionId:'thread-after-migration'};}});
   assert.deepEqual([g.router.state.inputs.z.state,g.router.state.inputs.z.reconciliation.reason],['unconfirmed','not-the-submitted-thread']);
   assert.deepEqual(asked,['synthetic','synthetic','synthetic'],'every lookup went to the thread the input was submitted to');
+});
+
+// ---- Third review: CR3-FLOW ----
+
+test('a work summary, a health reading and a classification asked again each pass the activity gate where the call starts; refused, they count nothing (CR3-FLOW-01)',async t=>{
+  // A summary of open work Kin has gone quiet about.
+  const f=fixture(t);
+  await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  const task=f.router.tasks()[0];
+  await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
+  await f.router.observe('prompt-end',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,stopReason:'end_turn'});
+  let read=0,during=null,busyDuring=null;const asked=[];
+  const review=new WorkLockReview({router:f.router,file:path.join(f.root,'review.json'),now:()=>f.clock.now,idleMs:HOUR,
+    collect:async()=>{read++;return {input:{inputs:[{id:'job',text:'写一份报告'}],outputs:[],unsentDrafts:[]},facts:{unsentDraftIds:[],undelivered:[]}};},
+    summarize:async()=>{asked.push('summary');during=f.router.activityList();busyDuring=f.router.busy(f.runtime);
+      return {summary:{summary:'Asked for a report; nothing delivered yet.',delivered:[],open:['the report'],unsent:[],evidenceIds:['job']},receipt:{model:'deepseek-flash',requestId:'r-1'}};}});
+  f.clock.now+=2*HOUR;
+  await f.router.freezeDispatch('release');
+  const held=await review.tick();
+  assert.deepEqual([held.state,held.reason,read,asked.length],['waiting','dispatch-frozen',0,0],'frozen: nothing is read, spent or counted');
+  assert.deepEqual(f.router.activityList(),[]);
+  await f.router.thawDispatch('released');
+  f.clock.now+=10*MINUTE;
+  const told=await review.tick();
+  assert.deepEqual([told.state,told.repeats,asked.length],['told',0,1]);
+  assert.deepEqual(during.map(activity=>[activity.kind,activity.id]),[['work-summary',told.id]],'the drain counts it while the model is asked');
+  assert.equal(busyDuring,false,'it holds no turn, no switch and no dispatch');
+  assert.deepEqual(f.router.activityList(),[],'let go once the call has ended');
+
+  // A health reading: the freeze and its lane are both asked before anything is collected or counted.
+  const leases=[];
+  const lease={acquire:async({lane,purpose})=>{leases.push(purpose);return {proceed:true,lane,release:async()=>{leases.push('released');}};}};
+  let reading=null;
+  const audit=new MobileAudit({file:path.join(f.root,'audit.json'),now:()=>f.clock.now,lease,activity:spec=>f.router.beginActivity(spec),
+    collect:async()=>({checkedAt:f.clock.now}),review:async()=>{reading=f.router.activityList();return {status:'healthy',findings:[]};}});
+  const due=audit.state.nextAt;
+  await f.router.freezeDispatch('release');
+  assert.deepEqual(await audit.tick(),{state:'skipped',reason:'dispatch-frozen'});
+  assert.deepEqual([leases.length,audit.state.status,audit.state.failures,audit.state.nextAt],[0,undefined,undefined,due],'refused before its lane is asked: no run, no failure, still due');
+  await f.router.thawDispatch('released');
+  assert.deepEqual(await audit.tick(),{state:'healthy'});
+  assert.deepEqual(reading.map(activity=>activity.kind),['health-review'],'counted while the reading runs');
+  assert.deepEqual([f.router.activityList(),leases],[[],['mobile-health-audit','released']]);
+  const refusing={acquire:async({lane})=>({proceed:false,lane,state:'wait',reason:'lane-full',release:async()=>{}})};
+  const skipped=new MobileAudit({file:path.join(f.root,'audit-2.json'),now:()=>f.clock.now,lease:refusing,activity:spec=>f.router.beginActivity(spec),
+    collect:async()=>assert.fail('nothing is collected'),review:async()=>assert.fail('nothing is asked')});
+  assert.equal((await skipped.tick()).state,'skipped');
+  assert.deepEqual(f.router.activityList(),[],'a lane that refuses lets the gate go');
+
+  // A classification asked again.
+  let failing=true,classifying=null;
+  const g=fixture(t,{classify:async()=>{if(failing)throw Error('deepseek-http-503');classifying=[g.router.activityList(),g.router.busy(g.runtime)];return {route:'chat',reason:'synthetic'};}});
+  await g.router.select({id:'q',kind:'owner',text:'在吗'});
+  const entry=g.router.state.semanticPending.q;
+  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['semantic-pending',1]);
+  failing=false;
+  await g.router.freezeDispatch('release');
+  await g.router.reviewSemanticPending();
+  assert.deepEqual([entry.state,entry.attempts,classifying],['pending',1,null],'frozen: the model is not asked and no attempt is counted');
+  assert.equal(g.router.state.history.some(event=>event.kind==='semantic-retry'),false);
+  await g.router.thawDispatch('released');
+  await g.router.reviewSemanticPending();
+  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['selected',2]);
+  assert.deepEqual(classifying[0].map(activity=>[activity.kind,activity.id]),[['classification-retry','q']],'counted while the model is asked');
+  assert.equal(classifying[1],false,'holding nothing of her conversation');
+  assert.deepEqual(g.router.activityList(),[]);
+  for(const kind of ['work-summary','health-review','classification-retry'])assert.ok(ACTIVITY_KINDS.includes(kind),kind);
+});
+
+test('the owner\'s stop takes her stopped work out of the host\'s queue by its own ids, and a prompt that would begin with it never does (CR3-FLOW-02)',async t=>{
+  // The host's queue, by input id and in order.
+  const hostQueue=()=>{const queue=[];return {queue,take:ids=>{const taken=queue.filter(id=>ids.includes(id));queue.splice(0,queue.length,...queue.filter(id=>!ids.includes(id)));return taken;},
+    push:id=>async()=>{queue.push(id);return {route:'new-turn',queued:true};}};};
+  const q=hostQueue();
+  const f=fixture(t,{withdrawQueued:q.take});
+  await f.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},q.push('w'));
+  assert.equal(f.router.state.inputs.w.state,'queued','waiting behind a turn of its own, not begun');
+  await f.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},q.push('stop'));
+  const w=f.router.state.inputs.w;
+  assert.deepEqual(q.queue,['stop'],'her stopped work left the queue; the stop keeps its place');
+  assert.deepEqual([w.id,w.state,w.canceledBy,w.withdrawn.reason,w.withdrawn.stage,w.withdrawn.fromQueue,w.submissionStartedAt,typeof w.queuedSubmissionAt],
+    ['w','failed-before-submit','stop','canceled-by-owner','host-queue',true,undefined,'number'],'canceled under its own id with its receipt; the queue was never a submission');
+  assert.equal(inputSummary(w),'canceled-by-owner');
+  await f.router.dispatch({id:'later',kind:'owner',text:'在吗'},q.push('later'));
+  assert.deepEqual(q.queue,['stop','later'],'what came after the stop is untouched');
+  assert.equal((await f.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},async()=>assert.fail('never submitted'))).route,'canceled-by-owner','replayed, it stays withdrawn');
+  assert.equal(await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['stop']}),undefined,'the stop\'s own prompt begins');
+
+  // The queue did not hold it — it was the message about to begin — and a message sent after
+  // the stop was merged into it: that prompt never begins, and the later message is not lost.
+  const g=fixture(t,{withdrawQueued:()=>[]});
+  await g.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},async()=>({route:'new-turn',queued:true}));
+  await g.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=>({route:'new-turn',queued:true}));
+  assert.deepEqual([g.router.state.inputs.w.state,g.router.state.inputs.w.withdrawn.fromQueue],['failed-before-submit',false]);
+  await g.router.dispatch({id:'after',kind:'owner',text:'在吗'},async()=>({route:'merged-before-start',queued:true}));
+  assert.deepEqual(await g.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['w','after']}),
+    {state:'refused',canceled:['w'],notSubmitted:['after']},'refused where it would have begun');
+  assert.equal(g.router.state.turn,undefined,'no native turn is recorded');
+  const after=g.router.state.inputs.after;
+  assert.deepEqual([after.state,after.canceledBy,after.failureStage,after.retry.evidence],['failed-before-submit',undefined,'prompt-start','not-submitted']);
+  const requeued=[];
+  await g.router.watch({requeue:async id=>{requeued.push(id);return {state:'requeued'};},notifyOwner:async()=>({state:'accepted',messageId:'n'})});
+  assert.deepEqual(requeued,['after'],'the later message goes again under its own id; the stopped work never does');
+
+  // Stopped while it was being handed over: its prompt start refuses it, and the handover keeps that.
+  const h=fixture(t,{withdrawQueued:()=>[]});
+  let begin=null;
+  const handing=h.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
+    await markSubmitted();
+    await h.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=>({route:'new-turn',queued:true}));
+    begin=await h.router.observe('prompt-start',{taskId:decision.taskId,inputVersion:decision.inputVersion,turnFence:0,inputIds:['w']});
+    return {route:'new-turn',queued:true};
+  });
+  assert.equal((await handing).route,'canceled-by-owner');
+  assert.deepEqual(begin,{state:'refused',canceled:['w'],notSubmitted:[]});
+  assert.deepEqual([h.router.state.inputs.w.state,h.router.state.inputs.w.canceledBy,h.router.state.inputs.w.withdrawn.stage],['failed-before-submit','stop','prompt-start']);
+
+  // Handed to the queue just after the stop: taken back the moment the handover ends.
+  const k=hostQueue();
+  const late=fixture(t,{withdrawQueued:k.take});
+  const lateWork=late.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
+    await markSubmitted();
+    await late.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},k.push('stop'));
+    return k.push('w')();
+  });
+  assert.equal((await lateWork).route,'canceled-by-owner');
+  assert.deepEqual(k.queue,['stop']);
+  assert.deepEqual([late.router.state.inputs.w.canceledBy,late.router.state.inputs.w.withdrawn.stage,late.router.state.inputs.w.withdrawn.fromQueue],['stop','host-queue',true]);
+});
+
+test('a runtime notice whose write fails before its send lets the permit go and waits, unsent, under its own id (CR3-FLOW-09)',async t=>{
+  const f=fixture(t);
+  f.router.state.notices.n1={id:'n1',kind:'mode-failed',text:'切换没有成功。',state:'pending',attempts:0,sourceInputId:null};
+  const sent=[];const send=async request=>{sent.push(request.id);return {state:'accepted',messageId:'m-'+request.id};};
+  const save=f.router.save;
+  f.router.save=function(kind,detail){if(kind==='notice-sending')throw Error('disk full');return save.call(this,kind,detail);};
+  await assert.rejects(f.router.flushNotices({send,lookup:async()=>assert.fail('nothing was sent, so nothing is looked up')}),/disk full/);
+  assert.deepEqual(f.router.activityList(),[],'the permit is let go');
+  assert.equal(f.router.busy(f.runtime),false,'nothing holds busy or the drain');
+  const n=f.router.state.notices.n1;
+  assert.deepEqual([n.id,n.state,n.attempts,n.stage,n.nextAction],['n1','pending',0,'not-submitted','resend-same-id'],'not submitted, under its own id, no attempt spent');
+  assert.deepEqual(sent,[]);
+  f.router.save=save;
+  f.clock.now+=MINUTE;
+  await f.router.flushNotices({send,lookup:async id=>({state:'accepted',messageId:'m-'+id})});
+  assert.deepEqual(sent,['n1'],'taken up again under the same id once the write succeeds');
+  assert.deepEqual([f.router.state.notices.n1.state,f.router.state.notices.n1.attempts],['accepted',1]);
+  assert.deepEqual(f.router.activityList(),[]);
+});
+
+test('an input requeued while it was taken in keeps that count once it is routed (CR3-FLOW-10)',async t=>{
+  const f=fixture(t);let requeues=0;
+  const requeue=async()=>{requeues++;return {state:'requeued'};},notifyOwner=async()=>({state:'accepted',messageId:'n'});
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  // Its intake failed and it went back to the inbox once.
+  await f.router.received({id:'z',kind:'owner',channel:'wechat'});
+  await f.router.intakeFailed('z','attachment-unreadable');
+  f.clock.now+=HOUR;await f.router.watch({requeue,notifyOwner});
+  assert.deepEqual([requeues,f.router.state.inputs.z.requeues],[1,1]);
+  // Taken in again and routed; each submission is lost and then proven never received.
+  await f.router.received({id:'z',kind:'owner',channel:'wechat'});
+  for(let cycle=0;cycle<REQUEUE_BUDGET+1;cycle++) {
+    await assert.rejects(f.router.dispatch({id:'z',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+    if(!cycle)assert.deepEqual([f.router.state.inputs.z.state,f.router.state.inputs.z.requeues],['unconfirmed',1],'routing never starts the count again');
+    await f.router.watch({reconcileInput:async()=>absent});
+    await f.router.watch({requeue,notifyOwner});
+    f.clock.now+=HOUR;
+  }
+  assert.equal(requeues,REQUEUE_BUDGET,'three in all, across its intake and its routing');
+  // A classification that fails after an intake requeue keeps the count on its pending record too.
+  const g=fixture(t,{classify:async()=>{throw Error('deepseek-http-503');}});
+  await g.router.received({id:'s',kind:'owner',channel:'wechat'});
+  await g.router.intakeFailed('s','attachment-unreadable');
+  g.clock.now+=HOUR;await g.router.watch({requeue:async()=>({state:'requeued'}),notifyOwner});
+  await g.router.received({id:'s',kind:'owner',channel:'wechat'});
+  await g.router.select({id:'s',kind:'owner',text:'在吗'});
+  assert.deepEqual([g.router.state.inputs.s.state,g.router.state.inputs.s.requeues,g.router.state.inputs.s.retry.evidence],['semantic-pending',1,'not-submitted'],'the count and this attempt\'s evidence are kept apart');
 });

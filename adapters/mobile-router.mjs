@@ -20,10 +20,10 @@ export const DEFER_MAX_MS=30*24*3600000;
 export const HANDOFF_SOURCE_MAX_HOURS=24;
 /** What starts beside the owner's conversation and must stop for a freeze and be waited
  * for by a drain: sends (a reply, a system notice, a reminder, a desktop hand-off result,
- * a proactive contact) and the mind's own runs. Other kinds are accepted as named
- * (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01). */
+ * a proactive contact), the mind's own runs and the host's own background model calls.
+ * Other kinds are accepted as named (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01, CR3-FLOW-01). */
 export const ACTIVITY_KINDS=Object.freeze(['reply','notice','reminder','handoff','contact','assessment','contact-draft','creation','exploration',
-  'appraisal','enrichment','memory-prep']);
+  'appraisal','enrichment','memory-prep','work-summary','health-review','classification-retry']);
 /** The mind orders its own runs itself; a run in its own process never holds the owner's dispatch. */
 const MIND_ACTIVITIES=new Set(['assessment','contact-draft','creation','exploration']);
 const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
@@ -31,6 +31,11 @@ const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
  * session: an appraisal, a memory enrichment, a memory warm-up. A freeze refuses it and a
  * drain waits for it, and that is all: it holds no turn, no switch and no dispatch (CR2-MIND-01). */
 const STORE_ACTIVITIES=new Set(['appraisal','enrichment','memory-prep']);
+/** The host's own background model calls, each a request of its own and never a turn in the
+ * session: a summary of open work, a health reading, a classification asked again. Like the
+ * store work, a freeze refuses one and a drain waits for it until the call has ended, and it
+ * holds no turn, no switch and no dispatch (CR3-FLOW-01). */
+const REVIEW_ACTIVITIES=new Set(['work-summary','health-review','classification-retry']);
 /** A notice round that used its attempts rests this long before its identity is tried
  * or looked up again; it is never given up (CR-LIFE-05). */
 export const NOTICE_ROUND_REST_MS=Object.freeze([30*60000,2*3600000,6*3600000]);
@@ -211,9 +216,11 @@ export class MobileRouter {
    * — and lets an owner message with attachments be classified instead of assumed to be work.
    * Left off, every request and every record is what it was before intents existed.
    * `profiles` are the host's configured chat and work routing profiles; `hotLimits`
-   * narrows what the state file keeps (see HOT_LIMITS). */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null,runtimeId=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn});
+   * narrows what the state file keeps (see HOT_LIMITS). `withdrawQueued(ids)` is the
+   * host's own: it takes the messages carrying only those input ids out of its session
+   * queue before their prompts begin and answers the ids it took (CR3-FLOW-02). */
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null,runtimeId=null,withdrawQueued=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn,withdrawQueued});
     // The runtime bundle this host runs, named on every submission it makes (CR2-INT-02).
     this.runtimeId=typeof runtimeId==='string'&&runtimeId?runtimeId.slice(0,120):null;
     this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
@@ -446,9 +453,10 @@ export class MobileRouter {
   activityList() {return [...this.activities.values()].map(activity=>({...activity}));}
   /** Anything in flight. `owner` asks for the owner's own dispatch, which a run in its own
    * process never holds; `internal` asks for the mind's own turn, which orders the mind's
-   * runs itself. A send in flight holds both; the mind's store work holds nothing here. */
+   * runs itself. A send in flight holds both; the mind's store work and the host's own
+   * background model calls hold nothing here. */
   busy(runtime,{assessment=false,owner=false,internal=false}={}) {
-    for(const activity of this.activities.values())if(!STORE_ACTIVITIES.has(activity.kind)&&!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
+    for(const activity of this.activities.values())if(!STORE_ACTIVITIES.has(activity.kind)&&!REVIEW_ACTIVITIES.has(activity.kind)&&!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
     if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
     if(Object.values(this.state.inputs).some(record=>record.ownerNotice?.state==='sending'))return true;
     if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
@@ -675,21 +683,86 @@ export class MobileRouter {
   }
   cancelTask(task,at=this.now()) {
     task.status='canceled';task.canceledAt=at;task.outcome='owner-canceled';
+    const queued=[];
     for(const id of task.inputIds){
       const record=this.state.inputs[id];if(!record||task.cancelSourceInputId===id)continue;
       if(ownerInput(record)&&!answered(record)){record.canceledBy=task.cancelSourceInputId??'owner-stop';record.settledAt??=at;}
       // Not submitted yet: it loses its reservation and its right to submit (CR2-LIFE-01).
       if(['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,task.cancelSourceInputId??'owner-stop');
+      // Waiting in the host's queue, its prompt not begun: taken back by its own id (CR3-FLOW-02).
+      else if(record.state==='queued'&&!record.turnStartedAt)queued.push(record);
     }
+    this.withdrawQueuedWork(queued,task.cancelSourceInputId??'owner-stop');
   }
   /** The owner's stop, from the literal command or from a classifier that actually
    * answered: recorded on the stop input itself, applied to the tasks it names. */
   applyStop(inputId,stop) {
+    const queued=[];
     for(const task of this.tasks())if(!stop.taskIds||stop.taskIds.includes(task.id)){
       task.cancelRequested=true;task.cancelSourceInputId=inputId;
-      // What the stopped work has not submitted yet loses its reservation and its right to submit (CR2-LIFE-01).
-      for(const id of task.inputIds){const record=this.state.inputs[id];if(record&&id!==inputId&&['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,inputId);}
+      for(const id of task.inputIds){
+        const record=this.state.inputs[id];if(!record||id===inputId)continue;
+        // What the stopped work has not submitted yet loses its reservation and its right to submit (CR2-LIFE-01).
+        if(['selected','preparing'].includes(record.state)&&!record.submissionStartedAt)this.cancelBeforeSubmission(record,inputId);
+        // What of it waits in the host's queue is taken back by its own id before its prompt begins (CR3-FLOW-02).
+        else if(record.state==='queued'&&!record.turnStartedAt)queued.push(record);
+      }
     }
+    this.withdrawQueuedWork(queued,inputId);
+  }
+  /** The owner's stopped work that waits in the host's queue, its prompts not begun: each
+   * input is canceled by her under its own id, and the host takes the messages that carry
+   * only such inputs out of its queue. Anything else there keeps its place — whatever came
+   * after the stop included. What the host could not find is refused where its prompt
+   * would begin (CR3-FLOW-02). */
+  withdrawQueuedWork(records,stoppedBy) {
+    if(!records.length)return;
+    for(const record of records)this.cancelQueued(record,stoppedBy,'host-queue');
+    let taken=[];
+    try {taken=this.withdrawQueued?.(records.map(record=>record.id))??[];} catch {taken=[];}
+    for(const record of records) {
+      record.withdrawn.fromQueue=taken.includes(record.id);
+      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',stage:'host-queue',fromQueue:record.withdrawn.fromQueue});
+    }
+  }
+  /** An input handed to the host's queue, its prompt not begun, that the owner's stop
+   * reached: canceled by her under its own id, never requeued and never renamed. Nothing
+   * of it reached the native session (CR3-FLOW-02). */
+  cancelQueued(record,stoppedBy,stage) {
+    record.canceledBy??=stoppedBy;record.settledAt??=this.now();
+    this.releaseQueued(record,'canceled-by-owner',stage);
+    record.withdrawn={reason:'canceled-by-owner',at:this.now(),stage};
+  }
+  /** Handed to the host's queue, or being handed to it, is not a native submission: that
+   * fact is kept apart, and the input is not submitted. */
+  releaseQueued(record,reason,stage) {
+    if(record.submissionStartedAt){record.queuedSubmissionAt=record.submissionStartedAt;delete record.submissionStartedAt;}
+    this.notSubmitted(record,reason,{restart:true,stage});
+    this.settleAcceptance(record.id,{state:record.state});
+  }
+  /** The owner's stop is read again where a prompt would begin, in the step that records
+   * its start: a prompt that carries work she stopped never begins. What it carries of that
+   * work is canceled under its own ids; anything else it carries — a message merged into it
+   * after the stop — is not submitted, and goes again under its own id (CR3-FLOW-02). */
+  refusedPrompt(data) {
+    const ids=[...new Set(Array.isArray(data.inputIds)?data.inputIds:data.sourceInputId?[data.sourceInputId]:[])];
+    const records=ids.map(id=>this.state.inputs[id]).filter(record=>record&&!record.turnStartedAt);
+    const handing=record=>['queued','submitting'].includes(record.state);
+    // Taken back already, where the host's queue did not hold it, or stopped since it was handed over.
+    const stopped=records.filter(record=>record.state==='failed-before-submit'&&record.canceledBy||handing(record)&&this.stopOf(record));
+    if(!stopped.length)return null;
+    for(const record of stopped.filter(handing)) {
+      this.cancelQueued(record,this.stopOf(record),'prompt-start');
+      this.save('input-dispatch-withdrawn',{id:record.id,reason:'canceled-by-owner',stage:'prompt-start'});
+    }
+    const carried=records.filter(record=>!stopped.includes(record)&&handing(record));
+    for(const record of carried) {
+      this.releaseQueued(record,'carried-with-stopped-work','prompt-start');
+      this.save('input-failed-before-submit',{id:record.id,reason:record.reason});
+    }
+    const refused={state:'refused',canceled:stopped.map(record=>record.id),notSubmitted:carried.map(record=>record.id)};
+    this.save('prompt-refused',{canceled:refused.canceled,notSubmitted:refused.notSubmitted});
+    return refused;
   }
   /** The mind's own turns wait for the owner's work and for a coordinator that is busy. */
   internalHeld(runtime,kind) {
@@ -783,9 +856,11 @@ export class MobileRouter {
       const now=this.now();
       // When the host first received it is recorded once; routing never moves it later (CR2-LIFE-08).
       const firstReceivedAt=Math.min(receiptTime(input.receivedAt,now),Number.isFinite(intake?.firstReceivedAt)?intake.firstReceivedAt:Infinity);
+      // How often it went back to its inbox is the input's own, counted across every stage:
+      // routing never starts it again, and it is kept apart from this attempt's evidence (CR3-FLOW-10).
       const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt,
         ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),
-        ...(intake?.retry?{retry:clone(intake.retry)}:{})};
+        ...(intake?.retry?{retry:clone(intake.retry)}:{}),...(requeuesOf(intake)?{requeues:requeuesOf(intake)}:{})};
       if(semanticFailure) {
         const current=this.currentTask(),runtime=first.classify.runtime;
         this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
@@ -934,6 +1009,11 @@ export class MobileRouter {
    * the stop asked for the task it was given to (CR2-LIFE-01). The stop itself is not one. */
   stoppedBy(record) {
     if(!record||record.submissionStartedAt)return null;
+    return this.stopOf(record);
+  }
+  /** Who stopped this input, by the facts alone, whatever became of its submission. */
+  stopOf(record) {
+    if(!record)return null;
     if(record.canceledBy)return record.canceledBy;
     const task=record.taskId?this.state.tasks[record.taskId]:null;
     if(!task||!task.inputIds?.includes(record.id)||task.cancelSourceInputId===record.id)return null;
@@ -1111,10 +1191,23 @@ export class MobileRouter {
         throw Object.assign(Error('Input preparation failed before native submission',{cause:failure}),{code:'input-not-submitted',inputId:input.id,retryAt:retry.nextAt??null,retryExhausted:Boolean(retry.exhausted)});
       }
       const route=typeof outcome==='string'?outcome:outcome?.route;
+      // Refused where its prompt would have begun while it was still being handed over: what
+      // the owner stopped stays canceled, and what rode with it stays not submitted (CR3-FLOW-02).
+      if(record.state==='failed-before-submit'&&record.failureStage==='prompt-start'&&!record.submissionStartedAt) {
+        if(record.canceledBy)return {route:'canceled-by-owner',model:target};
+        throw Object.assign(Error('Input prompt never began: it rode with work the owner stopped'),
+          {code:'input-not-submitted',inputId:input.id,retryAt:record.retry?.nextAt??null,retryExhausted:Boolean(record.retry?.exhausted)});
+      }
       if(route==='superseded') {if(this.state.operations[record.id])this.state.operations[record.id].state='canceled';record.state='superseded';record.settledAt=this.now();this.save('input-superseded',{id:input.id});return{route,model:target};}
       // Handed only to the session's in-memory queue is not yet native acceptance:
       // the input is accepted when its prompt begins (H2a-02).
-      if(outcome?.queued===true&&!record.turnStartedAt){record.state='queued';record.queuedAt=this.now();this.save('input-queued',{id:input.id});return {route,model:target,queued:true};}
+      if(outcome?.queued===true&&!record.turnStartedAt){
+        record.state='queued';record.queuedAt=this.now();
+        // The owner's stop came while it was being handed over: it is taken back at once (CR3-FLOW-02).
+        const stopped=this.stopOf(record);
+        if(stopped){this.withdrawQueuedWork([record],stopped);return {route:'canceled-by-owner',model:target};}
+        this.save('input-queued',{id:input.id});return {route,model:target,queued:true};
+      }
       record.state='accepted';record.acceptedAt??=this.now();
       if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
       this.save('input-accepted',{id:input.id,route});
@@ -1152,23 +1245,32 @@ export class MobileRouter {
    * chains can see; the input is never silently swallowed. */
   async reviewSemanticPending() {
     for(const id of Object.keys(this.state.semanticPending)) {
-      const entry=await this.locked(async()=>{
+      const taken=await this.locked(async()=>{
         const e=this.state.semanticPending[id];
         if(!e||!['pending','retry'].includes(e.state)||e.nextAttemptAt>this.now())return null;
         const record=this.state.inputs[id];
         if(!record||record.state!=='semantic-pending'||record.hash!==e.hash) {
           e.state='superseded';e.updatedAt=this.now();delete e.text;this.save('semantic-review-superseded',{id});return null;
         }
-        if(e.attempts>=e.maxAttempts)return clone({...e,exhausted:true});
-        e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});
-        return clone(e);
+        if(e.attempts>=e.maxAttempts)return {entry:clone({...e,exhausted:true})};
+        // Asking the model again passes the gate every call beside her conversation passes, in
+        // the step that counts the attempt: a freeze refuses it before anything is counted, and
+        // the drain counts it until the call has ended (CR3-FLOW-01).
+        const gate=this.beginActivity({kind:'classification-retry',id});
+        if(!gate.ok)return null;
+        const before={state:e.state,attempts:e.attempts,updatedAt:e.updatedAt};
+        try {e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});}
+        catch(error){Object.assign(e,before);gate.release();throw error;}
+        return {entry:clone(e),gate};
       });
-      if(!entry)continue;
+      if(!taken)continue;
+      const {entry,gate}=taken;
       let result=null,failure=null;
       if(!entry.exhausted) {
         try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
           {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
         catch(error){failure=classificationFailure(error);}
+        finally {gate.release();}
       }
       await this.locked(async()=>{
         const e=this.state.semanticPending[id];if(!e||!['classifying','pending','retry'].includes(e.state))return;
@@ -1728,9 +1830,21 @@ export class MobileRouter {
         // that marks it sending, so no freeze reports idle while it starts (CR2-LIFE-02).
         const gate=this.beginActivity({kind:'notice',id});
         if(!gate.ok){n.stage='held';n.updatedAt=this.now();this.save('notice-held',{id,reason:gate.reason});return null;}
-        // Whatever else the message recalls, this is the model it names as the current one.
-        if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
-        this.save('notice-sending',{id});return {...clone(n),sendNow:true,gate};
+        // From the permit on, every step before the send is covered: a write that fails lets
+        // the permit go, and the notice — nothing of it sent — waits under its own id to be
+        // taken up again, its attempts as they were (CR3-FLOW-09).
+        const before=clone(n);let handed=false;
+        try {
+          // Whatever else the message recalls, this is the model it names as the current one.
+          if(view.actual.verified){n.runtime??=view.actual;if(n.kind!=='mode-failed')n.toldModel=view.actual.model;}n.state='sending';n.stage='sending';n.attempts=(n.attempts??0)+1;n.updatedAt=this.now();
+          this.save('notice-sending',{id});
+          const handing={...clone(n),sendNow:true,gate};handed=true;return handing;
+        } catch(error) {
+          for(const key of Object.keys(n))delete n[key];
+          Object.assign(n,before,{stage:'not-submitted',waitingReason:'not-submitted-save-failed',nextAction:'resend-same-id',
+            nextAttemptAt:this.now()+2000*Math.max(1,before.attempts??1),updatedAt:this.now()});
+          throw error;
+        } finally {if(!handed)gate.release();}
       });
       if(!notice)continue;
       let receipt;
@@ -1839,7 +1953,11 @@ export class MobileRouter {
   observe(kind,data={}) {
     return this.locked(async()=>{
       let dirty=false;
-      if(kind==='prompt-start')dirty=this.turnStarted(data)||dirty;
+      if(kind==='prompt-start') {
+        const refused=this.refusedPrompt(data);
+        if(refused)return refused;
+        dirty=this.turnStarted(data)||dirty;
+      }
       if(kind==='prompt-end')dirty=this.turnEnded(data)||dirty;
       if(kind==='delivery'&&data.sourceInputId)dirty=this.inputDelivery(data)||dirty;
       if(kind==='reply-complete'||kind==='reply-choice'){const settled=this.inputAnswered(kind,data);if(settled)this.save(kind,{inputId:data.inputId,...(settled.length>1?{covered:settled.slice(1)}:{})});return settled;}
@@ -2194,7 +2312,7 @@ export class MobileRouter {
           // A restored input of unknown kind proven never received goes back to the inbox it
           // may have come from, under its own id; with no job there, or its budget spent, it
           // stops, and nobody is told.
-          else if(record.kind==='unknown'&&record.state==='failed-before-submit'&&retry&&!retry.exhausted) {
+          else if(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.canceledBy&&retry&&!retry.exhausted) {
             if(requeue&&requeuesOf(record)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())handOutRequeue(record);}
             else {retry.exhausted=true;retry.requeue??='budget';changed=true;}
           }
