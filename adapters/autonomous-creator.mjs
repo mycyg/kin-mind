@@ -95,7 +95,9 @@ export function stopReason(error){
 }
 const halted=code=>Object.assign(Error(code),{code});
 /** `beginActivity({kind,id})`: the router's in-flight registration (CR-MIND-01), `{ok:false}` under
- * a release freeze, else `{ok:true,release()}`. Without one, nothing is registered. */
+ * a release freeze, else `{ok:true,release()}`. Without one, nothing is registered.
+ * The completion review (`plan-result`) runs a model in a worker process of its own; when `call`
+ * answers with the host's mind worker promise, its `exited` settles once that process has ended. */
 export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS,
   beginActivity=()=>({ok:true,release(){}})}){
   let running=false,closed=false,controller=null,current=null,stops=0;
@@ -104,6 +106,11 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
     // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
     if(closed||running||isBusy()||creator.command===null)return;
     running=true;let claimed,activity=null;
+    // CR3-MM-09: every completion review this run asked for, retries included, is in flight until
+    // its worker process has ended, not merely until it answered: a timeout answers first and
+    // ends the process after. The creation's activity is released only once each has.
+    const reviews=[];
+    const review=input=>{const answer=call('plan-result',input);if(answer?.exited)reviews.push(answer.exited);return answer;};
     // CR-MIND-05: the stop state exists before the claim is asked for. A literal stop or a
     // shutdown that lands while the claim is on its way is seen when it comes back, and that
     // claim is settled as interrupted under its own run id instead of starting.
@@ -123,13 +130,13 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
         if(closed)return {state:'interrupt'};
         return call('plan-renew',{run_id:run.id,owner,fence:run.fence});
       }});
-      let settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+      let settled=await review({run_id:run.id,owner,fence:run.fence,result});
       // The completion review found no free model slot: the same verified result is offered
       // again while the lease is kept, instead of the whole creation running again (K2-02).
       for(let tries=0;settled?.state==='waiting'&&tries<REVIEW_RETRIES&&!closed;tries++){
         await pause(retryMs);
         if(closed||(await call('plan-renew',{run_id:run.id,owner,fence:run.fence})).state!=='renewed')break;
-        settled=await call('plan-result',{run_id:run.id,owner,fence:run.fence,result});
+        settled=await review({run_id:run.id,owner,fence:run.fence,result});
       }
       if(settled?.state==='waiting')throw Object.assign(Error('completion-review-unavailable'),{code:'completion-review-unavailable'});
       recordStatus({creation:{state:settled.state,plan_id:claimed.plan.id,run_id:run.id}});
@@ -140,7 +147,7 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
       recordStatus({creation:{state:'needs-review',reason}});
     }
-    finally{try{activity?.release?.();}catch{}running=false;controller=null;current=null;}
+    finally{await Promise.allSettled(reviews);try{activity?.release?.();}catch{}running=false;controller=null;current=null;}
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
   const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();stops++;controller?.abort();};

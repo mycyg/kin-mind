@@ -633,6 +633,9 @@ def main():
     parser.add_argument("--registry")
     parser.add_argument("action")
     args = parser.parse_args()
+    # The host's control channel is this worker's alone: read out of the environment before
+    # anything here can start a process that would inherit it (CR3-MM-02).
+    from . import worker_groups  # noqa: F401
     try:
         import sys
 

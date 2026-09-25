@@ -15,7 +15,6 @@ import json
 import os
 import re
 import selectors
-import signal
 import subprocess
 import sys
 import tempfile
@@ -26,6 +25,7 @@ from urllib.parse import urlparse
 from eventmem.core.db import digest, dumps
 from eventmem.paths import atomic_write
 
+from . import worker_groups
 from .exploration import CodexUnavailable, Findings
 from .computer import redact
 from .source_ledger import (
@@ -870,10 +870,14 @@ def run_codex(
     buffer = b""
     with tempfile.TemporaryFile() as diagnostic:
         try:
-            child = subprocess.Popen(
-                argv, cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=diagnostic, start_new_session=True, env=child_env,
-            )
+            # The CLI's session is a group of its own, reported to the host that owns the worker
+            # before anything can end the worker (CR3-MM-02, worker_groups).
+            with worker_groups.starting() as report_group:
+                child = subprocess.Popen(
+                    argv, cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=diagnostic, start_new_session=True, env=child_env,
+                )
+                report_group(child.pid)
         except OSError as error:
             raise CodexUnavailable("codex-cli-missing", error) from error
         state = "failed"
@@ -922,14 +926,9 @@ def run_codex(
                                 buffer = b""
                             break
         finally:
-            # Only the process group created for this invocation is signaled.
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait(timeout=3)
+            # Only the process group created for this invocation is signaled: the CLI and
+            # whatever it started there, until the group is empty; then the host is told.
+            worker_groups.end(child)
             child.stdout.close()
         elapsed = round(time.monotonic() - started, 2)
         # A result is final only on a clean native completion. Anything written by

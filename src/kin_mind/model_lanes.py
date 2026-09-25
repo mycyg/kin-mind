@@ -431,23 +431,38 @@ class Lease:
 
 class Handoff:
     """What a thread started on the caller's behalf needs from it. A new thread begins with an
-    empty context, so without this a nested call would take a second slot of its own."""
+    empty context, so without this a nested call would take a second slot of its own — and a look
+    would stop being one: the read's own constraint travels too, so a thread started by a read
+    without a session calls no model and writes nothing either (CR3-MM-04)."""
 
     def __init__(self):
+        from eventmem.core.db import recording
+
         lease, outer = _current.get(), _carrier.get()
         # Only what lanes introduced travels: with model_lanes off a thread starts as empty as before.
         self.lease, self.lane = lease if isinstance(lease, Lease) else None, _declared.get()
         self.background = bool(_background.get() or (outer is not None and outer.background))
+        self.recording = recording()
         self.taken, self.abandoned = [], False
 
     @contextmanager
     def adopt(self):
+        from contextlib import nullcontext
+
+        from eventmem.core.db import unrecorded
+
         tokens = [(_current, _current.set(self.lease)), (_declared, _declared.set(self.lane)), (_carrier, _carrier.set(self))]
         try:
-            yield self
+            with nullcontext() if self.recording else unrecorded():
+                yield self
         finally:
             for variable, token in reversed(tokens):
                 variable.reset(token)
+
+    def run(self, call, *args, **kwargs):
+        """`call` in a thread of its own, under what its caller runs under."""
+        with self.adopt():
+            return call(*args, **kwargs)
 
     def took(self, lease):
         self.taken.append(lease)
