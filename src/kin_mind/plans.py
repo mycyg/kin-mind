@@ -756,15 +756,17 @@ class AutonomousPlans:
                     return {"state": "claimed", "run": attempt, "plan": plan, "step": step}
         return {"state": "waiting", "reason": "no-current-decision"}
 
-    def note_shown(self, run_id, shown):
+    def note_shown(self, run_id, shown, mark=None):
         """What a claimed run's brief showed its executor besides the decision's evidence -- the
         dialogue, earlier results, histories. The run's result is stored only while all of it
-        still stands (creation.accept_result, CR5-MM-02)."""
+        still stands (creation.accept_result, CR5-MM-02). `mark`: the `tombstone_mark` taken before
+        the claim, so its settlement counts only the deletes after it (CL6E-MM-02)."""
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND id=? AND state='running'",
                                (self.scope, run_id)).fetchone()
             if row:
-                conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (dumps({**json.loads(row[0]), "shown": shown}), run_id))
+                noted = {"shown": shown, **({"tombstone_mark": mark} if mark is not None else {})}
+                conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (dumps({**json.loads(row[0]), **noted}), run_id))
 
     def renew(self, run_id, owner, fence):
         with self.engine.db.connect(write=True) as conn:
@@ -794,9 +796,11 @@ class AutonomousPlans:
                                actual=row["fence"] if row else None)
             run = json.loads(row["data"])
             # A result settled after something it names was deleted keeps no words of it: the
-            # delete's own rule, in this write (CR5-MM-02).
+            # delete's own rule, in this write (CR5-MM-02) -- deleted since the run was claimed, when
+            # the claim noted how far the deletes went: nothing deleted before reached its executor
+            # or its review (CL6E-MM-02).
             from .erasure import drop_deleted
-            result = drop_deleted(conn, result)
+            result = drop_deleted(conn, result, since=run.get("tombstone_mark"))
             if row["state"] != "running":
                 if run.get("result") == result and row["state"] == state:
                     return run

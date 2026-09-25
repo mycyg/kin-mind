@@ -21,7 +21,8 @@ ADMISSION_WAITS = frozenset({WAIT_CAPACITY, WAIT_FOREGROUND, WAIT_LEDGER, WAIT_U
 
 # Retry bookkeeping an approved resume gives back, preserved in recovery_history.
 RETRY_COUNTERS = ("error_signature", "error_repeats", "compression_waits", "compression_stalls",
-                  "compression_parts", "transient_failures", "admission_waits", "light_attempts")
+                  "compression_parts", "transient_failures", "admission_waits", "light_attempts",
+                  "deletion_refusals")
 # What a conflict left for the next attempt to reuse or revalidate. A resumed row is judged afresh.
 REUSE_FIELDS = ("reuse", "tier", "revalidation")
 
@@ -125,7 +126,7 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
                 # Previous usage and proposals stay in recovery_history. Refresh
                 # source/configuration context; never replay an unrelated proposal.
                 for field in ("error", "error_detail", "repair_reason", "receipt", "proposed_result",
-                              "seed_memory", "seed_receipt", "seed_sources", "seed_manifest"):
+                              "seed_memory", "seed_receipt", "seed_sources", "seed_manifest", "seed_tombstone_mark"):
                     data.pop(field, None)
                 data["waiting_reason"] = "admission-recovered-current-review"
             data.pop("frozen_memory_context", None)

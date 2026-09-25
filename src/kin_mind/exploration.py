@@ -260,6 +260,11 @@ class Explorations:
             from .codex_executor import run_codex
             runner = run_codex
         from .actions import ActionEvents
+        from .erasure import tombstone_mark
+        with self.engine.db.connect() as conn:
+            # How far the deletes went before this run read anything it hands its executor: what was
+            # deleted before, the run never had the words of (CL6E-MM-02).
+            mark = tombstone_mark(conn)
         actions = ActionEvents(self.mind)
         candidate = actions.exploration_candidate()
         if candidate["state"] != "ready":
@@ -336,7 +341,7 @@ class Explorations:
                         break
             from .decision_context import execution_brief, sources_named
             shown.extend(sources_named(options.get("continuation")))
-            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown)
+            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown, since=mark)
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=self._stop_when(canceled, desire["id"]), model=model, **options)
@@ -430,7 +435,8 @@ class Explorations:
         data["evaluated_sources"] = shown
         with self.engine.db.connect(write=True) as conn:
             from .erasure import drop_deleted
-            data = drop_deleted(conn, data)
+            # What was deleted since the run began: before it, nothing of it reached the run (CL6E-MM-02).
+            data = drop_deleted(conn, data, since=mark)
             current = self.mind._load(conn)
             active = current["desires"].get(desire["id"])
             if active and active["revision"] == data["desire_revision"] and active["status"] == "in_progress":

@@ -1,13 +1,17 @@
 """Shared appraisal/worker context. Memory is read by the assessment fork's own read-only tools."""
 
-from eventmem.core.db import Conflict, Missing
+from eventmem.core.db import Conflict, Missing, digest
 
 
-def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown=None):
+def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown=None, since=None):
     """What an executor is given. `shown`, a list, receives every source the brief names -- its
     evidence at the versions read, the dialogue, earlier results and histories by id, the plan's
     own evidence -- so what comes back is stored only while all of it still stands (CR5-MM-02,
-    CL6-MM-03)."""
+    CL6-MM-03). `since`: the `tombstone_mark` the caller took before it read anything it hands the
+    executor. What was deleted before it had its words taken out of every layer the brief is put
+    together from, and the brief can only name it -- an earlier result's source, a tombstone
+    reference a history or a method keeps: left out of `shown`, it would refuse every result after
+    the first delete (CL6E-MM-02)."""
     from .dialogue import recent_dialogue
     from .exploration import Explorations
     from .memory import MemoryContinuity
@@ -48,8 +52,35 @@ def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown
                  [{"source_id": e["source_id"]} for e in previous if isinstance(e.get("source_id"), str)],
                  (plan or {}).get("evidence") or []]
         unique = {tuple(sorted(ref.items())): ref for ref in [*shown, *read, *sources_named(named)]}
-        shown[:] = list(unique.values())
+        refs = list(unique.values())
+        if since is not None:
+            with mind.engine.db.connect() as conn:
+                refs = _not_deleted_before(conn, refs, since)
+        shown[:] = refs
     return brief
+
+
+def _not_deleted_before(conn, refs, mark):
+    """`refs` less the ones deleted at or before `mark`, by the keys a stored derived source checks
+    them under (the source, the record, a bare source's root record: `Engine._derivable`). One also
+    deleted after the mark stays: that delete came while the executor worked (CL6E-MM-02)."""
+    keys = []
+    for ref in refs:
+        sid, rid = ref.get("source_id"), ref.get("record_id")
+        root = "mem_" + digest([sid, "root"])[:32] if isinstance(sid, str) and sid and not rid else None
+        keys.append([key for key in (sid, rid, root) if isinstance(key, str) and key])
+    wanted, stamps = sorted({key for named in keys for key in named}), {}
+    for start in range(0, len(wanted), 500):
+        page = wanted[start:start + 500]
+        stamps.update((row[0], row[1]) for row in conn.execute(
+            "SELECT key,rowid FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
+    kept = []
+    for ref, named in zip(refs, keys):
+        found = [stamps[key] for key in named if key in stamps]
+        if found and all(stamp <= mark for stamp in found):
+            continue
+        kept.append(ref)
+    return kept
 
 
 def sources_named(value):

@@ -219,14 +219,17 @@ def scrub(value, ids, *, erase=False):
     return out if changed else value
 
 
-def drop_deleted(conn, value):
+def drop_deleted(conn, value, since=None):
     """`value` as it may be written now, inside the transaction that writes it: whatever it names
     that the store has deleted since it was read -- the tombstone is the deletion fact -- is taken
     out by this module's own rule, `scrub`. Identities, states, error codes and usage stay. A value
-    that names nothing deleted comes back as it is (CR4-MM-02, CR5-MM-01)."""
+    that names nothing deleted comes back as it is (CR4-MM-02, CR5-MM-01). `since`: the
+    `tombstone_mark` taken before `value` was read, when there is one -- a delete before it had
+    already taken its words out of all `value` was read from, so only the deletes after it count
+    (`tombstoned_since`, CL6E-MM-02)."""
     from eventmem.core.db import NAMED
 
-    erased = tombstoned(conn, NAMED.findall(dumps(value)))
+    erased = tombstoned_since(conn, NAMED.findall(dumps(value)), since)
     return scrub(value, frozenset(erased)) if erased else value
 
 
@@ -251,14 +254,17 @@ def held(conn, ids):
     return found
 
 
-def shown_ids(conn, value):
+def shown_ids(conn, value, since=None):
     """Every source and record `value` names that the store holds now: all a model shown `value`
     may have written from, beyond the references it is asked about -- the mind's state, methods,
     entries marked for review. What it wrote is committed and kept only while none of them has
-    been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03)."""
+    been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03). `since`: the
+    `tombstone_mark` taken before `value` was read -- then what was deleted after it is named too
+    (`seen`), wherever in between the read and this the delete came (CL6E-MM-02)."""
     from eventmem.core.db import NAMED
 
-    return sorted(held(conn, NAMED.findall(dumps(value))))
+    ids = NAMED.findall(dumps(value))
+    return sorted(held(conn, ids) if since is None else seen(conn, ids, since))
 
 
 def read_ids(receipt):
@@ -289,14 +295,15 @@ def read_ids(receipt):
     return list(dict.fromkeys(found))
 
 
-def tool_read_ids(conn, receipt):
+def tool_read_ids(conn, receipt, since=None):
     """What a model read with its tools while it answered (`read_ids`), as far as the store knows
     it: held now, or deleted -- a deleted one must stop what was written from it, where it is
     checked. An id the store never held (a graph node, a plan, a wish) names nothing a delete could
     take, and where a derived source is stored it would read as one deleted: it is left out.
-    Beside `shown_ids`, this is everything the model had before it (CL6D-MM-01)."""
-    ids = read_ids(receipt)
-    return sorted(held(conn, ids) | tombstoned(conn, ids))
+    Beside `shown_ids`, this is everything the model had before it (CL6D-MM-01). `since`: the
+    `tombstone_mark` its attempt began at -- a tool that returned an id deleted before it returned
+    a tombstone reference, no words, and that id is left out too (`seen`, CL6E-MM-02)."""
+    return sorted(seen(conn, read_ids(receipt), since))
 
 
 def reads_truncated(receipt):
@@ -329,6 +336,31 @@ def deleted_since(conn, mark):
     mark, every delete counts."""
     mark = mark if isinstance(mark, int) and not isinstance(mark, bool) else 0
     return {row[0] for row in conn.execute("SELECT key FROM tombstones WHERE rowid>?", (mark,))}
+
+
+def tombstoned_since(conn, ids, mark):
+    """Those of `ids` deleted after `mark` (`tombstone_mark`). What was deleted before a model began
+    had had its words taken out of every layer it could read by the delete's own transaction: an id
+    of it -- a tombstone reference left in the state, a tool's answer quoting one -- is all that
+    could reach the model, and a check of what the model had before it counts only the deletes after
+    its mark. The state keeps such references for good, so counting the earlier ones would refuse
+    every answer after the first delete (CL6E-MM-02). Without a mark, every delete counts."""
+    if not isinstance(mark, int) or isinstance(mark, bool):
+        return tombstoned(conn, [i for i in ids if isinstance(i, str)])
+    ids, erased = sorted({i for i in ids if isinstance(i, str)}), set()
+    for start in range(0, len(ids), 500):
+        page = ids[start:start + 500]
+        erased.update(row[0] for row in conn.execute(
+            "SELECT key FROM tombstones WHERE rowid>? AND key IN (" + ",".join("?" * len(page)) + ")", [mark, *page]))
+    return erased
+
+
+def seen(conn, ids, mark):
+    """What of `ids` a model that began at `mark` may have had before it: what the store holds, and
+    what was deleted after the mark (`tombstoned_since`). The rest it never had, or had as an id
+    alone (CL6E-MM-02)."""
+    ids = [i for i in ids if isinstance(i, str)]
+    return held(conn, ids) | tombstoned_since(conn, ids, mark)
 
 
 def drop_refs(value, ids):

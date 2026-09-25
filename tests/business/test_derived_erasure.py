@@ -581,7 +581,8 @@ def test_a_source_only_the_state_named_deleted_while_the_model_answers_stops_the
     settle(mind.engine)
     assert texts_everywhere(mind.engine, MARKER) == set()
     state, count, data = queue_row(mind, job["id"])
-    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 1
+    # Refused for the delete, not for the judgment: no charged attempt (CL6E-MM-03).
+    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 0
     assert said in data["evaluated_ids"], "the row names what the state showed"
     assert mind.read()["dimensions"]["curiosity"]["value"] != 66, "the commit was refused"
     with mind.engine.db.connect(write=True) as conn:
@@ -720,7 +721,8 @@ def test_a_record_the_fork_read_with_its_tools_and_did_not_cite_deleted_while_it
     settle(mind.engine)
     assert texts_everywhere(mind.engine, MARKER) == set()
     state, count, data = queue_row(mind, job["id"])
-    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 1
+    # Refused for the delete, not for the judgment: no charged attempt (CL6E-MM-03).
+    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 0
     assert note in data["evaluated_ids"], "the row names what the tool returned"
     assert mind.read()["dimensions"]["curiosity"]["value"] != 66, "the commit was refused"
     with mind.engine.db.connect(write=True) as conn:

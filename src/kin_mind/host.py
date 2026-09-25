@@ -87,14 +87,19 @@ def dispatch(config, action, request):
             return accept_result(mind, config, request)
         if action == "plan-claim":
             from .decision_context import execution_brief
+            from .erasure import tombstone_mark
+            with mind.engine.db.connect() as conn:
+                # Before the claim reads the plan: what was deleted before it, the run never has the
+                # words of, and only the deletes after it count against its result (CL6E-MM-02).
+                mark = tombstone_mark(conn)
             result = plans.claim(**request)
             if result["state"] == "claimed":
                 shown = []
                 result["brief"] = execution_brief(mind, question=result["step"]["goal"],
                     evidence_ids=[r["record_id"] for r in result["run"]["decision"]["evidence"]],
-                    plan=result["plan"], step=result["step"], shown=shown)
+                    plan=result["plan"], step=result["step"], shown=shown, since=mark)
                 # What the brief showed is what the run's result is checked against when stored (CR5-MM-02).
-                plans.note_shown(result["run"]["id"], shown)
+                plans.note_shown(result["run"]["id"], shown, mark)
             return result
         if action == "procedure-memory":
             return Procedures(mind).read(**request)
