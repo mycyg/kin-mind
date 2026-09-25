@@ -8,13 +8,15 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {readJsonFile,writeJsonAtomic} from '../../../adapters/atomic-json.mjs';
 import {classifyReceipt} from '../../../adapters/channel-contract.mjs';
+import {platformErrorCode} from '../../../adapters/send-stages.mjs';
 
 const sha256=value=>createHash('sha256').update(value).digest('hex');
 const take=(rules,subject)=>{const rule=rules.find(r=>r.times>0&&r.when(subject));if(rule)rule.times--;return rule?.outcome;};
 
-/** Scripted outcomes: accept (default) | reject | timeout (landed, answer
- * lost) | lost (never landed) | no-id (accepted without a message ID). The
- * platform deduplicates one idempotency key inside its window. */
+/** Scripted outcomes: accept (default) | reject (refused with a platform error
+ * code) | uncoded (landed, answered without a usable code) | timeout (landed,
+ * answer lost) | lost (never landed) | no-id (accepted without a message ID).
+ * The platform deduplicates one idempotency key inside its window. */
 export function createFakePlatform({clock=()=>Date.now(),windowMs=3600000}={}) {
   const calls=[],delivered=[],rules=[],watchers=[],seen=new Map();let counter=0;
   const land=request=>{
@@ -30,6 +32,7 @@ export function createFakePlatform({clock=()=>Date.now(),windowMs=3600000}={}) {
       calls.push({...request,at:clock()});
       const outcome=take(rules,request)??'accept';
       if(outcome==='reject')return {code:230099};
+      if(outcome==='uncoded'){land(request);return {};}
       if(outcome==='lost')throw Object.assign(Error('Network unreachable'),{name:'FetchError'});
       if(outcome==='timeout'){land(request);throw Object.assign(Error('Request timed out'),{name:'TimeoutError'});}
       if(outcome==='no-id'){land(request);return {code:0,data:{}};}
@@ -67,7 +70,13 @@ export function createFakeTransport({directory,platform=createFakePlatform(),clo
     let answer;
     try{answer=await platform.submit({key:sha256(id).slice(0,32),id,body:media?'[file '+media.name+']':text});}
     catch(error){remember(write({...record,state:'unconfirmed',stage:'message-unconfirmed',checkedAt:stamp()}));throw error;}
-    if(answer?.code!==0){remember(write({...record,state:'rejected',stage:'platform-rejected',checkedAt:stamp()}));throw Error('Platform rejected send');}
+    // Only a platform error code is a refusal, and the receipt carries it the way each real
+    // sender writes its evidence; an answer without one is an unknown outcome (CR5-FLOW-02).
+    if(answer?.code!==0) {
+      if(!platformErrorCode(answer?.code)){remember(write({...record,state:'unconfirmed',stage:'message-unconfirmed',checkedAt:stamp()}));throw Object.assign(Error('Platform answer has no usable code'),{code:'PLATFORM_ANSWER_UNKNOWN'});}
+      const evidence=flavour==='wechat'?{reason:'api-'+answer.code,httpStatus:200,apiRet:answer.code}:{stage:'platform-rejected',platformCode:answer.code,errorCode:'PLATFORM_REJECTED'};
+      remember(write({...record,state:'rejected',...evidence,checkedAt:stamp()}));throw Object.assign(Error('Platform rejected send'),{code:'PLATFORM_REJECTED'});
+    }
     if(!answer.data?.message_id){remember(write({...record,state:'unconfirmed',stage:'message-unconfirmed',checkedAt:stamp()}));throw Error('Platform returned no message ID');}
     return remember(write({...record,state:'accepted',stage:'platform-accepted',messageId:answer.data.message_id,acceptedAt:stamp()}));
   }
