@@ -214,6 +214,8 @@ def settle_wishes(mind, *, apply=False):
             desire = current["desires"].get(identifier)
             if not desire or desire["status"] not in SETTLES or links_fresh(conn, mind, desire):
                 continue
+            # The host's words replace a copied reason, and what that was written from (CL6D-MM-01).
+            desire.pop("reason_evidence_ids", None)
             desire.update(status="waiting", revision=desire["revision"] + 1, updated_at=at,
                           event_id=event_id, reason=WAITING_REASON,
                           # The field a reader of a waiting wish already looks at, whatever its kind.
