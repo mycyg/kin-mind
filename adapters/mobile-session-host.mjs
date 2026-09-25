@@ -190,9 +190,13 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     // The attempt travels to the mind's queue key and comes back in its answer (CR-RT-08).
     reviewRequested:async event=>{writeObservation(event.observation);return mindCall('session-review',{id:event.id,snapshotId:event.cause,attempt:event.attempt});},
     createCandidate:request=>native.create(request),injectCandidate:request=>native.inject(request),verifyCandidate:request=>native.verify(request),
-    // A check that stands is not repeated; the candidate is loaded again (no model turn), which
-    // refuses a changed provider, instruction binding or resumed profile.
+    // A check that stands is not repeated. Before its handover the candidate is loaded again (no model
+    // turn), which refuses a changed provider, instruction binding or resumed profile.
     loadCandidate:request=>native.load(request),
+    // What a candidate would be launched with now, resolved without a process (the instruction files
+    // are read and hashed): a kept candidate whose provider or instruction binding is no longer it is
+    // replaced, and one that cannot be launched opens nothing.
+    candidateLaunch:profile=>{const launch=native.launch(profile);return {providerBinding:launch.providerBinding,instructionBinding:launch.instructionBinding??null};},
     closeCandidate:()=>native.close(),
     reconcileCandidate:async candidate=>candidate.native.path&&fs.existsSync(candidate.native.path)&&(await checkpointMarker(candidate.native.path,'kin-checkpoint:'+candidate.injectionId)).found,
     validateEvidence:async evidence=>(await mindCall('session-validate',{checkpoint:{sourceDependencies:evidence.flatMap(e=>e.dependencies??[])}})).valid,
@@ -223,7 +227,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     return result;
   };
   router.state.conversationId=manager.fence().conversationId;router.state.generation=manager.fence().generation;router.state.nativeSessionId=manager.fence().nativeSessionId;router.save('logical-conversation-bound');
-  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state,checkedAt:s.candidate.checked?.at??null,checkRetryAt:s.candidate.checkRetry?.nextAt??null}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
+  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state,checkpointId:s.candidate.checkpoint?.id??null,checkedAt:s.candidate.checked?.at??null,checkRetryAt:s.candidateRetry?.generation===s.binding.generation?s.candidateRetry.nextAt:null}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
     deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
