@@ -113,7 +113,11 @@ minute, decides from evidence alone:
   and the thread the answer read is the one it was submitted to. Any other answer —
   a bare `not-found` from an older runtime, an input with no recorded submission, a
   thread a migration replaced — leaves it `unknown`: looked up again, told as
-  `unknown`, never submitted again.
+  `unknown`, never submitted again. Until it is found or told, it holds the session's
+  boundary: native maintenance waits, and so do the mind's own contacts. One the
+  owner's stop has settled holds it no more, since the stop is its outcome, whether
+  it was stopped live or came back canceled from the journal; its submission stays on
+  record, and a native turn, a tool or a send of it still counts on its own.
 - An accepted input with no reply, no running turn and no progress for
   `inputStuckMinutes` while the session is idle is told as `partial` when part of its
   reply reached the platform, and as `unknown` otherwise.
@@ -150,18 +154,23 @@ freeze survives a restart and lifts itself after `ttlMs`, two hours by default a
 between one minute and twelve hours, so a release lost half way cannot leave the
 owner unanswered for good. Asking again with the same reason and migration ID changes
 nothing, so a caller may poll it; every answer says whether the host is `idle` and,
-if not, why. `POST /thaw` lifts it. `GET /busy` answers the same drain: inputs still
+if not, why. `POST /thaw` lifts it; one that names a `migrationId` lifts only that
+migration's own freeze, and gives a deployment's hold it froze over back to its
+holder, held (CR4-REL-04). `GET /busy` answers the same drain: inputs still
 moving through the host, a native turn or an unreadable native runtime, a send, a
 native command or a switch hold it, and so do the host's own background model calls —
-a summary of open work, a health reading, a classification asked again — until they
-return; a freeze refuses a new one before anything is counted for it, and none of them
-holds the owner's conversation. Open work, a desktop handoff, history and inputs
-waiting for a notice or a reconciliation do not, because they do not change by
-waiting. `GET /unsettled` returns the eight-state summary and every unsettled input
-by its original ID, naming inbox jobs the router has not taken by ID and file time
-only. The same summary is `inputLedger` in `/runtime`. `POST /handoff-source`
-answers from the same ledger whether an owner input may authorize a desktop handoff;
-see [task exchange](task-exchange.md#host-integration).
+a summary of open work, a health reading, a classification asked again — until the
+call has ended and let go of its lane; a freeze refuses a new one before anything is
+counted for it, and none of them holds the owner's conversation. A classification's
+deadline covers the lane's admission as well as the request: once it passes, the
+request is canceled, a lease that comes late starts nothing, and the classification
+answers only after the call has let go of everything it held. Open work, a desktop
+handoff, history and inputs waiting for a notice or a reconciliation do not, because
+they do not change by waiting. `GET /unsettled` returns the eight-state summary and
+every unsettled input by its original ID, naming inbox jobs the router has not taken
+by ID and file time only. The same summary is `inputLedger` in `/runtime`.
+`POST /handoff-source` answers from the same ledger whether an owner input may
+authorize a desktop handoff; see [task exchange](task-exchange.md#host-integration).
 
 The router's state file keeps what is unsettled and a bounded recent tail. Settled
 inputs, closed tasks, finished requests and settled notices beyond it move, oldest

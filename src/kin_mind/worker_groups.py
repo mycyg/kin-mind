@@ -1,39 +1,69 @@
-"""The process groups a mind worker runs its executions in, and who ends them (CR3-MM-02).
+"""The processes a mind worker runs its executions in, and who ends them (CR3-MM-02, CR4-MM-03).
 
 An executor's CLI runs in a session of its own (`start_new_session`), so that the worker can end
 the whole execution -- the CLI and everything it started -- without ending itself. That also
 takes the execution out of the worker's own process group, which is the group the host signals
-when it ends the worker: a timeout or a shutdown ended the worker and left the execution
-running, and the host counted the work over once the worker had gone.
+when it ends the worker; and a process the execution starts may leave the CLI's group and session
+in turn, and outlive the CLI, adopted by launchd. A set of process groups cannot say that the
+execution has ended.
 
-So the execution groups have one owner besides the worker, the host:
+So every process of an execution carries one mark, and the host owns the end of all of them:
 
-* The worker tells the host each group the moment it exists, on the control channel the host
-  opened for it (`KIN_WORKER_CONTROL_FD`, a JSON line `{"group": pgid}`), and again once it has
-  seen the group empty (`{"group": pgid, "ended": true}`). A termination cannot fall between a
-  group's start and its report: the worker's SIGTERM waits for the report (`starting`).
+* The host gives each worker a mark of its own (`KIN_WORKER_MARK`, a UUID) and knows it before
+  the worker runs anything. The worker takes it out of its environment at once, so the processes
+  it starts for itself (a shared service, say) do not carry it, and puts it into the environment of
+  each execution it starts, the CLI and every MCP server the CLI starts (`execution_env`). A
+  process inherits it from there, into a new group or session as well.
+* The host reads this user's process table for the mark (mind-host.mjs, worker-ownership.mjs),
+  follows the processes that carry it to their children and their groups, and counts the worker
+  ended only once no process of the execution is left. A table it cannot read is an execution not
+  known to have ended.
+* The worker still tells the host each execution group the moment it exists, on the control
+  channel the host opened for it (`KIN_WORKER_CONTROL_FD`, a JSON line `{"group": pgid}`), and
+  again once it has seen the group empty (`{"group": pgid, "ended": true}`): that only starts the
+  host's watch early. A report that never arrives costs nothing but that.
 * A SIGTERM for the worker is a SIGTERM for each live group before the worker dies as it always
-  has, so the execution hears it even when the worker is ended by someone other than the host.
-* The host sends the same TERM, and the KILL after it, to each reported group itself, and does
-  not count the worker ended until each has emptied (mind-host.mjs, WorkerGroups): it never
-  relies on the worker's own `finally`, which a SIGKILL skips.
+  has; a SIGTERM that arrives between a group's start and its report waits for the report.
 
-A worker the host did not open a channel for (an operator's command line) still forwards its
-TERM; it only has no one to report to.
+A worker no host started (an operator's command line) marks its executions with a mark of its own
+and still forwards its TERM; it only has no one to report to.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import stat
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 CONTROL_FD_ENV = "KIN_WORKER_CONTROL_FD"
+MARK_ENV = "KIN_WORKER_MARK"
 GRACE_SECONDS = 3.0
+MARK = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _mark():
+    """The host's mark for this worker, taken out of the environment on import like the channel:
+    only the executions the worker starts carry it."""
+    raw = os.environ.pop(MARK_ENV, "")
+    return raw if MARK.fullmatch(raw) else None
+
+
+_MARK = _mark()
+
+
+def execution_env():
+    """What an execution's environment adds, for itself and everything it starts: the mark the
+    host finds all of it by. A worker no host started marks its executions with one of its own."""
+    global _MARK
+    if _MARK is None:
+        _MARK = str(uuid.uuid4())
+    return {MARK_ENV: _MARK}
 
 
 def _control():

@@ -65,21 +65,26 @@ export function inputSummary(record) {
 export function inputSettled(record) {
   if(!record)return true;
   if(inputInFlight(record))return false;
+  // The owner's stop is an outcome whoever the input was for (CR4-FLOW-04).
+  if(record.canceledBy&&!record.historical)return true;
   if(!ownerInput(record)) {
     if(record.historical)return true;
     if(record.recovered||['unconfirmed','fenced-unconfirmed'].includes(record.state))return false;
-    // What the owner's stop settled is not on its way anywhere.
-    return !(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.canceledBy&&!record.retry?.exhausted);
+    return !(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.retry?.exhausted);
   }
   return ['answered','failed-notified','superseded','canceled-by-owner','historical'].includes(inputSummary(record));
 }
 
 /** What a native-session boundary (compaction, a segment swap) waits for: inputs
  * still moving, and submissions whose outcome is not yet reconciled or reported.
- * A release waits only for `inputInFlight`; neither ever waits on history. */
+ * A release waits only for `inputInFlight`; neither ever waits on history. An input the
+ * owner's stop settled is an outcome too: once nothing of it is moving it holds nothing,
+ * though its unknown submission stays on record as it was. A native turn, tool or
+ * delivery that is still running holds the session through its own checks (CR4-FLOW-04). */
 export function holdsSession(record) {
   if(!record||record.historical)return false;
   if(inputInFlight(record))return true;
+  if(record.canceledBy)return false;
   return ['unconfirmed','fenced-unconfirmed'].includes(record.state)&&record.reconciliation?.state!=='found'&&record.ownerNotice?.state!=='accepted';
 }
 

@@ -181,3 +181,47 @@ def test_no_process_the_worker_starts_inherits_the_control_channel(tmp_path):
                              pass_fds=(handle.fileno(),), capture_output=True, text=True, timeout=20)
     assert out.stdout.strip() == "None", out.stderr
 
+
+
+def test_every_process_of_an_execution_carries_the_hosts_mark_and_the_worker_passes_on_no_other(tmp_path):
+    """CR4-MM-03: the host's mark goes into the CLI's environment and into each MCP server's, and
+    nowhere else: the worker takes it out of its own, so what it starts for itself carries none."""
+    mark = "5d0c7a4e-3f9b-4c1a-8a8e-2b6f1c9d0e7f"
+    probe = (
+        "import json, os, subprocess, sys\n"
+        "from kin_mind import worker_groups\n"
+        "from kin_mind.codex_executor import codex_argv\n"
+        "own = subprocess.run([sys.executable, '-c', 'import os; print(os.environ.get(\"KIN_WORKER_MARK\"))'],"
+        " capture_output=True, text=True).stdout.strip()\n"
+        "server = {'command': sys.executable, 'args': ['-m', 'kin_mind.web_read'], 'env': {'PYTHONPATH': '/src'}}\n"
+        "argv = codex_argv('codex', '/tmp/x', model='m', reasoning='high', schema_file='/tmp/s', last_file='/tmp/l',"
+        " provider={'id': 'p', 'name': 'P', 'base_url': 'https://gateway.invalid/v1', 'wire_api': 'responses'},"
+        " web_mcp=server, execution_env=worker_groups.execution_env())\n"
+        "print(json.dumps({'own': own, 'execution': worker_groups.execution_env(),"
+        " 'server_env': next(argv[i + 1] for i, a in enumerate(argv) if a == '-c' and argv[i + 1].startswith('mcp_servers.kin_web.env='))}))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], env={**os.environ, worker_groups.MARK_ENV: mark},
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    seen = json.loads(out.stdout.strip().splitlines()[-1])
+    assert seen["own"] == "None", "a process the worker starts for itself carries no mark"
+    assert seen["execution"] == {"KIN_WORKER_MARK": mark}
+    assert seen["server_env"] == 'mcp_servers.kin_web.env={PYTHONPATH="/src", KIN_WORKER_MARK="' + mark + '"}'
+
+
+def test_the_cli_runs_with_the_mark_and_so_does_what_it_starts(tmp_path, monkeypatch):
+    """The CLI's environment is an allow-list; the mark is on it, and a process the CLI starts, in a
+    session of its own as well, inherits it."""
+    monkeypatch.setattr(worker_groups, "_MARK", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+    monkeypatch.setenv(PROVIDER["env_key"], "synthetic-key")
+    grandchild = (
+        "import subprocess\n"
+        "subprocess.run([sys.executable, '-c', 'import os, sys; open(os.path.join(os.getcwd(), \"grandchild.json\"), \"w\").write("
+        "__import__(\"json\").dumps(dict(os.environ)))'], start_new_session=True)\n"
+    )
+    fake = fake_codex(tmp_path / "fake", "open(os.path.join(os.getcwd(), 'cli.json'), 'w').write(json.dumps(dict(os.environ)))\n"
+                      + grandchild + COMPLETE)
+    run_codex(str(fake), TOPIC, tmp_path / "run", budget_seconds=60, **codex_kwargs())
+    for name in ("cli.json", "grandchild.json"):
+        env = json.loads(next((tmp_path / "run").rglob(name)).read_text())
+        assert env["KIN_WORKER_MARK"] == "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", name

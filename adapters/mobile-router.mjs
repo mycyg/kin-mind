@@ -547,22 +547,43 @@ export class MobileRouter {
    * way can never leave the owner unanswered for good. Asking again for the same
    * migration changes nothing, so a caller may poll it while it drains. A deployment's
    * hold stays on a freeze that replaces it: only a thaw ends it (CR3-FLOW-03). `hold`
-   * asks for one: a release left pending holds the running router at once (CR3-REL-01/02). */
+   * asks for one: a release left pending holds the running router at once (CR3-REL-01/02).
+   * A hold another holder put stays that holder's (`holdOf`), so a thaw by the holder that
+   * replaced it gives it back instead of ending it (CR4-REL-04). */
   freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null,hold=false}={}) {
     return this.locked(async()=>{
       if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
       const current=this.frozen()?this.state.freeze:null,id=migrationId?String(migrationId).slice(0,120):null;
       if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id&&(hold!==true||current.hold===true))return clone(current);
       const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:FREEZE_TTL_MS,60000),12*3600000);
-      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{}),...(current?.hold||hold===true?{hold:true}:{})};
+      // KIN-FIX-20260924, CR4-REL-04: whose hold this freeze carries, when it is not this holder's own.
+      const holder={reason:reason.trim().slice(0,200),migrationId:id},same=(a,b)=>a.reason===b.reason&&(a.migrationId??null)===(b.migrationId??null);
+      const under=current?.hold?current.holdOf??(same(current,holder)?null:{reason:current.reason,...(current.migrationId?{migrationId:current.migrationId}:{}),
+        ...(current.by?{by:current.by}:{}),at:current.at,until:current.until}):null;
+      const holdOf=under&&!same(under,holder)?under:null;
+      this.state.freeze={reason:holder.reason,at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{}),...(current?.hold||hold===true?{hold:true}:{}),...(holdOf?{holdOf}:{})};
       this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until,...(id?{migrationId:id}:{})});
       return clone(this.state.freeze);
     });
   }
-  thawDispatch(reason='thawed',{migrationId=null}={}) {
+  /** Lift the freeze. A thaw by holder (CR4-REL-04) -- `holder` {reason, migrationId}, and any
+   * thaw that names its migration, whose holder is then that migration's freeze -- lifts only a
+   * freeze that holder put: another's is left as it is (`not-own`), and a hold another put,
+   * which stayed on this holder's freeze, is given back to its holder, held (`hold-kept`).
+   * Any other thaw -- a release's own, a person's -- lifts whatever freeze there is. */
+  thawDispatch(reason='thawed',{migrationId=null,holder=migrationId?{reason,migrationId}:null}={}) {
     return this.locked(async()=>{
       const previous=this.state.freeze;if(!previous)return {state:'not-frozen'};
-      delete this.state.freeze;this.save('dispatch-thawed',{reason:String(reason).slice(0,200),frozenAt:previous.at,...(migrationId?{migrationId:String(migrationId).slice(0,120)}:{})});
+      const thawed={reason:String(reason).slice(0,200),frozenAt:previous.at,...(migrationId?{migrationId:String(migrationId).slice(0,120)}:{})};
+      if(holder) {
+        const own=previous.reason===String(holder.reason??'').trim().slice(0,200)&&(previous.migrationId??null)===(holder.migrationId?String(holder.migrationId).slice(0,120):null);
+        if(!own)return {state:'not-own',heldBy:previous.reason,...(previous.migrationId?{heldByMigration:previous.migrationId}:{}),...(previous.hold?{hold:true}:{}),frozen:this.frozen()};
+        if(previous.holdOf) {
+          this.state.freeze={...previous.holdOf,hold:true};this.save('dispatch-thawed',{...thawed,holdKept:previous.holdOf.reason});
+          return {state:'hold-kept',frozenAt:previous.at,...(previous.migrationId?{migrationId:previous.migrationId}:{}),heldBy:previous.holdOf.reason};
+        }
+      }
+      delete this.state.freeze;this.save('dispatch-thawed',thawed);
       return {state:'thawed',frozenAt:previous.at,...(previous.migrationId?{migrationId:previous.migrationId}:{})};
     });
   }
@@ -934,11 +955,17 @@ export class MobileRouter {
     // The catalog is read before the clock starts, and the clock always has a
     // listener: a slow catalog can never leave a rejection nobody handles (AD1-05).
     const availableModels=await this.availableModels(runtime);
+    // One deadline for the whole call, the lane's admission and the request alike. When it
+    // passes the call is canceled — a lease that comes late starts nothing — and this
+    // answers only once the call has let go of everything it held, so an activity it runs
+    // under is held until then too (CR4-FLOW-01).
+    const deadline=new AbortController();
     let timer;
-    const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
+    const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{deadline.abort(Error('classification-timeout'));reject(Error('classification-timeout'));},wait);});
     timeout.catch(()=>{});
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.openWork().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})}),timeout]);}
-    finally {clearTimeout(timer);}
+    const call=Promise.resolve().then(()=>this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.openWork().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})},{signal:deadline.signal}));
+    try {return await Promise.race([call,timeout]);}
+    finally {clearTimeout(timer);await call.then(()=>{},()=>{});}
   }
   /** A classification answer, validated and read within its bounds. It never owns
    * the execution lock and never changes state; it exists only when the classifier
