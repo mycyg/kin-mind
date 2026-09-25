@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {submitPayload} from '../../adapters/send-stages.mjs';
+import {submitPayload,platformErrorCode} from '../../adapters/send-stages.mjs';
 
 // The stages are the sender's evidence for what a failure means: before `message-submitting`
 // nothing can have reached the platform, so the same UUID may be sent again.
@@ -68,4 +68,20 @@ test('a check that answers later is waited for: nothing is uploaded or requested
   assert.equal(created,false);
   assert.deepEqual(run.seen.map(s=>[s.stage,s.submissionStarted]),[['uploading',false],['uploaded',false]]);
   assert.equal(seen.length,3);
+});
+
+test('only a platform error code is a refusal: an answer without a usable code, or no answer, stays unknown (CR5-FLOW-02)',async()=>{
+  // The request has left in every case below: what the platform did with it is not in the answer.
+  for(const answer of [{},null,undefined,{code:'230002'},{code:'0'},{code:null},{code:1.5},{code:Number.NaN},{code:true},{code:{}},{msg:'ok',data:{message_id:'om_x'}}]) {
+    const {seen,checkpoint}=stages();
+    await assert.rejects(submitPayload({uuid:'u',checkpoint,create:async()=>answer}),
+      error=>error.code==='PLATFORM_ANSWER_UNKNOWN'&&!('platformCode' in error),JSON.stringify(answer)??'undefined');
+    assert.deepEqual(seen.map(s=>[s.stage,s.submissionStarted]),[['message-submitting',true]]);
+  }
+  // A whole number other than zero is the platform's refusal, whatever its sign.
+  for(const code of [230002,99991663,-1]) {
+    await assert.rejects(submitPayload({uuid:'u',checkpoint:stages().checkpoint,create:async()=>({code,msg:'refused'})}),
+      error=>error.code==='PLATFORM_REJECTED'&&error.platformCode===code);
+  }
+  assert.deepEqual([0,230002,-1,'230002',1.5,null,undefined,Number.MAX_SAFE_INTEGER+2].map(platformErrorCode),[false,true,true,false,false,false,false,false]);
 });
