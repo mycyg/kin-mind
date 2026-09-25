@@ -46,6 +46,8 @@ TEXT_KEYS = frozenset({
     "reconsider_when", "alternative", "suggested_share", "why_distinct", "stance", "recheckCondition",
     # An exploration's brief is the wish's words, copied into its run.
     "selected_brief",
+    # A contact draft's text as its attempt row keeps it, for a send of unknown outcome (CL6D-MM-01).
+    "text_excerpt",
 })
 # Keys whose value is a list of such words: each string goes, and a structured item keeps its ids
 # (a session advice's findings are records with a source id; an exploration's are sentences).
@@ -295,6 +297,38 @@ def tool_read_ids(conn, receipt):
     Beside `shown_ids`, this is everything the model had before it (CL6D-MM-01)."""
     ids = read_ids(receipt)
     return sorted(held(conn, ids) | tombstoned(conn, ids))
+
+
+def reads_truncated(receipt):
+    """Whether a receipt says a fork turn read more than it names: the host keeps 64 tool calls a
+    turn and 100 ids a call -- the owned ACP stops there itself -- and marks a turn that reached
+    either `truncated` (boundaries.mjs `forkReceipt`), wherever the receipt carries one. What was
+    read past them is named nowhere, so no check by id can clear it; `deleted_since` can
+    (CL6D-MM-01)."""
+    def walk(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("tool_calls"), list) and value.get("truncated") is True:
+                return True
+            return any(walk(item) for item in value.values())
+        if isinstance(value, list):
+            return any(walk(item) for item in value)
+        return False
+
+    return walk(receipt)
+
+
+def tombstone_mark(conn):
+    """How far the deletion facts go now. Tombstones are only ever added, so their rows are in the
+    order of the deletes: `deleted_since` this mark is what was deleted after it."""
+    return conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM tombstones").fetchone()[0]
+
+
+def deleted_since(conn, mark):
+    """Every source and record deleted after `mark` (`tombstone_mark`): all that a model which began
+    after the mark may have read and no receipt names, once the receipt is `truncated`. Without a
+    mark, every delete counts."""
+    mark = mark if isinstance(mark, int) and not isinstance(mark, bool) else 0
+    return {row[0] for row in conn.execute("SELECT key FROM tombstones WHERE rowid>?", (mark,))}
 
 
 def drop_refs(value, ids):

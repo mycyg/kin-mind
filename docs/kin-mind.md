@@ -354,6 +354,18 @@ deterministic operation survives restart and never creates evidence or scores.
 Expired or corrected sources cannot resume. Every attempted draft passes the
 send-boundary checks again after a condition becomes ready.
 
+A draft's attempt row names what the draft had before it (`evaluated_ids`): the ids
+the memory context and the state handed to it name, the wishes and sends of unknown
+outcome it was offered, and what its fork's tools returned (`draft_receipt`). Kin's
+words from it -- the reason of a wait or an abandon, the text about to be sent -- are
+written only while none of that is deleted, checked in the write that keeps them;
+otherwise the attempt settles as `draft-sources-deleted`, nothing is sent, and the
+wishes wait five minutes to be drafted again. When the fork's receipt was cut short
+(`truncated`), any delete since the claim counts. A reason copied onto a wish names
+the same beside it (`reason_evidence_ids`, in the wish and in its `contact_wait`), so
+a later delete takes it there too. A text already sent is her message to the owner
+and stays with the conversation; only the row's copy of it goes.
+
 Unparseable or invalid output, empty output and model execution failures carry
 distinct failure codes, separate from a valid decision to wait. Their contact
 receipt keeps only a static category/code, retry condition and redacted model

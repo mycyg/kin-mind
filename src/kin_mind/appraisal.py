@@ -741,6 +741,13 @@ procedure_learning=true 时，从实际任务结果提出 procedure_candidates�
 这些字段在功能未启用、历史整理或纯会话维护时留空；无需每次都安排事情。reason 只写简短公开结论，不输出推理轨迹。宿主不使用分数阈值，行动依据当前有效决定、明确授权与真实情境；你判断联系时机，宿主保证新输入优先和执行不冲突。
 """
 
+def unlisted(value):
+    """`value` without the lists that name what a copied field was written from (`<field>_evidence_ids`):
+    they are for the erase rule, and a contact draft's names everything it had before it. The model
+    reads the words; what it was shown is named from the state as read, not as rendered (CL6D-MM-01)."""
+    return {k: v for k, v in value.items() if not k.endswith("_evidence_ids")} if isinstance(value, dict) else value
+
+
 def appraisal_context(context):
     """Project decision inputs; immutable evidence and full history stay in storage."""
     result = dict(context)
@@ -794,6 +801,8 @@ def appraisal_context(context):
         "continuity", "rhythm", "appraisal_summary", "exploration_decisions", "exploration_capabilities",
         "contact_unconfirmed",
     }}
+    if isinstance(state.get("contact_unconfirmed"), list):
+        state["contact_unconfirmed"] = [unlisted(u) for u in state["contact_unconfirmed"]]
     state["dimensions"] = {}
     for key, value in original.get("dimensions", {}).items():
         projected = {k: v for k, v in value.items() if k in {
@@ -824,6 +833,8 @@ def appraisal_context(context):
         if active:
             keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
         projected = {k: v for k, v in desire.items() if k in keys}
+        if isinstance(projected.get("contact_wait"), dict):
+            projected["contact_wait"] = unlisted(projected["contact_wait"])
         projected["content"] = desire.get("content", "")
         if active:
             projected["reason"] = desire.get("reason", "")
@@ -1918,6 +1929,9 @@ class Appraisals:
             # so nothing recorded it. Back-fill that attempt before this one starts.
             killed = {**data} if row["state"] == "running" else None
             data["attempt_started_at"] = self.mind.clock()
+            # How far the deletes went as this attempt began: a fork turn whose receipt was cut short
+            # may have read anything deleted after it (CL6D-MM-01).
+            data["tombstone_mark"] = erasure.tombstone_mark(conn)
             data["attempt_token"] = uuid.uuid4().hex
             data.pop("tier", None)
             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
@@ -2187,6 +2201,9 @@ class Appraisals:
                         # What it was shown, and what its model read with its tools, which a row from
                         # before this release names only in the stored receipt (CL6D-MM-01).
                         shown_gone = erasure.tombstoned(conn, [*(data.get("evaluated_ids") or ()), *erasure.read_ids(stored.receipt)])
+                    # A receipt cut short (`truncated`) does not name all its fork read, so nothing can
+                    # say all of that still stands: such a proposal is asked again in full (CL6D-MM-01).
+                    shown_gone = shown_gone or erasure.reads_truncated(stored.receipt)
                 if stored and (shown_gone or any(isinstance(ref, dict) and ref.get("erased")
                                                  for ref in [*stored.sources, *(data.get("evaluated_sources") or [])])):
                     # Something the stored proposal's model was shown has been deleted since, and the delete
@@ -2351,6 +2368,12 @@ class Appraisals:
                     # Only a deletion stops the commit: the state's own entries keep older versions of
                     # what they cite all the time, and a revision is not a delete (CL6-MM-03).
                     gone = erasure.tombstoned(conn, data.get("evaluated_ids") or ())
+                    if not gone and erasure.reads_truncated(receipt):
+                        # A fork turn read more than its receipt names: anything deleted since this
+                        # attempt began may have been among it, and the row names it so, which takes
+                        # the words this attempt leaves on it (CL6D-MM-01).
+                        gone = erasure.deleted_since(conn, data.get("tombstone_mark"))
+                        data["evaluated_ids"] = sorted(set(data.get("evaluated_ids") or ()) | gone)
                     if gone:
                         raise Conflict("Something the model was shown has been deleted", target=min(gone))
                     # What this commit attempt refuses or holds. It is written to the queue row as it happens, so
@@ -2997,6 +3020,15 @@ class DailyReview:
                 "INSERT INTO mind_daily_reviews VALUES(?,?,?,?) ON CONFLICT(scope,day) DO UPDATE SET state=excluded.state,data=excluded.data",
                 (self.mind.scope.key(), day, "evaluating", "{}"),
             )
+            # How far the deletes went before the model was asked (CL6D-MM-01).
+            mark = erasure.tombstone_mark(conn)
+
+        def deleted(conn, evaluated, receipt):
+            """What the review had before it that is deleted now: by what it names, and -- when its
+            receipt was cut short -- anything deleted since it began (CL6D-MM-01)."""
+            gone = erasure.tombstoned(conn, evaluated)
+            return gone or (erasure.deleted_since(conn, mark) if erasure.reads_truncated(receipt) else set())
+
         data = {}
         # What the review is shown is what its words rest on, named with them (CR5-MM-09).
         shown = list(unique.values())[:20]
@@ -3037,7 +3069,7 @@ class DailyReview:
 
                 def apply(conn, state, eid):
                     # Checked in the transaction that records the change, as an appraisal's commit is.
-                    gone = erasure.tombstoned(conn, evaluated)
+                    gone = deleted(conn, evaluated, receipt)
                     if gone:
                         raise Conflict("Something the model was shown has been deleted", target=min(gone))
                     return self.mind._apply_event(conn, state, event, eid)
@@ -3055,7 +3087,7 @@ class DailyReview:
             # write: deleted or changed while it answered, the reason goes and the receipt and the
             # error stay. What stays names its sources, so a later delete finds it (CR5-MM-09).
             if data.get("reason") and ((data.get("evidence") and not self.mind._fresh(conn, shown))
-                                       or erasure.tombstoned(conn, data.get("evaluated_ids") or ())):
+                                       or deleted(conn, data.get("evaluated_ids") or (), data.get("receipt"))):
                 data.pop("reason")
                 data["reason_withheld"] = "sources-changed"
             data = kept(conn, data)
