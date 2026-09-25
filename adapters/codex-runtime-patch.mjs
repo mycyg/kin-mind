@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V2';
+const assessmentMarker = '// KIN_ASSESS_V3';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -442,9 +442,17 @@ function kinSteerAccepted(state, params) {
  * newest this ACP saw complete, or else the newest the native history lists as
  * completed (a bounded read, newest first). Without one, or when the history cannot
  * be read in its documented shape, no fork is made: `no-completed-turn`, with the
- * reason. Each tool call is reported as `{name, ok, ids}` (CR-MIND-08): `ids` are the
- * record and source ids the call's structured result actually returned, each with its
- * revision where the result gave one, at most 100; `[]` when nothing can be read.
+ * reason. Each tool call is reported as `{name, ok, ids, idsTruncated, idsTruncatedBy?}`
+ * (CR-MIND-08, CL6E-MM-04). `ids` are the store's source and record ids (`src_`, `mem_`)
+ * the call's completed result carries anywhere -- values, keys, JSON carried as text (a
+ * packed read's lines), its structured result or else its text -- each with its revision
+ * where the result gave one; `[]` when there are none. What the result says it left out
+ * is not read: a recall's `trace`, `omitted_ids`, `needs_review_ids`, and the
+ * `deleted_ids` Kin's memory server lists as deleted before the read began. Reading
+ * stops at 1000 ids a call, 2000 a turn, 50000 nodes, 32 levels or 4 MB of text. Every
+ * call says whether it was cut short (`idsTruncated`), and a call that was names every
+ * bound that cut it (`idsTruncatedBy`: ids-per-call, ids-per-turn, nodes, depth, text,
+ * or rests-on when the memory server says it could not name all its result rests on).
  *
  * Every answer says how far it got, as `stage` (CR2-INT-06), beside the state and the
  * reason it already gave: `not-started` -- no turn was asked for, so no model was
@@ -475,40 +483,77 @@ export function patchKinAssessment(source) {
     return { reason: String(error?.message ?? error) === "timeout" ? "native-history-timeout" : "native-history-unavailable" };
   }
 }
-const KIN_ID_LIST_KEYS = new Set(["record_ids", "source_ids", "evidence_ids", "result_ids"]);
-function kinToolResultIds(item) {
-  if (item?.type !== "mcpToolCall" || item.status !== "completed") return [];
-  let value = item.result?.structuredContent;
-  if (!value || typeof value !== "object") {
-    value = [];
-    for (const part of Array.isArray(item.result?.content) ? item.result.content : []) {
-      if (part?.type !== "text" || typeof part.text !== "string") continue;
-      try { value.push(JSON.parse(part.text)); } catch {}
-    }
-  }
-  const found = new Map();
-  let nodes = 0;
+// The store's own ids, as eventmem.core.db.NAMED writes them: a source (src_) or a record
+// (mem_) and 32 hex digits. Only these name what a delete takes; any other id is left out.
+const KIN_STORE_ID = /\\b(?:src|mem)_[0-9a-f]{32}\\b/g;
+// How much of a turn's tool results is read for ids (CL6E-MM-04). A call cut short by any of these
+// says so, and by which; nothing is left for the host to guess from a count.
+const KIN_TOOL_ID_LIMITS = Object.freeze({ perCall: 1000, perTurn: 2000, nodes: 50000, depth: 32, text: 4000000 });
+// What a result says it left out: a recall's trace of what it filtered away, the items a packed
+// read omitted or found stale, and the ids Kin's memory server names as deleted before the read
+// began (bare references a delete left behind, with no words).
+const KIN_LEFT_OUT = new Set(["trace", "omitted_ids", "needs_review_ids", "deleted_ids"]);
+function kinToolResultIds(item, turn) {
+  if (item?.type !== "mcpToolCall" || item.status !== "completed") return { ids: [], idsTruncated: false };
+  const found = new Map(), cut = new Set(), deleted = new Set();
+  let nodes = 0, text = 0;
   const add = (id, revision) => {
-    if (typeof id !== "string" || !id || id.length > 200 || found.size >= 100) return;
+    if (deleted.has(id)) return;
     const known = found.get(id);
-    if (!known) found.set(id, { id, revision: Number.isSafeInteger(revision) ? revision : null });
-    else if (known.revision === null && Number.isSafeInteger(revision)) known.revision = revision;
+    if (known) { if (known.revision === null && Number.isSafeInteger(revision)) known.revision = revision; return; }
+    if (found.size >= KIN_TOOL_ID_LIMITS.perCall) { cut.add("ids-per-call"); return; }
+    if (turn.used >= KIN_TOOL_ID_LIMITS.perTurn) { cut.add("ids-per-turn"); return; }
+    turn.used++;
+    found.set(id, { id, revision: Number.isSafeInteger(revision) ? revision : null });
+  };
+  const scan = (value, revision) => {
+    for (const match of value.matchAll(KIN_STORE_ID)) add(match[0], revision);
+  };
+  // A string is read once, within the text bound. JSON it carries -- a packed read's lines, an
+  // item's text -- is read as JSON, so a record in it keeps the revision it was shown at.
+  const read = (value, depth, revision) => {
+    if (text + value.length > KIN_TOOL_ID_LIMITS.text) { cut.add("text"); value = value.slice(0, Math.max(0, KIN_TOOL_ID_LIMITS.text - text)); }
+    text += value.length;
+    if (!/^\\s*[[{]/.test(value)) { scan(value, revision); return; }
+    let whole;
+    try { whole = JSON.parse(value); } catch {}
+    if (whole && typeof whole === "object") { walk(whole, depth + 1); return; }
+    for (const line of value.split("\\n")) {
+      let parsed;
+      try { parsed = /^\\s*[[{]/.test(line) ? JSON.parse(line) : undefined; } catch {}
+      if (parsed && typeof parsed === "object") walk(parsed, depth + 1); else scan(line, revision);
+    }
   };
   const walk = (node, depth) => {
-    if (!node || typeof node !== "object" || depth > 12 || ++nodes > 20000) return;
+    if (typeof node === "string") { read(node, depth, null); return; }
+    if (!node || typeof node !== "object") return;
+    if (depth > KIN_TOOL_ID_LIMITS.depth) { cut.add("depth"); return; }
+    if (++nodes > KIN_TOOL_ID_LIMITS.nodes) { cut.add("nodes"); return; }
     if (Array.isArray(node)) { for (const entry of node) walk(entry, depth + 1); return; }
     const revision = Number.isSafeInteger(node.revision) ? node.revision : null;
-    if (typeof node.id === "string") add(node.id, revision);
-    if (typeof node.record_id === "string") add(node.record_id, revision);
-    if (typeof node.source_id === "string") add(node.source_id, null);
     for (const [key, entry] of Object.entries(node)) {
-      if (key === "trace") continue;
-      if (KIN_ID_LIST_KEYS.has(key) && Array.isArray(entry)) { for (const id of entry) add(id, null); continue; }
-      walk(entry, depth + 1);
+      if (KIN_LEFT_OUT.has(key)) continue;
+      read(key, depth, null);
+      if (typeof entry === "string") read(entry, depth, key === "id" || key === "record_id" ? revision : null);
+      else walk(entry, depth + 1);
     }
   };
-  walk(value, 0);
-  return [...found.values()];
+  const structured = item.result?.structuredContent;
+  const values = [];
+  if (structured && typeof structured === "object") values.push(structured);
+  else for (const part of Array.isArray(item.result?.content) ? item.result.content : []) {
+    if (part?.type !== "text" || typeof part.text !== "string") continue;
+    try { values.push(JSON.parse(part.text)); } catch { values.push(part.text); }
+  }
+  // Kin's memory server says which of what a result names was deleted before the read, and when it
+  // could not name everything the result rests on (kin_memory_mcp.py, read-only mode).
+  for (const value of values) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    for (const id of Array.isArray(value.deleted_ids) ? value.deleted_ids : []) if (typeof id === "string") deleted.add(id);
+    if (value.rests_on_truncated === true) cut.add("rests-on");
+  }
+  for (const value of values) walk(value, 0);
+  return { ids: [...found.values()], idsTruncated: cut.size > 0, ...(cut.size ? { idsTruncatedBy: [...cut].sort() } : {}) };
 }
 `, 'ACP assessment helpers');
   const method = `
@@ -569,11 +614,16 @@ function kinToolResultIds(item) {
         if (stopped) void interrupt(forkThreadId, id);
       }), deadline, "timeout");
       turnDone = true;
-      const turn = outcome.turn, items = turn.items?.length ? turn.items : seen;
+      // What the turn did, as this ACP saw each item complete. The completed turn itself lists its
+      // items only in summary (itemsView "summary": the final message alone, in the pinned
+      // app-server), so it only adds what was not seen (CL6E-MM-04).
+      const turn = outcome.turn, items = [...seen], seenIds = new Set(seen.map((item) => item?.id).filter(Boolean));
+      for (const item of Array.isArray(turn.items) ? turn.items : []) if (!item?.id || !seenIds.has(item.id)) items.push(item);
       result.turnId = turn.id;
       result.usage = usage;
+      const idTurn = { used: 0 };
       result.toolCalls = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "commandExecution", "webSearch", "fileChange"].includes(item.type))
-        .map((item) => ({ name: item.type === "mcpToolCall" ? \`\${item.server}.\${item.tool}\` : item.type === "dynamicToolCall" ? item.tool : item.type, ok: item.status === "completed", ids: kinToolResultIds(item) }));
+        .map((item) => ({ name: item.type === "mcpToolCall" ? \`\${item.server}.\${item.tool}\` : item.type === "dynamicToolCall" ? item.tool : item.type, ok: item.status === "completed", ...kinToolResultIds(item, idTurn) }));
       const text = items.findLast((item) => item.type === "agentMessage")?.text ?? "";
       result.rawText = text;
       if (turn.status === "interrupted") return end("interrupted");
