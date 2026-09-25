@@ -334,13 +334,15 @@ def test_reerase_erases_what_rests_on_an_input_deleted_before_the_release_and_th
     unrelated = store.reflection("reflect-2", [root_id(kept)], "天气不错的一天")
     queue = store.queue_row("appraisal-1", [said_ref], f"想起她住过 {MARKER} 街")
     store.receipt("appraise-1", [said], f"她住过 {MARKER} 街")
-    exploration = store.row("mind_explorations", "explore_1")
+    exploration, creation_run = store.row("mind_explorations", "explore_1"), store.row("mind_plan_runs", "run-1")
     # The delete, as the release before this one made it; then what its erase left, restored: the
-    # rule it had did not know these fields.
+    # rule it had did not know these fields, nor that a row naming nothing of what it was shown
+    # loses its words to any delete (CL6D-MM-04).
     store.engine.delete(said)
     with store.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE mind_appraisals SET data=? WHERE id='appraisal-1'", (json.dumps(queue, ensure_ascii=False),))
         conn.execute("UPDATE mind_explorations SET data=? WHERE id='explore_1'", (json.dumps(exploration, ensure_ascii=False),))
+        conn.execute("UPDATE mind_plan_runs SET data=? WHERE id='run-1'", (json.dumps(creation_run, ensure_ascii=False),))
         conn.execute("INSERT OR REPLACE INTO mind_state VALUES(?,?,?)", (store.scope.key(), 1, json.dumps(
             {"revision": 1, "concerns": {"concern-1": {"id": "concern-1", "kind": "care", "status": "active",
                                                        "evidence": [said_ref], "target": f"{MARKER} 街的老房子"}}},
