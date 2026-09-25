@@ -64,10 +64,11 @@ CODED_TEXT = frozenset({"target"})
 CODED_LISTS = frozenset({"verification_gaps"})
 # `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
 # sources included: a queue row or a run that names one of them erased loses every word the model or
-# the executor wrote (CR5-MM-01). `evaluated_ids` is the rest of what an appraisal's model was shown --
-# the mind's state, methods, entries marked for review -- by the sources and records it names
+# the executor wrote (CR5-MM-01). An enrichment row names the same for the memory its parent's model
+# proposed, as `seed_sources` (CL6-MM-04). `evaluated_ids` is the rest of what an appraisal's model was
+# shown -- the mind's state, methods, entries marked for review -- by the sources and records it names
 # (CL6-MM-03).
-REF_LISTS = ("evidence", "resolution_evidence", "refs", "evaluated_sources")
+REF_LISTS = ("evidence", "resolution_evidence", "refs", "evaluated_sources", "seed_sources")
 ID_LISTS = ("evidence_ids", "source_ids", "record_ids", "input_ids", "result_ids", "member_ids",
             "evaluated_continuity", "evaluated_ids")
 # A field copied from elsewhere names what it was written from beside it, as `<field>_evidence_ids`:

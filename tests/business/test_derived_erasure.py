@@ -712,3 +712,58 @@ def test_a_plan_whose_evidence_is_deleted_keeps_its_steps_and_their_state_withou
         plan = plans.get(conn, run["plan_id"])
     assert plan["status"] == "active" and [s["state"] for s in plan["steps"]] == ["waiting"]
     assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def enrichment_after(setup, recalled_text, *, wish=False):
+    """The action lane commits and hands the memory its model proposed to an enrichment row. The
+    proposal repeats words of something the model was only shown: a message it recalled, or the
+    one behind a wish in the state. Returns the mind, what to delete, and the row's id."""
+    from kin_mind.memory import MemoryAssessment, MemoryNote
+
+    mind, source, clock = setup
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True, "semantic": True, "operational_lanes": True})
+    recalled = memory.ingest({"id": "said-earlier", "kind": "owner-message", "at": clock[0].isoformat(), "text": recalled_text})["source_id"]
+    said = state_wish(mind, source) if wish else None
+    primary = source("today", "今天天气不错")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Reader:
+        def appraise(self, context):
+            assert MARKER in json.dumps(context, ensure_ascii=False)
+            paid(self)
+            return answered(Appraisal(reason="看了看今天", values={"curiosity": 61}, memory=MemoryAssessment(notes=[
+                MemoryNote(key="today", title="今天", content=f"今天她又说起 {MARKER}", evidence_ids=[record])])))
+
+    jobs = Appraisals(mind)
+    jobs.enqueue([primary], "synthetic-v1")
+    assert jobs.run_one(Reader(), lane="action")["state"] == "complete"
+    with mind.engine.db.connect() as conn:
+        [(enrichment, data)] = conn.execute("SELECT id,data FROM mind_appraisals WHERE id LIKE 'enrich_%'").fetchall()
+    assert MARKER in json.dumps(json.loads(data)["seed_memory"], ensure_ascii=False), "the seed holds the words"
+    return mind, said or recalled, enrichment
+
+
+def test_an_enrichment_row_as_the_last_release_wrote_it_keeps_no_words_of_a_recalled_source_once_deleted(setup):
+    """An enrichment row from before this release names what its seed was written from only as
+    `seed_sources`. Deleting a message the parent only recalled takes every word of the row, not
+    just the items that cite the message, and the seed is not reused (CL6-MM-04)."""
+    mind, recalled, enrichment = enrichment_after(setup, f"我小时候住在 {MARKER} 街")
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET data=json_remove(data,'$.evaluated_ids') WHERE id=?", (enrichment,))
+    mind.engine.delete(recalled)
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    state, count, data = queue_row(mind, enrichment)
+    assert all(ref.get("erased") for ref in data["seed_sources"] if ref.get("source_id") == recalled)
+    assert data["seed_memory"]["notes"][0]["key"] == "today", "what the seed is stays"
+
+
+def test_an_enrichment_row_keeps_no_words_of_a_source_behind_the_state_once_deleted(setup):
+    """The row names what its parent was shown besides its sources (`evaluated_ids`): deleting the
+    message behind a wish the state showed takes every word of the seed (CL6-MM-03)."""
+    mind, said, enrichment = enrichment_after(setup, "昨天说的一句话", wish=True)
+    mind.engine.delete(said)
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    assert queue_row(mind, enrichment)[2]["seed_memory"]["notes"][0]["content"] == ERASED
