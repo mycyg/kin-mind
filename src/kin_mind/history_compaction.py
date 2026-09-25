@@ -86,7 +86,7 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-from eventmem.core.db import Conflict, digest, dumps
+from eventmem.core.db import NAMED, Conflict, digest, dumps
 
 from . import history
 
@@ -1377,7 +1377,7 @@ def _restoring(db, scope, path, erased, batch):
                     _refuse("archive-row-differs-from-its-digest", revision=row["revision"])
                 data = _parse(row["data"])
                 if data is None:
-                    if erased.intersection(erasure.IDENTIFIER.findall(row["data"])):
+                    if erased.intersection(NAMED.findall(row["data"])):
                         # Nothing can be taken out of a row that will not parse, and it may not
                         # go back with erased words in it.
                         _refuse("archive-row-unreadable-and-names-erased-material", revision=row["revision"])
