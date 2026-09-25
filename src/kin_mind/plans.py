@@ -756,6 +756,16 @@ class AutonomousPlans:
                     return {"state": "claimed", "run": attempt, "plan": plan, "step": step}
         return {"state": "waiting", "reason": "no-current-decision"}
 
+    def note_shown(self, run_id, shown):
+        """What a claimed run's brief showed its executor besides the decision's evidence -- the
+        dialogue, earlier results, histories. The run's result is stored only while all of it
+        still stands (creation.accept_result, CR5-MM-02)."""
+        with self.engine.db.connect(write=True) as conn:
+            row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND id=? AND state='running'",
+                               (self.scope, run_id)).fetchone()
+            if row:
+                conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (dumps({**json.loads(row[0]), "shown": shown}), run_id))
+
     def renew(self, run_id, owner, fence):
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND id=?", (self.scope, run_id)).fetchone()
@@ -783,6 +793,10 @@ class AutonomousPlans:
                 raise Conflict("Execution fence mismatch", target=run_id, expected=fence,
                                actual=row["fence"] if row else None)
             run = json.loads(row["data"])
+            # A result settled after something it names was deleted keeps no words of it: the
+            # delete's own rule, in this write (CR5-MM-02).
+            from .erasure import drop_deleted
+            result = drop_deleted(conn, result)
             if row["state"] != "running":
                 if run.get("result") == result and row["state"] == state:
                     return run

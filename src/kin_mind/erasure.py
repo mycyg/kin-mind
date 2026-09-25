@@ -40,11 +40,37 @@ TEXT_KEYS = frozenset({
     "excerpt", "detail", "message", "conclusions", "pending", "corrections", "unresolved",
     "preview", "question", "answer", "condition", "explanation", "claim", "prediction",
     "evidence_text", "locator_text", "rationale", "interpretation", "body",
+    # Free text of the structured models that was missing here (CR5-MM-01): a sharing decision's
+    # condition, a next move's alternative, a finding's suggested share, a trait episode's
+    # distinction, an expression's stance, a session advice's recheck condition.
+    "reconsider_when", "alternative", "suggested_share", "why_distinct", "stance", "recheckCondition",
+    # An exploration's brief is the wish's words, copied into its run.
+    "selected_brief",
 })
+# Keys whose value is a list of such words: each string goes, and a structured item keeps its ids
+# (a session advice's findings are records with a source id; an exploration's are sentences).
+TEXT_LISTS = frozenset({
+    "findings", "open_questions", "advisory", "downstream", "remaining", "step_remaining", "grounds",
+    "avoid", "conditions_met", "preconditions", "queries",
+})
+# Keys whose value maps names to words: every word goes, the names stay.
+TEXT_MAPS = frozenset({"traits"})
 # `action` is an enum in every command and free text in an owner request: only the second goes.
 ENUM = re.compile(r"[a-z][a-z0-9_:-]{0,39}")
-REF_LISTS = ("evidence", "resolution_evidence", "refs")
-ID_LISTS = ("evidence_ids", "source_ids", "record_ids", "input_ids", "result_ids", "member_ids")
+# Keys that hold either a code or an identifier, or words: a concern's `target`, a conflict's; a
+# creation's `verification_gaps`, host codes beside the reviewer's own gaps. The words go.
+CODE = re.compile(r"[a-z][a-z0-9_:.-]{0,79}")
+CODED_TEXT = frozenset({"target"})
+CODED_LISTS = frozenset({"verification_gaps"})
+# `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
+# sources included: a queue row or a run that names one of them erased loses every word the model or
+# the executor wrote (CR5-MM-01).
+REF_LISTS = ("evidence", "resolution_evidence", "refs", "evaluated_sources")
+ID_LISTS = ("evidence_ids", "source_ids", "record_ids", "input_ids", "result_ids", "member_ids",
+            "evaluated_continuity")
+# A field copied from elsewhere names what it was written from beside it, as `<field>_evidence_ids`:
+# an erase takes that field's words, and only that field's (CR5-MM-01).
+FIELD_EVIDENCE = "_evidence_ids"
 ID_KEYS = ("source_id", "record_id")
 TOMBSTONE_KEYS = ("source_id", "record_id", "hash", "revision", "authority")
 IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
@@ -108,6 +134,26 @@ def _blank(value):
     return value
 
 
+def _blank_each(items):
+    out = [_blank(item) if isinstance(item, str) else scrub(item, (), erase=True) for item in items]
+    return items if all(a is b for a, b in zip(out, items)) else out
+
+
+def _blank_values(mapping):
+    out = {key: _blank(item) if isinstance(item, str) else scrub(item, (), erase=True) for key, item in mapping.items()}
+    return mapping if all(out[key] is mapping[key] for key in mapping) else out
+
+
+def _blank_words(items):
+    out = [ERASED if isinstance(item, str) and item != ERASED and not CODE.fullmatch(item) else item for item in items]
+    return items if all(a is b for a, b in zip(out, items)) else out
+
+
+def _field_cites(value, key, ids):
+    found = value.get(key + FIELD_EVIDENCE)
+    return isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found)
+
+
 def _tombstone(ref, ids):
     if isinstance(ref, dict) and (ref.get("source_id") in ids or ref.get("record_id") in ids):
         stone = {key: ref[key] for key in TOMBSTONE_KEYS if key in ref}
@@ -130,8 +176,19 @@ def scrub(value, ids, *, erase=False):
     for key, item in value.items():
         if erase and key in TEXT_KEYS:
             new = _blank(item)
+        elif _field_cites(value, key, ids):
+            # A field copied from what was erased, whatever its shape: its words go.
+            new = _blank(item) if isinstance(item, str) else scrub(item, (), erase=True)
+        elif erase and key in TEXT_LISTS and isinstance(item, list):
+            new = _blank_each(item)
+        elif erase and key in TEXT_MAPS and isinstance(item, dict):
+            new = _blank_values(item)
         elif erase and key == "action" and isinstance(item, str) and item != ERASED and not ENUM.fullmatch(item):
             new = ERASED
+        elif erase and key in CODED_TEXT and isinstance(item, str) and item != ERASED and not CODE.fullmatch(item):
+            new = ERASED
+        elif erase and key in CODED_LISTS and isinstance(item, list):
+            new = _blank_words(item)
         elif key in REF_LISTS and isinstance(item, list):
             new = [_tombstone(ref, ids) for ref in item]
             new = item if all(a is b for a, b in zip(new, item)) else new
@@ -141,6 +198,22 @@ def scrub(value, ids, *, erase=False):
         changed = changed or new is not item
         out[key] = new
     return out if changed else value
+
+
+def drop_deleted(conn, value):
+    """`value` as it may be written now, inside the transaction that writes it: whatever it names
+    that the store has deleted since it was read -- the tombstone is the deletion fact -- is taken
+    out by this module's own rule, `scrub`. Identities, states, error codes and usage stay. A value
+    that names nothing deleted comes back as it is (CR4-MM-02, CR5-MM-01)."""
+    from eventmem.core.db import NAMED
+
+    named = sorted(set(NAMED.findall(dumps(value))))
+    erased = set()
+    for start in range(0, len(named), 500):
+        page = named[start:start + 500]
+        erased.update(row[0] for row in conn.execute(
+            "SELECT key FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
+    return scrub(value, frozenset(erased)) if erased else value
 
 
 def drop_refs(value, ids):

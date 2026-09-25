@@ -104,17 +104,12 @@ def kept(conn, data):
     wrote from them. So whatever the copy names that the store has deleted since (the tombstone is
     the deletion fact) is taken out by the erase's own rule, `erasure.scrub`: the words go, the
     references become tombstone references, and identities, states, error codes, usage and the
-    attempt token stay. A copy that names nothing deleted is written as it is."""
-    from eventmem.core.db import NAMED
+    attempt token stay. A copy that names nothing deleted is written as it is. The row names every
+    source its model was shown as `evaluated_sources`, recall-only ones included, so one of them
+    deleted takes every word the model wrote from it (CR5-MM-01)."""
+    from .erasure import drop_deleted
 
-    from .erasure import scrub
-    named = sorted(set(NAMED.findall(dumps(data))))
-    erased = set()
-    for start in range(0, len(named), 500):
-        page = named[start:start + 500]
-        erased.update(row[0] for row in conn.execute(
-            "SELECT key FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
-    return scrub(data, frozenset(erased)) if erased else data
+    return drop_deleted(conn, data)
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -1941,6 +1936,8 @@ class Appraisals:
         calls = slots.enter_context(attempts.collect(provider))
         admission_wait = False
         uncharged_wait = False
+        # This attempt ended for good before its appraisal call was made: not a charged one (CR5-MM-07).
+        ended_before_call = False
         # This attempt only finished the row from another attempt's durable receipt (CR2-MIND-03).
         recovered = False
         model_admitted = False
@@ -2180,6 +2177,13 @@ class Appraisals:
                 # Its sources that are still current are merged back, so the moving dialogue window and
                 # what the fork read with its tools can neither remove nor authorize different evidence.
                 stored = revalidation.candidate(data, historical)
+                if stored and any(isinstance(ref, dict) and ref.get("erased") for ref in [*stored.sources, *(data.get("evaluated_sources") or [])]):
+                    # Something the stored proposal's model was shown has been deleted since, and the delete
+                    # took its words: it is neither reused nor put to a light question (CR5-MM-01).
+                    revalidation.forget(data)
+                    if stored.origin == "seed":
+                        data["seed_rejected"] = True
+                    stored = None
                 if stored:
                     lighting = stored.origin == "reuse"
                     light = revalidation.resume(self, provider, row, data, model_context, stored, manifest=manifest, semantic_refs=semantic_refs,
@@ -2313,8 +2317,10 @@ class Appraisals:
                     if not self.mind._fresh(conn, refs) or not self.mind._fresh(conn, targets):
                         stale = next((r["source_id"] for r in refs if not self.mind._fresh(conn, [r])), None)
                         raise Conflict("Evaluated sources changed before commit", target=stale)
-                    used_evidence = {identifier for items in (proposal.memory.notes, proposal.memory.links, proposal.memory.graph.nodes, proposal.memory.graph.edges, proposal.memory.event_routes) for item in items for identifier in item.evidence_ids}
-                    moved = next((ref for ref in semantic_refs.values() if {ref["source_id"], ref["record_id"]} & used_evidence and not self.mind._fresh(conn, [ref])), None)
+                    # Every source the model was shown, not only the ones the proposal cites: one read for
+                    # recall alone can still have been written from, so one deleted or changed while the
+                    # model answered stops the commit, and the retry is shown what is there (CR5-MM-01).
+                    moved = next((ref for ref in semantic_refs.values() if not self.mind._fresh(conn, [ref])), None)
                     if moved:
                         raise Conflict("Referenced semantic evidence changed before commit",
                                        target=moved["record_id"], expected=moved["revision"])
@@ -2712,7 +2718,8 @@ class Appraisals:
                     data["result"] = self.mind._record_only(event, apply)
                 else:
                     data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
-            self.memory.remember_reflection(data["result"])
+            # What the appraisal was shown goes with the result: the reflection is written from it (CR5-MM-02).
+            self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or []})
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.
@@ -2788,12 +2795,14 @@ class Appraisals:
             elif found.handling == "terminal":
                 # Nothing left to judge, or judged already: no retry can change that.
                 state = self._terminal_conflict(data, error)
+                ended_before_call = preparing and not completed_appraisal(calls)
             elif preparing and isinstance(error, (Conflict, Missing)):
                 uncharged_wait = "preparation"
                 state = self._preparation_conflict(data, error)
             elif preparing and isinstance(error, DETERMINISTIC_ERRORS):
                 data["error_detail"] = error_detail(error, str(data.get("error", "")))
                 state = self._quarantine(data, "deterministic-preparation-error:" + type(error).__name__)
+                ended_before_call = not completed_appraisal(calls)
             elif lighting:
                 # A charged attempt is one full appraisal call, and this attempt made none.
                 uncharged_wait = "light"
@@ -2825,7 +2834,7 @@ class Appraisals:
         else:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
         # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
-        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered)
+        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered or ended_before_call)
         with self.engine.db.connect(write=True) as conn:
             # The row as this attempt leaves it, less anything deleted while it ran (CR4-MM-02).
             stored = kept(conn, data)
@@ -2957,9 +2966,11 @@ class DailyReview:
                 (self.mind.scope.key(), day, "evaluating", "{}"),
             )
         data = {}
+        # What the review is shown is what its words rest on, named with them (CR5-MM-09).
+        shown = list(unique.values())[:20]
         try:
             view = self.mind.read()
-            ids = [r["record_id"] for r in list(unique.values())[:20]]
+            ids = [r["record_id"] for r in shown]
             sources = [
                 {"id": rid, "text": self.engine.get(rid)["content"][:4000]}
                 for rid in ids
@@ -2976,7 +2987,7 @@ class DailyReview:
                     "instruction": "只依据给定的当前假设与事前行为检验编号提出人格发展建议。不修改短期情绪值或愿望，保留反例；证据不足时 evolution=null。",
                 }
             )
-            data = {"receipt": receipt, "reason": proposal.reason}
+            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown}
             if proposal.evolution:
                 data["result"] = self.mind.record(
                     AffectiveEvent(
@@ -2997,6 +3008,13 @@ class DailyReview:
             state = "needs-review"
             data["error"] = type(error).__name__
         with self.engine.db.connect(write=True) as conn:
+            # The model's reason is kept only while what it was shown still stands, checked in this
+            # write: deleted or changed while it answered, the reason goes and the receipt and the
+            # error stay. What stays names its sources, so a later delete finds it (CR5-MM-09).
+            if data.get("evidence") and data.get("reason") and not self.mind._fresh(conn, shown):
+                data.pop("reason")
+                data["reason_withheld"] = "sources-changed"
+            data = kept(conn, data)
             conn.execute(
                 "UPDATE mind_daily_reviews SET state=?,data=? WHERE scope=? AND day=?",
                 (state, dumps(data), self.mind.scope.key(), day),
