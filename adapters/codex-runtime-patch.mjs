@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V3';
+const assessmentMarker = '// KIN_ASSESS_V4';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -453,6 +453,8 @@ function kinSteerAccepted(state, params) {
  * call says whether it was cut short (`idsTruncated`), and a call that was names every
  * bound that cut it (`idsTruncatedBy`: ids-per-call, ids-per-turn, nodes, depth, text,
  * or rests-on when the memory server says it could not name all its result rests on).
+ * A call that may read beside the memory tools and names nothing -- a shell command, a
+ * dynamic tool, an image view, a sub-agent -- is cut short as `untracked` (CL7B-MM-02).
  *
  * Every answer says how far it got, as `stage` (CR2-INT-06), beside the state and the
  * reason it already gave: `not-started` -- no turn was asked for, so no model was
@@ -493,7 +495,12 @@ const KIN_TOOL_ID_LIMITS = Object.freeze({ perCall: 1000, perTurn: 2000, nodes: 
 // read omitted or found stale, and the ids Kin's memory server names as deleted before the read
 // began (bare references a delete left behind, with no words).
 const KIN_LEFT_OUT = new Set(["trace", "omitted_ids", "needs_review_ids", "deleted_ids"]);
+// What may read beside the memory tools, the store's own files included, and names nothing a
+// receipt could carry: a shell command (a read-only sandbox reads anywhere), a client's dynamic
+// tool, an image view, a sub-agent. Such a call is cut short by that (CL7B-MM-02).
+const KIN_UNTRACKED = new Set(["commandExecution", "dynamicToolCall", "imageView", "collabAgentToolCall"]);
 function kinToolResultIds(item, turn) {
+  if (KIN_UNTRACKED.has(item?.type)) return { ids: [], idsTruncated: true, idsTruncatedBy: ["untracked"] };
   if (item?.type !== "mcpToolCall" || item.status !== "completed") return { ids: [], idsTruncated: false };
   const found = new Map(), cut = new Set(), deleted = new Set();
   let nodes = 0, text = 0;
@@ -622,7 +629,7 @@ function kinToolResultIds(item, turn) {
       result.turnId = turn.id;
       result.usage = usage;
       const idTurn = { used: 0 };
-      result.toolCalls = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "commandExecution", "webSearch", "fileChange"].includes(item.type))
+      result.toolCalls = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "commandExecution", "webSearch", "fileChange", "imageView", "collabAgentToolCall"].includes(item.type))
         .map((item) => ({ name: item.type === "mcpToolCall" ? \`\${item.server}.\${item.tool}\` : item.type === "dynamicToolCall" ? item.tool : item.type, ok: item.status === "completed", ...kinToolResultIds(item, idTurn) }));
       const text = items.findLast((item) => item.type === "agentMessage")?.text ?? "";
       result.rawText = text;
