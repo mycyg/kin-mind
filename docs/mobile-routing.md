@@ -235,6 +235,11 @@ manual, auto or work control is accepted. The receipt leaves `record.route` unto
 and authorizes one exact mode request; it never submits the source input or replays
 its task effects. An identical retry returns that receipt; a changed command ID
 conflicts, and a newer explicit control or reclassification makes the evidence stale.
+The host's maintenance entry for it, `POST /recover-owner-control`, asks the classifier
+beside her conversation like any classification asked again: a freeze refuses it before
+the model is asked, and the drain counts it until the call has ended, let go of its
+lane and the receipt is recorded. An identical retry asks no model and is answered,
+frozen or not.
 
 A mode request can set `notify: true`. After native model verification, the host
 creates a durable notification with a stable output ID. The owner-bound sender and
