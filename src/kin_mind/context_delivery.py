@@ -2,7 +2,7 @@
 import hashlib
 import json
 
-from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.db import Conflict, Missing, digest, dumps, tombstoned
 from eventmem.core.retrieval import tokens
 
 SCHEMA = """
@@ -67,6 +67,11 @@ class ContextDelivery:
             try:
                 return self.view(self._get(conn, session, epoch, identifier))
             except Missing:
+                # The prepared text is kept only while what it was rendered from is still there,
+                # checked in this write: a source deleted or revised since the build leaves no
+                # words behind, and the caller builds again (CR4-MM-01).
+                if not self.ctx._still(conn, items, self._policy(), body):
+                    raise Conflict('Context sources changed during preparation') from None
                 self._put(conn, value)
         return self.view(value)
 
@@ -102,8 +107,13 @@ class ContextDelivery:
             # the same read it was built for, so a stale one goes stale instead of arriving.
             if window['epoch'] != epoch or not all(self.ctx._current(i, policy) for i in value['items']):
                 value['state'] = 'stale'
+                if tombstoned(conn, dumps(value)):
+                    # It rendered words that have been deleted since: they go by the delete's own rule,
+                    # its identity stays for reconciliation (CR-MEM-02, CR4-MM-01).
+                    from .erasure import erased_delivery
+                    value = erased_delivery(value, self.ctx.mind.clock())
                 self._put(conn, value)
-                return self.view(value)
+                return {**self.view(value), 'state': 'erased'} if value.get('erased_at') else self.view(value)
             if not self.ctx.memory.settings(conn)['native_window_context'] and window['used'] + value['tokens'] > 12000:
                 return {'state': 'waiting', 'reason': 'automatic-background-budget'}
             value['state'] = 'sending'
