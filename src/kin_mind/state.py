@@ -139,11 +139,14 @@ FORK_TOOL_CALLS, FORK_TOOL_IDS, FORK_TURN_IDS, DRAFT_SHOWN_IDS = 64, 1000, 2000,
 def fork_reads(value):
     """What the host recorded of a contact draft's fork turn: each tool call, whether it succeeded,
     the ids it returned, and whether that record was cut short (`truncated`). Only these are kept
-    on the attempt row. A record longer than the host's own bounds is cut here too, and says so."""
+    on the attempt row. A record longer than the host's own bounds is cut here too, and says so. A
+    draft of the `legacy` assessment channel, a turn in the main session, records no read at all:
+    it is kept as a record cut short from the first read, and says which channel it was."""
     if not isinstance(value, dict):
         return None
-    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else []
-    kept, cut, room = [], value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS, FORK_TURN_IDS
+    legacy = value.get("channel") == "legacy"
+    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) and not legacy else []
+    kept, cut, room = [], legacy or value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS, FORK_TURN_IDS
     for call in calls[:FORK_TOOL_CALLS]:
         if not isinstance(call, dict):
             continue
@@ -155,7 +158,7 @@ def fork_reads(value):
         ids = ids[:room]
         room -= len(ids)
         kept.append({"name": str(call.get("name") or "")[:128], "ok": call.get("ok") is True, "ids": ids})
-    return {"tool_calls": kept, **({"truncated": True} if cut else {})}
+    return {**({"channel": "legacy"} if legacy else {}), "tool_calls": kept, **({"truncated": True} if cut else {})}
 
 
 def contact_wait_seconds(v):
@@ -1650,6 +1653,11 @@ class Mind(Continuity):
                 # How far the deletes went when the draft could begin: what its tools read past what
                 # the host's receipt names is anything deleted after this (CL6D-MM-01).
                 "tombstone_mark": erasure.tombstone_mark(conn),
+                # What its draft was shown, named from the claim on: nothing yet. Settled after a
+                # draft, the row names all of it (`_draft_read`); the words a draft wrote come only
+                # then. A row that never names it is one of a release before this one's, whose words
+                # any delete takes (erasure.UNNAMED, CL6D-MM-04) -- this row is not.
+                "evaluated_ids": [],
             }
             conn.execute(
                 "INSERT INTO mind_contacts VALUES(?,?,?,?)",
@@ -1693,8 +1701,11 @@ class Mind(Continuity):
         was offered and the sends of unknown outcome it was told of (what their words rest on), the
         ids the memory context and the state handed to it name (`shown_ids`, the host's), and what
         its fork read with its tools (`receipt`, kept as `draft_receipt`) -- as far as the store
-        knows each, held or deleted. And whether that is all of it: a receipt cut short, or more
-        shown than a row keeps, is not (`reads_truncated`) (CL6D-MM-01)."""
+        knows each: held, or deleted since the claim (`tombstone_mark`). What was deleted before the
+        claim had its words taken out of all of these by then, and the state keeps its tombstone
+        references for good: named, it would cancel every draft after the first delete
+        (CL6E-MM-02). And whether that is all of it: a receipt cut short, or more shown than a row
+        keeps, is not (`reads_truncated`) (CL6D-MM-01)."""
         named = set()
         for desire in [attempt.get("desire"), *(attempt.get("desires") or [])]:
             if isinstance(desire, dict):
@@ -1707,8 +1718,8 @@ class Mind(Continuity):
         shown = [i for i in shown_ids if isinstance(i, str)] if isinstance(shown_ids, list) else []
         named.update(shown[:DRAFT_SHOWN_IDS])
         named = {i for i in named if isinstance(i, str)}
-        read = fork_reads(receipt)
-        evaluated = erasure.held(conn, named) | erasure.tombstoned(conn, named) | set(erasure.tool_read_ids(conn, read))
+        read, mark = fork_reads(receipt), attempt.get("tombstone_mark")
+        evaluated = erasure.seen(conn, named, mark) | set(erasure.tool_read_ids(conn, read, since=mark))
         # What an earlier settlement of this attempt named stays named.
         attempt["evaluated_ids"] = sorted(evaluated | set(attempt.get("evaluated_ids") or ()))
         if read:
@@ -1789,9 +1800,12 @@ class Mind(Continuity):
             if words or shown_ids is not None or draft_receipt is not None:
                 self._draft_read(conn, attempt, shown_ids, draft_receipt)
             if words:
-                gone = erasure.tombstoned(conn, attempt["evaluated_ids"])
+                # Only what was deleted after the claim: the draft never had the words of anything
+                # deleted before it (CL6E-MM-02).
+                mark = attempt.get("tombstone_mark")
+                gone = erasure.tombstoned_since(conn, attempt["evaluated_ids"], mark)
                 if not gone and attempt.get("reads_truncated"):
-                    gone = erasure.deleted_since(conn, attempt.get("tombstone_mark"))
+                    gone = erasure.deleted_since(conn, mark)
                 if gone:
                     # Something the draft had before it was deleted while it was written: none of its
                     # words are kept and nothing is sent. The wishes are drafted again, from what is

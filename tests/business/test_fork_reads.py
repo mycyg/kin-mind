@@ -341,7 +341,8 @@ def test_an_appraisal_whose_reads_were_cut_short_is_refused_by_any_delete_while_
     jobs.run_one(Cut())
     settle(mind.engine)
     state, count, data = queue_row(mind, job["id"])
-    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 1
+    # Refused for the delete, not for the judgment: no charged attempt (CL6E-MM-03).
+    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 0
     assert unnamed_record in data["evaluated_ids"] and mind.read()["dimensions"]["curiosity"]["value"] != 66
     assert texts_everywhere(mind.engine, MARKER) == set()
     with mind.engine.db.connect(write=True) as conn:

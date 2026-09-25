@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {artifactManifest,AutonomousCreator,startAutonomousWork} from '../../adapters/autonomous-creator.mjs';
+import {artifactManifest,AutonomousCreator,creationWorkspace,scrubCreationResult,startAutonomousWork,sweepCreationResults} from '../../adapters/autonomous-creator.mjs';
+import {ERASED} from '../../adapters/without-words.mjs';
 
 const temporary=()=>fs.mkdtempSync(path.join(os.tmpdir(),'kin-creator-test-'));
 /** The host's execution records as the creator sees them (worker-ownership.mjs): `log` says what was
@@ -213,4 +214,41 @@ test('a completion review that timed out keeps the creation in flight until its 
  assert.deepEqual(inFlight(),[['creation','run-1']],'held for the first review\'s worker too');
  workers[0]();await retried;
  assert.deepEqual(inFlight(),[]);
+});
+
+test('a settled run\'s final answer keeps the artifacts it names and loses its words, however the run ended; the next start finds the ones left (CL6-MM-07)',async()=>{
+ const root=temporary(),WORDS='ferncastle 的钟面';
+ const spawnImpl=(command,args,options)=>{const child=new EventEmitter();Object.assign(child,{pid:99999995,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
+  child.stdin.on('finish',()=>{fs.writeFileSync(path.join(options.cwd,'clock.svg'),'<svg><text>'+WORDS+'</text></svg>');
+   fs.writeFileSync(args[args.indexOf('--output-last-message')+1],JSON.stringify({summary:'做好了 '+WORDS,artifacts:['clock.svg'],verification:['Parsed the SVG'],remaining:['上色 '+WORDS]}));
+   child.stdout.end(JSON.stringify({type:'thread.started',thread_id:'t'})+'\n'+JSON.stringify({type:'turn.completed',usage:{}})+'\n');setImmediate(()=>child.emit('exit',0));});return child;};
+ try{
+  // What the last host left: a final answer in words, another that is not JSON at all, and the schema.
+  const old=creationWorkspace(root,{id:'p-old'},{id:'s-old'});fs.mkdirSync(old,{recursive:true});
+  fs.writeFileSync(path.join(old,'.result-old.json'),JSON.stringify({summary:WORDS,artifacts:['old.svg'],verification:[],remaining:[]}));
+  fs.writeFileSync(path.join(old,'.result-torn.json'),'{"summary":"'+WORDS);
+  fs.writeFileSync(path.join(old,'.result-schema.json'),JSON.stringify({type:'object',description:'a schema has no words of hers'}));
+  const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root},executions:records()});
+  let review=async()=>({state:'completed'});const calls=[],runs=[];
+  const worker=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,creator,call:async(action,input)=>{calls.push(action);
+   if(action==='plan-claim'){runs.push('r-'+(runs.length+1));return {state:'claimed',run:{id:runs.at(-1),fence:1},plan:{id:'p',goal:'做一个钟'},step:{id:'s',goal:'做钟'},brief:{}};}
+   if(action==='plan-result')return review();return {state:'renewed'};}});
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(old,'.result-old.json'),'utf8')),{summary:ERASED,artifacts:['old.svg'],verification:[],remaining:[]});
+  assert.equal(JSON.parse(fs.readFileSync(path.join(old,'.result-torn.json'),'utf8')),ERASED);
+  assert.match(fs.readFileSync(path.join(old,'.result-schema.json'),'utf8'),/a schema has no words/,'the schema is not an answer');
+  await worker.tick();
+  const workspace=creationWorkspace(root,{id:'p'},{id:'s'});
+  const settled=JSON.parse(fs.readFileSync(path.join(workspace,'.result-r-1.json'),'utf8'));
+  assert.deepEqual(settled,{summary:ERASED,artifacts:['clock.svg'],verification:[ERASED],remaining:[ERASED]});
+  assert.match(fs.readFileSync(path.join(workspace,'clock.svg'),'utf8'),/ferncastle/,'what the run made is its work, and stays');
+  // A run whose review failed is interrupted, and its answer loses its words all the same.
+  review=async()=>{throw Error('review-failed');};
+  await worker.tick();
+  assert.deepEqual(calls.slice(-3),['plan-claim','plan-result','plan-interrupt']);
+  const interrupted=fs.readFileSync(path.join(workspace,'.result-r-2.json'),'utf8');
+  assert.doesNotMatch(interrupted,/ferncastle|做好了|上色/);
+  assert.equal(scrubCreationResult(path.join(workspace,'.result-r-2.json')),false,'a second pass finds nothing left');
+  assert.deepEqual(sweepCreationResults(root),[]);
+  worker.close();
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
 });

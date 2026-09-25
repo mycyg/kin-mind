@@ -284,7 +284,21 @@ class Explorations:
             # there is no other executor to fall back to.
             from .codex_executor import run_codex
             runner = run_codex
+        from . import workdirs
         from .actions import ActionEvents
+        from .erasure import tombstone_mark
+        with self.engine.db.connect() as conn:
+            # How far the deletes went before this run read anything it hands its executor: what was
+            # deleted before, the run never had the words of (CL6E-MM-02).
+            mark = tombstone_mark(conn)
+            settled = {row["id"]: row["state"] for row in conn.execute(
+                "SELECT id,state FROM mind_explorations WHERE scope=? AND state!='running'", (self.mind.scope.key(),))}
+        try:
+            # A run the host stopped, or one settled before this release, left its working directory
+            # with the words of its brief, its answers and its checkpoints: they go now (CL6-MM-07).
+            workdirs.sweep(directory, settled)
+        except OSError:
+            pass
         actions = ActionEvents(self.mind)
         candidate = actions.exploration_candidate()
         if candidate["state"] != "ready":
@@ -361,7 +375,7 @@ class Explorations:
                         break
             from .decision_context import execution_brief, sources_named
             shown.extend(sources_named(options.get("continuation")))
-            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown)
+            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown, since=mark)
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=self._stop_when(canceled, desire["id"]), model=model, **options)
@@ -455,7 +469,8 @@ class Explorations:
         data["evaluated_sources"] = shown
         with self.engine.db.connect(write=True) as conn:
             from .erasure import drop_deleted
-            data = drop_deleted(conn, data)
+            # What was deleted since the run began: before it, nothing of it reached the run (CL6E-MM-02).
+            data = drop_deleted(conn, data, since=mark)
             current = self.mind._load(conn)
             active = current["desires"].get(desire["id"])
             if active and active["revision"] == data["desire_revision"] and active["status"] == "in_progress":
@@ -494,4 +509,10 @@ class Explorations:
             actions.emit(conn, "exploration-result", eid, {"exploration_id": eid, "state": state,
                 # The action dispatcher adds one internal event source.
                 "evidence_ids": list(dict.fromkeys([source["id"], *observation_ids, *data["evidence_ids"]]))[:49], "agent_version": agent_version})
+        try:
+            # Settled: the report, the checkpoint and the receipts are in the store, where a delete
+            # reaches them. The working directory keeps its files without their words (CL6-MM-07).
+            workdirs.scrub(Path(directory) / eid, state=state)
+        except OSError:
+            pass
         return dict(data, id=eid, state=state)

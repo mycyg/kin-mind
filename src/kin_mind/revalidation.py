@@ -91,6 +91,9 @@ class Stored(NamedTuple):
     n: int
     deferred_memory: dict | None
     repeated: bool
+    # How far the deletes went when the attempt that asked for it began (`tombstone_mark`): what was
+    # deleted before, its model never had the words of (CL6E-MM-02). None for one kept before this.
+    mark: int | None = None
 
 
 class Light(NamedTuple):
@@ -109,10 +112,10 @@ def candidate(data, historical):
     if isinstance(kept, dict) and kept.get("proposal") and kept.get("receipt"):
         return Stored("reuse", kept["proposal"], kept["receipt"], kept.get("sources") or [], kept.get("continuity") or [],
                       kept.get("manifest_digest"), kept.get("conflict") or {}, int(kept.get("n") or 0), kept.get("deferred_memory"),
-                      bool(kept.get("repeated")))
+                      bool(kept.get("repeated")), kept.get("tombstone_mark"))
     if historical and data.get("seed_memory") and not data.get("seed_rejected"):
         return Stored("seed", {"reason": "Reuse verified semantic result", "memory": data["seed_memory"]}, data.get("seed_receipt") or {},
-                      data.get("seed_sources") or [], [], data.get("seed_manifest"), {}, 0, None, False)
+                      data.get("seed_sources") or [], [], data.get("seed_manifest"), {}, 0, None, False, data.get("seed_tombstone_mark"))
     return None
 
 
@@ -125,7 +128,10 @@ def remember(data, detail, *, n=0, deferred_memory=None, at=None, previous=None)
         "proposal": data["proposed_result"], "receipt": data["receipt"],
         "manifest_digest": data["proposal_manifest"], "conflict": conflict, "repeated": previous is not None and previous == conflict,
         "n": n, "sources": data.get("evaluated_sources") or [], "continuity": data.get("evaluated_continuity") or [],
-        **({"deferred_memory": deferred_memory} if deferred_memory else {}), "at": at}
+        **({"deferred_memory": deferred_memory} if deferred_memory else {}), "at": at,
+        # This attempt's mark: its model, or the light one that checked the stored proposal at its
+        # gate, began there, and the next gate counts what was deleted after it (CL6E-MM-02).
+        "tombstone_mark": data.get("tombstone_mark")}
 
 
 def failed(jobs, data, error, light, committing):
@@ -816,7 +822,7 @@ def _revalidate(jobs, provider, row, data, stored, entries, request):
         if previous is not None:
             provider.timeout = previous
     with jobs.engine.db.connect() as conn:
-        read = erasure.tool_read_ids(conn, call_receipt)
+        read = erasure.tool_read_ids(conn, call_receipt, since=data.get("tombstone_mark"))
     data["revalidation"] = {"conflicts": [{k: e["public"][k] for k in ("conflict_id", "kind", "object")} for e in entries],
                             "items": [item.model_dump(exclude={"patch"}) | {"patched": item.patch is not None} for item in answer.items],
                             # What the light call's model read with its tools: the reasons above were written

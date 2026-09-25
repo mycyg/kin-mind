@@ -96,7 +96,7 @@ def completed_appraisal(calls):
     return any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL for call in calls)
 
 
-def kept(conn, data):
+def kept(conn, data, since=None):
     """What of a worker's copy of its queue row may be written back now, inside the transaction that
     writes it (CR4-MM-02). The copy was taken when the attempt was claimed; a source or record
     deleted since -- while the model was asked, say -- has had its words taken out of the stored
@@ -107,10 +107,16 @@ def kept(conn, data):
     usage and the attempt token stay. A copy that names nothing deleted is written as it is. The row
     names every source its model was shown as `evaluated_sources`, recall-only ones included, so one
     of them deleted takes every word the model wrote from it (CR5-MM-01); and what its model read with
-    its tools, as its receipts say (CL6D-MM-01, CL6E-MM-01)."""
+    its tools, as its receipts say (CL6D-MM-01, CL6E-MM-01).
+
+    "Since" is since the claim: the claim took the copy and the attempt's `tombstone_mark` in one
+    transaction, so what was deleted before it had already left the copy, and the model asked after
+    it had only ids of it -- a tombstone reference in the state, a tool's answer quoting one. A
+    delete before the claim takes nothing more here (CL6E-MM-02). `since` is the mark of a copy
+    that is not a queue row's."""
     from .erasure import drop_deleted
 
-    return drop_deleted(conn, data, process=True)
+    return drop_deleted(conn, data, since=data.get("tombstone_mark") if since is None else since, process=True)
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -155,6 +161,16 @@ COMPRESSION_RETRY_SECONDS = 30
 # is not a charged attempt. It is bounded by a counter of its own, like a wait.
 MAX_PREPARATION_CONFLICTS = 4
 PREPARATION_RETRY_SECONDS = 30
+# A commit refused because something its model had before it was deleted while it answered
+# (`shown-deleted`) was refused for the owner's delete, not for anything in the judgment, and the
+# next attempt, shown what is there then, is a new judgment rather than the same one again: it
+# spends none of the row's charged attempts and never makes a repeated-failure signature. Its call
+# was made, and the ledger keeps what it cost like any other; what bounds such calls is a counter
+# of their own and a backoff that lets a run of deletes end before the next one -- 2, 4, 8, 16, 30,
+# 30 minutes, about an hour and a half -- after which the row is set aside for an operator, as an
+# exhausted wait of any kind is (CL6E-MM-03).
+MAX_DELETION_REFUSALS = 6
+DELETION_RETRY_SECONDS = 120
 REFERENCE_PATTERN = r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}"
 
 
@@ -1571,7 +1587,8 @@ class Appraisals:
                     for k, v in json.loads(r["data"]).items()
                     if k in {"receipt", "error", "result", "waiting_reason", "admission_waits", "last_wait_at",
                              "error_detail", "repair_reason", "compression_waits", "compression_stalls",
-                             "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts"}
+                             "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts",
+                             "deletion_refusals"}
                 },
             )
             for r in rows
@@ -1700,6 +1717,19 @@ class Appraisals:
             return self._quarantine(data, "preparation-conflicts-exhausted:" + str(conflicts))
         return "pending"
 
+    def _deletion_refusal(self, data, error):
+        """The commit was refused for a delete made while the model answered (`shown-deleted`): an
+        uncharged retry with a counter and a bound of its own (MAX_DELETION_REFUSALS). The context
+        is built again and the proposal is never reused: it may repeat what was deleted."""
+        data["error_detail"] = error_detail(error, str(data.get("error", "")))
+        refusals = data.get("deletion_refusals", 0) + 1
+        data.update(deletion_refusals=refusals, waiting_reason=data["error"], last_wait_at=self.mind.clock())
+        data.pop("frozen_memory_context", None)
+        data.pop("reuse", None)
+        if refusals > MAX_DELETION_REFUSALS:
+            return self._quarantine(data, "deletion-refusals-exhausted:" + str(refusals))
+        return "pending"
+
     def _root_evidence(self, conn, ids):
         """The evidence this evaluation exists to judge, with the taxonomy a root carries.
 
@@ -1738,10 +1768,18 @@ class Appraisals:
     def _tool_fetched(self, proposal, receipt, supplied, started):
         """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
         cites that this request did not supply is accepted only when a completed tool call of this
-        turn returned that very source or record, at its current revision when the call named one
+        turn returned that very source or record, at its current revision when a call named one
         (its receipt's `ids`, CR-MIND-08), and the id resolves to a
         current record of this scope that already existed when the attempt began. A tool that
-        succeeded at something else vouches for nothing; a receipt without ids admits nothing."""
+        succeeded at something else vouches for nothing; a receipt without ids admits nothing.
+
+        What a call's `ids` hold (CL6E-MM-04): every store id its result carried -- a record shown
+        with its revision, one named in its text or its keys without one, and what a derived thing it
+        showed rests on (`rests_on_ids`) -- but none the memory server said was deleted before the
+        read began (`deleted_ids`). One named only without a revision is taken at the revision it has
+        now: a concern or a graph item the fork read was made from it, and an entry that cites it goes
+        when it is deleted, as that item's words do. A revision any call named is the one read: a
+        record revised since is not accepted though another call named it bare."""
         native = receipt.get("native_receipt") or {}
         calls = native.get("tool_calls") or receipt.get("tool_calls") or []
         # What each completed call returned, WS1's [{id, revision}]: {id: {revision, ...}}, with
@@ -1761,11 +1799,13 @@ class Appraisals:
 
         def read_back(ref):
             # A record returned at a revision other than its current one: what was read is not
-            # what would be cited.
+            # what would be cited. Named bare as well -- as what something else rests on, say --
+            # it was still read at the revision named.
             for key in ("record_id", "source_id"):
                 seen = returned.get(ref[key])
                 if seen is not None:
-                    return key != "record_id" or None in seen or ref.get("revision") in seen
+                    named = seen - {None}
+                    return key != "record_id" or not named or ref.get("revision") in named
             return False
         known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
         cited = set()
@@ -2178,7 +2218,9 @@ class Appraisals:
                     # (wishes, concerns, decisions, understanding), methods, the entries marked for review
                     # that stay in its context: named by what the store holds now, so the commit and the
                     # reflection are checked against them and the queue row names them (CL6-MM-03).
-                    shown_ids = erasure.shown_ids(conn, model_context)
+                    # With what was deleted since this attempt began: a delete that came in while
+                    # the context was being put together may have left its words in it (CL6E-MM-02).
+                    shown_ids = erasure.shown_ids(conn, model_context, since=data["tombstone_mark"])
                 provider.section_isolation = isolation
                 provider.audit_sections = audited
                 provider.review_max_minutes = review_max
@@ -2200,11 +2242,17 @@ class Appraisals:
                 if stored:
                     with self.engine.db.connect() as conn:
                         # What it was shown, and what its model read with its tools, which a row from
-                        # before this release names only in the stored receipt (CL6D-MM-01).
-                        shown_gone = erasure.tombstoned(conn, [*(data.get("evaluated_ids") or ()), *erasure.read_ids(stored.receipt)])
+                        # before this release names only in the stored receipt (CL6D-MM-01): deleted
+                        # since the attempt that asked for it began (`stored.mark`), when it says so --
+                        # the model never had the words of anything deleted before (CL6E-MM-02).
+                        shown_gone = erasure.tombstoned_since(conn, [*(data.get("evaluated_ids") or ()), *erasure.read_ids(stored.receipt)],
+                                                              stored.mark)
                     # A receipt cut short (`truncated`) does not name all its fork read, so nothing can
                     # say all of that still stands: such a proposal is asked again in full (CL6D-MM-01).
                     shown_gone = shown_gone or erasure.reads_truncated(stored.receipt)
+                    # Words a delete took from the stored proposal itself leave nothing to take up
+                    # again: it is judged afresh, whichever erase took them.
+                    shown_gone = shown_gone or erasure.ERASED in dumps(stored.proposal)
                 if stored and (shown_gone or any(isinstance(ref, dict) and ref.get("erased")
                                                  for ref in [*stored.sources, *(data.get("evaluated_sources") or [])])):
                     # Something the stored proposal's model was shown has been deleted since, and the delete
@@ -2275,7 +2323,7 @@ class Appraisals:
                     # What the model read with its own tools while it answered -- in this call, its
                     # repairs, its evidence compression, a light question, or the stored proposal's
                     # own call -- it had before it as much as its context (CL6D-MM-01).
-                    read = erasure.tool_read_ids(conn, receipt)
+                    read = erasure.tool_read_ids(conn, receipt, since=data["tombstone_mark"])
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal_record(proposal), receipt=receipt,
@@ -2292,14 +2340,15 @@ class Appraisals:
                 if missing_targets and self.exploration_capabilities.get("decisions"):
                     if hasattr(provider, "repair_sharing") and not data.get("sharing_repair_attempted"):
                         data["sharing_repair_attempted"] = True
-                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt})
+                        data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt,
+                                                                         "tombstone_mark": data["tombstone_mark"]})
                         with self.engine.db.connect(write=True) as conn:
                             conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
                         proposal = proposal.model_copy(update={"sharing": sharing})
                         receipt = {**receipt, "sharing_repair": repair_receipt}
                         with self.engine.db.connect() as conn:
-                            read = erasure.tool_read_ids(conn, repair_receipt)
+                            read = erasure.tool_read_ids(conn, repair_receipt, since=data["tombstone_mark"])
                         data.update(proposed_result=proposal_record(proposal), receipt=receipt,
                                     evaluated_ids=sorted(set(data.get("evaluated_ids") or ()) | set(read)))
                     if any(sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1 for t in targets):
@@ -2367,8 +2416,10 @@ class Appraisals:
                     # And the rest it was shown, by the sources and records it names. A delete took their
                     # words out of the state while the model answered, and the answer may repeat them.
                     # Only a deletion stops the commit: the state's own entries keep older versions of
-                    # what they cite all the time, and a revision is not a delete (CL6-MM-03).
-                    gone = erasure.tombstoned(conn, data.get("evaluated_ids") or ())
+                    # what they cite all the time, and a revision is not a delete (CL6-MM-03). And only
+                    # one since this attempt began: the state keeps the tombstone references of every
+                    # earlier delete, with no words, for good (CL6E-MM-02).
+                    gone = erasure.tombstoned_since(conn, data.get("evaluated_ids") or (), data.get("tombstone_mark"))
                     if not gone and erasure.reads_truncated(receipt):
                         # A fork turn read more than its receipt names: anything deleted since this
                         # attempt began may have been among it, and the row names it so, which takes
@@ -2678,8 +2729,10 @@ class Appraisals:
                                 "origin": "reflection", "stimulus": "memory-enrichment", "parent_id": row["id"],
                                 "seed_memory": seed, "seed_receipt": receipt,
                                 "seed_sources": list(semantic_refs.values()),
-                                # The seed was written from everything its parent's model was shown (CL6-MM-03).
-                                "evaluated_ids": data.get("evaluated_ids") or []}
+                                # The seed was written from everything its parent's model was shown (CL6-MM-03),
+                                # by a model that began at its parent's mark (CL6E-MM-02).
+                                "evaluated_ids": data.get("evaluated_ids") or [],
+                                "seed_tombstone_mark": data.get("tombstone_mark")}
                             conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
                                 (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
                     elif memory_context:
@@ -2784,7 +2837,7 @@ class Appraisals:
                 data.pop(key, None)
                 if data["result"].get(key):
                     data[key] = data["result"][key]
-            for field in ("error", "error_detail", "error_signature", "error_repeats", "transient_failures", "reuse"):
+            for field in ("error", "error_detail", "error_signature", "error_repeats", "transient_failures", "deletion_refusals", "reuse"):
                 data.pop(field, None)
             state = "complete"
         except ModelAdmissionWait as error:
@@ -2863,6 +2916,11 @@ class Appraisals:
                 # A charged attempt is one full appraisal call, and this attempt made none.
                 uncharged_wait = "light"
                 state = revalidation.failed(self, data, error, light, committing)
+            elif found.code == "shown-deleted":
+                # Refused for the owner's delete while the model answered, not for the judgment: it
+                # is not charged, and it is bounded by its own counter (CL6E-MM-03).
+                uncharged_wait = "deleted"
+                state = self._deletion_refusal(data, error)
             else:
                 state = self._charged_failure(row, data, error, settings=settings, historical=historical)
                 if data["error"] != "deepseek-appraisal-preparation-complete":
@@ -2882,6 +2940,8 @@ class Appraisals:
             delay = min(1800, 60 * 2 ** min(data.get("transient_failures", 1) - 1, 5))
         elif uncharged_wait == "preparation":
             delay = PREPARATION_RETRY_SECONDS
+        elif uncharged_wait == "deleted":
+            delay = min(1800, DELETION_RETRY_SECONDS * 2 ** min(data.get("deletion_refusals", 1) - 1, 4))
         elif uncharged_wait == "light" or (not uncharged_wait and state == "pending" and data.get("reuse")):
             # The next attempt is a light one, or the full rerun a light attempt handed the row to.
             delay = revalidation.LIGHT_RETRY_SECONDS
@@ -2920,7 +2980,7 @@ class Appraisals:
                 "stimulus": data.get("stimulus"), "reason": data.get("repair_reason"), "error": data.get("error"),
                 "charged_attempts": row["attempts"] + int(not uncharged),
                 **{k: data[k] for k in ("error_detail", "error_repeats", "compression_waits", "compression_stalls",
-                                        "transient_failures", "preparation_conflicts") if k in data}})
+                                        "transient_failures", "preparation_conflicts", "deletion_refusals") if k in data}})
         if not changed:
             # This worker lost its attempt token, so the receipt, proposal and
             # error of this attempt are discarded. The holder settles children.
@@ -3026,8 +3086,10 @@ class DailyReview:
 
         def deleted(conn, evaluated, receipt):
             """What the review had before it that is deleted now: by what it names, and -- when its
-            receipt was cut short -- anything deleted since it began (CL6D-MM-01)."""
-            gone = erasure.tombstoned(conn, evaluated)
+            receipt was cut short -- anything deleted since it began (CL6D-MM-01). Since it began in
+            either case: the state it reads keeps the tombstone references of every earlier delete,
+            with no words, for good (CL6E-MM-02)."""
+            gone = erasure.tombstoned_since(conn, evaluated, mark)
             return gone or (erasure.deleted_since(conn, mark) if erasure.reads_truncated(receipt) else set())
 
         data = {}
@@ -3054,9 +3116,13 @@ class DailyReview:
             with self.engine.db.connect() as conn:
                 # Beside the messages: the state and the self-knowledge it was shown, and what it read
                 # with the fork's tools while it answered. Its words rest on these too, so the row
-                # names them and the change is recorded only while none is deleted (CL6D-MM-01).
-                evaluated = sorted(set(erasure.shown_ids(conn, context)) | set(erasure.tool_read_ids(conn, receipt)))
-            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown, "evaluated_ids": evaluated}
+                # names them and the change is recorded only while none is deleted (CL6D-MM-01): held
+                # now, or deleted since the review began -- the context was put together after its
+                # mark, and one deleted while the model answered is held no longer (CL6E-MM-02).
+                evaluated = sorted(set(erasure.shown_ids(conn, context, since=mark)) | set(erasure.tool_read_ids(conn, receipt, since=mark)))
+            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown, "evaluated_ids": evaluated,
+                    # Where it began, for a later erase that passes earlier deletes (erasure.read_by).
+                    "tombstone_mark": mark}
             if proposal.evolution:
                 event = AffectiveEvent(
                     command_id="daily:" + day,
@@ -3091,7 +3157,7 @@ class DailyReview:
                                        or deleted(conn, data.get("evaluated_ids") or (), data.get("receipt"))):
                 data.pop("reason")
                 data["reason_withheld"] = "sources-changed"
-            data = kept(conn, data)
+            data = kept(conn, data, since=mark)
             conn.execute(
                 "UPDATE mind_daily_reviews SET state=?,data=? WHERE scope=? AND day=?",
                 (state, dumps(data), self.mind.scope.key(), day),

@@ -153,22 +153,25 @@ class Contexts:
                 return False
         return not tombstoned(conn, *texts, *(dumps(item) for item in items))
 
-    def _keep(self, key, value, depends, policy):
+    def _keep(self, key, value, depends, policy, since=None):
         """Keep one compression only while what it was made from is still what a read may see,
         checked in the write transaction that keeps it. A source deleted or revised while the
         model was answering leaves no row behind; its call's cost is all that stays, already
         recorded by the call (CR3-MM-03). False when what it was made from changed. A compression made in the main
         session's fork -- an appraisal's evidence, compressed by the model that appraises it -- may
         also read memory with that fork's tools: what its receipt says they returned is checked the
-        same way, and the row keeps the receipt, so a later delete finds it (CL6D-MM-01). A receipt cut
+        same way, and the row keeps the receipt, so a later delete finds it (CL6D-MM-01) -- deleted
+        since the pack began (`since`, its `tombstone_mark`): a tool that returned an id deleted
+        before returned a tombstone reference, which the state keeps for good, and no words
+        (CL6E-MM-02). A receipt cut
         short (`truncated`) does not name all its tools read, so no later delete could be sure to find
         the row: that compression is used by the appraisal that asked for it, whose commit counts every
         delete since it began, and is not kept."""
-        from .erasure import read_ids, reads_truncated
+        from .erasure import read_ids, reads_truncated, tombstoned_since
 
         text = dumps(value)
         with self.engine.db.connect(write=True) as conn:
-            if not self._still(conn, depends, policy, *self._words(value), dumps(read_ids(value))):
+            if not self._still(conn, depends, policy, *self._words(value)) or tombstoned_since(conn, read_ids(value), since):
                 return False
             if reads_truncated(value):
                 return True
@@ -273,7 +276,10 @@ class Contexts:
         # so every summary cache is a miss until the migration finishes.
         strict = policy is not None and policy.strict
         with self.engine.db.connect() as conn:
-            # One read transaction per pack: every item is checked against the same instant.
+            # One read transaction per pack: every item is checked against the same instant, and the
+            # tools of a compression asked after it count the deletes after it (CL6E-MM-02).
+            from .erasure import tombstone_mark
+            mark = tombstone_mark(conn)
             state = None
             checked = []
             for i in items:
@@ -375,7 +381,7 @@ class Contexts:
                         omitted_ids = set(value.omitted_ids)
                         if not covered & omitted_ids and covered | omitted_ids == ids and (not require_all or not omitted_ids):
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
-                            if persist and not self._keep(part_key, {"value": value.model_dump(), "receipt": receipt}, rests_on(payload), policy):
+                            if persist and not self._keep(part_key, {"value": value.model_dump(), "receipt": receipt}, rests_on(payload), policy, since=mark):
                                 # What it was made from changed while the model answered: no part
                                 # of it is kept, and no further call is paid for (CR3-MM-03).
                                 raise Conflict("Sources changed while compressing")
@@ -437,7 +443,7 @@ class Contexts:
                 if persist and lines and (not require_all or not result["omitted_ids"]):
                     # The check above answers for what is returned; the one that keeps it is made
                     # again inside the write, where no delete can come in between (CR3-MM-03).
-                    if not self._keep(cache_id, result, items, policy):
+                    if not self._keep(cache_id, result, items, policy, since=mark):
                         raise Conflict("Sources changed while compressing")
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": sum(r.get("requests", 1) for r in receipts), "state": result["state"]})
                 return result
