@@ -102,11 +102,12 @@ def kept(conn, data, since=None):
     deleted since -- while the model was asked, say -- has had its words taken out of the stored
     row by the erase, and writing the copy whole would put them back, with the proposal the model
     wrote from them. So whatever the copy names that the store has deleted since (the tombstone is
-    the deletion fact) is taken out by the erase's own rule, `erasure.scrub`: the words go, the
-    references become tombstone references, and identities, states, error codes, usage and the
-    attempt token stay. A copy that names nothing deleted is written as it is. The row names every
-    source its model was shown as `evaluated_sources`, recall-only ones included, so one of them
-    deleted takes every word the model wrote from it (CR5-MM-01).
+    the deletion fact) is taken out by the erase's own rule for a process row, `erasure.scrub_process`:
+    the words go, the references become tombstone references, and identities, states, error codes,
+    usage and the attempt token stay. A copy that names nothing deleted is written as it is. The row
+    names every source its model was shown as `evaluated_sources`, recall-only ones included, so one
+    of them deleted takes every word the model wrote from it (CR5-MM-01); and what its model read with
+    its tools, as its receipts say (CL6D-MM-01, CL6E-MM-01).
 
     "Since" is since the claim: the claim took the copy and the attempt's `tombstone_mark` in one
     transaction, so what was deleted before it had already left the copy, and the model asked after
@@ -115,7 +116,7 @@ def kept(conn, data, since=None):
     that is not a queue row's."""
     from .erasure import drop_deleted
 
-    return drop_deleted(conn, data, since=data.get("tombstone_mark") if since is None else since)
+    return drop_deleted(conn, data, since=data.get("tombstone_mark") if since is None else since, process=True)
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside

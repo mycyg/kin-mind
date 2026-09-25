@@ -4,6 +4,7 @@ import {readJsonFile,claimPidLock,releasePidLock} from './atomic-json.mjs';
 import {atomicJson,loadState} from './mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validateCheckpoint} from './session-policy.mjs';
 import {runtimeProfile} from './codex-models.mjs';
+import {sameInstructionBinding} from './instruction-evidence.mjs';
 const hash=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const copy=v=>structuredClone(v);
 const candidateProfile=value=>{
@@ -37,10 +38,11 @@ const SEMANTIC_CAUSES=Object.freeze(['configVersion','policyVersion','profile','
 const LIVE_REVIEW_JOB=new Set(['pending','running','batched','complete']),SPENT_REVIEW_JOB=new Set(['needs-repair','superseded']);
 // How long the host waits on its own maintenance calls (N1-03) and on an unanswered review.
 // A rotation candidate's check -- one model turn in its own app-server -- stands for
-// `candidateCheckMs` at most once passed: everything it proves that can change by itself is asked
-// on its own (see checkCandidate), so the bound only covers what nothing observes -- a model served
-// under the same name -- at four checks a day at most for a candidate kept ready. A failed check
-// waits `candidateRetryMs`, doubled on each further failure, up to that same bound.
+// `candidateCheckMs` at most once passed: everything it proves that can change and be seen is a
+// reason of its own to replace the candidate (see `standby`), so the bound only covers what nothing
+// observes -- a model served differently under the same name and provider -- at four checks a day at
+// most for a candidate kept while a judgment stands, and no handover rests on an older one. A failed
+// check waits `candidateRetryMs`, doubled on each further failure, up to that same bound.
 export const MAINTENANCE_LIMITS=Object.freeze({reviewTimeoutMs:2*HOUR,compactTimeoutMs:600000,compactCheckMs:300000,
   compactCheckTimeoutMs:30000,compactQuietMs:HOUR,candidateCheckMs:6*HOUR,candidateRetryMs:300000});
 const withTimeout=(promise,ms)=>{let timer;return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('KIN_MAINTENANCE_TIMEOUT')),ms);})]).finally(()=>clearTimeout(timer));};
@@ -56,8 +58,8 @@ const retireLegacyCandidate=state=>{
 /** One durable binding, used by every channel. Acquiring this lease is a host
  * operation. A second live host cannot silently steal dispatch or sending. */
 export class SessionManager {
-  constructor({file,binding,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence=async()=>true,reviewRequested=async()=>{},now=()=>Date.now(),config={},limits={},lease=true}) {
-    Object.assign(this,{file,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence,reviewRequested,now});
+  constructor({file,binding,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,candidateLaunch,promote,closeCandidate,reconcileCandidate,validateEvidence=async()=>true,reviewRequested=async()=>{},now=()=>Date.now(),config={},limits={},lease=true}) {
+    Object.assign(this,{file,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,candidateLaunch,promote,closeCandidate,reconcileCandidate,validateEvidence,reviewRequested,now});
     this.limits={...MAINTENANCE_LIMITS,...limits};
     this.tail=Promise.resolve();this.closed=false;
     if(lease)this.acquireLease();
@@ -375,7 +377,7 @@ export class SessionManager {
       if(!eligibility.eligible)return {state:'waiting',reason:eligibility.reason};
       if(!await this.validateEvidence(eligibility.evidenceIds.map(id=>this.state.evidence[id])))return {state:'waiting',reason:'degradation-source-invalidated'};
       if(!this.state.config.prepare)return {state:'waiting',reason:'candidate-preparation-disabled'};
-      return await this.prepare(advice,context);
+      return await this.prepare(advice,context,{runtime,eligibility});
     }finally{this.running=false;}
   }
   /** Checkpoints are built once per cursor state (K3-05, K3-09, AD1-13): an unchanged
@@ -489,7 +491,7 @@ export class SessionManager {
     // itself, and a compaction it asked for waits out the cooldown.
     this.prune();this.save('native-compact-complete',{id:op.id});return {state:'complete'};
   }
-  async prepare(advice,context) {
+  async prepare(advice,context,{runtime=null,eligibility=null}={}) {
     let candidate=this.state.candidate;
     if(retireLegacyCandidate(this.state)){this.save('legacy-candidate-retired',{id:candidate.id});await this.closeCandidate?.(candidate);candidate=this.state.candidate;}
     if(candidate?.state==='unconfirmed'){
@@ -497,50 +499,83 @@ export class SessionManager {
       if(candidate.native&&candidate.injectionId&&await this.reconcileCandidate?.(candidate)){candidate.state='injected';this.save('candidate-injection-reconciled');}
       else return {state:'waiting',reason:'candidate-operation-unconfirmed'};
     }
-    return this.maintained('rotation:'+advice.snapshotId.slice(0,24),()=>this.advanceCandidate(advice,context,candidate));
+    return this.maintained('rotation:'+advice.snapshotId.slice(0,24),()=>this.advanceCandidate(advice,context,candidate,{runtime,eligibility}));
   }
-  async advanceCandidate(advice,context,candidate) {
-    const fence=this.fence();
+  /** A rotation candidate is made and checked once, then kept while her judgment stands: the
+   * conversation going on -- a new checkpoint -- does not replace it (CL6-FLOW-02 follow-up). It is
+   * replaced, and the new one checked, only for what `standby` names. It is handed over only with a
+   * checkpoint exactly as far as the conversation. */
+  async advanceCandidate(advice,context,candidate,{runtime:observed=null,eligibility=null}={}) {
+    const fence=this.fence(),judgment=hash([advice.snapshotId,advice.at??null]);
     const budget=Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0);
-    const {checkpoint,retryAt}=await this.preparedCheckpoint(context,fence,budget);
-    if(retryAt)return {state:'waiting',reason:'checkpoint-coverage-incomplete',nextAt:retryAt};
-    const current=await this.collect();
-    const invalid=validateCheckpoint(checkpoint,{binding:fence,cursors:current.cursors,configVersion:current.configVersion,budget});
-    if(invalid)return {state:'waiting',reason:invalid};
+    // Her judgment to hand over now, with handovers enabled: no bound below holds it back.
+    const handover=advice.action==='rotate'&&Boolean(this.state.config.rotate);
+    // After a failed check nothing is made or checked for the same judgment before its wait ends.
+    const retry=this.state.candidateRetry;
+    if(retry?.judgment===judgment&&retry.generation===fence.generation&&this.now()<retry.nextAt)return {state:'waiting',reason:'candidate-check-backoff',nextAt:retry.nextAt};
     this.assertFence(fence);
+    const runtime=observed??await this.inspect();
+    const live=candidate&&!['retired','failed','stale'].includes(candidate.state);
+    let replace=null;
+    if(live){const standby=this.standby(candidate,{fence,context,runtime,budget,handover,eligibility});if(standby.wait)return standby.wait;replace=standby.replace??null;}
     // CL6-FLOW-02: each step of a candidate -- its creation, its injection, its check -- starts only
     // while dispatch is not frozen. A step running when a freeze came finishes and starts no other;
     // the candidate stays in the state it reached and goes on from it after the thaw.
-    if(!candidate||['retired','failed','stale'].includes(candidate.state)){
+    if(!live||replace){
       if(this.frozen())return frozenWait();
-      const runtime=await this.inspect(),profile=candidateProfile(runtime);
+      const profile=candidateProfile(runtime);
       if(!profile)return {state:'waiting',reason:'candidate-profile-unverified'};
-      candidate={id:'rotation:'+randomUUID(),state:'creating',generation:fence.generation,checkpoint,profile,at:this.now()};
+      // A launch that cannot be made now opens nothing (an uncertain creation would stay unconfirmed).
+      if(this.launchState(profile)==='unavailable')return {state:'waiting',reason:'candidate-launch-unavailable'};
+      // Checkpoint compression may call DS: a checkpoint is built for a candidate being made, never for one kept.
+      const {checkpoint,retryAt}=await this.preparedCheckpoint(context,fence,budget);
+      if(retryAt)return {state:'waiting',reason:'checkpoint-coverage-incomplete',nextAt:retryAt};
+      const current=await this.collect();
+      const invalid=validateCheckpoint(checkpoint,{binding:fence,cursors:current.cursors,configVersion:current.configVersion,budget});
+      if(invalid)return {state:'waiting',reason:invalid};
+      this.assertFence(fence);
+      if(this.frozen())return frozenWait();
+      // The candidate it replaces goes only now that the new one can be made.
+      if(replace)await this.retireCandidate(candidate,replace);
+      candidate={id:'rotation:'+randomUUID(),state:'creating',generation:fence.generation,checkpoint,profile,evidenceIds:[...(eligibility?.evidenceIds??[])],at:this.now()};
       this.state.candidate=candidate;this.save('candidate-creating',{id:candidate.id});
       try{candidate.native=await this.createCandidate({id:candidate.id,checkpoint,model:profile.model,profile:copy(profile)});if(!candidate.native?.threadId||!candidate.native?.nativeSessionId||!candidateHasProfileAuthority(candidate))throw Error('Missing native creation receipt');candidate.state='created';this.save('candidate-created',{id:candidate.id});}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
-    if(candidate.checkpoint.id!==checkpoint.id){
-      candidate.state='stale';this.state.retiredCandidates??=[];this.state.retiredCandidates.push(copy(candidate));this.save('candidate-checkpoint-invalidated');await this.closeCandidate?.(candidate);return {state:'waiting',reason:'candidate-checkpoint-changed'};
-    }
+    // The candidate's own checkpoint is the one it is given, checked with and handed over with.
+    const checkpoint=candidate.checkpoint;
     if(candidate.state==='created'){
       if(this.frozen())return frozenWait();
       candidate.state='injecting';candidate.injectionId=hash([candidate.id,checkpoint.id]);this.save('candidate-injecting',{id:candidate.id});
       try{candidate.injection=await this.injectCandidate({...candidate.native,checkpoint,operationId:candidate.injectionId});if(!candidate.injection?.verified)throw Error('Injection unconfirmed');candidate.state='injected';this.save('candidate-injected',{id:candidate.id});}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
-    if(this.frozen())return frozenWait();
-    const waiting=await this.checkCandidate(advice,candidate,checkpoint);if(waiting)return waiting;
+    let checkedNow=false;
+    // A ready candidate with no check on record (an earlier release's) is checked once.
+    if(candidate.state==='injected'||candidate.state==='ready'&&!candidate.checked){
+      if(this.frozen())return frozenWait();
+      const waiting=await this.checkCandidate(candidate,judgment);if(waiting)return waiting;
+      checkedNow=true;
+    }
+    if(!handover)return {state:'ready',reason:'promotion-not-enabled-or-requested'};
+    if(!checkedNow){
+      // A check made at an earlier minute stands. The candidate is loaded again (no model turn) before
+      // anything is committed, and only at a moment the handover can be made.
+      const boundary=safeBoundary({...context,runtime});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
+      if(typeof this.loadCandidate==='function')
+        try{await this.loadCandidate({...candidate.native});}
+        catch(error){this.checkFailed(candidate,judgment,'candidate-reload-failed','candidate-reload-failed');throw error;}
+    }
     const verification=candidate.verification;
-    if(advice.action!=='rotate'||!this.state.config.rotate)return {state:'ready',reason:'promotion-not-enabled-or-requested'};
     return this.locked(async()=>{
       // A freeze that came while the candidate was checked keeps the binding a release or a
-      // migration read: the candidate stays ready and is promoted after the thaw, its check made
-      // again only if it no longer stands.
+      // migration read: the candidate stays ready and is promoted after the thaw -- replaced first
+      // only if it no longer stands, or is behind the conversation by then.
       if(this.frozen())return frozenWait();
       const runtime=await this.inspect(),latest=await this.collect();
       const boundary=safeBoundary({...latest,runtime});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
       if((latest.tasks??[]).length&&(!this.state.config.pausedTaskHandover||!latest.tasks.every(t=>t.restartable&&verification.taskIds?.includes(t.id))))return {state:'waiting',reason:'work-checkpoint-required'};
+      // Freshness: every cursor of the checkpoint the candidate holds is the conversation's now.
       const invalid=validateCheckpoint(checkpoint,{binding:fence,cursors:latest.cursors,configVersion:latest.configVersion,budget});
       if(invalid)return {state:'waiting',reason:invalid};
       if(!rotationEligibility(this.state,advice,this.now()).eligible)return {state:'waiting',reason:'rotation-evidence-changed'};
@@ -556,44 +591,91 @@ export class SessionManager {
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('promotion-unconfirmed');return {state:'unconfirmed',binding:next};}
     });
   }
+  /** What becomes of a candidate that exists (CL6-FLOW-02 follow-up): kept (`{}`), replaced by a new
+   * one on the current checkpoint (`{replace}`, the reason), or waited on (`{wait}`). It is replaced
+   *  - when it can no longer be used: the binding or its generation changed, or the session
+   *    configuration (both in `checkKey`), the persona configuration, the serving profile, or its
+   *    launch -- provider and instructions, resolved without a process; when its checkpoint no longer
+   *    passes; or when its check failed and the wait after it is over;
+   *  - when its check is `candidateCheckMs` old;
+   *  - when a handover is at hand and its checkpoint is behind the conversation: her judgment is to
+   *    hand over now, or it cites a degradation observed after the candidate was made.
+   * Otherwise it is kept, behind or not. A replacement is made at a quiet moment, the one a handover
+   * needs: made mid-exchange, the new candidate would be behind again before it could be handed over.
+   * Freshness is exact: a checkpoint behind the conversation by any cursor -- a message, an input, a
+   * task, the routing configuration, linked memory -- is never handed over, since the thread she would
+   * continue holds nothing but that checkpoint. Behind, a candidate is only a standby. */
+  standby(candidate,{fence,context,runtime,budget,handover,eligibility}) {
+    const launch=candidate.native?this.launchState(candidate.native.profile??candidate.profile,candidate.native):null;
+    if(launch==='unavailable')return {wait:{state:'waiting',reason:'candidate-launch-unavailable'}};
+    const checked=candidate.state==='ready'?candidate.checked:null,profile=candidateProfile(runtime);
+    const behind=validateCheckpoint(candidate.checkpoint,{binding:fence,cursors:context.cursors,configVersion:context.configVersion,budget});
+    const replace=
+      // It can no longer be used, or its check no longer stands.
+      candidate.generation!==fence.generation?'binding-changed':candidate.state==='waiting'?'check-failed':
+      checked&&checked.key!==this.checkKey(candidate)?'check-basis-changed':
+      checked&&this.now()-checked.at>=this.limits.candidateCheckMs?'check-interval':
+      checked&&(candidate.verification?.checkpointId!==candidate.checkpoint?.id||!candidateVerificationReady(candidate.verification,candidate))?'check-unverified':
+      profile&&!sameCandidateProfile(candidate.profile,profile)?'profile-changed':launch==='changed'?'launch-changed':
+      behind&&behind!=='checkpoint-increments-pending'?behind:
+      // It is behind the conversation, and a handover is at hand.
+      behind&&handover?'handover-due':behind&&this.degradedSince(candidate,eligibility)?'degradation-observed':null;
+    if(!replace)return {};
+    const boundary=safeBoundary({...context,runtime});
+    return boundary.safe?{replace}:{wait:{state:'waiting',reason:boundary.reason}};
+  }
+  /** The launch a candidate would be made with now, as the host resolves it without a process:
+   * 'unavailable' when none can be made, 'changed' when `native`'s own (provider, instructions) is
+   * not it, else null. With no resolver there is nothing to compare. */
+  launchState(profile,native=null) {
+    if(typeof this.candidateLaunch!=='function')return null;
+    let launch;try{launch=this.candidateLaunch(copy(profile));}catch{return 'unavailable';}
+    if(!launch?.providerBinding)return 'unavailable';
+    if(!native)return null;
+    return sameProviderBinding(launch.providerBinding,native.providerBinding)&&sameInstructionBinding(launch.instructionBinding??null,native.instructionBinding??null)?null:'changed';
+  }
+  /** A degradation her judgment cites that was observed after the candidate was made: what the
+   * judgment rests on now is newer than the candidate's checkpoint. Each one counts once. */
+  degradedSince(candidate,eligibility) {
+    const known=new Set(candidate.evidenceIds??[]);
+    return (eligibility?.evidenceIds??[]).some(id=>!known.has(id)&&this.state.evidence[id]?.at>candidate.at);
+  }
+  async retireCandidate(candidate,reason) {
+    Object.assign(candidate,{state:'stale',staleReason:reason});
+    this.state.retiredCandidates=[...(this.state.retiredCandidates??[]),copy(candidate)].slice(-RETENTION.candidates);
+    this.save('candidate-replaced',{id:candidate.id,reason});
+    await this.closeCandidate?.(candidate);
+  }
   /** What a candidate's check proves it for: the binding (its generation with it), the session
-   * configuration revision and the candidate itself. A new checkpoint, and with it new dialogue or
-   * a router configuration, already makes a new candidate. */
+   * configuration revision and the candidate itself, its checkpoint with it. */
   checkKey(candidate) {
     const native=candidate.native??{};
     return hash({binding:this.state.binding,configRevision:this.state.configRevision??0,candidate:{id:candidate.id,threadId:native.threadId,
       nativeSessionId:native.nativeSessionId,checkpointId:candidate.checkpoint?.id,profile:candidate.profile,providerBinding:native.providerBinding,
       instructionBinding:native.instructionBinding??null}});
   }
-  /** CL6-FLOW-02 follow-up: the check -- a model turn in the candidate's app-server -- is made once
-   * for what it proves (`checkKey`), not at every minute a judgment stands. Passed, it stands for
-   * `candidateCheckMs` at most; standing, the candidate is only loaded again, which asks no model and
-   * still refuses a changed launch (instructions, provider, profile) before anything is committed.
-   * Failed, it is not made again before its wait, which doubles from `candidateRetryMs`, unless what it
-   * checks or Kin's judgment has changed: a judgment of hers is tried at once. Kin's judgments are
-   * carried out as before; only calls that could not change the answer are no longer made. Answers
-   * null when the candidate stands checked, else why it waits. */
-  async checkCandidate(advice,candidate,checkpoint) {
-    const now=this.now(),key=this.checkKey(candidate),judgment=hash([advice.snapshotId,advice.at??null]);
-    const failed=(reason,event)=>{
-      const prior=candidate.checkRetry,failures=(prior?.key===key&&prior.judgment===judgment?prior.failures:0)+1;
-      candidate.state='waiting';delete candidate.checked;
-      candidate.checkRetry={key,judgment,failures,reason,at:now,nextAt:now+Math.min(this.limits.candidateCheckMs,this.limits.candidateRetryMs*2**(failures-1))};
-      this.save(event,{id:candidate.id,failures});
-    };
-    if(candidate.state==='ready'&&candidate.checked?.key===key&&now-candidate.checked.at<this.limits.candidateCheckMs&&typeof this.loadCandidate==='function'&&
-      candidate.verification?.checkpointId===checkpoint.id&&candidateVerificationReady(candidate.verification,candidate)) {
-      try{await this.loadCandidate({...candidate.native});return null;}
-      catch(error){failed('candidate-reload-failed','candidate-reload-failed');throw error;}
-    }
-    const retry=candidate.checkRetry;
-    if(retry?.key===key&&retry.judgment===judgment&&now<retry.nextAt)return {state:'waiting',reason:'candidate-check-backoff',nextAt:retry.nextAt};
-    let verification;
+  /** A failed check: the candidate is not checked again. Nothing is made or checked for the same
+   * judgment before a wait that doubles from `candidateRetryMs`, up to `candidateCheckMs`; then a new
+   * candidate is made. A new judgment of hers is tried at once. */
+  checkFailed(candidate,judgment,reason,event) {
+    const now=this.now(),generation=this.state.binding.generation,prior=this.state.candidateRetry;
+    const failures=(prior?.judgment===judgment&&prior.generation===generation?prior.failures:0)+1;
+    candidate.state='waiting';delete candidate.checked;
+    this.state.candidateRetry={judgment,generation,failures,reason,candidateId:candidate.id,at:now,
+      nextAt:now+Math.min(this.limits.candidateCheckMs,this.limits.candidateRetryMs*2**(failures-1))};
+    this.save(event,{id:candidate.id,failures});
+  }
+  /** The check -- a model turn in the candidate's app-server, which stays in the thread she would
+   * continue -- is made once per candidate (CL6-FLOW-02 follow-up). Answers null when it passed,
+   * else why the candidate waits. */
+  async checkCandidate(candidate,judgment) {
+    const at=this.now(),checkpoint=candidate.checkpoint;let verification;
     try{verification=await this.verifyCandidate({...candidate.native,checkpoint});}
-    catch(error){failed('candidate-check-error','candidate-check-failed');throw error;}
-    if(!verification?.verified||verification.checkpointId!==checkpoint.id){failed('candidate-continuity-unverified','candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
-    if(!candidateVerificationReady(verification,candidate)){failed('candidate-profile-unverified','candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
-    candidate.state='ready';candidate.verification=verification;candidate.checked={key,at:now};delete candidate.checkRetry;this.save('candidate-ready');
+    catch(error){this.checkFailed(candidate,judgment,'candidate-check-error','candidate-check-failed');throw error;}
+    if(!verification?.verified||verification.checkpointId!==checkpoint.id){this.checkFailed(candidate,judgment,'candidate-continuity-unverified','candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
+    if(!candidateVerificationReady(verification,candidate)){this.checkFailed(candidate,judgment,'candidate-profile-unverified','candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
+    candidate.state='ready';candidate.verification=verification;candidate.checked={key:this.checkKey(candidate),at};
+    delete candidate.checkRetry;delete this.state.candidateRetry;this.save('candidate-ready');
     return null;
   }
 }
