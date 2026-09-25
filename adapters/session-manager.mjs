@@ -36,8 +36,13 @@ const SEMANTIC_CAUSES=Object.freeze(['configVersion','policyVersion','profile','
 // snapshot), or ended without an answer, which uses the attempt up.
 const LIVE_REVIEW_JOB=new Set(['pending','running','batched','complete']),SPENT_REVIEW_JOB=new Set(['needs-repair','superseded']);
 // How long the host waits on its own maintenance calls (N1-03) and on an unanswered review.
+// A rotation candidate's check -- one model turn in its own app-server -- stands for
+// `candidateCheckMs` at most once passed: everything it proves that can change by itself is asked
+// on its own (see checkCandidate), so the bound only covers what nothing observes -- a model served
+// under the same name -- at four checks a day at most for a candidate kept ready. A failed check
+// waits `candidateRetryMs`, doubled on each further failure, up to that same bound.
 export const MAINTENANCE_LIMITS=Object.freeze({reviewTimeoutMs:2*HOUR,compactTimeoutMs:600000,compactCheckMs:300000,
-  compactCheckTimeoutMs:30000,compactQuietMs:HOUR});
+  compactCheckTimeoutMs:30000,compactQuietMs:HOUR,candidateCheckMs:6*HOUR,candidateRetryMs:300000});
 const withTimeout=(promise,ms)=>{let timer;return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('KIN_MAINTENANCE_TIMEOUT')),ms);})]).finally(()=>clearTimeout(timer));};
 /** The router activity a maintenance step is counted under while it runs (CL6-FLOW-02). */
 export const MAINTENANCE_ACTIVITY='session-maintenance';
@@ -51,8 +56,8 @@ const retireLegacyCandidate=state=>{
 /** One durable binding, used by every channel. Acquiring this lease is a host
  * operation. A second live host cannot silently steal dispatch or sending. */
 export class SessionManager {
-  constructor({file,binding,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence=async()=>true,reviewRequested=async()=>{},now=()=>Date.now(),config={},limits={},lease=true}) {
-    Object.assign(this,{file,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence,reviewRequested,now});
+  constructor({file,binding,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence=async()=>true,reviewRequested=async()=>{},now=()=>Date.now(),config={},limits={},lease=true}) {
+    Object.assign(this,{file,coordinator,inspect,collect,checkpoint,compact,reconcileCompact,ackCompact,createCandidate,injectCandidate,verifyCandidate,loadCandidate,promote,closeCandidate,reconcileCandidate,validateEvidence,reviewRequested,now});
     this.limits={...MAINTENANCE_LIMITS,...limits};
     this.tail=Promise.resolve();this.closed=false;
     if(lease)this.acquireLease();
@@ -525,14 +530,13 @@ export class SessionManager {
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
     if(this.frozen())return frozenWait();
-    const verification=await this.verifyCandidate({...candidate.native,checkpoint});
-    if(!verification?.verified||verification.checkpointId!==checkpoint.id){candidate.state='waiting';this.save('candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
-    if(!candidateVerificationReady(verification,candidate)){candidate.state='waiting';this.save('candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
-    candidate.state='ready';candidate.verification=verification;this.save('candidate-ready');
+    const waiting=await this.checkCandidate(advice,candidate,checkpoint);if(waiting)return waiting;
+    const verification=candidate.verification;
     if(advice.action!=='rotate'||!this.state.config.rotate)return {state:'ready',reason:'promotion-not-enabled-or-requested'};
     return this.locked(async()=>{
       // A freeze that came while the candidate was checked keeps the binding a release or a
-      // migration read: the candidate stays ready, and is checked and promoted after the thaw.
+      // migration read: the candidate stays ready and is promoted after the thaw, its check made
+      // again only if it no longer stands.
       if(this.frozen())return frozenWait();
       const runtime=await this.inspect(),latest=await this.collect();
       const boundary=safeBoundary({...latest,runtime});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
@@ -551,6 +555,46 @@ export class SessionManager {
       try{const receipt=await this.promote({previous:fence,binding:next,candidate});if(!receipt?.verified||receipt.threadId!==next.threadId)throw Error('Promotion unconfirmed');candidate.state='retired';candidate.promotion=receipt;this.state.sessionAdvice=null;this.settleRequests('complete',receipt);this.save('promotion-complete');return {state:'complete',binding:next};}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('promotion-unconfirmed');return {state:'unconfirmed',binding:next};}
     });
+  }
+  /** What a candidate's check proves it for: the binding (its generation with it), the session
+   * configuration revision and the candidate itself. A new checkpoint, and with it new dialogue or
+   * a router configuration, already makes a new candidate. */
+  checkKey(candidate) {
+    const native=candidate.native??{};
+    return hash({binding:this.state.binding,configRevision:this.state.configRevision??0,candidate:{id:candidate.id,threadId:native.threadId,
+      nativeSessionId:native.nativeSessionId,checkpointId:candidate.checkpoint?.id,profile:candidate.profile,providerBinding:native.providerBinding,
+      instructionBinding:native.instructionBinding??null}});
+  }
+  /** CL6-FLOW-02 follow-up: the check -- a model turn in the candidate's app-server -- is made once
+   * for what it proves (`checkKey`), not at every minute a judgment stands. Passed, it stands for
+   * `candidateCheckMs` at most; standing, the candidate is only loaded again, which asks no model and
+   * still refuses a changed launch (instructions, provider, profile) before anything is committed.
+   * Failed, it is not made again before its wait, which doubles from `candidateRetryMs`, unless what it
+   * checks or Kin's judgment has changed: a judgment of hers is tried at once. Kin's judgments are
+   * carried out as before; only calls that could not change the answer are no longer made. Answers
+   * null when the candidate stands checked, else why it waits. */
+  async checkCandidate(advice,candidate,checkpoint) {
+    const now=this.now(),key=this.checkKey(candidate),judgment=hash([advice.snapshotId,advice.at??null]);
+    const failed=(reason,event)=>{
+      const prior=candidate.checkRetry,failures=(prior?.key===key&&prior.judgment===judgment?prior.failures:0)+1;
+      candidate.state='waiting';delete candidate.checked;
+      candidate.checkRetry={key,judgment,failures,reason,at:now,nextAt:now+Math.min(this.limits.candidateCheckMs,this.limits.candidateRetryMs*2**(failures-1))};
+      this.save(event,{id:candidate.id,failures});
+    };
+    if(candidate.state==='ready'&&candidate.checked?.key===key&&now-candidate.checked.at<this.limits.candidateCheckMs&&typeof this.loadCandidate==='function'&&
+      candidate.verification?.checkpointId===checkpoint.id&&candidateVerificationReady(candidate.verification,candidate)) {
+      try{await this.loadCandidate({...candidate.native});return null;}
+      catch(error){failed('candidate-reload-failed','candidate-reload-failed');throw error;}
+    }
+    const retry=candidate.checkRetry;
+    if(retry?.key===key&&retry.judgment===judgment&&now<retry.nextAt)return {state:'waiting',reason:'candidate-check-backoff',nextAt:retry.nextAt};
+    let verification;
+    try{verification=await this.verifyCandidate({...candidate.native,checkpoint});}
+    catch(error){failed('candidate-check-error','candidate-check-failed');throw error;}
+    if(!verification?.verified||verification.checkpointId!==checkpoint.id){failed('candidate-continuity-unverified','candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
+    if(!candidateVerificationReady(verification,candidate)){failed('candidate-profile-unverified','candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
+    candidate.state='ready';candidate.verification=verification;candidate.checked={key,at:now};delete candidate.checkRetry;this.save('candidate-ready');
+    return null;
   }
 }
 
