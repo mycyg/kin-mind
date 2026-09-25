@@ -694,3 +694,93 @@ def test_evidence_already_integrated_ends_the_attempt_with_no_call_no_slot_and_n
     assert out["attempts"] == 0 and out["completed_from"] == "already-integrated"
     [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
     assert (ledger["charged"], ledger["outcome"], ledger["calls"]) == (False, "discarded", [])
+
+
+def test_a_repair_that_never_started_leaves_the_appraisal_that_ran_charged(setup):
+    """CR3-MM-06: the main-session appraisal ran to its answer and the answer needs one schema repair,
+    whose fork is never made. The repair alone is exempt -- no call on record, no usage -- and the
+    attempt that made the full appraisal call is charged for it, keeps that call and spends the
+    budget; the second time in a row sets the row aside instead of paying for it again."""
+    mind, source, _ = setup
+    asked = []
+
+    def exchange(request):
+        asked.append(request['name'])
+        if request['name'] == 'submit_appraisal':
+            # A full answer, with a value of the wrong type: it needs the repair.
+            return {'state': 'complete', 'result': {'reason': '想先记在心里。', 'values': {'curiosity': 'high'}},
+                    'receipt': {'native_turn_id': 'turn-1', 'model': 'gpt-6-astra', 'usage': {'input_tokens': 500, 'output_tokens': 50}}}
+        return NEVER_STARTED[0]
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('repair-never-started')], 'synthetic-v1')
+
+    def row():
+        with mind.engine.db.connect() as conn:
+            found = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+        return found['state'], found['attempts'], json.loads(found['data'])
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'pending'
+    assert asked == ['submit_appraisal', 'repair_appraisal']
+    state, charged, data = row()
+    assert (state, charged) == ('pending', 1), 'the attempt that made the appraisal call is counted'
+    assert not data.get('admission_waits') and data['error'] == 'deepseek-partial-evaluation-wait'
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts']
+    assert ledger['charged'] is True
+    assert [(c['purpose'], c['outcome'], c['usage_status']) for c in ledger['calls']] == [('appraise', 'schema-invalid', 'reported')]
+    # Again: another full call, and its repair again never starts. It is not paid for a third time.
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job['id'],))
+    jobs.run_one(native_provider(mind, exchange))
+    state, charged, data = row()
+    assert (state, charged) == ('needs-repair', 2)
+    assert [a['charged'] for a in attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts']] == [True, True]
+
+
+def test_a_process_that_dies_at_the_attempt_record_leaves_the_row_and_the_ledger_agreeing(setup, monkeypatch):
+    """CR3-MM-07, fault injection at the commit boundary: the attempt made its call and committed its
+    judgment, and the process dies as the attempt's ledger row is written. The row's final state and
+    that ledger row commit together or not at all: the row is still `running`, not a finished row
+    whose attempt no record holds. Once its lease has expired, the next claim back-fills the attempt
+    that made the call (charged, its usage unknown) and finishes the row from the committed receipt."""
+    import time
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('died-at-the-ledger')], 'synthetic-v1')
+    usage = {'input_tokens': 700, 'output_tokens': 30}
+
+    class Reviewer:
+        def appraise(self, context):
+            attempts.record_call(self, 'submit_appraisal', outcome='ok', model='synthetic', request_id='req-7', usage=usage)
+            return (Appraisal(reason='Worth keeping', values={'curiosity': 64}),
+                    {'provider': 'deepseek', 'model': 'synthetic', 'request_id': 'req-7', 'usage': usage})
+
+    real = attempts.record
+
+    def dies(engine, scope, entry, **options):
+        if not options.get('placeholder'):
+            raise SystemExit('the process died writing the attempt record')
+        return real(engine, scope, entry, **options)
+    monkeypatch.setattr(attempts, 'record', dies)
+    with pytest.raises(SystemExit):
+        jobs.run_one(Reviewer())
+    monkeypatch.undo()
+    assert mind.read()['dimensions']['curiosity']['value'] == 64, 'the judgment itself was committed'
+    with mind.engine.db.connect() as conn:
+        row = conn.execute("SELECT state,attempts,lease FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+    assert (row['state'], row['attempts']) == ('running', 1), 'no final state without its attempt record'
+    assert attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts'] == []
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET lease=? WHERE id=?", (time.time() - 1, job['id']))
+
+    class NoCall:
+        def appraise(self, context):
+            raise AssertionError('a committed judgment is never asked for again')
+    out = jobs.run_one(NoCall())
+    assert out['state'] == 'complete' and out['completed_from'] == 'already-committed' and out['attempts'] == 1
+    ledger = sorted(attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts'], key=lambda a: a['ordinal'])
+    assert [(a['outcome'], a['charged']) for a in ledger] == [('abandoned', True), ('discarded', False)]
+    # The ledger keeps one row per attempt token: writing the same attempt again changes nothing.
+    first = ledger[1]
+    attempts.record(mind.engine, mind.scope.key(), {'appraisal_id': job['id'], 'attempt_token': first['attempt_token'],
+                                                    'outcome': 'committed', 'calls': [], 'charged': True})
+    again = sorted(attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts'], key=lambda a: a['ordinal'])
+    assert [(a['outcome'], a['charged']) for a in again] == [('abandoned', True), ('discarded', False)]

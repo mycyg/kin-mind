@@ -84,6 +84,9 @@ REVIEW_MAX_MINUTES = 1440
 # identical failure twice in a row is quarantined instead of paid for again.
 MAX_CHARGED_ATTEMPTS = 4
 REPEATED_FAILURE_LIMIT = 2
+# The outcomes of a full appraisal call that ran to its answer: valid, or valid enough to need a
+# repair. A call preempted on the way is not one of them (CR3-MM-06).
+COMPLETED_APPRAISAL = {"ok", "schema-invalid"}
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -1898,8 +1901,10 @@ class Appraisals:
                 # keep the lease beyond that deadline, including HTTP keepalives.
                 (time.time() + manifests.attempt_bound(provider), row["id"]),
             )
-        if ledger and killed:
-            attempts.backfill_abandoned(self.engine, self.mind.scope.key(), row, killed, at=self.mind.clock())
+            if ledger and killed:
+                # In the claim's own transaction: once the killed attempt's token is replaced, nothing
+                # could back-fill it any more (CR3-MM-07).
+                attempts.backfill_abandoned(self.engine, self.mind.scope.key(), row, killed, at=self.mind.clock(), conn=conn)
         slots = ExitStack()
         # Every model call this attempt makes, nested ones included, accumulates here.
         calls = slots.enter_context(attempts.collect(provider))
@@ -1941,10 +1946,11 @@ class Appraisals:
                             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,attempts=MAX(0,attempts-1),data=? WHERE id=?",
                                          (dumps(data), row["id"]))
                             self._settle_children(conn, row["id"], data, "complete")
+                            if ledger:
+                                # With the row's end, in one transaction (CR3-MM-07).
+                                self._ledger_attempt(row, data, "complete", calls, owned=True, charged=False,
+                                                     historical=historical, maintenance=maintenance, conn=conn)
                         slots.close()
-                        if ledger:
-                            self._ledger_attempt(row, data, "complete", calls, owned=True, charged=False,
-                                                 historical=historical, maintenance=maintenance)
                         return self.status(row["id"])
                     data["evidence_ids"] = remaining
                 # Admit the entire evaluation before any compression/review call.
@@ -2687,7 +2693,13 @@ class Appraisals:
                 data.pop(field, None)
             state = "complete"
         except ModelAdmissionWait as error:
-            admission_wait = not model_admitted or getattr(provider, "native_review", False)
+            # A native review is admitted call by call, so its wait means no model call only until a
+            # full appraisal call of this attempt has completed. After that the wait is a later
+            # call's -- a schema or advice repair that never started: that call alone is exempt, and
+            # the attempt that made the appraisal call is charged for it (CR3-MM-06).
+            appraised = any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL
+                            for call in calls)
+            admission_wait = not model_admitted or (getattr(provider, "native_review", False) and not appraised)
             state = "pending"
             if admission_wait:
                 data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),
@@ -2788,6 +2800,16 @@ class Appraisals:
             ).rowcount
             if changed:
                 self._settle_children(conn, row["id"], data, state)
+            if ledger:
+                # One row per attempt, written with the row's final state in the same transaction:
+                # both commit or neither does, so a process that dies here leaves the row `running`
+                # for the next claim to back-fill, never a finished row whose attempt is on no record
+                # (CR3-MM-07). The attempt token keeps it one row: a real record only completes the
+                # `abandoned` placeholder. The queue row's own error/receipt/proposal fields are left
+                # exactly as they are.
+                self._ledger_attempt(row, data, state, calls, owned=bool(changed),
+                                     charged=not uncharged, historical=historical,
+                                     maintenance=maintenance, conn=conn)
         if changed and state != "pending":
             self._reschedule_idle(data, settings)
         if changed and state == "needs-repair":
@@ -2806,16 +2828,11 @@ class Appraisals:
             self.engine.db.metric("appraisal_attempt_discarded", 1, {
                 "appraisal": row["id"], "reason": "attempt-token-no-longer-owns-the-row", "attempted_state": state,
                 **({"usage": receipt["usage"]} if receipt.get("usage") else {"usage_status": receipt.get("usage_status", "unknown")})})
-        if ledger:
-            # One row per attempt, written now that the attempt has ended. The queue row's
-            # own error/receipt/proposal fields are left exactly as they are.
-            self._ledger_attempt(row, data, state, calls, owned=bool(changed),
-                                 charged=not uncharged, historical=historical,
-                                 maintenance=maintenance)
         return self.status(row["id"])
 
-    def _ledger_attempt(self, row, data, state, calls, *, owned, charged, historical, maintenance):
-        """The attempt's durable record: outcome, classification, digests and its calls."""
+    def _ledger_attempt(self, row, data, state, calls, *, owned, charged, historical, maintenance, conn=None):
+        """The attempt's durable record: outcome, classification, digests and its calls. Written in
+        `conn`'s transaction when given one."""
         proposal = data.get("proposed_result")
         context_digest = next((c["context_digest"] for c in calls
                                if c["purpose"] in {"appraise", "revalidate"} and c.get("context_digest")), None)
@@ -2833,7 +2850,7 @@ class Appraisals:
             # verdicts only. The reasons a revalidation gave stay on the queue row.
             "tier": data.get("tier"), "manifest_digest": data.get("manifest"),
             "revalidation": [{k: item[k] for k in ("conflict_id", "verdict", "patched")} for item in (data.get("revalidation") or {}).get("items", [])]
-                            if data.get("tier") == "B" else None})
+                            if data.get("tier") == "B" else None}, conn=conn)
 
 
 class DailyReview:
