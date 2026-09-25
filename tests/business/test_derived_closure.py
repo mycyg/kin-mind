@@ -153,6 +153,8 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     assert dry["derived_by_kind"] == {**nothing, "reports": 1, "reflections": 1} and dry["reflections_by_target"] == 1
     assert dry["closure_by_kind"] == {**nothing, "reflections": 1}
     assert dry["records_by_kind"] == {"own": 3, "notes": 5}, "three sources' own records, five notes citing them"
+    # Beside them, every derived source the store holds, by kind: the share the deletes take.
+    assert dry["store_by_kind"] == {**nothing, "reflections": 3, "reports": 2, "creations": 1}
     alone = repair.run(root, apply=False, steps=("reerase",))["steps"]["reerase"]["plan"]
     assert (alone["records"], alone["sources"], alone["derived_in_closure"]) == (6, 2, 0), "without lineage first, as it is now"
     applied = repair.run(root, apply=True, steps=("lineage", "reerase"))["steps"]
@@ -174,6 +176,7 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     assert [report["reerase"]["plan"][key] for key in ("derived_sources", "derived_in_closure", "records", "sources",
                                                         "reflections_by_target")] == [0, 0, 0, 0, 0]
     assert set(report["reerase"]["plan"]["derived_by_kind"].values()) == set(report["reerase"]["plan"]["records_by_kind"].values()) == {0}
+    assert report["reerase"]["plan"]["store_by_kind"] == {**nothing, "reflections": 1, "reports": 1, "creations": 1}
     with store.engine.db.connect() as conn:
         derived = {row[0]: json.loads(row[1])["derived_from"] for row in conn.execute(
             "SELECT id,data FROM sources WHERE json_extract(data,'$.derived_from') IS NOT NULL")}
@@ -221,3 +224,43 @@ def test_a_run_that_would_delete_more_than_its_dry_run_stops_with_one_line(tmp_p
     assert code == 1
     assert capsys.readouterr().err.strip() == "repair-20260924: stopped: reerase would take more than its plan said: records 2 > 1"
     assert store.engine.source(doomed)["status"] == "received"
+
+
+def test_lineage_alone_in_one_release_and_reerase_alone_in_a_later_one_take_what_both_together_would(tmp_path):
+    """A first release that finds the deletion too large to make without the owner runs `lineage`
+    alone: it registers, deletes nothing, and is done. A later release, once she agrees, runs
+    `reerase` alone (or with `lineage`, which finds nothing left): its plan is the one the first
+    release saw, and its apply takes exactly that."""
+    store, doomed = doomed_store(tmp_path)
+    on_doomed = store.reflection("reflect-1", [root_id(doomed)], "那份报告让我想了很久")
+    root = store.engine.db.root
+    together = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]["reerase"]["plan"]
+    scale = ("derived_sources", "derived_in_closure", "records", "sources", "derived_by_kind", "closure_by_kind", "records_by_kind",
+             "reflections_by_target", "store_by_kind")
+    assert (together["derived_sources"], together["derived_in_closure"], together["records"], together["sources"]) == (1, 1, 3, 2)
+
+    def counts():
+        with store.engine.db.connect() as conn:
+            return conn.execute("SELECT (SELECT COUNT(*) FROM records),(SELECT COUNT(*) FROM sources),"
+                                "(SELECT COUNT(*) FROM tombstones)").fetchone()[:]
+
+    def present(sid):
+        with store.engine.db.connect() as conn:
+            return bool(conn.execute("SELECT 1 FROM sources WHERE id=?", (sid,)).fetchone())
+
+    before = counts()
+    first = repair.run(root, apply=True, steps=("lineage",))["steps"]["lineage"]["done"]
+    assert first["sources"] == 2 and counts() == before, "registered, and nothing deleted"
+    assert present(doomed) and present(on_doomed)
+    assert set(repair.run(root, apply=False, steps=("lineage",))["steps"]["lineage"]["plan"].values()) == {0}, "the step is done"
+    # The later release: with or without `lineage` beside it, the same plan the first release saw.
+    for steps in (("reerase",), ("lineage", "reerase")):
+        later = repair.run(root, apply=False, steps=steps)["steps"]["reerase"]["plan"]
+        assert {key: later[key] for key in scale} == {key: together[key] for key in scale}, steps
+    done = repair.run(root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
+    assert (done["derived_sources"], done["records"], done["sources"]) == (1, 3, 2)
+    settle(store.engine)
+    assert not present(doomed) and not present(on_doomed)
+    again = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]
+    assert set(again["lineage"]["plan"].values()) == {0}
+    assert [again["reerase"]["plan"][key] for key in ("derived_sources", "derived_in_closure", "records", "sources")] == [0, 0, 0, 0]

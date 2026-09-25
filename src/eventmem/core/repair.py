@@ -77,7 +77,9 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               what their appraisal was about (`reflections_by_target`), the sources' own records
               beside the notes that cite them (`records_by_kind`). The apply holds itself to the
               plan of the same run: deletes that would take more are not made, and deletes that
-              took more stop the run (CL6D-MM-02). It rewrites history rows, so it is named
+              took more stop the run (CL6D-MM-02). Beside them, every derived source the store
+              holds, by the same kinds (`store_by_kind`), so the share each deletion takes can be
+              read. It rewrites history rows, so it is named
               explicitly; run it after `lineage`, in the same run or a later one. What an earlier
               run already erased is left alone, and the history is queued only for identifiers
               it has neither finished nor still owes a pass for, so a second run changes nothing
@@ -557,14 +559,17 @@ def _identity(ref):
     return ref.get("source_id"), ref.get("record_id")
 
 
-def _lineage_sources(conn, cache):
+def _lineage_sources(conn, cache, totals=None):
     """The derived sources `lineage` would write to: each with the references to add to its
-    `derived_from` (all of them, where it has none) and the dependencies its root record lacks."""
+    `derived_from` (all of them, where it has none) and the dependencies its root record lacks.
+    `totals`, when given, counts every derived source in the store by kind, registered or not."""
     sources = []
     for kind, sid, scope, data, inputs, notes in _candidates(conn, cache):
         if inputs is None:
             sources.append({"kind": kind, "source_id": sid, "without_basis": True})
             continue
+        if totals is not None:
+            totals[kind] += 1
         marked = data.get("derived_from")
         have = {_identity(ref) for ref in marked or () if isinstance(ref, dict)}
         refs, records, deleted, unresolved, added = [], [], [], 0, set()
@@ -600,7 +605,8 @@ def _lineage(conn, cache=None):
     dependencies, the runs and the receipts with the identifiers they would name. `cache` carries
     what was read of the history from one step to the next within a run."""
     cache = {} if cache is None else cache
-    sources = _lineage_sources(conn, cache)
+    totals = dict.fromkeys(KINDS, 0)
+    sources = _lineage_sources(conn, cache, totals)
     runs = []
     if _table(conn, "mind_plan_runs"):
         for row in conn.execute("SELECT id,data FROM mind_plan_runs WHERE CASE WHEN json_valid(data) THEN"
@@ -616,7 +622,7 @@ def _lineage(conn, cache=None):
                         " ORDER BY id").fetchall()
     rested = _history(conn, [row["event"] for row in rows], cache)
     receipts = [{"id": row["id"], "rests_on": sorted(set(rested.get(row["event"]) or ()))} for row in rows]
-    return {"sources": sources, "runs": runs, "receipts": receipts}
+    return {"sources": sources, "runs": runs, "receipts": receipts, "totals": totals}
 
 
 def plan_lineage(conn, found=None):
@@ -838,7 +844,7 @@ def plan_reerase(conn, lineage=None, *, after_lineage=False):
 
     from .models import now
 
-    lineage = lineage or {"sources": _lineage_sources(conn, {})}
+    lineage = lineage or _lineage(conn)
     doomed = _resting_on_deletions(conn, lineage)
     records, sources, derived = _closure(conn, doomed, _pending(lineage) if after_lineage else None)
     ids = frozenset(set(erased_ids(conn)) | records | sources)
@@ -848,7 +854,10 @@ def plan_reerase(conn, lineage=None, *, after_lineage=False):
     base = {"tombstones": len(erased_ids(conn)), "derived_sources": len(doomed), "derived_by_kind": _kinds(conn, doomed),
             "reflections_by_target": _by_target(conn, doomed), "records": len(records),
             "records_by_kind": _record_kinds(conn, records, sources), "sources": len(sources),
-            "derived_in_closure": len(derived), "closure_by_kind": _kinds(conn, derived), "receipts": _receipts(conn, ids)}
+            "derived_in_closure": len(derived), "closure_by_kind": _kinds(conn, derived),
+            # Every derived source the store holds, by the same kinds, before anything is deleted: what
+            # share of each the deletes take (the CL6F review, 4.1).
+            "store_by_kind": {**dict.fromkeys(KINDS, 0), **(lineage.get("totals") or {})}, "receipts": _receipts(conn, ids)}
     if not ids or not _table(conn, "mind_state"):
         return {**base, "layers": {}, "derived_rows": 0, "history_ids": 0, "history_rows": 0, "history_passes_owed": 0}
     layers = erase(conn, *_split(ids), now(), write=False)
