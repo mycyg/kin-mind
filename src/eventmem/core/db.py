@@ -179,8 +179,10 @@ def recording():
     return not _UNRECORDED.get()
 
 
-# How a text names a source or a record: the identifiers a deletion leaves its tombstone under.
-NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
+# How a text names a source or a record: the identifiers a deletion leaves its tombstone under. The
+# word boundaries are ASCII ones, as JS has them in the owned ACP that reads the same ids out of a
+# fork's tool results: an id written right against Chinese words is an id to both (CL7B-FLOW-02).
+NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b", re.ASCII)
 
 
 def tombstoned(conn, *texts):
