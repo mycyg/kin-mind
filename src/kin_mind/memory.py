@@ -460,10 +460,18 @@ class MemoryContinuity:
                 if (inputs is None and shown is None) or getattr(error, "code", None) not in DERIVED_CONFLICTS:
                     raise
                 # What it was written from is gone or changed: the artifact and the run stay facts,
-                # every word written from those sources goes, by the delete's own rule.
+                # every word written from those sources goes, by the delete's own rule. The artifact
+                # is a fact by which file and which bytes it is; the words the host read from it --
+                # its excerpt, the text a render showed -- were made from the same sources and go
+                # too. The one reduced artifact is what the source, the version node and the event
+                # row below are written with (CL6-MM-05).
                 from .erasure import scrub
+                if artifact:
+                    artifact = {**{key: value for key, value in artifact.items() if key != "inspection"},
+                                **({"inspection": scrub(artifact["inspection"], (), erase=True)}
+                                   if isinstance(artifact.get("inspection"), dict) else {})}
                 event = {**scrub({key: value for key, value in event.items() if key != "artifact"}, (), erase=True),
-                         **({"artifact": event["artifact"]} if "artifact" in event else {}),
+                         **({"artifact": artifact} if "artifact" in event else {}),
                          "input_source_ids": [], "shown_sources": [], "inputs_withheld": error.code}
                 source_id = received(event, None, None)
         with self.engine.db.connect(write=True) as conn:

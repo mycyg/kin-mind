@@ -292,7 +292,7 @@ def creation(env, tmp_path):
     root = tmp_path / "creator"
     root.mkdir()
     made = root / "clock.json"
-    made.write_text('{"total":10}')
+    made.write_text(json.dumps({"face": f"{MARKER} 的钟"}, ensure_ascii=False))
     result = {"state": "produced", "summary": f"做好了 {MARKER} 的钟", "remaining": [], "verification": ["Parsed JSON"],
               "artifacts": [fingerprint_file(made)],
               "receipt": {"model": "gpt-6-astra", "run_id": run["id"], "thread_id": "isolated-native", "exit_code": 0,
@@ -319,6 +319,14 @@ def artifact_kept(mind):
     return events
 
 
+def withheld_artifact(artifact, made):
+    """What a creation's artifact keeps once its words were withheld: which file and which bytes,
+    and what the host found of it -- not the excerpt it read from it (CL6-MM-05)."""
+    assert {key: artifact[key] for key in ("path", "name", "sha256", "bytes")} == {key: made[key] for key in ("path", "name", "sha256", "bytes")}
+    assert artifact["inspection"]["format"] == ".json" and artifact["inspection"]["content_verified"] is True
+    assert artifact["inspection"]["excerpt"] == ERASED
+
+
 def test_a_creation_whose_evidence_is_deleted_during_its_review_keeps_the_artifact_not_the_words(env, tmp_path):
     """The review is out when the message the step rested on is deleted. The artifact and the run
     stay facts -- the file's fingerprint, the event, the settled run -- and nothing the summary or
@@ -328,8 +336,8 @@ def test_a_creation_whose_evidence_is_deleted_during_its_review_keeps_the_artifa
     settle(mind.engine)
     assert settled["state"] != "completed"
     [event] = artifact_kept(mind)
-    assert event["artifact"]["sha256"] == request["result"]["artifacts"][0]["sha256"]
     assert event["inputs_withheld"] == "derived-from-deleted"
+    withheld_artifact(event["artifact"], request["result"]["artifacts"][0])
     assert texts_everywhere(mind.engine, MARKER) == set()
 
 
@@ -376,7 +384,7 @@ def test_a_creation_keeps_no_words_of_a_message_its_brief_showed_that_was_delete
     root = tmp_path / "creator"
     root.mkdir()
     made = root / "clock.json"
-    made.write_text('{"total":10}')
+    made.write_text(json.dumps({"face": f"{MARKER} 的钟"}, ensure_ascii=False))
     run = claimed["run"]
     request = {"run_id": run["id"], "owner": "worker", "fence": run["fence"], "result": {
         "state": "produced", "summary": f"做好了写着 {MARKER} 的钟", "remaining": [], "verification": ["Parsed JSON"],
@@ -387,8 +395,8 @@ def test_a_creation_keeps_no_words_of_a_message_its_brief_showed_that_was_delete
     settle(mind.engine)
     assert settled["state"] == "completed", "the step rested on other evidence, which stands"
     [event] = artifact_kept(mind)
-    assert event["artifact"]["sha256"] == request["result"]["artifacts"][0]["sha256"]
     assert event["inputs_withheld"] == "derived-from-deleted"
+    withheld_artifact(event["artifact"], request["result"]["artifacts"][0])
     assert texts_everywhere(mind.engine, MARKER) == set()
 
 
@@ -669,7 +677,7 @@ def test_a_creation_keeps_no_words_once_its_plans_own_evidence_is_deleted_during
     root = tmp_path / "creator"
     root.mkdir()
     made = root / "clock.json"
-    made.write_text('{"total":10}')
+    made.write_text(json.dumps({"face": f"{MARKER} 的钟"}, ensure_ascii=False))
     run = claimed["run"]
     request = {"run_id": run["id"], "owner": "worker", "fence": run["fence"], "result": {
         "state": "produced", "summary": f"做好了 {MARKER} 的钟", "remaining": [], "verification": ["Parsed JSON"],
@@ -680,8 +688,8 @@ def test_a_creation_keeps_no_words_once_its_plans_own_evidence_is_deleted_during
     settle(mind.engine)
     assert settled["state"] != "completed", "the plan lost its basis"
     [event] = artifact_kept(mind)
-    assert event["artifact"]["sha256"] == request["result"]["artifacts"][0]["sha256"]
     assert event["inputs_withheld"] == "derived-from-deleted"
+    withheld_artifact(event["artifact"], request["result"]["artifacts"][0])
     assert texts_everywhere(mind.engine, MARKER) == set()
 
 
@@ -767,3 +775,34 @@ def test_an_enrichment_row_keeps_no_words_of_a_source_behind_the_state_once_dele
     settle(mind.engine)
     assert texts_everywhere(mind.engine, MARKER) == set()
     assert queue_row(mind, enrichment)[2]["seed_memory"]["notes"][0]["content"] == ERASED
+
+
+def test_a_withheld_artifact_keeps_neither_its_excerpt_nor_the_text_a_render_showed(setup, tmp_path):
+    """A page made from a message deleted before its event was stored: the event keeps the page as
+    a fact -- path, bytes, hash, the render's image -- and neither the excerpt the host read nor the
+    text the render showed, in the source, the version node or the event row (CL6-MM-05)."""
+    mind, source, clock = setup
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True})
+    gone = source("poster-request", f"画一张 {MARKER} 的海报")
+    mind.engine.delete(gone)
+    page = tmp_path / "poster.html"
+    page.write_text(f"<p>{MARKER}</p>")
+    made = fingerprint_file(page)
+    image = {"path": str(tmp_path / "poster-390.png"), "sha256": "0" * 64, "bytes": 10}
+    artifact = {**made, "inspection": {"format": ".html", "content_verified": True, "excerpt": f"<p>{MARKER}</p>", "excerpt_complete": True,
+                                       "rendering": {"state": "verified", "method": "host-static-browser-v1", "source_sha256": made["sha256"],
+                                                     "checks": [{"viewport_width": 390, "text": MARKER, "image": image}]}}}
+    stored = memory.ingest({"id": "poster:artifact:0", "kind": "artifact-created", "at": clock[0].isoformat(), "task_id": "poster",
+                            "actor": "Kin", "artifact": artifact, "text": f"做好了 {MARKER} 的海报", "input_source_ids": [gone]})
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    [event] = artifact_kept(mind)
+    assert event["inputs_withheld"] == "derived-from-deleted" and event["source_id"] == stored["source_id"]
+    kept = event["artifact"]
+    assert (kept["sha256"], kept["bytes"], kept["path"]) == (made["sha256"], made["bytes"], made["path"])
+    assert kept["inspection"]["excerpt"] == ERASED and kept["inspection"]["rendering"]["checks"][0]["text"] == ERASED
+    assert kept["inspection"]["rendering"]["checks"][0]["image"] == image
+    with mind.engine.db.connect() as conn:
+        node = json.loads(conn.execute("SELECT data FROM mind_memory_nodes WHERE kind='artifact'").fetchone()[0])
+    assert node["sha256"] == made["sha256"] and node["inspection"]["excerpt"] == ERASED
