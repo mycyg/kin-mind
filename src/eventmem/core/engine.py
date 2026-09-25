@@ -271,8 +271,19 @@ class Engine:
                 )
                 self._invalidate_dependents(conn, data["id"], "Updated current source")
 
+    @staticmethod
+    def _derived_root(conn, rid):
+        """Whether `rid` is the record of a derived source (stored with `derived_from`)."""
+        return bool(conn.execute(
+            "SELECT 1 FROM evidence e JOIN sources s ON s.id=e.source_id"
+            " WHERE e.record_id=? AND json_extract(s.data,'$.derived_from') IS NOT NULL LIMIT 1",
+            (rid,)).fetchone())
+
     def _invalidate_dependents(self, conn, rid, reason):
-        # Invalidate generated conclusions, never silently promote a stale summary.
+        # Invalidate generated conclusions, never silently promote a stale summary. A derived
+        # source -- a reflection, a report, a creation's event -- depends on what it was written
+        # from only so that deleting that takes it along: an archive, a correction, a replacement
+        # or a newer version of an input leaves it, and what was built on it, as it was.
         pending = [rid]
         visited = {rid}
         while pending:
@@ -284,6 +295,8 @@ class Engine:
                 if dep[0] in visited:
                     continue
                 visited.add(dep[0])
+                if self._derived_root(conn, dep[0]):
+                    continue
                 pending.append(dep[0])
                 child = self._get(conn, dep[0])
                 if child["generated"] and child["status"] == "active":

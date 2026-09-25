@@ -423,7 +423,8 @@ def test_a_second_reerase_changes_nothing_and_a_rerun_reuses_the_history_under_w
     # A rerun before the worker has taken the history up: the layers are done, and the step
     # already queued for the same identifiers is the one it answers with.
     rerun = repair.run(engine.db.root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
-    assert rerun == {"layers": {}, "history_ids": first["history_ids"], "history_job": first["history_job"]}
+    assert rerun == {"derived_sources": 0, "receipts": 0, "layers": {}, "history_ids": first["history_ids"],
+                     "history_job": first["history_job"]}
     with engine.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='erase_history' AND json_extract(payload,'$.ids')"
                             " IS NOT NULL AND state!='done'").fetchone()[0] == 1
@@ -439,7 +440,7 @@ def test_a_second_reerase_changes_nothing_and_a_rerun_reuses_the_history_under_w
     assert again["layers"] == {} and again["derived_rows"] == 0
     assert again["history_ids"] == 0 and again["history_rows"] == 0 and again["history_passes_owed"] == 0
     done = repair.run(engine.db.root, apply=True, steps=("reerase",))["steps"]["reerase"]["done"]
-    assert done == {"layers": {}, "history_ids": 0, "history_job": None}
+    assert done == {"derived_sources": 0, "receipts": 0, "layers": {}, "history_ids": 0, "history_job": None}
     assert every_row(engine) == before
     with engine.db.connect() as conn:
         assert tuple(conn.execute("SELECT revision,updated_at FROM mind_graph_nodes WHERE id='secret-event'")
