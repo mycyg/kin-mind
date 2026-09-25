@@ -1281,3 +1281,62 @@ def test_no_committed_entry_goes_with_what_the_fork_that_wrote_it_only_read():
     assert "does not make the entry go with it" in guide and "a daily review -- name everything shown" in guide
     assert new["reuse"]["proposal"]["reason"] == ERASED and new["rejected_results"][0]["proposal"]["reason"] == ERASED
     assert new["rejected_results"][1] is kept["rejected_results"][1]
+
+
+def test_an_excerpt_a_frozen_memory_context_labels_by_its_records_id_goes_at_the_delete(setup):
+    """A queue row keeps the memory context it built frozen for its retry (appraisal.py), and that
+    context can hold more than the row names (`evaluated_ids`): the row names what its last model call
+    was shown, and a retry freezes a new context, then waits. The memory context labels an excerpt of
+    a record by the record's own id -- an event's identity evidence, a topic candidate's members
+    (memory.py). The record is deleted. At the delete, not at the next attempt, every excerpt of it
+    loses its words, and so does the topic candidate that shows it: a copy of a family the store
+    deletes with it, titled by one of its members. An excerpt of a record that stands, the event node
+    beside it -- which does not rest on the deleted record -- and the row's own words stay, and a
+    second run of the same erase finds nothing left to take (CL7B-MM-03)."""
+    from pathlib import Path
+
+    from kin_mind import erasure
+
+    mind, source, clock = setup
+    jobs = Appraisals(mind)
+    shown = source("shown", "她说今天去了公园")
+    gone_source, kept_source = source("gone", f"她说起 {MARKER} 的事"), source("kept", "她说周末想休息")
+    gone, kept = (mind.engine.source(sid)["record_ids"][0] for sid in (gone_source, kept_source))
+    at = clock[0].isoformat()
+
+    def excerpt(record, text):
+        # As memory.py writes an event's `identity_evidence` and a topic candidate's `members`.
+        return {"id": record, "revision": 1, "basis": "observed", "occurred_at": at, "text": text, "excerpt_only": False}
+
+    job = jobs.enqueue([shown], "synthetic-v1")
+    with mind.engine.db.connect(write=True) as conn:
+        data = json.loads(conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (job["id"],)).fetchone()[0])
+        data.update(evaluated_ids=[shown], tombstone_mark=erasure.tombstone_mark(conn),
+                    proposed_result={"reason": "她今天去了公园，想问问她玩得怎么样"},
+                    frozen_memory_context={
+                        "cursor": 0, "through_seq": 0, "pending_events": [], "recent_interaction": [], "works": [], "shares": [],
+                        "graph_candidates": [{"id": "node_weekend", "kind": "event", "title": "周末的安排", "text": "", "revision": 1,
+                                              "record_ids": [kept], "needs_review": False,
+                                              "identity_evidence": [excerpt(gone, f"说起 {MARKER}"), excerpt(kept, "周末想休息")]}],
+                        "topic_candidates": [{"id": "family_" + "a" * 24, "revision": 1, "title": f"{MARKER} 的事", "candidate_only": True,
+                                              "members": [excerpt(gone, f"说起 {MARKER}"), excerpt(kept, "周末想休息")],
+                                              "omitted_count": 0}]})
+        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), job["id"]))
+
+    mind.engine.delete(gone_source)
+    _, _, row = queue_row(mind, job["id"])
+    node, topic = row["frozen_memory_context"]["graph_candidates"][0], row["frozen_memory_context"]["topic_candidates"][0]
+    assert node["identity_evidence"][0] == excerpt(gone, ERASED), "the excerpt of the deleted record goes, its id stays"
+    assert node["identity_evidence"][1] == excerpt(kept, "周末想休息") and node["title"] == "周末的安排", "the event does not rest on it"
+    assert topic["title"] == ERASED and topic["members"] == [excerpt(gone, ERASED), excerpt(kept, ERASED)], "nor does its family stand"
+    assert row["proposed_result"]["reason"] == "她今天去了公园，想问问她玩得怎么样", "the row names nothing deleted: its own words stay"
+    assert MARKER not in json.dumps(row, ensure_ascii=False), "at the delete: nothing waits for the next attempt"
+    with mind.engine.db.connect() as conn:
+        counts = json.loads(conn.execute("SELECT data FROM metrics WHERE name='memory_erased' ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+        assert counts.get("mind_appraisals") == 1, counts
+        assert erasure.erase(conn, [gone], [gone_source], at, write=False, again=True) == {}, "a second run finds nothing left"
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    assert queue_row(mind, job["id"])[0] == "pending", "and no attempt of the row ran meanwhile"
+    guide = " ".join((Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8").split())
+    assert "loses its words with that record at the delete, not at the next attempt" in guide
