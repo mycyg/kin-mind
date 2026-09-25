@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {writeJsonAtomic} from './atomic-json.mjs';
+import {ERASED,withoutWords} from './without-words.mjs';
 
 const schema={type:'object',properties:{summary:{type:'string'},artifacts:{type:'array',minItems:1,maxItems:24,items:{type:'string'}},verification:{type:'array',items:{type:'string'}},remaining:{type:'array',items:{type:'string'}}},required:['summary','artifacts','verification','remaining'],additionalProperties:false};
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
@@ -18,6 +19,37 @@ export function artifactManifest(directory,artifacts){
     if(!stat.isFile()||stat.size===0||total>128*1024*1024)throw Error('Artifact missing, empty or over budget');
     return {path:candidate,relative:path.relative(root,candidate),bytes:stat.size,sha256:hash(fs.readFileSync(candidate))};
   });
+}
+
+/** A step's stable workspace: it survives preemption, retries and new decision receipts. */
+export const creationWorkspace=(root,plan,step)=>path.join(root,hash(Buffer.from(plan.id)).slice(0,24),hash(Buffer.from(step.id)).slice(0,24));
+/** CL6-MM-07: a run's final answer, `.result-<run>.json` in its workspace, once the run is settled
+ * -- stopped runs too -- keeps the artifacts it names and loses its words (the summary, what was
+ * checked, what remains): the store has them, where a delete reaches them, and the file is a copy
+ * none reaches. What the run made is its work and stays as it is. True when the file changed. */
+export function scrubCreationResult(file) {
+  let text;
+  try{text=fs.readFileSync(file,'utf8');}catch{return false;}
+  let value,kept;
+  try{value=JSON.parse(text);kept=withoutWords(value);}catch{value=null;kept=ERASED;}
+  if(value!==null&&JSON.stringify(kept)===JSON.stringify(value))return false;
+  writeJsonAtomic(file,kept,{previous:false});
+  return true;
+}
+/** Every run's final answer under the creation root without its words: at start-up, when no run
+ * of this host is going, so a run stopped with the last host, or settled before this release, is
+ * found. Returns the files that changed. */
+export function sweepCreationResults(root) {
+  const changed=[];
+  if(typeof root!=='string'||!root)return changed;
+  const entries=dir=>{try{return fs.readdirSync(dir,{withFileTypes:true});}catch{return [];}};
+  for(const plan of entries(root))if(plan.isDirectory())for(const step of entries(path.join(root,plan.name)))if(step.isDirectory())
+    for(const file of entries(path.join(root,plan.name,step.name)))
+      if(file.isFile()&&/^\.result-.+\.json$/.test(file.name)&&file.name!=='.result-schema.json'){
+        const full=path.join(root,plan.name,step.name,file.name);
+        if(scrubCreationResult(full))changed.push(full);
+      }
+  return changed;
 }
 
 /** Independent creation process. No phone binding, MCP, hooks or network. Only its workspace
@@ -41,6 +73,11 @@ export class AutonomousCreator {
   constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env,executions=null,stopCapMs=9000}){
     Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env,executions,stopCapMs});this.child=null;this.current=null;
   }
+  /** The run is settled: its final answer keeps no words (CL6-MM-07). */
+  settled({plan,step,run}){
+    if(typeof this.root!=='string'||!plan?.id||!step?.id||!run?.id)return false;
+    return scrubCreationResult(path.join(creationWorkspace(this.root,plan,step),'.result-'+run.id+'.json'));
+  }
   /** Interrupts the running step and waits until every process of it is seen ended, or `capMs` has
    * passed: a shutdown is not held for good, and a step not seen to end keeps its record, which the
    * next start ends. */
@@ -52,8 +89,7 @@ export class AutonomousCreator {
   async run({plan,step,run,brief}, {signal,timeoutMs=1200000,onHeartbeat=async()=>({state:'renewed'})}={}){
     if(this.current)throw Error('Creation executor is already running');
     if(typeof this.executions?.open!=='function')throw Error('Creation needs the host\'s execution records');
-    // Stable workspace survives preemption, retries and new decision receipts.
-    const directory=path.join(this.root,hash(Buffer.from(plan.id)).slice(0,24),hash(Buffer.from(step.id)).slice(0,24));
+    const directory=creationWorkspace(this.root,plan,step);
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
     const schemaFile=path.join(directory,'.result-schema.json'),lastFile=path.join(directory,'.result-'+run.id+'.json');
     writeJsonAtomic(schemaFile,schema,{previous:false});
@@ -137,6 +173,8 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
   beginActivity=()=>({ok:true,release(){}})}){
   let running=false,closed=false,controller=null,current=null,stops=0;
   const owner='creator-'+process.pid;
+  // Nothing of this host runs yet: the final answers the last one left keep no words (CL6-MM-07).
+  try{sweepCreationResults(creator.root);}catch{}
   const tick=async()=>{
     // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
     if(closed||running||isBusy()||creator.command===null)return;
@@ -182,7 +220,12 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
       recordStatus({creation:{state:'needs-review',reason}});
     }
-    finally{await Promise.allSettled(reviews);try{activity?.release?.();}catch{}running=false;controller=null;current=null;}
+    finally{
+      await Promise.allSettled(reviews);try{activity?.release?.();}catch{}
+      // Settled, interrupted or failed alike: its final answer keeps no words (CL6-MM-07).
+      if(claimed?.state==='claimed')try{creator.settled?.(claimed);}catch{}
+      running=false;controller=null;current=null;
+    }
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
   const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();stops++;controller?.abort();};
