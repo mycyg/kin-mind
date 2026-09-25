@@ -569,7 +569,11 @@ function kinToolResultIds(item) {
         if (stopped) void interrupt(forkThreadId, id);
       }), deadline, "timeout");
       turnDone = true;
-      const turn = outcome.turn, items = turn.items?.length ? turn.items : seen;
+      // What the turn did, as this ACP saw each item complete. The completed turn itself lists its
+      // items only in summary (itemsView "summary": the final message alone, in the pinned
+      // app-server), so it only adds what was not seen (CL6E-MM-04).
+      const turn = outcome.turn, items = [...seen], seenIds = new Set(seen.map((item) => item?.id).filter(Boolean));
+      for (const item of Array.isArray(turn.items) ? turn.items : []) if (!item?.id || !seenIds.has(item.id)) items.push(item);
       result.turnId = turn.id;
       result.usage = usage;
       result.toolCalls = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "commandExecution", "webSearch", "fileChange"].includes(item.type))
