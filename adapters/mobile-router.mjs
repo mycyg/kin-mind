@@ -546,14 +546,15 @@ export class MobileRouter {
    * (two hours unless asked otherwise), so a release or migration that is lost half
    * way can never leave the owner unanswered for good. Asking again for the same
    * migration changes nothing, so a caller may poll it while it drains. A deployment's
-   * hold stays on a freeze that replaces it: only a thaw ends it (CR3-FLOW-03). */
-  freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null}={}) {
+   * hold stays on a freeze that replaces it: only a thaw ends it (CR3-FLOW-03). `hold`
+   * asks for one: a release left pending holds the running router at once (CR3-REL-01/02). */
+  freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null,hold=false}={}) {
     return this.locked(async()=>{
       if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
       const current=this.frozen()?this.state.freeze:null,id=migrationId?String(migrationId).slice(0,120):null;
-      if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id)return clone(current);
+      if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id&&(hold!==true||current.hold===true))return clone(current);
       const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:FREEZE_TTL_MS,60000),12*3600000);
-      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{}),...(current?.hold?{hold:true}:{})};
+      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{}),...(current?.hold||hold===true?{hold:true}:{})};
       this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until,...(id?{migrationId:id}:{})});
       return clone(this.state.freeze);
     });
