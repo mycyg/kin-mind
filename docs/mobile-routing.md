@@ -150,7 +150,9 @@ freeze survives a restart and lifts itself after `ttlMs`, two hours by default a
 between one minute and twelve hours, so a release lost half way cannot leave the
 owner unanswered for good. Asking again with the same reason and migration ID changes
 nothing, so a caller may poll it; every answer says whether the host is `idle` and,
-if not, why. `POST /thaw` lifts it. `GET /busy` answers the same drain: inputs still
+if not, why. `POST /thaw` lifts it; one that names a `migrationId` lifts only that
+migration's own freeze, and gives a deployment's hold it froze over back to its
+holder, held (CR4-REL-04). `GET /busy` answers the same drain: inputs still
 moving through the host, a native turn or an unreadable native runtime, a send, a
 native command or a switch hold it, and so do the host's own background model calls —
 a summary of open work, a health reading, a classification asked again — until they
