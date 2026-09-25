@@ -322,11 +322,13 @@ def validated_provider(provider):
     return clean
 
 
-def codex_cli_version(executable, *, timeout=10):
-    """The CLI version, or why it cannot serve. Verified against MIN_CODEX_VERSION."""
+def codex_cli_version(executable, *, timeout=10, execution_env=None):
+    """The CLI version, or why it cannot serve. Verified against MIN_CODEX_VERSION. Run for an
+    execution, the probe carries its mark (`execution_env`) like everything else it starts."""
     try:
         proc = subprocess.run(
-            [str(executable), "--version"], capture_output=True, text=True, timeout=timeout, check=False
+            [str(executable), "--version"], capture_output=True, text=True, timeout=timeout, check=False,
+            env=worker_groups.environment(marked=execution_env) if execution_env else None,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise CodexUnavailable("codex-cli-missing", error) from error
@@ -392,14 +394,16 @@ def protected_roots(config):
     return list(dict.fromkeys(str(Path(root).expanduser()) for root in roots if root))
 
 
-def reader_settings(computer, *, directory, attempt, ledger, codex_home=None):
+def reader_settings(computer, *, directory, attempt, ledger, codex_home=None, execution_env=None):
     """The file reader's settings for one run. Its deny list is the host's own and no broad
     authorized root or missing exclude relaxes it: the run's directory (host-created configs,
-    credentials by reference, ledgers), Kin's Codex home and the protected roots."""
+    credentials by reference, ledgers), Kin's Codex home and the protected roots. The execution's
+    mark goes with them, for the snapshot tool and the converters the reader runs (CR5-MM-03)."""
     return {
         **{key: value for key, value in computer.items() if key != "ui"},
         "execution_id": Path(directory).name, "attempt": attempt,
         "ledger": str(ledger),
+        **({"execution_env": dict(execution_env)} if execution_env else {}),
         "internal_deny_roots": [str(directory)] + ([str(codex_home)] if codex_home else [])
                                + [str(root) for root in computer.get("protected_roots") or []],
     }
@@ -530,6 +534,10 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
                 argv += ["-c", "mcp_servers.kin_ui.required=true"]
     else:
         argv += ["-c", "mcp_servers={}"]
+    if execution_env:
+        # Whatever the CLI itself would run gets no inherited environment, but it gets the mark.
+        argv += ["-c", "shell_environment_policy.set={" + ", ".join(
+            key + "=" + dumps(value) for key, value in execution_env.items()) + "}"]
     pid = provider["id"]
     argv += [
         "-c", "model_provider=" + dumps(pid),
@@ -678,8 +686,13 @@ def run_codex(
     provider.setdefault("stream_idle_timeout_ms", min(300_000, budget_seconds * 1000))
     provider["request_max_retries"] = min(provider.get("request_max_retries", 3), 3)
     provider["stream_max_retries"] = 0
+    # The execution's mark, before any process of it starts: the version probe, the snapshot tool,
+    # the Computer Use service and its readiness probe, the CLI and every MCP server it starts, and
+    # whatever those start, in a group or a session of their own as well. Each is handed it by name
+    # (CR4-MM-03, CR5-MM-03).
+    marked = worker_groups.execution_env()
     if cli_version is None:
-        cli_version = codex_cli_version(executable)
+        cli_version = codex_cli_version(executable, execution_env=marked)
     started = time.monotonic()
     started_at = time.time()
     directory = Path(directory)
@@ -704,7 +717,7 @@ def run_codex(
         # config. The execution directory, Kin's Codex home and the protected roots are
         # denied even when an authorized root is broad enough to contain them.
         settings = reader_settings(computer, directory=directory, attempt=attempt, ledger=computer_ledger,
-                                   codex_home=codex_home if shared_home else None)
+                                   codex_home=codex_home if shared_home else None, execution_env=marked)
         computer_config = directory / "computer-reader.json"
         computer_config.write_text(dumps(settings))
         computer_config.chmod(0o600)
@@ -738,6 +751,7 @@ def run_codex(
                 allowed_apps=ui.get("allowed_apps", []),
                 allowed_app_actions=ui.get("allowed_app_actions", ["observe"]),
                 timeout_seconds=ui.get("readiness_timeout_seconds", 45),
+                execution_env=marked,
             )
         except Exception as error:
             # Never start the provider with a configured-but-absent tool surface.
@@ -762,6 +776,8 @@ def run_codex(
             # The browser's address check resolves through the web reader's resolver, so the
             # two agree on what is public, on a Fake-IP network as anywhere else.
             "public_transport": (web or {}).get("public_transport"),
+            # The Computer Use service this server starts is the execution's (CR5-MM-03).
+            "execution_env": dict(marked),
         }
         ui_config_file = directory / "computer-use.json"
         ui_config_file.write_text(dumps(ui_config))
@@ -816,9 +832,7 @@ def run_codex(
         continuation_file.write_text(dumps(continuation))
         continuation_file.chmod(0o600)
     last_file = directory / f"result-{attempt}.json"
-    # Every process of this run carries the worker's mark: the CLI, each MCP server it starts, and
-    # whatever they start, in a group or a session of its own as well (CR4-MM-03).
-    marked = worker_groups.execution_env()
+    # The CLI and each MCP server it starts carry the mark taken above (CR4-MM-03).
     argv = codex_argv(executable, directory, model=model, reasoning=reasoning,
                       schema_file=schema_file, last_file=last_file, provider=provider,
                       computer_mcp=computer_mcp, web_mcp=web_mcp, ui_mcp=ui_mcp,

@@ -8,6 +8,13 @@ import {PassThrough} from 'node:stream';
 import {artifactManifest,AutonomousCreator,startAutonomousWork} from '../../adapters/autonomous-creator.mjs';
 
 const temporary=()=>fs.mkdtempSync(path.join(os.tmpdir(),'kin-creator-test-'));
+/** The host's execution records as the creator sees them (worker-ownership.mjs): `log` says what was
+ * asked of them, in order. */
+const MARK='4f1c2b3a-0d9e-4a8b-9c7d-6e5f4a3b2c1d';
+function records(log=[]) {
+ return {log,open:spec=>{log.push('open:'+spec.kind);return {mark:MARK,track(){log.push('track');},
+  end:async()=>{log.push('end');return {ended:true};},settle:async()=>{log.push('settle');return {ended:true};}};}};
+}
 test('manifest rejects traversal, symlink escape and duplicate artifact paths',()=>{
  const root=temporary();try{fs.mkdirSync(path.join(root,'inside'));fs.writeFileSync(path.join(root,'file.txt'),'actual output');
  fs.symlinkSync(path.join(root,'file.txt'),path.join(root,'inside','escape'));
@@ -22,12 +29,33 @@ test('isolated worker uses configured model and returns native and artifact rece
  const spawnImpl=(command,args,options)=>{captured={command,args,options};const child=new EventEmitter();Object.assign(child,{pid:99999999,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
  child.stdin.on('finish',()=>{fs.writeFileSync(path.join(options.cwd,'result.txt'),'A verified creation.');fs.writeFileSync(args[args.indexOf('--output-last-message')+1],JSON.stringify({summary:'Created',artifacts:['result.txt'],verification:['Read file'],remaining:[]}));
  child.stdout.end(JSON.stringify({type:'thread.started',thread_id:'isolated-only'})+'\n'+JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_tokens:4}})+'\n');setImmediate(()=>child.emit('exit',0));});return child;};
- try{const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root,FEISHU_APP_SECRET:'must-not-pass'}});
+ try{const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root,FEISHU_APP_SECRET:'must-not-pass'},executions:records()});
  const result=await creator.run({plan:{id:'p',goal:'Create a text'},step:{id:'s'},run:{id:'r'},brief:{known_evidence:[]}});
  assert.equal(result.state,'produced');assert.equal(result.receipt.thread_id,'isolated-only');assert.equal(result.artifacts.length,1);
  assert.equal(captured.options.env.FEISHU_APP_SECRET,undefined);assert.ok(captured.args.includes('--ignore-user-config'));assert.ok(captured.args.includes('features.apps=false'));assert.ok(captured.args.includes('sandbox_workspace_write.network_access=false'));assert.ok(!captured.args.includes('resume'));
  assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-6-sol');assert.ok(captured.args.includes('model_reasoning_effort="medium"'));
  assert.equal(captured.args.includes('service_tier="fast"'),false,'the default creator never opts into paid Fast');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('a step is one execution of the host\'s: recorded before its CLI starts, its mark handed to the CLI, its shell and the render worker, and ended before its workspace is read and before it returns (CR5-MM-04)',async()=>{
+ const root=temporary();const log=[];let captured;
+ const spawnImpl=(command,args,options)=>{log.push('spawn');captured={args,options};const child=new EventEmitter();Object.assign(child,{pid:99999996,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
+  child.stdin.on('finish',()=>{fs.writeFileSync(path.join(options.cwd,'page.html'),'<p>made</p>');fs.writeFileSync(args[args.indexOf('--output-last-message')+1],JSON.stringify({summary:'Made',artifacts:['page.html'],verification:[],remaining:[]}));
+  child.stdout.end(JSON.stringify({type:'turn.completed',usage:{}})+'\n');setImmediate(()=>child.emit('exit',0));});return child;};
+ const verifier={capabilities:()=>({static_html_render:true}),verify:async(result,{env})=>{log.push('verify:'+env.KIN_WORKER_MARK);return result;}};
+ try{
+  const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root},executions:records(log),verifier});
+  const result=await creator.run({plan:{id:'p',goal:'Make a page'},step:{id:'s'},run:{id:'r'},brief:{}});
+  assert.equal(result.state,'produced');
+  // The record first; the end of everything the CLI started before the workspace is read (the
+  // manifest, then the render); the step's own end, render worker included, before it returns.
+  assert.deepEqual(log,['open:creation','spawn','track','end','verify:'+MARK,'settle']);
+  assert.equal(captured.options.env.KIN_WORKER_MARK,MARK,'the CLI has the mark by name');
+  assert.ok(captured.args.includes('shell_environment_policy.set={KIN_WORKER_MARK="'+MARK+'"}'),'and every shell command it runs');
+  assert.ok(captured.args.includes('shell_environment_policy.inherit="none"'),'which inherits nothing else');
+  // Without the host's records, nothing runs.
+  const bare=new AutonomousCreator({command:'codex',root,spawnImpl:()=>{throw Error('must not start');}});
+  await assert.rejects(bare.run({plan:{id:'p'},step:{id:'s'},run:{id:'r'},brief:{}}),/execution records/);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 test('user work prevents claims and failed result review releases only its own finished run',async()=>{
@@ -46,7 +74,7 @@ test('the production combination: configured model, Fast, catalogue, and no writ
  const spawnImpl=(command,args,options)=>{captured={command,args,options};const child=new EventEmitter();Object.assign(child,{pid:99999998,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
  child.stdin.on('finish',()=>{child.stdout.end(JSON.stringify({type:'thread.started',thread_id:'t'})+'\n');setImmediate(()=>child.emit('exit',1));});return child;};
  try{const creator=new AutonomousCreator({command:'/runtime/versions/b/bin/codex',root,model:'gpt-5.6-sol',reasoning:'medium',fast:true,
-   modelCatalog:'/host/mobile-models.json',spawnImpl,env:{PATH:'/usr/bin',HOME:root,CODEX_HOME:'/host/state/codex-home'}});
+   modelCatalog:'/host/mobile-models.json',spawnImpl,env:{PATH:'/usr/bin',HOME:root,CODEX_HOME:'/host/state/codex-home'},executions:records()});
  const result=await creator.run({plan:{id:'p',goal:'Create'},step:{id:'s'},run:{id:'r'},brief:{}});
  assert.equal(result.state,'failed');
  assert.equal(captured.command,'/runtime/versions/b/bin/codex');assert.equal(captured.options.env.CODEX_HOME,'/host/state/codex-home');
