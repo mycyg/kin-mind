@@ -856,7 +856,8 @@ class Contexts:
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
             recalled, recall_info = AdaptiveRecall(self).collect(query, mode="deep" if explicit and mode == "auto" else mode, history=history, provider=provider,
-                allow_model=allow_model and record, deadline=started + 150, policy=policy, owner_words=owner_words)
+                allow_model=allow_model and record, deadline=started + 150, policy=policy, owner_words=owner_words,
+                record=record)
             items.extend(recalled)
         elif settings["graph_recall"] and (query or (intent or {}).get("exploration_id")):
             graph = self.memory.graph.read(query=query, focus=(intent or {}).get("exploration_id"),
