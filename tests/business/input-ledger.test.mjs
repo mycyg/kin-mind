@@ -229,9 +229,42 @@ test('a migration may ask for its freeze again while it drains; nothing changes,
   assert.equal(f.router.state.revision,revision,'a repeated freeze writes nothing');
   const release=await f.router.freezeDispatch('release',{migrationId:'deploy-7'});
   assert.equal(release.at,first.at,'another reason refreshes the freeze without restarting its clock');
-  assert.deepEqual(await f.router.thawDispatch('kin-home-migration',{migrationId:'m1'}),{state:'thawed',frozenAt:first.at,migrationId:'deploy-7'});
+  // A thaw that names its migration lifts only that migration's freeze: another's stays (CR4-REL-04).
+  assert.deepEqual(await f.router.thawDispatch('kin-home-migration',{migrationId:'m1'}),{state:'not-own',heldBy:'release',heldByMigration:'deploy-7',frozen:true});
+  assert.deepEqual(await f.router.thawDispatch('release',{migrationId:'deploy-7'}),{state:'thawed',frozenAt:first.at,migrationId:'deploy-7'});
   await f.router.freezeDispatch('kin-home-migration',{migrationId:'m2'});
   f.clock.now+=2*3600000;assert.equal(f.router.frozen(),false);
+});
+
+test('a migration\'s thaw lifts only its own freeze: a release\'s hold it froze over goes back to the release, held, and a thaw by nobody in particular still ends it (CR4-REL-04)',async t=>{
+  const f=fixture(t);
+  // A release left pending holds dispatch; a migration that did not see it freezes over it.
+  const hold=await f.router.freezeDispatch('kin-deploy r8',{ttlMs:12*3600000,by:'control',hold:true});
+  const migration=await f.router.freezeDispatch('kin-home-migration',{migrationId:'m1',by:'control'});
+  assert.deepEqual([migration.reason,migration.migrationId,migration.hold,migration.holdOf?.reason],['kin-home-migration','m1',true,'kin-deploy r8'],
+    'the hold stays on the migration\'s freeze, and stays the release\'s');
+  assert.deepEqual(await f.router.freezeDispatch('kin-home-migration',{migrationId:'m1',by:'control'}),migration,'asked again while it drains, nothing changes');
+  // The migration's thaw, as POST /thaw passes it on: its own freeze goes, the release's hold comes back as it was.
+  assert.deepEqual(await f.router.thawDispatch('kin-home-migration',{migrationId:'m1'}),{state:'hold-kept',frozenAt:hold.at,migrationId:'m1',heldBy:'kin-deploy r8'});
+  assert.deepEqual(f.router.state.freeze,{reason:'kin-deploy r8',at:hold.at,until:hold.until,by:'control',hold:true});
+  f.clock.now+=13*3600000;
+  assert.deepEqual([f.router.frozen(),new MobileRouter(f.args).frozen()],[true,true],'past its end and across a restart');
+  // Asked again, after a restart: nothing of the migration's is left, and the hold is not its to lift.
+  const router=new MobileRouter(f.args);
+  assert.deepEqual(await router.thawDispatch('kin-home-migration',{migrationId:'m1'}),{state:'not-own',heldBy:'kin-deploy r8',hold:true,frozen:true});
+  assert.equal(router.frozen(),true);
+  // A person's thaw ends the hold; a migration's own freeze, over nobody's hold, is lifted by its thaw as before.
+  assert.equal((await router.thawDispatch('operator')).state,'thawed');
+  await router.freezeDispatch('kin-home-migration',{migrationId:'m2'});
+  assert.equal((await router.thawDispatch('kin-home-migration',{migrationId:'m2'})).state,'thawed');
+  assert.equal(router.frozen(),false);
+  // The release asking for its hold again over the migration's freeze has it as its own: the migration's thaw leaves it.
+  await router.freezeDispatch('kin-deploy r9',{ttlMs:12*3600000,by:'control',hold:true});
+  await router.freezeDispatch('kin-home-migration',{migrationId:'m3'});
+  const again=await router.freezeDispatch('kin-deploy r9',{ttlMs:12*3600000,by:'control',hold:true});
+  assert.deepEqual([again.reason,again.hold,again.holdOf],['kin-deploy r9',true,undefined]);
+  assert.equal((await router.thawDispatch('kin-home-migration',{migrationId:'m3'})).state,'not-own');
+  assert.equal(router.frozen(),true);
 });
 
 test('a freeze holds mode changes nobody forced',async t=>{
