@@ -94,6 +94,27 @@ def completed_appraisal(calls):
     attempt is a charged one however it ends: a wait or a transient fault after it belongs to a
     later call -- a repair -- which alone goes uncharged (CR3-MM-06, CR4-MM-04)."""
     return any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL for call in calls)
+
+
+def kept(conn, data):
+    """What of a worker's copy of its queue row may be written back now, inside the transaction that
+    writes it (CR4-MM-02). The copy was taken when the attempt was claimed; a source or record
+    deleted since -- while the model was asked, say -- has had its words taken out of the stored
+    row by the erase, and writing the copy whole would put them back, with the proposal the model
+    wrote from them. So whatever the copy names that the store has deleted since (the tombstone is
+    the deletion fact) is taken out by the erase's own rule, `erasure.scrub`: the words go, the
+    references become tombstone references, and identities, states, error codes, usage and the
+    attempt token stay. A copy that names nothing deleted is written as it is."""
+    from eventmem.core.db import NAMED
+
+    from .erasure import scrub
+    named = sorted(set(NAMED.findall(dumps(data))))
+    erased = set()
+    for start in range(0, len(named), 500):
+        page = named[start:start + 500]
+        erased.update(row[0] for row in conn.execute(
+            "SELECT key FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ")", page))
+    return scrub(data, frozenset(erased)) if erased else data
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -1953,9 +1974,10 @@ class Appraisals:
                         # back, and the ledger records an uncharged attempt that committed nothing.
                         data["result"], data["completed_from"] = {"already_integrated": True}, "already-integrated"
                         with self.engine.db.connect(write=True) as conn:
+                            stored = kept(conn, data)
                             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,attempts=MAX(0,attempts-1),data=? WHERE id=?",
-                                         (dumps(data), row["id"]))
-                            self._settle_children(conn, row["id"], data, "complete")
+                                         (dumps(stored), row["id"]))
+                            self._settle_children(conn, row["id"], stored, "complete")
                             if ledger:
                                 # With the row's end, in one transaction (CR3-MM-07).
                                 self._ledger_attempt(row, data, "complete", calls, owned=True, charged=False,
@@ -2013,7 +2035,7 @@ class Appraisals:
                 if lanes and memory_context and not data.get("frozen_memory_context"):
                     data["frozen_memory_context"] = memory_context
                     with self.engine.db.connect(write=True) as conn:
-                        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                 with self.engine.db.connect() as conn:
                     refs = self._root_evidence(conn, data["evidence_ids"])
                     if not self.mind._fresh(conn, refs):
@@ -2202,7 +2224,7 @@ class Appraisals:
                         # repair that fails, is recorded by the commit and the appraisal completes.
                         data["advice_repair_attempted"] = True
                         with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                         try:
                             advice, repair_receipt = provider.repair_session_advice(proposal.session_advice, self.session_context, problem)
                             proposal = proposal.model_copy(update={"session_advice": advice})
@@ -2231,7 +2253,7 @@ class Appraisals:
                         data["sharing_repair_attempted"] = True
                         data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt})
                         with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
                         proposal = proposal.model_copy(update={"sharing": sharing})
                         receipt = {**receipt, "sharing_repair": repair_receipt}
@@ -2805,12 +2827,14 @@ class Appraisals:
         # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
         uncharged = bool(admission_wait or uncharged_wait or lighting or recovered)
         with self.engine.db.connect(write=True) as conn:
+            # The row as this attempt leaves it, less anything deleted while it ran (CR4-MM-02).
+            stored = kept(conn, data)
             changed = conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
-                (state, time.time() + delay, int(uncharged), dumps(data), row["id"], data["attempt_token"]),
+                (state, time.time() + delay, int(uncharged), dumps(stored), row["id"], data["attempt_token"]),
             ).rowcount
             if changed:
-                self._settle_children(conn, row["id"], data, state)
+                self._settle_children(conn, row["id"], stored, state)
             if ledger:
                 # One row per attempt, written with the row's final state in the same transaction:
                 # both commit or neither does, so a process that dies here leaves the row `running`
