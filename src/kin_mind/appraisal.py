@@ -1936,6 +1936,8 @@ class Appraisals:
         calls = slots.enter_context(attempts.collect(provider))
         admission_wait = False
         uncharged_wait = False
+        # This attempt ended for good before its appraisal call was made: not a charged one (CR5-MM-07).
+        ended_before_call = False
         # This attempt only finished the row from another attempt's durable receipt (CR2-MIND-03).
         recovered = False
         model_admitted = False
@@ -2793,12 +2795,14 @@ class Appraisals:
             elif found.handling == "terminal":
                 # Nothing left to judge, or judged already: no retry can change that.
                 state = self._terminal_conflict(data, error)
+                ended_before_call = preparing and not completed_appraisal(calls)
             elif preparing and isinstance(error, (Conflict, Missing)):
                 uncharged_wait = "preparation"
                 state = self._preparation_conflict(data, error)
             elif preparing and isinstance(error, DETERMINISTIC_ERRORS):
                 data["error_detail"] = error_detail(error, str(data.get("error", "")))
                 state = self._quarantine(data, "deterministic-preparation-error:" + type(error).__name__)
+                ended_before_call = not completed_appraisal(calls)
             elif lighting:
                 # A charged attempt is one full appraisal call, and this attempt made none.
                 uncharged_wait = "light"
@@ -2830,7 +2834,7 @@ class Appraisals:
         else:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
         # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
-        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered)
+        uncharged = bool(admission_wait or uncharged_wait or lighting or recovered or ended_before_call)
         with self.engine.db.connect(write=True) as conn:
             # The row as this attempt leaves it, less anything deleted while it ran (CR4-MM-02).
             stored = kept(conn, data)

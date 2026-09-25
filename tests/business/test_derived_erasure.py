@@ -487,3 +487,24 @@ def test_a_daily_review_whose_source_is_deleted_while_the_model_answers_keeps_no
     with mind.engine.db.connect() as conn:
         data = json.loads(conn.execute("SELECT data FROM mind_daily_reviews").fetchone()[0])
     assert data["receipt"]["usage"] == USAGE and data["evidence"] and "reason" not in data
+
+
+def test_an_attempt_that_ends_before_its_model_call_is_not_charged(setup):
+    """Its evidence was deleted before the attempt ran: it ends for good before any call, and the
+    ledger and the attempt count say it cost nothing, with its end and its error kept (CR5-MM-07)."""
+    mind, source, clock = setup
+    doomed = source("gone-before-the-call", "很快就删掉的话")
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([doomed], "synthetic-v1")
+    mind.engine.delete(doomed)
+    settle(mind.engine)
+
+    class Never:
+        def appraise(self, context):
+            raise AssertionError("no call is made for an attempt with nothing to judge")
+
+    jobs.run_one(Never())
+    state, count, data = queue_row(mind, job["id"])
+    assert state != "running" and data.get("error") and count == 0
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
+    assert ledger["charged"] is False and not ledger["calls"]
