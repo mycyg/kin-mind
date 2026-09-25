@@ -248,16 +248,18 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         // owner notifications are unconfirmed; the prepared artifacts carry the
         // annotation. Compaction, injection and promotion keep the strict boundary.
         const preparation=safeReadOnlyPreparation({...snapshot,runtime});
-        if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe){
+        // CL6-FLOW-02: a checkpoint is maintenance -- the recovery one may ask DS -- so under a
+        // freeze neither starts; the first tick after the thaw prepares them.
+        if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe)await manager.maintained('restore-checkpoint',async()=>{
           const {checkpoint:cp}=await manager.preparedCheckpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
           if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
-        }
+        });
         if(snapshot.manifestVersion&&preparation.safe){
           const key=digest(snapshot.cursors);
-          if(manager.state.rollingCursor!==key){
+          if(manager.state.rollingCursor!==key)await manager.maintained('rolling-checkpoint',async()=>{
             const cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
-          }
+          });
         }
         // The judgment arrives with the snapshot the tick reads anyway (K3-04, DB1-03).
         const result=await manager.tick({runtime,context:snapshot}),{checkedAt,...previous}=manager.state.lastTick??{};
