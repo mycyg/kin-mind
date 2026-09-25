@@ -146,6 +146,49 @@ test('a release renews its freeze beside the state file before each start: taken
   assert.equal(new MobileRouter(f.args).frozen(),false);
 });
 
+test('a deployment\'s hold does not lift itself: past its end it is overdue and waits for an explicit thaw; every other freeze keeps its TTL (WS7, CR3-FLOW-03)',async t=>{
+  const f=fixture(t);
+  const handover=freeze=>fs.writeFileSync(path.join(f.root,'release-carryover.json'),JSON.stringify({schema:1,releaseId:'k',id:'r3',inputs:[],freeze}));
+  // A first release held for a forward fix: its hold is taken up at the start.
+  handover({reason:'kin-deploy r3',at:f.clock.now,until:f.clock.now+12*3600000,hold:true});
+  let router=new MobileRouter(f.args);
+  assert.deepEqual([router.frozen(),router.state.freeze.reason,router.state.freeze.hold],[true,'kin-deploy r3',true]);
+  // Twelve hours and more: overdue, and still closed -- dispatch, activities, a restart.
+  f.clock.now+=13*3600000;
+  assert.equal(router.frozen(),true,'past its end it is overdue, not lifted');
+  assert.equal(router.beginActivity({kind:'notice',id:'n1'}).ok,false);
+  assert.equal(router.summary().frozen.hold,true);
+  assert.equal(new MobileRouter(f.args).frozen(),true,'a restart does not lift it either');
+  // A forward fix freezes under its own name, and the hold goes with it: its TTL lifts nothing.
+  router=new MobileRouter(f.args);
+  const fix=await router.freezeDispatch('kin-deploy runtime-cand-2',{ttlMs:90*60000,by:'control'});
+  assert.deepEqual([fix.reason,fix.hold],['kin-deploy runtime-cand-2',true]);
+  f.clock.now+=2*3600000;
+  assert.equal(router.frozen(),true,'the fix\'s own TTL does not lift the hold');
+  // Only an explicit thaw ends it: the fix's once its candidate passed, or a person's.
+  await router.thawDispatch('verified');
+  assert.equal(router.frozen(),false);
+  assert.equal(new MobileRouter(f.args).frozen(),false,'the spent hand-over does not freeze a restart again');
+  // Every other freeze keeps its TTL, asked for or handed over.
+  router=new MobileRouter(f.args);
+  const plain=await router.freezeDispatch('kin-deploy r4',{ttlMs:10*60000,by:'control'});
+  assert.equal(plain.hold,undefined);
+  f.clock.now+=11*60000;
+  assert.equal(router.frozen(),false);
+  handover({reason:'kin-deploy r5',at:f.clock.now,until:f.clock.now+60*60000});
+  router=new MobileRouter(f.args);
+  assert.deepEqual([router.frozen(),router.state.freeze.hold],[true,undefined]);
+  f.clock.now+=61*60000;
+  assert.equal(router.frozen(),false,'a release\'s ordinary freeze still lifts itself');
+  // A held release whose services did not come up, started by hand past the hold's end: it starts held.
+  handover({reason:'kin-deploy r6',at:f.clock.now,until:f.clock.now+60000,hold:true});
+  f.clock.now+=2*3600000;
+  router=new MobileRouter(f.args);
+  assert.deepEqual([router.frozen(),router.state.freeze.reason,router.state.freeze.hold],[true,'kin-deploy r6',true],'a late start still starts held');
+  await router.thawDispatch('operator');
+  assert.equal(new MobileRouter(f.args).frozen(),false,'and once thawed it is not taken up again');
+});
+
 test('a freeze holds new dispatch, survives a restart and lifts itself, but never the owner\'s stop',async t=>{
   const f=fixture(t);
   const freeze=await f.router.freezeDispatch('release',{ttlMs:10*60000,by:'kin-deploy'});
