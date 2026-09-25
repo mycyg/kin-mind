@@ -6,14 +6,17 @@ the state handed to it name, what its tools returned -- and Kin's words from it 
 while none of that is deleted; a reason copied onto a wish goes when that goes. A draft already
 sent is her message: the conversation keeps it, and only the row's copy goes.
 
-The host's record of a fork turn stops at 64 calls and 100 ids a call and then says `truncated`:
+The host's record of a fork turn stops at 64 calls, 1000 ids a call and 2000 a turn, and says
+`truncated` there or where the owned ACP says it could not read a call's result whole (CL6E-MM-04):
 what was read past it is named nowhere, so any delete since the attempt began counts, a proposal
 kept for reuse is asked again in full, and a compression is used and not kept.
 
 Each case blocks where the model answers or the draft is about to be settled, deletes, lets it go
 on, and then reads every table of the store for the words."""
 import json
+import re
 from datetime import timedelta
+from pathlib import Path
 
 from eventmem.core.models import SourceInput
 
@@ -22,6 +25,7 @@ from kin_mind.context import Contexts
 from kin_mind.erasure import ERASED, reads_truncated
 from kin_mind.memory import MemoryContinuity
 from kin_mind.state import DRAFT_SHOWN_IDS, fork_reads
+from eventmem.core.db import NAMED
 from test_derived_erasure import answered, paid, prospective_check, queue_row, read_note
 from test_erasure import settle, system, texts_everywhere  # noqa: F401  (`system`: the compression fixture)
 from test_kin_mind import wish
@@ -210,18 +214,35 @@ def test_a_draft_whose_reads_were_cut_short_counts_any_delete_since_its_claim(se
 
 def test_the_row_keeps_the_hosts_record_within_its_bounds_and_says_when_it_was_cut():
     """What the row keeps of the host's record: each call, whether it succeeded and the ids it
-    returned. Past 64 calls or 100 ids a call -- the host's own bounds -- it is cut here too and
-    says so, as a record the host cut says so; an entry that is no id is dropped (CL6D-MM-01)."""
+    returned. Past 64 calls, 1000 ids a call or 2000 a turn -- the host's own bounds -- it is cut
+    here too and says so, as a record the host cut says so; an entry that is no id is dropped
+    (CL6D-MM-01, CL6E-MM-04)."""
     call = {"name": "memorypalace.read", "ok": True, "ids": [{"id": "mem_" + "1" * 32, "revision": 2}, {"id": 7}, {"id": "x" * 201}]}
     assert fork_reads({"tool_calls": [call], "usage": {"input_tokens": 9}}) == {
         "tool_calls": [{"name": "memorypalace.read", "ok": True, "ids": [{"id": "mem_" + "1" * 32, "revision": 2}]}]}
     assert not reads_truncated(fork_reads({"tool_calls": [call] * 64}))
     assert reads_truncated(fork_reads({"tool_calls": [call] * 65}))
     assert len(fork_reads({"tool_calls": [call] * 65})["tool_calls"]) == 64
-    many = {"name": "memorypalace.read", "ok": True, "ids": [{"id": f"mem_{n:032x}"} for n in range(101)]}
-    assert reads_truncated(fork_reads({"tool_calls": [many]}))
+
+    def many(count, start=0):
+        return {"name": "memorypalace.read", "ok": True, "ids": [{"id": f"mem_{n:032x}"} for n in range(start, start + count)]}
+    assert not reads_truncated(fork_reads({"tool_calls": [many(1000)]}))
+    assert reads_truncated(fork_reads({"tool_calls": [many(1001)]}))
+    assert len(fork_reads({"tool_calls": [many(1001)]})["tool_calls"][0]["ids"]) == 1000
+    assert not reads_truncated(fork_reads({"tool_calls": [many(1000), many(1000, 1000)]}))
+    turn = fork_reads({"tool_calls": [many(900), many(900, 900), many(900, 1800)]})
+    assert reads_truncated(turn) and [len(c["ids"]) for c in turn["tool_calls"]] == [900, 900, 200]
     assert reads_truncated(fork_reads({"tool_calls": [], "truncated": True}))
     assert fork_reads(None) is None and DRAFT_SHOWN_IDS == 4000
+
+
+def test_the_owned_acp_reads_the_store_ids_the_store_writes():
+    """The owned ACP names what a fork's tools returned by the pattern the store's own ids have, the
+    one a delete finds its rows by (`eventmem.core.db.NAMED`): the two are one pattern (CL6E-MM-04)."""
+    patch = (Path(__file__).resolve().parents[2] / "adapters" / "codex-runtime-patch.mjs").read_text()
+    # The helper is template text: each backslash of the generated source is written twice.
+    found = re.search(r"const KIN_STORE_ID = /(.+)/g;", patch)
+    assert found and found.group(1).replace("\\\\", "\\") == NAMED.pattern
 
 
 def test_more_shown_than_a_row_keeps_counts_as_cut_short(setup):
