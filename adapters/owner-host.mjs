@@ -161,21 +161,29 @@ export class MindLoop {
           ...(current?{failure:detail}:{})});
       }
       // Kin picked among the ready wishes handed to her this round; unnamed means all of those,
-      // never a wish she was not shown (N11, CR-MIND-04). `handed_ids` is the host's, not hers.
-      const {desire_ids:named,handed_ids:handed,...semantic}=decision;
+      // never a wish she was not shown (N11, CR-MIND-04). `handed_ids` is the host's, not hers; so
+      // are `shown_ids`, what the memory context and the state handed to her name, and `receipt`,
+      // what her fork read with its tools. Each settlement of the draft carries those two: the store
+      // names them on the attempt and writes her words only while none of it is deleted (CL6D-MM-01).
+      const {desire_ids:named,handed_ids:handed,shown_ids:shown,receipt:read,...semantic}=decision;
+      const reads={...(Array.isArray(shown)?{shown_ids:shown}:{}),...(read&&typeof read==='object'&&!Array.isArray(read)?{draft_receipt:read}:{})};
+      const settleDraft=request=>this.call('settle',{...request,...reads});
       const chosen=Array.isArray(named)&&named.length?{desire_ids:named}:Array.isArray(handed)&&handed.length?{desire_ids:handed}:{};
       const content=decision.action==='send'?decision.text:null;
       const valid=await this.call('check',{attempt_id:attempt.id,owner_epoch:this.ownerEpoch(),...chosen,...(typeof content==='string'?{text:content}:{})});
-      if(valid.reason==='repeats-unconfirmed-send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});
-      if(valid.reason==='desire-not-offered')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
+      if(valid.reason==='repeats-unconfirmed-send')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});
+      if(valid.reason==='desire-not-offered')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-unknown-desire',retry_condition:'deepseek-decision'})});
       if(this.closed||!valid.eligible||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
-        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});
+        return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});
       }
-      if(decision.action!=='send')return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision:semantic,...chosen});
-      if(typeof content!=='string'||!content.trim())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
+      if(decision.action!=='send')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision:semantic,...chosen});
+      if(typeof content!=='string'||!content.trim())return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision'})});
-      await this.call('settle',{attempt_id:attempt.id,state:'pending',...chosen,text:content});
+      const held=await settleDraft({attempt_id:attempt.id,state:'pending',...chosen,text:content});
+      // Something the draft had before it was deleted while it was written: the store canceled it in
+      // the write that would have held the text, and nothing is sent (CL6D-MM-01).
+      if(held?.state==='canceled')return held;
       // The durable pending write is not a send. Yield safely if context moved.
       if(this.closed||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
         return await this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
@@ -242,6 +250,9 @@ export function stateContext(result) {
 export const INTERACTION_LIMITS=Object.freeze({desires:16,concerns:6,guidance:3});
 const REVIEW='待复核';
 const marked=item=>item?.needs_review?{...item,review:REVIEW}:item;
+/** Without what a copied field was written from (`<field>_evidence_ids`): that is for the store's
+ * erase rule, and a contact draft's names everything it had before it (CL6D-MM-01). */
+const unlisted=value=>value&&typeof value==='object'&&!Array.isArray(value)?Object.fromEntries(Object.entries(value).filter(([key])=>!key.endsWith('_evidence_ids'))):value;
 export function interactionView(state) {
   const active=state.continuity?.activation!=='shadow';
   const pending=Boolean(state.continuity?.needs_review);
@@ -254,10 +265,10 @@ export function interactionView(state) {
     dimensions:Object.fromEntries(Object.entries(state.dimensions??{}).map(([k,v])=>[k,marked({value:v.value,basis:v.basis,needs_review:v.needs_review,...(!expression?{reason:v.reason}:{} )})])),
     desires:(state.desires??[]).filter(d=>!d.expired&&['wanted','waiting','in_progress'].includes(d.status)).slice(-INTERACTION_LIMITS.desires).map(d=>marked({
       id:d.id,kind:d.kind,status:d.status,topic:d.topic,content:d.content,completion:d.completion,expires_at:d.expires_at,
-      concern_ids:d.concern_ids,concern_needs_review:d.concern_needs_review,contact_wait:d.contact_wait,
+      concern_ids:d.concern_ids,concern_needs_review:d.concern_needs_review,contact_wait:unlisted(d.contact_wait),
       exploration_target:d.exploration_target,exploration_id:d.exploration_id,needs_review:d.needs_review||d.trait_needs_review||undefined,
     })),
-    contact_unconfirmed:state.contact_unconfirmed?.length?state.contact_unconfirmed:undefined,
+    contact_unconfirmed:state.contact_unconfirmed?.length?state.contact_unconfirmed.map(unlisted):undefined,
     traits:state.traits,interaction_style:expression?undefined:state.interaction_style,
     contact:state.contact,interaction_timing:state.interaction_timing,continuity:state.continuity,expression,
     exploration_decisions:(state.exploration_decisions??[]).slice(0,4),

@@ -245,6 +245,56 @@ test('a draft that names no wish acts on the wishes handed to Kin that round, ne
  const settled=waited.events.at(-1)[1];
  assert.deepEqual(settled.desire_ids,['d-a']);assert.equal(settled.decision.handed_ids,undefined);
 });
+test('each settlement of a draft carries what it was shown and what its fork read, never as her decision (CL6D-MM-01)',async()=>{
+ const shown=['mem_'+'a'.repeat(32)],receipt={tool_calls:[{name:'memorypalace.read',ok:true,ids:[{id:'mem_'+'b'.repeat(32),revision:1}]}],truncated:true};
+ const reads=request=>[request.shown_ids,request.draft_receipt];
+ // A wait: the settlement that writes her reason carries both, and her decision neither.
+ const waited=fixture({draft:async()=>({action:'wait',condition:'time',retry_after_seconds:600,reason:'Later',handed_ids:['d-a'],shown_ids:shown,receipt}),
+   send:async()=>assert.fail('must not send')});
+ await waited.loop.tick();
+ const decided=waited.events.at(-1)[1];
+ assert.equal(decided.reason,'draft-decision');assert.deepEqual(reads(decided),[shown,receipt]);
+ assert.equal('shown_ids' in decided.decision||'receipt' in decided.decision,false,'the host\'s record is not part of her decision');
+ // A send: the pending that holds her text carries both; the settlements after the send need nothing more.
+ const sent=fixture({draft:async()=>({action:'send',text:'Hi',shown_ids:shown,receipt})});
+ await sent.loop.tick();
+ const settlements=sent.events.filter(([action])=>action==='settle').map(([,request])=>request);
+ assert.deepEqual(settlements.map(request=>request.state),['pending','accepted']);
+ assert.deepEqual(reads(settlements[0]),[shown,receipt]);assert.equal(settlements[0].receipt,undefined);
+ // Every other settlement of the same draft carries them too.
+ for(const [check,draft,reason] of [[{eligible:false,reason:'repeats-unconfirmed-send'},{action:'send',text:'Again'},'repeats-unconfirmed-send'],
+   [{eligible:false,reason:'desire-not-offered'},{action:'send',text:'Hi',desire_ids:['d-x']},'draft-failed'],
+   [{eligible:false,reason:'candidate-changed'},{action:'send',text:'Hi'},'Draft or delivery conditions changed'],
+   [{eligible:true},{action:'send',text:'  '},'draft-failed']]) {
+  const events=[];
+  const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=>'owner-1',isBusy:()=>false,send:async()=>assert.fail('must not send'),
+   draft:async()=>({...draft,shown_ids:shown,receipt}),call:async(action,request)=>{events.push([action,request]);
+    if(action==='candidate')return {eligible:true};if(action==='claim')return {id:'a1',state:'drafting'};if(action==='check')return check;return request;}});
+  loop.review=async()=>{};await loop.tick();
+  const settled=events.at(-1)[1];
+  assert.equal(settled.reason,reason);assert.deepEqual(reads(settled),[shown,receipt],reason);
+ }
+});
+test('a pending the store canceled, because something the draft had was deleted, sends nothing (CL6D-MM-01)',async()=>{
+ let sends=0;const events=[];
+ const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=>'owner-1',isBusy:()=>false,
+  draft:async()=>({action:'send',text:'Hi',shown_ids:[],receipt:{tool_calls:[]}}),send:async()=>{sends++;return {state:'accepted',messageId:'m-1'};},
+  call:async(action,request)=>{events.push([action,request]);
+   if(action==='candidate')return {eligible:true};if(action==='claim')return {id:'a1',state:'drafting'};if(action==='check')return {eligible:true};
+   if(action==='settle'&&request.state==='pending')return {id:'a1',state:'canceled',reason:'draft-sources-deleted'};return request;}});
+ loop.review=async()=>{};
+ const result=await loop.tick();
+ assert.equal(sends,0);assert.deepEqual([result.state,result.reason],['canceled','draft-sources-deleted']);
+ assert.deepEqual(events.filter(([action])=>action==='settle').map(([,request])=>request.state),['pending'],'nothing more to settle');
+});
+test('what a copied field was written from is the store\'s, not words rendered for Kin (CL6D-MM-01)',()=>{
+ const ids=['mem_'+'c'.repeat(32)];
+ const view=interactionView({dimensions:{},desires:[{id:'w1',kind:'contact',status:'waiting',topic:'t',content:'c',expires_at:'2999-01-01T00:00:00Z',
+   contact_wait:{condition:'owner_reply',reason:'等她回来',reason_evidence_ids:ids}}],
+  contact_unconfirmed:[{attempt_id:'a1',desire_ids:['w1'],excerpt:'晚安',since:'2026-09-25T00:00:00Z',excerpt_evidence_ids:ids}]});
+ assert.deepEqual(view.desires[0].contact_wait,{condition:'owner_reply',reason:'等她回来'});
+ assert.deepEqual(view.contact_unconfirmed,[{attempt_id:'a1',desire_ids:['w1'],excerpt:'晚安',since:'2026-09-25T00:00:00Z'}]);
+});
 test('a send of unknown outcome is checked again under its own id and only then does the tick go on (AD2-14)',async()=>{
  const events=[];const loop=new MindLoop({eligibility:()=>({eligible:true}),ownerEpoch:()=> 'owner-1',isBusy:()=>false,draft:async()=>assert.fail('nothing ready'),send:async()=>assert.fail('must not send'),
    resume:async candidate=>{events.push(['resume',candidate.attempt_id]);return{state:'unconfirmed',reason:'receipt-unavailable'};},

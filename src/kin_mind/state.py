@@ -21,6 +21,7 @@ from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
 
+from . import erasure
 from .continuity import SCHEMA as CONTINUITY_SCHEMA
 from .continuity import Continuity, RhythmProposal, Understanding
 from .profile import DIMENSIONS, default_profile, interaction_style
@@ -129,6 +130,30 @@ class AffectiveEvent(Model):
 CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
 # A draft that could not start waits five minutes more each time, up to half an hour (CR2-INT-06).
 DRAFT_START_WAIT_MAX_SECONDS = 1800
+# What the host keeps of a fork turn (boundaries.mjs `forkReceipt`: 64 tool calls, 100 ids a call),
+# and how many ids of what a draft was shown an attempt row names. Past either, the row says the
+# record was cut short, and the settlement treats it so (CL6D-MM-01).
+FORK_TOOL_CALLS, FORK_TOOL_IDS, DRAFT_SHOWN_IDS = 64, 100, 4000
+
+
+def fork_reads(value):
+    """What the host recorded of a contact draft's fork turn: each tool call, whether it succeeded,
+    the ids it returned, and whether that record was cut short (`truncated`). Only these are kept
+    on the attempt row. A record longer than the host's own bounds is cut here too, and says so."""
+    if not isinstance(value, dict):
+        return None
+    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else []
+    kept, cut = [], value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS
+    for call in calls[:FORK_TOOL_CALLS]:
+        if not isinstance(call, dict):
+            continue
+        entries = call.get("ids") if isinstance(call.get("ids"), list) else []
+        cut = cut or len(entries) > FORK_TOOL_IDS
+        kept.append({"name": str(call.get("name") or "")[:128], "ok": call.get("ok") is True,
+                     "ids": [{"id": entry["id"], "revision": entry["revision"] if type(entry.get("revision")) is int else None}
+                             for entry in entries[:FORK_TOOL_IDS]
+                             if isinstance(entry, dict) and isinstance(entry.get("id"), str) and 0 < len(entry["id"]) <= 200]})
+    return {"tool_calls": kept, **({"truncated": True} if cut else {})}
 
 
 def contact_wait_seconds(v):
@@ -825,7 +850,11 @@ class Mind(Continuity):
             attempt = json.loads(row["data"])
             facts.append({"attempt_id": row["id"], "desire_ids": attempt.get("chosen") or [attempt["desire_id"]],
                           "since": attempt.get("unconfirmed_at") or attempt.get("updated_at") or attempt["created_at"],
-                          "excerpt": attempt.get("text_excerpt"), "owner_epoch": attempt.get("owner_epoch"),
+                          "excerpt": attempt.get("text_excerpt"),
+                          # What the draft had before it, beside every copy of its words: the next
+                          # attempt keeps one, and a view names it (CL6D-MM-01).
+                          **({"excerpt_evidence_ids": attempt["evaluated_ids"]} if attempt.get("evaluated_ids") else {}),
+                          "owner_epoch": attempt.get("owner_epoch"),
                           "checks": attempt.get("reconcile_checks", 0),
                           "next_check_at": attempt.get("next_check_at") or at})
         return facts
@@ -1388,7 +1417,7 @@ class Mind(Continuity):
                               for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
             # Sends of unknown outcome, as facts: each may have reached 小光. It is reconciled under
             # its own id and never said again under another; a new, different contact is Kin's to make.
-            "contact_unconfirmed": [{k: u[k] for k in ("attempt_id", "desire_ids", "excerpt", "since")}
+            "contact_unconfirmed": [{k: u[k] for k in ("attempt_id", "desire_ids", "excerpt", "since", "excerpt_evidence_ids") if k in u}
                                     for u in self._unconfirmed_contacts(conn, at)],
         }
         if ledger:
@@ -1500,6 +1529,8 @@ class Mind(Continuity):
             eid = "mind_" + digest([self.scope.key(), "contact-resumed", [(d["id"], d["revision"]) for d in due]])[:32]
             for desire in due:
                 wait = desire.pop("contact_wait")
+                # The host's words replace a copied reason, and what that was written from (CL6D-MM-01).
+                desire.pop("reason_evidence_ids", None)
                 desire.update(status="wanted", revision=desire["revision"] + 1,
                               updated_at=at, event_id=eid,
                               reason="Declared contact condition became ready: " + wait["condition"])
@@ -1614,6 +1645,9 @@ class Mind(Continuity):
                 "desire": desire,
                 "desires": ready,
                 "unconfirmed": self._unconfirmed_contacts(conn, self.clock()),
+                # How far the deletes went when the draft could begin: what its tools read past what
+                # the host's receipt names is anything deleted after this (CL6D-MM-01).
+                "tombstone_mark": erasure.tombstone_mark(conn),
             }
             conn.execute(
                 "INSERT INTO mind_contacts VALUES(?,?,?,?)",
@@ -1651,6 +1685,35 @@ class Mind(Continuity):
                 "attempt": attempt,
             }
 
+    @staticmethod
+    def _draft_read(conn, attempt, shown_ids, receipt):
+        """Name on the attempt row everything its draft had before it (`evaluated_ids`): the wishes it
+        was offered and the sends of unknown outcome it was told of (what their words rest on), the
+        ids the memory context and the state handed to it name (`shown_ids`, the host's), and what
+        its fork read with its tools (`receipt`, kept as `draft_receipt`) -- as far as the store
+        knows each, held or deleted. And whether that is all of it: a receipt cut short, or more
+        shown than a row keeps, is not (`reads_truncated`) (CL6D-MM-01)."""
+        named = set()
+        for desire in [attempt.get("desire"), *(attempt.get("desires") or [])]:
+            if isinstance(desire, dict):
+                named.update(v for ref in desire.get("evidence") or [] if isinstance(ref, dict)
+                             for v in (ref.get("source_id"), ref.get("record_id")))
+                named.update(desire.get("reason_evidence_ids") or ())
+        for fact in attempt.get("unconfirmed") or []:
+            if isinstance(fact, dict):
+                named.update(fact.get("excerpt_evidence_ids") or ())
+        shown = [i for i in shown_ids if isinstance(i, str)] if isinstance(shown_ids, list) else []
+        named.update(shown[:DRAFT_SHOWN_IDS])
+        named = {i for i in named if isinstance(i, str)}
+        read = fork_reads(receipt)
+        evaluated = erasure.held(conn, named) | erasure.tombstoned(conn, named) | set(erasure.tool_read_ids(conn, read))
+        # What an earlier settlement of this attempt named stays named.
+        attempt["evaluated_ids"] = sorted(evaluated | set(attempt.get("evaluated_ids") or ()))
+        if read:
+            attempt["draft_receipt"] = read
+        if len(shown) > DRAFT_SHOWN_IDS or erasure.reads_truncated(read):
+            attempt["reads_truncated"] = True
+
     def _attempt(self, conn, aid):
         row = conn.execute(
             "SELECT data FROM mind_contacts WHERE id=? AND scope=?",
@@ -1676,10 +1739,19 @@ class Mind(Continuity):
                 return True
         return False
 
-    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False, desire_ids=None, text=None):
+    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False, desire_ids=None, text=None, shown_ids=None, draft_receipt=None):
         """`desire_ids`: the wishes Kin's draft acts on, among those the attempt offered her; unnamed
         means all of them. `text`: the text about to be sent, kept as a digest and an excerpt so a
-        send of unknown outcome can be recognised and never said again under another id."""
+        send of unknown outcome can be recognised and never said again under another id.
+
+        `shown_ids` and `draft_receipt`, from the host once a draft is back: the ids the memory
+        context and the state it was handed name, and the host's record of its fork turn -- what its
+        tools returned. The attempt row names them with what it offered (`evaluated_ids`). Kin's words
+        from the draft, her decision's reason and the text about to be sent, are written only while
+        none of that is deleted, checked in this write; a record cut short counts anything deleted
+        since the claim. A reason copied onto a wish names them beside it, so a delete takes it
+        there too. A text already sent is a message to her: that record is the conversation's and
+        stays; only this row's copy goes (CL6D-MM-01)."""
         decision = ContactDecision.model_validate(decision) if decision is not None else None
         failure = ContactFailure.model_validate(failure) if failure is not None else None
         if decision and state != "canceled":
@@ -1711,6 +1783,18 @@ class Mind(Continuity):
                 raise Conflict(
                     "A possible send requires reconciliation, not cancellation"
                 )
+            words = state == "pending" or (state == "canceled" and decision is not None)
+            if words or shown_ids is not None or draft_receipt is not None:
+                self._draft_read(conn, attempt, shown_ids, draft_receipt)
+            if words:
+                gone = erasure.tombstoned(conn, attempt["evaluated_ids"])
+                if not gone and attempt.get("reads_truncated"):
+                    gone = erasure.deleted_since(conn, attempt.get("tombstone_mark"))
+                if gone:
+                    # Something the draft had before it was deleted while it was written: none of its
+                    # words are kept and nothing is sent. The wishes are drafted again, from what is
+                    # there then.
+                    state, reason, decision, text = "canceled", "draft-sources-deleted", None, None
             if state == "pending":
                 attempt["chosen"] = list(dict.fromkeys(desire_ids or offered))
                 if text is not None:
@@ -1740,7 +1824,7 @@ class Mind(Continuity):
                 "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
                 (state, dumps(attempt), attempt_id),
             )
-            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-not-started", "draft-source-changed", "contact-source-changed", "contact-review-failed", "repeats-unconfirmed-send"}):
+            if state == "canceled" and (decision or reason in {"draft-empty", "draft-failed", "draft-not-started", "draft-source-changed", "contact-source-changed", "contact-review-failed", "repeats-unconfirmed-send", "draft-sources-deleted"}):
                 current = self._load(conn)
                 targets = list(dict.fromkeys(desire_ids or attempt.get("chosen") or offered))
                 # A decision or a failure applies to the wishes it names that are still as drafted.
@@ -1789,12 +1873,26 @@ class Mind(Continuity):
                             applied = ContactDecision(action="wait",
                                 reason="这条和一次结果未知的发送相同：那次按原编号对账；想说的话换成新的内容再说",
                                 condition="new_evidence")
+                        elif reason == "draft-sources-deleted":
+                            # No failure, and no model decision to keep: drafted again soon.
+                            applied = ContactDecision(action="wait", reason="Something the draft had read was deleted while it was written",
+                                condition="time", retry_after_seconds=CONTACT_WAIT_MIN_SECONDS)
                         applied = applied or ContactDecision(action="wait", reason="Legacy empty draft; a new related source is required")
                         desire.update(status="abandoned" if applied.action == "abandon" else "waiting", revision=desire["revision"] + 1,
                                       updated_at=self.clock(), event_id=eid,
                                       reason=applied.reason)
+                        # Kin's own reason names what it was written from beside it, as a sharing
+                        # decision's copies do, and goes when that goes; a host reason is no one's
+                        # copy and replaces what the old one named (CL6D-MM-01).
+                        written_from = attempt.get("evaluated_ids") if applied is decision else None
+                        if written_from:
+                            desire["reason_evidence_ids"] = written_from
+                        else:
+                            desire.pop("reason_evidence_ids", None)
                         if applied.action == "wait":
                             desire["contact_wait"] = self._wait_details(applied, self.clock(), attempt["owner_epoch"])
+                            if written_from:
+                                desire["contact_wait"]["reason_evidence_ids"] = written_from
                         else:
                             desire.pop("contact_wait", None)
                         attempt.setdefault("decisions", {})[desire["id"]] = applied.model_dump()
