@@ -453,7 +453,7 @@ def findings_schema():
 
 
 def codex_argv(executable, directory, *, model, reasoning, schema_file, last_file, provider,
-               computer_mcp=None, web_mcp=None, ui_mcp=None, model_catalog=None):
+               computer_mcp=None, web_mcp=None, ui_mcp=None, model_catalog=None, execution_env=None):
     """One non-interactive run: user config, rules, hooks, multi-agent, built-in
     web search and approvals all off; read-only sandbox; prompt arrives on stdin.
     The only MCP servers allowed are the host's own computer reader and web
@@ -510,10 +510,13 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
                 continue
             # default_tools_approval_mode=approve pre-approves THIS host-owned server
             # only; the global approval policy stays never and other tools are unaffected.
+            # The server's environment is only what is named here, so the execution's mark, which
+            # the host finds every process of this run by, is named too (CR4-MM-03).
+            server_env = {"PYTHONPATH": server["env"]["PYTHONPATH"], **(execution_env or {})}
             argv += [
                 "-c", f"mcp_servers.{name}.command=" + dumps(server["command"]),
                 "-c", f"mcp_servers.{name}.args=" + dumps(server["args"]),
-                "-c", f"mcp_servers.{name}.env={{PYTHONPATH=" + dumps(server["env"]["PYTHONPATH"]) + "}",
+                "-c", f"mcp_servers.{name}.env={{" + ", ".join(key + "=" + dumps(value) for key, value in server_env.items()) + "}",
                 "-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"',
                 "-c", f"mcp_servers.{name}.omit_tools_from=[]",
                 "-c", f"mcp_servers.{name}.startup_timeout_sec=10",
@@ -813,14 +816,18 @@ def run_codex(
         continuation_file.write_text(dumps(continuation))
         continuation_file.chmod(0o600)
     last_file = directory / f"result-{attempt}.json"
+    # Every process of this run carries the worker's mark: the CLI, each MCP server it starts, and
+    # whatever they start, in a group or a session of its own as well (CR4-MM-03).
+    marked = worker_groups.execution_env()
     argv = codex_argv(executable, directory, model=model, reasoning=reasoning,
                       schema_file=schema_file, last_file=last_file, provider=provider,
                       computer_mcp=computer_mcp, web_mcp=web_mcp, ui_mcp=ui_mcp,
-                      model_catalog=model_catalog)
+                      model_catalog=model_catalog, execution_env=marked)
     child_env = codex_env(
         codex_home, env_key=provider.get("env_key"),
         extra_env_keys=(ui_mcp or {}).get("env_vars", []),
     )
+    child_env.update(marked)
     identity = {"executor": "codex-cli", "executor_version": cli_version, "model": model,
                 "executor_source": executor_source, "codex_home": "kin" if shared_home else "isolated",
                 "reasoning": reasoning, "sandbox": "read-only",
