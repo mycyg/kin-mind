@@ -574,6 +574,13 @@ def test_evidence_the_fork_read_with_its_tools_may_be_cited(setup):
         ref = mind._evidence(conn, [earlier])[0]
     assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision']}), {}, started)
     assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': ref['revision'] + 1}), {}, started) == {}
+    # CL6E-MM-04: named bare -- as what a shown item rests on -- it is taken at the revision it has now;
+    # a revision any call named is the one that was read, whatever another call named bare.
+    assert jobs._tool_fetched(Proposal(), calls({'id': ref['record_id'], 'revision': None}), {}, started)
+    both = {'native_receipt': {'tool_calls': [
+        {'name': 'read_memory', 'ok': True, 'ids': [{'id': ref['record_id'], 'revision': ref['revision'] + 1}]},
+        {'name': 'read_continuity_context', 'ok': True, 'ids': [{'id': ref['record_id'], 'revision': None}]}]}}
+    assert jobs._tool_fetched(Proposal(), both, {}, started) == {}
 
 
 def test_the_decision_runtime_is_read_from_the_committed_schedule(setup):

@@ -1768,10 +1768,18 @@ class Appraisals:
     def _tool_fetched(self, proposal, receipt, supplied, started):
         """K1-16: the assessment fork reads memory with its own read-only tools. Evidence the proposal
         cites that this request did not supply is accepted only when a completed tool call of this
-        turn returned that very source or record, at its current revision when the call named one
+        turn returned that very source or record, at its current revision when a call named one
         (its receipt's `ids`, CR-MIND-08), and the id resolves to a
         current record of this scope that already existed when the attempt began. A tool that
-        succeeded at something else vouches for nothing; a receipt without ids admits nothing."""
+        succeeded at something else vouches for nothing; a receipt without ids admits nothing.
+
+        What a call's `ids` hold (CL6E-MM-04): every store id its result carried -- a record shown
+        with its revision, one named in its text or its keys without one, and what a derived thing it
+        showed rests on (`rests_on_ids`) -- but none the memory server said was deleted before the
+        read began (`deleted_ids`). One named only without a revision is taken at the revision it has
+        now: a concern or a graph item the fork read was made from it, and an entry that cites it goes
+        when it is deleted, as that item's words do. A revision any call named is the one read: a
+        record revised since is not accepted though another call named it bare."""
         native = receipt.get("native_receipt") or {}
         calls = native.get("tool_calls") or receipt.get("tool_calls") or []
         # What each completed call returned, WS1's [{id, revision}]: {id: {revision, ...}}, with
@@ -1791,11 +1799,13 @@ class Appraisals:
 
         def read_back(ref):
             # A record returned at a revision other than its current one: what was read is not
-            # what would be cited.
+            # what would be cited. Named bare as well -- as what something else rests on, say --
+            # it was still read at the revision named.
             for key in ("record_id", "source_id"):
                 seen = returned.get(ref[key])
                 if seen is not None:
-                    return key != "record_id" or None in seen or ref.get("revision") in seen
+                    named = seen - {None}
+                    return key != "record_id" or not named or ref.get("revision") in named
             return False
         known = {v for ref in supplied.values() for v in (ref["record_id"], ref["source_id"])}
         cited = set()
