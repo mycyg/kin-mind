@@ -66,6 +66,14 @@ ENUM = re.compile(r"[a-z][a-z0-9_:-]{0,39}")
 CODE = re.compile(r"[a-z][a-z0-9_:.-]{0,79}")
 CODED_TEXT = frozenset({"target", "role"})
 CODED_LISTS = frozenset({"verification_gaps"})
+# A conversation habit (habits.py) keeps 小光's own words -- the directions she named, the frequency
+# she asked for -- as an entry's `value`, beside the evidence she said them in; a read of the habits
+# and a proposal to change them repeat them as `preferences`. An entry that cites erased material
+# loses its value's words with its reason, a proposal its preferences', and a read the preferences
+# its erased entries gave it: a string goes, a list of them is emptied, a number or a switch stays
+# (CL8-MM-01). Only a habit's: anywhere else a `value` is a number or an enum.
+HABIT_ENTRY = frozenset({"value", "evidence", "reason", "at"})
+HABIT_PREFERENCES = "preferences"
 # `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
 # sources included: a queue row or a run that names one of them erased loses every word the model or
 # the executor wrote (CR5-MM-01). An enrichment row names the same for the memory its parent's model
@@ -338,6 +346,19 @@ def _blank_words(items):
     return items if all(a is b for a, b in zip(out, items)) else out
 
 
+def _blank_keys(mapping, keys):
+    out = {key: _blank(item) if key in keys else item for key, item in mapping.items()}
+    return mapping if all(out[key] is mapping[key] for key in mapping) else out
+
+
+def _habits_erased(value, ids):
+    """The preferences a read of the habits has from its entries (`entries` beside them) that rest on `ids`."""
+    entries = value.get("entries")
+    if not isinstance(entries, dict):
+        return frozenset()
+    return frozenset(key for key, entry in entries.items() if isinstance(entry, dict) and cites(entry, ids))
+
+
 def _field_cites(value, key, ids):
     found = value.get(key + FIELD_EVIDENCE)
     return isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found)
@@ -382,6 +403,10 @@ def scrub(value, ids, *, erase=False, receipts=True):
             new = ERASED
         elif erase and key in CODED_LISTS and isinstance(item, list):
             new = _blank_words(item)
+        elif erase and key == "value" and HABIT_ENTRY <= value.keys():
+            new = _blank(item)
+        elif key == HABIT_PREFERENCES and isinstance(item, dict) and (erase or _habits_erased(value, ids)):
+            new = _blank_keys(item, item if erase else _habits_erased(value, ids))
         elif key in REF_LISTS and isinstance(item, list):
             new = [_tombstone(ref, ids) for ref in item]
             new = item if all(a is b for a, b in zip(new, item)) else new
@@ -401,10 +426,11 @@ def drop_deleted(conn, value, since=None, *, process=False):
     deleted comes back as it is (CR4-MM-02, CR5-MM-01, CL6E-MM-01). `since`: the `tombstone_mark`
     taken before `value` was read, when there is one -- a delete before it had already taken its
     words out of all `value` was read from, so only the deletes after it count (`tombstoned_since`,
-    CL6E-MM-02)."""
-    from eventmem.core.db import NAMED
+    CL6E-MM-02). What it names is read string by string (`named_in`), never from its JSON, where an
+    escaped line break stands right before an id as a letter and hides it (CL8-FLOW-03)."""
+    from eventmem.core.db import named_in
 
-    erased = tombstoned_since(conn, NAMED.findall(dumps(value)), since)
+    erased = tombstoned_since(conn, named_in(value), since)
     if not erased:
         return value
     return scrub_process(value, frozenset(erased)) if process else scrub(value, frozenset(erased))
@@ -437,10 +463,11 @@ def shown_ids(conn, value, since=None):
     entries marked for review. What it wrote is committed and kept only while none of them has
     been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03). `since`: the
     `tombstone_mark` taken before `value` was read -- then what was deleted after it is named too
-    (`seen`), wherever in between the read and this the delete came (CL6E-MM-02)."""
-    from eventmem.core.db import NAMED
+    (`seen`), wherever in between the read and this the delete came (CL6E-MM-02). Read string by
+    string, as `drop_deleted` reads (CL8-FLOW-03)."""
+    from eventmem.core.db import named_in
 
-    ids = NAMED.findall(dumps(value))
+    ids = named_in(value)
     return sorted(held(conn, ids) if since is None else seen(conn, ids, since))
 
 

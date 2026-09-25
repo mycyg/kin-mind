@@ -226,3 +226,32 @@ def test_a_stored_proposal_a_delete_took_words_from_is_judged_afresh(setup, monk
     state, count, data = queue_row(mind, job["id"])
     assert state == "complete" and mind.read()["dimensions"]["curiosity"]["value"] == 55
     assert data["proposed_result"]["reason"] == "重新看了一遍今天"
+
+
+def test_what_a_value_names_is_read_string_by_string_by_the_commit_and_by_the_write(setup, monkeypatch):
+    """What a model was shown is named by the ids it holds (`shown_ids`), and a row is written without
+    what was deleted since its attempt began by the ids it holds (`drop_deleted`): each reads them
+    string by string (`named_in`), as the store does everywhere. An id right after a line break -- in
+    the value's JSON, right after the letter `n` -- is named like any other, and so is each of the
+    eleven ways a text holds one where it is one (CL8-FLOW-03)."""
+    from eventmem.core.db import NAMED, dumps
+    from test_fork_reads import STORE_ID_BOUNDARIES
+
+    mind, source, clock = setup
+    sid = source("named-in-text", "一行")
+    looked, real = [], erasure.tombstoned_since
+    monkeypatch.setattr(erasure, "tombstoned_since", lambda conn, ids, mark: looked.append(sorted(set(ids))) or real(conn, ids, mark))
+    for text, named in (("第一行\n{id}", True), *STORE_ID_BOUNDARIES):
+        value = {"text": text.format(id=sid)}
+        with mind.engine.db.connect() as conn:
+            assert erasure.shown_ids(conn, value) == ([sid] if named else []), text
+            looked.clear()
+            erasure.drop_deleted(conn, value, since=erasure.tombstone_mark(conn))
+            assert looked == [[sid] if named else []], text
+    line = {"text": "第一行\n" + sid}
+    assert NAMED.findall(dumps(line)) == [], "in its JSON the id stands right after a letter"
+    with mind.engine.db.connect() as conn:
+        mark = erasure.tombstone_mark(conn)
+    mind.engine.delete(sid)
+    with mind.engine.db.connect() as conn:
+        assert erasure.shown_ids(conn, line, since=mark) == [sid], "deleted since the mark, and named all the same"

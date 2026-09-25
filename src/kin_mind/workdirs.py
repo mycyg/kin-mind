@@ -39,14 +39,21 @@ EMAIL = re.compile(r"[A-Za-z0-9_.+=~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za
 # tools give -- never a model's or a person's word. A single word stays in one of these, or where
 # it is the name of a key of the same document; anywhere else it is a word. A code field missing
 # here loses a one-word value to ERASED, which costs a file read by nobody some detail; `state` is
-# here because the host's health and audit read it from the status file.
+# here because the host's health and audit read it from the status file, and a receipt's
+# `truncated_by` and `usage_status` because an operator reads there why a fork's reads were cut
+# short and whether a call's usage was reported (CL8-MM-04).
 CODE_KEYS = frozenset({
     "state", "status", "result_state", "stage", "outcome",
     "channel", "provider", "model", "reasoning", "executor", "backend", "adapter", "server", "tool",
     "kind", "type", "item_type", "content_type", "class", "code", "category", "error", "error_tags",
-    "retry_condition", "authority", "basis", "actor", "role", "origin",
+    "retry_condition", "authority", "basis", "actor", "origin",
     "tier", "lane", "stimulus", "waiting_reason", "repair_reason", "reason_withheld",
+    "truncated_by", "usage_status",
 })
+# The fields that hold a code where the host writes them and a model's own word elsewhere: only their
+# codes stay. `role` is whose turn a message is, and in a graph relation what the model called
+# someone (erasure.py, CL6-MM-09) (CL8-MM-06).
+CODE_VALUES = {"role": frozenset({"user", "assistant", "system", "tool", "developer"})}
 # The files of the directory that carry words, beside `result-N.json`, one an attempt.
 FILES = ("input.json", "continuation.json", "checkpoint.json", "receipt.json",
          "computer-observations.json", "computer-use-observations.json", "web-observations.json",
@@ -66,7 +73,7 @@ def kept(value, key=None, keys=frozenset()):
     if not KEPT.fullmatch(value) or EMAIL.search(value):
         return False
     if WORD.fullmatch(value):
-        return key in CODE_KEYS or value in keys
+        return key in CODE_KEYS or value in keys or value in CODE_VALUES.get(key, ())
     return True
 
 

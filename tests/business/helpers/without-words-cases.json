@@ -115,14 +115,18 @@
    "authority": "explicit",
    "basis": "observed",
    "actor": "unknown",
-   "role": "user",
    "origin": "reflection",
    "tier": "A",
    "lane": "action",
    "stimulus": "idle",
    "waiting_reason": "admission",
    "repair_reason": "manual",
-   "reason_withheld": "withheld"
+   "reason_withheld": "withheld",
+   "truncated_by": [
+    "untracked",
+    "depth"
+   ],
+   "usage_status": "reported"
   },
   "expected": {
    "state": "running",
@@ -155,14 +159,142 @@
    "authority": "explicit",
    "basis": "observed",
    "actor": "unknown",
-   "role": "user",
    "origin": "reflection",
    "tier": "A",
    "lane": "action",
    "stimulus": "idle",
    "waiting_reason": "admission",
    "repair_reason": "manual",
-   "reason_withheld": "withheld"
+   "reason_withheld": "withheld",
+   "truncated_by": [
+    "untracked",
+    "depth"
+   ],
+   "usage_status": "reported"
+  }
+ },
+ {
+  "name": "a role keeps only the codes of whose turn a message is; what a model called someone is text (CL8-MM-06)",
+  "value": {
+   "turns": [
+    {
+     "role": "user"
+    },
+    {
+     "role": "assistant"
+    },
+    {
+     "role": "system"
+    },
+    {
+     "role": "tool"
+    },
+    {
+     "role": "developer"
+    }
+   ],
+   "relation": {
+    "role": "mentor"
+   },
+   "relations": [
+    {
+     "role": "Mentor"
+    },
+    {
+     "role": "User"
+    }
+   ]
+  },
+  "expected": {
+   "turns": [
+    {
+     "role": "user"
+    },
+    {
+     "role": "assistant"
+    },
+    {
+     "role": "system"
+    },
+    {
+     "role": "tool"
+    },
+    {
+     "role": "developer"
+    }
+   ],
+   "relation": {
+    "role": "[已删除]"
+   },
+   "relations": [
+    {
+     "role": "[已删除]"
+    },
+    {
+     "role": "[已删除]"
+    }
+   ]
+  }
+ },
+ {
+  "name": "a receipt keeps why its reads were cut short and whether its usage was reported; a one-word tool name is text (CL8-MM-04)",
+  "value": {
+   "receipt": {
+    "channel": "fork",
+    "truncated": true,
+    "truncated_by": [
+     "depth",
+     "ids-per-call",
+     "untracked"
+    ],
+    "usage_status": "unknown",
+    "tool_calls": [
+     {
+      "name": "commandExecution",
+      "ok": true,
+      "ids": []
+     },
+     {
+      "name": "memorypalace.read_continuity_context",
+      "ok": true,
+      "ids": [
+       {
+        "id": "mem_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "revision": 1
+       }
+      ]
+     }
+    ]
+   }
+  },
+  "expected": {
+   "receipt": {
+    "channel": "fork",
+    "truncated": true,
+    "truncated_by": [
+     "depth",
+     "ids-per-call",
+     "untracked"
+    ],
+    "usage_status": "unknown",
+    "tool_calls": [
+     {
+      "name": "[已删除]",
+      "ok": true,
+      "ids": []
+     },
+     {
+      "name": "memorypalace.read_continuity_context",
+      "ok": true,
+      "ids": [
+       {
+        "id": "mem_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "revision": 1
+       }
+      ]
+     }
+    ]
+   }
   }
  },
  {

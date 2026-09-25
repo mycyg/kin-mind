@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from eventmem.core.db import dumps
 
-from kin_mind.workdirs import CODE_KEYS, ERASED, MARKER, scrub, without_words
+from kin_mind.workdirs import CODE_KEYS, CODE_VALUES, ERASED, MARKER, scrub, without_words
 from kin_mind.memory import MemoryContinuity
 from test_erasure import settle
 
@@ -42,10 +42,15 @@ def test_what_names_or_classifies_something_stays_and_words_go(case):
 
 
 def test_both_sides_know_the_same_fields_of_codes():
-    """The fields whose one-word values stay are the same list on both sides."""
+    """The fields whose one-word values stay are the same list on both sides, and so are the fields
+    that keep only their codes, with the same codes (CL8-MM-04, CL8-MM-06)."""
     source = (Path(__file__).resolve().parents[2] / "adapters" / "without-words.mjs").read_text(encoding="utf-8")
     listed = re.search(r"export const CODE_KEYS=Object\.freeze\(\[(.*?)\]\);", source, re.S).group(1)
     assert set(re.findall(r"'([a-z_]+)'", listed)) == set(CODE_KEYS)
+    assert {"truncated_by", "usage_status"} <= CODE_KEYS and "role" not in CODE_KEYS
+    valued = re.search(r"export const CODE_VALUES=Object\.freeze\(\{(.*?)\}\);", source, re.S).group(1)
+    both = {key: set(re.findall(r"'([a-z_]+)'", codes)) for key, codes in re.findall(r"(\w+):Object\.freeze\(\[(.*?)\]\)", valued)}
+    assert both == {key: set(codes) for key, codes in CODE_VALUES.items()} and both["role"] >= {"user", "assistant"}
 
 
 def test_a_settled_exploration_leaves_its_directory_without_words_and_the_next_run_finds_the_ones_left(env, tmp_path):

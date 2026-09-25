@@ -157,6 +157,8 @@ NO_REPEAT_QUARANTINE = {"deepseek-timeout"}
 COMPRESSION_STALL_LIMIT = 3
 MAX_COMPRESSION_WAITS = 12
 COMPRESSION_RETRY_SECONDS = 30
+# The part of the memory context no queue row freezes: every attempt reads it afresh (CL8-MM-01).
+HABITS = "conversation_habits"
 # A conflict raised while the context was still being built spent no model call, so it
 # is not a charged attempt. It is bounded by a counter of its own, like a wait.
 MAX_PREPARATION_CONFLICTS = 4
@@ -2049,7 +2051,15 @@ class Appraisals:
                 view["exploration_capabilities"] = self.exploration_capabilities
                 sources = []
                 maintenance = data.get("stimulus") == "session-maintenance"
-                memory_context = data.get("frozen_memory_context") or ((self.memory.semantic_context(event_limit=0, operational=True) if operational else self.memory.semantic_context()) if semantic_enabled and not maintenance else None)
+                frozen = data.get("frozen_memory_context")
+                if frozen and HABITS in frozen:
+                    # As an earlier build froze it, with the habits in it: they are read afresh below.
+                    frozen = data["frozen_memory_context"] = {k: v for k, v in frozen.items() if k != HABITS}
+                # The habits are 小光's own words, and a delete takes a habit's out of the store: they are
+                # read afresh at every attempt, never taken from a frozen context (CL8-MM-01).
+                memory_context = ({**frozen, HABITS: self.memory.habits.read()} if frozen else
+                                  (self.memory.semantic_context(event_limit=0, operational=True) if operational else self.memory.semantic_context())
+                                  if semantic_enabled and not maintenance else None)
                 historical = data.get("stimulus") in {"memory-backfill", "memory-enrichment"}
                 if memory_context and historical and not data.get("frozen_memory_context"):
                     memory_context["through_seq"] = memory_context["cursor"]
@@ -2085,7 +2095,7 @@ class Appraisals:
                         memory_context["through_seq"] = memory_context["cursor"]
                         memory_context["pending_events"] = []
                 if lanes and memory_context and not data.get("frozen_memory_context"):
-                    data["frozen_memory_context"] = memory_context
+                    data["frozen_memory_context"] = {k: v for k, v in memory_context.items() if k != HABITS}
                     with self.engine.db.connect(write=True) as conn:
                         conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
                 with self.engine.db.connect() as conn:
