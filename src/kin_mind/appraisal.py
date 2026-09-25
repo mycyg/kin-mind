@@ -84,6 +84,9 @@ REVIEW_MAX_MINUTES = 1440
 # identical failure twice in a row is quarantined instead of paid for again.
 MAX_CHARGED_ATTEMPTS = 4
 REPEATED_FAILURE_LIMIT = 2
+# The outcomes of a full appraisal call that ran to its answer: valid, or valid enough to need a
+# repair. A call preempted on the way is not one of them (CR3-MM-06).
+COMPLETED_APPRAISAL = {"ok", "schema-invalid"}
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -2683,7 +2686,13 @@ class Appraisals:
                 data.pop(field, None)
             state = "complete"
         except ModelAdmissionWait as error:
-            admission_wait = not model_admitted or getattr(provider, "native_review", False)
+            # A native review is admitted call by call, so its wait means no model call only until a
+            # full appraisal call of this attempt has completed. After that the wait is a later
+            # call's -- a schema or advice repair that never started: that call alone is exempt, and
+            # the attempt that made the appraisal call is charged for it (CR3-MM-06).
+            appraised = any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL
+                            for call in calls)
+            admission_wait = not model_admitted or (getattr(provider, "native_review", False) and not appraised)
             state = "pending"
             if admission_wait:
                 data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),

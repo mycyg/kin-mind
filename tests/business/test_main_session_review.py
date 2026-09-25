@@ -694,3 +694,42 @@ def test_evidence_already_integrated_ends_the_attempt_with_no_call_no_slot_and_n
     assert out["attempts"] == 0 and out["completed_from"] == "already-integrated"
     [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
     assert (ledger["charged"], ledger["outcome"], ledger["calls"]) == (False, "discarded", [])
+
+
+def test_a_repair_that_never_started_leaves_the_appraisal_that_ran_charged(setup):
+    """CR3-MM-06: the main-session appraisal ran to its answer and the answer needs one schema repair,
+    whose fork is never made. The repair alone is exempt -- no call on record, no usage -- and the
+    attempt that made the full appraisal call is charged for it, keeps that call and spends the
+    budget; the second time in a row sets the row aside instead of paying for it again."""
+    mind, source, _ = setup
+    asked = []
+
+    def exchange(request):
+        asked.append(request['name'])
+        if request['name'] == 'submit_appraisal':
+            # A full answer, with a value of the wrong type: it needs the repair.
+            return {'state': 'complete', 'result': {'reason': '想先记在心里。', 'values': {'curiosity': 'high'}},
+                    'receipt': {'native_turn_id': 'turn-1', 'model': 'gpt-6-astra', 'usage': {'input_tokens': 500, 'output_tokens': 50}}}
+        return NEVER_STARTED[0]
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('repair-never-started')], 'synthetic-v1')
+
+    def row():
+        with mind.engine.db.connect() as conn:
+            found = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+        return found['state'], found['attempts'], json.loads(found['data'])
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'pending'
+    assert asked == ['submit_appraisal', 'repair_appraisal']
+    state, charged, data = row()
+    assert (state, charged) == ('pending', 1), 'the attempt that made the appraisal call is counted'
+    assert not data.get('admission_waits') and data['error'] == 'deepseek-partial-evaluation-wait'
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts']
+    assert ledger['charged'] is True
+    assert [(c['purpose'], c['outcome'], c['usage_status']) for c in ledger['calls']] == [('appraise', 'schema-invalid', 'reported')]
+    # Again: another full call, and its repair again never starts. It is not paid for a third time.
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job['id'],))
+    jobs.run_one(native_provider(mind, exchange))
+    state, charged, data = row()
+    assert (state, charged) == ('needs-repair', 2)
+    assert [a['charged'] for a in attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts']] == [True, True]
