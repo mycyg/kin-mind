@@ -136,8 +136,17 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     settle(store.engine)
     assert store.engine.source(doomed)["status"] == "received"
     root = store.engine.db.root
+    # The dry run says how much the only deleting step will take, as it will be once `lineage` has
+    # run before it: the report, the reflection written from it, the notes that cite either
+    # (CL6-MM-02). A release's expect holds these, so a closure that grew would stop it.
+    dry = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]["reerase"]["plan"]
+    assert {key: dry[key] for key in ("derived_sources", "derived_in_closure", "records", "sources")} == {
+        "derived_sources": 1, "derived_in_closure": 1, "records": 7, "sources": 2}
+    alone = repair.run(root, apply=False, steps=("reerase",))["steps"]["reerase"]["plan"]
+    assert (alone["records"], alone["sources"], alone["derived_in_closure"]) == (5, 1, 0), "without lineage first, as it is now"
     applied = repair.run(root, apply=True, steps=("lineage", "reerase"))["steps"]
     assert applied["reerase"]["done"]["derived_sources"] == 1
+    assert (applied["reerase"]["done"]["records"], applied["reerase"]["done"]["sources"]) == (7, 2), "what the plan said"
     settle(store.engine)
     with store.engine.db.connect() as conn:
         sources = {row[0] for row in conn.execute("SELECT id FROM sources")}
@@ -149,7 +158,8 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     assert {root_id(sid) for sid in (kept_report, creation, reflection, later, again)} <= records
     # A second run finds nothing left.
     report = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]
-    assert report["reerase"]["plan"]["derived_sources"] == 0 and set(report["lineage"]["plan"].values()) == {0}
+    assert set(report["lineage"]["plan"].values()) == {0}
+    assert [report["reerase"]["plan"][key] for key in ("derived_sources", "derived_in_closure", "records", "sources")] == [0, 0, 0, 0]
     with store.engine.db.connect() as conn:
         derived = {row[0]: json.loads(row[1])["derived_from"] for row in conn.execute(
             "SELECT id,data FROM sources WHERE json_extract(data,'$.derived_from') IS NOT NULL")}

@@ -6,9 +6,12 @@ from .db import Missing, digest
 from .engine import derived_source, uid
 
 
-def erase_set(conn, object_id):
+def erase_set(conn, object_id, lineage=None):
     """What deleting `object_id` erases, as (record ids, source ids). The delete and its preview
-    both ask here, so the set a console shows is the set that goes.
+    both ask here, so the set a console shows is the set that goes. `lineage` is only the repair's:
+    what its `lineage` step is about to register and has not yet -- `dependents`, the root records
+    that will depend on a record, and `roots`, the root records whose sources it will make derived
+    -- so a dry run reports the set its apply will take (CL6-MM-02).
 
     A source takes every record that cites it, and each record takes what was built on it —
     records that name it as evidence and its parts — and so on down. A record takes its own
@@ -26,6 +29,7 @@ def erase_set(conn, object_id):
             "SELECT e.source_id FROM dependencies d JOIN evidence e ON e.record_id=d.evidence_id"
             " WHERE d.record_id=?", (object_id,))}
         sources, pending = own - cited, {object_id}
+    dependents, roots = (lineage or {}).get("dependents") or {}, (lineage or {}).get("roots") or {}
     records, walked, examined = set(), set(), set()
     while True:
         for sid in sources - walked:
@@ -38,12 +42,13 @@ def erase_set(conn, object_id):
             records.add(current)
             pending.update(r[0] for r in conn.execute(
                 "SELECT record_id FROM dependencies WHERE evidence_id=?", (current,)))
+            pending.update(dependents.get(current, ()))
             pending.update(r[0] for r in conn.execute("SELECT id FROM records WHERE parent_id=?", (current,)))
         # A derived source -- a reflection, a creation's summary -- holds in its own bytes the words it
         # was written from: it goes when the record it was stored as goes, with whatever was built on
         # it (CR5-MM-02). Only that record: a note in the set that cites a derived source among its
         # evidence goes alone, and the derived source it cites stays (CL6-MM-01).
-        derived = {sid for sid in (derived_source(conn, rid) for rid in records - examined) if sid}
+        derived = {sid for sid in (derived_source(conn, rid) or roots.get(rid) for rid in records - examined) if sid}
         examined |= records
         if derived <= sources:
             return records, sources
