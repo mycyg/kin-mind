@@ -344,3 +344,25 @@ def test_a_shared_service_woken_for_an_execution_is_handed_no_mark(tmp_path, mon
         local_embedding.ensure_started(tmp_path, f"http://127.0.0.1:{port}/v1", local_embedding.MODEL)
     assert started["env"] is not None and worker_groups.MARK_ENV not in started["env"]
     assert started["env"].get("PATH") == os.environ.get("PATH"), "everything else is inherited as before"
+
+
+def test_the_version_probe_of_the_explore_action_carries_the_mark(tmp_path, monkeypatch):
+    """The explore action asks the CLI's version once, in `prepare_codex_exploration`, and hands it
+    to `run_codex`, which does not ask again: that probe is the run's first process, and it carries
+    the run's mark by name (CL6-MM-09)."""
+    from kin_mind.codex_executor import prepare_codex_exploration
+
+    monkeypatch.setattr(worker_groups, "_MARK", MARK)
+    monkeypatch.setenv(PROVIDER["env_key"], "synthetic-key")
+    fake = tmp_path / "codex"
+    fake.write_text("#!" + sys.executable + "\nimport os, sys\n"
+                    "open(sys.argv[0] + '.mark', 'w').write(os.environ.get('KIN_WORKER_MARK', ''))\n"
+                    "print('codex-cli 0.155.0')\n")
+    fake.chmod(0o700)
+    prepared = prepare_codex_exploration({
+        "native_codex_command": str(fake),
+        "exploration_model_provider": {"base_url": PROVIDER["base_url"], "env_key": PROVIDER["env_key"]},
+    })
+    assert prepared["state"] == "ready", prepared
+    assert prepared["cli_version"] == "0.155.0"
+    assert (tmp_path / "codex.mark").read_text() == MARK

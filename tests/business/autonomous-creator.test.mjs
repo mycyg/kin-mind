@@ -13,6 +13,7 @@ const temporary=()=>fs.mkdtempSync(path.join(os.tmpdir(),'kin-creator-test-'));
 const MARK='4f1c2b3a-0d9e-4a8b-9c7d-6e5f4a3b2c1d';
 function records(log=[]) {
  return {log,open:spec=>{log.push('open:'+spec.kind);return {mark:MARK,track(){log.push('track');},
+  runsIn(pid){log.push('runs-in:'+pid);},workerExited(){log.push('cli-exited');},
   end:async()=>{log.push('end');return {ended:true};},settle:async()=>{log.push('settle');return {ended:true};}};}};
 }
 test('manifest rejects traversal, symlink escape and duplicate artifact paths',()=>{
@@ -49,7 +50,8 @@ test('a step is one execution of the host\'s: recorded before its CLI starts, it
   assert.equal(result.state,'produced');
   // The record first; the end of everything the CLI started before the workspace is read (the
   // manifest, then the render); the step's own end, render worker included, before it returns.
-  assert.deepEqual(log,['open:creation','spawn','track','end','verify:'+MARK,'settle']);
+  // The CLI leads its own group, followed after its exit like a mind worker's (CL6-MM-09).
+  assert.deepEqual(log,['open:creation','spawn','runs-in:99999996','track','cli-exited','end','verify:'+MARK,'settle']);
   assert.equal(captured.options.env.KIN_WORKER_MARK,MARK,'the CLI has the mark by name');
   assert.ok(captured.args.includes('shell_environment_policy.set={KIN_WORKER_MARK="'+MARK+'"}'),'and every shell command it runs');
   assert.ok(captured.args.includes('shell_environment_policy.inherit="none"'),'which inherits nothing else');
