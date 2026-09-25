@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
+import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,ACTIVITY_KINDS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
 import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
+import {MobileAudit} from '../../adapters/mobile-audit.mjs';
 
 const MINUTE=60000,HOUR=3600000;
 function fixture(t,options={}) {
@@ -564,4 +565,72 @@ test('not-found proves an input never arrived only on its own thread, from a run
   await g.router.watch({reconcileInput:async(id,options)=>{asked.push(options.sessionId);return {state:'not-found',complete:true,sessionId:'thread-after-migration'};}});
   assert.deepEqual([g.router.state.inputs.z.state,g.router.state.inputs.z.reconciliation.reason],['unconfirmed','not-the-submitted-thread']);
   assert.deepEqual(asked,['synthetic','synthetic','synthetic'],'every lookup went to the thread the input was submitted to');
+});
+
+// ---- Third review: CR3-FLOW ----
+
+test('a work summary, a health reading and a classification asked again each pass the activity gate where the call starts; refused, they count nothing (CR3-FLOW-01)',async t=>{
+  // A summary of open work Kin has gone quiet about.
+  const f=fixture(t);
+  await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  const task=f.router.tasks()[0];
+  await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
+  await f.router.observe('prompt-end',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,stopReason:'end_turn'});
+  let read=0,during=null,busyDuring=null;const asked=[];
+  const review=new WorkLockReview({router:f.router,file:path.join(f.root,'review.json'),now:()=>f.clock.now,idleMs:HOUR,
+    collect:async()=>{read++;return {input:{inputs:[{id:'job',text:'写一份报告'}],outputs:[],unsentDrafts:[]},facts:{unsentDraftIds:[],undelivered:[]}};},
+    summarize:async()=>{asked.push('summary');during=f.router.activityList();busyDuring=f.router.busy(f.runtime);
+      return {summary:{summary:'Asked for a report; nothing delivered yet.',delivered:[],open:['the report'],unsent:[],evidenceIds:['job']},receipt:{model:'deepseek-flash',requestId:'r-1'}};}});
+  f.clock.now+=2*HOUR;
+  await f.router.freezeDispatch('release');
+  const held=await review.tick();
+  assert.deepEqual([held.state,held.reason,read,asked.length],['waiting','dispatch-frozen',0,0],'frozen: nothing is read, spent or counted');
+  assert.deepEqual(f.router.activityList(),[]);
+  await f.router.thawDispatch('released');
+  f.clock.now+=10*MINUTE;
+  const told=await review.tick();
+  assert.deepEqual([told.state,told.repeats,asked.length],['told',0,1]);
+  assert.deepEqual(during.map(activity=>[activity.kind,activity.id]),[['work-summary',told.id]],'the drain counts it while the model is asked');
+  assert.equal(busyDuring,false,'it holds no turn, no switch and no dispatch');
+  assert.deepEqual(f.router.activityList(),[],'let go once the call has ended');
+
+  // A health reading: the freeze and its lane are both asked before anything is collected or counted.
+  const leases=[];
+  const lease={acquire:async({lane,purpose})=>{leases.push(purpose);return {proceed:true,lane,release:async()=>{leases.push('released');}};}};
+  let reading=null;
+  const audit=new MobileAudit({file:path.join(f.root,'audit.json'),now:()=>f.clock.now,lease,activity:spec=>f.router.beginActivity(spec),
+    collect:async()=>({checkedAt:f.clock.now}),review:async()=>{reading=f.router.activityList();return {status:'healthy',findings:[]};}});
+  const due=audit.state.nextAt;
+  await f.router.freezeDispatch('release');
+  assert.deepEqual(await audit.tick(),{state:'skipped',reason:'dispatch-frozen'});
+  assert.deepEqual([leases.length,audit.state.status,audit.state.failures,audit.state.nextAt],[0,undefined,undefined,due],'refused before its lane is asked: no run, no failure, still due');
+  await f.router.thawDispatch('released');
+  assert.deepEqual(await audit.tick(),{state:'healthy'});
+  assert.deepEqual(reading.map(activity=>activity.kind),['health-review'],'counted while the reading runs');
+  assert.deepEqual([f.router.activityList(),leases],[[],['mobile-health-audit','released']]);
+  const refusing={acquire:async({lane})=>({proceed:false,lane,state:'wait',reason:'lane-full',release:async()=>{}})};
+  const skipped=new MobileAudit({file:path.join(f.root,'audit-2.json'),now:()=>f.clock.now,lease:refusing,activity:spec=>f.router.beginActivity(spec),
+    collect:async()=>assert.fail('nothing is collected'),review:async()=>assert.fail('nothing is asked')});
+  assert.equal((await skipped.tick()).state,'skipped');
+  assert.deepEqual(f.router.activityList(),[],'a lane that refuses lets the gate go');
+
+  // A classification asked again.
+  let failing=true,classifying=null;
+  const g=fixture(t,{classify:async()=>{if(failing)throw Error('deepseek-http-503');classifying=[g.router.activityList(),g.router.busy(g.runtime)];return {route:'chat',reason:'synthetic'};}});
+  await g.router.select({id:'q',kind:'owner',text:'在吗'});
+  const entry=g.router.state.semanticPending.q;
+  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['semantic-pending',1]);
+  failing=false;
+  await g.router.freezeDispatch('release');
+  await g.router.reviewSemanticPending();
+  assert.deepEqual([entry.state,entry.attempts,classifying],['pending',1,null],'frozen: the model is not asked and no attempt is counted');
+  assert.equal(g.router.state.history.some(event=>event.kind==='semantic-retry'),false);
+  await g.router.thawDispatch('released');
+  await g.router.reviewSemanticPending();
+  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['selected',2]);
+  assert.deepEqual(classifying[0].map(activity=>[activity.kind,activity.id]),[['classification-retry','q']],'counted while the model is asked');
+  assert.equal(classifying[1],false,'holding nothing of her conversation');
+  assert.deepEqual(g.router.activityList(),[]);
+  for(const kind of ['work-summary','health-review','classification-retry'])assert.ok(ACTIVITY_KINDS.includes(kind),kind);
 });

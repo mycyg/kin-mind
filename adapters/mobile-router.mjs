@@ -20,10 +20,10 @@ export const DEFER_MAX_MS=30*24*3600000;
 export const HANDOFF_SOURCE_MAX_HOURS=24;
 /** What starts beside the owner's conversation and must stop for a freeze and be waited
  * for by a drain: sends (a reply, a system notice, a reminder, a desktop hand-off result,
- * a proactive contact) and the mind's own runs. Other kinds are accepted as named
- * (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01). */
+ * a proactive contact), the mind's own runs and the host's own background model calls.
+ * Other kinds are accepted as named (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01, CR3-FLOW-01). */
 export const ACTIVITY_KINDS=Object.freeze(['reply','notice','reminder','handoff','contact','assessment','contact-draft','creation','exploration',
-  'appraisal','enrichment','memory-prep']);
+  'appraisal','enrichment','memory-prep','work-summary','health-review','classification-retry']);
 /** The mind orders its own runs itself; a run in its own process never holds the owner's dispatch. */
 const MIND_ACTIVITIES=new Set(['assessment','contact-draft','creation','exploration']);
 const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
@@ -31,6 +31,11 @@ const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
  * session: an appraisal, a memory enrichment, a memory warm-up. A freeze refuses it and a
  * drain waits for it, and that is all: it holds no turn, no switch and no dispatch (CR2-MIND-01). */
 const STORE_ACTIVITIES=new Set(['appraisal','enrichment','memory-prep']);
+/** The host's own background model calls, each a request of its own and never a turn in the
+ * session: a summary of open work, a health reading, a classification asked again. Like the
+ * store work, a freeze refuses one and a drain waits for it until the call has ended, and it
+ * holds no turn, no switch and no dispatch (CR3-FLOW-01). */
+const REVIEW_ACTIVITIES=new Set(['work-summary','health-review','classification-retry']);
 /** A notice round that used its attempts rests this long before its identity is tried
  * or looked up again; it is never given up (CR-LIFE-05). */
 export const NOTICE_ROUND_REST_MS=Object.freeze([30*60000,2*3600000,6*3600000]);
@@ -446,9 +451,10 @@ export class MobileRouter {
   activityList() {return [...this.activities.values()].map(activity=>({...activity}));}
   /** Anything in flight. `owner` asks for the owner's own dispatch, which a run in its own
    * process never holds; `internal` asks for the mind's own turn, which orders the mind's
-   * runs itself. A send in flight holds both; the mind's store work holds nothing here. */
+   * runs itself. A send in flight holds both; the mind's store work and the host's own
+   * background model calls hold nothing here. */
   busy(runtime,{assessment=false,owner=false,internal=false}={}) {
-    for(const activity of this.activities.values())if(!STORE_ACTIVITIES.has(activity.kind)&&!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
+    for(const activity of this.activities.values())if(!STORE_ACTIVITIES.has(activity.kind)&&!REVIEW_ACTIVITIES.has(activity.kind)&&!(internal&&MIND_ACTIVITIES.has(activity.kind))&&!(owner&&DETACHED_ACTIVITIES.has(activity.kind)))return true;
     if(Object.values(this.state.notices).some(n=>n.state==='sending'))return true;
     if(Object.values(this.state.inputs).some(record=>record.ownerNotice?.state==='sending'))return true;
     if(Object.values(this.state.operations).some(o=>['submitted','running','unconfirmed'].includes(o.state)))return true;
@@ -1152,23 +1158,32 @@ export class MobileRouter {
    * chains can see; the input is never silently swallowed. */
   async reviewSemanticPending() {
     for(const id of Object.keys(this.state.semanticPending)) {
-      const entry=await this.locked(async()=>{
+      const taken=await this.locked(async()=>{
         const e=this.state.semanticPending[id];
         if(!e||!['pending','retry'].includes(e.state)||e.nextAttemptAt>this.now())return null;
         const record=this.state.inputs[id];
         if(!record||record.state!=='semantic-pending'||record.hash!==e.hash) {
           e.state='superseded';e.updatedAt=this.now();delete e.text;this.save('semantic-review-superseded',{id});return null;
         }
-        if(e.attempts>=e.maxAttempts)return clone({...e,exhausted:true});
-        e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});
-        return clone(e);
+        if(e.attempts>=e.maxAttempts)return {entry:clone({...e,exhausted:true})};
+        // Asking the model again passes the gate every call beside her conversation passes, in
+        // the step that counts the attempt: a freeze refuses it before anything is counted, and
+        // the drain counts it until the call has ended (CR3-FLOW-01).
+        const gate=this.beginActivity({kind:'classification-retry',id});
+        if(!gate.ok)return null;
+        const before={state:e.state,attempts:e.attempts,updatedAt:e.updatedAt};
+        try {e.state='classifying';e.attempts++;e.updatedAt=this.now();this.save('semantic-retry',{id,attempt:e.attempts});}
+        catch(error){Object.assign(e,before);gate.release();throw error;}
+        return {entry:clone(e),gate};
       });
-      if(!entry)continue;
+      if(!taken)continue;
+      const {entry,gate}=taken;
       let result=null,failure=null;
       if(!entry.exhausted) {
         try {result=await this.askClassification({id:entry.id,kind:entry.kind,text:entry.text,occurredAt:entry.occurredAt,receivedAt:entry.receivedAt},
           {files:entry.attachments??[],intents:this.classifyIntents&&entry.kind==='owner',wait:Math.min((this.state.config.classifierTimeoutMs??15000)*2,CLASSIFY_RETRY_MAX_MS)});}
         catch(error){failure=classificationFailure(error);}
+        finally {gate.release();}
       }
       await this.locked(async()=>{
         const e=this.state.semanticPending[id];if(!e||!['classifying','pending','retry'].includes(e.state))return;

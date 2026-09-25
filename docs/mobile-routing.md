@@ -151,7 +151,10 @@ owner unanswered for good. Asking again with the same reason and migration ID ch
 nothing, so a caller may poll it; every answer says whether the host is `idle` and,
 if not, why. `POST /thaw` lifts it. `GET /busy` answers the same drain: inputs still
 moving through the host, a native turn or an unreadable native runtime, a send, a
-native command or a switch hold it; open work, a desktop handoff, history and inputs
+native command or a switch hold it, and so do the host's own background model calls —
+a summary of open work, a health reading, a classification asked again — until they
+return; a freeze refuses a new one before anything is counted for it, and none of them
+holds the owner's conversation. Open work, a desktop handoff, history and inputs
 waiting for a notice or a reconciliation do not, because they do not change by
 waiting. `GET /unsettled` returns the eight-state summary and every unsettled input
 by its original ID, naming inbox jobs the router has not taken by ID and file time
