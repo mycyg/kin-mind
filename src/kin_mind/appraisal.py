@@ -87,6 +87,13 @@ REPEATED_FAILURE_LIMIT = 2
 # The outcomes of a full appraisal call that ran to its answer: valid, or valid enough to need a
 # repair. A call preempted on the way is not one of them (CR3-MM-06).
 COMPLETED_APPRAISAL = {"ok", "schema-invalid"}
+
+
+def completed_appraisal(calls):
+    """Whether this attempt made a full appraisal call that ran to its answer. Once it has, the
+    attempt is a charged one however it ends: a wait or a transient fault after it belongs to a
+    later call -- a repair -- which alone goes uncharged (CR3-MM-06, CR4-MM-04)."""
+    return any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL for call in calls)
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -1634,7 +1641,10 @@ class Appraisals:
         data.update(error_signature=signature, error_repeats=repeats)
         charged = row["attempts"] + 1
         limit = min(settings.get("max_charged_attempts") or MAX_CHARGED_ATTEMPTS, MAX_CHARGED_ATTEMPTS)
-        if repeats >= REPEATED_FAILURE_LIMIT and detail.get("code") not in NO_REPEAT_QUARANTINE:
+        # A transient fault of a later call (a repair after a completed appraisal, CR4-MM-04) is an
+        # outage, not the same fault of the judgment twice: only the charged budget bounds it.
+        transient = re.fullmatch(TRANSIENT_PATTERN, str(data.get("error", ""))) is not None
+        if repeats >= REPEATED_FAILURE_LIMIT and detail.get("code") not in NO_REPEAT_QUARANTINE and not transient:
             return self._quarantine(data, "repeated-failure:" + (detail.get("code") or detail.get("message") or detail["class"]))
         if charged >= limit:
             return self._quarantine(data, "charged-attempts-exhausted:" + str(charged))
@@ -2697,9 +2707,7 @@ class Appraisals:
             # full appraisal call of this attempt has completed. After that the wait is a later
             # call's -- a schema or advice repair that never started: that call alone is exempt, and
             # the attempt that made the appraisal call is charged for it (CR3-MM-06).
-            appraised = any(call.get("purpose") == "appraise" and call.get("outcome") in COMPLETED_APPRAISAL
-                            for call in calls)
-            admission_wait = not model_admitted or (getattr(provider, "native_review", False) and not appraised)
+            admission_wait = not model_admitted or (getattr(provider, "native_review", False) and not completed_appraisal(calls))
             state = "pending"
             if admission_wait:
                 data.update(waiting_reason=str(error), last_wait_at=self.mind.clock(),
@@ -2741,13 +2749,16 @@ class Appraisals:
                               "transient_failures", "frozen_memory_context", "reuse"):
                     data.pop(field, None)
                 state = "complete"
-            elif data["error"].startswith("deepseek-evidence-compression-pending"):
+            # Every uncharged wait below is uncharged only while this attempt has made no full
+            # appraisal call: after one, a wait or a transient fault is a later call's -- a repair --
+            # and the attempt is charged, with the charged budget and its backoff (CR4-MM-04).
+            elif data["error"].startswith("deepseek-evidence-compression-pending") and not completed_appraisal(calls):
                 # Compression caches each finished part under keys derived from
                 # these frozen inputs, so a preparation pass keeps them and is a
                 # wait, not a charged attempt. Stalled preparation is quarantined.
                 uncharged_wait = "compression"
                 state = self._compression_wait(data, len(provider.compression_parts))
-            elif re.fullmatch(TRANSIENT_PATTERN, data["error"]):
+            elif re.fullmatch(TRANSIENT_PATTERN, data["error"]) and not completed_appraisal(calls):
                 # The request never produced model output; an outage must not
                 # spend this row's repair budget or quarantine the whole queue.
                 uncharged_wait = "transient"
