@@ -185,7 +185,13 @@ anything else, answers when no classifier can and applies to every open task. A 
 read from natural language counts only when the classifier actually answered, and
 applies only to the tasks it was read against. Either way it is recorded on the stop
 input itself, cancels the tasks it names once execution has stopped, and never opens
-or extends work.
+or extends work. What of the stopped work waits in the host's in-memory queue, its
+prompt not begun, leaves that queue at once by its original input IDs and is canceled
+by her under those IDs; it is never requeued or sent under another ID. Nothing else in
+the queue moves, whatever arrived after the stop included. The stop is read again where
+any prompt would begin, in the step that records its start: a prompt that carries
+stopped work never begins, and a message merged into it after the stop is not
+submitted and goes again under its own ID.
 
 In manual mode, ordinary messages retain the selected model, effort and Fast
 preference. The classifier still reads content, recall and stop/file intentions, but

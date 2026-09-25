@@ -634,3 +634,64 @@ test('a work summary, a health reading and a classification asked again each pas
   assert.deepEqual(g.router.activityList(),[]);
   for(const kind of ['work-summary','health-review','classification-retry'])assert.ok(ACTIVITY_KINDS.includes(kind),kind);
 });
+
+test('the owner\'s stop takes her stopped work out of the host\'s queue by its own ids, and a prompt that would begin with it never does (CR3-FLOW-02)',async t=>{
+  // The host's queue, by input id and in order.
+  const hostQueue=()=>{const queue=[];return {queue,take:ids=>{const taken=queue.filter(id=>ids.includes(id));queue.splice(0,queue.length,...queue.filter(id=>!ids.includes(id)));return taken;},
+    push:id=>async()=>{queue.push(id);return {route:'new-turn',queued:true};}};};
+  const q=hostQueue();
+  const f=fixture(t,{withdrawQueued:q.take});
+  await f.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},q.push('w'));
+  assert.equal(f.router.state.inputs.w.state,'queued','waiting behind a turn of its own, not begun');
+  await f.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},q.push('stop'));
+  const w=f.router.state.inputs.w;
+  assert.deepEqual(q.queue,['stop'],'her stopped work left the queue; the stop keeps its place');
+  assert.deepEqual([w.id,w.state,w.canceledBy,w.withdrawn.reason,w.withdrawn.stage,w.withdrawn.fromQueue,w.submissionStartedAt,typeof w.queuedSubmissionAt],
+    ['w','failed-before-submit','stop','canceled-by-owner','host-queue',true,undefined,'number'],'canceled under its own id with its receipt; the queue was never a submission');
+  assert.equal(inputSummary(w),'canceled-by-owner');
+  await f.router.dispatch({id:'later',kind:'owner',text:'在吗'},q.push('later'));
+  assert.deepEqual(q.queue,['stop','later'],'what came after the stop is untouched');
+  assert.equal((await f.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},async()=>assert.fail('never submitted'))).route,'canceled-by-owner','replayed, it stays withdrawn');
+  assert.equal(await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['stop']}),undefined,'the stop\'s own prompt begins');
+
+  // The queue did not hold it — it was the message about to begin — and a message sent after
+  // the stop was merged into it: that prompt never begins, and the later message is not lost.
+  const g=fixture(t,{withdrawQueued:()=>[]});
+  await g.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},async()=>({route:'new-turn',queued:true}));
+  await g.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=>({route:'new-turn',queued:true}));
+  assert.deepEqual([g.router.state.inputs.w.state,g.router.state.inputs.w.withdrawn.fromQueue],['failed-before-submit',false]);
+  await g.router.dispatch({id:'after',kind:'owner',text:'在吗'},async()=>({route:'merged-before-start',queued:true}));
+  assert.deepEqual(await g.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['w','after']}),
+    {state:'refused',canceled:['w'],notSubmitted:['after']},'refused where it would have begun');
+  assert.equal(g.router.state.turn,undefined,'no native turn is recorded');
+  const after=g.router.state.inputs.after;
+  assert.deepEqual([after.state,after.canceledBy,after.failureStage,after.retry.evidence],['failed-before-submit',undefined,'prompt-start','not-submitted']);
+  const requeued=[];
+  await g.router.watch({requeue:async id=>{requeued.push(id);return {state:'requeued'};},notifyOwner:async()=>({state:'accepted',messageId:'n'})});
+  assert.deepEqual(requeued,['after'],'the later message goes again under its own id; the stopped work never does');
+
+  // Stopped while it was being handed over: its prompt start refuses it, and the handover keeps that.
+  const h=fixture(t,{withdrawQueued:()=>[]});
+  let begin=null;
+  const handing=h.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
+    await markSubmitted();
+    await h.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=>({route:'new-turn',queued:true}));
+    begin=await h.router.observe('prompt-start',{taskId:decision.taskId,inputVersion:decision.inputVersion,turnFence:0,inputIds:['w']});
+    return {route:'new-turn',queued:true};
+  });
+  assert.equal((await handing).route,'canceled-by-owner');
+  assert.deepEqual(begin,{state:'refused',canceled:['w'],notSubmitted:[]});
+  assert.deepEqual([h.router.state.inputs.w.state,h.router.state.inputs.w.canceledBy,h.router.state.inputs.w.withdrawn.stage],['failed-before-submit','stop','prompt-start']);
+
+  // Handed to the queue just after the stop: taken back the moment the handover ends.
+  const k=hostQueue();
+  const late=fixture(t,{withdrawQueued:k.take});
+  const lateWork=late.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
+    await markSubmitted();
+    await late.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},k.push('stop'));
+    return k.push('w')();
+  });
+  assert.equal((await lateWork).route,'canceled-by-owner');
+  assert.deepEqual(k.queue,['stop']);
+  assert.deepEqual([late.router.state.inputs.w.canceledBy,late.router.state.inputs.w.withdrawn.stage,late.router.state.inputs.w.withdrawn.fromQueue],['stop','host-queue',true]);
+});
