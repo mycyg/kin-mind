@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 
-from eventmem.core.db import digest, dumps
+from eventmem.core.db import digest, dumps, tombstoned
 
 JUDGMENT_CACHE = "semantic_cache_v2"
 # The clock is part of an appraisal request; the same question is never asked twice.
@@ -151,6 +151,31 @@ def dependencies(context, declared=None):
     return list(dict.fromkeys(found))[:MAX_DEPENDENCIES]
 
 
+# Where a dependency's words are kept, and the columns that say which version of them it is. A
+# dependency whose row changed, or went, since the question was put is not the one it was asked
+# about; an identifier none of these tables holds has no version to compare.
+VERSIONED = {"records": "revision,status,deleted", "sources": "version,hash,deleted",
+             "mind_graph_nodes": "revision,state", "mind_memory_nodes": "revision",
+             "mind_traits": "revision,status"}
+
+
+def versions(conn, dependencies):
+    """The version of each dependency that has one, read before the question is put and again in
+    the write that would keep its answer (CR3-MM-03)."""
+    wanted = [one for one in dict.fromkeys(dependencies) if isinstance(one, str) and one]
+    found = {}
+    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table, columns in VERSIONED.items():
+        if table not in present:
+            continue
+        for start in range(0, len(wanted), 500):
+            page = wanted[start:start + 500]
+            for row in conn.execute(f"SELECT id,{columns} FROM {table} WHERE id IN ("
+                                    + ",".join("?" * len(page)) + ")", page):
+                found[table + ":" + row[0]] = list(row[1:])
+    return found
+
+
 def _present(conn):
     return bool(conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone())
@@ -174,8 +199,13 @@ def get(engine, conn, tool, request_digest, judgment, *, now):
     return row["token"], json.loads(row["data"])
 
 
-def put(engine, tool, request_digest, judgment, value, *, now, depends_on=(), valid_for=None):
-    """Write the verdict as **pending**. Only `accept()` makes it servable."""
+def put(engine, tool, request_digest, judgment, value, *, now, depends_on=(), valid_for=None, asked=None):
+    """Write the verdict as **pending**. Only `accept()` makes it servable.
+
+    Only while what it rested on is still there, checked in the same write (CR3-MM-03): nothing
+    it depends on or names has been deleted, and, given the `versions()` it was `asked` under,
+    every dependency is still at that version. A delete purges the rows that exist when it
+    runs; an answer that comes back after it is not kept at all. Its cost is recorded by the call."""
     if not cacheable(tool):
         return None
     marks = identity(tool, judgment)
@@ -188,6 +218,10 @@ def put(engine, tool, request_digest, judgment, value, *, now, depends_on=(), va
         conn.executescript(SCHEMA)
     with engine.db.connect(write=True) as conn:
         if not enabled(conn, marks["scope"]):
+            return None
+        depends_on = list(depends_on)
+        if tombstoned(conn, *depends_on, dumps(value)) or (
+                asked is not None and versions(conn, depends_on) != asked):
             return None
         _expire(conn, now)
         conn.execute(
