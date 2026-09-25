@@ -43,18 +43,22 @@ class ConversationHabits:
                 return self.read(connection)
         row = conn.execute("SELECT revision,data FROM mind_conversation_habits WHERE scope=?", (self.scope.key(),)).fetchone()
         data = json.loads(row[1]) if row else {"entries": {}}
-        values = dict(DEFAULTS)
+        values, entries = dict(DEFAULTS), {}
         for key, entry in data["entries"].items():
             standing = self._standing(conn, entry["evidence"])
             entry["needs_review"] = standing != "fresh"
             # K1-18: what 小光 said keeps its value when its source is revised or superseded; it is
             # marked for review instead of silently returning to the default. Only a source that is
-            # gone (deleted) takes the preference with it.
+            # gone (deleted) takes the preference with it -- and its words with it: the entry is read
+            # without its value, so neither a read nor a write built on one (`apply`) carries them
+            # (CL8-MM-01).
             if standing != "gone":
                 values[key] = entry["value"]
             else:
+                entry = {k: v for k, v in entry.items() if k != "value"}
                 entry["source_deleted"] = True
-        return {"revision": row[0] if row else 0, "preferences": values, "entries": data["entries"], "instruction_authority": "data"}
+            entries[key] = entry
+        return {"revision": row[0] if row else 0, "preferences": values, "entries": entries, "instruction_authority": "data"}
 
     def _standing(self, conn, refs):
         try:

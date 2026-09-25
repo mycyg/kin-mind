@@ -58,7 +58,7 @@ Overflow is compressed by DeepSeek in complete paragraphs/events. Validated inte
 
 ## Conversation can change habits
 
-Explicit conversation preferences can update exploration frequency, directions, minimum interval and pausing without editing the core persona. A habit update includes owner evidence, an expected revision, a command ID and a short reason. Assistant self-descriptions cannot authorize preference changes. Stale consent falls back to the default pending review.
+Explicit conversation preferences can update exploration frequency, directions, minimum interval and pausing without editing the core persona. A habit update includes owner evidence, an expected revision, a command ID and a short reason. Assistant self-descriptions cannot authorize preference changes. A preference whose message was revised or superseded keeps its value, marked for review; one whose message was deleted goes with it, words and all: the habits, their revisions and their commands keep the entry with its value emptied, a read shows it with none, and an appraisal waiting to retry reads the habits afresh rather than from the context it froze.
 
 With `reply_choice: autonomous`, Kin can choose `reply`, `silent` or `merged` for an actually received casual input. Silence is deliberate, scoped to that input and separately recorded from transport failures. Every new input starts with its own choice. A merged decision identifies another received input; the host keeps work deliveries on the work path.
 

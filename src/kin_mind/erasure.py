@@ -66,6 +66,14 @@ ENUM = re.compile(r"[a-z][a-z0-9_:-]{0,39}")
 CODE = re.compile(r"[a-z][a-z0-9_:.-]{0,79}")
 CODED_TEXT = frozenset({"target", "role"})
 CODED_LISTS = frozenset({"verification_gaps"})
+# A conversation habit (habits.py) keeps 小光's own words -- the directions she named, the frequency
+# she asked for -- as an entry's `value`, beside the evidence she said them in; a read of the habits
+# and a proposal to change them repeat them as `preferences`. An entry that cites erased material
+# loses its value's words with its reason, a proposal its preferences', and a read the preferences
+# its erased entries gave it: a string goes, a list of them is emptied, a number or a switch stays
+# (CL8-MM-01). Only a habit's: anywhere else a `value` is a number or an enum.
+HABIT_ENTRY = frozenset({"value", "evidence", "reason", "at"})
+HABIT_PREFERENCES = "preferences"
 # `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
 # sources included: a queue row or a run that names one of them erased loses every word the model or
 # the executor wrote (CR5-MM-01). An enrichment row names the same for the memory its parent's model
@@ -339,6 +347,19 @@ def _blank_words(items):
     return items if all(a is b for a, b in zip(out, items)) else out
 
 
+def _blank_keys(mapping, keys):
+    out = {key: _blank(item) if key in keys else item for key, item in mapping.items()}
+    return mapping if all(out[key] is mapping[key] for key in mapping) else out
+
+
+def _habits_erased(value, ids):
+    """The preferences a read of the habits has from its entries (`entries` beside them) that rest on `ids`."""
+    entries = value.get("entries")
+    if not isinstance(entries, dict):
+        return frozenset()
+    return frozenset(key for key, entry in entries.items() if isinstance(entry, dict) and cites(entry, ids))
+
+
 def _field_cites(value, key, ids):
     found = value.get(key + FIELD_EVIDENCE)
     return isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found)
@@ -383,6 +404,10 @@ def scrub(value, ids, *, erase=False, receipts=True):
             new = ERASED
         elif erase and key in CODED_LISTS and isinstance(item, list):
             new = _blank_words(item)
+        elif erase and key == "value" and HABIT_ENTRY <= value.keys():
+            new = _blank(item)
+        elif key == HABIT_PREFERENCES and isinstance(item, dict) and (erase or _habits_erased(value, ids)):
+            new = _blank_keys(item, item if erase else _habits_erased(value, ids))
         elif key in REF_LISTS and isinstance(item, list):
             new = [_tombstone(ref, ids) for ref in item]
             new = item if all(a is b for a, b in zip(new, item)) else new
