@@ -220,4 +220,86 @@ def test_the_guide_and_the_repair_say_which_process_rows_lose_their_words_to_any
     assert "A process row that does not name what its model or executor was shown at all" in guide
     assert "loses its words to any delete, its ids, state and receipts kept" in guide and "`unnamed:<table>`" in guide
     assert "`unnamed:<table>`" in " ".join((repair.__doc__ or "").split())
+    assert "a run whose words were taken shows its id and state, and the summary of its report while the report stands" in guide
     assert set(erasure.UNNAMED) == {"mind_appraisals", "mind_daily_reviews", "mind_contacts", "mind_explorations", "mind_plan_runs"}
+
+
+def test_a_run_whose_words_were_taken_is_shown_by_its_report_while_the_report_stands(setup):
+    """Among the previous explorations, a run whose words were taken -- one from before this release
+    by any delete, one of this release by a delete of what it names -- shows its id, its state and
+    the summary of its report while the report stands; the report goes with what it was written
+    from, and then the run shows its id and state alone, naming no report a brief could pass on as
+    shown. The rule that takes the words is unchanged: only where the words shown come from
+    (CL6D-MM-04)."""
+    from eventmem.core.engine import root_id
+    from eventmem.core.models import SourceInput
+
+    from kin_mind.decision_context import execution_brief
+    from kin_mind.exploration import Explorations
+
+    mind, source, clock = setup
+    engine, explorations, scope = mind.engine, Explorations(mind), mind.scope.key()
+    asked, basis, dialogue, elsewhere = (source(key, text) for key, text in (
+        ("asked", "她问过钟是怎么做的"), ("basis", "她说想要一只木头的钟"), ("dialogue", f"刚才聊到 {NEW}"), ("elsewhere", "别的事")))
+
+    def report(key, summary, **written):
+        text = json.dumps({"state": "complete", "result": {"summary": summary, "findings": [summary], "sources": [], "open_questions": []},
+                           "partial": False}, ensure_ascii=False)
+        return engine.receive(SourceInput(namespace="kin-exploration", key=key, scope=mind.scope, authority="model", kind="observation",
+                                          session=key, text=text, occurred_at=mind.clock(), extract=False,
+                                          metadata={"host_event": "exploration-result", "exploration_id": key}), **written)["id"]
+
+    def run(key, at, data):
+        with engine.db.connect(write=True) as conn:
+            conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", (key, scope, "complete", at, json.dumps(data, ensure_ascii=False)))
+
+    # A run and its report as the release before this one wrote them; lineage then registers the report
+    # as written from what its run cites.
+    old_report = report("explore-old", "钟的做法：先选机芯")
+    run("explore-old", "2026-09-20T08:00:00+00:00", {
+        "desire_id": "wish-1", "evidence_ids": [root_id(asked)], "selected_brief": f"查清 {OLD}", "source_id": old_report,
+        "result": {"summary": f"钟的做法 {OLD}", "findings": [OLD], "sources": [], "open_questions": []},
+        "observations": [{"id": "obs-1", "title": OLD, "locator": "file:///notes/clock.md", "version": "1"}],
+        "checkpoint": {"findings": [OLD]}})
+    repair.run(engine.db.root, apply=True, steps=("lineage",))
+    # A run of this release: its report written from its own evidence, the run naming what its brief showed.
+    new_report = report("explore-new", "木头钟：选胡桃木", derived_from=[root_id(basis)])
+    run("explore-new", "2026-09-25T08:00:00+00:00", {
+        "desire_id": "wish-2", "evidence_ids": [root_id(basis)], "evaluated_sources": [{"source_id": dialogue}],
+        "source_id": new_report, "result": {"summary": f"木头钟 {NEW}", "findings": [NEW], "sources": [], "open_questions": []}})
+
+    def previous():
+        named = []
+        brief = execution_brief(mind, question="做钟", evidence_ids=[], shown=named)
+        return explorations.recent(4), brief["previous_explorations"], {ref.get("source_id") for ref in named}
+
+    shown, briefed, named = previous()
+    assert [run["result"]["summary"] for run in shown] == [f"木头钟 {NEW}", f"钟的做法 {OLD}"], "before any delete each shows itself"
+    assert {old_report, new_report} <= named
+
+    # Any delete takes the old run's words: it is shown by its report.
+    engine.delete(elsewhere)
+    shown, briefed, named = previous()
+    assert shown[1] == {"id": "explore-old", "state": "complete", "created_at": "2026-09-20T08:00:00+00:00", "desire_id": "wish-1",
+                        "source_id": old_report, "result": {"summary": "钟的做法：先选机芯"}}
+    assert briefed[1] == {"id": "explore-old", "state": "complete", "created_at": "2026-09-20T08:00:00+00:00",
+                          "result": {"summary": "钟的做法：先选机芯"}}
+    assert shown[0]["result"]["summary"] == f"木头钟 {NEW}", "a run that names what it was shown keeps its words"
+    assert OLD not in json.dumps([shown, briefed], ensure_ascii=False) and ERASED not in json.dumps([shown, briefed], ensure_ascii=False)
+    assert old_report in named
+
+    # A delete of what the new run's brief showed takes its words; its report, written from its own evidence, stands.
+    engine.delete(dialogue)
+    shown, briefed, named = previous()
+    assert shown[0] == {"id": "explore-new", "state": "complete", "created_at": "2026-09-25T08:00:00+00:00", "desire_id": "wish-2",
+                        "source_id": new_report, "result": {"summary": "木头钟：选胡桃木"}}
+
+    # What the old report was written from deleted: the report goes with it, and the run shows its id and state alone.
+    engine.delete(asked)
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM tombstones WHERE key=?", (old_report,)).fetchone(), "the report went with its basis"
+    shown, briefed, named = previous()
+    assert shown[1] == {"id": "explore-old", "state": "complete", "created_at": "2026-09-20T08:00:00+00:00", "desire_id": "wish-1"}
+    assert briefed[1] == {"id": "explore-old", "state": "complete", "created_at": "2026-09-20T08:00:00+00:00"}
+    assert old_report not in named and new_report in named, "no brief names the deleted report as shown"
+    assert shown[0]["result"] == {"summary": "木头钟：选胡桃木"}
