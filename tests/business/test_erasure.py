@@ -508,6 +508,38 @@ def test_a_compression_that_comes_back_after_its_source_was_deleted_keeps_nothin
     assert paid(engine) == 1  # what the call cost is all it leaves
 
 
+def test_a_compression_whose_fork_read_a_record_deleted_while_it_answered_keeps_nothing(system):
+    """An appraisal's evidence compressed in the main session's fork, by the model that appraises:
+    its read-only tool reads a note, the note is deleted while it answers, and the summary repeats
+    it. Neither the part nor the summary is cached, and the words are in no table (CL6D-MM-01)."""
+    mind, memory, source, clock = system
+    engine = mind.engine
+    filler = "They checked the harbour path, the tide table and the lamps along the pier. " * 12
+    items_from = [source(f"walk-{i}", f"Harbour walk note {i}. " + filler) for i in range(3)]
+    contexts = Contexts(mind)
+    items = [contexts.record_item(engine.get(engine.source(sid)["record_ids"][0])) for sid in items_from]
+    note_source = engine.receive(SourceInput(namespace="kin-notes", key="compress-read", text=f"The pier lamp is called {MARKER}.",
+                                             scope=mind.scope, authority="document", occurred_at=mind.clock()))["id"]
+    note = engine.source(note_source)["record_ids"][0]
+
+    class Fork:
+        model = "synthetic-fork"
+
+        def structured(self, name, schema, system, payload, **kwargs):
+            engine.delete(note_source)
+            value = schema.model_validate({"entries": [{"item_ids": payload["allowed_item_ids"],
+                                                        "summary": f"They walked the harbour under {MARKER}."}], "omitted_ids": []})
+            return value, {"model": self.model, "channel": "fork",
+                           "tool_calls": [{"name": "kin_memory.read_memory", "ok": True, "ids": [{"id": note, "revision": 1}]}]}
+
+    packed = contexts.pack(items, "harbour walk", 600, provider=Fork(), allow_model=True, persist=True)
+    settle(engine)
+    assert packed["state"] == "needs-compression" and packed["reason"] == "Conflict"
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_context_cache").fetchone()[0] == 0
+    assert texts_everywhere(engine, MARKER) == set()
+
+
 def test_a_judgment_that_comes_back_after_its_source_changed_keeps_nothing(system, monkeypatch):
     """The same for a judgment: deleted while the verdict is out, no pending row and no words; and
     a verdict about a record that was corrected meanwhile is not kept for the old version either.

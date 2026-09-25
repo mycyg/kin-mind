@@ -482,9 +482,10 @@ def prospective_check(mind, source, clock):
     prediction = knowledge.predict(PredictionInput(command_id="prospective", claim_id=claim["id"],
         expected_revision=1, case_id="future-case", behavior="Check a primary source",
         information="The next query has not been answered", probability=0.8), compat=compat)
-    knowledge.assess(AssessmentInput(command_id="assess", prediction_id=prediction["id"],
+    assessment = knowledge.assess(AssessmentInput(command_id="assess", prediction_id=prediction["id"],
         expected_revision=1, outcome=True, evidence_ids=[record_id("later-observed-behavior")],
         note="Observed source check"), compat=compat)
+    return claim, assessment
 
 
 def test_a_daily_review_whose_source_is_deleted_while_the_model_answers_keeps_no_reason(setup):
@@ -670,6 +671,314 @@ def test_a_reflection_is_not_stored_once_a_source_only_the_state_named_is_delete
         assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone()
     found = {table for table, _ in texts_everywhere(mind.engine, MARKER)}
     assert not {table for table in found if table.startswith(("records", "sources", "mind_appraisals"))}, found
+
+
+def tool_read(*ids, at="native_receipt"):
+    """What the host records of a fork turn (boundaries.mjs `forkReceipt`): each read-only tool call
+    and the ids it returned. `at` is where the receipt carries the turn."""
+    turn = {"channel": "fork", "tool_calls": [{"name": "kin_memory.read_memory", "ok": True,
+                                               "ids": [{"id": identifier, "revision": 1} for identifier in ids]}]}
+    return {at: turn}
+
+
+def read_note(mind, clock, key, text):
+    """Something in the store no context of an appraisal is built from: only a tool that reads
+    memory finds it. Returns its source and its record."""
+    sid = mind.engine.receive(SourceInput(namespace="kin-notes", key=key, text=text, scope=mind.scope,
+                                          authority="document", occurred_at=clock[0].isoformat()))["id"]
+    return sid, mind.engine.source(sid)["record_ids"][0]
+
+
+def test_a_record_the_fork_read_with_its_tools_and_did_not_cite_deleted_while_it_answers_stops_the_commit(setup):
+    """The fork reads a note with its read-only memory tool; its proposal repeats the note and cites
+    only the appraisal's own evidence. The note is deleted while it answers. The commit refuses as
+    for anything else the model was shown, no word is left in the queue row or anywhere, and the
+    retry asks again in full (CL6D-MM-01)."""
+    mind, source, clock = setup
+    note_source, note = read_note(mind, clock, "favourite", f"她最喜欢的地方是 {MARKER}")
+    primary = source("today", "今天天气不错")
+
+    class Reader:
+        def appraise(self, context):
+            assert MARKER not in json.dumps(context, ensure_ascii=False), "nothing the appraisal was given shows the note"
+            mind.engine.delete(note_source)
+            paid(self)
+            proposal, receipt = answered(Appraisal(reason=f"想起她最喜欢 {MARKER}", values={"curiosity": 66}))
+            return proposal, {**receipt, **tool_read(note)}
+
+    class Again:
+        def appraise(self, context):
+            paid(self)
+            return answered(Appraisal(reason="重新看了一遍今天", values={"curiosity": 55}))
+
+        def structured(self, *args, **kwargs):
+            raise AssertionError("a proposal written from a deleted source is not revalidated")
+
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Reader())
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    state, count, data = queue_row(mind, job["id"])
+    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted" and count == 1
+    assert note in data["evaluated_ids"], "the row names what the tool returned"
+    assert mind.read()["dimensions"]["curiosity"]["value"] != 66, "the commit was refused"
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job["id"],))
+    jobs.run_one(Again())
+    state, count, data = queue_row(mind, job["id"])
+    assert state == "complete" and "tier" not in data, data.get("error")
+    assert mind.read()["dimensions"]["curiosity"]["value"] == 55
+
+
+def test_a_reflection_is_not_stored_once_a_record_the_fork_read_with_its_tools_is_deleted(setup, monkeypatch):
+    """The appraisal committed while the note it read with its tool stood; the note is deleted
+    before the reflection is stored. The reflection is not stored, and the queue row keeps none of
+    its words (CL6D-MM-01)."""
+    mind, source, clock = setup
+    note_source, note = read_note(mind, clock, "garden", f"院子里种着 {MARKER}")
+    primary = source("quiet", "今天下午很安静")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Thinker:
+        def appraise(self, context):
+            paid(self)
+            proposal, receipt = answered(Appraisal(reason="安静的下午", values={"curiosity": 57}, understanding=Understanding(
+                meaning=f"安静的下午让我想起院子里的 {MARKER}", topic="下午", importance=50, confidence=0.7,
+                basis="internal_thought", evidence_ids=[record])))
+            return proposal, {**receipt, **tool_read(note)}
+
+    real = MemoryContinuity.remember_reflection
+
+    def deleted_first(self, result):
+        mind.engine.delete(note_source)
+        return real(self, result)
+
+    monkeypatch.setattr(MemoryContinuity, "remember_reflection", deleted_first)
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Thinker())
+    settle(mind.engine)
+    assert queue_row(mind, job["id"])[0] == "complete"
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone()
+    found = {table for table, _ in texts_everywhere(mind.engine, MARKER)}
+    assert not {table for table in found if table.startswith(("records", "sources", "mind_appraisals"))}, found
+
+
+def test_a_stored_proposal_from_before_this_release_whose_tool_read_record_was_deleted_is_asked_again_in_full(setup):
+    """The last release kept a proposal for a later attempt without naming what its fork read: only
+    the receipt's tool calls say it. The note it read is deleted. The row's words go with it, and the
+    next attempt neither reuses the proposal nor puts it to a light question (CL6D-MM-01)."""
+    from eventmem.core.models import RevisionInput
+
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"records": True})
+    recalled = MemoryContinuity(mind).ingest({"id": "said-earlier", "kind": "owner-message", "at": clock[0].isoformat(),
+                                              "text": "昨天说的一句话"})
+    note_source, note = read_note(mind, clock, "old-row-read", f"那家店叫 {MARKER}")
+    primary = source("today", "今天天气不错")
+
+    class Reader:
+        def appraise(self, context):
+            record = mind.engine.get(recalled["record_id"])
+            mind.engine.revise(recalled["record_id"], RevisionInput(expected_revision=record["revision"], command_id="fix-earlier",
+                                                                    action="correct", content="昨天说的另一句话", reason="更正"))
+            paid(self)
+            proposal, receipt = answered(Appraisal(reason=f"想去 {MARKER}", values={"curiosity": 66}))
+            return proposal, {**receipt, **tool_read(note)}
+
+    class Again:
+        def appraise(self, context):
+            paid(self)
+            return answered(Appraisal(reason="重新看了一遍今天", values={"curiosity": 55}))
+
+        def structured(self, *args, **kwargs):
+            raise AssertionError("a proposal written from a deleted source is not revalidated")
+
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Reader())
+    state, count, data = queue_row(mind, job["id"])
+    assert state != "complete" and data.get("reuse"), "the proposal was kept for a later attempt"
+    with mind.engine.db.connect(write=True) as conn:
+        # As the last release wrote the row: nothing but the receipt says what the fork read.
+        data.pop("evaluated_ids", None)
+        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (json.dumps(data, ensure_ascii=False), job["id"]))
+    mind.engine.delete(note_source)
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job["id"],))
+    jobs.run_one(Again())
+    state, count, data = queue_row(mind, job["id"])
+    assert state == "complete" and "tier" not in data, data.get("error")
+    assert mind.read()["dimensions"]["curiosity"]["value"] == 55
+
+
+def test_every_turn_of_an_attempt_counts_and_what_the_store_never_held_does_not(setup):
+    """What the tools returned is read wherever the receipt keeps a turn -- the call's own, a schema
+    repair's, an evidence compression's parts -- and only what the store holds or has deleted is
+    kept: an id it never held (a graph node, a record id nobody wrote) names nothing a delete could
+    take, and would stop the reflection as if it had been deleted (CL6D-MM-01)."""
+    mind, source, clock = setup
+    repaired_source, repaired = read_note(mind, clock, "repair-read", "修正时读到的一条")
+    compressed_source, compressed = read_note(mind, clock, "compression-read", "压缩时读到的一条")
+    primary = source("walk", "今天去散步了")
+    record = mind.engine.source(primary)["record_ids"][0]
+    never = "mem_" + "0" * 32
+
+    class Thinker:
+        def appraise(self, context):
+            paid(self)
+            proposal, receipt = answered(Appraisal(reason="散步", values={"curiosity": 58}, understanding=Understanding(
+                meaning="散步的时候想起很多事", topic="散步", importance=50, confidence=0.7,
+                basis="internal_thought", evidence_ids=[record])))
+            return proposal, {**receipt, **tool_read("node_river", never),
+                              "schema_repair": tool_read(repaired)["native_receipt"],
+                              "compression_receipt": {"receipt": [tool_read(compressed)["native_receipt"]]}}
+
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Thinker())
+    state, count, data = queue_row(mind, job["id"])
+    assert state == "complete", data.get("error")
+    assert {repaired, compressed} <= set(data["evaluated_ids"])
+    assert not {"node_river", never} & set(data["evaluated_ids"])
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone(), "the reflection is kept"
+    # A later delete of either finds the row, and its words go.
+    mind.engine.delete(compressed_source)
+    settle(mind.engine)
+    assert "散步" not in json.dumps(queue_row(mind, job["id"])[2]["proposed_result"], ensure_ascii=False)
+
+
+def test_what_a_sharing_repair_read_with_its_tools_counts_as_shown(setup):
+    """The appraisal left out the decision on its exploration result, and the host asks the fork to
+    repair it; the repair reads a note with its tool, repeats it, and the note is deleted while it
+    answers. The commit refuses, and no word is left (CL6D-MM-01)."""
+    mind, source, clock = setup
+    engine = mind.engine
+    with engine.db.connect(write=True) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS mind_explorations(id TEXT PRIMARY KEY,scope TEXT NOT NULL,state TEXT NOT NULL,"
+                     "created_at TEXT NOT NULL,data TEXT NOT NULL)")
+    result = engine.receive(SourceInput(namespace="test", key="shared-exploration", scope=mind.scope,
+                                        text="探索结果：那座桥的来历", authority="model", occurred_at=clock[0].isoformat(),
+                                        metadata={"host_event": "exploration-result", "exploration_id": TARGET}))["id"]
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)",
+                     (TARGET, mind.scope.key(), "complete", mind.clock(), json.dumps({"source_id": result})))
+    note_source, note = read_note(mind, clock, "share-read", f"她说过想听 {MARKER}")
+
+    class Repairs:
+        def appraise(self, context):
+            paid(self)
+            return answered(Appraisal(reason="看了探索结果", values={"curiosity": 62}))
+
+        def repair_sharing(self, proposal, context):
+            engine.delete(note_source)
+            attempts.record_call(self, "repair_sharing", outcome="ok", model="synthetic", request_id="req-2", usage=USAGE)
+            return ([SharingDecision(exploration_id=TARGET, decision="keep", reason=f"等她想听 {MARKER} 的时候再说")],
+                    {"provider": "deepseek", "model": "synthetic", "request_id": "req-2", "usage": USAGE, **tool_read(note)["native_receipt"]})
+
+    jobs = Appraisals(mind, exploration_capabilities={"decisions": True})
+    job = jobs.enqueue([result], "synthetic-v1", origin="exploration", stimulus="exploration-result")
+    jobs.run_one(Repairs())
+    settle(engine)
+    assert texts_everywhere(engine, MARKER) == set()
+    state, count, data = queue_row(mind, job["id"])
+    assert state != "complete" and data["error_detail"]["code"] == "shown-deleted", data.get("error")
+    assert note in data["evaluated_ids"]
+
+
+def test_a_light_question_names_what_its_model_read_beside_its_reasons(setup):
+    """A stored proposal is put to a light question in the fork, whose tool reads a note, and the
+    answer is refused. The reasons it gave stay on the queue row until the next attempt, named with
+    what its model read: deleting the note takes them (CL6D-MM-01)."""
+    from kin_mind import revalidation
+    from kin_mind.erasure import drop_deleted
+
+    mind, source, clock = setup
+    note_source, note = read_note(mind, clock, "light-read", f"轻量复核时读到 {MARKER}")
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source("light", "今天早上下雨")], "synthetic-v1")
+    data = {"attempt_token": "token-1", "proposed_result": {"reason": "原来的提案"}}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET state='running',data=? WHERE id=?", (json.dumps(data), job["id"]))
+
+    class Light:
+        timeout = 60
+
+        def structured(self, name, schema, system, request, **kwargs):
+            answer = revalidation.Revalidation(items=[revalidation.RevalidationItem(
+                conflict_id="c1", verdict="replan", reason=f"读到 {MARKER} 之后，要重新想")])
+            return answer, {"model": "synthetic", **tool_read(note)["native_receipt"]}
+
+    stored = revalidation.Stored("reuse", {"reason": "原来的提案"}, {}, [], [], None, {}, 1, None, False)
+    entries = [{"public": {"conflict_id": "c1", "kind": "evidence", "object": "x"}, "paths": []}]
+    try:
+        revalidation._revalidate(jobs, Light(), {"id": job["id"]}, data, stored, entries, {})
+        raise AssertionError("a replan is refused")
+    except RuntimeError:
+        pass
+    assert data["revalidation"]["evaluated_ids"] == [note] and data["revalidation"]["refused"] == "replan"
+    mind.engine.delete(note_source)
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        kept = drop_deleted(conn, data)
+    assert MARKER not in json.dumps(kept, ensure_ascii=False)
+    assert kept["proposed_result"] == {"reason": "原来的提案"}, "only the light call's own words go"
+
+
+def test_a_daily_review_keeps_no_reason_once_a_record_its_model_read_with_its_tools_is_deleted(setup):
+    """With the behaviour chain off the day is reviewed in the fork, whose tool reads a note; the
+    note is deleted while it answers and the answer repeats it. The reason is not kept, the row
+    names the note, no word is left (CL6D-MM-01)."""
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"behavior_chain": False, "trait_ledger": False})
+    prospective_check(mind, source, clock)
+    note_source, note = read_note(mind, clock, "daily-read", f"她说过 {MARKER} 很重要")
+
+    class Daily:
+        def appraise(self, context):
+            assert MARKER not in json.dumps(context, ensure_ascii=False)
+            mind.engine.delete(note_source)
+            proposal, receipt = answered(Appraisal(reason=f"她看重 {MARKER}", values={"curiosity": 64}))
+            return proposal, {**receipt, **tool_read(note)}
+
+    reviewed = DailyReview(mind).run(Daily(), "synthetic-v1")
+    settle(mind.engine)
+    assert reviewed["state"] == "complete" and reviewed["reason_withheld"] == "sources-changed"
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect() as conn:
+        data = json.loads(conn.execute("SELECT data FROM mind_daily_reviews").fetchone()[0])
+    assert note in data["evaluated_ids"] and "reason" not in data
+
+
+def test_a_daily_review_changes_no_personality_once_a_record_its_model_read_is_deleted(setup):
+    """The same review proposes a change of personality built on the note it read, which is deleted
+    while it answers: the change is not recorded, checked in the transaction that would record it,
+    as an appraisal's commit is (CL6D-MM-01)."""
+    from kin_mind.state import Evolution
+
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"behavior_chain": False, "trait_ledger": False})
+    claim, assessment = prospective_check(mind, source, clock)
+    note_source, note = read_note(mind, clock, "evolve-read", f"她说过 {MARKER} 让她安心")
+    baseline = mind.read()["dimensions"]["curiosity"]["baseline"]
+
+    class Daily:
+        def appraise(self, context):
+            mind.engine.delete(note_source)
+            proposal, receipt = answered(Appraisal(reason=f"因为 {MARKER}，更想去查证", evolution=Evolution(
+                claim_id=claim["id"], assessment_id=assessment["id"], baseline_changes={"curiosity": baseline + 5})))
+            return proposal, {**receipt, **tool_read(note)}
+
+    reviewed = DailyReview(mind).run(Daily(), "synthetic-v1")
+    settle(mind.engine)
+    assert reviewed["state"] == "needs-review" and reviewed["error"] == "Conflict"
+    assert mind.read()["dimensions"]["curiosity"]["baseline"] == baseline, "no change was recorded"
+    assert texts_everywhere(mind.engine, MARKER) == set()
 
 
 def test_a_creation_keeps_no_words_once_its_plans_own_evidence_is_deleted_during_its_review(env, tmp_path):

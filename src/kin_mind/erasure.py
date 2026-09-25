@@ -114,7 +114,10 @@ HISTORY_BYTES = 8 * 1024 * 1024
 
 
 def cites(value, ids):
-    """Whether this one dict rests on erased material, by its own references."""
+    """Whether this one dict rests on erased material, by its own references -- or by what the
+    model call whose receipt it keeps (`receipt`, `seed_receipt` and the like) read with its tools:
+    the words beside that receipt were written by a model that had it before it, cited or not.
+    A queue row written before this release names those reads only there (CL6D-MM-01)."""
     for key in REF_LISTS:
         refs = value.get(key)
         if isinstance(refs, list) and any(isinstance(ref, dict) and (ref.get("source_id") in ids or ref.get("record_id") in ids)
@@ -123,6 +126,10 @@ def cites(value, ids):
     for key in ID_LISTS:
         found = value.get(key)
         if isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found):
+            return True
+    for key, item in value.items():
+        if isinstance(key, str) and (key == "receipt" or key.endswith("_receipt")) and isinstance(item, (dict, list)) \
+                and any(i in ids for i in read_ids(item)):
             return True
     return any(value.get(key) in ids for key in ID_KEYS if isinstance(value.get(key), str))
 
@@ -231,6 +238,17 @@ def tombstoned(conn, ids):
     return erased
 
 
+def held(conn, ids):
+    """Those of `ids` the store holds now, as records or sources."""
+    ids, found = sorted({i for i in ids if isinstance(i, str)}), set()
+    for start in range(0, len(ids), 500):
+        page = ids[start:start + 500]
+        marks = ",".join("?" * len(page))
+        found.update(row[0] for row in conn.execute(f"SELECT id FROM records WHERE deleted=0 AND id IN ({marks})", page))
+        found.update(row[0] for row in conn.execute(f"SELECT id FROM sources WHERE deleted=0 AND id IN ({marks})", page))
+    return found
+
+
 def shown_ids(conn, value):
     """Every source and record `value` names that the store holds now: all a model shown `value`
     may have written from, beyond the references it is asked about -- the mind's state, methods,
@@ -238,13 +256,45 @@ def shown_ids(conn, value):
     been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03)."""
     from eventmem.core.db import NAMED
 
-    named, held = sorted(set(NAMED.findall(dumps(value)))), set()
-    for start in range(0, len(named), 500):
-        page = named[start:start + 500]
-        marks = ",".join("?" * len(page))
-        held.update(row[0] for row in conn.execute(f"SELECT id FROM records WHERE deleted=0 AND id IN ({marks})", page))
-        held.update(row[0] for row in conn.execute(f"SELECT id FROM sources WHERE deleted=0 AND id IN ({marks})", page))
-    return sorted(held)
+    return sorted(held(conn, NAMED.findall(dumps(value))))
+
+
+def read_ids(receipt):
+    """Every id a receipt says a tool returned to the model: `tool_calls[].ids`, as the host records
+    a fork turn (boundaries.mjs `forkReceipt`), wherever the receipt carries one -- the call itself
+    (`native_receipt`), and the other turns of the same attempt it keeps beside it: a schema, advice
+    or sharing repair, an evidence compression, a light question (`reuse.revalidation`), and a
+    stored proposal's own receipt. What a call returned was read, whether the proposal cites it or
+    not, and whether the call then succeeded or not (CL6D-MM-01)."""
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "tool_calls" and isinstance(item, list):
+                    for call in item:
+                        for entry in (call.get("ids") if isinstance(call, dict) and isinstance(call.get("ids"), list) else ()):
+                            identifier = entry.get("id") if isinstance(entry, dict) else entry
+                            if isinstance(identifier, str) and identifier:
+                                found.append(identifier)
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(receipt)
+    return list(dict.fromkeys(found))
+
+
+def tool_read_ids(conn, receipt):
+    """What a model read with its tools while it answered (`read_ids`), as far as the store knows
+    it: held now, or deleted -- a deleted one must stop what was written from it, where it is
+    checked. An id the store never held (a graph node, a plan, a wish) names nothing a delete could
+    take, and where a derived source is stored it would read as one deleted: it is left out.
+    Beside `shown_ids`, this is everything the model had before it (CL6D-MM-01)."""
+    ids = read_ids(receipt)
+    return sorted(held(conn, ids) | tombstoned(conn, ids))
 
 
 def drop_refs(value, ids):
