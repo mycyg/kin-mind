@@ -174,7 +174,9 @@ test('a completion review that timed out keeps the creation in flight until its 
  // The retry path: a review that found no slot, then one that settled; the first worker is still ending.
  calls.length=0;workers.length=0;answers=[{state:'waiting'},{state:'completed'}];
  const retried=worker.tick();
- for(let i=0;i<50&&workers.length<2;i++)await turn();
+ // The retry waits retryMs on a timer, so wait on the clock rather than on a count of event-loop turns.
+ for(let i=0;i<200&&workers.length<2;i++)await new Promise(resolve=>setTimeout(resolve,5));
+ assert.equal(workers.length,2,'the retried completion review started');
  workers[1]();
  for(let i=0;i<5;i++)await turn();
  assert.deepEqual(calls,['plan-claim','plan-result','plan-renew','plan-result']);
