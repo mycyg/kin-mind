@@ -157,10 +157,15 @@ class Contexts:
         """Keep one compression only while what it was made from is still what a read may see,
         checked in the write transaction that keeps it. A source deleted or revised while the
         model was answering leaves no row behind; its call's cost is all that stays, already
-        recorded by the call (CR3-MM-03). False when nothing was kept."""
+        recorded by the call (CR3-MM-03). False when nothing was kept. A compression made in the main
+        session's fork -- an appraisal's evidence, compressed by the model that appraises it -- may
+        also read memory with that fork's tools: what its receipt says they returned is checked the
+        same way, and the row keeps the receipt, so a later delete finds it (CL6D-MM-01)."""
+        from .erasure import read_ids
+
         text = dumps(value)
         with self.engine.db.connect(write=True) as conn:
-            if not self._still(conn, depends, policy, *self._words(value)):
+            if not self._still(conn, depends, policy, *self._words(value), dumps(read_ids(value))):
                 return False
             conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)",
                          (key, self.mind.scope.key(), text, self.mind.clock()))

@@ -29,6 +29,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model
 from eventmem.core.retrieval import tokens
 
+from . import erasure
 from . import manifest as manifests
 from .conflicts import reusable
 from .dialogue import clock_context
@@ -814,8 +815,13 @@ def _revalidate(jobs, provider, row, data, stored, entries, request):
     finally:
         if previous is not None:
             provider.timeout = previous
+    with jobs.engine.db.connect() as conn:
+        read = erasure.tool_read_ids(conn, call_receipt)
     data["revalidation"] = {"conflicts": [{k: e["public"][k] for k in ("conflict_id", "kind", "object")} for e in entries],
-                            "items": [item.model_dump(exclude={"patch"}) | {"patched": item.patch is not None} for item in answer.items]}
+                            "items": [item.model_dump(exclude={"patch"}) | {"patched": item.patch is not None} for item in answer.items],
+                            # What the light call's model read with its tools: the reasons above were written
+                            # from it too, and stay on the row whether or not the answer is accepted (CL6D-MM-01).
+                            "evaluated_ids": read}
     try:
         proposal, verdicts = accept(answer, entries, stored.proposal)
     except Refused as refusal:

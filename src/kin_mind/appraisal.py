@@ -2184,7 +2184,9 @@ class Appraisals:
                 stored = revalidation.candidate(data, historical)
                 if stored:
                     with self.engine.db.connect() as conn:
-                        shown_gone = erasure.tombstoned(conn, data.get("evaluated_ids") or ())
+                        # What it was shown, and what its model read with its tools, which a row from
+                        # before this release names only in the stored receipt (CL6D-MM-01).
+                        shown_gone = erasure.tombstoned(conn, [*(data.get("evaluated_ids") or ()), *erasure.read_ids(stored.receipt)])
                 if stored and (shown_gone or any(isinstance(ref, dict) and ref.get("erased")
                                                  for ref in [*stored.sources, *(data.get("evaluated_sources") or [])])):
                     # Something the stored proposal's model was shown has been deleted since, and the delete
@@ -2251,12 +2253,17 @@ class Appraisals:
                         receipt = {**receipt, "advice_repair": repair_receipt}
                 if historical:
                     proposal = proposal.model_copy(update={"values": {}, "motivations": {}, "wishes": [], "wish_updates": [], "evolution": None, "understanding": None, "concerns": [], "rhythm": None, "sharing": [], "habits": None, "plan_changes": [], "action_decisions": [], "procedure_candidates": []})
+                with self.engine.db.connect() as conn:
+                    # What the model read with its own tools while it answered -- in this call, its
+                    # repairs, its evidence compression, a light question, or the stored proposal's
+                    # own call -- it had before it as much as its context (CL6D-MM-01).
+                    read = erasure.tool_read_ids(conn, receipt)
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
                 data.update(proposed_result=proposal_record(proposal), receipt=receipt,
                             evaluated_sources=list(semantic_refs.values()),
                             # A stored proposal was written from what its own attempt was shown as well.
-                            evaluated_ids=sorted(set(shown_ids) | set(data.get("evaluated_ids") or () if light else ())))
+                            evaluated_ids=sorted(set(shown_ids) | set(read) | set(data.get("evaluated_ids") or () if light else ())))
                 if manifest:
                     # The manifest this proposal rests on: this attempt's, unless the proposal was reused
                     # without a question and so still rests on what its own model call was shown.
@@ -2273,7 +2280,10 @@ class Appraisals:
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
                         proposal = proposal.model_copy(update={"sharing": sharing})
                         receipt = {**receipt, "sharing_repair": repair_receipt}
-                        data.update(proposed_result=proposal_record(proposal), receipt=receipt)
+                        with self.engine.db.connect() as conn:
+                            read = erasure.tool_read_ids(conn, repair_receipt)
+                        data.update(proposed_result=proposal_record(proposal), receipt=receipt,
+                                    evaluated_ids=sorted(set(data.get("evaluated_ids") or ()) | set(read)))
                     if any(sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) != 1 for t in targets):
                         raise RuntimeError("deepseek-missing-sharing-decision")
                 if data.get("stimulus") == FOLLOW_UP and isolation:
@@ -2997,31 +3007,42 @@ class DailyReview:
                 {"id": rid, "text": self.engine.get(rid)["content"][:4000]}
                 for rid in ids
             ]
-            proposal, receipt = provider.appraise(
-                {
-                    "mode": "daily-personality-review",
-                    "state": view,
-                    "definitions": DIMENSIONS,
-                    "new_evidence": sources,
-                    "self_knowledge": SelfKnowledge(self.engine, self.mind.scope).view(
-                        agent_version=agent_version
-                    ),
-                    "instruction": "只依据给定的当前假设与事前行为检验编号提出人格发展建议。不修改短期情绪值或愿望，保留反例；证据不足时 evolution=null。",
-                }
-            )
-            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown}
+            context = {
+                "mode": "daily-personality-review",
+                "state": view,
+                "definitions": DIMENSIONS,
+                "new_evidence": sources,
+                "self_knowledge": SelfKnowledge(self.engine, self.mind.scope).view(
+                    agent_version=agent_version
+                ),
+                "instruction": "只依据给定的当前假设与事前行为检验编号提出人格发展建议。不修改短期情绪值或愿望，保留反例；证据不足时 evolution=null。",
+            }
+            proposal, receipt = provider.appraise(context)
+            with self.engine.db.connect() as conn:
+                # Beside the messages: the state and the self-knowledge it was shown, and what it read
+                # with the fork's tools while it answered. Its words rest on these too, so the row
+                # names them and the change is recorded only while none is deleted (CL6D-MM-01).
+                evaluated = sorted(set(erasure.shown_ids(conn, context)) | set(erasure.tool_read_ids(conn, receipt)))
+            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown, "evaluated_ids": evaluated}
             if proposal.evolution:
-                data["result"] = self.mind.record(
-                    AffectiveEvent(
-                        command_id="daily:" + day,
-                        agent_version=agent_version,
-                        expected_revision=view["revision"],
-                        evidence_ids=ids,
-                        reason=proposal.reason,
-                        origin="reflection",
-                        evolution=proposal.evolution,
-                    )
+                event = AffectiveEvent(
+                    command_id="daily:" + day,
+                    agent_version=agent_version,
+                    expected_revision=view["revision"],
+                    evidence_ids=ids,
+                    reason=proposal.reason,
+                    origin="reflection",
+                    evolution=proposal.evolution,
                 )
+
+                def apply(conn, state, eid):
+                    # Checked in the transaction that records the change, as an appraisal's commit is.
+                    gone = erasure.tombstoned(conn, evaluated)
+                    if gone:
+                        raise Conflict("Something the model was shown has been deleted", target=min(gone))
+                    return self.mind._apply_event(conn, state, event, eid)
+
+                data["result"] = self.mind._mutate(event, "evolution", apply)
             state = "complete"
         except ModelAdmissionWait:
             state = "waiting"
@@ -3033,7 +3054,8 @@ class DailyReview:
             # The model's reason is kept only while what it was shown still stands, checked in this
             # write: deleted or changed while it answered, the reason goes and the receipt and the
             # error stay. What stays names its sources, so a later delete finds it (CR5-MM-09).
-            if data.get("evidence") and data.get("reason") and not self.mind._fresh(conn, shown):
+            if data.get("reason") and ((data.get("evidence") and not self.mind._fresh(conn, shown))
+                                       or erasure.tombstoned(conn, data.get("evaluated_ids") or ())):
                 data.pop("reason")
                 data["reason_withheld"] = "sources-changed"
             data = kept(conn, data)
