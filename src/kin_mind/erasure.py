@@ -78,7 +78,16 @@ ID_LISTS = ("evidence_ids", "source_ids", "record_ids", "input_ids", "result_ids
 # A field copied from elsewhere names what it was written from beside it, as `<field>_evidence_ids`:
 # an erase takes that field's words, and only that field's (CR5-MM-01).
 FIELD_EVIDENCE = "_evidence_ids"
-ID_KEYS = ("source_id", "record_id")
+# A dict whose own `id` is a record or a source of the store is a copy of it: an excerpt the memory
+# context labels by the record's id -- an event's `identity_evidence`, a topic candidate's `members`
+# (memory.py) -- which a queue row keeps frozen for its retry, however much later that comes. It goes
+# with the record, at the delete (CL7B-MM-03). Only the store's records and sources are ever erased
+# (`IDENTIFIER`), so an `id` matches nothing but a copy of one: never a wish, a plan or a family (a
+# graph node that projects a record takes its id, and names it in `record_ids` besides).
+ID_KEYS = ("source_id", "record_id", "id")
+# A topic candidate copies a family of records, titled by one of them, and the store deletes the family
+# with any of its members (`Engine.delete`): the copy goes with any member it shows (CL7B-MM-03).
+MEMBER_LISTS = ("members",)
 TOMBSTONE_KEYS = ("source_id", "record_id", "hash", "revision", "authority")
 IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
 # Graph kinds whose words are a claim the model wrote from its evidence: they go whenever any of
@@ -120,7 +129,8 @@ def cites(value, ids):
     keeps -- a wish's, a plan's, a trait's `decision_receipt` or `receipt`, the appraisal that wrote
     it -- says what that call's model read with its tools, and a committed entry does not go with
     what was only read: it goes with what it cites (decision 1, CL6E-MM-01). What a model read counts
-    on the rows of its own process alone, `scrub_process`."""
+    on the rows of its own process alone, `scrub_process`. A copy of an erased record, named by its own
+    `id`, rests on it, and a topic candidate on each member it shows (CL7B-MM-03)."""
     for key in REF_LISTS:
         refs = value.get(key)
         if isinstance(refs, list) and any(isinstance(ref, dict) and (ref.get("source_id") in ids or ref.get("record_id") in ids)
@@ -129,6 +139,11 @@ def cites(value, ids):
     for key in ID_LISTS:
         found = value.get(key)
         if isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found):
+            return True
+    for key in MEMBER_LISTS:
+        found = value.get(key)
+        if isinstance(found, list) and any(isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"] in ids
+                                           for item in found):
             return True
     return any(value.get(key) in ids for key in ID_KEYS if isinstance(value.get(key), str))
 
