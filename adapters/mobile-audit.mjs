@@ -24,9 +24,11 @@ export const INCIDENT_REOPEN_MS=24*3600000;
  * fault classes: the same classes seen again only refresh its evidence. The
  * findings are facts for Kin, who decides when and whether to look at them (N13). */
 export class MobileAudit {
-  constructor({file,collect,review,intervalHours=4,now=()=>Date.now(),lease=null,
+  /** `activity` is the router's gate for what starts beside the owner's conversation
+   * (`beginActivity`); a host passes it, and every reading then passes it (CR3-FLOW-01). */
+  constructor({file,collect,review,intervalHours=4,now=()=>Date.now(),lease=null,activity=null,
     lane=REVIEWER_LANES.audit,purpose=REVIEWER_PURPOSES.audit,skipRetryMs=5*60000}) {
-    Object.assign(this,{file,collect,review,intervalHours,now,lease,lane,purpose,skipRetryMs});this.running=false;
+    Object.assign(this,{file,collect,review,intervalHours,now,lease,activity,lane,purpose,skipRetryMs});this.running=false;
     this.state=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{schema:1,nextAt:now(),history:[],incidents:{}};
     if(this.state.schema!==1)throw Error('Unknown audit schema');
     this.state.incidents??={};
@@ -39,15 +41,24 @@ export class MobileAudit {
   }
   async tick() {
     if(this.running||this.now()<this.state.nextAt)return{state:'not-due'};
+    const id='audit-'+this.now();
+    // A reading is a model call beside her conversation. Dispatch must not be frozen and
+    // the lane must admit it, both before anything is collected, spent or counted; the
+    // drain counts the reading until it has returned. Refused, it counts nothing and is
+    // due again at the next tick (CR3-FLOW-01).
+    const gate=this.activity?this.activity({kind:'health-review',id}):null;
+    if(gate&&!gate.ok)return{state:'skipped',reason:'dispatch-'+gate.reason};
+    this.running=true;
     // The health review is background work. At capacity, or with the ledger
     // unreachable, this run is skipped before anything is collected or spent; it
     // never waits for a slot, because waiting here would delay nothing useful.
-    const held=this.lease?await this.lease.acquire({lane:this.lane,purpose:this.purpose}):null;
-    if(held&&!held.proceed){await held.release();return{state:'skipped',lane:held.lane,reason:held.reason??held.state};}
-    this.running=true;
-    const id='audit-'+this.now();
+    let held=null;
+    try {held=this.lease?await this.lease.acquire({lane:this.lane,purpose:this.purpose}):null;}
+    catch(error){this.running=false;gate?.release();throw error;}
+    if(held&&!held.proceed){this.running=false;gate?.release();await held.release();return{state:'skipped',lane:held.lane,reason:held.reason??held.state};}
     this.state.status='running';this.state.startedAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;
-    atomicJson(this.file,this.state);
+    try {atomicJson(this.file,this.state);}
+    catch(error){this.running=false;gate?.release();await held?.release();throw error;}
     try {
       const snapshot=await this.collect();const result=await this.review(snapshot,{held});
       const at=this.now();
@@ -64,7 +75,7 @@ export class MobileAudit {
       const minutes=AUDIT_FAILURE_RETRY_MINUTES[this.state.failures-1]??this.intervalHours*60;
       this.state.nextAt=this.now()+minutes*60000;
       this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
-    finally {this.running=false;await held?.release();atomicJson(this.file,this.state);}
+    finally {this.running=false;gate?.release();await held?.release();atomicJson(this.file,this.state);}
   }
   record(id,result,at) {
     const incidents=Object.values(this.state.incidents);

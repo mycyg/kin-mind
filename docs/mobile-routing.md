@@ -100,7 +100,8 @@ minute, decides from evidence alone:
 - An input proven never submitted — its preparation failed or was withdrawn, it
   reached only the host's in-memory queue, or reconciliation proved it absent — goes
   back to the inbox under the same ID after 30 seconds, 2 minutes and 10 minutes, at
-  most three times across all its attempts, never while dispatch is frozen; after
+  most three times across all its attempts — those of its intake and of its routing
+  counted together — never while dispatch is frozen; after
   that it is told as `stopped`. A failed model control of the owner's is reported by
   its own mode notice instead. What the owner's stop withdrew before it was submitted
   is canceled by her, never retried.
@@ -151,7 +152,10 @@ owner unanswered for good. Asking again with the same reason and migration ID ch
 nothing, so a caller may poll it; every answer says whether the host is `idle` and,
 if not, why. `POST /thaw` lifts it. `GET /busy` answers the same drain: inputs still
 moving through the host, a native turn or an unreadable native runtime, a send, a
-native command or a switch hold it; open work, a desktop handoff, history and inputs
+native command or a switch hold it, and so do the host's own background model calls —
+a summary of open work, a health reading, a classification asked again — until they
+return; a freeze refuses a new one before anything is counted for it, and none of them
+holds the owner's conversation. Open work, a desktop handoff, history and inputs
 waiting for a notice or a reconciliation do not, because they do not change by
 waiting. `GET /unsettled` returns the eight-state summary and every unsettled input
 by its original ID, naming inbox jobs the router has not taken by ID and file time
@@ -182,7 +186,13 @@ anything else, answers when no classifier can and applies to every open task. A 
 read from natural language counts only when the classifier actually answered, and
 applies only to the tasks it was read against. Either way it is recorded on the stop
 input itself, cancels the tasks it names once execution has stopped, and never opens
-or extends work.
+or extends work. What of the stopped work waits in the host's in-memory queue, its
+prompt not begun, leaves that queue at once by its original input IDs and is canceled
+by her under those IDs; it is never requeued or sent under another ID. Nothing else in
+the queue moves, whatever arrived after the stop included. The stop is read again where
+any prompt would begin, in the step that records its start: a prompt that carries
+stopped work never begins, and a message merged into it after the stop is not
+submitted and goes again under its own ID.
 
 In manual mode, ordinary messages retain the selected model, effort and Fast
 preference. The classifier still reads content, recall and stop/file intentions, but
@@ -216,7 +226,9 @@ terminal; or not submitted — no outbox record, or one that proves nothing reac
 platform — which sends the same ID again under a bounded budget that survives
 restarts. Anything else leaves the submission unknown: the original ID is only looked
 up, never resent, and after a bounded number of lookups the notice stops polling as
-`unresolved`. Exhaustion is a state with a reason, never permanent polling. A settle
+`unresolved`. Exhaustion is a state with a reason, never permanent polling. A send
+starts only past the activity gate; if the ledger cannot be written after that, the
+permit is let go and the notice waits, not submitted, under its own ID. A settle
 that would change nothing writes nothing. Notification receipts are separate from
 task delivery receipts. Host integrations must guard provider changes for the
 duration of the send and must bypass task-delivery accounting for these non-task
