@@ -280,3 +280,7 @@ def test_the_operations_guide_says_what_the_repair_deletes_as_the_repair_itself_
     for text in (section, described):
         assert "Only `reerase` deletes" in text
     assert not re.search(r"(?<!other )\b[Nn]o step deletes", section), "the guide's own words contradict the reerase step"
+    # Both say what the store holds beside what the deletes take, and that reerase may come a release after lineage.
+    for text in (section, described):
+        assert "`store_by_kind`" in text
+    assert "`reerase` may run in a later release than `lineage`" in section and "in the same run or a later one" in described
