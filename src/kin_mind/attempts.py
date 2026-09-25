@@ -174,36 +174,44 @@ def _row(scope, entry, ordinal):
             entry["outcome"], entry.get("started_at"), entry.get("finished_at"), dumps(data))
 
 
-def record(engine, scope, entry, *, placeholder=False):
+def record(engine, scope, entry, *, placeholder=False, conn=None):
     """Insert one attempt row.
 
     A real record completes the `abandoned` placeholder a later claimer left for a
-    killed attempt, and never overwrites another real record.
+    killed attempt, and never overwrites another real record. Given `conn`, the row is
+    written in that open write transaction, so it commits with the queue state beside it
+    or not at all (CR3-MM-07); without it, in a transaction of its own.
     """
     if entry["outcome"] not in OUTCOMES:
         raise ValueError("Unknown appraisal attempt outcome")
     if not entry.get("attempt_token"):
         return None
-    with engine.db.connect(write=True) as conn:
-        # Statement by statement: executescript would commit this transaction first, and the
-        # ordinal read and the insert below would no longer be one atomic step (K2-17).
-        for statement in filter(None, (part.strip() for part in LEDGER_SCHEMA.split(";"))):
-            conn.execute(statement)
-        ordinal = conn.execute(
-            "SELECT COUNT(*) FROM mind_appraisal_attempts WHERE scope=? AND appraisal_id=?",
-            (scope, entry["appraisal_id"])).fetchone()[0] + 1
-        row = _row(scope, entry, ordinal)
-        if placeholder:
-            conn.execute("INSERT OR IGNORE INTO mind_appraisal_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)", row)
-        else:
-            conn.execute(
-                "INSERT INTO mind_appraisal_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-                "outcome=excluded.outcome,finished_at=excluded.finished_at,data=excluded.data "
-                "WHERE mind_appraisal_attempts.outcome='abandoned'", row)
+    if conn is None:
+        with engine.db.connect(write=True) as own:
+            return _insert(own, scope, entry, placeholder)
+    return _insert(conn, scope, entry, placeholder)
+
+
+def _insert(conn, scope, entry, placeholder):
+    # Statement by statement: executescript would commit this transaction first, and the
+    # ordinal read and the insert below would no longer be one atomic step (K2-17).
+    for statement in filter(None, (part.strip() for part in LEDGER_SCHEMA.split(";"))):
+        conn.execute(statement)
+    ordinal = conn.execute(
+        "SELECT COUNT(*) FROM mind_appraisal_attempts WHERE scope=? AND appraisal_id=?",
+        (scope, entry["appraisal_id"])).fetchone()[0] + 1
+    row = _row(scope, entry, ordinal)
+    if placeholder:
+        conn.execute("INSERT OR IGNORE INTO mind_appraisal_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)", row)
+    else:
+        conn.execute(
+            "INSERT INTO mind_appraisal_attempts VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "outcome=excluded.outcome,finished_at=excluded.finished_at,data=excluded.data "
+            "WHERE mind_appraisal_attempts.outcome='abandoned'", row)
     return row[0]
 
 
-def backfill_abandoned(engine, scope, row, data, *, at):
+def backfill_abandoned(engine, scope, row, data, *, at, conn=None):
     """The attempt that left this row `running` past its lease recorded nothing itself.
 
     Its usage is unknowable from here, so it is stated as unknown rather than guessed.
@@ -213,7 +221,7 @@ def backfill_abandoned(engine, scope, row, data, *, at):
         "lane": lane_of(data), "stimulus": data.get("stimulus"), "started_at": data.get("attempt_started_at"),
         "finished_at": at, "calls": [], "charged": True,
         "error": "appraisal-attempt-abandoned", "attempts": row["attempts"],
-    }, placeholder=True)
+    }, placeholder=True, conn=conn)
 
 
 def lane_of(data):
