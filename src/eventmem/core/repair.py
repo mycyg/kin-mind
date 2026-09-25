@@ -115,7 +115,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-from .db import digest
+from .db import NAMED, digest, named_in_json
 from .models import Scope
 from .read_policy import (
     RULE_ORIGIN,
@@ -134,7 +134,6 @@ COMMAND = "repair-20260924"
 # index.
 ARCHIVED_NAMESPACES = ("kin-session-maintenance",)
 CHUNK = 200
-IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
 
 
 class Refused(ValueError):
@@ -315,10 +314,10 @@ def plan_maintenance(conn, pending_origins=()):
     named = set()
     if _table(conn, "mind_state"):
         for (text,) in conn.execute("SELECT data FROM mind_state"):
-            named.update(IDENTIFIER.findall(text))
+            named.update(named_in_json(text))
     if _table(conn, "mind_appraisals"):
         for (text,) in conn.execute("SELECT data FROM mind_appraisals WHERE state IN ('pending','running','batched')"):
-            named.update(IDENTIFIER.findall(text))
+            named.update(named_in_json(text))
     for sid in sorted(sources):
         record = conn.execute("SELECT rowid,id,status FROM records WHERE id=?", (_root(sid),)).fetchone()
         if record is None:
@@ -523,7 +522,7 @@ def _json(text):
 
 
 def _named(values):
-    return [value for value in values or () if isinstance(value, str) and IDENTIFIER.fullmatch(value)]
+    return [value for value in values or () if isinstance(value, str) and NAMED.fullmatch(value)]
 
 
 def _tombstoned(conn, keys):
@@ -918,7 +917,7 @@ def _receipts(conn, ids, *, write=False):
         if not ids or not _table(conn, table):
             continue
         doomed = [key for key, text in conn.execute(f"SELECT rowid,{column} FROM {table}")
-                  if isinstance(text, str) and not ids.isdisjoint(IDENTIFIER.findall(text))]
+                  if isinstance(text, str) and not ids.isdisjoint(named_in_json(text))]
         count += len(doomed)
         if write:
             for start in range(0, len(doomed), 500):

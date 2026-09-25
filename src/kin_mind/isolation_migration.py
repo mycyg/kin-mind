@@ -67,7 +67,10 @@ MARK = "evidence_isolation"
 CONFIGURATION = ("role_configuration", "synthetic_example", "host_envelope")
 NODE_REASON = "Configuration references moved out of this node's evidence"
 UNDO_REASON = "Evidence isolation taken back; the archived version is restored"
-IDENTIFIER = re.compile(r"\b[a-z]+_[0-9a-z_]{8,}\b")
+# Any identifier a cached context names -- a record's, a graph node's -- ending words where the store's
+# own pattern does (`db.NAMED`): at ASCII boundaries, so one written right against Chinese words is
+# found (CL8-FLOW-03).
+IDENTIFIER = re.compile(r"\b[a-z]+_[0-9a-z_]{8,}\b", re.ASCII)
 # Rows per write transaction. Small enough that an ordinary host write waits milliseconds.
 CHUNK = 200
 

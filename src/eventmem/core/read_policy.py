@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import threading
 from pathlib import Path
 from typing import NamedTuple
 
+from .db import named_in
 from .models import Scope
 
 PURPOSES = ("experience_recall", "self_knowledge_view", "audit")
@@ -121,7 +121,6 @@ HOST_PREFIXES = (
     "## Memory Writing Agent:", "# AGENTS.md instructions", "<environment_context>",
     "<turn_aborted>", "Warning: Heads up: Long threads")
 
-_IDENTIFIER = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
 _cache: dict = {}
 _persona_cache: dict = {}
 _cache_lock = threading.Lock()
@@ -328,7 +327,7 @@ def _named_in_persona(engine, scope):
         policy = json.loads(path.read_text()) if stamp else {}
         if policy and Scope.model_validate(policy["scope"]) == scope:
             named = frozenset(i for field in ("approved_source", "approved_sources", "approved_source_id", "approved_source_ids")
-                              for i in _IDENTIFIER.findall(json.dumps(policy.get(field, ""))))
+                              for i in named_in(policy.get(field, "")))
     except (OSError, ValueError, KeyError, TypeError):
         named = frozenset()
     with _cache_lock:

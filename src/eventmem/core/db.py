@@ -185,6 +185,32 @@ def recording():
 NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b", re.ASCII)
 
 
+def named_in(value):
+    """The store ids a value names (`NAMED`), in every string it holds, keys too, each read as the
+    string it is -- never in the value's JSON, whose escapes stand right before an id as a letter or
+    a digit and hide it: a line break, and every Chinese character where JSON keeps to ASCII
+    (CL8-FLOW-03)."""
+    found, stack = [], [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            found.extend(NAMED.findall(item))
+        elif isinstance(item, dict):
+            stack.extend(reversed([part for pair in item.items() for part in pair]))
+        elif isinstance(item, (list, tuple)):
+            stack.extend(reversed(item))
+    return found
+
+
+def named_in_json(text):
+    """The store ids a text a table keeps names: the JSON value it holds, read string by string
+    (`named_in`), or the text itself where it holds none."""
+    try:
+        return named_in(json.loads(text))
+    except (TypeError, ValueError, RecursionError):
+        return named_in(text)
+
+
 def tombstoned(conn, *texts):
     """Whether a source or record these texts name has been deleted. The tombstone is the deletion
     fact and outlives every word of what was deleted, so a model answer that comes back after a
