@@ -52,6 +52,17 @@ test('the renderer gets only the workspace, the file and its digest, and a bad a
   assert.deepEqual(Object.keys(fake.launched[0].options.env).filter(k=>!['PATH','HOME','TMPDIR','LANG'].includes(k)),[]);
 });
 
+test('the render worker carries the creation step\'s mark and nothing else it is handed (CR5-MM-04)',async t=>{
+  const result=produced(t,{'a.html':'<p>一</p>'});
+  const fake=renderer((child,request)=>{child.stdout.end(JSON.stringify({state:'verified',source_sha256:request.sha256}));child.emit('close',0);});
+  const verifier=new CreationVerifier({playwrightModule:fileURLToPath(import.meta.url),...fake});
+  const mark='4f1c2b3a-0d9e-4a8b-9c7d-6e5f4a3b2c1d';
+  await verifier.verify(result,{env:{KIN_WORKER_MARK:mark,FEISHU_APP_SECRET:'must-not-pass'}});
+  const env=fake.launched[0].options.env;
+  assert.equal(env.KIN_WORKER_MARK,mark,'the worker and the browser it starts are the step\'s');
+  assert.deepEqual(Object.keys(env).filter(k=>!['PATH','HOME','TMPDIR','LANG','KIN_WORKER_MARK'].includes(k)),[]);
+});
+
 test('a renderer that hangs is stopped at its limit or when the run is interrupted',async t=>{
   const result=produced(t,{'a.html':'<p>一</p>'});
   const slow=new CreationVerifier({playwrightModule:fileURLToPath(import.meta.url),timeoutMs:50,...renderer(()=>{})});
