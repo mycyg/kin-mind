@@ -17,21 +17,29 @@ const EMAIL=/[A-Za-z0-9_.+=~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/
 // The fields whose value is a state, a code or a name that the host, the mind, an executor or its
 // tools give -- never a model's or a person's word. A single word stays in one of these, or where it
 // is the name of a key of the same document; anywhere else it is a word. A code field missing here
-// loses a one-word value to ERASED; `state` is here because the host's health and audit read it.
+// loses a one-word value to ERASED; `state` is here because the host's health and audit read it, and
+// a receipt's `truncated_by` and `usage_status` because an operator reads there why a fork's reads
+// were cut short and whether a call's usage was reported (CL8-MM-04).
 export const CODE_KEYS=Object.freeze([
   'state','status','result_state','stage','outcome',
   'channel','provider','model','reasoning','executor','backend','adapter','server','tool',
   'kind','type','item_type','content_type','class','code','category','error','error_tags',
-  'retry_condition','authority','basis','actor','role','origin',
+  'retry_condition','authority','basis','actor','origin',
   'tier','lane','stimulus','waiting_reason','repair_reason','reason_withheld',
+  'truncated_by','usage_status',
 ]);
 const codeKeys=new Set(CODE_KEYS);
+// The fields that hold a code where the host writes them and a model's own word elsewhere: only their
+// codes stay. `role` is whose turn a message is, and in a graph relation what the model called someone
+// (erasure.py, CL6-MM-09) (CL8-MM-06).
+export const CODE_VALUES=Object.freeze({role:Object.freeze(['user','assistant','system','tool','developer'])});
+const codeValues=new Map(Object.entries(CODE_VALUES).map(([key,values])=>[key,new Set(values)]));
 
 /** Whether the string `value` names or classifies something, as it stands under `key` in a
  * document whose keys are `keys`. */
 export function kept(value,key=null,keys=new Set()) {
   if(!KEPT.test(value)||EMAIL.test(value))return false;
-  if(WORD.test(value))return codeKeys.has(key)||keys.has(value);
+  if(WORD.test(value))return codeKeys.has(key)||keys.has(value)||(codeValues.get(key)?.has(value)??false);
   return true;
 }
 const isObject=value=>Boolean(value)&&typeof value==='object'&&!Array.isArray(value);
