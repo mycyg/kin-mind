@@ -236,13 +236,27 @@ def test_the_row_keeps_the_hosts_record_within_its_bounds_and_says_when_it_was_c
     assert fork_reads(None) is None and DRAFT_SHOWN_IDS == 4000
 
 
+# Where a store id begins and ends: beside Chinese words, a space, full-width brackets, a label or a
+# letter outside ASCII it stands alone; right after an ASCII letter, digit or underscore, or right
+# before one, it is part of another word (CL7B-FLOW-02).
+STORE_ID_BOUNDARIES = (("记忆{id}的", True), ("记忆 {id} 的", True), ("（{id}）", True), ("id:{id}", True), ("é{id}", True),
+                       ("{id}的", True), ("a{id}", False), ("7{id}", False), ("_{id}", False), ("{id}g", False), ("{id}0", False))
+
+
 def test_the_owned_acp_reads_the_store_ids_the_store_writes():
     """The owned ACP names what a fork's tools returned by the pattern the store's own ids have, the
-    one a delete finds its rows by (`eventmem.core.db.NAMED`): the two are one pattern (CL6E-MM-04)."""
+    one a delete finds its rows by (`eventmem.core.db.NAMED`): the two are one pattern (CL6E-MM-04),
+    and they end words alike. JS's word boundary knows only ASCII letters, digits and `_`; so does
+    the store's (re.ASCII), where Python's own would take a Chinese character for a letter and miss
+    an id written right against Chinese words, which the ACP reads (CL7B-FLOW-02)."""
     patch = (Path(__file__).resolve().parents[2] / "adapters" / "codex-runtime-patch.mjs").read_text()
     # The helper is template text: each backslash of the generated source is written twice.
     found = re.search(r"const KIN_STORE_ID = /(.+)/g;", patch)
     assert found and found.group(1).replace("\\\\", "\\") == NAMED.pattern
+    assert NAMED.flags & re.ASCII
+    identifier = "mem_" + "ab" * 16
+    for text, named in STORE_ID_BOUNDARIES:
+        assert NAMED.findall(text.format(id=identifier)) == ([identifier] if named else []), text
 
 
 def test_more_shown_than_a_row_keeps_counts_as_cut_short(setup):
