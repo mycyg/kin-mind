@@ -284,3 +284,137 @@ def test_the_operations_guide_says_what_the_repair_deletes_as_the_repair_itself_
     for text in (section, described):
         assert "`store_by_kind`" in text
     assert "`reerase` may run in a later release than `lineage`" in section and "in the same run or a later one" in described
+
+
+def side_files(root):
+    return sorted(path.name for path in root.iterdir() if path.name in SQLITE_OWN)
+
+
+def leave(path):
+    """The last connection to leave a store in WAL mode, as a writer can: it takes the side files away."""
+    conn = sqlite3.connect(path)
+    conn.execute("SELECT 1 FROM meta").fetchall()
+    conn.close()
+
+
+def test_a_snapshot_dry_run_leaves_not_even_sqlites_side_files_and_reports_what_a_dry_run_of_the_store_does(store, capsys):
+    """A dry run of the store itself leaves SQLite's `-wal` and `-shm` beside a store in WAL mode: a
+    read-only reader cannot take them away when it is the last to leave. A snapshot reads a clone
+    taken while the store is still, outside the root, and leaves nothing beside the store -- not
+    those either, not a byte, not its times -- and no clone behind it; its report is the one a dry
+    run of the store gives. It is for a dry run only (WS7's dry run before the services stop)."""
+    import os
+    import tempfile
+
+    engine = store[0]
+    root = engine.db.root
+    as_before_this_release(root)
+    # The rest of the root is read where it lies: a host receipt nobody can replay.
+    (root / "host-spool").mkdir()
+    (root / "host-spool" / "unreadable.json").write_text("{")
+    assert side_files(root) == []
+    plain = repair.run(root)
+    assert plain["steps"]["spool"]["plan"] == {"receipts": 1, "unreadable": 1}
+    assert side_files(root) == sorted(SQLITE_OWN), "the plain dry run leaves them"
+    # (`on_disk` reads the store as the plain dry run does, and leaves them too.)
+    before = on_disk(root)
+    leave(root / "memory.sqlite3")
+    listing, stat = sorted(path.name for path in root.iterdir()), os.stat(root / "memory.sqlite3")
+    assert side_files(root) == []
+    still = repair.run(root, still=True)
+    assert still["snapshot"] == {"how": "still-clone", "tries": 1, "side_files": []}
+    assert still["steps"] == plain["steps"] and still["applied"] is False
+    # The command: --snapshot says how the store was taken; with --apply it is refused, and nothing runs.
+    assert repair.main(["--root", str(root), "--snapshot", "--steps", "origins"]) == 0
+    assert json.loads(capsys.readouterr().out)["snapshot"]["how"] == "still-clone"
+    assert repair.main(["--root", str(root), "--snapshot", "--apply"]) == 2
+    out, err = capsys.readouterr()
+    assert out == "" and "refused" in err and "dry run" in err
+    # Nothing beside the store, the store as it was to its times, no clone left behind.
+    assert sorted(path.name for path in root.iterdir()) == listing
+    now = os.stat(root / "memory.sqlite3")
+    assert (now.st_ino, now.st_size, now.st_mtime_ns, now.st_ctime_ns) == (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    assert not [entry for entry in os.scandir(tempfile.gettempdir()) if entry.name.startswith("kin-repair-snapshot-")]
+    assert on_disk(root) == before
+    # The guide and the module say so.
+    from pathlib import Path
+
+    guide = " ".join((Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8").split())
+    assert "--snapshot --output /outside/the/root/dry-run.json" in guide and "leaves not even those" in guide
+    assert "`--snapshot` leaves not even those" in " ".join((repair.__doc__ or "").split())
+
+
+def test_a_snapshot_waits_for_a_still_moment_takes_again_a_store_that_moved_and_is_refused_by_one_that_never_stops(tmp_path):
+    """Held open: it waits and looks again. Written while it cloned: it clones again, and the clone
+    has the write. Never still within the wait: refused, and nothing is left where the clone was to go."""
+    root = tmp_path / "root"
+    root.mkdir()
+    path = root / "memory.sqlite3"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    # Held before the clone; free before it, held after it; free before and after.
+    slept, answers = [], iter(["some", "none", "some", "none", "none"])
+    into = tmp_path / "held"
+    into.mkdir()
+    taken = repair.snapshot(path, into, held=lambda files: next(answers), sleep=slept.append, clock=lambda: 0.0)
+    assert taken == {"how": "still-clone", "tries": 3, "side_files": []} and slept == [repair.SNAPSHOT_PAUSE] * 2
+    looks = []
+
+    def meanwhile(files):
+        looks.append(files)
+        if len(looks) == 2:
+            # Between the clone and the look after it, a writer came and went.
+            writer = sqlite3.connect(path, isolation_level=None)
+            writer.execute("INSERT INTO meta VALUES('written-meanwhile','1')")
+            writer.close()
+        return "none"
+
+    into = tmp_path / "moved"
+    into.mkdir()
+    taken = repair.snapshot(path, into, held=meanwhile, sleep=lambda seconds: None, clock=lambda: 0.0)
+    assert taken["tries"] == 2 and len(looks) == 4
+    with sqlite3.connect(into / "memory.sqlite3") as clone:
+        assert clone.execute("SELECT value FROM meta WHERE key='written-meanwhile'").fetchone() == ("1",)
+    clock, into = [0.0], tmp_path / "busy"
+    into.mkdir()
+    with pytest.raises(repair.Refused, match="not still for a moment in 5 seconds"):
+        repair.snapshot(path, into, wait=5, held=lambda files: "some", sleep=lambda seconds: clock.__setitem__(0, clock[0] + 1),
+                        clock=lambda: clock[0])
+    assert list(into.iterdir()) == []
+
+
+def test_a_wal_a_crash_left_behind_is_cloned_with_the_store_and_recovered_in_the_clone_never_beside_the_store(tmp_path):
+    """A process that wrote and died leaves its WAL, which nobody holds: the snapshot clones it with
+    the store and replays it in the clone. The store and its side files stay exactly as they were."""
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "root"
+    root.mkdir()
+    path = root / "memory.sqlite3"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    crash = ("import os, sqlite3, sys\n"
+             "conn = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+             "conn.execute('PRAGMA wal_autocheckpoint=0')\n"
+             "conn.execute(\"INSERT INTO meta VALUES('only-in-the-wal','1')\")\n"
+             "os._exit(0)\n")
+    subprocess.run([sys.executable, "-c", crash, str(path)], check=True)
+    assert side_files(root) == sorted(SQLITE_OWN)
+    stat = {name: os.stat(root / name) for name in ("memory.sqlite3", *SQLITE_OWN)}
+    into = tmp_path / "clone"
+    into.mkdir()
+    taken = repair.snapshot(path, into)
+    assert taken == {"how": "still-clone", "tries": 1, "side_files": ["-wal", "-shm"]}
+    # Replayed into the clone's own file: read as it lies, without any WAL, it has the write.
+    clone = sqlite3.connect((into / "memory.sqlite3").as_uri() + "?mode=ro&immutable=1", uri=True)
+    assert clone.execute("SELECT value FROM meta WHERE key='only-in-the-wal'").fetchone() == ("1",)
+    clone.close()
+    for name, was in stat.items():
+        now = os.stat(root / name)
+        assert (now.st_ino, now.st_size, now.st_mtime_ns) == (was.st_ino, was.st_size, was.st_mtime_ns), name

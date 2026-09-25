@@ -1,6 +1,7 @@
 """The one-time data repair that goes with the 2026-09-24 memory-kernel release.
 
     python -m eventmem.core.repair --root <MemoryPalace>            # dry run: writes nothing
+    python -m eventmem.core.repair --root <MemoryPalace> --snapshot # dry run of a still copy
     python -m eventmem.core.repair --root <MemoryPalace> --apply    # the default steps
     python -m eventmem.core.repair --root <MemoryPalace> --apply --steps reerase
     python -m eventmem.core.repair --root <MemoryPalace> --apply --steps quarantine
@@ -9,6 +10,12 @@ Run it with the memory service stopped, after the backup the deploy takes. Every
 idempotent: it asks what is already done rather than counting what it did, so a second run
 reports nothing left and writes nothing. The dry run opens the store read-only and builds
 nothing: no table, index or metadata of this release, no cache under the root (CR-MEM-05).
+SQLite itself still keeps a reader's `-wal` and `-shm` beside a store in WAL mode, and a reader
+cannot take them away when it is the last to leave. `--snapshot` leaves not even those: the store
+is cloned from a moment when nothing holds it or its side files open and nothing about them changes
+(lsof, and inode, size and times before and after), into a private directory outside the root, and
+the dry run reads the clone, which goes when it is done. A store never still for `--wait` seconds
+is refused. It is the dry run for a store in use -- one taken before the services stop.
 A root without a `memory.sqlite3` is refused in both modes rather than becoming a new store.
 
 Exit status: 0 with the JSON report on stdout (also in `--output`, 0600); 2 when refused — an
@@ -96,9 +103,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,9 +147,10 @@ class ReadOnlyStore:
     metadata and pin the tokenizer cache under the root before the report said a word. The only
     files that may appear are the `-wal` and `-shm` SQLite coordinates its readers with."""
 
-    def __init__(self, path):
+    def __init__(self, path, root=None):
         self.path = Path(path).resolve()
-        self.root = self.path.parent
+        # A snapshot's store is read from its clone, and the rest of the root where it lies.
+        self.root = Path(root).resolve() if root is not None else self.path.parent
         self.blobs = self.root / "blobs"
 
     @contextmanager
@@ -162,6 +175,84 @@ class ReadOnlyStore:
 
 def _table(conn, name):
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+# --- a still copy, for a dry run of a store in use -------------------------------------------
+
+SIDE_FILES = ("-wal", "-shm", "-journal")
+# How long a snapshot waits for a moment when the store is still, and how often it looks.
+SNAPSHOT_WAIT = 120.0
+SNAPSHOT_PAUSE = 1.0
+
+
+def _side_files(store):
+    return [store.with_name(store.name + suffix) for suffix in SIDE_FILES if store.with_name(store.name + suffix).exists()]
+
+
+def _fingerprint(files):
+    """The files as the file system has them: inode, size and the times of change, to the nanosecond."""
+    out = []
+    for path in files:
+        try:
+            found = os.stat(path)
+            out.append((path.name, found.st_ino, found.st_size, found.st_mtime_ns, found.st_ctime_ns))
+        except FileNotFoundError:
+            out.append((path.name, None))
+    return out
+
+
+def holders(files):
+    """Whether any process holds any of `files` open, as lsof sees every process of this user:
+    `none`, `some`, or `unknown` when it cannot say."""
+    try:
+        answer = subprocess.run([shutil.which("lsof") or "/usr/sbin/lsof", "-w", "-F", "p", "--", *map(str, files)],
+                                capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if answer.returncode == 0 and re.search(r"^p\d+$", answer.stdout, re.M):
+        return "some"
+    if answer.returncode == 1 and not answer.stdout.strip() and not answer.stderr.strip():
+        return "none"
+    return "unknown"
+
+
+def _clone(source, target):
+    if subprocess.run(["/bin/cp", "-c", "-p", str(source), str(target)], capture_output=True).returncode != 0:
+        shutil.copy2(source, target)
+
+
+def snapshot(store, into, *, wait=SNAPSHOT_WAIT, pause=SNAPSHOT_PAUSE, held=holders, clock=time.monotonic, sleep=time.sleep):
+    """`store` and its side files cloned into `into` from one moment of them, without SQLite, or
+    anything else of ours, ever opening them: taken only when no process holds any of them open,
+    before and after, and they are the same file for file (inode, size, times) and the same set
+    after the clone as before. A write meanwhile changes the store or its side files, and the clone
+    is taken again. A WAL or a journal it came with is recovered in the clone, never beside the
+    store. Refused when the store is not still for `wait` seconds."""
+    deadline, tries, last = clock() + wait, 0, None
+    while True:
+        tries += 1
+        files = [store, *_side_files(store)]
+        before, first = _fingerprint(files), held(files)
+        if first == "none":
+            copies = [into / path.name for path in files]
+            for path, copy in zip(files, copies):
+                _clone(path, copy)
+            now = [store, *_side_files(store)]
+            second = held(now)
+            if second == "none" and _fingerprint(now) == before:
+                if len(copies) > 1:
+                    with sqlite3.connect(copies[0]) as conn:
+                        if conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                return {"how": "still-clone", "tries": tries, "side_files": [path.name[len(store.name):] for path in files[1:]]}
+            for copy in copies:
+                copy.unlink(missing_ok=True)
+            last = "held" if second == "some" else "unknown" if second == "unknown" else "changed"
+        else:
+            last = "held" if first == "some" else "unknown"
+        if clock() >= deadline:
+            raise Refused(f"The store was not still for a moment in {wait:g} seconds (last: {last}); nothing was read")
+        sleep(pause)
 
 
 def _root(sid):
@@ -1015,9 +1106,10 @@ def apply_quarantine(engine, plan):
 
 # --- the command -----------------------------------------------------------------------------
 
-def run(root, *, apply=False, steps=DEFAULT_STEPS):
-    from . import Engine
-
+def run(root, *, apply=False, steps=DEFAULT_STEPS, still=False, wait=SNAPSHOT_WAIT):
+    """The repair's report. `still`: a dry run of a clone of the store (`snapshot`) rather than of
+    the store, which is then never opened: nothing is written beside it, not even SQLite's side
+    files, and the clone goes when the run is done."""
     unknown = sorted(set(steps) - set(STEPS))
     if unknown:
         raise Refused(f"Unknown steps: {', '.join(unknown)}")
@@ -1026,9 +1118,27 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
         # A mistyped root would otherwise become a new, empty store, and the report would say
         # there was nothing to repair.
         raise Refused(f"No memory store at {store}")
+    if not still:
+        return _run(root, store, apply=apply, steps=steps)
+    if apply:
+        raise Refused("A snapshot is for a dry run: an apply repairs the store itself")
+    into = Path(tempfile.mkdtemp(prefix="kin-repair-snapshot-")).resolve()
+    try:
+        if into.is_relative_to(store.parent.resolve()):
+            raise Refused(f"The temporary directory {into} is inside the root")
+        taken = snapshot(store, into, wait=wait)
+        report = _run(root, into / store.name, steps=steps, beside=store.parent)
+        return {**report, "snapshot": taken}
+    finally:
+        shutil.rmtree(into, ignore_errors=True)
+
+
+def _run(root, store, *, apply=False, steps=DEFAULT_STEPS, beside=None):
+    from . import Engine
+
     # Only an apply builds the engine, and with it this release's structure; the dry run reads
-    # the store exactly as it is.
-    engine = Engine(store.parent) if apply else SimpleNamespace(db=ReadOnlyStore(store))
+    # the store exactly as it is -- or a clone of it, with the rest of the root where it lies.
+    engine = Engine(store.parent) if apply else SimpleNamespace(db=ReadOnlyStore(store, beside))
     report = {"command": COMMAND, "root": str(Path(root)), "applied": apply, "steps": {}}
     with engine.db.connect() as conn:
         origins = plan_origins(conn) if "origins" in steps else []
@@ -1116,9 +1226,13 @@ def main(argv=None):
     parser.add_argument("--steps", default=",".join(DEFAULT_STEPS),
                         help=f"comma-separated, from {', '.join(STEPS)}; default {','.join(DEFAULT_STEPS)}")
     parser.add_argument("--output", help="also write the report here (0600)")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="dry run a clone of the store taken while it is still, for a store in use: nothing is written beside it")
+    parser.add_argument("--wait", type=float, default=SNAPSHOT_WAIT,
+                        help=f"how long --snapshot waits for the store to be still, in seconds (default {SNAPSHOT_WAIT:g})")
     args = parser.parse_args(argv)
     try:
-        report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s))
+        report = run(args.root, apply=args.apply, steps=tuple(s for s in args.steps.split(",") if s), still=args.snapshot, wait=args.wait)
     except Refused as refusal:
         print(f"{COMMAND}: refused: {refusal}", file=sys.stderr)
         return 2
