@@ -426,10 +426,11 @@ def drop_deleted(conn, value, since=None, *, process=False):
     deleted comes back as it is (CR4-MM-02, CR5-MM-01, CL6E-MM-01). `since`: the `tombstone_mark`
     taken before `value` was read, when there is one -- a delete before it had already taken its
     words out of all `value` was read from, so only the deletes after it count (`tombstoned_since`,
-    CL6E-MM-02)."""
-    from eventmem.core.db import NAMED
+    CL6E-MM-02). What it names is read string by string (`named_in`), never from its JSON, where an
+    escaped line break stands right before an id as a letter and hides it (CL8-FLOW-03)."""
+    from eventmem.core.db import named_in
 
-    erased = tombstoned_since(conn, NAMED.findall(dumps(value)), since)
+    erased = tombstoned_since(conn, named_in(value), since)
     if not erased:
         return value
     return scrub_process(value, frozenset(erased)) if process else scrub(value, frozenset(erased))
@@ -462,10 +463,11 @@ def shown_ids(conn, value, since=None):
     entries marked for review. What it wrote is committed and kept only while none of them has
     been deleted, and a queue row names them, so a delete finds its words (CL6-MM-03). `since`: the
     `tombstone_mark` taken before `value` was read -- then what was deleted after it is named too
-    (`seen`), wherever in between the read and this the delete came (CL6E-MM-02)."""
-    from eventmem.core.db import NAMED
+    (`seen`), wherever in between the read and this the delete came (CL6E-MM-02). Read string by
+    string, as `drop_deleted` reads (CL8-FLOW-03)."""
+    from eventmem.core.db import named_in
 
-    ids = NAMED.findall(dumps(value))
+    ids = named_in(value)
     return sorted(held(conn, ids) if since is None else seen(conn, ids, since))
 
 
