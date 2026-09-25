@@ -53,8 +53,8 @@ export function channelContract(channel,overrides={}) {
  *     already seen is not documented (`duplicateResponse:'unknown'` above), so a 409 may
  *     mean this very message is already there;
  *   - an answer read whole whose `errcode` or `ret` is a platform error code, a whole
- *     number other than zero (`platformErrorCode`): iLink answers its own refusals -- an
- *     expired session, a stale context token -- with HTTP 200 and such a code.
+ *     number other than zero (`platformErrorCode`): iLink answers its own refusals with
+ *     HTTP 200 and such a code (-14, an expired session, is the one wechat-acp names).
  * Anything else leaves the outcome unknown, to be reconciled under the original client
  * ID: a 5xx (a proxy's or a gateway's included), any other status, a body that is not a
  * JSON object, a code that is not a whole number. `answered` refused nothing; the server
