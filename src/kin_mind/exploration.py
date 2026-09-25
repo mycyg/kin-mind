@@ -38,7 +38,7 @@ from urllib.parse import unquote, urlparse
 from pydantic import Field, field_validator
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.engine import DERIVED_CONFLICTS
+from eventmem.core.engine import DERIVED_CONFLICTS, root_id
 from eventmem.core.models import Model, SourceInput
 
 from . import liveness
@@ -46,6 +46,9 @@ from .memory import MemoryContinuity
 from .state import DesireChange
 
 EXECUTION_STATES = ("complete", "failed", "timed-out", "preempted")
+# What a run whose words were taken still shows of itself among the previous explorations: its
+# identity, state and time, and the wish it was for. Its report, while it stands, says the rest.
+KEPT_WHEN_ERASED = ("id", "state", "created_at", "desire_id")
 USAGE_STATUSES = ("not_dispatched", "reported", "unknown")
 
 
@@ -169,19 +172,41 @@ class Explorations:
             )
 
     def recent(self, limit=3):
+        """The latest runs, newest first, as the previous explorations are shown. A run whose words
+        were taken -- by what it names, or because it names nothing of what it was shown, as a run
+        from before this release (`erasure.UNNAMED`) -- shows its identity and state, and the
+        summary of its report while the report stands: a report goes with what it was written
+        from, so one still there may be shown. Without it, the run names no report either, so no
+        brief names a deleted one as shown (CL6D-MM-04)."""
         with self.engine.db.connect() as conn:
             return [
-                dict(
-                    json.loads(r["data"]),
-                    id=r["id"],
-                    state=r["state"],
-                    created_at=r["created_at"],
-                )
+                self._shown(conn, dict(json.loads(r["data"]), id=r["id"], state=r["state"], created_at=r["created_at"]))
                 for r in conn.execute(
                     "SELECT * FROM mind_explorations WHERE scope=? ORDER BY created_at DESC LIMIT ?",
                     (self.mind.scope.key(), limit),
-                )
+                ).fetchall()
             ]
+
+    def _shown(self, conn, run):
+        from .erasure import ERASED, UNNAMED_MARK
+
+        if not run.get(UNNAMED_MARK) and ERASED not in dumps(run):
+            return run
+        shown = {key: run[key] for key in KEPT_WHEN_ERASED if key in run}
+        sid = run.get("source_id")
+        found = conn.execute("SELECT blob FROM sources WHERE id=? AND deleted=0", (sid,)).fetchone() if isinstance(sid, str) else None
+        if not found:
+            return shown
+        shown["source_id"] = sid
+        root = conn.execute("SELECT data FROM records WHERE id=? AND deleted=0", (root_id(sid),)).fetchone()
+        try:
+            text = json.loads(root[0]).get("content") if root else (self.engine.db.blobs / found[0]).read_text()
+            summary = (json.loads(text).get("result") or {}).get("summary")
+        except (OSError, ValueError, AttributeError, TypeError):
+            summary = None
+        if isinstance(summary, str) and summary.strip() and summary != ERASED:
+            shown["result"] = {"summary": summary}
+        return shown
 
     def reclaim_dead(self):
         """Take back a running exploration whose worker is provably gone (the host timed it out or
