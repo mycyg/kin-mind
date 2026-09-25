@@ -103,7 +103,7 @@ export function readCarryover(stateFile) {
   const inputs=value.inputs.filter(entry=>typeof entry?.id==='string'&&/^[\w:.-]{1,200}$/.test(entry.id))
     .map(entry=>({id:entry.id,create:entry.create===true,...(Number.isFinite(entry.at)?{at:entry.at}:{})}));
   const freeze=typeof value.freeze?.reason==='string'&&value.freeze.reason.trim()&&Number.isFinite(value.freeze.until)
-    ?{reason:value.freeze.reason.trim().slice(0,200),at:Number.isFinite(value.freeze.at)?value.freeze.at:null,until:value.freeze.until}:null;
+    ?{reason:value.freeze.reason.trim().slice(0,200),at:Number.isFinite(value.freeze.at)?value.freeze.at:null,until:value.freeze.until,...(value.freeze.hold===true?{hold:true}:{})}:null;
   return {releaseId:typeof value.releaseId==='string'?value.releaseId.slice(0,120):null,inputs,freeze};
 }
 /** Hot state keeps what is unsettled plus a bounded recent tail; the rest moves to
@@ -318,12 +318,12 @@ export class MobileRouter {
     // the release renews it before it starts a host, so a long stop never lets a new
     // host dispatch before it is verified. It is taken up at every start: extended,
     // never shortened, never over another holder's freeze; the same hand-over is not
-    // taken up again once it has been lifted.
+    // taken up again once it has been lifted. A hold is taken up past its end too (CR3-FLOW-03).
     const handed=readCarryover(file)?.freeze,taken=this.state.freezeHandover;
-    if(handed&&handed.until>at&&!(taken?.reason===handed.reason&&taken.until===handed.until&&!this.frozen())){
+    if(handed&&(handed.until>at||handed.hold)&&!(taken?.reason===handed.reason&&taken.until===handed.until&&!this.frozen())){
       const current=this.frozen()?this.state.freeze:null;
       if(!current||current.reason===handed.reason){
-        this.state.freeze={...(current??{}),reason:handed.reason,at:current?.at??handed.at??at,until:Math.max(handed.until,current?.until??0),by:current?.by??'kin-deploy'};
+        this.state.freeze={...(current??{}),reason:handed.reason,at:current?.at??handed.at??at,until:Math.max(handed.until,current?.until??0),by:current?.by??'kin-deploy',...(handed.hold?{hold:true}:{})};
         this.state.freezeHandover={reason:handed.reason,until:handed.until};
       }
     }
@@ -535,21 +535,25 @@ export class MobileRouter {
   }
   frozen() {
     const freeze=this.state.freeze;
-    return Boolean(freeze&&!(Number.isFinite(freeze.until)&&freeze.until<=this.now()));
+    // KIN-FIX-20260924, CR3-FLOW-03: a deployment's hold (a first release waiting for a forward
+    // fix of a runtime that failed its proof) does not lift itself at `until`: past it the freeze
+    // is overdue and waits for an explicit thaw. Every other freeze keeps its TTL.
+    return Boolean(freeze&&(freeze.hold===true||!(Number.isFinite(freeze.until)&&freeze.until<=this.now())));
   }
   /** Stop new dispatch — both channels, the mind's turns, handoffs and mode changes
    * nobody forced — while in-flight work settles. The owner's literal stop and her
    * own mode commands still act. It survives a restart and lifts itself at `until`
    * (two hours unless asked otherwise), so a release or migration that is lost half
    * way can never leave the owner unanswered for good. Asking again for the same
-   * migration changes nothing, so a caller may poll it while it drains. */
+   * migration changes nothing, so a caller may poll it while it drains. A deployment's
+   * hold stays on a freeze that replaces it: only a thaw ends it (CR3-FLOW-03). */
   freezeDispatch(reason,{ttlMs=FREEZE_TTL_MS,migrationId=null,by=null}={}) {
     return this.locked(async()=>{
       if(typeof reason!=='string'||!reason.trim())throw Error('A freeze needs a reason');
       const current=this.frozen()?this.state.freeze:null,id=migrationId?String(migrationId).slice(0,120):null;
       if(current&&current.reason===reason.trim().slice(0,200)&&(current.migrationId??null)===id)return clone(current);
       const ttl=Math.min(Math.max(Number.isFinite(ttlMs)?ttlMs:FREEZE_TTL_MS,60000),12*3600000);
-      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{})};
+      this.state.freeze={reason:reason.trim().slice(0,200),at:current?.at??this.now(),until:this.now()+ttl,...(id?{migrationId:id}:{}),...(by?{by:String(by).slice(0,120)}:{}),...(current?.hold?{hold:true}:{})};
       this.save('dispatch-frozen',{reason:this.state.freeze.reason,until:this.state.freeze.until,...(id?{migrationId:id}:{})});
       return clone(this.state.freeze);
     });
