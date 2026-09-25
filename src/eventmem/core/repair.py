@@ -79,7 +79,11 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               plan of the same run: deletes that would take more are not made, and deletes that
               took more stop the run (CL6D-MM-02). Beside them, every derived source the store
               holds, by the same kinds (`store_by_kind`), so the share each deletion takes can be
-              read. It rewrites history rows, so it is named
+              read. The rows of a model's or an executor's own process that do not name what
+              they were shown -- every one a release before this one wrote -- lose their words to
+              any delete, and are counted by table among the layers as `unnamed:<table>`; a queue
+              row still to be judged also loses the proposal it kept, and is judged afresh
+              (CL6D-MM-04). It rewrites history rows, so it is named
               explicitly; run it after `lineage`, in the same run or a later one. What an earlier
               run already erased is left alone, and the history is queued only for identifiers
               it has neither finished nor still owes a pass for, so a second run changes nothing
@@ -860,7 +864,7 @@ def plan_reerase(conn, lineage=None, *, after_lineage=False):
             "store_by_kind": {**dict.fromkeys(KINDS, 0), **(lineage.get("totals") or {})}, "receipts": _receipts(conn, ids)}
     if not ids or not _table(conn, "mind_state"):
         return {**base, "layers": {}, "derived_rows": 0, "history_ids": 0, "history_rows": 0, "history_passes_owed": 0}
-    layers = erase(conn, *_split(ids), now(), write=False)
+    layers = erase(conn, *_split(ids), now(), write=False, stopped=True)
     waiting = ids - history_covered(conn)
     rows = len(mentions(conn, "mind_events", waiting, "rowid AS key")) if waiting and _table(conn, "mind_events") else 0
     return {**base, "layers": layers, "derived_rows": sum(layers.values()),
@@ -903,7 +907,7 @@ def apply_reerase(engine, cache=None, plan=None):
         _within(plan, {"records": taken[0], "sources": taken[1]}, "took")
     with engine.db.connect(write=True) as conn:
         ids = erased_ids(conn)
-        counts = erase(conn, *_split(ids), now(), again=True)
+        counts = erase(conn, *_split(ids), now(), again=True, stopped=True)
         receipts = _receipts(conn, ids, write=True)
         if counts:
             # As after a delete: an FTS5 delete leaves the words in the index's segments until
