@@ -70,7 +70,7 @@ def deletion_preview(engine, object_id):
         "source_count": len(sources),
         "record_ids": sorted(records)[:100],
         "source_ids": sorted(sources),
-        "effect": "Erase original sources and dependent records, revisions, indexes, caches, the mind's derived text and state history, and attachments. A derived summary is erased without the sources it cites. Existing external backups and history archives keep their copies; a history restore takes erased words out again.",
+        "effect": "Erase original sources and dependent records, revisions, indexes, caches, the mind's derived text and state history, and attachments. A source written from what is erased -- a reflection, an exploration report, a creation's event -- goes with it, and so does whatever cites that source. A summary or a note is erased without the sources it cites, and Kin's replies stay as the conversation record: deleting a message does not delete the answer to it. Existing external backups and history archives keep their copies; a history restore takes erased words out again.",
     }
 
 

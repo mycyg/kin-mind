@@ -161,6 +161,20 @@ def test_what_a_run_or_a_concern_wrote_goes_and_its_codes_and_ids_stay():
     assert erased["target"] == ERASED and erased["error_detail"] == concern["error_detail"], "an identity is no word"
 
 
+def test_a_role_the_model_wrote_goes_and_a_coded_role_stays():
+    """A graph edge's `role` is the model's own words; a message's `role` is a code. An erase
+    takes the first and keeps the second (CL6-MM-09)."""
+    from kin_mind.erasure import scrub
+
+    gone = "mem_" + "a" * 32
+    evidence = [{"source_id": "src_" + "a" * 32, "record_id": gone}]
+    edge = {"id": "edge-1", "relation": "participates", "evidence": evidence, "reason": "她提过", "role": f"{MARKER} 街的老住户"}
+    assert scrub(edge, frozenset({gone}))["role"] == ERASED
+    assert scrub({**edge, "role": "participant"}, frozenset({gone}))["role"] == "participant"
+    said = {"role": "user", "text": f"我住在 {MARKER} 街", "evidence": evidence}
+    assert scrub(said, frozenset({gone})) == {**said, "text": ERASED, "evidence": [{**evidence[0], "erased": True}]}
+
+
 def test_a_reflection_whose_source_is_deleted_after_the_commit_is_not_kept(setup, monkeypatch):
     """The appraisal commits its understanding; its source is deleted before the reflection is
     stored as a source of its own. The reflection is not kept, and nothing of the words is left

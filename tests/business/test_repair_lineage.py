@@ -376,3 +376,22 @@ def test_reerase_erases_what_rests_on_an_input_deleted_before_the_release_and_th
     assert set(again["lineage"].values()) == {0}, again["lineage"]
     assert (again["reerase"]["derived_sources"], again["reerase"]["receipts"], again["reerase"]["derived_rows"]) == (0, 0, 0)
 
+
+def test_one_run_reads_each_history_row_once_whichever_step_asks(tmp_path, monkeypatch):
+    """The dry run's plan, the lineage and the reerase of one run share what they read of the
+    history: a reflection's appraisal and a receipt's event are each looked up once (CL6-MM-09)."""
+    store = OldStore(tmp_path)
+    said = store.message("said", "我们聊到了那座桥")
+    for n in range(3):
+        store.reflection(f"reflect-{n}", [root_id(said)], "那座桥让我想了很久", about=[said])
+        store.receipt(f"appraise-{n}", [said], "想起那座桥")
+    looked = []
+    real = repair._history
+
+    def counted(conn, event_ids, cache):
+        looked.extend(event for event in dict.fromkeys(event_ids) if isinstance(event, str) and event not in cache)
+        return real(conn, event_ids, cache)
+
+    monkeypatch.setattr(repair, "_history", counted)
+    repair.run(store.engine.db.root, apply=True, steps=("lineage", "reerase"))
+    assert len(looked) == 6 and len(set(looked)) == 6, looked

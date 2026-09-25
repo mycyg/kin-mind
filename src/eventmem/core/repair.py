@@ -61,7 +61,7 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               replacement or a newer version of an input leaves the derived source as it is. An
               input already deleted is named, and `reerase` erases the derived source; an input
               the store never held, or holds in another scope, is left out and counted. Nothing
-              is erased here (CR5-MM-02).
+              is erased here (CR5-MM-02). What it reads of the history is read once per run.
 - `reerase`   Opt-in. Deletes made before this release left their words in the mind's derived
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). A derived source whose lineage
@@ -940,8 +940,10 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
     report = {"command": COMMAND, "root": str(Path(root)), "applied": apply, "steps": {}}
     with engine.db.connect() as conn:
         origins = plan_origins(conn) if "origins" in steps else []
-        # Found once for both steps that read it.
-        lineage = _lineage(conn) if {"lineage", "reerase"} & set(steps) else None
+        # Found once for both steps that read it; what is read of the history is kept for the
+        # applies (CL6-MM-09).
+        cache = {}
+        lineage = _lineage(conn, cache) if {"lineage", "reerase"} & set(steps) else None
         plans = {
             "origins": {"sources": len(origins),
                         "by_namespace": _count(origins, "namespace"), "by_origin": _count(origins, "origin")}
@@ -979,9 +981,9 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
             elif step == "evidence":
                 entry["done"] = apply_evidence(engine, plan)
             elif step == "lineage":
-                entry["done"] = apply_lineage(engine)
+                entry["done"] = apply_lineage(engine, cache)
             elif step == "reerase":
-                entry["done"] = apply_reerase(engine)
+                entry["done"] = apply_reerase(engine, cache)
             elif step == "quarantine":
                 entry["done"] = apply_quarantine(engine, plan)
         report["steps"][step] = entry

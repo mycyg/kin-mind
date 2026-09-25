@@ -67,6 +67,8 @@ def test_deleting_a_message_takes_the_note_that_cites_it_and_leaves_the_derived_
     assert ({rid for rid in records if rid.startswith("mem_")}, sources) == ({root_id(said), note}, {said})
     preview = deletion_preview(store.engine, said)
     assert (preview["record_count"], preview["source_ids"]) == (2, [said])
+    # What the console says a delete does (CL6-MM-09).
+    assert "a creation's event -- goes with it" in preview["effect"] and "does not delete the answer to it" in preview["effect"]
     store.engine.delete(said)
     settle(store.engine)
     assert store.status(note) is None

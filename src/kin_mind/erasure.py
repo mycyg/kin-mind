@@ -58,9 +58,11 @@ TEXT_MAPS = frozenset({"traits"})
 # `action` is an enum in every command and free text in an owner request: only the second goes.
 ENUM = re.compile(r"[a-z][a-z0-9_:-]{0,39}")
 # Keys that hold either a code or an identifier, or words: a concern's `target`, a conflict's; a
-# creation's `verification_gaps`, host codes beside the reviewer's own gaps. The words go.
+# creation's `verification_gaps`, host codes beside the reviewer's own gaps; a graph edge's `role`,
+# which the model writes in its own words where a message's `role` is `user` (CL6-MM-09). The
+# words go.
 CODE = re.compile(r"[a-z][a-z0-9_:.-]{0,79}")
-CODED_TEXT = frozenset({"target"})
+CODED_TEXT = frozenset({"target", "role"})
 CODED_LISTS = frozenset({"verification_gaps"})
 # `evaluated_sources` is everything an appraisal's model, or an executor's brief, was shown, recall-only
 # sources included: a queue row or a run that names one of them erased loses every word the model or
