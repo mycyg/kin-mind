@@ -113,7 +113,11 @@ minute, decides from evidence alone:
   and the thread the answer read is the one it was submitted to. Any other answer —
   a bare `not-found` from an older runtime, an input with no recorded submission, a
   thread a migration replaced — leaves it `unknown`: looked up again, told as
-  `unknown`, never submitted again.
+  `unknown`, never submitted again. Until it is found or told, it holds the session's
+  boundary: native maintenance waits, and so do the mind's own contacts. One the
+  owner's stop has settled holds it no more, since the stop is its outcome, whether
+  it was stopped live or came back canceled from the journal; its submission stays on
+  record, and a native turn, a tool or a send of it still counts on its own.
 - An accepted input with no reply, no running turn and no progress for
   `inputStuckMinutes` while the session is idle is told as `partial` when part of its
   reply reached the platform, and as `unknown` otherwise.

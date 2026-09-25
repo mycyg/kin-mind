@@ -9,6 +9,7 @@ import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 import {MobileAudit} from '../../adapters/mobile-audit.mjs';
 import {createMobileReviewer} from '../../adapters/mobile-reviewer.mjs';
 import {createLeaseClient} from '../../adapters/model-lease.mjs';
+import {safeBoundary} from '../../adapters/session-policy.mjs';
 
 const MINUTE=60000,HOUR=3600000;
 function fixture(t,options={}) {
@@ -863,4 +864,30 @@ test('a classification asked again holds its activity until the model call has e
   assert.equal(leaseCalls.at(-1),'release');
   assert.deepEqual([requests,usage.at(-1).outcome],[['fail','slow'],'caller-deadline'],'the canceled request is accounted to the caller\'s deadline');
   assert.deepEqual([f.router.state.semanticPending.q.attempts,f.router.state.semanticPending.q.lastFailure.class],[3,'timeout']);
+});
+
+test('an unknown submission the owner\'s stop settled holds the session no more, before or after a restore from the journal; its unknown evidence stays (CR4-FLOW-04)',async t=>{
+  const f=fixture(t);
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  await assert.rejects(f.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  const boundary=router=>safeBoundary({runtime:{...f.runtime},inputs:Object.values(router.state.inputs),tasks:router.tasks()});
+  const w=()=>f.router.state.inputs.w;
+  // Before the stop: its outcome is unknown, and it holds the session.
+  assert.deepEqual([w().state,holdsSession(w()),inputSummary(w()),boundary(f.router)],
+    ['unconfirmed',true,'submitted',{safe:false,reason:'input-awaiting-dispatch-or-reconciliation'}]);
+  // The owner stops the work; nothing of it runs.
+  await f.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=> 'new-turn');
+  assert.deepEqual([w().state,w().canceledBy,holdsSession(w()),inputSummary(w()),boundary(f.router)],['unconfirmed','stop',false,'canceled-by-owner',{safe:true}]);
+  assert.deepEqual([w().submit.sessionId,typeof w().submit.at,w().reconciliation],['synthetic','number',undefined],'its unknown submission stays on record as it was');
+  // What still runs holds the boundary through its own checks.
+  assert.deepEqual(safeBoundary({runtime:{...f.runtime,active:true},inputs:[w()]}),{safe:false,reason:'native-or-delivery-busy'});
+  assert.deepEqual(safeBoundary({runtime:{...f.runtime},inputs:[w()],tasks:[{tools:{t1:{status:'in_progress'}}}]}),{safe:false,reason:'unfinished-tool'});
+  // Restored from the journal alone, it holds nothing either, and is not looked up.
+  fs.writeFileSync(f.args.file,'{broken');fs.writeFileSync(f.args.file+'.prev','{broken');
+  const router=new MobileRouter(f.args);
+  const restored=router.state.inputs.w;
+  assert.deepEqual([restored.state,restored.canceledBy,restored.cancelScope,restored.submit.sessionId,holdsSession(restored),inputSummary(restored)],
+    ['unconfirmed','stop','native-session','synthetic',false,'canceled-by-owner']);
+  await router.watch({reconcileInput:async id=>{assert.equal(id,'stop','nothing she stopped is looked up');return {state:'found'};}});
+  assert.deepEqual(boundary(router),{safe:true});
 });
