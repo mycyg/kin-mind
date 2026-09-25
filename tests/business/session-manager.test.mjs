@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {SessionManager,commitRegistryMigration} from '../../adapters/session-manager.mjs';
+import {SessionManager,commitRegistryMigration,MAINTENANCE_ACTIVITY} from '../../adapters/session-manager.mjs';
+import {MobileRouter,ACTIVITY_KINDS} from '../../adapters/mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility} from '../../adapters/session-policy.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from '../../adapters/native-window.mjs';
 import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateCatalogFile,candidateConfigForRuntime,startMobileSessions,sessionReviewCursors} from '../../adapters/mobile-session-host.mjs';
@@ -610,3 +611,124 @@ test('each review attempt is its own job in the mind, and only the job the mind 
  assert.deepEqual([event.state,event.answer.requestId],['answered',id(2)],'the judgment names the attempt it answers');
 });
 
+// CL6-FLOW-02: session maintenance under the router's freeze. The router is the one the host runs,
+// as the manager's coordinator; no model is called.
+function withRouter(f) {
+ const router=new MobileRouter({file:path.join(f.dir,'router.json'),sessionId:'old',inspect:async()=>({...f.runtime}),now:()=>f.clock.now,
+  classify:async()=>({route:'chat',reason:'synthetic'}),switchModel:async()=>{throw Error('no switch in this test');},waitForIdle:async()=>{throw Error('waiting');}});
+ f.manager.coordinator=f.options.coordinator=router;
+ return router;
+}
+const until=async(check,what)=>{for(let i=0;i<400&&!check();i++)await new Promise(resolve=>setTimeout(resolve,5));assert.ok(check(),what);};
+const inFlight=router=>router.activityList().map(activity=>[activity.kind,activity.id.split(':')[0]]);
+const FREEZES=[['release',router=>router.freezeDispatch('kin-deploy release-1'),router=>router.thawDispatch('released')],
+ ['migration',router=>router.freezeDispatch('kin-home-migration',{migrationId:'m-1'}),router=>router.thawDispatch('kin-home-migration',{migrationId:'m-1'})],
+ ['hold',router=>router.freezeDispatch('kin-deploy release-2',{hold:true}),router=>router.thawDispatch('released')]];
+
+test('a compaction the judgment asks for starts under no freeze -- a release\'s, a migration\'s or a hold -- and runs after the thaw (CL6-FLOW-02)',async t=>{
+ assert.ok(ACTIVITY_KINDS.includes(MAINTENANCE_ACTIVITY));
+ for(const [kind,freeze,thaw] of FREEZES) {
+  const f=fixture(t),router=withRouter(f),built=[];
+  const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{built.push('checkpoint');return build(...args);};
+  await f.advise('compact');
+  await freeze(router);
+  // A hold does not lift itself at its end; the others are still within theirs.
+  for(let i=0;i<3;i++){minutes(f,kind==='hold'?90:1);assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'},kind);}
+  assert.deepEqual([built,f.calls.filter(c=>c==='compact'),inFlight(router)],[[],[],[]],kind+': no checkpoint, no compaction, nothing counted');
+  assert.equal(f.manager.state.sessionAdvice.action,'compact',kind+': the judgment stands');
+  await thaw(router);
+  assert.equal((await f.manager.tick()).state,'complete',kind+': carried out after the thaw');
+  assert.deepEqual([built.length,f.calls.filter(c=>c==='compact').length,inFlight(router)],[1,1,[]],kind);
+ }
+});
+
+test('a freeze that comes while a compaction\'s checkpoint is built lets the build finish, counted for the drain, and holds the compaction (CL6-FLOW-02)',async t=>{
+ const f=fixture(t),router=withRouter(f);let finish;const building=new Promise(resolve=>{finish=resolve;});
+ const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{await building;return build(...args);};
+ await f.advise('compact');
+ const ticking=f.manager.tick();
+ await until(()=>inFlight(router).length>0,'the compaction has started');
+ await router.freezeDispatch('kin-home-migration',{migrationId:'m-1'});
+ assert.deepEqual(inFlight(router),[[MAINTENANCE_ACTIVITY,'compaction']],'the drain counts the checkpoint being built');
+ assert.equal(router.busy(f.runtime),false,'and it does not hold her conversation');
+ finish();
+ assert.deepEqual(await ticking,{state:'waiting',reason:'dispatch-frozen'});
+ assert.deepEqual([f.calls.filter(c=>c==='compact'),inFlight(router),f.manager.state.compactions],[[],[],[]],'no compaction was started');
+ await router.thawDispatch('kin-home-migration',{migrationId:'m-1'});
+ assert.equal((await f.manager.tick()).state,'complete');
+ assert.equal(f.calls.filter(c=>c==='compact').length,1);
+});
+
+test('a handover the judgment asks for opens no candidate under a freeze, and goes on after the thaw (CL6-FLOW-02)',async t=>{
+ const f=fixture(t),router=withRouter(f),started=[];
+ await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+ f.context.cursors.input++;// the handover builds a checkpoint of its own
+ for(const [name,key] of [['checkpoint','checkpoint'],['create','createCandidate'],['inject','injectCandidate'],['verify','verifyCandidate']]){const fn=f.manager[key];f.manager[key]=async(...args)=>{started.push(name);return fn(...args);};}
+ await router.freezeDispatch('kin-deploy release-1',{hold:true});
+ minutes(f,180);
+ assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'});
+ assert.deepEqual([started,f.manager.state.candidate??null,f.manager.fence().generation,inFlight(router)],[[],null,1,[]],
+  'no checkpoint and no candidate: nothing was built, created, injected or checked');
+ assert.equal(f.manager.state.sessionAdvice.action,'rotate','the judgment stands');
+ await router.thawDispatch('released');
+ assert.equal((await f.manager.tick()).state,'complete');
+ assert.deepEqual([started,f.calls.filter(c=>c==='promote').length,f.manager.fence().generation],[['checkpoint','create','inject','verify'],1,2]);
+});
+
+test('a freeze that comes during any step of a candidate lets that step finish, counted for the drain, and starts no other; after the thaw it goes on and is promoted (CL6-FLOW-02)',async t=>{
+ for(const [step,reached] of [['checkpoint',null],['create','created'],['inject','injected'],['verify','ready']]) {
+  const f=fixture(t),router=withRouter(f);
+  await f.advise('compact');await f.manager.tick();f.degraded();await f.advise('rotate',['failure']);
+  f.context.cursors.input++;// the handover builds a checkpoint of its own
+  const started=[];let resume;const running=new Promise(resolve=>{resume=resolve;});
+  const hook=(name,fn)=>async(...args)=>{started.push(name);if(name===step)await running;return fn(...args);};
+  for(const [name,key] of [['checkpoint','checkpoint'],['create','createCandidate'],['inject','injectCandidate'],['verify','verifyCandidate']])f.manager[key]=hook(name,f.manager[key]);
+  const ticking=f.manager.tick();
+  await until(()=>started.includes(step),step+' has started');
+  await router.freezeDispatch('kin-home-migration',{migrationId:'m-1'});
+  assert.deepEqual(inFlight(router),[[MAINTENANCE_ACTIVITY,'rotation']],step+': the drain counts the candidate while the step runs');
+  assert.equal(router.busy(f.runtime),false,step+': it runs in its own app-server and holds nothing of her conversation');
+  resume();
+  assert.deepEqual(await ticking,{state:'waiting',reason:'dispatch-frozen'},step);
+  assert.deepEqual([started.at(-1),f.manager.state.candidate?.state??null,inFlight(router),f.calls.includes('promote'),f.manager.fence().generation],[step,reached,[],false,1],
+   step+': it finished, no step after it started, and the binding a migration read is the binding');
+  const steps=started.length;minutes(f,1);
+  assert.deepEqual(await f.manager.tick(),{state:'waiting',reason:'dispatch-frozen'},step);
+  assert.equal(started.length,steps,step+': frozen, the next minute starts nothing');
+  await router.thawDispatch('kin-home-migration',{migrationId:'m-1'});
+  assert.equal((await f.manager.tick()).state,'complete',step+': after the thaw it goes on from the state it reached');
+  assert.deepEqual([f.manager.fence().generation,f.calls.filter(c=>c==='create').length,f.calls.filter(c=>c==='promote').length,inFlight(router)],[2,1,1,[]],step);
+ }
+});
+
+test('under a freeze the minute tick prepares no checkpoint -- neither the rolling one nor the recovery one -- and after the thaw it does (CL6-FLOW-02)',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-session-freeze-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ fs.mkdirSync(path.join(root,'conversation'),{recursive:true});fs.mkdirSync(path.join(root,'state'),{recursive:true});
+ fs.writeFileSync(path.join(root,'conversation/AGENTS.md'),'Synthetic persona\n');
+ const runtime={known:true,threadId:'main',sessionId:'main',nativeSessionId:'main',nativeStatus:'idle',active:false,backgroundTasks:0,model:'deepseek-flash',modelProvider:'custom-gateway',
+  providerOverride:true,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',modelContextWindow:100000,lastTokenUsage:{inputTokens:20000}};
+ const router=new MobileRouter({file:path.join(root,'state/mobile-router.json'),sessionId:'main',inspect:async()=>({...runtime}),
+  classify:async()=>({route:'chat',reason:'synthetic'}),switchModel:async()=>{throw Error('no switch in this test');},waitForIdle:async()=>{throw Error('waiting');}});
+ await router.freezeDispatch('kin-deploy release-1');
+ const built=[],status=[];
+ const mindCall=async(action,request)=>{
+  if(action==='session-snapshot')return {configVersion:'persona-v1',cursors:{public:'p'},items:[],invalidatedSources:[],sourceRevisions:{},scope:{},shared:{},manifestVersion:'continuity-manifest-v1'};
+  if(action==='session-checkpoint'){built.push(request.shadow?'rolling':request.allow_model===false?'model-free':'recovery');return {id:'cp:'+built.length,complete:true,tokens:100};}
+  if(action==='session-review')return {id:'job:'+request.id,state:'pending',requestId:request.id,snapshotId:request.snapshotId};
+  throw Error('unexpected mind call '+action);};
+ const bridge={ownerId:'owner',sessionManager:{getSession:()=>({processing:false,queue:[]})},
+  mobileRouting:{router,gateway:{token:'synthetic'},inspect:async()=>({...runtime}),ensureSession:async()=>({agentInfo:{connection:{extMethod:async()=>({})}}})}};
+ const config={adaptive_sessions:true,companion_instructions:{enabled:false},session_management:{observe:true,compact:true,prepare:false,rotate:false}};
+ const api=await startMobileSessions({bridge,root,config,mindCall,recordStatus:value=>{if(value.sessionManagement)status.push(value.sessionManagement);}});
+ t.after(()=>api.close());
+ await until(()=>status.length>0,'the first tick has run');
+ // What a native compaction leaves for the next minute: a recovery checkpoint to prepare.
+ Object.assign(api.manager.state,{restoreRequired:true,restorePending:false});
+ await api.tick();
+ assert.deepEqual([built,inFlight(router)],[[],[]],'frozen: no checkpoint was built, and nothing is counted');
+ assert.deepEqual([api.manager.state.rollingCheckpoint??null,api.manager.state.restorePending],[null,false]);
+ await router.thawDispatch('released');
+ await api.tick();
+ assert.deepEqual(built.sort(),['recovery','rolling'],'after the thaw the first tick prepares both');
+ assert.deepEqual([api.manager.state.restorePending,Boolean(api.manager.state.rollingCheckpoint),inFlight(router)],[true,true,[]]);
+});

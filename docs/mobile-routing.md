@@ -148,8 +148,10 @@ ID. A batch's members follow its first input.
 A release or migration freezes dispatch through the host's authenticated loopback
 control endpoint. `POST /freeze` with a `reason` and an optional `migrationId` and
 `ttlMs` stops new dispatch — both channels' inboxes, the mind's own turns (which
-check `router.frozen()`), handoff continuations and mode changes nobody forced —
-while the owner's literal stop and her `/mode work` and `/mode auto` still act. The
+check `router.frozen()`), handoff continuations, mode changes nobody forced and new
+session maintenance (a checkpoint, a compaction, a rotation candidate or its promotion,
+each carried out after the thaw) — while the owner's literal stop and her `/mode work`
+and `/mode auto` still act. The
 freeze survives a restart and lifts itself after `ttlMs`, two hours by default and
 between one minute and twelve hours, so a release lost half way cannot leave the
 owner unanswered for good. Asking again with the same reason and migration ID changes
@@ -161,7 +163,10 @@ moving through the host, a native turn or an unreadable native runtime, a send, 
 native command or a switch hold it, and so do the host's own background model calls —
 a summary of open work, a health reading, a classification asked again — until the
 call has ended and let go of its lane; a freeze refuses a new one before anything is
-counted for it, and none of them holds the owner's conversation. A classification's
+counted for it, and none of them holds the owner's conversation. Session maintenance
+(`session-maintenance`) is counted the same way: a compaction from its checkpoint to
+its end, and a rotation candidate, in an app-server of its own, from its creation to
+its promotion or abandonment (CL6-FLOW-02). A classification's
 deadline covers the lane's admission as well as the request: once it passes, the
 request is canceled, a lease that comes late starts nothing, and the classification
 answers only after the call has let go of everything it held. Open work, a desktop

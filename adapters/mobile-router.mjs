@@ -20,10 +20,11 @@ export const DEFER_MAX_MS=30*24*3600000;
 export const HANDOFF_SOURCE_MAX_HOURS=24;
 /** What starts beside the owner's conversation and must stop for a freeze and be waited
  * for by a drain: sends (a reply, a system notice, a reminder, a desktop hand-off result,
- * a proactive contact), the mind's own runs and the host's own background model calls.
- * Other kinds are accepted as named (CR-LIFE-08, CR-MIND-01, CR2-INT-01, CR2-MIND-01, CR3-FLOW-01). */
+ * a proactive contact), the mind's own runs, the host's own background model calls and its
+ * session maintenance. Other kinds are accepted as named (CR-LIFE-08, CR-MIND-01, CR2-INT-01,
+ * CR2-MIND-01, CR3-FLOW-01, CL6-FLOW-02). */
 export const ACTIVITY_KINDS=Object.freeze(['reply','notice','reminder','handoff','contact','assessment','contact-draft','creation','exploration',
-  'appraisal','enrichment','memory-prep','work-summary','health-review','classification-retry']);
+  'appraisal','enrichment','memory-prep','work-summary','health-review','classification-retry','session-maintenance']);
 /** The mind orders its own runs itself; a run in its own process never holds the owner's dispatch. */
 const MIND_ACTIVITIES=new Set(['assessment','contact-draft','creation','exploration']);
 const DETACHED_ACTIVITIES=new Set(['creation','exploration']);
@@ -34,8 +35,10 @@ const STORE_ACTIVITIES=new Set(['appraisal','enrichment','memory-prep']);
 /** The host's own background model calls, each a request of its own and never a turn in the
  * session: a summary of open work, a health reading, a classification asked again. Like the
  * store work, a freeze refuses one and a drain waits for it until the call has ended, and it
- * holds no turn, no switch and no dispatch (CR3-FLOW-01). */
-const REVIEW_ACTIVITIES=new Set(['work-summary','health-review','classification-retry']);
+ * holds no turn, no switch and no dispatch (CR3-FLOW-01). So does session maintenance: a
+ * checkpoint, and a rotation candidate in an app-server of its own; a compaction holds the
+ * session through the coordinator and the native runtime, not through this (CL6-FLOW-02). */
+const REVIEW_ACTIVITIES=new Set(['work-summary','health-review','classification-retry','session-maintenance']);
 /** A notice round that used its attempts rests this long before its identity is tried
  * or looked up again; it is never given up (CR-LIFE-05). */
 export const NOTICE_ROUND_REST_MS=Object.freeze([30*60000,2*3600000,6*3600000]);
