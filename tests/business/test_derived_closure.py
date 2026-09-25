@@ -7,6 +7,8 @@ it goes when any of its evidence goes, and it takes nothing it cites with it. An
 unverified, like any other generated record, when an input of it is corrected."""
 import json
 
+import pytest
+
 from eventmem.core import Engine, repair
 from eventmem.core.db import digest
 from eventmem.core.maintenance import deletion_preview, erase_set
@@ -116,6 +118,8 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     creation = store.creation("make-1", [made_from], "做好的钟")
     reflection = store.reflection("reflect-1", [root_id(thought_of)], "想了想")
     on_doomed = store.reflection("reflect-2", [root_id(doomed)], "那份报告让我想了很久")
+    # An appraisal about a batch that held the deleted message: what its understanding cites stands.
+    by_target = store.reflection("reflect-3", [root_id(thought_of)], "又想起那天", about=[doomed_input])
 
     def note(key, cites):
         rid = "mem_" + digest(["note", key])[:32]
@@ -139,16 +143,21 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     assert store.engine.source(doomed)["status"] == "received"
     root = store.engine.db.root
     # The dry run says how much the only deleting step will take, as it will be once `lineage` has
-    # run before it: the report, the reflection written from it, the notes that cite either
-    # (CL6-MM-02). A release's expect holds these, so a closure that grew would stop it.
+    # run before it: the report, the reflection written from it, the notes that cite either, and
+    # the reflection whose appraisal was about the deleted message (CL6-MM-02). A release's expect
+    # holds these, so a closure that grew would stop it. By kind too (CL6D-MM-02).
     dry = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]["reerase"]["plan"]
     assert {key: dry[key] for key in ("derived_sources", "derived_in_closure", "records", "sources")} == {
-        "derived_sources": 1, "derived_in_closure": 1, "records": 7, "sources": 2}
+        "derived_sources": 2, "derived_in_closure": 1, "records": 8, "sources": 3}
+    nothing = dict.fromkeys(repair.KINDS, 0)
+    assert dry["derived_by_kind"] == {**nothing, "reports": 1, "reflections": 1} and dry["reflections_by_target"] == 1
+    assert dry["closure_by_kind"] == {**nothing, "reflections": 1}
+    assert dry["records_by_kind"] == {"own": 3, "notes": 5}, "three sources' own records, five notes citing them"
     alone = repair.run(root, apply=False, steps=("reerase",))["steps"]["reerase"]["plan"]
-    assert (alone["records"], alone["sources"], alone["derived_in_closure"]) == (5, 1, 0), "without lineage first, as it is now"
+    assert (alone["records"], alone["sources"], alone["derived_in_closure"]) == (6, 2, 0), "without lineage first, as it is now"
     applied = repair.run(root, apply=True, steps=("lineage", "reerase"))["steps"]
-    assert applied["reerase"]["done"]["derived_sources"] == 1
-    assert (applied["reerase"]["done"]["records"], applied["reerase"]["done"]["sources"]) == (7, 2), "what the plan said"
+    assert applied["reerase"]["done"]["derived_sources"] == 2
+    assert (applied["reerase"]["done"]["records"], applied["reerase"]["done"]["sources"]) == (8, 3), "what the plan said"
     settle(store.engine)
     with store.engine.db.connect() as conn:
         sources = {row[0] for row in conn.execute("SELECT id FROM sources")}
@@ -156,13 +165,59 @@ def test_the_repair_on_a_store_whose_notes_cite_reports_and_creations_erases_onl
     erased = {"doomed+message", "doomed-only", "doomed+creation", "doomed+report+creation", "reflection-on-doomed"}
     assert {name for name, rid in notes.items() if rid not in records} == erased
     assert doomed not in sources and on_doomed not in sources, "the report and the reflection written from it go"
+    assert by_target not in sources, "and the reflection written about the deleted message"
     assert {kept_report, creation, reflection, other_input, made_from, thought_of, later, again} <= sources
     assert {root_id(sid) for sid in (kept_report, creation, reflection, later, again)} <= records
     # A second run finds nothing left.
     report = repair.run(root, apply=False, steps=("lineage", "reerase"))["steps"]
     assert set(report["lineage"]["plan"].values()) == {0}
-    assert [report["reerase"]["plan"][key] for key in ("derived_sources", "derived_in_closure", "records", "sources")] == [0, 0, 0, 0]
+    assert [report["reerase"]["plan"][key] for key in ("derived_sources", "derived_in_closure", "records", "sources",
+                                                        "reflections_by_target")] == [0, 0, 0, 0, 0]
+    assert set(report["reerase"]["plan"]["derived_by_kind"].values()) == set(report["reerase"]["plan"]["records_by_kind"].values()) == {0}
     with store.engine.db.connect() as conn:
         derived = {row[0]: json.loads(row[1])["derived_from"] for row in conn.execute(
             "SELECT id,data FROM sources WHERE json_extract(data,'$.derived_from') IS NOT NULL")}
     assert set(derived) == {kept_report, creation, reflection}
+
+
+def doomed_store(tmp_path):
+    """A report written, before the release, from a message the owner has deleted since, with a
+    note that cites the report."""
+    store = OldStore(tmp_path)
+    said = store.message("m1", "消息 m1")
+    doomed = store.report("explore_1", [root_id(said)], "第一份报告")
+    rid = "mem_" + digest(["note", "n1"])[:32]
+    store.engine.add_record(RecordInput(id=rid, kind="knowledge", title="n1", content="笔记", scope=store.scope, source_ids=[doomed],
+                                        evidence_ids=[root_id(doomed)], generated=True, confirmation="inferred"), "note:n1")
+    store.engine.delete(said)
+    settle(store.engine)
+    return store, doomed
+
+
+def test_the_apply_deletes_nothing_its_own_dry_run_did_not_count(tmp_path, monkeypatch):
+    """The apply holds itself to the plan of the same run (CL6D-MM-02): a closure larger than the
+    plan -- here a plan that counted less -- and nothing is deleted; deletes that turned out larger
+    than the plan stop the run once they are made."""
+    store, doomed = doomed_store(tmp_path)
+    plan = repair.run(store.engine.db.root, apply=False, steps=("lineage", "reerase"))["steps"]["reerase"]["plan"]
+    assert (plan["derived_sources"], plan["records"], plan["sources"]) == (1, 2, 1)
+    repair.run(store.engine.db.root, apply=True, steps=("lineage",))
+    with pytest.raises(repair.Exceeded, match="would take more than its plan said: records 2 > 1"):
+        repair.apply_reerase(store.engine, plan={**plan, "records": 1})
+    assert store.engine.source(doomed)["status"] == "received", "nothing was deleted"
+    # A closure that says the deletes take nothing lets them through; what they took stops the run.
+    monkeypatch.setattr(repair, "_closure", lambda conn, doomed, pending=None: (set(), set(), set()))
+    with pytest.raises(repair.Exceeded, match="took more than its plan said: records 2 > 0, sources 1 > 0"):
+        repair.apply_reerase(store.engine, plan={**plan, "records": 0, "sources": 0})
+
+
+def test_a_run_that_would_delete_more_than_its_dry_run_stops_with_one_line(tmp_path, monkeypatch, capsys):
+    """Through the command: the apply's own plan counts less than its deletes would take (as if the
+    store had moved under it), the run stops before deleting, exits 1 and says so in one line."""
+    store, doomed = doomed_store(tmp_path)
+    real = repair.plan_reerase
+    monkeypatch.setattr(repair, "plan_reerase", lambda *args, **kwargs: {**real(*args, **kwargs), "records": 1})
+    code = repair.main(["--root", str(store.engine.db.root), "--apply", "--steps", "lineage,reerase"])
+    assert code == 1
+    assert capsys.readouterr().err.strip() == "repair-20260924: stopped: reerase would take more than its plan said: records 2 > 1"
+    assert store.engine.source(doomed)["status"] == "received"
