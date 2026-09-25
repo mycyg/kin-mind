@@ -62,10 +62,11 @@ function reviewFailure(verdict={},fallback={}) {
  * before it, and once it has begun the rules between two contacts no longer hold its remainder. */
 const within=batch=>({contact:batch.id,started:batch.deliveryStarted===true||batch.items.some(item=>BEGUN.includes(item.state))});
 /** The journal freezes content and IDs before sending. Unknown sends only reconcile. `eligible` and
- * `guard` are asked with `within(batch)`. */
+ * `guard` are asked with `within(batch)`; `begin({id, channel})` is told once, when the group's first
+ * send has been admitted and before it begins. */
 export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,
   preflight=async request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))}),
-  verifyFile=async()=>{throw Error('File delivery is not configured');},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
+  verifyFile=async()=>{throw Error('File delivery is not configured');},begin=async()=>{},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
   const active=new Map();
   const digest=value=>createHash('sha256').update(value).digest('hex');
   // Proactive contact leaves through the Feishu bridge; a channel with no
@@ -241,6 +242,11 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
         if(!activity.ok)return heldAtGate(batch,id,item,activity.reason);
         try {
           if(batch.heldAtGate){delete batch.heldAtGate;delete batch.reason;}
+          // The contact begins where its first send is admitted, and only there: `begin` is told once,
+          // before that bubble is marked begun. Every exit before it (the rules or the guard refusing,
+          // a freeze, a hold at the gate, a supersession, a review sending it back) began nothing
+          // (CR3-FLOW-05).
+          if(!batch.deliveryStarted)await begin({id:batch.id,channel:batch.channel});
           item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
           try {
             const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,

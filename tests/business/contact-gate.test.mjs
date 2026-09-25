@@ -65,3 +65,23 @@ test('the batch asks its rules and its guard about itself: its ID, and whether a
   assert.deepEqual(asked,[['rules',fresh],['guard',fresh],['rules',fresh],['guard',fresh],['rules',begun],['guard',begun]],
     'before the review, before the first bubble, and before the second, once the first has begun');
 });
+
+test('the batch says a contact begins once, where its first send is admitted, and never on an exit before it (CR3-FLOW-05)',async t=>{
+  const began=[];let allow=false;
+  const w=world(t,accepted);
+  const batch=createContactBatch({read:id=>structuredClone(w.journal.get(id)),write:(id,value)=>w.journal.set(id,structuredClone(value)),
+    send:async request=>accepted(request),begin:contact=>{began.push(contact);}});
+  // The guard refuses the first bubble; then the gate holds it; then it is superseded: nothing began.
+  assert.equal((await batch({id:'c-guard',bubbles:['一','二'],channel:'feishu',gate:w.gate,guard:()=>allow})).state,'pending');
+  await w.router.freezeDispatch('release');allow=true;
+  assert.equal((await batch({id:'c-guard',gate:w.gate,guard:()=>allow})).reason,'dispatch-frozen');
+  await w.router.thawDispatch('done');
+  assert.deepEqual(began,[]);
+  // Admitted, it begins once, however many bubbles follow and however often it is taken up again.
+  assert.equal((await batch({id:'c-guard',gate:w.gate,guard:()=>allow})).state,'accepted');
+  assert.equal((await batch({id:'c-guard',gate:w.gate})).state,'accepted');
+  assert.deepEqual(began,[{id:'c-guard',channel:'feishu'}]);
+  assert.equal((await batch({id:'c-superseded',bubbles:['三'],channel:'feishu',gate:w.gate,guard:()=>false})).state,'pending');
+  assert.equal((await batch({id:'c-superseded',superseded:true,gate:w.gate})).state,'canceled');
+  assert.equal(began.length,1);
+});
