@@ -32,6 +32,7 @@ from mcp.server.fastmcp import Context
 
 from eventmem.core.models import now
 
+from . import worker_groups
 from .computer import redact, safe_url
 from .web_read import public_host_refusal
 
@@ -98,9 +99,13 @@ def _j(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _backend_environment(config):
+def _backend_environment(config, execution_env=None):
     # Values are inherited by name at runtime. They must never be serialized in
     # a per-run config file where a broad computer-read root could expose them.
+    # The one exception is the execution's mark (`execution_env`), which is no secret: the service
+    # and whatever it starts, in a session of its own as the MCP client starts it, are the
+    # execution's, and the host finds them by it. It is set here by name; the filter below would
+    # otherwise drop it (CR5-MM-03).
     if config.get("env") not in (None, {}):
         raise ValueError("computer-use-backend-inline-env-refused")
     names = config.get("env_vars") or []
@@ -115,15 +120,17 @@ def _backend_environment(config):
             raise ValueError("computer-use-backend-env-missing:" + key)
     inherited = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
                  if key in os.environ}
-    return {**inherited, **{key: os.environ[key] for key in names}}
+    return {**inherited, **{key: os.environ[key] for key in names},
+            **(worker_groups.checked(execution_env) or {})}
 
 
 class CuaBackend:
     """Nested MCP client for the actual ``@oai/cua-repl`` service."""
 
     def __init__(self, config, *, execution_id, attempt, model="deepseek-flash",
-                 allowed_apps=(), allowed_app_actions=("observe",)):
+                 allowed_apps=(), allowed_app_actions=("observe",), execution_env=None):
         self.config = config
+        self.execution_env = execution_env
         self.execution_id = str(execution_id)
         self.attempt = int(attempt)
         self.model = model
@@ -156,7 +163,7 @@ class CuaBackend:
         try:
             read, write = await self.stack.enter_async_context(stdio_client(StdioServerParameters(
                 command=command, args=[str(value) for value in args],
-                env=_backend_environment(self.config),
+                env=_backend_environment(self.config, self.execution_env),
             )))
 
             async def elicitation(_context, params):
@@ -252,8 +259,9 @@ class CuaBackend:
 
 def probe_backend_readiness(config, *, execution_id, attempt, model="deepseek-flash",
                             allowed_apps=(), allowed_app_actions=("observe",),
-                            timeout_seconds=45):
-    """Prove the nested MCP and its required CUA bootstrap work before model dispatch."""
+                            timeout_seconds=45, execution_env=None):
+    """Prove the nested MCP and its required CUA bootstrap work before model dispatch. The service
+    the probe starts is the execution's already: it carries `execution_env`, the execution's mark."""
     timeout_seconds = float(timeout_seconds)
     if not 1 <= timeout_seconds <= 120:
         raise ValueError("computer-use-readiness-timeout-invalid")
@@ -265,6 +273,7 @@ def probe_backend_readiness(config, *, execution_id, attempt, model="deepseek-fl
             config, execution_id=f"{execution_id}:readiness-probe", attempt=attempt,
             model=model,
             allowed_apps=allowed_apps, allowed_app_actions=allowed_app_actions,
+            execution_env=execution_env,
         ) as backend:
             return dict(backend.readiness)
 
@@ -649,10 +658,14 @@ def create_server(config):
     @asynccontextmanager
     async def lifespan(_server):
         backend_config = config.get("backend") or {}
+        # The mark the executor wrote into this server's configuration; this server's own, as the
+        # CLI set it, where an older configuration has none (CR5-MM-03).
+        marked = worker_groups.checked(config.get("execution_env")) or worker_groups.execution_env()
         async with CuaBackend(
             backend_config, execution_id=config["execution_id"], attempt=config["attempt"],
             model=config.get("model") or "deepseek-flash", allowed_apps=config.get("allowed_apps", []),
             allowed_app_actions=config.get("allowed_app_actions", ["observe"]),
+            execution_env=marked,
         ) as backend:
             yield ComputerUseController(config, backend)
 

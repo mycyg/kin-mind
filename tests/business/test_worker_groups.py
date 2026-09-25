@@ -6,9 +6,13 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from kin_mind import worker_groups
 from kin_mind.codex_executor import run_codex
@@ -225,3 +229,118 @@ def test_the_cli_runs_with_the_mark_and_so_does_what_it_starts(tmp_path, monkeyp
     for name in ("cli.json", "grandchild.json"):
         env = json.loads(next((tmp_path / "run").rglob(name)).read_text())
         assert env["KIN_WORKER_MARK"] == "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", name
+
+
+# ---------------------------------------------------------------------------------------------
+# CR5-MM-03: whatever the worker starts for an execution is handed the mark by name, from before the
+# first process of the execution exists; a shared service is handed none. Real processes, no model.
+
+MARK = "7c1e9d2a-5b3f-4e8a-9d6c-1a2b3c4d5e6f"
+
+
+def test_the_computer_use_service_and_its_readiness_probe_are_handed_the_mark(tmp_path):
+    """The MCP client starts the service in a session of its own, from an environment filtered by
+    name: the mark is set in it by name, and nothing else rides along with it."""
+    from kin_mind.computer_use import _backend_environment, probe_backend_readiness
+
+    marked = {worker_groups.MARK_ENV: MARK}
+    assert _backend_environment({"env_vars": []}, marked)[worker_groups.MARK_ENV] == MARK
+    assert "TOKEN" not in _backend_environment({"env_vars": []}, {**marked, "TOKEN": "x"})
+    assert worker_groups.MARK_ENV not in _backend_environment({"env_vars": []}, {worker_groups.MARK_ENV: "not-a-mark"})
+    # The readiness probe's service notes its environment and leaves without answering.
+    service = tmp_path / "service.py"
+    service.write_text("import json, os, sys\nopen(sys.argv[1], 'w').write(json.dumps(dict(os.environ)))\n")
+    seen = tmp_path / "service.json"
+    with pytest.raises(Exception):
+        probe_backend_readiness({"command": sys.executable, "args": [str(service), str(seen)], "env_vars": []},
+                                execution_id="x", attempt=1, timeout_seconds=10, execution_env=marked)
+    assert json.loads(seen.read_text())[worker_groups.MARK_ENV] == MARK
+
+
+def test_the_snapshot_tool_and_the_pdf_converter_are_handed_the_mark(tmp_path, monkeypatch):
+    from kin_mind.computer import ComputerReader
+
+    tool = tmp_path / "snapshot.py"
+    tool.write_text("import json, os\nprint(json.dumps({'mark': os.environ.get('KIN_WORKER_MARK')}))\n")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    converter = tools / "pdftotext"
+    converter.write_text("#!" + sys.executable + "\nimport os\nprint('mark ' + os.environ.get('KIN_WORKER_MARK', 'none'))\n")
+    converter.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ.get("PATH", ""))
+    document = tmp_path / "doc.pdf"
+    document.write_bytes(b"%PDF-1.4 synthetic")
+    reader = ComputerReader({"snapshot_command": [sys.executable, str(tool)], "roots": [str(tmp_path)],
+                             "ledger": str(tmp_path / "ledger.json"), "execution_env": {worker_groups.MARK_ENV: MARK}})
+    assert reader.context()["context"]["mark"] == MARK
+    assert "mark " + MARK in reader.read_resource(str(document))["text"]
+    # In a worker, with no configuration of its own (the computer-context action): the worker's mark.
+    monkeypatch.setattr(worker_groups, "_MARK", MARK)
+    plain = ComputerReader({"snapshot_command": [sys.executable, str(tool)], "ledger": str(tmp_path / "plain.json")})
+    assert plain.context()["context"]["mark"] == MARK
+
+
+def test_the_version_probe_is_handed_the_mark(tmp_path):
+    from kin_mind.codex_executor import codex_cli_version
+
+    fake = tmp_path / "codex"
+    fake.write_text("#!" + sys.executable + "\nimport os, sys\n"
+                    "open(sys.argv[0] + '.mark', 'w').write(os.environ.get('KIN_WORKER_MARK', ''))\n"
+                    "print('codex-cli 0.155.0')\n")
+    fake.chmod(0o700)
+    assert codex_cli_version(fake, execution_env={worker_groups.MARK_ENV: MARK}) == "0.155.0"
+    assert (tmp_path / "codex.mark").read_text() == MARK
+
+
+def test_one_mark_is_taken_before_the_first_probe_and_reaches_every_process_of_the_run(tmp_path, monkeypatch):
+    """The readiness probe runs before the CLI; it, the file reader's tools, the Computer Use
+    server's service, the CLI and whatever the CLI would run all get the same mark."""
+    import kin_mind.computer_use as computer_use
+
+    monkeypatch.setattr(worker_groups, "_MARK", MARK)
+    monkeypatch.setenv(PROVIDER["env_key"], "synthetic-key")
+    probed = {}
+
+    def probe(config, **kwargs):
+        probed.update(kwargs)
+        return {"state": "ready", "protocol": "mcp"}
+
+    monkeypatch.setattr(computer_use, "probe_backend_readiness", probe)
+    observe = "open(os.path.join(os.getcwd(), 'observed.json'), 'w').write(json.dumps({'argv': argv, 'env': dict(os.environ)}))\n"
+    fake = fake_codex(tmp_path / "fake", observe + COMPLETE)
+    computer = {"enabled": True, "roots": [str(tmp_path)],
+                "ui": {"enabled": True, "backend": {"command": sys.executable, "args": []}}}
+    run_codex(str(fake), TOPIC, tmp_path / "run", budget_seconds=60, computer=computer, **codex_kwargs())
+    marked = {worker_groups.MARK_ENV: MARK}
+    assert probed["execution_env"] == marked
+    run = tmp_path / "run"
+    assert json.loads((run / "computer-use.json").read_text())["execution_env"] == marked
+    assert json.loads((run / "computer-reader.json").read_text())["execution_env"] == marked
+    observed = json.loads((run / "observed.json").read_text())
+    assert observed["env"][worker_groups.MARK_ENV] == MARK
+    assert 'shell_environment_policy.set={KIN_WORKER_MARK="' + MARK + '"}' in observed["argv"]
+
+
+def test_a_shared_service_woken_for_an_execution_is_handed_no_mark(tmp_path, monkeypatch):
+    """The local embedding service outlives whoever woke it: an execution's end must not end it."""
+    from eventmem.core import local_embedding
+
+    started = {}
+
+    class Exited:
+        def poll(self):
+            return 1
+
+    def popen(argv, **kwargs):
+        started["env"] = kwargs.get("env")
+        return Exited()
+
+    monkeypatch.setattr(local_embedding, "subprocess", SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL))
+    monkeypatch.setenv(worker_groups.MARK_ENV, MARK)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with pytest.raises(RuntimeError, match="exited during startup"):
+        local_embedding.ensure_started(tmp_path, f"http://127.0.0.1:{port}/v1", local_embedding.MODEL)
+    assert started["env"] is not None and worker_groups.MARK_ENV not in started["env"]
+    assert started["env"].get("PATH") == os.environ.get("PATH"), "everything else is inherited as before"

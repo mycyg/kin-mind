@@ -11,9 +11,14 @@ So every process of an execution carries one mark, and the host owns the end of 
 
 * The host gives each worker a mark of its own (`KIN_WORKER_MARK`, a UUID) and knows it before
   the worker runs anything. The worker takes it out of its environment at once, so the processes
-  it starts for itself (a shared service, say) do not carry it, and puts it into the environment of
-  each execution it starts, the CLI and every MCP server the CLI starts (`execution_env`). A
-  process inherits it from there, into a new group or session as well.
+  it starts for itself (a shared service, say) do not carry it, and passes it explicitly into the
+  environment of everything it starts for an execution (`execution_env`, `environment`): the
+  executor's version probe, the snapshot tool and the converters, the Computer Use service and its
+  readiness probe, the CLI, every MCP server the CLI starts and the service each of those starts in
+  turn -- each hands it on by name, never by relying on an environment that is filtered on the way
+  (CR5-MM-03). A process inherits it from there, into a new group or session as well. What the
+  worker starts in its own group without a mark is still the execution's: the host ends what is
+  left there once the worker has ended.
 * The host reads this user's process table for the mark (mind-host.mjs, worker-ownership.mjs),
   follows the processes that carry it to their children and their groups, and counts the worker
   ended only once no process of the execution is left. A table it cannot read is an execution not
@@ -64,6 +69,20 @@ def execution_env():
     if _MARK is None:
         _MARK = str(uuid.uuid4())
     return {MARK_ENV: _MARK}
+
+
+def environment(base=None, marked=None):
+    """The environment of a process started for an execution: `base` (this process's own by
+    default) with the execution's mark (`marked`, else this process's) set by name."""
+    return {**(os.environ if base is None else base), **(marked or execution_env())}
+
+
+def checked(marked):
+    """`marked` when it is an execution's mark as `execution_env` gives it, else nothing: a
+    configuration may carry the mark on, and only the mark."""
+    if isinstance(marked, dict) and set(marked) == {MARK_ENV} and MARK.fullmatch(str(marked[MARK_ENV])):
+        return {MARK_ENV: marked[MARK_ENV]}
+    return None
 
 
 def _control():

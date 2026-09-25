@@ -32,21 +32,24 @@ export class CreationVerifier {
   withdrawn:this.environmentFailure};}
  capabilities(){return {static_html_render:!this.environmentFailure&&!!this.playwrightModule&&fs.existsSync(this.playwrightModule)&&(!this.executablePath||fs.existsSync(this.executablePath)),
   network:false,scripts:false,visual_quality:'requires-review'};}
- async verify(result,{signal}={}){
+ /** `env`: what the render worker's environment adds, the creation step's mark (CR5-MM-04): the
+  * worker and the browser it starts are the step's, and the host ends them with it. */
+ async verify(result,{signal,env={}}={}){
   if(result.state!=='produced')return result;
   const checks=[];
   for(const artifact of result.artifacts.filter(a=>path.extname(a.path).toLowerCase()==='.html').slice(0,2)){
    if(signal?.aborted)break;
    if(!this.capabilities().static_html_render){checks.push({state:'unavailable',source_sha256:artifact.sha256,reason:'static-browser-unavailable'});continue;}
-   const check=await this.render(result.receipt.workspace,artifact,signal);
+   const check=await this.render(result.receipt.workspace,artifact,signal,env);
    if(['renderer-start-failed','browser-launch-failed'].includes(check.reason))this.environmentFailure=check.reason;
    checks.push(check);
   }
   return {...result,host_verification:checks};
  }
- render(workspace,artifact,signal){return new Promise(resolve=>{
+ render(workspace,artifact,signal,env={}){return new Promise(resolve=>{
+  const marked=typeof env?.KIN_WORKER_MARK==='string'?{KIN_WORKER_MARK:env.KIN_WORKER_MARK}:{};
   const child=this.spawnImpl(this.node,[fileURLToPath(new URL('./creation-render-worker.mjs',import.meta.url)),this.playwrightModule,this.executablePath??''],
-   {stdio:['pipe','pipe','pipe'],env:Object.fromEntries(['PATH','HOME','TMPDIR','LANG'].filter(k=>process.env[k]).map(k=>[k,process.env[k]])),detached:true});
+   {stdio:['pipe','pipe','pipe'],env:{...Object.fromEntries(['PATH','HOME','TMPDIR','LANG'].filter(k=>process.env[k]).map(k=>[k,process.env[k]])),...marked},detached:true});
   let output='',settled=false,timer;
   const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',cancel);resolve({...value,source_sha256:artifact.sha256});};
   const cancel=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{child.kill('SIGKILL');}finish({state:'unavailable',reason:signal?.aborted?'interrupted':'render-timeout'});};
