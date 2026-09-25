@@ -1,8 +1,10 @@
 /** What each phone channel promises, and how one of its send receipts reads.
- * A declared capability is not evidence: the transport contract tests
- * (`testing/transport-contract.mjs`) decide what a channel really does. */
+ * A declared capability is not evidence: the transport contract cases
+ * (`transportContractCases`, run against the real Feishu sender) decide what a
+ * channel really does. */
 import path from 'node:path';
 import {readJsonFile} from './atomic-json.mjs';
+import {platformErrorCode} from './send-stages.mjs';
 
 /** Text measures. A fragment must fit the platform limit in the unit the
  * platform counts, and every measure is additive over whole characters.
@@ -42,14 +44,56 @@ export function channelContract(channel,overrides={}) {
   return Object.freeze({...base,...overrides,text:Object.freeze({...base.text,...overrides.text}),file:Object.freeze({...base.file,...overrides.file})});
 }
 
+/** What one WeChat send answer proves (CR5-FLOW-02). A refusal is only an answer that
+ * shows the platform did not take the message:
+ *   - an HTTP 4xx: the request was refused before it was processed. Except 409 Conflict:
+ *     it says the request clashes with state the server already holds (RFC 9110
+ *     §15.5.10), and it is what the HTTP Idempotency-Key draft answers for a key whose
+ *     first request is still being processed. What iLink answers to a client_id it has
+ *     already seen is not documented (`duplicateResponse:'unknown'` above), so a 409 may
+ *     mean this very message is already there;
+ *   - an answer read whole whose `errcode` or `ret` is a platform error code, a whole
+ *     number other than zero (`platformErrorCode`): iLink answers its own refusals with
+ *     HTTP 200 and such a code (-14, an expired session, is the one wechat-acp names).
+ * Anything else leaves the outcome unknown, to be reconciled under the original client
+ * ID: a 5xx (a proxy's or a gateway's included), any other status, a body that is not a
+ * JSON object, a code that is not a whole number. `answered` refused nothing; the server
+ * message ID then decides whether the platform took it. */
+export function wechatAnswer({status,body}) {
+  if(status>=400&&status<500&&status!==409)return {state:'rejected',reason:'http-'+status};
+  if(!(status>=200&&status<300))return {state:'unknown',reason:'http-'+status};
+  if(!body||typeof body!=='object'||Array.isArray(body))return {state:'unknown',reason:'response-unreadable'};
+  const codes=['errcode','ret'].filter(key=>Object.hasOwn(body,key)).map(key=>body[key]);
+  const refusal=codes.find(platformErrorCode);
+  if(refusal!==undefined)return {state:'rejected',reason:'api-'+refusal};
+  if(codes.some(code=>code!==0))return {state:'unknown',reason:'api-code-unreadable'};
+  return {state:'answered'};
+}
+
+/** A `rejected` receipt whose own evidence does not prove the refusal (CR5-FLOW-02):
+ * written by an earlier sender for an answer that is no refusal by today's rule -- a
+ * Feishu answer without a platform error code (no code, `null`, a string), or a WeChat
+ * answer `wechatAnswer` does not read as one (a 5xx, a code that was not a number).
+ * The fields read are the ones every version of both senders wrote beside a refusal. */
+function unprovenRefusal(record) {
+  if(record.state!=='rejected')return false;
+  if(record.errorCode==='PLATFORM_REJECTED'&&!platformErrorCode(record.platformCode))return true;
+  if(typeof record.httpStatus!=='number')return false;
+  const body=Object.fromEntries([['errcode',record.apiError],['ret',record.apiRet]].filter(([,code])=>code!==undefined));
+  return wechatAnswer({status:record.httpStatus,body}).state!=='rejected';
+}
+
 const token=value=>typeof value==='string'&&/^[A-Za-z0-9_.:-]{1,64}$/.test(value)?value:undefined;
 /** One shape for both channels' receipt files and for outbox evidence rows.
- * It carries states, times and platform IDs only, never message text. */
+ * It carries states, times and platform IDs only, never message text. A refusal
+ * its receipt does not prove reads as `unconfirmed`, marked `refusal:'unproven'`
+ * (CR5-FLOW-02): the message may have arrived. */
 export function normalizeReceipt(record) {
   if(!record||typeof record!=='object'||typeof record.state!=='string')return null;
   const literal=typeof record.responseText==='string'?record.responseText.match(/"message_id"\s*:\s*("[0-9]+"|[0-9]+)/)?.[1]?.replaceAll('"',''):undefined;
   const messageId=record.messageId??record.message_id??literal;
-  return {state:record.state,...(messageId?{messageId:String(messageId)}:{}),
+  const unproven=unprovenRefusal(record)||(record.state==='unconfirmed'&&record.refusal==='unproven');
+  return {state:unproven?'unconfirmed':record.state,...(unproven?{refusal:'unproven'}:{}),...(messageId?{messageId:String(messageId)}:{}),
     ...(typeof (record.submissionStarted??record.submission_started)==='boolean'?{submissionStarted:record.submissionStarted??record.submission_started}:{}),
     ...(record.acceptedAt?{acceptedAt:record.acceptedAt}:{}),...(record.checkedAt?{checkedAt:record.checkedAt}:{}),
     ...(record.attemptedAt?{attemptedAt:record.attemptedAt}:{}),...(token(record.stage??record.reason)?{reason:token(record.stage??record.reason)}:{})};
@@ -60,7 +104,9 @@ export function normalizeReceipt(record) {
  *   absent        no receipt: the send never began
  *   never-started a receipt that proves nothing was submitted
  *   accepted      the platform took it and named a message
- *   rejected      the platform definitively refused it
+ *   rejected      the platform definitively refused it, and the receipt proves it:
+ *                 a platform error code, or for WeChat a refusal `wechatAnswer`
+ *                 reads (CR5-FLOW-02). Only this may go again under its own ID.
  *   unknown       anything else; the network effect cannot be told */
 export function classifyReceipt(record) {
   const receipt=normalizeReceipt(record);
