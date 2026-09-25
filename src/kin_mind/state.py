@@ -139,11 +139,14 @@ FORK_TOOL_CALLS, FORK_TOOL_IDS, DRAFT_SHOWN_IDS = 64, 100, 4000
 def fork_reads(value):
     """What the host recorded of a contact draft's fork turn: each tool call, whether it succeeded,
     the ids it returned, and whether that record was cut short (`truncated`). Only these are kept
-    on the attempt row. A record longer than the host's own bounds is cut here too, and says so."""
+    on the attempt row. A record longer than the host's own bounds is cut here too, and says so. A
+    draft of the `legacy` assessment channel, a turn in the main session, records no read at all:
+    it is kept as a record cut short from the first read, and says which channel it was."""
     if not isinstance(value, dict):
         return None
-    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else []
-    kept, cut = [], value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS
+    legacy = value.get("channel") == "legacy"
+    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) and not legacy else []
+    kept, cut = [], legacy or value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS
     for call in calls[:FORK_TOOL_CALLS]:
         if not isinstance(call, dict):
             continue
@@ -153,7 +156,7 @@ def fork_reads(value):
                      "ids": [{"id": entry["id"], "revision": entry["revision"] if type(entry.get("revision")) is int else None}
                              for entry in entries[:FORK_TOOL_IDS]
                              if isinstance(entry, dict) and isinstance(entry.get("id"), str) and 0 < len(entry["id"]) <= 200]})
-    return {"tool_calls": kept, **({"truncated": True} if cut else {})}
+    return {**({"channel": "legacy"} if legacy else {}), "tool_calls": kept, **({"truncated": True} if cut else {})}
 
 
 def contact_wait_seconds(v):

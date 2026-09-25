@@ -311,10 +311,11 @@ def reads_truncated(receipt):
     turn and 100 ids a call -- the owned ACP stops there itself -- and marks a turn that reached
     either `truncated` (boundaries.mjs `forkReceipt`), wherever the receipt carries one. What was
     read past them is named nowhere, so no check by id can clear it; `deleted_since` can
-    (CL6D-MM-01)."""
+    (CL6D-MM-01). A turn of the `legacy` assessment channel -- a turn in the main session itself,
+    with its tools -- keeps no record of what they read at all: the same, from the first read."""
     def walk(value):
         if isinstance(value, dict):
-            if isinstance(value.get("tool_calls"), list) and value.get("truncated") is True:
+            if value.get("channel") == "legacy" or (isinstance(value.get("tool_calls"), list) and value.get("truncated") is True):
                 return True
             return any(walk(item) for item in value.values())
         if isinstance(value, list):
