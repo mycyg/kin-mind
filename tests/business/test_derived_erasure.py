@@ -508,3 +508,32 @@ def test_an_attempt_that_ends_before_its_model_call_is_not_charged(setup):
     assert state != "running" and data.get("error") and count == 0
     [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job["id"])["attempts"]
     assert ledger["charged"] is False and not ledger["calls"]
+
+
+def test_a_plan_whose_evidence_is_deleted_keeps_its_steps_and_their_state_without_their_words(env):
+    """Deleting what a plan was written from takes the plan's words -- its goal, each step's goal
+    and completion -- and keeps every step with its id, state and revision. Emptied, the step list
+    left a running step that no host call could find: renewing or settling it failed, and the next
+    save would have called the plan completed."""
+    from test_autonomous_plans import create, decide
+
+    mind, plans, _, _, _ = env
+    basis = mind.engine.receive(SourceInput(namespace="planning-test", key="plan-basis", text=f"她想要一个 {MARKER} 的钟",
+                                            scope=mind.scope, authority="explicit", occurred_at=mind.clock(),
+                                            metadata={"role": "user", "host_event": "message"}))["id"]
+    decide(env, create(env, key="marker-steps", goal=f"做一个 {MARKER} 的钟", evidence_ids=[basis],
+                       steps=[{"id": "make", "actor": "create", "goal": f"做 {MARKER} 钟", "completion": f"{MARKER} 钟做好了"}]))
+    run = plans.claim("create", "worker")["run"]
+    mind.engine.delete(basis)
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        plan = plans.get(conn, run["plan_id"])
+    [step] = plan["steps"]
+    assert (step["id"], step["state"], step["goal"], step["completion"]) == ("make", "running", ERASED, ERASED)
+    assert plan["status"] == "active" and plan["goal"] == ERASED
+    assert plans.renew(run["id"], "worker", 1) == {"state": "interrupt", "reason": "plan-or-evidence-changed"}
+    assert plans.settle(run["id"], "worker", 1, state="interrupted", result={"reason": "plan-or-evidence-changed"})["state"] == "interrupted"
+    with mind.engine.db.connect() as conn:
+        plan = plans.get(conn, run["plan_id"])
+    assert plan["status"] == "active" and [s["state"] for s in plan["steps"]] == ["waiting"]
+    assert texts_everywhere(mind.engine, MARKER) == set()

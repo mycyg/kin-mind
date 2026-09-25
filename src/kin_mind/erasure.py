@@ -128,6 +128,11 @@ def _blank(value):
         # same erase changes nothing and can say so (CR-MEM-06).
         return value if not value or value == ERASED else ERASED
     if isinstance(value, list):
+        if any(isinstance(item, dict) for item in value):
+            # Structured items -- a plan's steps, with their ids, states and receipts -- stay, each
+            # without its words: emptied, the plan would lose its steps, and every host call that
+            # looks one up by id would fail on a plan whose evidence was deleted.
+            return _blank_each(value)
         return [] if value else value
     if isinstance(value, dict):
         return scrub(value, (), erase=True)
