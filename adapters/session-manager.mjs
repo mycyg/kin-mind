@@ -39,6 +39,9 @@ const LIVE_REVIEW_JOB=new Set(['pending','running','batched','complete']),SPENT_
 export const MAINTENANCE_LIMITS=Object.freeze({reviewTimeoutMs:2*HOUR,compactTimeoutMs:600000,compactCheckMs:300000,
   compactCheckTimeoutMs:30000,compactQuietMs:HOUR});
 const withTimeout=(promise,ms)=>{let timer;return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('KIN_MAINTENANCE_TIMEOUT')),ms);})]).finally(()=>clearTimeout(timer));};
+/** The router activity a maintenance step is counted under while it runs (CL6-FLOW-02). */
+export const MAINTENANCE_ACTIVITY='session-maintenance';
+const frozenWait=()=>({state:'waiting',reason:'dispatch-frozen'});
 const retireLegacyCandidate=state=>{
   const candidate=state.candidate;
   if(!candidate||!['created','injected','ready','waiting'].includes(candidate.state)||candidateHasProfileAuthority(candidate))return false;
@@ -133,6 +136,20 @@ export class SessionManager {
     return true;
   }
   async locked(fn){return this.coordinator.locked(async()=>{this.assertFence(this.state.binding);return fn();});}
+  /** CL6-FLOW-02: whether dispatch is frozen -- a release's freeze, a migration's, a hold -- as the
+   * router answers it: the test the mind's own loop makes (mind-host `isBusy`). */
+  frozen(){return Boolean(this.coordinator.frozen?.());}
+  /** Maintenance that can call a model or move the binding -- a checkpoint, a compaction, a
+   * rotation candidate from its creation to its promotion or abandonment -- starts only through
+   * the router's gate. Under a freeze it does not start: the advice it would carry out stands, and
+   * the first tick after the thaw carries it out. Once started it is in flight for a drain (never
+   * for the owner's dispatch) until `fn` has ended. The freeze check and the registration are one
+   * step (CL6-FLOW-02). A coordinator without the gate (the migration's one commit) is never frozen. */
+  async maintained(id,fn) {
+    const gate=typeof this.coordinator.beginActivity==='function'?this.coordinator.beginActivity({kind:MAINTENANCE_ACTIVITY,id}):{ok:!this.frozen(),release(){}};
+    if(!gate.ok)return frozenWait();
+    try{return await fn();}finally{gate.release();}
+  }
   /** The hosts' one process lock (AD1-20), held for this manager's lifetime and
    * judged by pid and start time: a crashed host whose pid was handed on no longer
    * blocks the next start, and a second live host cannot take it. A lease left by a
@@ -338,6 +355,9 @@ export class SessionManager {
   async tick({runtime:observed,context:collected}={}) {
     if(this.running||this.closed)return {state:'busy'};this.running=true;
     try{
+      // Under a freeze (CL6-FLOW-02) a tick reads, observes and reconciles, and finishes a promotion
+      // whose binding is already committed (it moves no binding and asks no model); what would start
+      // new maintenance goes through `maintained` and waits for the thaw.
       const recovery=await this.recoverPromotion();if(recovery)return recovery;
       const runtime=observed??await this.inspect(),context=collected??await this.collect();await this.observe(runtime,context);
       if(context.sessionAdvice)this.receive(context.sessionAdvice,runtime);
@@ -370,11 +390,16 @@ export class SessionManager {
     const last=this.state.compactions.findLast(c=>c.state==='complete');
     // A cooldown says when the next compaction may run. It is not a judgment that none is needed.
     if(last&&this.now()-last.completedAt<this.state.config.compactCooldownMs)return {state:'waiting',reason:'observe-after-compaction',nextAt:last.completedAt+this.state.config.compactCooldownMs};
+    return this.maintained('compaction:'+advice.snapshotId.slice(0,24),()=>this.startCompaction(advice,context));
+  }
+  async startCompaction(advice,context) {
     // Checkpoint compression may call DS; it deliberately happens outside the coordinator.
     const budget=Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0);
     const {checkpoint,retryAt}=await this.preparedCheckpoint(context,this.state.binding,budget);
     if(retryAt)return {state:'waiting',reason:'checkpoint-coverage-incomplete',nextAt:retryAt};
     return this.locked(async()=>{
+      // A freeze that came while the checkpoint was built holds the compaction until the thaw.
+      if(this.frozen())return frozenWait();
       const before=await this.inspect(),current=await this.collect();
       if(!this.state.config.compact)return {state:'waiting',reason:'compaction-disabled'};
       const boundary=safeBoundary({...current,runtime:before});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
@@ -467,6 +492,9 @@ export class SessionManager {
       if(candidate.native&&candidate.injectionId&&await this.reconcileCandidate?.(candidate)){candidate.state='injected';this.save('candidate-injection-reconciled');}
       else return {state:'waiting',reason:'candidate-operation-unconfirmed'};
     }
+    return this.maintained('rotation:'+advice.snapshotId.slice(0,24),()=>this.advanceCandidate(advice,context,candidate));
+  }
+  async advanceCandidate(advice,context,candidate) {
     const fence=this.fence();
     const budget=Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0);
     const {checkpoint,retryAt}=await this.preparedCheckpoint(context,fence,budget);
@@ -475,7 +503,11 @@ export class SessionManager {
     const invalid=validateCheckpoint(checkpoint,{binding:fence,cursors:current.cursors,configVersion:current.configVersion,budget});
     if(invalid)return {state:'waiting',reason:invalid};
     this.assertFence(fence);
+    // CL6-FLOW-02: each step of a candidate -- its creation, its injection, its check -- starts only
+    // while dispatch is not frozen. A step running when a freeze came finishes and starts no other;
+    // the candidate stays in the state it reached and goes on from it after the thaw.
     if(!candidate||['retired','failed','stale'].includes(candidate.state)){
+      if(this.frozen())return frozenWait();
       const runtime=await this.inspect(),profile=candidateProfile(runtime);
       if(!profile)return {state:'waiting',reason:'candidate-profile-unverified'};
       candidate={id:'rotation:'+randomUUID(),state:'creating',generation:fence.generation,checkpoint,profile,at:this.now()};
@@ -487,16 +519,21 @@ export class SessionManager {
       candidate.state='stale';this.state.retiredCandidates??=[];this.state.retiredCandidates.push(copy(candidate));this.save('candidate-checkpoint-invalidated');await this.closeCandidate?.(candidate);return {state:'waiting',reason:'candidate-checkpoint-changed'};
     }
     if(candidate.state==='created'){
+      if(this.frozen())return frozenWait();
       candidate.state='injecting';candidate.injectionId=hash([candidate.id,checkpoint.id]);this.save('candidate-injecting',{id:candidate.id});
       try{candidate.injection=await this.injectCandidate({...candidate.native,checkpoint,operationId:candidate.injectionId});if(!candidate.injection?.verified)throw Error('Injection unconfirmed');candidate.state='injected';this.save('candidate-injected',{id:candidate.id});}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
+    if(this.frozen())return frozenWait();
     const verification=await this.verifyCandidate({...candidate.native,checkpoint});
     if(!verification?.verified||verification.checkpointId!==checkpoint.id){candidate.state='waiting';this.save('candidate-verification-waiting');return {state:'waiting',reason:'candidate-continuity-unverified'};}
     if(!candidateVerificationReady(verification,candidate)){candidate.state='waiting';this.save('candidate-profile-unverified');return {state:'waiting',reason:'candidate-profile-unverified'};}
     candidate.state='ready';candidate.verification=verification;this.save('candidate-ready');
     if(advice.action!=='rotate'||!this.state.config.rotate)return {state:'ready',reason:'promotion-not-enabled-or-requested'};
     return this.locked(async()=>{
+      // A freeze that came while the candidate was checked keeps the binding a release or a
+      // migration read: the candidate stays ready, and is checked and promoted after the thaw.
+      if(this.frozen())return frozenWait();
       const runtime=await this.inspect(),latest=await this.collect();
       const boundary=safeBoundary({...latest,runtime});if(!boundary.safe)return {state:'waiting',reason:boundary.reason};
       if((latest.tasks??[]).length&&(!this.state.config.pausedTaskHandover||!latest.tasks.every(t=>t.restartable&&verification.taskIds?.includes(t.id))))return {state:'waiting',reason:'work-checkpoint-required'};
