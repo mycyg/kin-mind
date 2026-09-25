@@ -179,6 +179,23 @@ def recording():
     return not _UNRECORDED.get()
 
 
+# How a text names a source or a record: the identifiers a deletion leaves its tombstone under.
+NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
+
+
+def tombstoned(conn, *texts):
+    """Whether a source or record these texts name has been deleted. The tombstone is the deletion
+    fact and outlives every word of what was deleted, so a model answer that comes back after a
+    delete is checked against it in the transaction that would keep it (CR2-MEM-01, CR3-MM-03)."""
+    named = sorted({found for text in texts if isinstance(text, str) for found in NAMED.findall(text)})
+    for start in range(0, len(named), 500):
+        page = named[start:start + 500]
+        if conn.execute("SELECT 1 FROM tombstones WHERE key IN (" + ",".join("?" * len(page)) + ") LIMIT 1",
+                        page).fetchone():
+            return True
+    return False
+
+
 class Database:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()

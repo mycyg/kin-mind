@@ -137,3 +137,48 @@ test('the creation executor starts only when the router admits it, and leaves th
  assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-result']);
  assert.deepEqual(activities,[{kind:'creation',id:'r1'},'released']);
 });
+
+test('a completion review that timed out keeps the creation in flight until its worker has exited, on every path (CR3-MM-09)',async t=>{
+ const {MobileRouter}=await import('../../adapters/mobile-router.mjs');
+ const root=temporary();t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
+  model:'deepseek-flash',modelProvider:'custom-gateway',reasoningEffort:'high',active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0};
+ const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),now:()=>Date.parse('2026-09-25T00:00:00Z'),
+  classify:async()=>({route:'chat',reason:'synthetic'}),switchModel:async()=>({...runtime}),waitForIdle:async()=>{throw Error('waiting');}});
+ const inFlight=()=>router.activityList().map(a=>[a.kind,a.id]);
+ // As the host's mind worker answers: the answer, and apart from it the end of its process.
+ const workers=[],calls=[];
+ let answers=[];
+ const call=(action,input)=>{
+  calls.push(action);
+  if(action==='plan-claim')return Promise.resolve({state:'claimed',run:{id:'run-'+calls.length,fence:1},plan:{id:'p'},step:{goal:'g'}});
+  if(action!=='plan-result')return Promise.resolve({state:'renewed'});
+  let exit;const answer=answers.shift();
+  const running=answer instanceof Error?Promise.reject(answer):Promise.resolve(answer);
+  running.exited=new Promise(resolve=>{exit=resolve;});workers.push(exit);
+  return running;
+ };
+ const turn=()=>new Promise(resolve=>setImmediate(resolve));
+ const worker=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,retryMs:1,call,
+  creator:{run:async()=>({state:'produced'}),stop(){}},beginActivity:spec=>router.beginActivity(spec)});
+ // The exception path: the review timed out; its process is still ending when the run is interrupted.
+ answers=[Object.assign(Error('mind-worker-timeout'),{code:'mind-worker-timeout'})];
+ const timedOut=worker.tick();
+ for(let i=0;i<20&&!calls.includes('plan-interrupt');i++)await turn();
+ assert.deepEqual(calls,['plan-claim','plan-result','plan-interrupt']);
+ await turn();
+ assert.deepEqual(inFlight(),[['creation','run-1']],'the drain still sees the creation');
+ assert.equal(worker.running,true);
+ workers[0]();await timedOut;
+ assert.deepEqual(inFlight(),[]);
+ // The retry path: a review that found no slot, then one that settled; the first worker is still ending.
+ calls.length=0;workers.length=0;answers=[{state:'waiting'},{state:'completed'}];
+ const retried=worker.tick();
+ for(let i=0;i<50&&workers.length<2;i++)await turn();
+ workers[1]();
+ for(let i=0;i<5;i++)await turn();
+ assert.deepEqual(calls,['plan-claim','plan-result','plan-renew','plan-result']);
+ assert.deepEqual(inFlight(),[['creation','run-1']],'held for the first review\'s worker too');
+ workers[0]();await retried;
+ assert.deepEqual(inFlight(),[]);
+});

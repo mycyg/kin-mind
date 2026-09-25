@@ -5,8 +5,9 @@ has (E2-08). A recall without a session writes nothing however often it is retri
 any table, no telemetry, no lease — and one that names its session is a use as before (S1-02).
 A deep one without a session asks no model: it answers from an existing cache or the originals
 and says a session is required, while the same recall with a session compresses and records
-what it cost (CR-MEM-07, CR2-MEM-02). A pre-action cue with nothing to recall answers empty
-(E3-19). The delivery inbox closes every connection it opens (E3-21)."""
+what it cost (CR-MEM-07, CR2-MEM-02); the threads an adaptive deep recall gathers its channels in
+are held to the same (CR3-MM-04). A pre-action cue with nothing to recall answers empty (E3-19).
+The delivery inbox closes every connection it opens (E3-21)."""
 import json
 import sqlite3
 import time
@@ -211,6 +212,45 @@ def test_a_generic_deep_recall_without_a_session_asks_no_model(tmp_path, monkeyp
     assert reply.status_code == 200, reply.text[:300]
     assert reply.json()["items"] and "session_required" in reply.json()["trace"]["degraded"]
     assert calls == [] and every_row(engine) == before
+
+
+def test_an_adaptive_deep_recall_without_a_session_embeds_nothing_in_any_thread(tmp_path, monkeypatch):
+    """With adaptive recall on and an embedding model configured, a deep recall gathers its
+    channels in threads. Without a session none of them asks the embedding model or writes
+    anything, and the answer says a session is required; with one, the vector channel asks for
+    the query's embedding as before (CR3-MM-04)."""
+    import httpx
+
+    from kin_mind.context import Contexts
+
+    engine, client = kin_store(tmp_path)
+    MemoryContinuity(Mind(engine, KIN)).configure({"records": True, "context": True, "usage_reinforcement": True,
+                                                   "temperature_shadow": True, "event_lifecycle": True,
+                                                   "adaptive_recall": True})
+    engine.settings("models", {"embedding": {"endpoint": "https://synthetic.invalid/v1", "model": "synthetic-embedding",
+                                             "input_price_per_million": 1}})
+    calls = []
+
+    class Recording(httpx.BaseTransport):
+        def handle_request(self, request):
+            calls.append(str(request.url))
+            return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1] * 8}],
+                                             "usage": {"prompt_tokens": 4, "total_tokens": 4}})
+
+    real = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda *a, **k: real(*a, **{**k, "transport": Recording()}))
+    Contexts(Mind(engine, KIN))  # a store that has served a context before
+    deep = {**LAB, "mode": "deep", "scope": KIN.model_dump()}
+    before = every_row(engine)
+    reply = client.post("/v1/recall", headers=HEADERS, json=deep)
+    assert reply.status_code == 200, reply.text[:300]
+    assert calls == []
+    after = every_row(engine)
+    assert not {table for table in after if after[table] != before.get(table)}  # every table, row for row
+    assert reply.json()["mode_used"] == "deep" and "session-required" in reply.json()["degraded_reasons"]
+    reply = client.post("/v1/recall", headers=HEADERS, json={**deep, "session": "s1"})
+    assert reply.status_code == 200, reply.text[:300]
+    assert any(url.endswith("/embeddings") for url in calls)
 
 
 def test_a_pre_action_cue_with_nothing_to_recall_answers_empty(tmp_path):

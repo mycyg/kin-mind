@@ -165,8 +165,13 @@ class AdaptiveRecall:
             min(30, deadline - time.monotonic()))
 
     def collect(self, query, *, mode="auto", history=False, provider=None, allow_model=False, deadline=None,
-                recall_purpose="experience_recall", policy=None, owner_words=()):
+                recall_purpose="experience_recall", policy=None, owner_words=(), record=True):
+        """`allow_model` is for the paid ranking; `record=False` is a look, which asks no model at
+        all — not even for the query's embedding — and writes nothing, in any thread (CR3-MM-04)."""
+        from eventmem.core.db import recording
+
         started = time.monotonic()
+        record = record and recording()
         # One policy for every lane. A caller that already loaded one hands it down; its purpose wins.
         policy = policy or ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
         # Envelopes used to be dropped here by prefix alone. The policy decides now, so an audit
@@ -276,10 +281,14 @@ class AdaptiveRecall:
                 docs, graph, vector_hits = [], {"nodes": [], "edges": []}, []
             else:
                 channel_started = time.monotonic()
+                # Every channel runs as its caller does: a look's threads are looks too.
                 with ThreadPoolExecutor(max_workers=3, thread_name_prefix="kin-recall") as executor:
-                    lexical_future = executor.submit(candidates, self.engine, request, full_lexical=True, policy=policy)
-                    graph_future = executor.submit(self.memory.graph.read, query=lookup, limit=40, hops=1, policy=policy)
-                    vector_future = executor.submit(vector_candidates) if mode_used == "deep" and lookup else None
+                    lexical_future = executor.submit(carried.run, candidates, self.engine, request, full_lexical=True, policy=policy)
+                    graph_future = executor.submit(carried.run, self.memory.graph.read, query=lookup, limit=40, hops=1, policy=policy)
+                    # The query's embedding is a model call: a look leaves the vector channel out.
+                    vector_future = executor.submit(vector_candidates) if mode_used == "deep" and lookup and record else None
+                    if mode_used == "deep" and lookup and not record and "session-required" not in info["degraded_reasons"]:
+                        info["degraded_reasons"].append("session-required")
                     docs, _, _ = lexical_future.result()
                     graph = graph_future.result()
                     vector_hits = []

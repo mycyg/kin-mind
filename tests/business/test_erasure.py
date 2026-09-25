@@ -1,5 +1,7 @@
 """An explicit delete reaches every layer the mind built from what it deleted, and stays in force
-when an old history archive is put back (K4-01, K4-20, K4-21, E2-06, K3-15)."""
+when an old history archive is put back (K4-01, K4-20, K4-21, E2-06, K3-15). A model answer that
+comes back after the delete, for a compression or a judgment that was waiting on it, keeps nothing
+but its cost; nor does one that comes back after its source was revised (CR3-MM-03)."""
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -440,3 +442,148 @@ def test_a_second_reerase_changes_nothing_and_a_rerun_reuses_the_history_under_w
     with engine.db.connect() as conn:
         assert tuple(conn.execute("SELECT revision,updated_at FROM mind_graph_nodes WHERE id='secret-event'")
                      .fetchone()) == tuple(node)
+
+
+class LateModel:
+    """A model whose answer arrives only after `meanwhile` ran: the owner deletes or corrects the
+    source while the request is out. Its answer repeats the source's words, as a summary or a
+    verdict would."""
+
+    def __init__(self, engine, monkeypatch, meanwhile, answer):
+        import httpx
+
+        from kin_mind.appraisal import APPRAISAL_MODEL, DeepSeek
+
+        self.calls, self.meanwhile, self.answer = [], meanwhile, answer
+        monkeypatch.setenv("EVENTMEM_API_KEY", "synthetic-key")
+        self.provider = DeepSeek("https://api.deepseek.com/anthropic", APPRAISAL_MODEL,
+                                 transport=httpx.MockTransport(self.respond))
+        self.provider.engine = engine
+        self.model = APPRAISAL_MODEL
+
+    def respond(self, request):
+        import httpx
+
+        sent = json.loads(request.content)
+        asked = json.loads(sent["messages"][0]["content"])
+        self.calls.append(sent["tools"][0]["name"])
+        self.meanwhile()
+        return httpx.Response(200, json={
+            "id": f"synthetic-{len(self.calls)}", "model": self.model, "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": sent["tools"][0]["name"], "input": self.answer(asked)}],
+            "usage": {"input_tokens": 900, "output_tokens": 30}})
+
+
+def paid(engine):
+    with engine.db.connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM metrics WHERE name='structured_model_usage'").fetchone()[0]
+
+
+def test_a_compression_that_comes_back_after_its_source_was_deleted_keeps_nothing(system, monkeypatch):
+    """Blocked on the model, the source is deleted; then the answer arrives, repeating its words.
+    Neither the part nor the summary is cached, the words are in no table, and the call's cost
+    stays on record (CR3-MM-03)."""
+    mind, memory, source, clock = system
+    engine = mind.engine
+    filler = "They checked the harbour path, the tide table and the lamps along the pier. " * 12
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk. " + filler)
+    others = [source(f"walk-{i}", f"Harbour walk note {i}. " + filler) for i in range(2)]
+    contexts = Contexts(mind)
+    items = [contexts.record_item(engine.get(engine.source(sid)["record_ids"][0])) for sid in [secret, *others]]
+    model = LateModel(engine, monkeypatch, lambda: engine.delete(secret), lambda asked: {
+        "entries": [{"item_ids": asked["allowed_item_ids"], "summary": f"They walked the harbour; {MARKER}."}],
+        "omitted_ids": []})
+
+    packed = contexts.pack(items, "harbour walk", 600, provider=model.provider, allow_model=True, persist=True)
+    settle(engine)
+
+    assert model.calls == ["submit_compression"]
+    assert packed["state"] == "needs-compression" and packed["reason"] == "Conflict"
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_context_cache").fetchone()[0] == 0
+    assert texts_everywhere(engine, MARKER) == set()
+    assert paid(engine) == 1  # what the call cost is all it leaves
+
+
+def test_a_judgment_that_comes_back_after_its_source_changed_keeps_nothing(system, monkeypatch):
+    """The same for a judgment: deleted while the verdict is out, no pending row and no words; and
+    a verdict about a record that was corrected meanwhile is not kept for the old version either.
+    Both calls stay paid for (CR3-MM-03)."""
+    from pydantic import BaseModel
+
+    from eventmem.core.models import RevisionInput
+
+    class Verdict(BaseModel):
+        verdict: str
+
+    mind, memory, source, clock = system
+    engine = mind.engine
+    judgment = {"scope": mind.scope.key(), "type": "step-complete", "goal": "walk", "completion": "walked",
+                "obligation_version": "1"}
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk.")
+    record = engine.source(secret)["record_ids"][0]
+    model = LateModel(engine, monkeypatch, lambda: engine.delete(secret), lambda asked: {"verdict": f"done: {MARKER}"})
+    _, receipt = model.provider.structured("judge_step", Verdict, "Judge the step.",
+                                           {"records": [{"id": record, "text": engine.get(record)["content"]}]},
+                                           judgment=judgment, depends_on=[record])
+    settle(engine)
+    assert model.calls == ["judge_step"] and "judgment_cache" not in receipt
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache_deps").fetchone()[0] == 0
+    assert texts_everywhere(engine, MARKER) == set()
+
+    walk = source("walk", "The owner walked to the harbour.")
+    kept = engine.source(walk)["record_ids"][0]
+    corrected = RevisionInput(expected_revision=1, command_id="correct-walk", action="correct",
+                              content="The owner walked to the station.", reason="synthetic correction")
+    model = LateModel(engine, monkeypatch, lambda: engine.revise(kept, corrected), lambda asked: {"verdict": "harbour"})
+    _, receipt = model.provider.structured("judge_step", Verdict, "Judge the step.",
+                                           {"records": [{"id": kept, "text": "The owner walked to the harbour."}]},
+                                           judgment={**judgment, "goal": "harbour"}, depends_on=[kept])
+    assert "judgment_cache" not in receipt
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache").fetchone()[0] == 0
+    assert paid(engine) == 2
+
+    # Nothing changed while it was out: the verdict is kept, pending, as before.
+    model = LateModel(engine, monkeypatch, lambda: None, lambda asked: {"verdict": "station"})
+    _, receipt = model.provider.structured("judge_step", Verdict, "Judge the step.",
+                                           {"records": [{"id": kept, "text": engine.get(kept)["content"]}]},
+                                           judgment={**judgment, "goal": "station"}, depends_on=[kept])
+    assert receipt.get("judgment_cache")
+    with engine.db.connect() as conn:
+        assert [tuple(row) for row in conn.execute("SELECT accepted FROM mind_judgment_cache")] == [(0,)]
+
+
+def test_an_overview_of_a_source_deleted_after_its_summary_came_back_is_not_kept(system, monkeypatch):
+    """Overviews are written after their pack returns. A source deleted in between gets no overview:
+    the words are in no table, and the other source's overview is kept as before (CR3-MM-03)."""
+    mind, memory, source, clock = system
+    engine = mind.engine
+    filler = "They checked the harbour path, the tide table and the lamps along the pier. " * 40
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk. " + filler)
+    other = source("walk", "Harbour walk note. " + filler)
+    contexts = Contexts(mind)
+    records = {sid: engine.source(sid)["record_ids"][0] for sid in (secret, other)}
+    items = [{**contexts.record_item(engine.get(rid)), "needs_review": False} for rid in records.values()]
+    monkeypatch.setattr(contexts.memory, "history",
+                        lambda kind, query="", limit=20, **_: {"items": items if kind == "work" else []})
+    monkeypatch.setattr(contexts, "node_item", lambda node, policy=None: node)
+    model = LateModel(engine, monkeypatch, lambda: None, lambda asked: {
+        "entries": [{"item_ids": [i], "summary": f"Harbour walk; {MARKER}." if i == records[secret] else "Harbour walk."}
+                    for i in asked["allowed_item_ids"]], "omitted_ids": []})
+    real = contexts.pack
+
+    def deleted_on_return(*args, **kwargs):
+        packed = real(*args, **kwargs)
+        engine.delete(secret)
+        return packed
+
+    monkeypatch.setattr(contexts, "pack", deleted_on_return)
+    assert contexts.warm("harbour walk", provider=model.provider)["state"] == "compressed"
+    settle(engine)
+    assert texts_everywhere(engine, MARKER) == set()
+    with engine.db.connect() as conn:
+        overviews = [json.loads(row[0]) for row in conn.execute("SELECT data FROM mind_context_cache WHERE id LIKE 'overview-v2:%'")]
+    assert [view["source"]["id"] for view in overviews] == [records[other]]
