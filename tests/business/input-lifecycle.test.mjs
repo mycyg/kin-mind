@@ -7,6 +7,8 @@ import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_M
 import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 import {MobileAudit} from '../../adapters/mobile-audit.mjs';
+import {createMobileReviewer} from '../../adapters/mobile-reviewer.mjs';
+import {createLeaseClient} from '../../adapters/model-lease.mjs';
 
 const MINUTE=60000,HOUR=3600000;
 function fixture(t,options={}) {
@@ -807,4 +809,58 @@ test('a restore from the journal alone keeps the owner\'s stop: what she stopped
     assert.equal((await router.dispatch({id,kind:'owner',text},async()=>assert.fail('never submitted'))).route,'canceled-by-owner',id);
   assert.equal((await router.dispatch({id:'running',kind:'owner',text:'写一份报告'},async()=>assert.fail('never submitted'))).route,'deduplicated');
   assert.deepEqual(['running','queued-w','prep','handing'].map(id=>inputSummary(restored(id))),Array(4).fill('canceled-by-owner'));
+});
+
+// ---- Fourth review: CR4-FLOW ----
+
+test('a classification asked again holds its activity until the model call has ended: a late lease starts nothing, a request past the deadline is canceled (CR4-FLOW-01)',async t=>{
+  // The real reviewer and lane client; the ledger and the provider answer when the test says so.
+  let slowLease=null;const leaseCalls=[];
+  const lease=createLeaseClient({holder:'test',request:async route=>{
+    leaseCalls.push(route.split('/').pop());
+    if(route.endsWith('/acquire')&&slowLease)await slowLease;
+    return route.endsWith('/acquire')?{state:'admitted',lease:{renew_after_seconds:30}}:{state:'released'};
+  }});
+  let phase='fail',endRequest=null;const requests=[],usage=[];
+  const fetchImpl=async(url,init)=>{
+    requests.push(phase);
+    if(phase==='fail')return {ok:false,status:503};
+    // A slow request: like fetch it refuses a signal already fired; otherwise it ends only
+    // after it is canceled, and when the test lets it.
+    return new Promise((_,reject)=>{
+      if(init.signal.aborted)return reject(init.signal.reason);
+      init.signal.addEventListener('abort',()=>{endRequest=()=>reject(init.signal.reason??Error('aborted'));},{once:true});
+    });
+  };
+  const reviewer=createMobileReviewer({key:'synthetic-key',fetchImpl,lease,onUsage:row=>usage.push(row)});
+  const f=fixture(t,{classify:(input,options)=>reviewer.classify(input,options)});
+  f.router.state.config.classifierTimeoutMs=20;
+  await f.router.select({id:'q',kind:'owner',text:'在吗'});
+  assert.equal(f.router.state.inputs.q.state,'semantic-pending');
+  const retrying=()=>f.router.activityList().map(activity=>[activity.kind,activity.id]);
+  // 1. The lane answers after the deadline: then a freeze, and the drain.
+  let grant;slowLease=new Promise(resolve=>{grant=resolve;});phase='slow';
+  const first=f.router.reviewSemanticPending();
+  await waitFor(()=>leaseCalls.filter(call=>call==='acquire').length===2,'the lane is asked');
+  await new Promise(resolve=>setTimeout(resolve,80));
+  await f.router.freezeDispatch('release');
+  assert.deepEqual(retrying(),[['classification-retry','q']],'past the deadline the drain still counts it: its lane has not answered');
+  grant();slowLease=null;
+  await first;
+  assert.deepEqual(requests,['fail'],'the lease that came late started no request');
+  assert.equal(leaseCalls.at(-1),'release','and was let go');
+  assert.deepEqual(f.router.activityList(),[],'held until then');
+  // 2. The request is slow: at the deadline it is canceled; then a freeze, and the drain.
+  await f.router.thawDispatch('released');
+  f.clock.now+=MINUTE;
+  const second=f.router.reviewSemanticPending();
+  await waitFor(()=>endRequest!==null,'the request is canceled at the deadline');
+  await f.router.freezeDispatch('release');
+  assert.deepEqual(retrying(),[['classification-retry','q']],'canceled but not yet ended: the drain still counts it');
+  endRequest();
+  await second;
+  assert.deepEqual(f.router.activityList(),[],'let go once the request has ended and its lease is released');
+  assert.equal(leaseCalls.at(-1),'release');
+  assert.deepEqual([requests,usage.at(-1).outcome],[['fail','slow'],'caller-deadline'],'the canceled request is accounted to the caller\'s deadline');
+  assert.deepEqual([f.router.state.semanticPending.q.attempts,f.router.state.semanticPending.q.lastFailure.class],[3,'timeout']);
 });

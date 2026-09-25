@@ -44,8 +44,8 @@ export class MobileAudit {
     const id='audit-'+this.now();
     // A reading is a model call beside her conversation. Dispatch must not be frozen and
     // the lane must admit it, both before anything is collected, spent or counted; the
-    // drain counts the reading until it has returned. Refused, it counts nothing and is
-    // due again at the next tick (CR3-FLOW-01).
+    // drain counts the reading until it has returned and let go of its lease. Refused, it
+    // counts nothing and is due again at the next tick (CR3-FLOW-01, CR4-FLOW-01).
     const gate=this.activity?this.activity({kind:'health-review',id}):null;
     if(gate&&!gate.ok)return{state:'skipped',reason:'dispatch-'+gate.reason};
     this.running=true;
@@ -55,10 +55,10 @@ export class MobileAudit {
     let held=null;
     try {held=this.lease?await this.lease.acquire({lane:this.lane,purpose:this.purpose}):null;}
     catch(error){this.running=false;gate?.release();throw error;}
-    if(held&&!held.proceed){this.running=false;gate?.release();await held.release();return{state:'skipped',lane:held.lane,reason:held.reason??held.state};}
+    if(held&&!held.proceed){this.running=false;try {await held.release();} finally {gate?.release();}return{state:'skipped',lane:held.lane,reason:held.reason??held.state};}
     this.state.status='running';this.state.startedAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;
     try {atomicJson(this.file,this.state);}
-    catch(error){this.running=false;gate?.release();await held?.release();throw error;}
+    catch(error){this.running=false;try {await held?.release();} finally {gate?.release();}throw error;}
     try {
       const snapshot=await this.collect();const result=await this.review(snapshot,{held});
       const at=this.now();
@@ -75,7 +75,7 @@ export class MobileAudit {
       const minutes=AUDIT_FAILURE_RETRY_MINUTES[this.state.failures-1]??this.intervalHours*60;
       this.state.nextAt=this.now()+minutes*60000;
       this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
-    finally {this.running=false;gate?.release();await held?.release();atomicJson(this.file,this.state);}
+    finally {this.running=false;try {await held?.release();} finally {gate?.release();}atomicJson(this.file,this.state);}
   }
   record(id,result,at) {
     const incidents=Object.values(this.state.incidents);

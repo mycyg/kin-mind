@@ -153,15 +153,18 @@ nothing, so a caller may poll it; every answer says whether the host is `idle` a
 if not, why. `POST /thaw` lifts it. `GET /busy` answers the same drain: inputs still
 moving through the host, a native turn or an unreadable native runtime, a send, a
 native command or a switch hold it, and so do the host's own background model calls —
-a summary of open work, a health reading, a classification asked again — until they
-return; a freeze refuses a new one before anything is counted for it, and none of them
-holds the owner's conversation. Open work, a desktop handoff, history and inputs
-waiting for a notice or a reconciliation do not, because they do not change by
-waiting. `GET /unsettled` returns the eight-state summary and every unsettled input
-by its original ID, naming inbox jobs the router has not taken by ID and file time
-only. The same summary is `inputLedger` in `/runtime`. `POST /handoff-source`
-answers from the same ledger whether an owner input may authorize a desktop handoff;
-see [task exchange](task-exchange.md#host-integration).
+a summary of open work, a health reading, a classification asked again — until the
+call has ended and let go of its lane; a freeze refuses a new one before anything is
+counted for it, and none of them holds the owner's conversation. A classification's
+deadline covers the lane's admission as well as the request: once it passes, the
+request is canceled, a lease that comes late starts nothing, and the classification
+answers only after the call has let go of everything it held. Open work, a desktop
+handoff, history and inputs waiting for a notice or a reconciliation do not, because
+they do not change by waiting. `GET /unsettled` returns the eight-state summary and
+every unsettled input by its original ID, naming inbox jobs the router has not taken
+by ID and file time only. The same summary is `inputLedger` in `/runtime`.
+`POST /handoff-source` answers from the same ledger whether an owner input may
+authorize a desktop handoff; see [task exchange](task-exchange.md#host-integration).
 
 The router's state file keeps what is unsettled and a bounded recent tail. Settled
 inputs, closed tasks, finished requests and settled notices beyond it move, oldest
