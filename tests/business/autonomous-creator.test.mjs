@@ -220,7 +220,7 @@ test('a settled run\'s final answer keeps the artifacts it names and loses its w
  const root=temporary(),WORDS='ferncastle 的钟面';
  const spawnImpl=(command,args,options)=>{const child=new EventEmitter();Object.assign(child,{pid:99999995,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough(),kill:()=>{}});
   child.stdin.on('finish',()=>{fs.writeFileSync(path.join(options.cwd,'clock.svg'),'<svg><text>'+WORDS+'</text></svg>');
-   fs.writeFileSync(args[args.indexOf('--output-last-message')+1],JSON.stringify({summary:'做好了 '+WORDS,artifacts:['clock.svg'],verification:['Parsed the SVG'],remaining:['上色 '+WORDS]}));
+   fs.writeFileSync(args[args.indexOf('--output-last-message')+1],JSON.stringify({summary:'做好了 '+WORDS,artifacts:['clock.svg'],verification:['Parsed the SVG','ferncastle'],remaining:['上色 '+WORDS]}));
    child.stdout.end(JSON.stringify({type:'thread.started',thread_id:'t'})+'\n'+JSON.stringify({type:'turn.completed',usage:{}})+'\n');setImmediate(()=>child.emit('exit',0));});return child;};
  try{
   // What the last host left: a final answer in words, another that is not JSON at all, and the schema.
@@ -239,7 +239,7 @@ test('a settled run\'s final answer keeps the artifacts it names and loses its w
   await worker.tick();
   const workspace=creationWorkspace(root,{id:'p'},{id:'s'});
   const settled=JSON.parse(fs.readFileSync(path.join(workspace,'.result-r-1.json'),'utf8'));
-  assert.deepEqual(settled,{summary:ERASED,artifacts:['clock.svg'],verification:[ERASED],remaining:[ERASED]});
+  assert.deepEqual(settled,{summary:ERASED,artifacts:['clock.svg'],verification:[ERASED,ERASED],remaining:[ERASED]},'one word is a word too (CL7B-MM-05)');
   assert.match(fs.readFileSync(path.join(workspace,'clock.svg'),'utf8'),/ferncastle/,'what the run made is its work, and stays');
   // A run whose review failed is interrupted, and its answer loses its words all the same.
   review=async()=>{throw Error('review-failed');};
