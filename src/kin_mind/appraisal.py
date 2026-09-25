@@ -908,7 +908,7 @@ class DeepSeek:
             receipt["judgment_cache"] = token
         return schema.model_validate(value["result"]), receipt
 
-    def _cache_get(self, name, schema, system, context, judgment):
+    def _cache_get(self, name, schema, system, context, judgment, depends_on=None):
         """Look this exact rendered request up, and report what the write seam needs.
 
         Judgment cache v2 when the caller declared a judgment and `semantic_cache_v2`
@@ -922,7 +922,11 @@ class DeepSeek:
         with self.engine.db.connect() as conn:
             if judgment is not None and judgment_cache.enabled(conn, judgment["scope"]):
                 found = judgment_cache.get(self.engine, conn, name, request, judgment, now=time.time())
-                state = {"request": request, "generation": None, "v2": True}
+                # What the question rests on, and at which versions, as it is put: the answer is
+                # kept only if they still hold when it comes back (CR3-MM-03).
+                depends = judgment_cache.dependencies(context, depends_on)
+                state = {"request": request, "generation": None, "v2": True, "depends_on": depends,
+                         "asked": judgment_cache.versions(conn, depends)}
                 return state, (self._cache_hit(name, schema, found[1], found[0]) if found else None)
             if name in judgment_cache.NEVER_CACHED:
                 return None, None
@@ -946,7 +950,7 @@ class DeepSeek:
         if state["v2"]:
             return judgment_cache.put(self.engine, name, state["request"], judgment, value,
                                       now=time.time(), valid_for=valid_for,
-                                      depends_on=judgment_cache.dependencies(context, depends_on))
+                                      depends_on=state["depends_on"], asked=state["asked"])
         with self.engine.db.connect(write=True) as conn:
             if conn.execute("SELECT value FROM meta WHERE key='generation'").fetchone()[0] == state["generation"]:
                 conn.execute("DELETE FROM mind_semantic_cache WHERE expires_at<=?", (time.time(),))
@@ -966,7 +970,7 @@ class DeepSeek:
         key = os.environ.get(self.key_env)
         if not key:
             raise RuntimeError("deepseek-key-unavailable")
-        cache_state, hit = self._cache_get(name, schema, system, context, judgment)
+        cache_state, hit = self._cache_get(name, schema, system, context, judgment, depends_on)
         if hit is not None:
             return hit
         from eventmem.core.db import recording
