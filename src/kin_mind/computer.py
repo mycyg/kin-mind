@@ -20,6 +20,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from eventmem.core.models import now
 
+from . import worker_groups
+
 SECRET_NAME = re.compile(r"^(?:\.env(?:\..*)?|credentials?(?:\..*)?|auth\.json|secrets?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?:\.pub)?|[._]netrc|local-token|embedding-token|.*\.(?:pem|p12|keychain|keychain-db))$", re.IGNORECASE)
 SECRET_DIRS = {".ssh", ".aws", ".azure", ".gnupg", ".codex", ".kimi-code", "keychains", "cookies", ".git", "node_modules"}
 # Exact authentication files known by where they live (K2-12). Only these files: the rest of
@@ -66,6 +68,12 @@ class ComputerReader:
         self.roots = [Path(p).expanduser().resolve() for p in config.get("roots", [])]
         self.ledger = Path(config["ledger"])
         self.lock = threading.Lock()
+
+    def tool_environment(self):
+        """The environment of the snapshot tool and the converters this reader runs: the
+        execution's mark set by name (the configuration's, else this process's), so the host finds
+        them, and ends them, wherever they go (CR5-MM-03)."""
+        return worker_groups.environment(marked=worker_groups.checked(self.config.get("execution_env")))
 
     def checked_path(self, value):
         path = Path(value).expanduser().resolve()
@@ -132,7 +140,8 @@ class ComputerReader:
         if not command:
             return {"state": "unavailable", "reason": "snapshot-adapter-unconfigured", "observed_at": now()}
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=12, check=True)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=12, check=True,
+                                    env=self.tool_environment())
             value = redact(json.loads(result.stdout))
         except (subprocess.SubprocessError, ValueError, OSError):
             return {"state": "unavailable", "reason": "snapshot-adapter-unavailable", "observed_at": now()}
@@ -182,7 +191,7 @@ class ComputerReader:
             if not converter:
                 raise ValueError("pdf-text-adapter-unavailable")
             text = subprocess.run([converter, "-f", "1", "-l", "20", str(path), "-"], capture_output=True,
-                                  text=True, timeout=10, check=True).stdout
+                                  text=True, timeout=10, check=True, env=self.tool_environment()).stdout
         else:
             raw = path.read_bytes()
             if b"\0" in raw[:8192]:

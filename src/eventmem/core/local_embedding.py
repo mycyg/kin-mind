@@ -95,6 +95,10 @@ def ensure_started(root, endpoint, model):
             if alive():
                 return auth
             log_path = root / "embedding-service.log"
+            # A shared service outlives whoever woke it: it is no execution's, so an execution's mark
+            # (kin_mind.worker_groups) is not handed on to it, and the end of that execution does
+            # not end it (CR5-MM-03).
+            service_env = {key: value for key, value in os.environ.items() if key != "KIN_WORKER_MARK"}
             with log_path.open("ab") as log:
                 os.chmod(log_path, 0o600)
                 process = subprocess.Popen(
@@ -111,6 +115,7 @@ def ensure_started(root, endpoint, model):
                     stdout=log,
                     stderr=log,
                     start_new_session=True,
+                    env=service_env,
                 )
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
