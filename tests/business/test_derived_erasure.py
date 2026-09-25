@@ -1340,3 +1340,22 @@ def test_an_excerpt_a_frozen_memory_context_labels_by_its_records_id_goes_at_the
     assert queue_row(mind, job["id"])[0] == "pending", "and no attempt of the row ran meanwhile"
     guide = " ".join((Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8").split())
     assert "loses its words with that record at the delete, not at the next attempt" in guide
+
+
+def test_the_guide_gives_a_fork_receipts_bounds_and_the_legacy_channel_as_the_code_keeps_them():
+    """The operations guide says what a fork's receipt keeps as the host and the core keep it -- 64
+    tool calls, 1000 ids a call and 2000 a turn -- that it says why it was cut, and that a turn of the
+    legacy channel, which records nothing its tools read, is checked as one cut short from its first
+    read (CL7B-MM-04)."""
+    from pathlib import Path
+
+    from kin_mind import erasure
+    from kin_mind.state import FORK_TOOL_CALLS, FORK_TOOL_IDS, FORK_TURN_IDS, fork_reads
+
+    guide = " ".join((Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8").split())
+    assert f"A fork's receipt keeps {FORK_TOOL_CALLS} tool calls, {FORK_TOOL_IDS} ids a call and {FORK_TURN_IDS} a turn" in guide
+    assert "says `truncated`, and why (`truncated_by`)" in guide
+    assert "100 ids a call" not in guide and "records no tool reads" not in guide, "the old bound and the old legacy rule are gone"
+    legacy = {"channel": "legacy", "tool_calls": [{"name": "kin_memory.read_memory", "ok": True, "ids": []}]}
+    assert erasure.reads_truncated(legacy) and fork_reads(legacy) == {"channel": "legacy", "tool_calls": [], "truncated": True}
+    assert "its receipt says `channel: legacy`, and it is checked as a fork turn cut short from its first read" in guide
