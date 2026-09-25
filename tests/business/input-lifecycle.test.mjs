@@ -744,3 +744,67 @@ test('an input requeued while it was taken in keeps that count once it is routed
   await g.router.select({id:'s',kind:'owner',text:'在吗'});
   assert.deepEqual([g.router.state.inputs.s.state,g.router.state.inputs.s.requeues,g.router.state.inputs.s.retry.evidence],['semantic-pending',1,'not-submitted'],'the count and this attempt\'s evidence are kept apart');
 });
+
+// ---- The owner's stop kept through a restore from the journal alone (§0) ----
+
+test('a restore from the journal alone keeps the owner\'s stop: what she stopped comes back canceled under its own id, and what came after is untouched',async t=>{
+  const queue=[];
+  const take=ids=>{const taken=queue.filter(id=>ids.includes(id));queue.splice(0,queue.length,...queue.filter(id=>!ids.includes(id)));return taken;};
+  let f;
+  f=fixture(t,{withdrawQueued:take,interruptTurn:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  // A turn the stop cut: the input it answered had reached the native session.
+  await f.router.dispatch({id:'running',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  const first=f.router.tasks()[0];
+  await f.router.observe('prompt-start',{taskId:first.id,inputVersion:first.inputVersion,turnFence:0,inputIds:['running']});
+  Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+  await f.router.dispatch({id:'stop-0',kind:'owner',text:'停止任务'},async()=> 'new-turn');
+  // Stopped in the host's queue (CR3-FLOW-02), and while still being prepared (CR2-LIFE-01).
+  await f.router.dispatch({id:'queued-w',kind:'owner',text:'写第二份'},async()=>{queue.push('queued-w');return {route:'new-turn',queued:true};});
+  let release;const prepared=new Promise(resolve=>{release=resolve;});
+  const prep=f.router.dispatch({id:'prep',kind:'owner',text:'再写一份',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{await prepared;await markSubmitted();return 'new-turn';});
+  await waitFor(()=>f.router.state.inputs.prep?.state==='preparing','being prepared');
+  await f.router.dispatch({id:'stop-1',kind:'owner',text:'停止任务'},async()=> 'new-turn');
+  release();assert.equal((await prep).route,'canceled-by-owner');
+  // Stopped while it was being handed over: refused where its prompt would have begun.
+  const handing=await f.router.dispatch({id:'handing',kind:'owner',text:'写第三份',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
+    await markSubmitted();
+    await f.router.dispatch({id:'stop-2',kind:'owner',text:'停止任务'},async()=> 'new-turn');
+    await f.router.observe('prompt-start',{taskId:decision.taskId,inputVersion:decision.inputVersion,turnFence:0,inputIds:['handing']});
+    return {route:'new-turn',queued:true};
+  });
+  assert.equal(handing.route,'canceled-by-owner');
+  // Unrelated and after every stop: a chat whose submission was lost.
+  await assert.rejects(f.router.dispatch({id:'after',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+  // The journal names each stop and how far the input had got.
+  const canceling=fs.readFileSync(f.args.file+'.events.jsonl','utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(event=>event.canceledBy);
+  assert.deepEqual(canceling.map(event=>[event.id,event.kind,event.canceledBy,event.scope]).sort(),[
+    ['handing','input-canceled','stop-2','native-session'],['handing','input-dispatch-withdrawn','stop-2','prompt-start'],
+    ['prep','input-dispatch-withdrawn','stop-1','preparation'],['queued-w','input-dispatch-withdrawn','stop-1','host-queue'],
+    ['running','input-canceled','stop-0','native-session']]);
+
+  // Every revision is lost; only the journal is left.
+  fs.writeFileSync(f.args.file,'{broken');fs.writeFileSync(f.args.file+'.prev','{broken');
+  const router=new MobileRouter(f.args);
+  const restored=id=>router.state.inputs[id];
+  assert.deepEqual(['running','queued-w','prep','handing'].map(id=>[id,restored(id).state,restored(id).canceledBy,restored(id).cancelScope,restored(id).recovered,inputSummary(restored(id))]),[
+    ['running','accepted','stop-0','native-session',undefined,'canceled-by-owner'],
+    ['queued-w','failed-before-submit','stop-1','host-queue',undefined,'canceled-by-owner'],
+    ['prep','failed-before-submit','stop-1','preparation',undefined,'canceled-by-owner'],
+    ['handing','failed-before-submit','stop-2','prompt-start',undefined,'canceled-by-owner']],'each comes back canceled by the stop that did it, under its own id');
+  assert.deepEqual([restored('after').state,restored('after').recovered,restored('after').canceledBy],['unconfirmed',true,undefined],'what came after comes back as any input does');
+  // The watchdog looks up and requeues only what she did not stop; nobody is told about what she did.
+  const stops=['stop-0','stop-1','stop-2'],looked=[],requeued=[],told=[];
+  const notifyOwner=async(kind,id)=>{told.push(id);return {state:'accepted',messageId:'n'};};
+  await router.watch({reconcileInput:async id=>{looked.push(id);return stops.includes(id)?{state:'found'}:absent;},notifyOwner});
+  await router.watch({requeue:async id=>{requeued.push(id);return {state:'requeued'};},notifyOwner});
+  assert.deepEqual(looked.sort(),['after',...stops].sort(),'nothing she stopped is looked up');
+  assert.deepEqual(requeued,['after'],'proven unsent, what came after goes again under its own id; nothing she stopped does');
+  assert.deepEqual(told,[]);
+  // Taken in or replayed under their own ids, the stopped inputs stay stopped.
+  assert.deepEqual((await router.received({id:'prep',kind:'owner',channel:'wechat'})).record.state,'failed-before-submit','taken in again, it is not prepared afresh');
+  for(const [id,text] of [['queued-w','写第二份'],['prep','再写一份'],['handing','写第三份']])
+    assert.equal((await router.dispatch({id,kind:'owner',text},async()=>assert.fail('never submitted'))).route,'canceled-by-owner',id);
+  assert.equal((await router.dispatch({id:'running',kind:'owner',text:'写一份报告'},async()=>assert.fail('never submitted'))).route,'deduplicated');
+  assert.deepEqual(['running','queued-w','prep','handing'].map(id=>inputSummary(restored(id))),Array(4).fill('canceled-by-owner'));
+});
