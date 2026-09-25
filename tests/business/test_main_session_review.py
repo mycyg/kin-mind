@@ -784,3 +784,75 @@ def test_a_process_that_dies_at_the_attempt_record_leaves_the_row_and_the_ledger
                                                     'outcome': 'committed', 'calls': [], 'charged': True})
     again = sorted(attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts'], key=lambda a: a['ordinal'])
     assert [(a['outcome'], a['charged']) for a in again] == [('abandoned', True), ('discarded', False)]
+
+
+def repair_fails(mind, fault, asked):
+    """A provider whose full appraisal runs to an answer that needs a schema repair, and whose repair
+    then fails the way an outage does: `unknown` (a fork nobody can place), `network`, `5xx`, `429`."""
+    if fault == 'unknown':
+        def exchange(request):
+            asked.append(request['name'])
+            if request['name'] == 'submit_appraisal':
+                return {'state': 'complete', 'result': {'reason': '想先记在心里。', 'values': {'curiosity': 'high'}},
+                        'receipt': {'native_turn_id': 'turn-1', 'model': 'gpt-6-astra', 'usage': {'input_tokens': 500, 'output_tokens': 50}}}
+            return {'state': 'waiting', 'reason': 'fork-timeout', 'stage': 'unknown', 'detail': 'timeout',
+                    'model_invoked': None, 'started': None, 'receipt': UNMADE}
+        return native_provider(mind, exchange)
+    import httpx
+    from kin_mind.appraisal import APPRAISAL_MODEL, DeepSeek
+
+    def answer(request):
+        tool = json.loads(request.content)['tools'][0]['name']
+        asked.append(tool)
+        if tool == 'submit_appraisal':
+            return httpx.Response(200, json={'id': 'msg-1', 'model': APPRAISAL_MODEL, 'stop_reason': 'end_turn',
+                                             'usage': {'input_tokens': 500, 'output_tokens': 50},
+                                             'content': [{'type': 'tool_use', 'name': 'submit_appraisal',
+                                                          'input': {'reason': '想先记在心里。', 'values': {'curiosity': 'high'}}}]})
+        if fault == 'network':
+            raise httpx.ConnectError('synthetic outage', request=request)
+        return httpx.Response({'5xx': 503, '429': 429}[fault], json={'error': 'synthetic'})
+    provider = DeepSeek('https://api.deepseek.com', APPRAISAL_MODEL, 'KIN_TEST_DS_KEY', timeout=60, transport=httpx.MockTransport(answer))
+    provider.engine = mind.engine
+    return provider
+
+
+@pytest.mark.parametrize('fault,error,repair_outcome', [
+    ('unknown', 'native-review-fork-timeout', 'fork-timeout'),
+    ('network', 'deepseek-network-error', 'network-error'),
+    ('5xx', 'deepseek-http-503', 'http-503'),
+    ('429', 'deepseek-http-429', 'http-429'),
+])
+def test_a_repair_that_fails_like_an_outage_leaves_the_appraisal_that_ran_charged(setup, monkeypatch, fault, error, repair_outcome):
+    """CR4-MM-04: the full appraisal ran to its answer, which needs one schema repair, and the repair
+    fails the way an outage does. That fault is the repair's alone: the attempt that made the full
+    call is charged, keeps both calls, and spends the charged budget with its backoff -- not the
+    transient one -- until the cap sets the row aside."""
+    from kin_mind.appraisal import MAX_CHARGED_ATTEMPTS
+    monkeypatch.setenv('KIN_TEST_DS_KEY', 'synthetic')
+    mind, source, _ = setup
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source('repair-outage-' + fault)], 'synthetic-v1')
+
+    def row():
+        with mind.engine.db.connect() as conn:
+            found = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (job['id'],)).fetchone()
+        return found['state'], found['attempts'], json.loads(found['data'])
+    asked = []
+    assert jobs.run_one(repair_fails(mind, fault, asked))['state'] == 'pending'
+    assert asked == ['submit_appraisal', 'repair_appraisal']
+    state, charged, data = row()
+    assert (state, charged) == ('pending', 1), 'the attempt that made the full call is counted'
+    assert data['error'] == error and not data.get('transient_failures')
+    [ledger] = attempts.read(mind.engine, mind.scope.key(), job_id=job['id'])['attempts']
+    assert ledger['charged'] is True
+    assert [(c['purpose'], c['outcome']) for c in ledger['calls']] == [('appraise', 'schema-invalid'), ('schema-repair', repair_outcome)]
+    # An outage repeating is not the same fault twice: the charged cap, not the repeat rule, bounds it.
+    for attempt in range(2, MAX_CHARGED_ATTEMPTS + 1):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute("UPDATE mind_appraisals SET available=0 WHERE id=?", (job['id'],))
+        jobs.run_one(repair_fails(mind, fault, asked))
+        state, charged, data = row()
+        assert charged == attempt
+        assert state == ('needs-repair' if attempt == MAX_CHARGED_ATTEMPTS else 'pending'), attempt
+    assert data['repair_reason'].startswith('charged-attempts-exhausted')

@@ -310,14 +310,18 @@ def dispatch(config, action, request):
         )
         job = jobs.enqueue([source["id"]], config["agent_version"])
         memory.ingest({**request, "kind": "owner-message", "source_id": source["id"], "session": request.get("session") or config["session_id"]})
-        if request.get("defer_context") and memory.settings()["context"]:
+        # A resident action only stores (CR4-MM-05): whatever the request asks, `ingest` prepares no
+        # context. A context that may call a model -- a deep recall, an embedding -- is prepared by
+        # `memory-context`, a worker of its own under the model lanes' admission. With the context
+        # layer off, the answer is the state view, as before, and nothing to prepare.
+        if memory.settings()["context"]:
             return {"source_id": source["id"], "appraisal": job, "memory_enabled": True}
         return {
             "source_id": source["id"],
             "appraisal": job,
             "state": mind.read(query=request["text"]),
             "findings": explorer.recent(),
-            "memory_context": Contexts(mind).build(query=request["text"], session=config["session_id"], event_id=request["id"], purpose=request.get("purpose", "chat")),
+            "memory_context": {"state": "disabled", "text": "", "tokens": 0},
         }
     if action == "read":
         return {
