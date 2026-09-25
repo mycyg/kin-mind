@@ -53,3 +53,19 @@ test('a send asks before its upload and before its message request, and stopping
     assert.deepEqual(run.seen.map(s=>s.stage),expected);assert.ok(run.seen.every(s=>s.submissionStarted===false));
   }
 });
+
+test('a check that answers later is waited for: nothing is uploaded or requested before it, and its rejection submits nothing (CR4-FLOW-02)',async()=>{
+  // The host's send admission renews with the granting host before each stage, so its answer arrives after a round trip.
+  const order=[],{seen,checkpoint}=stages();
+  const later=(stage,fail)=>new Promise((resolve,reject)=>setTimeout(()=>{order.push('checked '+stage);fail?reject(Object.assign(Error('lost'),{code:'KIN_SEND_ADMISSION_LOST'})):resolve();},5));
+  assert.equal(await submitPayload({media:{name:'a.png'},uuid:'u',checkpoint:value=>{order.push(value.stage);checkpoint(value);},beforeSubmit:stage=>later(stage),
+    upload:async()=>{order.push('upload');return {file_key:'fk'};},create:async()=>{order.push('create');return {code:0,data:{message_id:'om_5'}};}}),'om_5');
+  assert.deepEqual(order,['checked upload','uploading','upload','uploaded','checked message','message-submitting','create']);
+  // Rejected after the upload (the host restarted meanwhile): uploaded, never submitted.
+  const run=stages();let created=false;
+  await assert.rejects(submitPayload({media:{name:'b.png'},uuid:'u',checkpoint:run.checkpoint,beforeSubmit:stage=>later(stage,stage==='message'),
+    upload:async()=>({file_key:'fk'}),create:async()=>{created=true;return {code:0,data:{message_id:'om_6'}};}}),error=>error.code==='KIN_SEND_ADMISSION_LOST');
+  assert.equal(created,false);
+  assert.deepEqual(run.seen.map(s=>[s.stage,s.submissionStarted]),[['uploading',false],['uploaded',false]]);
+  assert.equal(seen.length,3);
+});
