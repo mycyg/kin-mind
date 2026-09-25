@@ -934,11 +934,17 @@ export class MobileRouter {
     // The catalog is read before the clock starts, and the clock always has a
     // listener: a slow catalog can never leave a rejection nobody handles (AD1-05).
     const availableModels=await this.availableModels(runtime);
+    // One deadline for the whole call, the lane's admission and the request alike. When it
+    // passes the call is canceled — a lease that comes late starts nothing — and this
+    // answers only once the call has let go of everything it held, so an activity it runs
+    // under is held until then too (CR4-FLOW-01).
+    const deadline=new AbortController();
     let timer;
-    const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('classification-timeout')),wait);});
+    const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{deadline.abort(Error('classification-timeout'));reject(Error('classification-timeout'));},wait);});
     timeout.catch(()=>{});
-    try {return await Promise.race([this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.openWork().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})}),timeout]);}
-    finally {clearTimeout(timer);}
+    const call=Promise.resolve().then(()=>this.classify({text:input.text,clock:conversationClock(input,this.now()),recent:recentConversation(this.state.recent),task:this.currentTask()?.summary??null,mode:this.state.mode,currentProfile:this.state.manualProfile??(runtime?runtimeProfile(runtime):null),workHeld:Boolean(this.openWork().length||runtime?.active),availableModels,timeoutMs:wait,...(files.length?{attachments:files}:{}),...(intents?{intents:true}:{})},{signal:deadline.signal}));
+    try {return await Promise.race([call,timeout]);}
+    finally {clearTimeout(timer);await call.then(()=>{},()=>{});}
   }
   /** A classification answer, validated and read within its bounds. It never owns
    * the execution lock and never changes state; it exists only when the classifier
