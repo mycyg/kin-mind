@@ -130,10 +130,10 @@ class AffectiveEvent(Model):
 CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
 # A draft that could not start waits five minutes more each time, up to half an hour (CR2-INT-06).
 DRAFT_START_WAIT_MAX_SECONDS = 1800
-# What the host keeps of a fork turn (boundaries.mjs `forkReceipt`: 64 tool calls, 100 ids a call),
-# and how many ids of what a draft was shown an attempt row names. Past either, the row says the
-# record was cut short, and the settlement treats it so (CL6D-MM-01).
-FORK_TOOL_CALLS, FORK_TOOL_IDS, DRAFT_SHOWN_IDS = 64, 100, 4000
+# What the host keeps of a fork turn (boundaries.mjs `forkReceipt`: 64 tool calls, 1000 ids a call and
+# 2000 a turn), and how many ids of what a draft was shown an attempt row names. Past any, the row says
+# the record was cut short, and the settlement treats it so (CL6D-MM-01, CL6E-MM-04).
+FORK_TOOL_CALLS, FORK_TOOL_IDS, FORK_TURN_IDS, DRAFT_SHOWN_IDS = 64, 1000, 2000, 4000
 
 
 def fork_reads(value):
@@ -143,16 +143,18 @@ def fork_reads(value):
     if not isinstance(value, dict):
         return None
     calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) else []
-    kept, cut = [], value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS
+    kept, cut, room = [], value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS, FORK_TURN_IDS
     for call in calls[:FORK_TOOL_CALLS]:
         if not isinstance(call, dict):
             continue
         entries = call.get("ids") if isinstance(call.get("ids"), list) else []
-        cut = cut or len(entries) > FORK_TOOL_IDS
-        kept.append({"name": str(call.get("name") or "")[:128], "ok": call.get("ok") is True,
-                     "ids": [{"id": entry["id"], "revision": entry["revision"] if type(entry.get("revision")) is int else None}
-                             for entry in entries[:FORK_TOOL_IDS]
-                             if isinstance(entry, dict) and isinstance(entry.get("id"), str) and 0 < len(entry["id"]) <= 200]})
+        ids = [{"id": entry["id"], "revision": entry["revision"] if type(entry.get("revision")) is int else None}
+               for entry in entries[:FORK_TOOL_IDS]
+               if isinstance(entry, dict) and isinstance(entry.get("id"), str) and 0 < len(entry["id"]) <= 200]
+        cut = cut or len(entries) > FORK_TOOL_IDS or len(ids) > room
+        ids = ids[:room]
+        room -= len(ids)
+        kept.append({"name": str(call.get("name") or "")[:128], "ok": call.get("ok") is True, "ids": ids})
     return {"tool_calls": kept, **({"truncated": True} if cut else {})}
 
 
