@@ -710,8 +710,9 @@ def test_a_creation_keeps_no_words_once_its_plans_own_evidence_is_deleted_during
 def test_a_plan_whose_evidence_is_deleted_keeps_its_steps_and_their_state_without_their_words(env):
     """Deleting what a plan was written from takes the plan's words -- its goal, each step's goal
     and completion -- and keeps every step with its id, state and revision. Emptied, the step list
-    left a running step that no host call could find: renewing or settling it failed, and the next
-    save would have called the plan completed."""
+    left a running step that no host call could find: renewing it, settling it or taking its run
+    back failed, and once its lease ran out every later claim of that actor failed with it, since a
+    claim first takes back the runs whose lease ran out."""
     from test_autonomous_plans import create, decide
 
     mind, plans, _, _, _ = env
@@ -729,9 +730,14 @@ def test_a_plan_whose_evidence_is_deleted_keeps_its_steps_and_their_state_withou
     assert (step["id"], step["state"], step["goal"], step["completion"]) == ("make", "running", ERASED, ERASED)
     assert plan["status"] == "active" and plan["goal"] == ERASED
     assert plans.renew(run["id"], "worker", 1) == {"state": "interrupt", "reason": "plan-or-evidence-changed"}
-    assert plans.settle(run["id"], "worker", 1, state="interrupted", result={"reason": "plan-or-evidence-changed"})["state"] == "interrupted"
+    # The executor never answers: its lease runs out, and the next claim takes the run back.
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=0 WHERE id=?", (run["id"],))
+    assert plans.claim("create", "worker")["state"] == "waiting", "nothing else to claim, and no failure"
     with mind.engine.db.connect() as conn:
         plan = plans.get(conn, run["plan_id"])
+        reclaimed = conn.execute("SELECT state FROM mind_plan_runs WHERE id=?", (run["id"],)).fetchone()[0]
+    assert reclaimed == "interrupted"
     assert plan["status"] == "active" and [s["state"] for s in plan["steps"]] == ["waiting"]
     assert texts_everywhere(mind.engine, MARKER) == set()
 
