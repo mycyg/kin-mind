@@ -266,12 +266,20 @@ in-progress state, its plan step is decided again or the owner pauses
 exploration. Busy owner work only keeps a new run from starting. The wrapper
 terminates only its own child process group: the CLI and everything it started
 there, until the group is empty, including after a CLI that exited on its own.
-That group is a session of its own, outside the worker's, so the worker reports
-it to the host on its control channel the moment it exists and again once it is
-empty (`kin_mind/worker_groups.py`). A TERM for the worker is passed on to it, and
-the host sends its own TERM, and the KILL after it, to the group as well: the
-exploration stays in flight for the router, `/busy` and a freeze's drain until
-the group has ended, not merely until the worker has (CR3-MM-02). A timeout keeps any already
+Every process of the run carries the mark the host gave the worker
+(`KIN_WORKER_MARK`, in the CLI's environment and in each MCP server's), whatever
+group or session it moves to; the worker itself passes it on to nothing else
+(`kin_mind/worker_groups.py`). The host ends the run's processes with the worker --
+found by the mark, as children of processes of the run and as members of their
+groups, and followed by their own identity once seen -- and counts the
+exploration in flight, for the router, `/busy` and a freeze's drain, until a fresh
+read of the process table shows none of them left; a table it cannot read keeps it
+in flight. A shutdown that cannot see a run end leaves its mark in
+`state/unconfirmed-executions.json`, and the next start ends what still carries it
+before anything else runs (CR3-MM-02, CR4-MM-03). macOS hides the environment of a
+platform binary such as `/bin/sleep`: one that leaves the run before the host has
+seen it as the child of a process of the run is the case these links cannot cover.
+A timeout keeps any already
 completed final report as a partial checkpoint. A missing final report is recorded
 as incomplete, never fabricated. Crash-interrupted jobs stay inspectable.
 `exploration_backend` must be `codex`, the default; any other value pauses with

@@ -149,8 +149,9 @@ def host_config(tmp_path, mind, **extra):
 # Python's C-locale coercion (PEP 538) when LANG is unset.
 RUNTIME_ADDED = {"CPATH", "LIBRARY_PATH", "MANPATH", "SDKROOT", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
 
+# KIN_WORKER_MARK is no credential: the random mark the host finds every process of the run by (CR4-MM-03).
 ALLOWED_ENV = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE",
-               "CODEX_HOME", "KIN_TEST_DS_KEY"}
+               "CODEX_HOME", "KIN_TEST_DS_KEY", "KIN_WORKER_MARK"}
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 
