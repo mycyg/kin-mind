@@ -15,7 +15,8 @@ def erase_set(conn, object_id):
     raw sources too, because their bytes hold the same words. What a record does not take is a
     source it cites only through the records it was written from: a narrative or a summary cites
     the sources of the conversations it summarised, and deleting the summary is not deleting
-    the owner's messages it was written about."""
+    the owner's messages it was written about. A derived source -- stored with `derived_from` --
+    goes with its record, since its bytes are the derived words (CR5-MM-02)."""
     if object_id.startswith("src_"):
         sources, pending = {object_id}, {object_id}
     else:
@@ -24,18 +25,30 @@ def erase_set(conn, object_id):
             "SELECT e.source_id FROM dependencies d JOIN evidence e ON e.record_id=d.evidence_id"
             " WHERE d.record_id=?", (object_id,))}
         sources, pending = own - cited, {object_id}
-    for sid in sources:
-        pending.update(r[0] for r in conn.execute("SELECT record_id FROM evidence WHERE source_id=?", (sid,)))
-    records = set()
-    while pending:
-        current = pending.pop()
-        if current in records:
-            continue
-        records.add(current)
-        pending.update(r[0] for r in conn.execute(
-            "SELECT record_id FROM dependencies WHERE evidence_id=?", (current,)))
-        pending.update(r[0] for r in conn.execute("SELECT id FROM records WHERE parent_id=?", (current,)))
-    return records, sources
+    records, walked = set(), set()
+    while True:
+        for sid in sources - walked:
+            pending.update(r[0] for r in conn.execute("SELECT record_id FROM evidence WHERE source_id=?", (sid,)))
+        walked |= sources
+        while pending:
+            current = pending.pop()
+            if current in records:
+                continue
+            records.add(current)
+            pending.update(r[0] for r in conn.execute(
+                "SELECT record_id FROM dependencies WHERE evidence_id=?", (current,)))
+            pending.update(r[0] for r in conn.execute("SELECT id FROM records WHERE parent_id=?", (current,)))
+        # A derived source -- a reflection, a creation's summary -- holds in its own bytes the words it
+        # was written from: it goes with the record it was stored as, and whatever was built on it
+        # after it (CR5-MM-02).
+        derived = set()
+        for rid in records:
+            derived.update(r[0] for r in conn.execute(
+                "SELECT e.source_id FROM evidence e JOIN sources s ON s.id=e.source_id"
+                " WHERE e.record_id=? AND json_extract(s.data,'$.derived_from') IS NOT NULL", (rid,)))
+        if derived <= sources:
+            return records, sources
+        sources |= derived
 
 
 def deletion_preview(engine, object_id):

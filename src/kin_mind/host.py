@@ -89,9 +89,12 @@ def dispatch(config, action, request):
             from .decision_context import execution_brief
             result = plans.claim(**request)
             if result["state"] == "claimed":
+                shown = []
                 result["brief"] = execution_brief(mind, question=result["step"]["goal"],
                     evidence_ids=[r["record_id"] for r in result["run"]["decision"]["evidence"]],
-                    plan=result["plan"], step=result["step"])
+                    plan=result["plan"], step=result["step"], shown=shown)
+                # What the brief showed is what the run's result is checked against when stored (CR5-MM-02).
+                plans.note_shown(result["run"]["id"], shown)
             return result
         if action == "procedure-memory":
             return Procedures(mind).read(**request)

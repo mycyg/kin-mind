@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlparse
 from pydantic import Field, field_validator
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.engine import DERIVED_CONFLICTS
 from eventmem.core.models import Model, SourceInput
 
 from . import liveness
@@ -312,6 +313,9 @@ class Explorations:
                 self.mind._history(conn, event_id, current, "exploration-start", request.model_dump())
         except Conflict:
             return {"state": "waiting", "reason": "exploration-claim-changed"}
+        # Every source the run is shown besides the wish's evidence: its report is kept only while
+        # all of it still stands (CR5-MM-02).
+        shown = []
         try:
             options = {}
             ui_enabled = bool((computer or {}).get("enabled")
@@ -330,8 +334,9 @@ class Explorations:
                     if prior.get("desire_id") == desire["id"] and isinstance(prior.get("checkpoint"), dict):
                         options["continuation"] = prior["checkpoint"]
                         break
-            from .decision_context import execution_brief
-            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"])
+            from .decision_context import execution_brief, sources_named
+            shown.extend(sources_named(options.get("continuation")))
+            reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown)
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
                 "source_ids": data["evidence_ids"]}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=self._stop_when(canceled, desire["id"]), model=model, **options)
@@ -389,21 +394,43 @@ class Explorations:
                           "stored_content": "excerpt", "delivery": web_delivery(receipt)}))
             observation_ids.append(observed["id"])
         executor = data.get("executor") or "codex-cli"
-        source = self.engine.receive(SourceInput(namespace="kin-exploration", key=eid,
-            scope=self.mind.scope, authority="model", kind="observation", session=eid,
-            text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
-            occurred_at=self.mind.clock(), extract=not MemoryContinuity(self.mind).settings()['semantic'],
-            # Executor (the CLI that ran) and provider (the model behind it) are
-            # distinct facts; legacy rows come from kimi-cli running kimi.
-            metadata={"host_event": "exploration-result", "executor": executor,
-                      "provider": data.get("provider"),
-                      "model": data.get("model"), "reasoning": data.get("reasoning"),
-                      "exploration_id": eid,
-                      "exploration_target": target, "observation_ids": observation_ids,
-                      "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])}))
+
+        def report():
+            return SourceInput(namespace="kin-exploration", key=eid,
+                scope=self.mind.scope, authority="model", kind="observation", session=eid,
+                text=dumps({"state": state, "result": data.get("result"), "partial": data.get("partial", True)}),
+                occurred_at=self.mind.clock(), extract=not MemoryContinuity(self.mind).settings()['semantic'],
+                # Executor (the CLI that ran) and provider (the model behind it) are
+                # distinct facts; legacy rows come from kimi-cli running kimi.
+                metadata={"host_event": "exploration-result", "executor": executor,
+                          "provider": data.get("provider"),
+                          "model": data.get("model"), "reasoning": data.get("reasoning"),
+                          "exploration_id": eid,
+                          "exploration_target": target, "observation_ids": observation_ids,
+                          "partial": data.get("partial", True), "sources": (data.get("result") or {}).get("sources", [])})
+        if data.get("result") is None:
+            source = self.engine.receive(report())
+        else:
+            # The report is written from the wish's evidence, which it goes with, and from what the
+            # brief showed besides: checked where it is stored (CR5-MM-02).
+            try:
+                source = self.engine.receive(report(), derived_from=data["evidence_ids"], shown=shown)
+            except Conflict as error:
+                if getattr(error, "code", None) not in DERIVED_CONFLICTS:
+                    raise
+                # Something it was given was deleted or changed while it ran: the report is not
+                # kept. The run, its observations and its cost stay facts.
+                state = "failed"
+                data.update(error="exploration-inputs-changed", inputs_withheld=error.code, partial=True, result=None)
+                source = self.engine.receive(report())
         data["source_id"] = source["id"]
         data["observation_ids"] = observation_ids
+        # The run names everything its brief showed: one deleted since loses it its words, in this
+        # write and at any later delete (CR5-MM-02).
+        data["evaluated_sources"] = shown
         with self.engine.db.connect(write=True) as conn:
+            from .erasure import drop_deleted
+            data = drop_deleted(conn, data)
             current = self.mind._load(conn)
             active = current["desires"].get(desire["id"])
             if active and active["revision"] == data["desire_revision"] and active["status"] == "in_progress":

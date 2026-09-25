@@ -16,6 +16,11 @@ def uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+# A derived source whose inputs were deleted or changed before it was stored: the writer keeps its
+# facts and withholds the words (CR5-MM-02). A cross-scope citation is an error, not one of these.
+DERIVED_CONFLICTS = frozenset({"derived-from-deleted", "derived-from-changed"})
+
+
 class Engine:
     """All authoritative writes, including host adapters, pass through this class.
 
@@ -51,7 +56,64 @@ class Engine:
         record(conn, stamp, key, now())
         return result
 
-    def receive(self, source: SourceInput, attachment: bytes | None = None) -> dict:
+    def _derivable(self, conn, derived_from, scope, shown=()):
+        """What a derived source rests on, checked in the transaction that stores it: nothing of it
+        deleted, and nothing changed since it was read where a read version is given. Refs as the
+        mind keeps them (source_id, record_id, hash, revision) or bare ids. `derived_from` is what
+        the new source cites: in its own scope, and its records become the root record's
+        dependencies (a bare source id stands for its root record, or for the records parsed from
+        it). `shown` is what its writer was only shown: checked the same way, and not kept.
+        Returns the refs to keep with the source and the records its root depends on."""
+        kept, records = [], set()
+        for item, cited in [*((item, True) for item in derived_from), *((item, False) for item in shown)]:
+            if isinstance(item, str):
+                item = {"source_id": item} if item.startswith("src_") else {"record_id": item}
+            if not isinstance(item, dict):
+                continue
+            sid, rid = item.get("source_id"), item.get("record_id")
+            root = "mem_" + digest([sid, "root"])[:32] if isinstance(sid, str) and sid and not rid else None
+            named = [key for key in (sid, rid, root) if isinstance(key, str) and key]
+            if not named:
+                continue
+            if conn.execute("SELECT 1 FROM tombstones WHERE key IN (" + ",".join("?" * len(named)) + ") LIMIT 1",
+                            named).fetchone():
+                raise Deleted("What this was written from has been deleted", code="derived-from-deleted", target=named[0])
+            if sid:
+                row = conn.execute("SELECT hash,deleted,scope FROM sources WHERE id=?", (sid,)).fetchone()
+                if not row or row["deleted"]:
+                    raise Deleted("What this was written from has been deleted", code="derived-from-deleted", target=sid)
+                if cited and row["scope"] != scope.key():
+                    raise Conflict("A derived source rests on another scope", code="derived-from-scope", target=sid)
+                if item.get("hash") and item["hash"] != row["hash"]:
+                    raise Conflict("What this was written from has changed", code="derived-from-changed", target=sid)
+            if rid:
+                row = conn.execute("SELECT revision,deleted,scope FROM records WHERE id=?", (rid,)).fetchone()
+                if not row or row["deleted"]:
+                    raise Deleted("What this was written from has been deleted", code="derived-from-deleted", target=rid)
+                if cited and row["scope"] != scope.key():
+                    raise Conflict("A derived source rests on another scope", code="derived-from-scope", target=rid)
+                if item.get("revision") is not None and item["revision"] != row["revision"]:
+                    raise Conflict("What this was written from has changed", code="derived-from-changed", target=rid,
+                                   expected=item["revision"], actual=row["revision"])
+                rests = [rid]
+            else:
+                # A source is its root record, or, for an attachment, what was parsed from it.
+                rests = [root] if conn.execute("SELECT 1 FROM records WHERE id=? AND deleted=0", (root,)).fetchone() else [
+                    r[0] for r in conn.execute("SELECT e.record_id FROM evidence e JOIN records r ON r.id=e.record_id"
+                                               " WHERE e.source_id=? AND r.deleted=0", (sid,))]
+            if cited:
+                kept.append({key: value for key, value in (("source_id", sid), ("record_id", rid), ("hash", item.get("hash")),
+                                                           ("revision", item.get("revision"))) if value is not None})
+                records.update(rests)
+        return kept, sorted(records)
+
+    def receive(self, source: SourceInput, attachment: bytes | None = None, *, derived_from=None, shown=None) -> dict:
+        """Store a source. `derived_from` makes it a derived one: text written from other sources
+        and records -- a reflection, a creation's summary, an exploration's report. What it names
+        is checked in the same transaction that stores it, so a delete cannot come in between, and
+        becomes its root record's dependencies, so deleting any of it later takes the derived
+        source with it (`maintenance.erase_set`). `shown` is what the writer read besides -- recent
+        dialogue, earlier results: checked with it, not kept as dependencies (CR5-MM-02)."""
         identity = [source.namespace, source.key, source.version, source.scope.key()]
         sid = "src_" + digest(identity)[:32]
         raw = attachment if attachment is not None else source.text.encode()
@@ -77,9 +139,17 @@ class Engine:
                 if previous["hash"] != hash_:
                     raise Conflict("Source changed: provide a new version")
                 return self._source(previous)
+            rests_on = []
+            if derived_from is not None or shown:
+                if attachment is not None or not source.text or len(source.text) > 1_000_000:
+                    raise ValueError("A derived source is inline text")
+                kept, rests_on = self._derivable(conn, derived_from or (), source.scope, shown or ())
+                derived_from = kept if derived_from is not None else None
             stamp = now()
             data = source.model_dump(exclude={"text"})
             data["byte_length"] = len(raw)
+            if derived_from is not None:
+                data["derived_from"] = derived_from
             conn.execute(
                 "INSERT INTO sources(id,namespace,source_key,version,scope,session,received_at,occurred_at,hash,blob,data,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -127,6 +197,7 @@ class Engine:
                     valid_from=source.occurred_at,
                     confirmation=confirmation,
                     generated=source.authority == "model",
+                    evidence_ids=rests_on,
                     # The stamp is the engine's word: a caller cannot supply one it did not earn.
                     attributes={k: v for k, v in source.metadata.items() if k != STAMP}
                     | ({STAMP: origin} if origin else {}),

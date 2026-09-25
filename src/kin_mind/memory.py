@@ -16,6 +16,7 @@ from typing import Literal
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
+from eventmem.core.engine import DERIVED_CONFLICTS
 from eventmem.core.models import Model, RecordInput, SourceInput
 
 from . import memory_items
@@ -440,13 +441,31 @@ class MemoryContinuity:
         authority = "explicit" if kind == "owner-message" else "model" if kind in {"assistant-message", "exploration-result"} else "operation"
         source_id = event.get("source_id")
         if not source_id:
-            source_id = self.engine.receive(SourceInput(
-                namespace="kin-runtime", key=event_id, scope=self.scope, session=event.get("session", "host"),
-                text=dumps({**event, "artifact": artifact}) if kind != "owner-message" else event.get("text", ""),
-                authority=authority, occurred_at=event["at"], extract=False,
-                metadata={"host_event": kind, "role": "user" if kind == "owner-message" else "assistant",
-                          "runtime_event_id": event_id, "channel": event.get("channel"), "internal": kind not in {"owner-message", "assistant-message"}},
-            ))["id"]
+            def received(observed, derived_from, shown):
+                return self.engine.receive(SourceInput(
+                    namespace="kin-runtime", key=event_id, scope=self.scope, session=observed.get("session", "host"),
+                    text=dumps({**observed, "artifact": artifact}) if kind != "owner-message" else observed.get("text", ""),
+                    authority=authority, occurred_at=observed["at"], extract=False,
+                    metadata={"host_event": kind, "role": "user" if kind == "owner-message" else "assistant",
+                              "runtime_event_id": event_id, "channel": observed.get("channel"), "internal": kind not in {"owner-message", "assistant-message"}},
+                ), derived_from=derived_from, shown=shown)["id"]
+            # An event that names the sources it was written from -- a creation's summary -- is a
+            # derived source: they are checked where it is stored and become its dependencies, and
+            # what its writer was shown besides (`shown_sources`) is checked with them (CR5-MM-02).
+            inputs = event.get("input_source_ids") or None
+            shown = event.get("shown_sources") or None
+            try:
+                source_id = received(event, inputs, shown)
+            except Conflict as error:
+                if (inputs is None and shown is None) or getattr(error, "code", None) not in DERIVED_CONFLICTS:
+                    raise
+                # What it was written from is gone or changed: the artifact and the run stay facts,
+                # every word written from those sources goes, by the delete's own rule.
+                from .erasure import scrub
+                event = {**scrub({key: value for key, value in event.items() if key != "artifact"}, (), erase=True),
+                         **({"artifact": event["artifact"]} if "artifact" in event else {}),
+                         "input_source_ids": [], "shown_sources": [], "inputs_withheld": error.code}
+                source_id = received(event, None, None)
         with self.engine.db.connect(write=True) as conn:
             # Another host may have committed while file/source IO ran.
             old = conn.execute("SELECT * FROM mind_runtime_events WHERE id=?", (event_id,)).fetchone()
@@ -797,6 +816,11 @@ class MemoryContinuity:
 
         The appraisal event is its identity. Re-entering after a restart reuses
         the source; it does not evaluate or score the experience again.
+
+        It is a derived source: it rests on the evidence it cites and on what the appraisal was
+        about, which become its dependencies, and it was written from everything the appraisal was
+        shown (`evaluated_sources`, refs at the versions read). All of it is checked where it is
+        stored; one deleted or changed since, and it is not kept (CR5-MM-02).
         """
         understanding = (result.get("proposal") or {}).get("understanding")
         if not understanding or understanding.get("basis") != "internal_thought":
@@ -814,6 +838,16 @@ class MemoryContinuity:
             return self.engine._source(kept)
         # Neutral words for who thought it and whose words it is not: the core names no owner and
         # no role; `basis: internal_thought` is what tells the two apart (K1-21, K3-03).
+        derived_from = list(dict.fromkeys([*understanding.get("evidence_ids", []), *(result.get("rests_on") or [])]))
+        shown = [ref for ref in result.get("evaluated_sources") or [] if isinstance(ref, dict)]
+        try:
+            return self._reflect(result, understanding, event, derived_from, shown)
+        except Conflict as error:
+            if getattr(error, "code", None) in DERIVED_CONFLICTS:
+                return None
+            raise
+
+    def _reflect(self, result, understanding, event, derived_from, shown):
         return self.engine.receive(SourceInput(
             namespace="kin-reflection", key=result["event_id"],
             scope=self.scope, occurred_at=event["occurred_at"], authority="model",
@@ -822,7 +856,7 @@ class MemoryContinuity:
             metadata={"role": "assistant", "basis": "internal_thought", "internal": True,
                       "host_event": "diary", "topic": understanding.get("topic"), "appraisal_event_id": result["event_id"],
                       "evidence_ids": understanding.get("evidence_ids", []),
-                      "confidence": understanding.get("confidence")}))
+                      "confidence": understanding.get("confidence")}), derived_from=derived_from, shown=shown)
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None):
         """Called inside the same transaction as affect/concerns/wishes.

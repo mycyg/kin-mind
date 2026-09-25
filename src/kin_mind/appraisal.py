@@ -2716,7 +2716,8 @@ class Appraisals:
                     data["result"] = self.mind._record_only(event, apply)
                 else:
                     data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
-            self.memory.remember_reflection(data["result"])
+            # What the appraisal was shown goes with the result: the reflection is written from it (CR5-MM-02).
+            self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or []})
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.

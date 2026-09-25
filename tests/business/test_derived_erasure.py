@@ -159,3 +159,282 @@ def test_what_a_run_or_a_concern_wrote_goes_and_its_codes_and_ids_stay():
                "target": f"{MARKER} 街的老房子", "error_detail": {"code": "evidence-not-current", "target": gone}}
     erased = scrub(concern, frozenset({gone}))
     assert erased["target"] == ERASED and erased["error_detail"] == concern["error_detail"], "an identity is no word"
+
+
+def test_a_reflection_whose_source_is_deleted_after_the_commit_is_not_kept(setup, monkeypatch):
+    """The appraisal commits its understanding; its source is deleted before the reflection is
+    stored as a source of its own. The reflection is not kept, and nothing of the words is left
+    (CR5-MM-02)."""
+    mind, source, clock = setup
+    primary = source("afternoon", f"她说起 {MARKER} 的那个下午")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Thinker:
+        def appraise(self, context):
+            paid(self)
+            return answered(Appraisal(reason="想了想那个下午", values={"curiosity": 62}, understanding=Understanding(
+                meaning=f"那个 {MARKER} 的下午让我安静下来", topic="下午", importance=50, confidence=0.7,
+                basis="internal_thought", evidence_ids=[record])))
+
+    real = MemoryContinuity.remember_reflection
+
+    def deleted_first(self, result):
+        mind.engine.delete(primary)
+        return real(self, result)
+
+    monkeypatch.setattr(MemoryContinuity, "remember_reflection", deleted_first)
+    jobs = Appraisals(mind)
+    jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Thinker())
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone()
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def test_a_reflection_goes_with_the_source_it_was_written_from(setup):
+    """Kept while its source stood, a reflection is that source's dependent: deleting the source
+    takes the reflection, source and record, with it (CR5-MM-02)."""
+    mind, source, clock = setup
+    primary = source("evening", f"她说起 {MARKER} 的那个晚上")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Thinker:
+        def appraise(self, context):
+            paid(self)
+            return answered(Appraisal(reason="想了想那个晚上", values={"curiosity": 63}, understanding=Understanding(
+                meaning=f"那个 {MARKER} 的晚上很安静", topic="晚上", importance=50, confidence=0.7,
+                basis="internal_thought", evidence_ids=[record])))
+
+    jobs = Appraisals(mind)
+    jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Thinker())
+    with mind.engine.db.connect() as conn:
+        [reflection] = [row[0] for row in conn.execute("SELECT id FROM sources WHERE namespace='kin-reflection'")]
+    assert MARKER in mind.engine.source(reflection, content=True).read_text()
+    mind.engine.delete(primary)
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM tombstones WHERE key=?", (reflection,)).fetchone()
+        assert not conn.execute("SELECT 1 FROM sources WHERE id=?", (reflection,)).fetchone()
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def test_a_reflection_is_not_stored_once_a_source_it_was_only_shown_is_deleted(setup, monkeypatch):
+    """The appraisal committed while everything it was shown stood; a message it saw only as recent
+    dialogue is deleted before the reflection is stored. The reflection is not stored, so no record
+    or source holds the words. What the commit wrote before the delete goes with what it cites, as
+    every committed mind entry does (CR5-MM-02)."""
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"records": True})
+    recalled = MemoryContinuity(mind).ingest({"id": "said-before", "kind": "owner-message", "at": clock[0].isoformat(),
+                                              "text": f"我小时候住在 {MARKER} 街"})["source_id"]
+    primary = source("quiet", "今天下午很安静")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Thinker:
+        def appraise(self, context):
+            assert MARKER in json.dumps(context, ensure_ascii=False), "the earlier message was shown"
+            paid(self)
+            return answered(Appraisal(reason="安静的下午", values={"curiosity": 57}, understanding=Understanding(
+                meaning=f"安静的下午让我想起 {MARKER} 街", topic="下午", importance=50, confidence=0.7,
+                basis="internal_thought", evidence_ids=[record])))
+
+    real = MemoryContinuity.remember_reflection
+
+    def deleted_first(self, result):
+        mind.engine.delete(recalled)
+        return real(self, result)
+
+    monkeypatch.setattr(MemoryContinuity, "remember_reflection", deleted_first)
+    jobs = Appraisals(mind)
+    jobs.enqueue([primary], "synthetic-v1")
+    jobs.run_one(Thinker())
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM sources WHERE namespace='kin-reflection'").fetchone()
+    found = {table for table, _ in texts_everywhere(mind.engine, MARKER)}
+    assert not {table for table in found if table.startswith(("records", "sources", "mind_appraisals"))}, found
+
+
+def test_a_derived_source_may_rest_on_an_attachment_with_nothing_parsed_yet(setup):
+    """A bare source id stands for its root record, or for what was parsed from an attachment:
+    an attachment with nothing parsed is checked, not refused (CR5-MM-02)."""
+    mind, source, clock = setup
+    engine = mind.engine
+    picture = engine.receive(SourceInput(namespace="test", key="picture", scope=mind.scope, media_type="image/png",
+                                         occurred_at=clock[0].isoformat()), attachment=b"\x89PNG synthetic")["id"]
+    note = engine.receive(SourceInput(namespace="test", key="about-the-picture", scope=mind.scope, authority="model",
+                                      text="一张照片的读后感", occurred_at=clock[0].isoformat()), derived_from=[picture])
+    with engine.db.connect() as conn:
+        data = json.loads(conn.execute("SELECT data FROM sources WHERE id=?", (note["id"],)).fetchone()[0])
+    assert data["derived_from"] == [{"source_id": picture}]
+    engine.delete(picture)
+    try:
+        engine.receive(SourceInput(namespace="test", key="about-the-picture-again", scope=mind.scope, authority="model",
+                                   text="又一张读后感", occurred_at=clock[0].isoformat()), derived_from=[picture])
+    except Conflict as error:
+        assert error.code == "derived-from-deleted"
+    else:
+        raise AssertionError("a source written from a deleted one is refused")
+
+
+def creation(env, tmp_path):
+    """A creation step whose decision rests on a message that says the marker."""
+    from test_autonomous_plans import create, decide
+
+    mind, plans, _, _, _ = env
+    secret = mind.engine.receive(SourceInput(namespace="planning-test", key="secret", text=f"做一个 {MARKER} 的钟",
+                                             scope=mind.scope, authority="explicit", occurred_at=mind.clock(),
+                                             metadata={"role": "user", "host_event": "message"}))["id"]
+    decide(env, create(env), evidence=[secret])
+    run = plans.claim("create", "worker")["run"]
+    root = tmp_path / "creator"
+    root.mkdir()
+    made = root / "clock.json"
+    made.write_text('{"total":10}')
+    result = {"state": "produced", "summary": f"做好了 {MARKER} 的钟", "remaining": [], "verification": ["Parsed JSON"],
+              "artifacts": [fingerprint_file(made)],
+              "receipt": {"model": "gpt-6-astra", "run_id": run["id"], "thread_id": "isolated-native", "exit_code": 0,
+                          "workspace": str(root)}}
+    config = {"creation_directory": str(root), "creation_model": "gpt-6-astra", "agent_version": "planning-v1"}
+    return mind, secret, {"run_id": run["id"], "owner": "worker", "fence": 1, "result": result}, config
+
+
+class Review:
+    def __init__(self, meanwhile=lambda: None):
+        self.meanwhile = meanwhile
+
+    def structured(self, name, schema, system, context, **kwargs):
+        self.meanwhile()
+        return schema.model_validate({"complete": True, "reason": f"{MARKER} 的钟做好了",
+                                      "artifact_hashes": [context["verified_artifacts"][0]["sha256"]]}), \
+            {"provider": "deepseek", "reasoning": "high"}
+
+
+def artifact_kept(mind):
+    with mind.engine.db.connect() as conn:
+        events = [json.loads(row[0]) for row in conn.execute(
+            "SELECT data FROM mind_runtime_events WHERE kind='artifact-created'")]
+    return events
+
+
+def test_a_creation_whose_evidence_is_deleted_during_its_review_keeps_the_artifact_not_the_words(env, tmp_path):
+    """The review is out when the message the step rested on is deleted. The artifact and the run
+    stay facts -- the file's fingerprint, the event, the settled run -- and nothing the summary or
+    the review wrote from the deleted message is stored (CR5-MM-02)."""
+    mind, secret, request, config = creation(env, tmp_path)
+    settled = accept_result(mind, config, request, Review(lambda: mind.engine.delete(secret)))
+    settle(mind.engine)
+    assert settled["state"] != "completed"
+    [event] = artifact_kept(mind)
+    assert event["artifact"]["sha256"] == request["result"]["artifacts"][0]["sha256"]
+    assert event["inputs_withheld"] == "derived-from-deleted"
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def test_a_created_result_goes_with_the_evidence_it_was_written_from(env, tmp_path):
+    """Kept while its evidence stood, the creation's summary is a derived source: deleting the
+    evidence later takes it, and the settled run keeps its identity without the words (CR5-MM-02)."""
+    mind, secret, request, config = creation(env, tmp_path)
+    settled = accept_result(mind, config, request, Review())
+    assert settled["state"] == "completed"
+    assert MARKER in json.dumps(artifact_kept(mind), ensure_ascii=False)
+    mind.engine.delete(secret)
+    settle(mind.engine)
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect() as conn:
+        state, data = conn.execute("SELECT state,data FROM mind_plan_runs WHERE id=?", (request["run_id"],)).fetchone()
+    assert state == "completed" and json.loads(data)["result"]["verified"] is True
+
+
+def claim_with_brief(env, tmp_path):
+    """A creation step claimed the way the host claims it: through `plan-claim`, which hands the
+    creator its brief."""
+    from kin_mind import host
+    from test_autonomous_plans import create, decide
+
+    mind = env[0]
+    decide(env, create(env))
+    claimed = host.dispatch({"root": str(tmp_path), "scope": mind.scope.model_dump()}, "plan-claim",
+                            {"actor": "create", "owner": "worker"})
+    assert claimed["state"] == "claimed"
+    # The host's process keeps real time; the fixture's clock catches up with it.
+    env[3][0] = datetime.now(timezone.utc)
+    return claimed
+
+
+def test_a_creation_keeps_no_words_of_a_message_its_brief_showed_that_was_deleted_during_its_review(env, tmp_path):
+    """The step rests on other evidence; a message the creator's brief showed as recent dialogue is
+    deleted while the review is out. The artifact and the run stay facts; nothing the summary or the
+    review wrote is stored anywhere (CR5-MM-02)."""
+    mind = env[0]
+    said = MemoryContinuity(mind).ingest({"id": "said-while-making", "kind": "owner-message", "at": mind.clock(),
+                                          "text": f"钟面上写 {MARKER}"})["source_id"]
+    claimed = claim_with_brief(env, tmp_path)
+    assert MARKER in json.dumps(claimed["brief"], ensure_ascii=False), "the message was in the brief"
+    root = tmp_path / "creator"
+    root.mkdir()
+    made = root / "clock.json"
+    made.write_text('{"total":10}')
+    run = claimed["run"]
+    request = {"run_id": run["id"], "owner": "worker", "fence": run["fence"], "result": {
+        "state": "produced", "summary": f"做好了写着 {MARKER} 的钟", "remaining": [], "verification": ["Parsed JSON"],
+        "artifacts": [fingerprint_file(made)],
+        "receipt": {"model": "gpt-6-astra", "run_id": run["id"], "thread_id": "isolated-native", "exit_code": 0, "workspace": str(root)}}}
+    config = {"creation_directory": str(root), "creation_model": "gpt-6-astra", "agent_version": "planning-v1"}
+    settled = accept_result(mind, config, request, Review(lambda: mind.engine.delete(said)))
+    settle(mind.engine)
+    assert settled["state"] == "completed", "the step rested on other evidence, which stands"
+    [event] = artifact_kept(mind)
+    assert event["artifact"]["sha256"] == request["result"]["artifacts"][0]["sha256"]
+    assert event["inputs_withheld"] == "derived-from-deleted"
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def explore(env, tmp_path, meanwhile=lambda brief: None):
+    """One exploration of a planned wish, whose report names the marker."""
+    from kin_mind.exploration import Explorations
+    from test_autonomous_plans import create, decide
+
+    mind, plans, _, _, initial = env
+    decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+
+    def runner(executable, brief, directory, **kwargs):
+        meanwhile(brief)
+        return {"state": "complete", "partial": False, "attempt": 1,
+                "result": {"summary": f"查到了 {MARKER} 的来历", "findings": [f"{MARKER} 开业于 1990 年"],
+                           "sources": [{"url": "memory://" + initial, "title": "Owner note"}],
+                           "open_questions": [], "suggested_share": None}}
+    return Explorations(mind).run("codex", str(tmp_path / "explore"), "planning-v1", runner=runner)
+
+
+def test_an_exploration_keeps_no_report_written_while_a_message_it_was_shown_was_deleted(env, tmp_path):
+    """A message the exploration's brief showed is deleted while it runs, and the report repeats it.
+    The report is not kept; the run ends with the reason and keeps its facts (CR5-MM-02)."""
+    mind = env[0]
+    said = MemoryContinuity(mind).ingest({"id": "said-while-exploring", "kind": "owner-message", "at": mind.clock(),
+                                          "text": f"那家店好像叫 {MARKER}"})["source_id"]
+
+    def deleted(brief):
+        assert MARKER in json.dumps(brief, ensure_ascii=False), "the message was in the brief"
+        mind.engine.delete(said)
+
+    ran = explore(env, tmp_path, deleted)
+    settle(mind.engine)
+    assert ran["state"] == "failed" and ran["inputs_withheld"] == "derived-from-deleted" and ran["result"] is None
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def test_an_exploration_report_goes_with_the_evidence_of_its_wish(env, tmp_path):
+    """Kept while the wish's evidence stood, the report is that evidence's dependent: deleting it
+    later takes the report, source and record, and every copy of its words (CR5-MM-02)."""
+    mind, _, _, _, initial = env
+    ran = explore(env, tmp_path)
+    assert ran["state"] == "complete" and MARKER in mind.engine.source(ran["source_id"], content=True).read_text()
+    mind.engine.delete(initial)
+    settle(mind.engine)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM tombstones WHERE key=?", (ran["source_id"],)).fetchone()
+    assert texts_everywhere(mind.engine, MARKER) == set()

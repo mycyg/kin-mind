@@ -40,7 +40,12 @@ def accept_result(mind, config, request, provider=None):
         plan = plans.get(conn, run["plan_id"])
         step = next(s for s in plan["steps"] if s["id"] == run["step_id"])
     renewal = plans.renew(run_id, owner, fence)
-    base = {"manifest_hash": digest(result), "native_receipt": result.get("receipt"), "checkpoint": result.get("checkpoint") or result.get("receipt", {}).get("workspace")}
+    # Every settled result names what the run rested on and what its brief showed, so a delete of
+    # any of it, in the settling write or later, takes the words the review and the summary wrote
+    # from it (CR5-MM-02).
+    base = {"manifest_hash": digest(result), "native_receipt": result.get("receipt"), "checkpoint": result.get("checkpoint") or result.get("receipt", {}).get("workspace"),
+            "evidence_ids": sorted({ref[key] for ref in run["decision"]["evidence"] for key in ("source_id", "record_id")}),
+            "evaluated_sources": run.get("shown") or []}
     if result.get("state") != "produced" or renewal["state"] != "renewed":
         return plans.settle(run_id, owner, fence, state="interrupted" if result.get("state") == "interrupted" or renewal["state"] != "renewed" else "failed", result=base)
     receipt = result.get("receipt", {})
@@ -179,7 +184,8 @@ def accept_result(mind, config, request, provider=None):
     work_id = memory._id("work", ["plan-step", plan["id"], step["id"]])
     placed = [memory.ingest({"id": run_id + ":artifact:" + str(index), "kind": "artifact-created", "at": produced_at,
             "task_id": run_id, "work_id": work_id, "actor": "Kin", "artifact": artifact,
-            "text": result["summary"], "input_source_ids": [r["source_id"] for r in run["decision"]["evidence"]]})
+            "text": result["summary"], "input_source_ids": [r["source_id"] for r in run["decision"]["evidence"]],
+            "shown_sources": run.get("shown") or []})
         for index, artifact in enumerate(artifacts)]
     # The artifacts are facts whatever the plan says; the verified result is written only once
     # the plan has accepted the completion, so a refused settlement leaves no verified result
@@ -202,7 +208,10 @@ def accept_result(mind, config, request, provider=None):
     outcome = memory.ingest({"id": run_id + ":result:" + digest([complete, decision.model_dump()])[:16], "kind": "task-result", "at": produced_at,
         "task_id": run_id, "text": result["summary"], "verified": complete,
         "plan_id": plan["id"], "step_id": step["id"], "completion_review": decision.model_dump(),
-        "review_receipt": review_receipt, "native_receipt": receipt})
+        "review_receipt": review_receipt, "native_receipt": receipt,
+        # Written from the step's evidence: a derived source, checked and dependent; and from what
+        # the brief showed besides, checked with it (CR5-MM-02).
+        "input_source_ids": [r["source_id"] for r in run["decision"]["evidence"]], "shown_sources": run.get("shown") or []})
     if complete:
         from .reinforcement import record
         with mind.engine.db.connect(write=True) as conn:
