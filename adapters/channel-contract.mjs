@@ -4,7 +4,6 @@
  * channel really does. */
 import path from 'node:path';
 import {readJsonFile} from './atomic-json.mjs';
-import {platformErrorCode} from './send-stages.mjs';
 
 /** Text measures. A fragment must fit the platform limit in the unit the
  * platform counts, and every measure is additive over whole characters.
@@ -44,6 +43,17 @@ export function channelContract(channel,overrides={}) {
   return Object.freeze({...base,...overrides,text:Object.freeze({...base.text,...overrides.text}),file:Object.freeze({...base.file,...overrides.file})});
 }
 
+/** A platform error code: a whole number other than zero. Nothing else a platform answers
+ * with -- a string, a fraction, `null`, a missing field -- is read as its refusal. */
+export const platformErrorCode=code=>Number.isSafeInteger(code)&&code!==0;
+/** A WeChat server message ID in a send answer's body: a whole number above zero, or its digits. */
+export function hasWechatMessageId(body) {
+  const id=body?.message_id;
+  return (typeof id==='number'&&Number.isInteger(id)&&id>0)||(typeof id==='string'&&/^[1-9][0-9]*$/.test(id));
+}
+const readableBody=body=>Boolean(body)&&typeof body==='object'&&!Array.isArray(body);
+const refusedStatus=status=>Number.isInteger(status)&&status>=400&&status<500&&status!==409;
+
 /** What one WeChat send answer proves (CR5-FLOW-02). A refusal is only an answer that
  * shows the platform did not take the message:
  *   - an HTTP 4xx: the request was refused before it was processed. Except 409 Conflict:
@@ -55,19 +65,49 @@ export function channelContract(channel,overrides={}) {
  *   - an answer read whole whose `errcode` or `ret` is a platform error code, a whole
  *     number other than zero (`platformErrorCode`): iLink answers its own refusals with
  *     HTTP 200 and such a code (-14, an expired session, is the one wechat-acp names).
+ * An answer that names a server message ID and carries either of those as well
+ * contradicts itself, and explains nothing: unknown, `contradictory-answer` (CL6-FLOW-01).
  * Anything else leaves the outcome unknown, to be reconciled under the original client
- * ID: a 5xx (a proxy's or a gateway's included), any other status, a body that is not a
- * JSON object, a code that is not a whole number. `answered` refused nothing; the server
- * message ID then decides whether the platform took it. */
+ * ID: a 5xx (a proxy's or a gateway's included) or any other status, whatever its body
+ * says; a body that is not a JSON object; a code that is not a whole number. `answered`
+ * refused nothing; the server message ID then decides whether the platform took it. */
 export function wechatAnswer({status,body}) {
-  if(status>=400&&status<500&&status!==409)return {state:'rejected',reason:'http-'+status};
-  if(!(status>=200&&status<300))return {state:'unknown',reason:'http-'+status};
-  if(!body||typeof body!=='object'||Array.isArray(body))return {state:'unknown',reason:'response-unreadable'};
-  const codes=['errcode','ret'].filter(key=>Object.hasOwn(body,key)).map(key=>body[key]);
+  const readable=readableBody(body),refused=refusedStatus(status);
+  const codes=readable?['errcode','ret'].filter(key=>Object.hasOwn(body,key)).map(key=>body[key]):[];
   const refusal=codes.find(platformErrorCode);
+  if(!refused&&!(status>=200&&status<300))return {state:'unknown',reason:'http-'+status};
+  if((refused||refusal!==undefined)&&readable&&hasWechatMessageId(body))return {state:'unknown',reason:'contradictory-answer'};
+  if(refused)return {state:'rejected',reason:'http-'+status};
+  if(!readable)return {state:'unknown',reason:'response-unreadable'};
   if(refusal!==undefined)return {state:'rejected',reason:'api-'+refusal};
   if(codes.some(code=>code!==0))return {state:'unknown',reason:'api-code-unreadable'};
   return {state:'answered'};
+}
+
+/** What one Feishu message answer proves, by the same rule. The SDK hands a 2xx answer's
+ * body back; its HTTP client rejects any other status, and the SDK throws that error on
+ * unchanged, the answer on it (`error.response`: the status and the parsed body).
+ *   - rejected: `code` is a platform error code (`platformErrorCode`), in a 2xx answer or
+ *     in a 4xx other than 409 -- Feishu answers most refusals (a receive_id it does not
+ *     know, a bot outside the chat, the rate limit) with HTTP 400 or 429 and its own
+ *     code -- and no message ID;
+ *   - unknown: a 5xx, 409 or any other status, whatever its body says; an answer naming
+ *     a message ID with a refusal on it as well (`contradictory-answer`, CL6-FLOW-01); a
+ *     4xx without the platform's code; a body that is not a JSON object; a code that is
+ *     not a whole number; code 0 without a message ID. An unknown answer that named a
+ *     message ID carries it (`messageId`): evidence for the reconciliation;
+ *   - answered: code 0 and a message ID. */
+export function feishuAnswer({status,body}) {
+  const readable=readableBody(body),ok=Number.isInteger(status)&&status>=200&&status<300,refused=refusedStatus(status);
+  const code=readable?body.code:undefined,messageId=readable&&readableBody(body.data)?body.data.message_id:undefined;
+  const named=messageId?{messageId}:{};
+  if(!ok&&!refused)return {state:'unknown',reason:'http-'+status,...named};
+  if((refused||platformErrorCode(code))&&messageId)return {state:'unknown',reason:'contradictory-answer',...(platformErrorCode(code)?{code}:{}),messageId};
+  if(platformErrorCode(code))return {state:'rejected',reason:ok?'api-'+code:'http-'+status,code};
+  if(!ok)return {state:'unknown',reason:'http-'+status};
+  if(!readable)return {state:'unknown',reason:'response-unreadable'};
+  if(code!==0)return {state:'unknown',reason:'api-code-unreadable',...named};
+  return messageId?{state:'answered',messageId}:{state:'unknown',reason:'missing-message-id'};
 }
 
 /** A `rejected` receipt whose own evidence does not prove the refusal (CR5-FLOW-02):
@@ -87,10 +127,12 @@ const token=value=>typeof value==='string'&&/^[A-Za-z0-9_.:-]{1,64}$/.test(value
 /** One shape for both channels' receipt files and for outbox evidence rows.
  * It carries states, times and platform IDs only, never message text. A refusal
  * its receipt does not prove reads as `unconfirmed`, marked `refusal:'unproven'`
- * (CR5-FLOW-02): the message may have arrived. */
+ * (CR5-FLOW-02): the message may have arrived. A message ID is the platform's
+ * acceptance only on an accepted receipt: one a contradictory answer named stays in
+ * its receipt as evidence (CL6-FLOW-01), not here. */
 export function normalizeReceipt(record) {
   if(!record||typeof record!=='object'||typeof record.state!=='string')return null;
-  const literal=typeof record.responseText==='string'?record.responseText.match(/"message_id"\s*:\s*("[0-9]+"|[0-9]+)/)?.[1]?.replaceAll('"',''):undefined;
+  const literal=record.state==='accepted'&&typeof record.responseText==='string'?record.responseText.match(/"message_id"\s*:\s*("[0-9]+"|[0-9]+)/)?.[1]?.replaceAll('"',''):undefined;
   const messageId=record.messageId??record.message_id??literal;
   const unproven=unprovenRefusal(record)||(record.state==='unconfirmed'&&record.refusal==='unproven');
   return {state:unproven?'unconfirmed':record.state,...(unproven?{refusal:'unproven'}:{}),...(messageId?{messageId:String(messageId)}:{}),
