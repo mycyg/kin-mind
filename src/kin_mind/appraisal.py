@@ -1586,7 +1586,8 @@ class Appraisals:
                     for k, v in json.loads(r["data"]).items()
                     if k in {"receipt", "error", "result", "waiting_reason", "admission_waits", "last_wait_at",
                              "error_detail", "repair_reason", "compression_waits", "compression_stalls",
-                             "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts"}
+                             "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts",
+                             "deletion_refusals"}
                 },
             )
             for r in rows

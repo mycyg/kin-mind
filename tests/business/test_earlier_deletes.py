@@ -556,6 +556,7 @@ def test_a_commit_refused_for_a_delete_made_while_the_model_answered_is_not_char
         jobs.run_one(Deleting())
         state, count, data = queue_row(mind, job["id"])
         assert state == "pending" and count == 0 and data["deletion_refusals"] == n, data.get("repair_reason")
+        assert jobs.status(job["id"])["deletion_refusals"] == n, "the operator's view says why it waits"
         assert data["error_detail"]["code"] == "shown-deleted" and "error_repeats" not in data
         wait = available(job["id"]) - time.time()
         assert abs(wait - min(1800, DELETION_RETRY_SECONDS * 2 ** (n - 1))) < 60, (n, wait)

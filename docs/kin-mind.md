@@ -289,7 +289,10 @@ is still there, before anything else runs, and the drain counts every record,
 frozen or not (CR3-MM-02, CR4-MM-03, CR5-MM-05, CR5-MM-06). macOS hides the
 environment of a platform binary such as `/bin/sleep`: one that leaves the run
 before the host has seen it as the child of a process of the run is the case these
-links cannot cover.
+links cannot cover. To keep that window short the host reads the table every
+second while an execution runs an executor's CLI -- the exploration's worker, a
+creation step -- and every five seconds for the other workers, never two reads at
+once; one read of the whole table costs about 60 ms of CPU.
 A timeout keeps any already
 completed final report as a partial checkpoint. A missing final report is recorded
 as incomplete, never fabricated. Crash-interrupted jobs stay inspectable.
