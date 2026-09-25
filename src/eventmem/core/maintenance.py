@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .db import Missing, digest
-from .engine import uid
+from .engine import derived_source, uid
 
 
 def erase_set(conn, object_id):
@@ -16,7 +16,8 @@ def erase_set(conn, object_id):
     source it cites only through the records it was written from: a narrative or a summary cites
     the sources of the conversations it summarised, and deleting the summary is not deleting
     the owner's messages it was written about. A derived source -- stored with `derived_from` --
-    goes with its record, since its bytes are the derived words (CR5-MM-02)."""
+    goes with its own root record, since its bytes are the derived words (CR5-MM-02); a note that
+    merely cites one goes without it, like any other record that cites a source (CL6-MM-01)."""
     if object_id.startswith("src_"):
         sources, pending = {object_id}, {object_id}
     else:
@@ -25,7 +26,7 @@ def erase_set(conn, object_id):
             "SELECT e.source_id FROM dependencies d JOIN evidence e ON e.record_id=d.evidence_id"
             " WHERE d.record_id=?", (object_id,))}
         sources, pending = own - cited, {object_id}
-    records, walked = set(), set()
+    records, walked, examined = set(), set(), set()
     while True:
         for sid in sources - walked:
             pending.update(r[0] for r in conn.execute("SELECT record_id FROM evidence WHERE source_id=?", (sid,)))
@@ -39,13 +40,11 @@ def erase_set(conn, object_id):
                 "SELECT record_id FROM dependencies WHERE evidence_id=?", (current,)))
             pending.update(r[0] for r in conn.execute("SELECT id FROM records WHERE parent_id=?", (current,)))
         # A derived source -- a reflection, a creation's summary -- holds in its own bytes the words it
-        # was written from: it goes with the record it was stored as, and whatever was built on it
-        # after it (CR5-MM-02).
-        derived = set()
-        for rid in records:
-            derived.update(r[0] for r in conn.execute(
-                "SELECT e.source_id FROM evidence e JOIN sources s ON s.id=e.source_id"
-                " WHERE e.record_id=? AND json_extract(s.data,'$.derived_from') IS NOT NULL", (rid,)))
+        # was written from: it goes when the record it was stored as goes, with whatever was built on
+        # it (CR5-MM-02). Only that record: a note in the set that cites a derived source among its
+        # evidence goes alone, and the derived source it cites stays (CL6-MM-01).
+        derived = {sid for sid in (derived_source(conn, rid) for rid in records - examined) if sid}
+        examined |= records
         if derived <= sources:
             return records, sources
         sources |= derived
