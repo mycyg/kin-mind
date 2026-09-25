@@ -2962,9 +2962,11 @@ class DailyReview:
                 (self.mind.scope.key(), day, "evaluating", "{}"),
             )
         data = {}
+        # What the review is shown is what its words rest on, named with them (CR5-MM-09).
+        shown = list(unique.values())[:20]
         try:
             view = self.mind.read()
-            ids = [r["record_id"] for r in list(unique.values())[:20]]
+            ids = [r["record_id"] for r in shown]
             sources = [
                 {"id": rid, "text": self.engine.get(rid)["content"][:4000]}
                 for rid in ids
@@ -2981,7 +2983,7 @@ class DailyReview:
                     "instruction": "只依据给定的当前假设与事前行为检验编号提出人格发展建议。不修改短期情绪值或愿望，保留反例；证据不足时 evolution=null。",
                 }
             )
-            data = {"receipt": receipt, "reason": proposal.reason}
+            data = {"receipt": receipt, "reason": proposal.reason, "evidence": shown}
             if proposal.evolution:
                 data["result"] = self.mind.record(
                     AffectiveEvent(
@@ -3002,6 +3004,13 @@ class DailyReview:
             state = "needs-review"
             data["error"] = type(error).__name__
         with self.engine.db.connect(write=True) as conn:
+            # The model's reason is kept only while what it was shown still stands, checked in this
+            # write: deleted or changed while it answered, the reason goes and the receipt and the
+            # error stay. What stays names its sources, so a later delete finds it (CR5-MM-09).
+            if data.get("evidence") and data.get("reason") and not self.mind._fresh(conn, shown):
+                data.pop("reason")
+                data["reason_withheld"] = "sources-changed"
+            data = kept(conn, data)
             conn.execute(
                 "UPDATE mind_daily_reviews SET state=?,data=? WHERE scope=? AND day=?",
                 (state, dumps(data), self.mind.scope.key(), day),

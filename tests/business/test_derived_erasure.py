@@ -438,3 +438,52 @@ def test_an_exploration_report_goes_with_the_evidence_of_its_wish(env, tmp_path)
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT 1 FROM tombstones WHERE key=?", (ran["source_id"],)).fetchone()
     assert texts_everywhere(mind.engine, MARKER) == set()
+
+
+def prospective_check(mind, source, clock):
+    """The behavioural check a daily review needs before it asks the model anything."""
+    from eventmem.core.self_knowledge import AssessmentInput, ClaimInput, PredictionInput, SelfKnowledge
+
+    from kin_mind.compat import stamp as compatibility
+
+    knowledge = SelfKnowledge(mind.engine, mind.scope)
+    with mind.engine.db.connect() as conn:
+        compat = compatibility(mind, conn)
+
+    def record_id(key):
+        clock[0] = datetime.now(timezone.utc)
+        return mind.engine.source(source(key))["record_ids"][0]
+
+    refs = [record_id("interaction-" + str(n)) for n in range(1, 4)]
+    claim = knowledge.claim(ClaimInput(command_id="hypothesis", aspect="curiosity", context="source-checking",
+        agent_version="synthetic-v1", claim="I prefer checking a primary source", evidence_ids=refs), compat=compat)
+    prediction = knowledge.predict(PredictionInput(command_id="prospective", claim_id=claim["id"],
+        expected_revision=1, case_id="future-case", behavior="Check a primary source",
+        information="The next query has not been answered", probability=0.8), compat=compat)
+    knowledge.assess(AssessmentInput(command_id="assess", prediction_id=prediction["id"],
+        expected_revision=1, outcome=True, evidence_ids=[record_id("later-observed-behavior")],
+        note="Observed source check"), compat=compat)
+
+
+def test_a_daily_review_whose_source_is_deleted_while_the_model_answers_keeps_no_reason(setup):
+    """With the behaviour chain off the day is reviewed by a model call. A message it was shown is
+    deleted while the model answers, and the answer repeats it: the reason is not kept, the receipt
+    and what it was shown are (CR5-MM-09)."""
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"behavior_chain": False, "trait_ledger": False})
+    prospective_check(mind, source, clock)
+    doomed = source("said-today", f"今天又说起 {MARKER}")
+
+    class Daily:
+        def appraise(self, context):
+            assert MARKER in json.dumps(context, ensure_ascii=False)
+            mind.engine.delete(doomed)
+            return answered(Appraisal(reason=f"她今天总提 {MARKER}", values={"curiosity": 64}))
+
+    reviewed = DailyReview(mind).run(Daily(), "synthetic-v1")
+    settle(mind.engine)
+    assert reviewed["state"] == "complete" and reviewed["reason_withheld"] == "sources-changed"
+    assert texts_everywhere(mind.engine, MARKER) == set()
+    with mind.engine.db.connect() as conn:
+        data = json.loads(conn.execute("SELECT data FROM mind_daily_reviews").fetchone()[0])
+    assert data["receipt"]["usage"] == USAGE and data["evidence"] and "reason" not in data
