@@ -856,9 +856,11 @@ export class MobileRouter {
       const now=this.now();
       // When the host first received it is recorded once; routing never moves it later (CR2-LIFE-08).
       const firstReceivedAt=Math.min(receiptTime(input.receivedAt,now),Number.isFinite(intake?.firstReceivedAt)?intake.firstReceivedAt:Infinity);
+      // How often it went back to its inbox is the input's own, counted across every stage:
+      // routing never starts it again, and it is kept apart from this attempt's evidence (CR3-FLOW-10).
       const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt,
         ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),
-        ...(intake?.retry?{retry:clone(intake.retry)}:{})};
+        ...(intake?.retry?{retry:clone(intake.retry)}:{}),...(requeuesOf(intake)?{requeues:requeuesOf(intake)}:{})};
       if(semanticFailure) {
         const current=this.currentTask(),runtime=first.classify.runtime;
         this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,

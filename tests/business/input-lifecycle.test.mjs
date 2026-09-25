@@ -715,3 +715,32 @@ test('a runtime notice whose write fails before its send lets the permit go and 
   assert.deepEqual([f.router.state.notices.n1.state,f.router.state.notices.n1.attempts],['accepted',1]);
   assert.deepEqual(f.router.activityList(),[]);
 });
+
+test('an input requeued while it was taken in keeps that count once it is routed (CR3-FLOW-10)',async t=>{
+  const f=fixture(t);let requeues=0;
+  const requeue=async()=>{requeues++;return {state:'requeued'};},notifyOwner=async()=>({state:'accepted',messageId:'n'});
+  const lost=async(_,started)=>{started();throw Error('lost response');};
+  // Its intake failed and it went back to the inbox once.
+  await f.router.received({id:'z',kind:'owner',channel:'wechat'});
+  await f.router.intakeFailed('z','attachment-unreadable');
+  f.clock.now+=HOUR;await f.router.watch({requeue,notifyOwner});
+  assert.deepEqual([requeues,f.router.state.inputs.z.requeues],[1,1]);
+  // Taken in again and routed; each submission is lost and then proven never received.
+  await f.router.received({id:'z',kind:'owner',channel:'wechat'});
+  for(let cycle=0;cycle<REQUEUE_BUDGET+1;cycle++) {
+    await assert.rejects(f.router.dispatch({id:'z',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
+    if(!cycle)assert.deepEqual([f.router.state.inputs.z.state,f.router.state.inputs.z.requeues],['unconfirmed',1],'routing never starts the count again');
+    await f.router.watch({reconcileInput:async()=>absent});
+    await f.router.watch({requeue,notifyOwner});
+    f.clock.now+=HOUR;
+  }
+  assert.equal(requeues,REQUEUE_BUDGET,'three in all, across its intake and its routing');
+  // A classification that fails after an intake requeue keeps the count on its pending record too.
+  const g=fixture(t,{classify:async()=>{throw Error('deepseek-http-503');}});
+  await g.router.received({id:'s',kind:'owner',channel:'wechat'});
+  await g.router.intakeFailed('s','attachment-unreadable');
+  g.clock.now+=HOUR;await g.router.watch({requeue:async()=>({state:'requeued'}),notifyOwner});
+  await g.router.received({id:'s',kind:'owner',channel:'wechat'});
+  await g.router.select({id:'s',kind:'owner',text:'在吗'});
+  assert.deepEqual([g.router.state.inputs.s.state,g.router.state.inputs.s.requeues,g.router.state.inputs.s.retry.evidence],['semantic-pending',1,'not-submitted'],'the count and this attempt\'s evidence are kept apart');
+});

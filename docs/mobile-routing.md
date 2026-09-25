@@ -100,7 +100,8 @@ minute, decides from evidence alone:
 - An input proven never submitted — its preparation failed or was withdrawn, it
   reached only the host's in-memory queue, or reconciliation proved it absent — goes
   back to the inbox under the same ID after 30 seconds, 2 minutes and 10 minutes, at
-  most three times across all its attempts, never while dispatch is frozen; after
+  most three times across all its attempts — those of its intake and of its routing
+  counted together — never while dispatch is frozen; after
   that it is told as `stopped`. A failed model control of the owner's is reported by
   its own mode notice instead. What the owner's stop withdrew before it was submitted
   is canceled by her, never retried.
