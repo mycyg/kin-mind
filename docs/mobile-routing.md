@@ -164,9 +164,11 @@ native command or a switch hold it, and so do the host's own background model ca
 a summary of open work, a health reading, a classification asked again — until the
 call has ended and let go of its lane; a freeze refuses a new one before anything is
 counted for it, and none of them holds the owner's conversation. Session maintenance
-(`session-maintenance`) is counted the same way: a compaction from its checkpoint to
-its end, and a rotation candidate, in an app-server of its own, from its creation to
-its promotion or abandonment (CL6-FLOW-02). A classification's
+(`session-maintenance`) is counted the same way, step by step while each runs: a
+compaction from its checkpoint to its end, and a rotation candidate's creation,
+injection, verification and promotion in an app-server of its own; a candidate that
+waits between ticks (ready, or waiting for a safe boundary) runs nothing and is not
+counted (CL6-FLOW-02). A classification's
 deadline covers the lane's admission as well as the request: once it passes, the
 request is canceled, a lease that comes late starts nothing, and the classification
 answers only after the call has let go of everything it held. Open work, a desktop
