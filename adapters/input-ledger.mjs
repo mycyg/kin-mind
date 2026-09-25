@@ -68,7 +68,8 @@ export function inputSettled(record) {
   if(!ownerInput(record)) {
     if(record.historical)return true;
     if(record.recovered||['unconfirmed','fenced-unconfirmed'].includes(record.state))return false;
-    return !(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.retry?.exhausted);
+    // What the owner's stop settled is not on its way anywhere.
+    return !(record.kind==='unknown'&&record.state==='failed-before-submit'&&!record.canceledBy&&!record.retry?.exhausted);
   }
   return ['answered','failed-notified','superseded','canceled-by-owner','historical'].includes(inputSummary(record));
 }
