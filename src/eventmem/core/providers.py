@@ -4,13 +4,12 @@ import base64
 import contextvars
 import json
 import os
-import re
 import time
 from contextlib import contextmanager
 
 import httpx
 
-from .db import digest, dumps
+from .db import digest, dumps, tombstoned
 from .models import ModelRole
 
 
@@ -55,10 +54,6 @@ def job_answers(job):
         _JOB.reset(token)
 
 
-# The identifiers a job's payload can name, as the tombstones hold them.
-_NAMED = re.compile(r"\b(?:src|mem)_[0-9a-f]{32}\b")
-
-
 def keep_answers(conn, job, answers):
     """A run whose job was taken over leaves what it paid for with the job, in the stored
     command results. Beside the answer, the job's payload: the identifiers in it are what an
@@ -74,9 +69,7 @@ def keep_answers(conn, job, answers):
     row = conn.execute("SELECT state,payload FROM jobs WHERE id=?", (job["id"],)).fetchone()
     if row is None or row["state"] not in ("pending", "retry", "running") or row["payload"] != job.get("payload"):
         return 0
-    named = sorted(set(_NAMED.findall(row["payload"] or "")))
-    if named and conn.execute(f"SELECT 1 FROM tombstones WHERE key IN ({','.join('?' * len(named))}) LIMIT 1",
-                              named).fetchone():
+    if tombstoned(conn, row["payload"]):
         return 0
     for request, answer in answers:
         conn.execute("INSERT OR REPLACE INTO commands VALUES(?,?,?)",

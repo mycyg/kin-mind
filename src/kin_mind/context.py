@@ -9,7 +9,7 @@ import time
 
 from pydantic import Field
 
-from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.db import Conflict, Missing, digest, dumps, tombstoned
 from eventmem.core.models import Model, RecallRequest
 from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
@@ -125,6 +125,26 @@ class Contexts:
             return self._current_in(conn, item, policy, state=state)
         with self.engine.db.connect() as connection:
             return self._current_in(connection, item, policy)
+
+    def _keep(self, key, value, depends, policy):
+        """Keep one compression only while what it was made from is still what a read may see,
+        checked in the write transaction that keeps it: every input current by the rule a reader
+        applies, and nothing the inputs or the answer name deleted. A source deleted or revised
+        while the model was answering leaves no row behind; its call's cost is all that stays,
+        already recorded by the call (CR3-MM-03). False when nothing was kept."""
+        text = dumps(value)
+        with self.engine.db.connect(write=True) as conn:
+            state = None
+            for item in depends:
+                if state is None and "state_dependency" in item:
+                    state = self.mind._load(conn)
+                if not self._current_in(conn, item, policy, state=state):
+                    return False
+            if tombstoned(conn, text, *(dumps(item) for item in depends)):
+                return False
+            conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)",
+                         (key, self.mind.scope.key(), text, self.mind.clock()))
+        return True
 
     def _current_in(self, conn, item, policy, state=None):
         dependency = item.get("digest_dependency")
@@ -289,6 +309,12 @@ class Contexts:
                 # continuation cursor instead of a partially cut source account.
                 receipts, entries, omitted = [], [], list(dict.fromkeys(unprocessed))
                 deadline = time.monotonic() + work_seconds
+                def rests_on(payload):
+                    # The inputs a part was made from: a batch's pieces name their item, a reduction's
+                    # groups the items their summaries cover.
+                    origins = {x.get("origin_id") or x["id"] for x in payload["items"]}
+                    origins.update(i for x in payload["items"] for i in x.get("item_ids", []))
+                    return [source[i] for i in sorted(origins) if i in source]
                 def compress(payload):
                     nonlocal model_requests
                     ids = {item["id"] for item in payload["items"]}
@@ -319,9 +345,10 @@ class Contexts:
                         omitted_ids = set(value.omitted_ids)
                         if not covered & omitted_ids and covered | omitted_ids == ids and (not require_all or not omitted_ids):
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
-                            if persist:
-                                with self.engine.db.connect(write=True) as connection:
-                                    connection.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (part_key,self.mind.scope.key(),dumps({"value":value.model_dump(),"receipt":receipt}),self.mind.clock()))
+                            if persist and not self._keep(part_key, {"value": value.model_dump(), "receipt": receipt}, rests_on(payload), policy):
+                                # What it was made from changed while the model answered: no part
+                                # of it is kept, and no further call is paid for (CR3-MM-03).
+                                raise Conflict("Sources changed while compressing")
                             if on_progress is not None:
                                 on_progress(part_key)
                             return value, receipt
@@ -378,8 +405,10 @@ class Contexts:
                           "covered_ids": list(dict.fromkeys(covered)), "omitted_ids": list(dict.fromkeys([*omitted, *[i for i in source if i not in covered]])),
                           "items": selected, "receipt": receipts, "cache_hit": False, "model_requests": model_requests, "elapsed_ms": round((time.monotonic() - started) * 1000)}
                 if persist and lines and (not require_all or not result["omitted_ids"]):
-                    with self.engine.db.connect(write=True) as conn:
-                        conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (cache_id, self.mind.scope.key(), dumps(result), self.mind.clock()))
+                    # The check above answers for what is returned; the one that keeps it is made
+                    # again inside the write, where no delete can come in between (CR3-MM-03).
+                    if not self._keep(cache_id, result, items, policy):
+                        raise Conflict("Sources changed while compressing")
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": sum(r.get("requests", 1) for r in receipts), "state": result["state"]})
                 return result
             except Exception as error:  # noqa: BLE001 - worker boundary, redacted failure type only
@@ -623,6 +652,9 @@ class Contexts:
                     if len(entry["item_ids"]) != 1 or entry["item_ids"][0] in result["omitted_ids"]:
                         continue
                     item = original[entry["item_ids"][0]]
+                    # Deleted or revised since the pack kept its summary: no overview of it either (CR3-MM-03).
+                    if not self._current_in(conn, item, policy) or tombstoned(conn, dumps(item), entry["summary"]):
+                        continue
                     key = self._overview_key(item)
                     conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)", (key, self.mind.scope.key(), dumps({"text": entry["summary"], "source": item, "receipt": result.get("receipt"), "coverage": "overview"}), self.mind.clock()))
         return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt", "elapsed_ms"}}
