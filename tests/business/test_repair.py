@@ -265,3 +265,18 @@ def test_a_root_without_a_store_is_refused_and_nothing_is_created(tmp_path, caps
     with pytest.raises(repair.Refused):
         repair.run(missing, apply=True)
     assert not (tmp_path / "mistyped").exists()
+
+
+def test_the_operations_guide_says_what_the_repair_deletes_as_the_repair_itself_does():
+    """The guide's repair section and the module's own description agree: only `reerase` deletes, and
+    no sentence of the guide says that no step does (CL6D-MM-03)."""
+    import re
+    from pathlib import Path
+
+    guide = (Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8")
+    start = guide.index("python -m eventmem.core.repair")
+    section = " ".join(guide[start:guide.index("\n## ", start)].split())
+    described = " ".join((repair.__doc__ or "").split())
+    for text in (section, described):
+        assert "Only `reerase` deletes" in text
+    assert not re.search(r"(?<!other )\b[Nn]o step deletes", section), "the guide's own words contradict the reerase step"
