@@ -89,8 +89,10 @@ def test_the_reerase_counts_what_a_process_row_read_only_from_where_its_call_beg
     monkeypatch.undo()
     with engine.db.connect() as conn:
         after = erasure.tombstone_mark(conn)
-        # The source went last: the mark after the delete is its own deletion fact.
-        assert conn.execute("SELECT rowid FROM tombstones WHERE key=?", (note_source,)).fetchone()[0] == after > before
+        # The note's two deletion facts are the last there are, in whichever order: every receipt
+        # reads both, so one of them sits at the mark itself.
+        stamps = {row[0] for row in conn.execute("SELECT rowid FROM tombstones WHERE key IN (?,?)", (note_source, note_record))}
+    assert after in stamps and min(stamps) > before
     late = {
         "mind_appraisals": {
             # Began after the delete; what it kept to take up began before it, and so did the earlier
