@@ -1135,3 +1135,147 @@ def test_a_withheld_artifact_keeps_neither_its_excerpt_nor_the_text_a_render_sho
     with mind.engine.db.connect() as conn:
         node = json.loads(conn.execute("SELECT data FROM mind_memory_nodes WHERE kind='artifact'").fetchone()[0])
     assert node["sha256"] == made["sha256"] and node["inspection"]["excerpt"] == ERASED
+
+
+def test_what_the_fork_only_read_takes_no_words_from_the_wish_and_the_plan_its_appraisal_committed(setup):
+    """The fork reads a note with its tool and cites only the appraisal's own evidence; the appraisal
+    commits a wish and a plan, each keeping the appraisal's receipt. The note is deleted afterwards.
+    The wish and the plan keep their words and their states -- a committed entry goes with what it
+    cites (decision 1) -- while the queue row, the record of the model's work, keeps none of its
+    words; nor does a row as the last release wrote it, which names the read only in its receipt
+    (CL6E-MM-01)."""
+    from kin_mind.appraisal import Wish
+    from kin_mind.autonomy_models import PlanChange, PlanStep
+
+    mind, source, clock = setup
+    MemoryContinuity(mind).configure({"records": True, "semantic_actions": True, "autonomous_plans": True})
+    note_source, note = read_note(mind, clock, "garden-read", f"院子里种着 {MARKER}")
+    primary = source("plan-day", "我们周末一起做个钟吧")
+    record = mind.engine.source(primary)["record_ids"][0]
+
+    class Planner:
+        def appraise(self, context):
+            paid(self)
+            proposal, receipt = answered(Appraisal(
+                reason="她提议周末一起做个钟，我也想做", values={"curiosity": 64},
+                wishes=[Wish(content="周末和她一起做个钟", topic="手工", kind="explore", strength=70, ttl_hours=48,
+                             completion="钟做好了")],
+                plan_changes=[PlanChange(action="create", key="clock", goal="做一个小钟", motivation="她提议周末一起做",
+                                         reason="她说周末一起做个钟", evidence_ids=[record],
+                                         steps=[PlanStep(id="sketch", actor="create", goal="画出钟的草图", completion="草图存好了")])]))
+            return proposal, {**receipt, **tool_read(note)}
+
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([primary], "synthetic-v1")
+    out = jobs.run_one(Planner())
+    state, _, row = queue_row(mind, job["id"])
+    assert out["state"] == "complete", {key: row.get(key) for key in ("error", "error_detail", "held_sections", "waiting_reason")}
+    assert note in row["evaluated_ids"]
+    def stored():
+        with mind.engine.db.connect() as conn:
+            [wish] = [w for w in mind._load(conn)["desires"].values() if w["content"] == "周末和她一起做个钟"]
+            [plan] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plans")]
+        return wish, plan
+
+    wish, plan = stored()
+    assert note in json.dumps(wish["decision_receipt"]) and note in json.dumps(plan["decision_receipt"]), \
+        "both keep the receipt that says the fork read the note"
+    with mind.engine.db.connect(write=True) as conn:
+        # A queue row as the last release wrote it: only its receipt says what the fork read.
+        old = {key: value for key, value in row.items() if key != "evaluated_ids"}
+        conn.execute("INSERT INTO mind_appraisals SELECT ?,scope,state,available,lease,attempts,? FROM mind_appraisals WHERE id=?",
+                     ("appraisal-before-release", json.dumps(old, ensure_ascii=False), job["id"]))
+    mind.engine.delete(note_source)
+    settle(mind.engine)
+    after, kept = stored()
+    assert {key: after[key] for key in ("content", "reason", "completion", "status", "topic")} == \
+        {key: wish[key] for key in ("content", "reason", "completion", "status", "topic")}
+    assert [w for w in mind.read()["desires"] if w["id"] == wish["id"]][0].get("needs_review") in (None, False)
+    assert {key: kept[key] for key in ("goal", "motivation", "reason", "status")} == {key: plan[key] for key in ("goal", "motivation", "reason", "status")}
+    assert kept["status"] == "active" and wish["status"] == "wanted"
+    assert [(s["goal"], s["completion"], s["state"]) for s in kept["steps"]] == [(s["goal"], s["completion"], s["state"]) for s in plan["steps"]]
+    # A worker's copy of such a row, written back after the delete, keeps none of them either.
+    from kin_mind.appraisal import kept as written_back
+    with mind.engine.db.connect() as conn:
+        assert written_back(conn, old)["proposed_result"]["reason"] == ERASED
+    # The queue rows, new and old, keep none of the words the model wrote while it had the note.
+    for identifier in (job["id"], "appraisal-before-release"):
+        data = queue_row(mind, identifier)[2]
+        assert data["proposed_result"]["reason"] == ERASED and "周末和她一起做个钟" not in json.dumps(data, ensure_ascii=False), identifier
+
+
+# Every kind of committed mind entry that keeps the receipt of the appraisal which wrote it, stored as
+# the code stores it: the receipt names what the fork read (`X`), the entry's own references do not.
+READ = "mem_" + "1" * 32
+CITED = "mem_" + "2" * 32
+FORK = {"provider": "deepseek", "model": "synthetic", "native_receipt": {"channel": "fork", "tool_calls": [
+    {"name": "kin_memory.read_memory", "ok": True, "ids": [{"id": READ, "revision": 1}]}]}}
+REF = {"source_id": "src_" + "3" * 32, "record_id": CITED, "hash": "h", "revision": 1}
+COMMITTED = {
+    # appraisal.py: a wish the appraisal created or updated (the state's `desires`).
+    "wish": {"id": "desire-1", "content": "陪她做个钟", "reason": "她提议的", "completion": "钟做好了", "status": "wanted",
+             "evidence_ids": [CITED], "decision_receipt": FORK},
+    # plans.py: a plan, a step's decision, an owner response's receipt, a run's record.
+    "plan": {"id": "plan-1", "goal": "做一个小钟", "motivation": "她提议", "reason": "她说的", "evidence": [REF], "state": "active",
+             "decision_receipt": FORK,
+             "steps": [{"id": "sketch", "goal": "画草图", "completion": "草图存好了", "state": "pending",
+                        "decision": {"decision_id": "d-1", "decision": {"reason": "可以开始"}, "evidence": [REF], "receipt": FORK},
+                        "receipts": [{"kind": "owner_response", "status": "accepted", "evidence": [REF], "decision_receipt": FORK}]}]},
+    "plan_run": {"id": "run-1", "decision": {"reason": "开始画", "evidence": [REF]}, "owner_epoch": 1, "receipt": FORK},
+    # memory.py: a share node the appraisal assessed.
+    "share_node": {"id": "share-1", "kind": "share", "topic": "钟", "summary": "她想做钟", "source_ids": [REF["source_id"]],
+                   "record_ids": [CITED], "assessment_event": "mind_e", "assessment_receipt": FORK},
+    # traits.py: an observation, and a trait an owner's words revoked.
+    "trait_observation": {"id": "obs-1", "note": "她喜欢动手", "evidence": [REF], "evidence_ids": [CITED], "receipts": [],
+                          "state": "valid", "receipt": FORK},
+    "trait": {"id": "trait-1", "status": "revoked", "reason": "她说不是这样", "quote": "我不是", "evidence": [REF], "receipt": FORK},
+    # next_move.py, expression_intent.py: the record of a move, the current intent.
+    "next_move": {"grounds": [REF], "alternative": "先问问她", "reason": "她提过", "receipt": FORK},
+    "expression_intent": {"id": "intent-1", "stance": "轻松地聊", "avoid": ["说教"], "evidence": [REF], "evidence_ids": [CITED],
+                          "receipt": FORK},
+    # behavior_chain.py: a personality proposal held for the day's merge.
+    "evolution_proposal": {"evolution": {"reason": "更耐心", "evidence_ids": [CITED]}, "reason": "她说我急了", "receipt": FORK},
+    # procedures.py: a method's recorded trial.
+    "procedure_trial": {"result_id": "r-1", "passed": True,
+                        "verification": {"reason": "复现通过", "decision_receipt": FORK, "method": "independent-recorded-outcome-replay"}},
+}
+
+
+def test_no_committed_entry_goes_with_what_the_fork_that_wrote_it_only_read():
+    """Each kind of committed entry keeps the receipt of the appraisal that wrote it, and the receipt
+    says the fork read `X`; `X` is deleted. Not one of them loses a word, in the store or in the
+    state's history: they go with what they cite. The rows of a model call's own process do lose
+    theirs: a queue row -- by its receipt, a stored proposal's or a rejected result's --, a draft's
+    attempt and a daily review (CL6E-MM-01)."""
+    from kin_mind import erasure
+
+    gone = frozenset({READ})
+    for kind, entry in COMMITTED.items():
+        assert not erasure.cites(entry, gone), kind
+        assert erasure.scrub(entry, gone) is entry, kind
+        assert erasure.scrub({"desires": {"d": entry}}, gone)["desires"]["d"] is entry, kind
+    assert erasure.PROCESS_TABLES == {"mind_appraisals", "mind_contacts", "mind_daily_reviews"}
+    rows = {
+        "queue row": {"proposed_result": {"reason": "想起那条笔记"}, "evidence_ids": [CITED], "receipt": FORK},
+        "enrichment row": {"seed_memory": {"items": [{"content": "记下那条笔记"}]}, "seed_receipt": FORK},
+        "draft attempt": {"text_excerpt": "想和她说那条笔记", "decisions": {"d": {"reason": "等她回来"}}, "draft_receipt": FORK},
+        "daily review": {"reason": "今天想起那条笔记", "receipt": FORK},
+    }
+    for name, row in rows.items():
+        new = erasure.scrub_process(row, gone)
+        assert "笔记" not in json.dumps({k: v for k, v in new.items() if not k.endswith("receipt")}, ensure_ascii=False), name
+        assert erasure.scrub_process(new, gone) is new, "a second erase changes nothing"
+        assert erasure.scrub(row, gone) is row, "the committed rule alone takes nothing by a receipt"
+    # Parts that keep their own call's receipt lose their words; the rest of the row keeps its own.
+    kept = {"proposed_result": {"reason": "今天的想法"}, "receipt": {"provider": "deepseek"},
+            "reuse": {"proposal": {"reason": "上次想起那条笔记"}, "receipt": FORK},
+            "rejected_results": [{"reason": "missing-target-decision", "proposal": {"reason": "漏了那条笔记"}, "receipt": FORK},
+                                 {"reason": "missing-target-decision", "proposal": {"reason": "另一次"}, "receipt": {}}]}
+    new = erasure.scrub_process(kept, gone)
+    assert new["proposed_result"]["reason"] == "今天的想法"
+    # The operations guide says the same.
+    from pathlib import Path
+    guide = " ".join((Path(__file__).resolve().parents[2] / "docs" / "operations.md").read_text(encoding="utf-8").split())
+    assert "does not make the entry go with it" in guide and "a daily review -- name everything shown" in guide
+    assert new["reuse"]["proposal"]["reason"] == ERASED and new["rejected_results"][0]["proposal"]["reason"] == ERASED
+    assert new["rejected_results"][1] is kept["rejected_results"][1]

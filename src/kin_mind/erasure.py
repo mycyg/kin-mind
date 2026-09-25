@@ -116,10 +116,11 @@ HISTORY_BYTES = 8 * 1024 * 1024
 
 
 def cites(value, ids):
-    """Whether this one dict rests on erased material, by its own references -- or by what the
-    model call whose receipt it keeps (`receipt`, `seed_receipt` and the like) read with its tools:
-    the words beside that receipt were written by a model that had it before it, cited or not.
-    A queue row written before this release names those reads only there (CL6D-MM-01)."""
+    """Whether this one dict rests on erased material, by its own references only. A receipt it
+    keeps -- a wish's, a plan's, a trait's `decision_receipt` or `receipt`, the appraisal that wrote
+    it -- says what that call's model read with its tools, and a committed entry does not go with
+    what was only read: it goes with what it cites (decision 1, CL6E-MM-01). What a model read counts
+    on the rows of its own process alone, `scrub_process`."""
     for key in REF_LISTS:
         refs = value.get(key)
         if isinstance(refs, list) and any(isinstance(ref, dict) and (ref.get("source_id") in ids or ref.get("record_id") in ids)
@@ -129,11 +130,49 @@ def cites(value, ids):
         found = value.get(key)
         if isinstance(found, list) and any(isinstance(i, str) and i in ids for i in found):
             return True
-    for key, item in value.items():
-        if isinstance(key, str) and (key == "receipt" or key.endswith("_receipt")) and isinstance(item, (dict, list)) \
-                and any(i in ids for i in read_ids(item)):
-            return True
     return any(value.get(key) in ids for key in ID_KEYS if isinstance(value.get(key), str))
+
+
+# The rows of a model call's own process -- an appraisal's queue row, a contact draft's attempt, a
+# daily review -- as against the mind's committed entries. Their words were written by a model that
+# had its tool reads before it, and a row written before this release names those reads only in its
+# receipts (CL6D-MM-01). Nowhere else: a wish, a plan, a trait keeps the receipt of the appraisal that
+# wrote it and goes only with what it cites (CL6E-MM-01).
+PROCESS_TABLES = frozenset({"mind_appraisals", "mind_contacts", "mind_daily_reviews"})
+# Within such a row, the parts that keep a receipt of their own call: a proposal kept for reuse, an
+# earlier attempt's rejected result.
+PROCESS_PARTS = ("reuse", "rejected_results")
+
+
+def read_by(value, ids):
+    """Whether a receipt `value` keeps at its own top level -- `receipt`, `seed_receipt`,
+    `draft_receipt` -- says a tool returned any of `ids` to the model."""
+    return any(isinstance(key, str) and (key == "receipt" or key.endswith("_receipt")) and isinstance(item, (dict, list))
+               and any(i in ids for i in read_ids(item)) for key, item in value.items())
+
+
+def scrub_process(value, ids):
+    """A process row (`PROCESS_TABLES`) with the words of everything resting on `ids` taken out: by
+    its references, as `scrub` takes them, and by what its model read with its tools, as its own
+    receipts say -- the whole row for the row's receipts, a stored proposal or a rejected result for
+    theirs. What an earlier run already took out is left as it is (CL6D-MM-01, CL6E-MM-01)."""
+    if not isinstance(value, dict):
+        return scrub(value, ids)
+    if read_by(value, ids):
+        return scrub(value, ids, erase=True)
+    out = value
+    for key in PROCESS_PARTS:
+        part = value.get(key)
+        if isinstance(part, dict) and read_by(part, ids):
+            new = scrub(part, ids, erase=True)
+        elif isinstance(part, list):
+            new = [scrub(item, ids, erase=True) if isinstance(item, dict) and read_by(item, ids) else item for item in part]
+            new = part if all(a is b for a, b in zip(new, part)) else new
+        else:
+            continue
+        if new is not part:
+            out = {**out, key: new}
+    return scrub(out, ids)
 
 
 def _blank(value):
@@ -219,15 +258,18 @@ def scrub(value, ids, *, erase=False):
     return out if changed else value
 
 
-def drop_deleted(conn, value):
+def drop_deleted(conn, value, *, process=False):
     """`value` as it may be written now, inside the transaction that writes it: whatever it names
     that the store has deleted since it was read -- the tombstone is the deletion fact -- is taken
-    out by this module's own rule, `scrub`. Identities, states, error codes and usage stay. A value
-    that names nothing deleted comes back as it is (CR4-MM-02, CR5-MM-01)."""
+    out by this module's own rule, `scrub`, or `scrub_process` for a row of a model call's own
+    process (`process`). Identities, states, error codes and usage stay. A value that names nothing
+    deleted comes back as it is (CR4-MM-02, CR5-MM-01, CL6E-MM-01)."""
     from eventmem.core.db import NAMED
 
     erased = tombstoned(conn, NAMED.findall(dumps(value)))
-    return scrub(value, frozenset(erased)) if erased else value
+    if not erased:
+        return value
+    return scrub_process(value, frozenset(erased)) if process else scrub(value, frozenset(erased))
 
 
 def tombstoned(conn, ids):
@@ -416,7 +458,7 @@ def _plain(conn, table, ids, changed_ids=None, *, write=True):
             data = json.loads(row["data"])
         except ValueError:
             continue
-        new = scrub(data, ids)
+        new = scrub_process(data, ids) if table in PROCESS_TABLES else scrub(data, ids)
         if new is data:
             continue
         changed += 1
