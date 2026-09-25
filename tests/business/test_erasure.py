@@ -1,7 +1,9 @@
 """An explicit delete reaches every layer the mind built from what it deleted, and stays in force
 when an old history archive is put back (K4-01, K4-20, K4-21, E2-06, K3-15). A model answer that
 comes back after the delete, for a compression or a judgment that was waiting on it, keeps nothing
-but its cost; nor does one that comes back after its source was revised (CR3-MM-03)."""
+but its cost; nor does one that comes back after its source was revised (CR3-MM-03). Nor does a
+context's own receipt, prepared injection or window receipt, whichever way the delete lands
+(CR4-MM-01)."""
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -587,3 +589,106 @@ def test_an_overview_of_a_source_deleted_after_its_summary_came_back_is_not_kept
     with engine.db.connect() as conn:
         overviews = [json.loads(row[0]) for row in conn.execute("SELECT data FROM mind_context_cache WHERE id LIKE 'overview-v2:%'")]
     assert [view["source"]["id"] for view in overviews] == [records[other]]
+
+
+
+def harbour(mind, source, length):
+    """Three accounts of the harbour walk. The short one says the marker and ranks first, so it is
+    among the originals a context falls back to; the others are `length` times longer."""
+    filler = "They checked the harbour path, the tide table and the lamps along the pier. " * length
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk.")
+    for i in range(2):
+        source(f"walk-{i}", f"Harbour walk note {i}. " + filler)
+    return secret
+
+
+def stored_words(engine, session):
+    """What the session's prepared injections and window receipts hold."""
+    found = []
+    with engine.db.connect() as conn:
+        for table in ("mind_context_deliveries", "mind_context_windows"):
+            present = conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone()
+            found.append([row[0] for row in conn.execute(f"SELECT data FROM {table} WHERE session=?", (session,))]
+                         if present else [])
+    return tuple(found)
+
+
+@pytest.mark.parametrize("receipt_mode", [True, False])
+def test_a_context_whose_source_is_deleted_while_it_is_compressed_keeps_no_words_of_it(system, monkeypatch, receipt_mode):
+    """The build waits on the compression; the source is deleted; the answer comes back. The
+    compression is not kept, and what the build falls back to is the originals as they are now:
+    neither the prepared injection nor the window receipt holds a word of the deleted one
+    (CR4-MM-01)."""
+    mind, memory, source, clock = system
+    engine = mind.engine
+    secret = harbour(mind, source, 80)
+    contexts = Contexts(mind)
+    model = LateModel(engine, monkeypatch, lambda: engine.delete(secret), lambda asked: {
+        "entries": [{"item_ids": asked["allowed_item_ids"], "summary": f"They walked the harbour; {MARKER}."}],
+        "omitted_ids": []})
+    packed = contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1",
+                            receipt_mode=receipt_mode, allow_model=True, provider=model.provider)
+    settle(engine)
+    assert model.calls and packed["reason"] == "Conflict"
+    assert MARKER not in json.dumps(packed, ensure_ascii=False)
+    deliveries, windows = stored_words(engine, "thread-1")
+    assert (deliveries if receipt_mode else windows)  # the context was kept, from what is left
+    assert texts_everywhere(engine, MARKER) == set()
+
+
+@pytest.mark.parametrize("receipt_mode", [True, False])
+def test_a_context_whose_source_is_deleted_before_its_receipt_is_written_keeps_nothing(system, monkeypatch, receipt_mode):
+    """The build has its text; the source is deleted before the receipt is written. The write
+    checks its sources and refuses: nothing is kept, and the caller is told to build again
+    (CR4-MM-01)."""
+    from eventmem.core.db import Conflict
+
+    mind, memory, source, clock = system
+    engine = mind.engine
+    secret = harbour(mind, source, 1)
+    contexts = Contexts(mind)
+    real = contexts.pack
+
+    def deleted_on_return(*args, **kwargs):
+        packed = real(*args, **kwargs)
+        assert MARKER in packed["text"]
+        engine.delete(secret)
+        return packed
+
+    monkeypatch.setattr(contexts, "pack", deleted_on_return)
+    with pytest.raises(Conflict, match="sources changed"):
+        contexts.build("harbour walk", purpose="chat", session="thread-1", event_id="turn-1", receipt_mode=receipt_mode)
+    settle(engine)
+    assert stored_words(engine, "thread-1") == ([], [])
+    assert texts_everywhere(engine, MARKER) == set()
+
+
+def test_a_prepared_context_found_stale_after_a_delete_loses_its_words(system):
+    """One an older build prepared after the delete had run: begin finds it stale, takes the
+    deleted words out by the delete's own rule and keeps its identity for reconciliation
+    (CR-MEM-02, CR4-MM-01)."""
+    from kin_mind.context_delivery import ContextDelivery, text_hash
+
+    mind, memory, source, clock = system
+    engine = mind.engine
+    secret = source("secret", f"The owner said {MARKER} about the harbour walk.")
+    contexts = Contexts(mind)
+    item = contexts.record_item(engine.get(engine.source(secret)["record_ids"][0]))
+    engine.delete(secret)
+    settle(engine)
+    epoch = contexts.window("thread-1")["epoch"]
+    body = "kin-context:context:late\n" + item["text"]
+    late = {"id": "context:late", "session": "thread-1", "epoch": epoch, "event_id": "turn-1", "state": "prepared",
+            "kind": "background", "marker": "kin-context:context:late", "text": body, "text_hash": text_hash(body),
+            "tokens": 40, "content_tokens": 40, "overhead": 0, "items": [item], "prepared_at": mind.clock()}
+    delivery = ContextDelivery(contexts)
+    with engine.db.connect(write=True) as conn:
+        delivery._put(conn, late)
+    assert MARKER in json.dumps(stored_words(engine, "thread-1"), ensure_ascii=False)
+    begun = delivery.begin("thread-1", epoch, "context:late")
+    assert begun["state"] == "erased" and not begun.get("acquired")
+    assert texts_everywhere(engine, MARKER) == set()
+    with engine.db.connect() as conn:
+        kept = json.loads(conn.execute("SELECT data FROM mind_context_deliveries WHERE id='context:late'").fetchone()[0])
+    assert (kept["id"], kept["marker"], kept["text_hash"], kept["state"]) == ("context:late", late["marker"], late["text_hash"], "stale")
+    assert kept["text"] == erasure.ERASED and kept["erased_at"]
