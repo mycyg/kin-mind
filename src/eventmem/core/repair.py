@@ -14,10 +14,11 @@ A root without a `memory.sqlite3` is refused in both modes rather than becoming 
 Exit status: 0 with the JSON report on stdout (also in `--output`, 0600); 2 when refused — an
 unknown step or no store at the root — with one line on stderr and nothing on stdout; anything
 else (1) is a failure with a traceback, and an `--apply` that failed may have finished the steps
-before the failing one, each of which a rerun finds done. Nothing here deletes a record, a source, a revision or
-a history row; records leave active use by a new revision (`archive`, `superseded`), queue rows
-change state, and derived indexes are rebuilt. The report carries identifiers, namespaces and
-counts only — never a line of content.
+before the failing one, each of which a rerun finds done. Only `reerase` deletes, and only what a
+delete made before this release should have taken (below); nothing else here deletes a record, a
+source, a revision or a history row: records leave active use by a new revision (`archive`,
+`superseded`), queue rows change state, and derived indexes are rebuilt. The report carries
+identifiers, namespaces and counts only — never a line of content.
 
 Steps, in order (the default is all but `reerase` and `quarantine`):
 
@@ -46,20 +47,31 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               delete of what they were written from never reached them. Each is given what the
               store recorded it was written from as `derived_from`, and its root record those
               records as dependencies -- the rule this release applies when it stores one: a
-              reflection's `evidence_ids`, an exploration report's run's `evidence_ids` (only
-              a report with a result), a creation event's `input_source_ids`. Settled runs and
-              the mind's command receipts name what they rest on as well (`result.evidence_ids`,
-              `rests_on`), so a delete finds the words they hold. Only a delete follows a
-              dependency; an archive, a correction, a replacement or a newer version of an input
-              leaves the derived source as it is. An input already deleted is named, and
-              `reerase` erases the derived source; an input the store never held, or holds in
-              another scope, is left out and counted. Nothing is erased here (CR5-MM-02).
+              reflection's `evidence_ids` and what its appraisal was about (the request of its
+              event's history row), an exploration report's run's `evidence_ids` (only a report
+              with a result), a creation's artifact event's `input_source_ids`, and a creation's
+              result event the step's evidence as its run (`task_id`) recorded it, or as the
+              run's artifact events named it (CL6-MM-06). A source that has a lineage already is
+              given only what it lacks, so a later run -- or a later release that knows another
+              basis -- still completes it. A result the host observed (a native task's reply)
+              names nothing it was written from: it stays the conversation record, counted as
+              `results_without_basis`. Settled runs and the mind's command receipts name what
+              they rest on as well (`result.evidence_ids`, `rests_on`), so a delete finds the
+              words they hold. Only a delete follows a dependency; an archive, a correction, a
+              replacement or a newer version of an input leaves the derived source as it is. An
+              input already deleted is named, and `reerase` erases the derived source; an input
+              the store never held, or holds in another scope, is left out and counted. Nothing
+              is erased here (CR5-MM-02). What it reads of the history is read once per run.
 - `reerase`   Opt-in. Deletes made before this release left their words in the mind's derived
               layers and state history; this runs the same erase for every tombstone and
               queues the history rewrite (K4-01, K4-20, K4-21). A derived source whose lineage
               names a deletion fact is deleted as a delete of that input would have taken it,
               and stored receipts, sessions and metrics that name a deletion fact go, as a
-              delete removes them (CR5-MM-02). It rewrites history rows, so it is named
+              delete removes them (CR5-MM-02). The plan says how much those deletes take --
+              `records`, `sources`, and `derived_in_closure`, the other derived sources among
+              them -- counted as they will be after `lineage` when both run, and the apply says
+              what they took; the release's `expect` holds the plan (CL6-MM-02). It rewrites
+              history rows, so it is named
               explicitly; run it after `lineage`, in the same run or a later one. What an earlier
               run already erased is left alone, and the history is queued only for identifiers
               it has neither finished nor still owes a pass for, so a second run changes nothing
@@ -447,67 +459,142 @@ def _content(conn, rid):
     return row[0] if row else None
 
 
-def _derived_before(conn):
-    """Sources written from others before this release -- no `derived_from` -- with what the
-    store recorded they were written from."""
-    found = []
-    for row in conn.execute("SELECT id,scope,data FROM sources WHERE namespace='kin-reflection'"
-                            " AND json_extract(data,'$.derived_from') IS NULL ORDER BY id"):
+def _history(conn, event_ids, cache):
+    """What each mind event rested on as its history row keeps it -- `request.evidence_ids`, in the
+    whole-document and the patch shapes alike: a list, empty when the request named nothing, or
+    None when no history row holds the event any more. History rows do not change while the repair
+    runs, so each is read once per run, in batches, whichever step asks (CL6-MM-09)."""
+    missing = [event for event in dict.fromkeys(event_ids) if isinstance(event, str) and event not in cache]
+    for name in ("mind_events", "mind_events_v1"):
+        if not missing or not _table(conn, name):
+            continue
+        for start in range(0, len(missing), 500):
+            page = missing[start:start + 500]
+            for event, evidence in conn.execute(
+                    f"SELECT id,CASE WHEN json_valid(data) THEN json_extract(data,'$.request.evidence_ids') END FROM {name}"
+                    f" WHERE id IN ({','.join('?' for _ in page)})", page):
+                cache.setdefault(event, _named(_json(evidence)) if evidence else [])
+        missing = [event for event in missing if event not in cache]
+    for event in missing:
+        cache[event] = None
+    return {event: cache.get(event) for event in event_ids if isinstance(event, str)}
+
+
+def _candidates(conn, cache):
+    """Every source written from others, with what the store recorded it was written from --
+    whether or not an earlier run, or this release's own writer, gave it a lineage already
+    (CL6-MM-06). Yields (kind, source id, scope, stored data, identifiers, notes): `notes` says
+    where a basis could not be found."""
+    reflections = conn.execute("SELECT id,scope,source_key,data FROM sources WHERE namespace='kin-reflection' ORDER BY id").fetchall()
+    events = {}
+    for row in reflections:
         metadata = (_json(row["data"]) or {}).get("metadata") or {}
-        found.append(("reflections", row["id"], row["scope"], _named(metadata.get("evidence_ids"))))
+        events[row["id"]] = metadata.get("appraisal_event_id") or row["source_key"]
+    targets = _history(conn, events.values(), cache)
+    for row in reflections:
+        data = _json(row["data"]) or {}
+        # What the understanding cited, and what the appraisal was about (`request.evidence_ids` of
+        # its event): the lineage this release's writer gives a reflection (memory.py).
+        about = targets.get(events[row["id"]])
+        yield ("reflections", row["id"], row["scope"], data,
+               [*_named((data.get("metadata") or {}).get("evidence_ids")), *(about or ())],
+               {"targets": set(about or ()), "targets_unfound": about is None})
     runs = {}
     if _table(conn, "mind_explorations"):
         for (text,) in conn.execute("SELECT data FROM mind_explorations"):
-            data = _json(text) or {}
-            if isinstance(data.get("source_id"), str):
-                runs[data["source_id"]] = data
-    for row in conn.execute("SELECT id,scope FROM sources WHERE namespace='kin-exploration'"
-                            " AND json_extract(data,'$.derived_from') IS NULL ORDER BY id"):
+            run = _json(text) or {}
+            if isinstance(run.get("source_id"), str):
+                runs[run["source_id"]] = run
+    for row in conn.execute("SELECT id,scope,data FROM sources WHERE namespace='kin-exploration' ORDER BY id"):
         run = runs.get(row["id"])
         written = run if run is not None else _json(_content(conn, _root(row["id"]))) or {}
         if written.get("result") is None:
             continue  # a run that reported nothing wrote no words: no derived source
-        found.append(("reports", row["id"], row["scope"], _named((run or {}).get("evidence_ids"))))
-    events = {}
+        yield "reports", row["id"], row["scope"], _json(row["data"]) or {}, _named((run or {}).get("evidence_ids")), {}
+    created, by_task, decided = {}, {}, {}
     if _table(conn, "mind_runtime_events"):
-        for (text,) in conn.execute("SELECT data FROM mind_runtime_events WHERE kind IN (%s)"
-                                    % ",".join("?" for _ in CREATION_EVENTS), CREATION_EVENTS):
-            data = _json(text) or {}
-            if isinstance(data.get("source_id"), str):
-                events[data["source_id"]] = data
-    for row in conn.execute("SELECT id,scope FROM sources WHERE namespace='kin-runtime'"
-                            " AND json_extract(data,'$.metadata.host_event') IN (%s)"
-                            " AND json_extract(data,'$.derived_from') IS NULL ORDER BY id"
+        for scope, text in conn.execute("SELECT scope,data FROM mind_runtime_events WHERE kind IN (%s)"
+                                        % ",".join("?" for _ in CREATION_EVENTS), CREATION_EVENTS):
+            event = _json(text) or {}
+            if isinstance(event.get("source_id"), str):
+                created[event["source_id"]] = event
+            if event.get("kind") == "artifact-created" and isinstance(event.get("task_id"), str):
+                by_task.setdefault((scope, event["task_id"]), []).extend(_named(event.get("input_source_ids")))
+    if _table(conn, "mind_plan_runs"):
+        for row in conn.execute("SELECT id,scope,data FROM mind_plan_runs"):
+            decision = (_json(row["data"]) or {}).get("decision") or {}
+            decided[(row["scope"], row["id"])] = [ref["source_id"] for ref in decision.get("evidence") or []
+                                                  if isinstance(ref, dict) and isinstance(ref.get("source_id"), str)]
+    for row in conn.execute("SELECT id,scope,data FROM sources WHERE namespace='kin-runtime'"
+                            " AND json_extract(data,'$.metadata.host_event') IN (%s) ORDER BY id"
                             % ",".join("?" for _ in CREATION_EVENTS), CREATION_EVENTS):
-        event = events.get(row["id"]) or _json(_content(conn, _root(row["id"]))) or {}
+        data = _json(row["data"]) or {}
+        event = created.get(row["id"]) or _json(_content(conn, _root(row["id"]))) or {}
+        if "inputs_withheld" in event:
+            continue  # stored without the words its inputs had: a fact, not a derived source
+        kind = (data.get("metadata") or {}).get("host_event")
         inputs = _named(event.get("input_source_ids"))
-        if inputs:  # an artifact the host only observed was written from nothing stored
-            found.append(("creations", row["id"], row["scope"], inputs))
-    return found
+        if kind == "task-result" and "input_source_ids" not in event:
+            # The last release wrote a creation's result without its inputs: they are the step's
+            # evidence, as the run that made it recorded them, or as its artifacts named them.
+            task = (row["scope"], event.get("task_id"))
+            inputs = decided.get(task) or list(dict.fromkeys(by_task.get(task) or []))
+        if inputs:
+            yield ("creations" if kind == "artifact-created" else "results"), row["id"], row["scope"], data, inputs, {}
+        elif kind == "task-result" and "derived_from" not in data:
+            # A result the host observed -- a native task's reply -- names nothing it was written
+            # from: kept as the conversation record, like Kin's other replies, and counted.
+            yield "results", row["id"], row["scope"], data, None, {}
 
 
-def _lineage(conn):
-    """What `lineage` would write, by what it is: the derived sources with their references and
-    dependencies, the runs and the receipts with the identifiers they would name."""
+def _identity(ref):
+    return ref.get("source_id"), ref.get("record_id")
+
+
+def _lineage_sources(conn, cache):
+    """The derived sources `lineage` would write to: each with the references to add to its
+    `derived_from` (all of them, where it has none) and the dependencies its root record lacks."""
     sources = []
-    for kind, sid, scope, inputs in _derived_before(conn):
-        refs, records, deleted, unresolved = [], [], [], 0
+    for kind, sid, scope, data, inputs, notes in _candidates(conn, cache):
+        if inputs is None:
+            sources.append({"kind": kind, "source_id": sid, "without_basis": True})
+            continue
+        marked = data.get("derived_from")
+        have = {_identity(ref) for ref in marked or () if isinstance(ref, dict)}
+        refs, records, deleted, unresolved, added = [], [], [], 0, set()
         for identifier in dict.fromkeys(inputs):
             state, ref, rests = _resolve(conn, identifier, scope)
             if state == "unresolved":
                 unresolved += 1
                 continue
-            refs.append(ref)
             records.extend(rests)
-            if state == "deleted":
-                deleted.append(identifier)
+            if _identity(ref) not in have:
+                refs.append(ref)
+                added.add(identifier)
+                if state == "deleted":
+                    deleted.append(identifier)
         root = _root(sid)
         if not conn.execute("SELECT 1 FROM records WHERE id=? AND deleted=0", (root,)).fetchone():
             root, records = None, []
         new = [rid for rid in dict.fromkeys(records) if rid != root and not conn.execute(
             "SELECT 1 FROM dependencies WHERE record_id=? AND evidence_id=?", (root, rid)).fetchone()]
-        sources.append({"kind": kind, "source_id": sid, "root": root, "refs": refs, "records": new,
-                        "deleted": deleted, "unresolved": unresolved})
+        if marked is not None and not refs and not new:
+            continue  # nothing left to register
+        sources.append({"kind": kind, "source_id": sid, "root": root, "marked": marked is not None, "refs": refs,
+                        "records": new, "deleted": deleted, "unresolved": unresolved,
+                        # A reflection that now names what its appraisal was about, or whose appraisal
+                        # no history row holds any more.
+                        "targets": bool(added & notes.get("targets", set())),
+                        "targets_unfound": bool(notes.get("targets_unfound"))})
+    return sources
+
+
+def _lineage(conn, cache=None):
+    """What `lineage` would write, by what it is: the derived sources with their references and
+    dependencies, the runs and the receipts with the identifiers they would name. `cache` carries
+    what was read of the history from one step to the next within a run."""
+    cache = {} if cache is None else cache
+    sources = _lineage_sources(conn, cache)
     runs = []
     if _table(conn, "mind_plan_runs"):
         for row in conn.execute("SELECT id,data FROM mind_plan_runs WHERE CASE WHEN json_valid(data) THEN"
@@ -517,53 +604,54 @@ def _lineage(conn):
             runs.append({"id": row["id"], "evidence_ids": sorted({ref[key] for ref in evidence if isinstance(ref, dict)
                                                                    for key in ("source_id", "record_id")
                                                                    if isinstance(ref.get(key), str)})})
-    receipts = []
-    history = [name for name in ("mind_events", "mind_events_v1") if _table(conn, name)]
-    if history:
-        for row in conn.execute("SELECT id,json_extract(result,'$.event_id') AS event FROM commands"
-                                " WHERE id LIKE 'mind:%' AND CASE WHEN json_valid(result) THEN"
-                                " json_type(result,'$.event_id')='text' AND json_type(result,'$.rests_on') IS NULL END"
-                                " ORDER BY id"):
-            evidence = None
-            for name in history:
-                found = conn.execute(f"SELECT CASE WHEN json_valid(data) THEN json_extract(data,'$.request.evidence_ids') END"
-                                     f" FROM {name} WHERE id=?", (row["event"],)).fetchone()
-                if found and found[0]:
-                    evidence = _json(found[0])
-                    break
-            receipts.append({"id": row["id"], "rests_on": sorted(set(_named(evidence)))})
+    rows = conn.execute("SELECT id,json_extract(result,'$.event_id') AS event FROM commands"
+                        " WHERE id LIKE 'mind:%' AND CASE WHEN json_valid(result) THEN"
+                        " json_type(result,'$.event_id')='text' AND json_type(result,'$.rests_on') IS NULL END"
+                        " ORDER BY id").fetchall()
+    rested = _history(conn, [row["event"] for row in rows], cache)
+    receipts = [{"id": row["id"], "rests_on": sorted(set(rested.get(row["event"]) or ()))} for row in rows]
     return {"sources": sources, "runs": runs, "receipts": receipts}
 
 
-def plan_lineage(conn):
-    found = _lineage(conn)
-    sources = found["sources"]
+def plan_lineage(conn, found=None):
+    found = found or _lineage(conn)
+    sources = [s for s in found["sources"] if not s.get("without_basis")]
     return {"reflections": sum(1 for s in sources if s["kind"] == "reflections"),
+            "targets": sum(1 for s in sources if s.get("targets")),
+            "targets_unfound": sum(1 for s in sources if s.get("targets_unfound")),
             "reports": sum(1 for s in sources if s["kind"] == "reports"),
             "creations": sum(1 for s in sources if s["kind"] == "creations"),
+            "results": sum(1 for s in sources if s["kind"] == "results"),
             "dependencies": sum(len(s["records"]) for s in sources),
             "inputs_deleted": sum(1 for s in sources if s["deleted"]),
             "inputs_unresolved": sum(s["unresolved"] for s in sources),
-            "without_inputs": sum(1 for s in sources if not s["refs"]),
-            "runs": len(found["runs"]), "receipts": len(found["receipts"])}
+            "without_inputs": sum(1 for s in sources if not s["marked"] and not s["refs"]),
+            "runs": len(found["runs"]), "receipts": len(found["receipts"]),
+            # Described, never registered: results the host observed, with nothing stored they
+            # were written from (CL6-MM-06).
+            "results_without_basis": sum(1 for s in found["sources"] if s.get("without_basis"))}
 
 
-def apply_lineage(engine):
-    """In one write: every derived source not yet given its lineage, its dependencies, and the
-    runs and receipts not yet naming what they rest on. A rerun finds nothing left."""
+def apply_lineage(engine, cache=None):
+    """In one write: every derived source given the lineage it lacks -- all of it, or what an
+    earlier run could not name -- its dependencies, and the runs and receipts not yet naming what
+    they rest on. A rerun finds nothing left."""
     from .db import dumps
 
     written = {"sources": 0, "dependencies": 0, "runs": 0, "receipts": 0}
     with engine.db.connect(write=True) as conn:
-        found = _lineage(conn)
+        found = _lineage(conn, cache)
         for entry in found["sources"]:
+            if entry.get("without_basis"):
+                continue
             row = conn.execute("SELECT data FROM sources WHERE id=?", (entry["source_id"],)).fetchone()
             data = _json(row["data"]) if row else None
-            if data is None or "derived_from" in data:
+            if data is None:
                 continue
-            data["derived_from"] = entry["refs"]
-            conn.execute("UPDATE sources SET data=? WHERE id=?", (dumps(data), entry["source_id"]))
-            written["sources"] += 1
+            if "derived_from" not in data or entry["refs"]:
+                data["derived_from"] = [*(data.get("derived_from") or []), *entry["refs"]]
+                conn.execute("UPDATE sources SET data=? WHERE id=?", (dumps(data), entry["source_id"]))
+                written["sources"] += 1
             for rid in entry["records"]:
                 written["dependencies"] += conn.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)",
                                                         (entry["root"], rid)).rowcount
@@ -591,10 +679,11 @@ def _split(ids):
 RECEIPT_TABLES = (("commands", "result"), ("sessions", "data"), ("metrics", "data"))
 
 
-def _resting_on_deletions(conn):
+def _resting_on_deletions(conn, lineage=None, cache=None):
     """Derived sources that rest on a deletion fact, by the lineage they carry or by the one
-    `lineage` gives them. Only a tombstone counts: an archived, corrected, replaced or superseded
-    input leaves them as they are (CR5-MM-02)."""
+    `lineage` gives them (`lineage`: that step's own finding, when the caller has it; `cache`, what
+    was read of the history already). Only a tombstone counts: an archived, corrected, replaced or
+    superseded input leaves them as they are (CR5-MM-02)."""
     found = set()
     for row in conn.execute("SELECT id,data FROM sources WHERE json_extract(data,'$.derived_from') IS NOT NULL"):
         keys = []
@@ -609,8 +698,51 @@ def _resting_on_deletions(conn):
                     keys.append(_root(ref["source_id"]))
         if keys and _tombstoned(conn, keys):
             found.add(row["id"])
-    found.update(entry["source_id"] for entry in _lineage(conn)["sources"] if entry["deleted"])
+    entries = lineage["sources"] if lineage else _lineage_sources(conn, {} if cache is None else cache)
+    found.update(entry["source_id"] for entry in entries if entry.get("deleted"))
     return sorted(found)
+
+
+def _pending(lineage):
+    """What `lineage` is about to register, as `erase_set` reads it before it is registered: the
+    root records that will depend on a record, and the root records whose sources become derived."""
+    dependents, roots = {}, {}
+    for entry in lineage["sources"]:
+        if entry.get("root"):
+            roots[entry["root"]] = entry["source_id"]
+            for rid in entry["records"]:
+                dependents.setdefault(rid, set()).add(entry["root"])
+    return {"dependents": dependents, "roots": roots}
+
+
+def _present(conn, table, ids):
+    ids = sorted(ids)
+    return {row[0] for start in range(0, len(ids), 500) for row in conn.execute(
+        f"SELECT id FROM {table} WHERE id IN ({','.join('?' for _ in ids[start:start + 500])})", ids[start:start + 500])}
+
+
+def _closure(conn, doomed, pending=None):
+    """What deleting every one of `doomed` takes, as it is there now: the records, the sources, and
+    the derived sources among them other than `doomed` -- the scale of the only step here that
+    deletes anything, for the gate to hold (CL6-MM-02)."""
+    from .maintenance import erase_set
+
+    records, sources = set(), set()
+    for sid in doomed:
+        taken, gone = erase_set(conn, sid, pending)
+        records |= taken
+        sources |= gone
+    records, sources = _present(conn, "records", records), _present(conn, "sources", sources)
+    roots = set((pending or {}).get("roots", {}).values())
+    others = sorted(sources - set(doomed))
+    derived = {sid for sid in others if sid in roots} | {row[0] for start in range(0, len(others), 500) for row in conn.execute(
+        f"SELECT id FROM sources WHERE json_extract(data,'$.derived_from') IS NOT NULL AND id IN"
+        f" ({','.join('?' for _ in others[start:start + 500])})", others[start:start + 500])}
+    return records, sources, derived
+
+
+def _counts(conn):
+    return conn.execute("SELECT (SELECT COUNT(*) FROM records),(SELECT COUNT(*) FROM sources)").fetchone()
 
 
 def _receipts(conn, ids, *, write=False):
@@ -630,22 +762,23 @@ def _receipts(conn, ids, *, write=False):
     return count
 
 
-def plan_reerase(conn):
+def plan_reerase(conn, lineage=None, *, after_lineage=False):
     """What a run would change, not what merely names a tombstone: an earlier run leaves
     tombstone references behind on purpose, and a second run finds nothing left (CR-MEM-06).
-    The derived sources it would delete count with what their deletion takes."""
+    The derived sources it would delete count with what their deletion takes: `records` and
+    `sources`, every one of them, and `derived_in_closure`, the derived sources taken beside the
+    ones that rest on a deletion (CL6-MM-02). With `after_lineage` -- `lineage` runs first in
+    the same run -- that is counted as it will be once `lineage` has registered what it found."""
     from kin_mind.erasure import erase, erased_ids, history_covered, history_owed, mentions
 
-    from .maintenance import erase_set
     from .models import now
 
-    doomed = _resting_on_deletions(conn)
-    ids = set(erased_ids(conn))
-    for sid in doomed:
-        records, sources = erase_set(conn, sid)
-        ids.update(records, sources)
-    ids = frozenset(ids)
-    base = {"tombstones": len(erased_ids(conn)), "derived_sources": len(doomed), "receipts": _receipts(conn, ids)}
+    lineage = lineage or {"sources": _lineage_sources(conn, {})}
+    doomed = _resting_on_deletions(conn, lineage)
+    records, sources, derived = _closure(conn, doomed, _pending(lineage) if after_lineage else None)
+    ids = frozenset(set(erased_ids(conn)) | records | sources)
+    base = {"tombstones": len(erased_ids(conn)), "derived_sources": len(doomed), "records": len(records),
+            "sources": len(sources), "derived_in_closure": len(derived), "receipts": _receipts(conn, ids)}
     if not ids or not _table(conn, "mind_state"):
         return {**base, "layers": {}, "derived_rows": 0, "history_ids": 0, "history_rows": 0, "history_passes_owed": 0}
     layers = erase(conn, *_split(ids), now(), write=False)
@@ -655,9 +788,10 @@ def plan_reerase(conn):
             "history_ids": len(waiting), "history_rows": rows, "history_passes_owed": history_owed(conn)}
 
 
-def apply_reerase(engine):
+def apply_reerase(engine, cache=None):
     """First every derived source that rests on a deletion fact goes by the delete's own rule --
-    its closure, the mind's layers, its history -- as a delete of that input would have taken it.
+    its closure, the mind's layers, its history -- as a delete of that input would have taken it;
+    the records and sources those deletes took are counted.
     Then the same erase for every tombstone, receipts that name one removed as a delete removes
     them, and the history rewrite for what it has not finished and does not owe: a rerun after a
     success writes nothing, and one after a failure takes up only what is left, reusing the
@@ -667,7 +801,8 @@ def apply_reerase(engine):
     from .models import now
 
     with engine.db.connect() as conn:
-        doomed = _resting_on_deletions(conn)
+        doomed = _resting_on_deletions(conn, cache=cache)
+        before = _counts(conn)
     deleted = 0
     for sid in doomed:
         with engine.db.connect() as conn:
@@ -675,6 +810,9 @@ def apply_reerase(engine):
         if present:  # an earlier one's closure may have taken it already
             engine.delete(sid)
             deleted += 1
+    with engine.db.connect() as conn:
+        # What those deletes took, counted: nothing else in the stopped window writes (CL6-MM-02).
+        taken = [was - left for was, left in zip(before, _counts(conn))]
     with engine.db.connect(write=True) as conn:
         ids = erased_ids(conn)
         counts = erase(conn, *_split(ids), now(), again=True)
@@ -687,8 +825,8 @@ def apply_reerase(engine):
             purge_text_indexes(conn)
         waiting = ids - history_covered(conn)
         job = queue_history(engine, conn, waiting, reuse=True) if waiting else None
-    return {"derived_sources": deleted, "receipts": receipts, "layers": counts, "history_ids": len(waiting),
-            "history_job": job}
+    return {"derived_sources": deleted, "records": taken[0], "sources": taken[1], "receipts": receipts, "layers": counts,
+            "history_ids": len(waiting), "history_job": job}
 
 
 # --- evidence --------------------------------------------------------------------------------
@@ -802,6 +940,10 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
     report = {"command": COMMAND, "root": str(Path(root)), "applied": apply, "steps": {}}
     with engine.db.connect() as conn:
         origins = plan_origins(conn) if "origins" in steps else []
+        # Found once for both steps that read it; what is read of the history is kept for the
+        # applies (CL6-MM-09).
+        cache = {}
+        lineage = _lineage(conn, cache) if {"lineage", "reerase"} & set(steps) else None
         plans = {
             "origins": {"sources": len(origins),
                         "by_namespace": _count(origins, "namespace"), "by_origin": _count(origins, "origin")}
@@ -810,8 +952,8 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
             "versions": plan_versions(conn) if "versions" in steps else None,
             "queues": plan_queues(conn) if "queues" in steps else None,
             "indexes": plan_indexes(conn) if "indexes" in steps else None,
-            "lineage": plan_lineage(conn) if "lineage" in steps else None,
-            "reerase": plan_reerase(conn) if "reerase" in steps else None,
+            "lineage": plan_lineage(conn, lineage) if "lineage" in steps else None,
+            "reerase": plan_reerase(conn, lineage, after_lineage="lineage" in steps) if "reerase" in steps else None,
             "quarantine": plan_quarantine(conn) if "quarantine" in steps else None,
         }
     if "spool" in steps:
@@ -839,9 +981,9 @@ def run(root, *, apply=False, steps=DEFAULT_STEPS):
             elif step == "evidence":
                 entry["done"] = apply_evidence(engine, plan)
             elif step == "lineage":
-                entry["done"] = apply_lineage(engine)
+                entry["done"] = apply_lineage(engine, cache)
             elif step == "reerase":
-                entry["done"] = apply_reerase(engine)
+                entry["done"] = apply_reerase(engine, cache)
             elif step == "quarantine":
                 entry["done"] = apply_quarantine(engine, plan)
         report["steps"][step] = entry

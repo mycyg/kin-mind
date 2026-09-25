@@ -16,6 +16,22 @@ def uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def root_id(sid: str) -> str:
+    """The record a source's own text is stored as."""
+    return "mem_" + digest([sid, "root"])[:32]
+
+
+def derived_source(conn, rid):
+    """The derived source -- stored with `derived_from` -- whose own root record `rid` is, else
+    None. Only that record holds the derived words: a note or a summary that cites a derived
+    source among its evidence is an ordinary record written from it, not the source (CL6-MM-01)."""
+    for (sid,) in conn.execute("SELECT e.source_id FROM evidence e JOIN sources s ON s.id=e.source_id"
+                               " WHERE e.record_id=? AND json_extract(s.data,'$.derived_from') IS NOT NULL", (rid,)):
+        if rid == root_id(sid):
+            return sid
+    return None
+
+
 # A derived source whose inputs were deleted or changed before it was stored: the writer keeps its
 # facts and withholds the words (CR5-MM-02). A cross-scope citation is an error, not one of these.
 DERIVED_CONFLICTS = frozenset({"derived-from-deleted", "derived-from-changed"})
@@ -273,17 +289,17 @@ class Engine:
 
     @staticmethod
     def _derived_root(conn, rid):
-        """Whether `rid` is the record of a derived source (stored with `derived_from`)."""
-        return bool(conn.execute(
-            "SELECT 1 FROM evidence e JOIN sources s ON s.id=e.source_id"
-            " WHERE e.record_id=? AND json_extract(s.data,'$.derived_from') IS NOT NULL LIMIT 1",
-            (rid,)).fetchone())
+        """Whether `rid` is the root record of a derived source (stored with `derived_from`) -- not
+        whether it cites one (CL6-MM-01)."""
+        return derived_source(conn, rid) is not None
 
     def _invalidate_dependents(self, conn, rid, reason):
         # Invalidate generated conclusions, never silently promote a stale summary. A derived
         # source -- a reflection, a report, a creation's event -- depends on what it was written
         # from only so that deleting that takes it along: an archive, a correction, a replacement
-        # or a newer version of an input leaves it, and what was built on it, as it was.
+        # or a newer version of an input leaves its root record, and what was built on it, as it
+        # was. A note or a summary that only cites a derived source is an ordinary generated
+        # record: its other inputs changing marks it unverified as before (CL6-MM-01).
         pending = [rid]
         visited = {rid}
         while pending:
