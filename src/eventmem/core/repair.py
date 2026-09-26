@@ -90,11 +90,14 @@ Steps, in order (the default is all but `reerase` and `quarantine`):
               they were shown -- every one a release before this one wrote -- lose their words to
               any delete, and are counted by table among the layers as `unnamed:<table>`; a queue
               row still to be judged also loses the proposal it kept, and is judged afresh
-              (CL6D-MM-04). It rewrites history rows, so it is named
-              explicitly; run it after `lineage`, in the same run or a later one. What an earlier
-              run already erased is left alone, and the history is queued only for identifiers
-              it has neither finished nor still owes a pass for, so a second run changes nothing
-              (CR-MEM-06).
+              (CL6D-MM-04). What a release before this one rendered from the conversation habits
+              -- a delivery, a window receipt, a compression -- names no message they were set
+              from: in a scope where a deletion fact set a habit it goes, counted with the rest
+              (`context_receipts`, `mind_context_cache`, CL8-MM-01). It rewrites history rows,
+              so it is named explicitly; run it after `lineage`, in the same run or a later one.
+              What an earlier run already erased is left alone, and the history is queued only
+              for identifiers it has neither finished nor still owes a pass for, so a second run
+              changes nothing (CR-MEM-06).
 - `quarantine` Opt-in. Quarantined appraisals whose evidence is gone are retired (state
               `superseded`, reason kept, no model call); the others are listed by reason for a
               decision, never resumed here, because a resume pays for a model call (K4-06, DB1-05).

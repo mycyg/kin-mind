@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS mind_context_compactions(
  scope TEXT NOT NULL,session TEXT NOT NULL,epoch TEXT NOT NULL,
  PRIMARY KEY(scope,session,epoch));
 """
+# The conversation habits as one item (`Contexts.habits_item`). Its id names no source, so beside it
+# the item names the sources and records it rests on (`RESTS_ON`), which no read checks for freshness,
+# and every compression kept names what its items rest on so as `CACHE_RESTS_ON` (`Contexts._keep`),
+# even when that is nothing: what a release before this one rendered from the habits names none of it,
+# and is told apart (`unnamed_habits`, `unnamed_compression`, CL8-MM-01).
+HABITS_ITEM = "conversation-habits"
+RESTS_ON = ("source_ids", "record_ids")
+CACHE_RESTS_ON = "rests_on"
+# A reduction compresses the summaries of a pack's batches as groups, which name no item.
+REDUCTION_GROUP = "group:"
 BUDGETS = {"startup": 2000, "chat": 800, "proactive": 2500, "work": 4000, "read": 2000}
 # The most one automatic injection adds to a native window, whatever room is left in it:
 # background context and continuity checkpoints alike. Relevance selects within it and
@@ -78,6 +88,25 @@ def enabled(engine, scope):
         return bool(row and json.loads(row[0]).get("context"))
     except sqlite3.OperationalError:
         return False
+
+
+def unnamed_habits(entries):
+    """Whether a delivery's `items`, or a window receipt's `index`, shows the conversation habits
+    without naming what they rest on: rendered by a release before the habits named it (CL8-MM-01)."""
+    return isinstance(entries, list) and any(isinstance(entry, dict) and entry.get("id") == HABITS_ITEM
+                                             and not any(key in entry for key in RESTS_ON) for entry in entries)
+
+
+def unnamed_compression(value):
+    """Whether a cached compression a release before this one kept -- no `CACHE_RESTS_ON` -- may hold
+    the conversation habits: a batch or a whole pack that covered them, or a reduction, whose groups
+    name no item (CL8-MM-01). An overview summarises one other item, and never does."""
+    if not isinstance(value, dict) or CACHE_RESTS_ON in value:
+        return False
+    part = value.get("value") if isinstance(value.get("value"), dict) else {}
+    covered = [*(value.get("covered_ids") or ()),
+               *(i for entry in part.get("entries") or () if isinstance(entry, dict) for i in entry.get("item_ids") or ())]
+    return any(i == HABITS_ITEM or isinstance(i, str) and i.startswith(REDUCTION_GROUP) for i in covered)
 
 
 def _lane_from_purpose(purpose=None):
@@ -169,7 +198,11 @@ class Contexts:
         delete since it began, and is not kept."""
         from .erasure import read_ids, reads_truncated, tombstoned_since
 
-        text = dumps(value)
+        # What its items rest on besides their own ids -- the conversation habits' sources and records
+        # (`habits_item`) -- is named with the row, so a delete finds it and drops it; named when it is
+        # nothing too, so a row kept before a release named it is told apart (`unnamed_compression`).
+        rests = sorted({identifier for item in depends for key in RESTS_ON for identifier in item.get(key) or ()})
+        text = dumps({**value, CACHE_RESTS_ON: rests})
         with self.engine.db.connect(write=True) as conn:
             if not self._still(conn, depends, policy, *self._words(value)) or tombstoned_since(conn, read_ids(value), since):
                 return False
@@ -297,6 +330,7 @@ class Contexts:
             row = None if strict else conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
         if row:
             result = json.loads(row[0])
+            result.pop(CACHE_RESTS_ON, None)
             if all(self._current(i, policy) for i in items) and (not require_all or not result.get("omitted_ids")):
                 self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "complete"})
                 return {**result, "cache_hit": True, "model_requests": 0}
@@ -415,7 +449,7 @@ class Contexts:
                 for batch in batches[len(selected_batches):]:
                     omitted.extend(i["origin_id"] for i in batch)
                 if len(batches) > 1 and entries:
-                    reduced = [{"id": "group:" + str(i), "text": e["summary"], "item_ids": e["item_ids"]} for i, e in enumerate(entries)]
+                    reduced = [{"id": REDUCTION_GROUP + str(i), "text": e["summary"], "item_ids": e["item_ids"]} for i, e in enumerate(entries)]
                     # Summary of summaries is still tied to original dependencies.
                     value, receipt = compress({"query": query, "budget_tokens": summary_budget, "items": reduced})
                     groups = {x["id"]: x["item_ids"] for x in reduced}
@@ -467,6 +501,19 @@ class Contexts:
         text = "\n".join(lines)
         return {"text": text, "tokens": tokens(text), "state": "needs-compression", "covered_ids": covered,
                 "omitted_ids": stale_ids + [i for i in source if i not in covered], "items": [source[i] for i in covered], "cache_hit": False, "reason": failure, "model_requests": model_requests}
+
+    @staticmethod
+    def habits_item(habits):
+        """The conversation habits as one item. Its id names no source, so it names the sources and
+        records its standing entries were set from (`source_ids`, `record_ids`): a delivery, a window
+        receipt or a compression that rendered the habits alone is found, and loses her words, when
+        the message that set one is deleted. They are not `dependencies`, which a read checks for
+        freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01)."""
+        refs = [ref for entry in habits["entries"].values() if not entry.get("source_deleted")
+                for ref in entry.get("evidence") or () if isinstance(ref, dict)]
+        return {"id": HABITS_ITEM, "revision": habits["revision"], "text": dumps(habits["preferences"]),
+                "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
+                "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")})}
 
     @staticmethod
     def _line(item):
@@ -895,7 +942,7 @@ class Contexts:
         affect_item = {"id": "affect", "revision": digest(dynamic), "text": dumps(dynamic), "basis": "inferred"}
         habits = self.memory.habits.read()
         if habits["revision"]:
-            items.append({"id": "conversation-habits", "revision": habits["revision"], "text": dumps(habits["preferences"]), "basis": "explicit"})
+            items.append(self.habits_item(habits))
         recall_started = time.monotonic()
         if adaptive_deep:
             from .adaptive_recall import AdaptiveRecall
@@ -984,7 +1031,8 @@ class Contexts:
             packed.update(rendered_text=rendered, tokens=tokens(rendered) + min(host_overhead, budget), content_tokens=packed["tokens"], host_overhead=host_overhead)
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
-                      index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index"} for i in selected],
+                      index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index",
+                              **{key: i[key] for key in RESTS_ON if key in i}} for i in selected],
                       instruction_authority="data", purpose=purpose,
                       **({"recall_purpose": recall_purpose} if recall_purpose != "experience_recall" else {}))
         compression_requests = packed.get("model_requests", 0)
