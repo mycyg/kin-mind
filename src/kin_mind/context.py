@@ -31,9 +31,13 @@ CREATE TABLE IF NOT EXISTS mind_context_compactions(
 # the item names the sources and records it rests on (`RESTS_ON`), which no read checks for freshness,
 # and every compression kept names what its items rest on so as `CACHE_RESTS_ON` (`Contexts._keep`),
 # even when that is nothing: what a release before this one rendered from the habits names none of it,
-# and is told apart (`unnamed_habits`, `unnamed_compression`, CL8-MM-01).
+# and is told apart (`unnamed_habits`, `unnamed_compression`, CL8-MM-01). Beside those lists the item,
+# and a read that shows the habits, names each message at the revision a standing entry was set from,
+# `{source_id, record_id, revision}` as the entry's evidence holds it (`SET_FROM`): a fork that read the
+# habits read that revision, not one she corrected the message to since (K1-16, CL10-MM-01).
 HABITS_ITEM = "conversation-habits"
 RESTS_ON = ("source_ids", "record_ids")
+SET_FROM = "evidence"
 CACHE_RESTS_ON = "rests_on"
 # A reduction compresses the summaries of a pack's batches as groups, which name no item.
 REDUCTION_GROUP = "group:"
@@ -508,15 +512,24 @@ class Contexts:
         records its standing entries were set from (`source_ids`, `record_ids`): a delivery, a window
         receipt or a compression that rendered the habits alone is found, and loses her words, when
         the message that set one is deleted. They are not `dependencies`, which a read checks for
-        freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01). Its
-        revision is the table's with a hash of what it shows, never the words: a delete takes a value
-        and leaves the table's revision, and a window that saw the habits gets them again, as they
-        are now, instead of keeping the earlier ones until it compacts (CL9-MM-03)."""
+        freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01). So each is
+        named too at the revision its entry was set from (`SET_FROM`): what read the habits did not
+        read the message as she corrected it, and may not cite that (K1-16, CL10-MM-01). Its
+        revision is a hash of the table's revision and of the keys of the entries a delete took: the
+        table's moves with every change she makes, and a delete takes a value and leaves it, so a
+        window that saw the habits gets them again, as they are now, instead of keeping the earlier
+        ones until it compacts (CL9-MM-03). Never of what she said: an erased delivery, a window's
+        receipts and the access log keep the hash (CL10-MM-02)."""
         refs = [ref for entry in habits["entries"].values() if not entry.get("source_deleted")
                 for ref in entry.get("evidence") or () if isinstance(ref, dict)]
-        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], habits["preferences"]]), "text": dumps(habits["preferences"]),
+        # As the entries' evidence names them; not the rest a reference keeps, such as the message's hash.
+        set_from = {dumps(named): named for named in ({key: ref[key] for key in ("source_id", "record_id", "revision") if key in ref}
+                                                      for ref in refs)}
+        taken = sorted(key for key, entry in habits["entries"].items() if entry.get("source_deleted"))
+        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], taken]), "text": dumps(habits["preferences"]),
                 "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
-                "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")})}
+                "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")}),
+                SET_FROM: [set_from[key] for key in sorted(set_from)]}
 
     @staticmethod
     def _line(item):
@@ -855,10 +868,11 @@ class Contexts:
         # Her words, with the messages they were set from as the background context names them
         # (`habits_item`): a fork that reads them here names those among what it read, so a delete
         # of one finds what it wrote from them -- the background item may have been left out as
-        # already seen in the window (CL9-MM-02).
+        # already seen in the window (CL9-MM-02) -- each at the revision it was set from, which is
+        # the one it read (CL10-MM-01).
         named = self.habits_item(habits)
         result["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"],
-                                         **{key: named[key] for key in RESTS_ON}}
+                                         **{key: named[key] for key in (*RESTS_ON, SET_FROM)}}
         items = [{"id": "expression", "text": dumps([g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:3]])}]
         items += [{"id": c["id"], "text": dumps({k: c.get(k) for k in ("content", "status", "basis", "evidence")})} for c in view.get("selected_concerns", [])[:3]]
         items += self._ledger_items(view)
@@ -1041,7 +1055,7 @@ class Contexts:
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index",
-                              **{key: i[key] for key in RESTS_ON if key in i}} for i in selected],
+                              **{key: i[key] for key in (*RESTS_ON, SET_FROM) if key in i}} for i in selected],
                       instruction_authority="data", purpose=purpose,
                       **({"recall_purpose": recall_purpose} if recall_purpose != "experience_recall" else {}))
         compression_requests = packed.get("model_requests", 0)
