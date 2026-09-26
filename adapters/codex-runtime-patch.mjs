@@ -8,13 +8,36 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V4';
+const assessmentMarker = '// KIN_ASSESS_V5';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
 const toolProbeMarker = '// KIN_TOOL_PROBE_V1';
 export const KIN_OWNED_ACP_MARKERS = Object.freeze([marker, lastReplyMarker, compactionMarker, compactionReceiptMarker,
   sessionMarker, inputIdentityMarker, inputStatusMarker, assessmentMarker, toolProbeMarker, retriesMarker, utf8Marker]);
+/** How `_kin/assess` takes each item a fork's turn leaves (CL8-FLOW-01), by the item kinds of the
+ * pinned app-server's ThreadItem (codex 0.156.1, as host/codex-thread-items.mjs pins its schema):
+ * - `notTool`: what the model was given, said or thought -- no tool call, left out of the receipt;
+ * - `read`: a call to an MCP server, whose result is read for the store's ids;
+ * - `readsNothing`: a call that reads nothing of the store (a web search, a patch, a sleep);
+ * - `untracked`: a call that may read anything and names nothing a receipt could carry.
+ * A kind in none of them -- a later app-server's new tool -- is taken as untracked: an unknown read
+ * cuts the turn short, it is never a silent one. */
+export const KIN_FORK_ITEM_KINDS = Object.freeze({
+  notTool: Object.freeze(['userMessage', 'agentMessage', 'reasoning', 'plan', 'contextCompaction']),
+  read: Object.freeze(['mcpToolCall']),
+  readsNothing: Object.freeze(['webSearch', 'fileChange', 'sleep']),
+  untracked: Object.freeze(['commandExecution', 'dynamicToolCall', 'imageView', 'collabAgentToolCall', 'subAgentActivity', 'functionCallOutput',
+    'imageGeneration', 'hookPrompt', 'enteredReviewMode', 'exitedReviewMode']),
+});
+/** What an assessment fork is not offered (CL8-FLOW-05, CL8-MM-03), as the exploration executor is
+ * not: it reads memory through the memory server and answers. No shell (in 0.156.1 shell_tool governs
+ * exec_command and write_stdin, unified_exec only their form), no image viewer, no sub-agents of
+ * either kind, apps, code mode, hooks or image generation. These are the fork's own settings, the
+ * main thread keeps its tools; each is one of 0.156.1's features, and a switch an app-server does not
+ * know it ignores. What still comes through is cut short as untracked (KIN_FORK_ITEM_KINDS). */
+export const KIN_FORK_CLOSED_FEATURES = Object.freeze(Object.fromEntries(['shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'multi_agent_v2',
+  'apps', 'code_mode', 'hooks', 'image_generation'].map(name => [`features.${name}`, false])));
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 const handlerAnchor = 'var CodexEventHandler = class _CodexEventHandler {';
 
@@ -452,9 +475,13 @@ function kinSteerAccepted(state, params) {
  * stops at 1000 ids a call, 2000 a turn, 50000 nodes, 32 levels or 4 MB of text. Every
  * call says whether it was cut short (`idsTruncated`), and a call that was names every
  * bound that cut it (`idsTruncatedBy`: ids-per-call, ids-per-turn, nodes, depth, text,
- * or rests-on when the memory server says it could not name all its result rests on).
- * A call that may read beside the memory tools and names nothing -- a shell command, a
- * dynamic tool, an image view, a sub-agent -- is cut short as `untracked` (CL7B-MM-02).
+ * rests-on when the memory server says it could not name all its result rests on, or
+ * rests-on-error when working that out failed there). A record is named once for each
+ * revision the call names it at (CL8-MM-02). A call that may read beside the memory tools
+ * and names nothing -- a shell command, a dynamic tool, an image view, a sub-agent, or a
+ * kind this code does not name (KIN_FORK_ITEM_KINDS) -- is cut short as `untracked`
+ * (CL7B-MM-02, CL8-FLOW-01); the fork is offered none of those it can be spared
+ * (KIN_FORK_CLOSED_FEATURES, CL8-FLOW-05).
  *
  * Every answer says how far it got, as `stage` (CR2-INT-06), beside the state and the
  * reason it already gave: `not-started` -- no turn was asked for, so no model was
@@ -495,23 +522,43 @@ const KIN_TOOL_ID_LIMITS = Object.freeze({ perCall: 1000, perTurn: 2000, nodes: 
 // read omitted or found stale, and the ids Kin's memory server names as deleted before the read
 // began (bare references a delete left behind, with no words).
 const KIN_LEFT_OUT = new Set(["trace", "omitted_ids", "needs_review_ids", "deleted_ids"]);
-// What may read beside the memory tools, the store's own files included, and names nothing a
-// receipt could carry: a shell command (a read-only sandbox reads anywhere), a client's dynamic
-// tool, an image view, a sub-agent. Such a call is cut short by that (CL7B-MM-02).
-const KIN_UNTRACKED = new Set(["commandExecution", "dynamicToolCall", "imageView", "collabAgentToolCall"]);
+// How each item of a fork's turn is taken (KIN_FORK_ITEM_KINDS, CL8-FLOW-01). What is not a tool call
+// is left out; an MCP call is read; a web search, a patch or a sleep reads nothing of the store; and
+// anything else -- a shell command (a read-only sandbox reads anywhere), a client's dynamic tool, an
+// image view, a sub-agent, a hook's words, or a kind the pinned app-server did not have -- may read
+// beside the memory tools, the store's own files included, and names nothing: it is cut short as
+// untracked (CL7B-MM-02).
+const KIN_ITEM_NOT_TOOL = new Set(${JSON.stringify(KIN_FORK_ITEM_KINDS.notTool)});
+const KIN_ITEM_READS_NOTHING = new Set(${JSON.stringify(KIN_FORK_ITEM_KINDS.readsNothing)});
+// What the fork is not offered, set on the fork alone (CL8-FLOW-05).
+const KIN_FORK_CLOSED = ${JSON.stringify(KIN_FORK_CLOSED_FEATURES)};
+function kinToolName(item) {
+  if (item?.type === "mcpToolCall") return \`\${item.server}.\${item.tool}\`;
+  if (item?.type === "dynamicToolCall" && typeof item.tool === "string") return item.tool;
+  return typeof item?.type === "string" && item.type ? item.type.slice(0, 128) : "unknown";
+}
 function kinToolResultIds(item, turn) {
-  if (KIN_UNTRACKED.has(item?.type)) return { ids: [], idsTruncated: true, idsTruncatedBy: ["untracked"] };
-  if (item?.type !== "mcpToolCall" || item.status !== "completed") return { ids: [], idsTruncated: false };
+  if (KIN_ITEM_READS_NOTHING.has(item?.type)) return { ids: [], idsTruncated: false };
+  if (item?.type !== "mcpToolCall") return { ids: [], idsTruncated: true, idsTruncatedBy: ["untracked"] };
+  if (item.status !== "completed") return { ids: [], idsTruncated: false };
+  // One entry for each id at each revision it is named at (CL8-MM-02): a record shown at its current
+  // revision beside an older reference to it is named at both. A bare mention names the id alone,
+  // until a revision is named for it.
   const found = new Map(), cut = new Set(), deleted = new Set();
   let nodes = 0, text = 0;
   const add = (id, revision) => {
     if (deleted.has(id)) return;
-    const known = found.get(id);
-    if (known) { if (known.revision === null && Number.isSafeInteger(revision)) known.revision = revision; return; }
+    revision = Number.isSafeInteger(revision) ? revision : null;
+    // An id's first entry is kept under the id; each further revision under id@revision.
+    const first = found.get(id);
+    if (first) {
+      if (first.revision === null) { if (revision !== null) first.revision = revision; return; }
+      if (revision === null || first.revision === revision || found.has(id + "@" + revision)) return;
+    }
     if (found.size >= KIN_TOOL_ID_LIMITS.perCall) { cut.add("ids-per-call"); return; }
     if (turn.used >= KIN_TOOL_ID_LIMITS.perTurn) { cut.add("ids-per-turn"); return; }
     turn.used++;
-    found.set(id, { id, revision: Number.isSafeInteger(revision) ? revision : null });
+    found.set(first ? id + "@" + revision : id, { id, revision });
   };
   const scan = (value, revision) => {
     for (const match of value.matchAll(KIN_STORE_ID)) add(match[0], revision);
@@ -553,11 +600,13 @@ function kinToolResultIds(item, turn) {
     try { values.push(JSON.parse(part.text)); } catch { values.push(part.text); }
   }
   // Kin's memory server says which of what a result names was deleted before the read, and when it
-  // could not name everything the result rests on (kin_memory_mcp.py, read-only mode).
+  // could not name everything the result rests on (kin_memory_mcp.py, read-only mode): past its bound or
+  // with a delete during the read (rests-on), or because working it out failed (rests-on-error, CL8-FLOW-02).
   for (const value of values) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     for (const id of Array.isArray(value.deleted_ids) ? value.deleted_ids : []) if (typeof id === "string") deleted.add(id);
-    if (value.rests_on_truncated === true) cut.add("rests-on");
+    if (value.rests_on_error) cut.add("rests-on-error");
+    else if (value.rests_on_truncated === true) cut.add("rests-on");
   }
   for (const value of values) walk(value, 0);
   return { ids: [...found.values()], idsTruncated: cut.size > 0, ...(cut.size ? { idsTruncatedBy: [...cut].sort() } : {}) };
@@ -603,6 +652,7 @@ function kinToolResultIds(item, turn) {
       const servers = await kinWithin(this.codexAcpClient.getConfigMcpServerNames(state.cwd), deadline, "timeout");
       for (const name of servers) if (name !== "memorypalace") config[\`mcp_servers.\${name}.enabled\`] = false;
       if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": "approve" });
+      Object.assign(config, KIN_FORK_CLOSED);
       const forkPromise = api.threadFork({ threadId: params.sessionId, lastTurnId, ephemeral: true, excludeTurns: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: "read-only", config });
       void forkPromise.then((fork) => { if (stopped && result.forkThreadId === null) void release(fork.thread.id); }, () => {});
       const fork = await kinWithin(forkPromise, deadline, "timeout");
@@ -629,8 +679,8 @@ function kinToolResultIds(item, turn) {
       result.turnId = turn.id;
       result.usage = usage;
       const idTurn = { used: 0 };
-      result.toolCalls = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "commandExecution", "webSearch", "fileChange", "imageView", "collabAgentToolCall"].includes(item.type))
-        .map((item) => ({ name: item.type === "mcpToolCall" ? \`\${item.server}.\${item.tool}\` : item.type === "dynamicToolCall" ? item.tool : item.type, ok: item.status === "completed", ...kinToolResultIds(item, idTurn) }));
+      result.toolCalls = items.filter((item) => !KIN_ITEM_NOT_TOOL.has(item?.type))
+        .map((item) => ({ name: kinToolName(item), ok: item?.status === "completed", ...kinToolResultIds(item, idTurn) }));
       const text = items.findLast((item) => item.type === "agentMessage")?.text ?? "";
       result.rawText = text;
       if (turn.status === "interrupted") return end("interrupted");
