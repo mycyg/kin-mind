@@ -508,10 +508,13 @@ class Contexts:
         records its standing entries were set from (`source_ids`, `record_ids`): a delivery, a window
         receipt or a compression that rendered the habits alone is found, and loses her words, when
         the message that set one is deleted. They are not `dependencies`, which a read checks for
-        freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01)."""
+        freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01). Its
+        revision is the table's with a hash of what it shows, never the words: a delete takes a value
+        and leaves the table's revision, and a window that saw the habits gets them again, as they
+        are now, instead of keeping the earlier ones until it compacts (CL9-MM-03)."""
         refs = [ref for entry in habits["entries"].values() if not entry.get("source_deleted")
                 for ref in entry.get("evidence") or () if isinstance(ref, dict)]
-        return {"id": HABITS_ITEM, "revision": habits["revision"], "text": dumps(habits["preferences"]),
+        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], habits["preferences"]]), "text": dumps(habits["preferences"]),
                 "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
                 "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")})}
 
@@ -849,7 +852,13 @@ class Contexts:
         result = {k: view[k] for k in ("scope", "revision", "agent_version", "as_of", "profile_version", "persona_contract") if k in view}
         result["dimensions"] = {k: {"value": round(d["value"], 2), "basis": d.get("basis"), "needs_review": bool(d.get("needs_review"))} for k, d in view["dimensions"].items()}
         habits = self.memory.habits.read()
-        result["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"]}
+        # Her words, with the messages they were set from as the background context names them
+        # (`habits_item`): a fork that reads them here names those among what it read, so a delete
+        # of one finds what it wrote from them -- the background item may have been left out as
+        # already seen in the window (CL9-MM-02).
+        named = self.habits_item(habits)
+        result["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"],
+                                         **{key: named[key] for key in RESTS_ON}}
         items = [{"id": "expression", "text": dumps([g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:3]])}]
         items += [{"id": c["id"], "text": dumps({k: c.get(k) for k in ("content", "status", "basis", "evidence")})} for c in view.get("selected_concerns", [])[:3]]
         items += self._ledger_items(view)
