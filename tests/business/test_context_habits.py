@@ -5,28 +5,46 @@ when such a message is deleted, even where nothing else in it names the message.
 review, and the context keeps showing it (K1-18, CL8-MM-01 follow-up). What a release before this one
 rendered from the habits names nothing: it goes, in the scope, when a message that set a habit is
 deleted, or by the release's reerase for one deleted before; and nothing this release keeps is taken
-for it, so a reerase with nothing left to erase plans nothing."""
+for it, so a reerase with nothing left to erase plans nothing. The state read shows the habits with
+the same names (CL9-MM-02)."""
 import json
 
 import pytest
 
-from eventmem.core.db import dumps
+from eventmem.core.db import dumps, named_in
 from eventmem.core.models import RevisionInput
 
 from kin_mind import erasure
 from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, Contexts, unnamed_compression
 from kin_mind.erasure import ERASED
+from kin_mind.memory import MemoryContinuity
 
 from test_erasure import LateModel, settle, stored_words, system, texts_everywhere  # noqa: F401  (the fixture)
+from test_fork_reads import contact_row
 from test_habit_erasure import DIRECTIONS, FREQUENCY, habits_from
+from test_kin_mind import wish
+
+pytest_plugins = ('test_kin_mind',)
 
 WORDS = (*DIRECTIONS, FREQUENCY)
 FILLER = "They checked the harbour path, the tide table and the lamps along the pier. " * 12
+# What a tool's result says it left out, which the owned ACP does not read (codex-runtime-patch.mjs KIN_LEFT_OUT).
+ACP_LEFT_OUT = frozenset({"trace", "omitted_ids", "needs_review_ids", "deleted_ids"})
 
 
 def her_words(engine):
     """Where the store still holds any of what she said the habits should be."""
     return {word: found for word in WORDS if (found := texts_everywhere(engine, word))}
+
+
+def acp_read(value):
+    """The store ids the owned ACP reads out of a tool's result (`kinToolResultIds`): every one it
+    names, keys too, outside what it says it left out."""
+    if isinstance(value, dict):
+        return {found for key, item in value.items() if key not in ACP_LEFT_OUT for found in (*named_in(key), *acp_read(item))}
+    if isinstance(value, list):
+        return {found for item in value for found in acp_read(item)}
+    return set(named_in(value))
 
 
 def rows_in(engine, table):
@@ -269,3 +287,39 @@ def test_a_compression_kept_before_that_may_hold_the_habits_is_told_apart():
     overview = {"text": "…", "source": {"id": "mem_" + "0" * 32}, "receipt": None, "coverage": "overview"}
     assert [unnamed_compression(value) for value in (batch, whole, reduction, others, overview)] == [True, True, True, False, False]
     assert not any(unnamed_compression({**value, CACHE_RESTS_ON: []}) for value in (batch, whole, reduction))
+
+
+def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
+    """`read_affective_state` shows the habits -- her words -- and names the messages their standing
+    entries were set from, as the background item does, so a fork that reads them there names those
+    among what it read. A contact draft whose fork read them there and wrote from them, with the
+    background item left out of its memory context as already seen in the window, is found and loses
+    the words when the message that set them is deleted (CL9-MM-02)."""
+    mind, source, clock = setup
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True, "semantic": True})
+    directions, reply = habits_from(memory, clock)
+    records = {sid: mind.engine.source(sid)["record_ids"][0] for sid in (directions, reply)}
+    state = Contexts(mind).affective()
+    habits = state["conversation_habits"]
+    assert habits["revision"] == memory.habits.read()["revision"], "the revision an update expects"
+    assert habits["preferences"]["exploration_directions"] == DIRECTIONS
+    assert (habits["source_ids"], habits["record_ids"]) == (sorted(records), sorted(records.values()))
+    read = acp_read(state)
+    assert {directions, records[directions]} <= read
+
+    wish(mind, source, "habits-wish", content="Suggest an outing she asked for")
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    receipt = {"channel": "fork", "tool_calls": [{"name": "memorypalace.read_affective_state", "ok": True,
+                                                  "ids": [{"id": identifier} for identifier in sorted(read)]}]}
+    pending = mind.settle_contact(attempt_id=attempt["id"], state="pending", text=f"这周要不要去看{DIRECTIONS[0]}？",
+                                  shown_ids=[], draft_receipt=receipt)
+    assert pending["state"] == "pending" and records[directions] in pending["evaluated_ids"]
+    assert DIRECTIONS[0] in contact_row(mind, attempt["id"])[1]["text_excerpt"]
+
+    mind.engine.delete(directions)
+    settle(mind.engine)
+    state, row = contact_row(mind, attempt["id"])
+    assert row["text_excerpt"] == ERASED and row["text_digest"]
+    assert texts_everywhere(mind.engine, DIRECTIONS[0]) == set()
+    assert Contexts(mind).affective()["conversation_habits"]["source_ids"] == [reply], "a message that is gone is named no more"

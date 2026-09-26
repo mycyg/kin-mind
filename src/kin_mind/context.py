@@ -849,7 +849,13 @@ class Contexts:
         result = {k: view[k] for k in ("scope", "revision", "agent_version", "as_of", "profile_version", "persona_contract") if k in view}
         result["dimensions"] = {k: {"value": round(d["value"], 2), "basis": d.get("basis"), "needs_review": bool(d.get("needs_review"))} for k, d in view["dimensions"].items()}
         habits = self.memory.habits.read()
-        result["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"]}
+        # Her words, with the messages they were set from as the background context names them
+        # (`habits_item`): a fork that reads them here names those among what it read, so a delete
+        # of one finds what it wrote from them -- the background item may have been left out as
+        # already seen in the window (CL9-MM-02).
+        named = self.habits_item(habits)
+        result["conversation_habits"] = {"revision": habits["revision"], "preferences": habits["preferences"],
+                                         **{key: named[key] for key in RESTS_ON}}
         items = [{"id": "expression", "text": dumps([g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:3]])}]
         items += [{"id": c["id"], "text": dumps({k: c.get(k) for k in ("content", "status", "basis", "evidence")})} for c in view.get("selected_concerns", [])[:3]]
         items += self._ledger_items(view)
