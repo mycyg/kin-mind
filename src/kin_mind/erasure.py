@@ -118,6 +118,14 @@ DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker"
 # Derived caches: a row that names erased material, or a graph item the erase took words from,
 # goes whole. Rebuilding one costs a model call; keeping one keeps the words.
 CACHES = ("mind_context_cache", "mind_semantic_cache")
+# A cached semantic answer is served only in the generation it was asked in, and a delete moves the
+# generation on (`Engine.delete`): none cached before it is served again, so at a delete every one
+# goes, whatever it names -- one asked about something that names no source, the conversation habits,
+# may repeat what the deleted message said (CL8-MM-01). The repair moves nothing on: its plan and its
+# runs take only the ones that name what was erased, so a store with nothing left to erase plans nothing.
+GENERATION_CACHES = frozenset({"mind_semantic_cache"})
+# Where a conversation habit was set from what is erased: the habits and their history name it.
+HABIT_TABLES = ("mind_conversation_habits", "mind_habit_revisions")
 # The history rewrite's own progress, in the table every resumable migration of the mind uses.
 HISTORY_MIGRATION = "history-erase"
 # And what it has finished: every identifier whose rows no history holds words of any more — a
@@ -633,9 +641,16 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
             counts["unnamed:" + table] = _unnamed(conn, table, changed.get(table, set()), write=write, stopped=stopped)
     # A cache that summarised a graph item the erase took words from holds those words too.
     for table in CACHES:
-        counts[table] = _drop_cache(conn, table, ids | touched, write=write)
+        every = table in GENERATION_CACHES and write and not again
+        counts[table] = _drop_cache(conn, table, None if every else ids | touched, write=write)
     # So does everything rendered for a native window from any of them (CR-MEM-02).
     counts["context_receipts"] = _context_receipts(conn, ids | touched | frozenset(nodes), at, write=write)
+    # And, where a conversation habit was set from any of them, what a release before this one rendered
+    # from the habits: it names nothing they rest on (CL8-MM-01).
+    rendered, compressed = _unnamed_habits(conn, _habit_scopes(conn, ids), ids | touched | frozenset(nodes),
+                                           ids | touched, at, write=write)
+    counts["context_receipts"] += rendered
+    counts["mind_context_cache"] += compressed
     if _table(conn, "mind_judgment_cache_deps"):
         wanted = sorted(ids | touched)
         if write:
@@ -734,13 +749,78 @@ def _context_receipts(conn, doomed, at, *, write=True):
 def _drop_cache(conn, table, ids, *, write=True):
     """Compressed context and cached semantic answers are the same words in a model's
     phrasing, and derived: the rows that name what the erase touched go, whatever the sweep
-    setting of the scope says."""
-    if not ids or not _table(conn, table):
+    setting of the scope says -- every row, where `ids` is None."""
+    if (ids is not None and not ids) or not _table(conn, table):
         return 0
-    doomed = [row["key"] for row in mentions(conn, table, ids, "rowid AS key")]
+    doomed = ([row[0] for row in conn.execute(f"SELECT rowid FROM {table}")] if ids is None
+              else [row["key"] for row in mentions(conn, table, ids, "rowid AS key")])
     for key in doomed if write else ():
         conn.execute(f"DELETE FROM {table} WHERE rowid=?", (key,))
     return len(doomed)
+
+
+def _habit_scopes(conn, ids):
+    """The scopes whose conversation habits, now or in their history, were set from any of `ids`."""
+    return frozenset(row[0] for table in HABIT_TABLES if _table(conn, table)
+                     for row in mentions(conn, table, ids, "scope"))
+
+
+def _unnamed_habits(conn, scopes, doomed, cached, at, *, write=True):
+    """In `scopes`, what a release before this one rendered from the conversation habits holds her
+    words and names nothing they rest on: every delivery and window receipt that shows them
+    (`context.unnamed_habits`) is erased as `_context_receipts` erases one, every compression that
+    may hold them (`context.unnamed_compression`) dropped. What names anything of `doomed` -- of
+    `cached`, a compression -- is the id rule's, which comes first, so a dry run counts each once, as
+    a run takes it. Returns the deliveries and receipts, and the compressions."""
+    from .context import HABITS_ITEM, unnamed_compression, unnamed_habits
+
+    def showing(table, needle=None):
+        if not scopes or not _table(conn, table):
+            return []
+        return conn.execute(f"SELECT rowid AS key,data FROM {table} WHERE scope IN ({','.join('?' * len(scopes))})"
+                            + (" AND instr(data,?)>0" if needle else ""), (*sorted(scopes), *([needle] if needle else []))).fetchall()
+
+    def named(table, ids):
+        return {row["key"] for row in mentions(conn, table, ids, "rowid AS key")} if ids else set()
+
+    rendered = compressed = 0
+    if found := showing("mind_context_deliveries", HABITS_ITEM):
+        taken = named("mind_context_deliveries", doomed)
+        for row in found:
+            value = json.loads(row["data"])
+            if row["key"] in taken or value.get("erased_at") and value.get("text") == ERASED or not unnamed_habits(value.get("items")):
+                continue
+            if write:
+                conn.execute("UPDATE mind_context_deliveries SET data=? WHERE rowid=?",
+                             (dumps(erased_delivery(value, at)), row["key"]))
+            rendered += 1
+    if found := showing("mind_context_windows", HABITS_ITEM):
+        taken, marks = named("mind_context_windows", doomed), sorted(doomed)
+        for row in found:
+            value = json.loads(row["data"])
+            receipts = value.get("receipts") or {}
+            new = {key: (erased_receipt(receipt, at) if isinstance(receipt, dict) and not receipt.get("erased_at")
+                         and unnamed_habits(receipt.get("index"))
+                         and not (row["key"] in taken and any(mark in dumps(receipt) for mark in marks)) else receipt)
+                   for key, receipt in receipts.items()}
+            erased = sum(new[key] is not receipts[key] for key in receipts)
+            if erased and write:
+                conn.execute("UPDATE mind_context_windows SET data=? WHERE rowid=?",
+                             (dumps({**value, "receipts": new}), row["key"]))
+            rendered += erased
+    if found := showing("mind_context_cache"):
+        taken = named("mind_context_cache", cached)
+        for row in found:
+            try:
+                value = json.loads(row["data"])
+            except ValueError:
+                continue
+            if row["key"] in taken or not unnamed_compression(value):
+                continue
+            if write:
+                conn.execute("DELETE FROM mind_context_cache WHERE rowid=?", (row["key"],))
+            compressed += 1
+    return rendered, compressed
 
 
 def _graph(conn, ids, records, at, *, write=True):
