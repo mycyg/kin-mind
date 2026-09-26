@@ -515,18 +515,21 @@ class Contexts:
         freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01). So each is
         named too at the revision its entry was set from (`SET_FROM`): what read the habits did not
         read the message as she corrected it, and may not cite that (K1-16, CL10-MM-01). Its
-        revision is a hash of the table's revision and of the keys of the entries a delete took: the
-        table's moves with every change she makes, and a delete takes a value and leaves it, so a
-        window that saw the habits gets them again, as they are now, instead of keeping the earlier
-        ones until it compacts (CL9-MM-03). Never of what she said: an erased delivery, a window's
-        receipts and the access log keep the hash (CL10-MM-02)."""
+        revision is a hash of the table's revision, of the keys of the entries a delete took and of
+        the defaults: the table's moves with every change she makes, a delete takes a value and leaves
+        it, and a release may change a default, so a window that saw the habits gets them again, as
+        they are now, instead of keeping the earlier ones until it compacts (CL9-MM-03, CL10-MM-04).
+        Never of what she said: an erased delivery, a window's receipts and the access log keep the
+        hash (CL10-MM-02); the defaults are the code's."""
+        from .habits import DEFAULTS
+
         refs = [ref for entry in habits["entries"].values() if not entry.get("source_deleted")
                 for ref in entry.get("evidence") or () if isinstance(ref, dict)]
         # As the entries' evidence names them; not the rest a reference keeps, such as the message's hash.
         set_from = {dumps(named): named for named in ({key: ref[key] for key in ("source_id", "record_id", "revision") if key in ref}
                                                       for ref in refs)}
         taken = sorted(key for key, entry in habits["entries"].items() if entry.get("source_deleted"))
-        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], taken]), "text": dumps(habits["preferences"]),
+        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], taken, DEFAULTS]), "text": dumps(habits["preferences"]),
                 "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
                 "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")}),
                 SET_FROM: [set_from[key] for key in sorted(set_from)]}

@@ -9,7 +9,8 @@ for it, so a reerase with nothing left to erase plans nothing. The state read sh
 the same names (CL9-MM-02). A window that saw the habits gets them again once a delete took a value
 from them (CL9-MM-03). Both name each message at the revision its habit was set from as well: a fork
 that read only the habits did not read the message as she corrected it since, and may not cite that
-(K1-16, CL10-MM-01). An update of the habits says it expects the state read's revision (CL10-MM-03)."""
+(K1-16, CL10-MM-01). An update of the habits says it expects the state read's revision (CL10-MM-03), and a
+change to the defaults moves the habits' revision too (CL10-MM-04)."""
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from eventmem.core.db import NAMED, digest, dumps
 from eventmem.core.models import RevisionInput
 
 from kin_mind import context, erasure
+from kin_mind import habits as habit_rules
 from kin_mind.appraisal import Appraisals
 from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, SET_FROM, Contexts, unnamed_compression
 from kin_mind.context_delivery import ContextDelivery
@@ -402,9 +404,9 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     later read there leaves them out as already seen. The message that set the directions is deleted:
     the habits lose the value and keep the table's revision. The next background read in the same
     window sends them again, as they are now: without her directions, with the reply choice the other
-    message set (CL9-MM-03). Their revision is a hash of the table's revision and of the keys the delete
-    took, never of anything she said: what the window keeps of it before and after names none of it
-    (CL10-MM-02)."""
+    message set (CL9-MM-03). Their revision is a hash of the table's revision, of the keys the delete took
+    and of the defaults, never of anything she said: what the window keeps of it before and after names
+    none of it (CL10-MM-02, CL10-MM-04)."""
     mind, memory, source, clock = system
     engine = mind.engine
     directions, reply = habits_from(memory, clock)
@@ -440,7 +442,8 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     hashed = []
     monkeypatch.setattr(context, "digest", lambda value: hashed.append(value) or digest(value))
     assert [Contexts.habits_item(habits)["revision"] for habits in (before, after)] == [seen, contexts.window("thread-1")["seen"][HABITS_ITEM]]
-    assert hashed == [[before["revision"], []], [before["revision"], ["exploration_directions", "exploration_frequency"]]]
+    assert hashed == [[before["revision"], [], habit_rules.DEFAULTS],
+                      [before["revision"], ["exploration_directions", "exploration_frequency"], habit_rules.DEFAULTS]]
     assert not any(value in json.dumps(hashed, ensure_ascii=False) for value in (*WORDS, "autonomous")), "no preference of hers"
 
 
@@ -507,3 +510,25 @@ def test_an_update_of_the_habits_expects_the_revision_the_state_read_shows(syste
     again = said(memory, clock, "said-again", "还是每周一次吧")
     assert memory.habits.update({"command_id": "again", "expected_revision": shown, "evidence_ids": [again], "reason": "她改成每周一次",
                                  "preferences": {"exploration_frequency": "每周一次"}})["revision"] == shown + 1
+
+
+def test_a_change_to_the_defaults_moves_the_habits_revision(system, monkeypatch):
+    """A release that changes a default changes what the habits show, with nothing she said changed or
+    deleted and the table's revision where it was: their revision moves too, so a window that saw them
+    gets them again, with the new default (CL10-MM-04)."""
+    mind, memory, source, clock = system
+    habits_from(memory, clock)
+    contexts = Contexts(mind)
+
+    def read(turn):
+        return contexts.build("", purpose="chat", session="thread-1", event_id=turn)
+
+    assert HABITS_ITEM in read("turn-1")["covered_ids"] and HABITS_ITEM not in read("turn-2")["covered_ids"]
+    seen, revision = contexts.window("thread-1")["seen"][HABITS_ITEM], memory.habits.read()["revision"]
+    monkeypatch.setattr(habit_rules, "DEFAULTS", {**habit_rules.DEFAULTS, "exploration_min_interval_minutes": 45})
+    assert memory.habits.read()["revision"] == revision
+    again = read("turn-3")
+    assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
+    lines = [json.loads(line) for line in again["text"].splitlines() if line.startswith("{")]
+    assert json.loads(next(line for line in lines if line["id"] == HABITS_ITEM)["text"])["exploration_min_interval_minutes"] == 45
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
