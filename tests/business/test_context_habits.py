@@ -7,17 +7,21 @@ rendered from the habits names nothing: it goes, in the scope, when a message th
 deleted, or by the release's reerase for one deleted before; and nothing this release keeps is taken
 for it, so a reerase with nothing left to erase plans nothing. The state read shows the habits with
 the same names (CL9-MM-02). A window that saw the habits gets them again once a delete took a value
-from them (CL9-MM-03)."""
+from them (CL9-MM-03). Both name each message at the revision its habit was set from as well: a fork
+that read only the habits did not read the message as she corrected it since, and may not cite that
+(K1-16, CL10-MM-01)."""
 import json
 import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from eventmem.core.db import dumps, named_in
+from eventmem.core.db import NAMED, dumps
 from eventmem.core.models import RevisionInput
 
 from kin_mind import erasure
-from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, Contexts, unnamed_compression
+from kin_mind.appraisal import Appraisals
+from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, SET_FROM, Contexts, unnamed_compression
 from kin_mind.context_delivery import ContextDelivery
 from kin_mind.erasure import ERASED
 from kin_mind.memory import MemoryContinuity
@@ -40,14 +44,74 @@ def her_words(engine):
     return {word: found for word in WORDS if (found := texts_everywhere(engine, word))}
 
 
-def acp_read(value):
-    """The store ids the owned ACP reads out of a tool's result (`kinToolResultIds`): every one it
-    names, keys too, outside what it says it left out."""
-    if isinstance(value, dict):
-        return {found for key, item in value.items() if key not in ACP_LEFT_OUT for found in (*named_in(key), *acp_read(item))}
-    if isinstance(value, list):
-        return {found for item in value for found in acp_read(item)}
-    return set(named_in(value))
+def acp_ids(result):
+    """What the owned ACP keeps of a tool's result (codex-runtime-patch.mjs `kinToolResultIds`), as
+    [{id, revision}]: every store id it names, keys and JSON carried as text too, outside what it says it
+    left out and what it lists as deleted. One under `id` or `record_id` beside an integer `revision` is
+    at that revision, any other mention bare, and a bare entry stands only until a revision is named."""
+    found, deleted = {}, set(result.get("deleted_ids") or ()) if isinstance(result, dict) else set()
+
+    def add(identifier, revision):
+        if identifier in deleted:
+            return
+        revision = revision if type(revision) is int else None
+        first = found.get(identifier)
+        if first is not None:
+            if first["revision"] is None:
+                if revision is not None:
+                    first["revision"] = revision
+                return
+            if revision is None or revision == first["revision"] or f"{identifier}@{revision}" in found:
+                return
+        found[f"{identifier}@{revision}" if first is not None else identifier] = {"id": identifier, "revision": revision}
+
+    def read(text, revision):
+        if text.lstrip()[:1] in ("{", "["):
+            try:
+                whole = json.loads(text)
+            except ValueError:
+                whole = None
+            if isinstance(whole, (dict, list)):
+                return walk(whole)
+            for line in text.split("\n"):
+                try:
+                    part = json.loads(line) if line.lstrip()[:1] in ("{", "[") else None
+                except ValueError:
+                    part = None
+                if isinstance(part, (dict, list)):
+                    walk(part)
+                else:
+                    for identifier in NAMED.findall(line):
+                        add(identifier, revision)
+            return
+        for identifier in NAMED.findall(text):
+            add(identifier, revision)
+
+    def walk(node):
+        if isinstance(node, str):
+            read(node, None)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            for key, item in node.items():
+                if key in ACP_LEFT_OUT:
+                    continue
+                read(str(key), None)
+                if isinstance(item, str):
+                    read(item, node.get("revision") if key in ("id", "record_id") else None)
+                else:
+                    walk(item)
+
+    walk(result)
+    return list(found.values())
+
+
+def set_from(engine, *sources):
+    """Each message, as a habit set from it now names it: at the revision its record has."""
+    named = [{"source_id": sid, "record_id": rid, "revision": engine.get(rid)["revision"]}
+             for sid in sources for rid in engine.source(sid)["record_ids"][:1]]
+    return sorted(named, key=dumps)
 
 
 def rows_in(engine, table):
@@ -68,7 +132,7 @@ def as_a_release_before_kept_them(engine, showing=None):
     nothing they rest on, and no compression named `rests_on`. `showing`: an event whose context also
     showed an item, by its id alone."""
     def bare(entries):
-        return [{key: value for key, value in entry.items() if key not in RESTS_ON} for entry in entries or []]
+        return [{key: value for key, value in entry.items() if key not in (*RESTS_ON, SET_FROM)} for entry in entries or []]
 
     showing = showing or {}
     with engine.db.connect(write=True) as conn:
@@ -98,8 +162,9 @@ def notes(engine, contexts, source):
 @pytest.mark.parametrize("receipt_mode", [True, False])
 def test_a_context_that_rendered_only_the_habits_keeps_none_of_her_words_once_the_message_is_deleted(system, receipt_mode):
     """A background context with no query renders the habits and nothing that names the messages that
-    set them; its prepared delivery, or its window receipt, now names them through the habits alone.
-    The message is deleted: the delivery or the receipt loses its words, and no table holds them."""
+    set them; its prepared delivery, or its window receipt, now names them through the habits alone,
+    each at the revision its habit was set from as well. The message is deleted: the delivery or the
+    receipt loses its words, and no table holds them."""
     mind, memory, source, clock = system
     directions, reply = habits_from(memory, clock)
     record = mind.engine.source(directions)["record_ids"][0]
@@ -113,6 +178,7 @@ def test_a_context_that_rendered_only_the_habits_keeps_none_of_her_words_once_th
     habits = next(entry for entry in named if entry["id"] == "conversation-habits")
     assert (habits["source_ids"], habits["record_ids"]) == (sorted([directions, reply]),
                                                              sorted([record, mind.engine.source(reply)["record_ids"][0]]))
+    assert habits[SET_FROM] == set_from(mind.engine, directions, reply)
 
     mind.engine.delete(directions)
     settle(mind.engine)
@@ -295,9 +361,10 @@ def test_a_compression_kept_before_that_may_hold_the_habits_is_told_apart():
 def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
     """`read_affective_state` shows the habits -- her words -- and names the messages their standing
     entries were set from, as the background item does, so a fork that reads them there names those
-    among what it read. A contact draft whose fork read them there and wrote from them, with the
-    background item left out of its memory context as already seen in the window, is found and loses
-    the words when the message that set them is deleted (CL9-MM-02)."""
+    among what it read, each at the revision its habit was set from (CL10-MM-01). A contact draft whose
+    fork read them there and wrote from them, with the background item left out of its memory context
+    as already seen in the window, is found and loses the words when the message that set them is
+    deleted (CL9-MM-02)."""
     mind, source, clock = setup
     memory = MemoryContinuity(mind)
     memory.configure({"records": True, "semantic": True})
@@ -308,13 +375,14 @@ def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
     assert habits["revision"] == memory.habits.read()["revision"], "the revision an update expects"
     assert habits["preferences"]["exploration_directions"] == DIRECTIONS
     assert (habits["source_ids"], habits["record_ids"]) == (sorted(records), sorted(records.values()))
-    read = acp_read(state)
-    assert {directions, records[directions]} <= read
+    assert habits[SET_FROM] == set_from(mind.engine, directions, reply)
+    read = acp_ids(state)
+    assert {"id": directions, "revision": None} in read
+    assert {"id": records[directions], "revision": mind.engine.get(records[directions])["revision"]} in read
 
     wish(mind, source, "habits-wish", content="Suggest an outing she asked for")
     attempt = mind.claim_contact(owner_epoch="owner-1")
-    receipt = {"channel": "fork", "tool_calls": [{"name": "memorypalace.read_affective_state", "ok": True,
-                                                  "ids": [{"id": identifier} for identifier in sorted(read)]}]}
+    receipt = {"channel": "fork", "tool_calls": [{"name": "memorypalace.read_affective_state", "ok": True, "ids": read}]}
     pending = mind.settle_contact(attempt_id=attempt["id"], state="pending", text=f"这周要不要去看{DIRECTIONS[0]}？",
                                   shown_ids=[], draft_receipt=receipt)
     assert pending["state"] == "pending" and records[directions] in pending["evaluated_ids"]
@@ -365,3 +433,50 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
     assert HABITS_ITEM not in read("turn-4")["covered_ids"], "and seen again"
     assert her_words(engine) == {}
+
+
+@pytest.mark.parametrize("tool", ["read_affective_state", "read_continuity_context"])
+def test_a_fork_that_read_the_habits_may_cite_their_message_only_as_they_were_set_from_it(system, tool):
+    """Replay H (CL10-MM-01). A fork reads the habits -- in the state read, or in the index of a
+    continuity read -- and cites the message that set the directions, by its record or by its source.
+    Uncorrected, the message is what the habits were set from, and K1-16 accepts it. She corrects it:
+    the habit keeps its value, marked for review (K1-18), and the read still names the message at the
+    revision the habit was set from, so a citation of what she says now is refused. Named bare, as the
+    lists alone name it, it was taken as read at the revision it has now."""
+    mind, memory, source, clock = system
+    directions, reply = habits_from(memory, clock)
+    [record] = mind.engine.source(directions)["record_ids"]
+    revision = mind.engine.get(record)["revision"]
+    contexts, jobs = Contexts(mind), Appraisals(mind)
+    started = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+    def fork_read():
+        result = contexts.affective() if tool == "read_affective_state" else contexts.build("", purpose="read")
+        shown = result["conversation_habits"] if tool == "read_affective_state" else next(
+            entry for entry in result["index"] if entry["id"] == HABITS_ITEM)
+        assert record in shown["record_ids"] and {"source_id": directions, "record_id": record, "revision": revision} in shown[SET_FROM]
+        ids = acp_ids(result)
+        return ids, {"native_receipt": {"channel": "fork", "tool_calls": [{"name": f"memorypalace.{tool}", "ok": True, "ids": ids}]}}
+
+    def citing(identifier):
+        class Proposal:
+            def model_dump(self):
+                return {"understanding": {"evidence_ids": [identifier]}}
+        return Proposal()
+
+    ids, receipt = fork_read()
+    assert [entry for entry in ids if entry["id"] == record] == [{"id": record, "revision": revision}]
+    for cited in (record, directions):
+        assert set(jobs._tool_fetched(citing(cited), receipt, {}, started)) == {record}, cited
+
+    mind.engine.revise(record, RevisionInput(expected_revision=revision, command_id="correct-directions", action="correct",
+                                             content="以后多去看看天文台的夜观", reason="她改了一下说法"))
+    habits = memory.habits.read()
+    assert habits["preferences"]["exploration_directions"] == DIRECTIONS and habits["entries"]["exploration_directions"]["needs_review"]
+    ids, receipt = fork_read()
+    assert [entry for entry in ids if entry["id"] == record] == [{"id": record, "revision": revision}], "as the habit was set from it"
+    for cited in (record, directions):
+        assert jobs._tool_fetched(citing(cited), receipt, {}, started) == {}, cited
+    bare = [{**entry, "revision": None} if entry["id"] == record else entry for entry in ids]
+    bare = {"native_receipt": {"channel": "fork", "tool_calls": [{"name": f"memorypalace.{tool}", "ok": True, "ids": bare}]}}
+    assert set(jobs._tool_fetched(citing(record), bare, {}, started)) == {record}
