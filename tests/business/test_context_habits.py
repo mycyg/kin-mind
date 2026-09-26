@@ -9,7 +9,7 @@ for it, so a reerase with nothing left to erase plans nothing. The state read sh
 the same names (CL9-MM-02). A window that saw the habits gets them again once a delete took a value
 from them (CL9-MM-03). Both name each message at the revision its habit was set from as well: a fork
 that read only the habits did not read the message as she corrected it since, and may not cite that
-(K1-16, CL10-MM-01)."""
+(K1-16, CL10-MM-01). An update of the habits says it expects the state read's revision (CL10-MM-03)."""
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -28,7 +28,7 @@ from kin_mind.memory import MemoryContinuity
 
 from test_erasure import LateModel, settle, stored_words, system, texts_everywhere  # noqa: F401  (the fixture)
 from test_fork_reads import contact_row
-from test_habit_erasure import DIRECTIONS, FREQUENCY, habits_from
+from test_habit_erasure import DIRECTIONS, FREQUENCY, habits_from, said
 from test_kin_mind import wish
 
 pytest_plugins = ('test_kin_mind',)
@@ -489,3 +489,21 @@ def test_a_fork_that_read_the_habits_may_cite_their_message_only_as_they_were_se
     bare = [{**entry, "revision": None} if entry["id"] == record else entry for entry in ids]
     bare = {"native_receipt": {"channel": "fork", "tool_calls": [{"name": f"memorypalace.{tool}", "ok": True, "ids": bare}]}}
     assert set(jobs._tool_fetched(citing(record), bare, {}, started)) == {record}
+
+
+def test_an_update_of_the_habits_expects_the_revision_the_state_read_shows(system):
+    """The background item's revision is a hash, which no update takes. The update tool says where its
+    `expected_revision` comes from -- the state read's `conversation_habits.revision`, the table's -- and
+    an update with that one applies (CL10-MM-03)."""
+    import asyncio
+
+    from eventmem.core.mcp import create_mcp
+
+    mind, memory, source, clock = system
+    habits_from(memory, clock)
+    tools = {tool.name: tool for tool in asyncio.run(create_mcp(mind.engine).list_tools())}
+    assert "expected_revision 用 read_affective_state 返回的 conversation_habits.revision" in tools["update_conversation_habits"].description
+    shown = Contexts(mind).affective()["conversation_habits"]["revision"]
+    again = said(memory, clock, "said-again", "还是每周一次吧")
+    assert memory.habits.update({"command_id": "again", "expected_revision": shown, "evidence_ids": [again], "reason": "她改成每周一次",
+                                 "preferences": {"exploration_frequency": "每周一次"}})["revision"] == shown + 1

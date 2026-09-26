@@ -27,7 +27,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def update_conversation_habits(scope: Scope, request: dict) -> dict:
-        """依据主人在对话中明确表达的偏好更新习惯。需要 command_id、expected_revision、evidence_ids、reason、preferences。支持 exploration_frequency、exploration_directions、exploration_min_interval_minutes、exploration_paused、reply_choice（always/autonomous）。返回持久修订；人格核心另行维护。"""
+        """依据主人在对话中明确表达的偏好更新习惯。需要 command_id、expected_revision、evidence_ids、reason、preferences。expected_revision 用 read_affective_state 返回的 conversation_habits.revision。支持 exploration_frequency、exploration_directions、exploration_min_interval_minutes、exploration_paused、reply_choice（always/autonomous）。返回持久修订；人格核心另行维护。"""
         from .habits import ConversationHabits
         return ConversationHabits(Mind(engine, scope)).update(request)
 
