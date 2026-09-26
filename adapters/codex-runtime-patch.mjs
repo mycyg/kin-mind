@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V5';
+const assessmentMarker = '// KIN_ASSESS_V7';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -18,7 +18,8 @@ export const KIN_OWNED_ACP_MARKERS = Object.freeze([marker, lastReplyMarker, com
 /** How `_kin/assess` takes each item a fork's turn leaves (CL8-FLOW-01), by the item kinds of the
  * pinned app-server's ThreadItem (codex 0.156.1, as host/codex-thread-items.mjs pins its schema):
  * - `notTool`: what the model was given, said or thought -- no tool call, left out of the receipt;
- * - `read`: a call to an MCP server, whose result is read for the store's ids;
+ * - `read`: a call to the memory server, whose result is read for the store's ids -- a call to any
+ *   other MCP server, one a plugin or an app brings past the fork's settings, is untracked (CL10-FLOW-03);
  * - `readsNothing`: a call that reads nothing of the store (a web search, a patch, a sleep);
  * - `untracked`: a call that may read anything and names nothing a receipt could carry.
  * A kind in none of them -- a later app-server's new tool -- is taken as untracked: an unknown read
@@ -33,11 +34,20 @@ export const KIN_FORK_ITEM_KINDS = Object.freeze({
 /** What an assessment fork is not offered (CL8-FLOW-05, CL8-MM-03), as the exploration executor is
  * not: it reads memory through the memory server and answers. No shell (in 0.156.1 shell_tool governs
  * exec_command and write_stdin, unified_exec only their form), no image viewer, no sub-agents of
- * either kind, apps, code mode, hooks or image generation. These are the fork's own settings, the
+ * either kind, apps, code mode, hooks or image generation; and, whatever Kin's home turns on, none of
+ * what the runtime proof runner closes besides (adapters/mobile-runtime-proof-runner.mjs, CL10-FLOW-03):
+ * plugins, browser or computer use, skill search, tool suggestions, sleep, web search requests,
+ * workspace dependencies, shell snapshots or terminals. No goals either: a goal the fork set could
+ * keep the app-server turning after the turn assessed (CL10-FLOW-04). A question to the user 0.156.1
+ * offers a fork whatever its settings; with default_mode_request_user_input off, the app-server itself
+ * answers the fork's model, in its Default mode, that it is unavailable -- nobody is asked, and the
+ * native proof asks one and holds the fork to ending on time. These are the fork's own settings, the
  * main thread keeps its tools; each is one of 0.156.1's features, and a switch an app-server does not
- * know it ignores. What still comes through is cut short as untracked (KIN_FORK_ITEM_KINDS). */
+ * know it ignores. What still comes through is cut short as untracked (KIN_FORK_ITEM_KINDS), and so is
+ * a call to any MCP server but the memory's. */
 export const KIN_FORK_CLOSED_FEATURES = Object.freeze(Object.fromEntries(['shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'multi_agent_v2',
-  'apps', 'code_mode', 'hooks', 'image_generation'].map(name => [`features.${name}`, false])));
+  'apps', 'code_mode', 'hooks', 'image_generation', 'plugins', 'browser_use', 'computer_use', 'skill_search', 'tool_suggest', 'sleep_tool',
+  'web_search_request', 'workspace_dependencies', 'shell_snapshot', 'unified_exec_tty', 'goals', 'default_mode_request_user_input'].map(name => [`features.${name}`, false])));
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 const handlerAnchor = 'var CodexEventHandler = class _CodexEventHandler {';
 
@@ -478,10 +488,11 @@ function kinSteerAccepted(state, params) {
  * rests-on when the memory server says it could not name all its result rests on, or
  * rests-on-error when working that out failed there). A record is named once for each
  * revision the call names it at (CL8-MM-02). A call that may read beside the memory tools
- * and names nothing -- a shell command, a dynamic tool, an image view, a sub-agent, or a
- * kind this code does not name (KIN_FORK_ITEM_KINDS) -- is cut short as `untracked`
- * (CL7B-MM-02, CL8-FLOW-01); the fork is offered none of those it can be spared
- * (KIN_FORK_CLOSED_FEATURES, CL8-FLOW-05).
+ * and names nothing -- a shell command, a dynamic tool, an image view, a sub-agent, a call
+ * to an MCP server other than the memory's (CL10-FLOW-03), or a kind this code does not
+ * name (KIN_FORK_ITEM_KINDS) -- is cut short as `untracked` (CL7B-MM-02, CL8-FLOW-01);
+ * the fork is offered none of those it can be spared (KIN_FORK_CLOSED_FEATURES,
+ * CL8-FLOW-05, CL10-FLOW-03).
  *
  * Every answer says how far it got, as `stage` (CR2-INT-06), beside the state and the
  * reason it already gave: `not-started` -- no turn was asked for, so no model was
@@ -523,11 +534,12 @@ const KIN_TOOL_ID_LIMITS = Object.freeze({ perCall: 1000, perTurn: 2000, nodes: 
 // began (bare references a delete left behind, with no words).
 const KIN_LEFT_OUT = new Set(["trace", "omitted_ids", "needs_review_ids", "deleted_ids"]);
 // How each item of a fork's turn is taken (KIN_FORK_ITEM_KINDS, CL8-FLOW-01). What is not a tool call
-// is left out; an MCP call is read; a web search, a patch or a sleep reads nothing of the store; and
-// anything else -- a shell command (a read-only sandbox reads anywhere), a client's dynamic tool, an
-// image view, a sub-agent, a hook's words, or a kind the pinned app-server did not have -- may read
-// beside the memory tools, the store's own files included, and names nothing: it is cut short as
-// untracked (CL7B-MM-02).
+// is left out; a call to the memory server is read; a web search, a patch or a sleep reads nothing of
+// the store; and anything else -- a shell command (a read-only sandbox reads anywhere), a client's
+// dynamic tool, an image view, a sub-agent, a hook's words, a call to another MCP server (one a plugin
+// or an app brings, which the fork's settings do not name: CL10-FLOW-03), or a kind the pinned
+// app-server did not have -- may read beside the memory tools, the store's own files included, and
+// names nothing: it is cut short as untracked (CL7B-MM-02).
 const KIN_ITEM_NOT_TOOL = new Set(${JSON.stringify(KIN_FORK_ITEM_KINDS.notTool)});
 const KIN_ITEM_READS_NOTHING = new Set(${JSON.stringify(KIN_FORK_ITEM_KINDS.readsNothing)});
 // What the fork is not offered, set on the fork alone (CL8-FLOW-05).
@@ -539,7 +551,7 @@ function kinToolName(item) {
 }
 function kinToolResultIds(item, turn) {
   if (KIN_ITEM_READS_NOTHING.has(item?.type)) return { ids: [], idsTruncated: false };
-  if (item?.type !== "mcpToolCall") return { ids: [], idsTruncated: true, idsTruncatedBy: ["untracked"] };
+  if (item?.type !== "mcpToolCall" || item.server !== "memorypalace") return { ids: [], idsTruncated: true, idsTruncatedBy: ["untracked"] };
   if (item.status !== "completed") return { ids: [], idsTruncated: false };
   // One entry for each id at each revision it is named at (CL8-MM-02): a record shown at its current
   // revision beside an older reference to it is named at both. A bare mention names the id alone,
