@@ -1,8 +1,33 @@
 """Read progress separately from liveness, without loading private messages."""
 import json
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from eventmem.core.integrity import verify_interpreter, verify_source_root
+
+# Beside the store, what Kin's read-only memory server (the host's kin_memory_mcp.py) could not work
+# out for a fork's memory reads. Each such read cut its fork turn short, so what the turn made was
+# neither reused nor cached; failing every time, it switches both off without a word (CL8-MM-07).
+FORK_READ_STATUS = "kin-fork-reads.json"
+
+
+def fork_read_errors(root, now=None):
+    """The count the server keeps in FORK_READ_STATUS: in all, over the last 7 days, and the last
+    one's kind, place and tool -- labels, never data. None while there has been none."""
+    try:
+        errors = json.loads((Path(root) / FORK_READ_STATUS).read_text())["rests_on_errors"]
+        days = errors.get("days") if isinstance(errors.get("days"), dict) else {}
+        last = errors.get("last") if isinstance(errors.get("last"), dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {"unreadable": True}
+    since = ((now or datetime.now(timezone.utc)) - timedelta(days=6)).date().isoformat()
+    return {"total": errors.get("total") if type(errors.get("total")) is int else None,
+            "last_7_days": sum(n for day, n in days.items() if isinstance(day, str) and day >= since and type(n) is int),
+            "last_at": str(errors.get("last_at"))[:40] if errors.get("last_at") else None,
+            "last": {key: last[key][:200] for key in ("error", "where", "raised", "tool") if isinstance(last.get(key), str)}}
 
 
 def operational_status(mind, config=None):
@@ -55,6 +80,7 @@ def operational_status(mind, config=None):
                                       "WHERE scope=? AND state='needs-repair' GROUP BY 1", (scope,)):
             reasons[label(reason) if reason else "unknown"] = reasons.get(label(reason) if reason else "unknown", 0) + n
         memory["quarantined"] = {"count": count, "oldest_available_unix": oldest, "reasons": reasons}
+        memory["fork_read_errors"] = fork_read_errors(mind.engine.db.root)
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
     # Which copy of the source answered this call, and which other copies are still
