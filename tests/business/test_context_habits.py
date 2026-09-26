@@ -16,10 +16,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from eventmem.core.db import NAMED, dumps
+from eventmem.core.db import NAMED, digest, dumps
 from eventmem.core.models import RevisionInput
 
-from kin_mind import erasure
+from kin_mind import context, erasure
 from kin_mind.appraisal import Appraisals
 from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, SET_FROM, Contexts, unnamed_compression
 from kin_mind.context_delivery import ContextDelivery
@@ -397,12 +397,14 @@ def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
 
 
 @pytest.mark.parametrize("receipt_mode", [True, False])
-def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value(system, receipt_mode):
+def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value(system, monkeypatch, receipt_mode):
     """The habits reach a native window -- a window receipt, or a delivery the host confirms -- and a
     later read there leaves them out as already seen. The message that set the directions is deleted:
     the habits lose the value and keep the table's revision. The next background read in the same
     window sends them again, as they are now: without her directions, with the reply choice the other
-    message set. Their revision is a hash, never her words (CL9-MM-03)."""
+    message set (CL9-MM-03). Their revision is a hash of the table's revision and of the keys the delete
+    took, never of anything she said: what the window keeps of it before and after names none of it
+    (CL10-MM-02)."""
     mind, memory, source, clock = system
     engine = mind.engine
     directions, reply = habits_from(memory, clock)
@@ -423,16 +425,23 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     assert re.fullmatch(r"[0-9a-f]{64}", seen), "a hash, never her words"
     assert HABITS_ITEM not in read("turn-2")["covered_ids"], "seen in this window"
 
-    revision = memory.habits.read()["revision"]
+    before = memory.habits.read()
     engine.delete(directions)
     settle(engine)
-    assert memory.habits.read()["revision"] == revision, "a delete leaves the table's revision"
+    after = memory.habits.read()
+    assert after["revision"] == before["revision"], "a delete leaves the table's revision"
     again = read("turn-3")
     assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
     assert not any(word in again["text"] for word in WORDS) and "autonomous" in again["text"]
     assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
     assert HABITS_ITEM not in read("turn-4")["covered_ids"], "and seen again"
     assert her_words(engine) == {}
+
+    hashed = []
+    monkeypatch.setattr(context, "digest", lambda value: hashed.append(value) or digest(value))
+    assert [Contexts.habits_item(habits)["revision"] for habits in (before, after)] == [seen, contexts.window("thread-1")["seen"][HABITS_ITEM]]
+    assert hashed == [[before["revision"], []], [before["revision"], ["exploration_directions", "exploration_frequency"]]]
+    assert not any(value in json.dumps(hashed, ensure_ascii=False) for value in (*WORDS, "autonomous")), "no preference of hers"
 
 
 @pytest.mark.parametrize("tool", ["read_affective_state", "read_continuity_context"])
