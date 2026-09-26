@@ -6,8 +6,10 @@ review, and the context keeps showing it (K1-18, CL8-MM-01 follow-up). What a re
 rendered from the habits names nothing: it goes, in the scope, when a message that set a habit is
 deleted, or by the release's reerase for one deleted before; and nothing this release keeps is taken
 for it, so a reerase with nothing left to erase plans nothing. The state read shows the habits with
-the same names (CL9-MM-02)."""
+the same names (CL9-MM-02). A window that saw the habits gets them again once a delete took a value
+from them (CL9-MM-03)."""
 import json
+import re
 
 import pytest
 
@@ -16,6 +18,7 @@ from eventmem.core.models import RevisionInput
 
 from kin_mind import erasure
 from kin_mind.context import CACHE_RESTS_ON, HABITS_ITEM, RESTS_ON, Contexts, unnamed_compression
+from kin_mind.context_delivery import ContextDelivery
 from kin_mind.erasure import ERASED
 from kin_mind.memory import MemoryContinuity
 
@@ -323,3 +326,42 @@ def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
     assert row["text_excerpt"] == ERASED and row["text_digest"]
     assert texts_everywhere(mind.engine, DIRECTIONS[0]) == set()
     assert Contexts(mind).affective()["conversation_habits"]["source_ids"] == [reply], "a message that is gone is named no more"
+
+
+@pytest.mark.parametrize("receipt_mode", [True, False])
+def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value(system, receipt_mode):
+    """The habits reach a native window -- a window receipt, or a delivery the host confirms -- and a
+    later read there leaves them out as already seen. The message that set the directions is deleted:
+    the habits lose the value and keep the table's revision. The next background read in the same
+    window sends them again, as they are now: without her directions, with the reply choice the other
+    message set. Their revision is a hash, never her words (CL9-MM-03)."""
+    mind, memory, source, clock = system
+    engine = mind.engine
+    directions, reply = habits_from(memory, clock)
+    contexts = Contexts(mind)
+
+    def read(turn):
+        packed = contexts.build("", purpose="chat", session="thread-1", event_id=turn, receipt_mode=receipt_mode)
+        if receipt_mode and packed.get("injection", {}).get("id"):
+            sent, deliveries = packed["injection"], ContextDelivery(contexts)
+            deliveries.begin("thread-1", sent["epoch"], sent["id"])
+            deliveries.acknowledge("thread-1", sent["epoch"], sent["id"], actual_session="thread-1", marker=sent["marker"],
+                                   text_hash=sent["text_hash"], verified=True)
+        return packed
+
+    first = read("turn-1")
+    assert HABITS_ITEM in first["covered_ids"] and all(word in first["text"] for word in WORDS)
+    seen = contexts.window("thread-1")["seen"][HABITS_ITEM]
+    assert re.fullmatch(r"[0-9a-f]{64}", seen), "a hash, never her words"
+    assert HABITS_ITEM not in read("turn-2")["covered_ids"], "seen in this window"
+
+    revision = memory.habits.read()["revision"]
+    engine.delete(directions)
+    settle(engine)
+    assert memory.habits.read()["revision"] == revision, "a delete leaves the table's revision"
+    again = read("turn-3")
+    assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
+    assert not any(word in again["text"] for word in WORDS) and "autonomous" in again["text"]
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
+    assert HABITS_ITEM not in read("turn-4")["covered_ids"], "and seen again"
+    assert her_words(engine) == {}
