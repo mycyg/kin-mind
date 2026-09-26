@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V6';
+const assessmentMarker = '// KIN_ASSESS_V7';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -37,13 +37,17 @@ export const KIN_FORK_ITEM_KINDS = Object.freeze({
  * either kind, apps, code mode, hooks or image generation; and, whatever Kin's home turns on, none of
  * what the runtime proof runner closes besides (adapters/mobile-runtime-proof-runner.mjs, CL10-FLOW-03):
  * plugins, browser or computer use, skill search, tool suggestions, sleep, web search requests,
- * workspace dependencies, shell snapshots or terminals. These are the fork's own settings, the main
- * thread keeps its tools; each is one of 0.156.1's features, and a switch an app-server does not know
- * it ignores. What still comes through is cut short as untracked (KIN_FORK_ITEM_KINDS), and so is a
- * call to any MCP server but the memory's. */
+ * workspace dependencies, shell snapshots or terminals. No goals either: a goal the fork set could
+ * keep the app-server turning after the turn assessed (CL10-FLOW-04). A question to the user 0.156.1
+ * offers a fork whatever its settings; with default_mode_request_user_input off, the app-server itself
+ * answers the fork's model, in its Default mode, that it is unavailable -- nobody is asked, and the
+ * native proof asks one and holds the fork to ending on time. These are the fork's own settings, the
+ * main thread keeps its tools; each is one of 0.156.1's features, and a switch an app-server does not
+ * know it ignores. What still comes through is cut short as untracked (KIN_FORK_ITEM_KINDS), and so is
+ * a call to any MCP server but the memory's. */
 export const KIN_FORK_CLOSED_FEATURES = Object.freeze(Object.fromEntries(['shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'multi_agent_v2',
   'apps', 'code_mode', 'hooks', 'image_generation', 'plugins', 'browser_use', 'computer_use', 'skill_search', 'tool_suggest', 'sleep_tool',
-  'web_search_request', 'workspace_dependencies', 'shell_snapshot', 'unified_exec_tty'].map(name => [`features.${name}`, false])));
+  'web_search_request', 'workspace_dependencies', 'shell_snapshot', 'unified_exec_tty', 'goals', 'default_mode_request_user_input'].map(name => [`features.${name}`, false])));
 const sessionFastMode = 'fastMode: state.fastModeEnabled === true ? "on" : state.fastModeEnabled === false ? "off" : undefined';
 const handlerAnchor = 'var CodexEventHandler = class _CodexEventHandler {';
 
