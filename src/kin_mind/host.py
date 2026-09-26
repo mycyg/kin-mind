@@ -583,7 +583,7 @@ APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "
 RESIDENT_ACTIONS = frozenset({
     "reply-status", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
     "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
-    "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review",
+    "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
     "context-delivery-metrics", "configure-habits", "reply-choice", "review-due",
 })

@@ -479,6 +479,39 @@ def test_the_resident_worker_answers_in_order_and_keeps_long_work_out(tmp_path):
     assert answers[3]["error"]["code"] == "invalid-frame"
 
 
+def test_resident_session_snapshots_read_current_state_without_model_work(tmp_path, monkeypatch):
+    """CR6-REL-16: the session minute uses the existing worker too; checkpoint building
+    still cannot enter it. A later frame must observe new evidence, not a cached snapshot."""
+    import io
+    from kin_mind import host
+    from kin_mind.memory import MemoryContinuity
+    from kin_mind.session_checkpoint import SessionCheckpoint
+    _, mind, _ = exploration_world(tmp_path)
+    config = host_config(tmp_path, mind, session_id="session-1")
+    MemoryContinuity(mind).configure({"manifests": True})
+
+    def no_build(*_args, **_kwargs):
+        raise AssertionError("resident snapshot must not build a model checkpoint")
+    monkeypatch.setattr(SessionCheckpoint, "build", no_build)
+    monkeypatch.setattr(host.DeepSeek, "from_engine", no_build)
+    later = {"id": "new-owner-evidence", "kind": "owner-message", "text": "Synthetic next turn",
+             "at": "2026-09-27T00:00:00Z"}
+    frames = [
+        {"id": "first", "action": "session-snapshot", "args": {"pending": []}},
+        {"id": "next", "action": "session-snapshot", "args": {"pending": [later]}},
+        {"id": "long", "action": "session-checkpoint", "args": {}},
+    ]
+    out = io.StringIO()
+    host.serve(config, io.StringIO("".join(json.dumps(frame) + "\n" for frame in frames)), out)
+    answers = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [answer["id"] for answer in answers] == ["first", "next", "long"]
+    assert answers[0]["ok"] and answers[1]["ok"]
+    assert answers[0]["result"]["manifestVersion"] == "continuity-manifest-v1"
+    assert "new-owner-evidence" not in answers[0]["result"]["sourceRevisions"]
+    assert "new-owner-evidence" in answers[1]["result"]["sourceRevisions"]
+    assert answers[2]["error"]["code"] == "not-a-resident-action"
+
+
 def test_the_minute_review_asks_the_resident_worker_before_a_process_is_started(tmp_path):
     """T-14: `review-due` does the minute's bookkeeping in the resident worker and says whether an
     appraisal is there to run; nothing runs while history compaction owns the store (WS6)."""
