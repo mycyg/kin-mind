@@ -37,6 +37,7 @@ from .habits import HabitProposal
 from .memory import MemoryAssessment, MemoryContinuity
 from .model_runtime import ModelAdmissionWait, evaluation_slot, request_client
 from .profile import DIMENSIONS
+from .strict_schema import decode as decode_strict, strict_schema
 from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, AffectiveEvent, DesireChange, Evolution,
                     Motivation, contact_wait_seconds, timestamp)
 
@@ -1393,9 +1394,11 @@ class NativeReview(DeepSeek):
         # Three parts for `_kin/assess` (WS4): the standing contract (instructions and fixed
         # definitions), the dynamic context, and the schema object, which travels only as
         # outputSchema and is never pasted into the input. `system` repeats the contract for the
-        # legacy in-session channel.
+        # legacy in-session channel. The model API holds a fork's outputSchema in strict mode,
+        # which refuses the pydantic schema whole: the fork gets its strict form, and the answer
+        # is read back into the pydantic shape before anything validates it (strict_schema.py).
         answer = self.exchange({"id": request_id, "name": name, "contract": system, "system": system,
-            "context": context, "schema": schema, "profile": self.profile,
+            "context": context, "schema": strict_schema(schema), "profile": self.profile,
             "timeout_ms": max(1, int(timeout * 1000))})
         stage = fork_stage(answer) if answer.get("state") in {"waiting", "failed"} else None
         if stage == "not-started":
@@ -1430,7 +1433,7 @@ class NativeReview(DeepSeek):
             raise RuntimeError("native-review-unconfirmed")
         receipt = {**receipt, "elapsed_ms": round((time.monotonic()-started)*1000),
                    **attempts.usage_entry(receipt.get("usage"))}
-        return answer["result"], receipt
+        return decode_strict(schema, answer["result"]), receipt
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
         schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max())

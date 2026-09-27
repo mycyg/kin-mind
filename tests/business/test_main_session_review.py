@@ -523,6 +523,27 @@ def test_the_assessment_frame_keeps_contract_context_and_schema_apart(setup):
     assert frame['system'] == frame['contract']
 
 
+def test_the_fork_is_held_to_the_strict_schema_and_its_answer_read_back(setup):
+    """2026-09-27: the model API refused every fork assessment (`invalid_json_schema`, "Missing
+    'strength'"): a fork's outputSchema is held in strict mode and the pydantic schema is not
+    strict. The fork is sent the strict form, and an answer in it -- every property present, the
+    unused ones null, the dicts as entries -- is applied like any other (strict_schema.py)."""
+    mind, source, _ = setup
+    frames = []
+    def exchange(request):
+        frames.append(request)
+        answer = {name: None for name in request['schema']['properties']}
+        answer.update(reason='想再看看这个问题。', values=[{'key': 'curiosity', 'value': 77}])
+        return {'state':'complete','result':answer,
+                'receipt':{'native_turn_id':'turn-1','native_session_id':'same-main','model':'gpt-6-astra','provider':'custom','reasoning':'medium','usage':{}}}
+    jobs = Appraisals(mind)
+    jobs.enqueue([source('strict')], 'synthetic-v1')
+    assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
+    schema = frames[0]['schema']
+    assert schema['additionalProperties'] is False and schema['required'] == list(schema['properties'])
+    assert mind.read()['dimensions']['curiosity']['value'] == 77
+
+
 
 def test_an_idle_assessment_is_told_it_may_start_something(setup):
     """K1-05: the contract no longer claims the host raises longing over time, the closing line
