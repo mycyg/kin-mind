@@ -76,7 +76,7 @@ def wish(mind, source, key="wish", strength=95, **extra):
 def test_independent_defaults_decay_restart_dedup(setup):
     mind, source, clock = setup
     initial = mind.read()
-    assert len(initial["dimensions"]) == 20
+    assert len(initial["dimensions"]) == 28
     assert all(x["basis"] == "role_default" for x in initial["dimensions"].values())
     request = event(
         mind,

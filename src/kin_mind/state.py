@@ -24,7 +24,7 @@ from eventmem.core.self_knowledge import SelfKnowledge, metadata
 from . import erasure
 from .continuity import SCHEMA as CONTINUITY_SCHEMA
 from .continuity import Continuity, RhythmProposal, Understanding
-from .profile import DIMENSIONS, default_profile, interaction_style
+from .profile import DIMENSIONS, GROUPS, default_profile, interaction_style
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_state(
@@ -101,7 +101,7 @@ class AffectiveEvent(Model):
     agent_version: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
     evidence_ids: list[str] = Field(min_length=1, max_length=50)
-    values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
+    values: dict[str, StrictInt] = Field(default_factory=dict, max_length=len(DIMENSIONS))
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
     reason: str = Field(min_length=1)
     origin: Literal["interaction", "exploration", "reflection"] = "interaction"
@@ -642,6 +642,43 @@ class Mind(Continuity):
                           state, "session-advice-migration", {"carrier_event_id": held[0] if held else None})
             return {"state": "moved", "revision": state["revision"], "carrier_event_id": held[0] if held else None}
 
+    def _ensure_dimensions(self, state, *, event_id, agent_version):
+        """Dimensions the role profile defines (profile.py) that a state initialized before them does
+        not hold yet join it as role defaults: the definition into the stored profile, a score at its
+        baseline, on the evidence the role itself was initialized from. The dimensions it holds, their
+        scores and their evolved baselines are never touched. Answers the keys added, in profile order."""
+        missing = [k for k in DIMENSIONS if k not in state["profile"]["dimensions"] or k not in state["dimensions"]]
+        if not missing:
+            return []
+        at = self.clock()
+        refs = next((deepcopy(entry["evidence"]) for entry in state["dimensions"].values()
+                     if entry.get("basis") == "role_default" and entry.get("evidence")), [])
+        for key in missing:
+            spec = state["profile"]["dimensions"].setdefault(key, deepcopy(DIMENSIONS[key]))
+            state["dimensions"].setdefault(key, {
+                "score": spec["baseline"], "target": spec["baseline"], "baseline": spec["baseline"],
+                "half_life_hours": spec["half_life_hours"], "at": at, "basis": "role_default",
+                "evidence": refs, "event_id": event_id, "agent_version": agent_version,
+            })
+        state["profile_version"] = digest([state["profile_version"], state["profile"]])[:16]
+        return missing
+
+    def extend_dimensions(self, *, agent_version):
+        """Emotion system v2 (2026-09-27): the dimensions this release adds to the role profile join
+        the current state at their baselines, once, as one recorded revision. Idempotent: a state
+        that already holds every dimension answers `unchanged`."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            missing = [k for k in DIMENSIONS if k not in state["profile"]["dimensions"] or k not in state["dimensions"]]
+            if not missing:
+                return {"state": "unchanged"}
+            event_id = "mind_" + digest([self.scope.key(), "profile-dimensions-added", missing])[:32]
+            added = self._ensure_dimensions(state, event_id=event_id, agent_version=agent_version)
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "profile-dimensions-added", {"added": added, "agent_version": agent_version})
+            return {"state": "extended", "added": added, "revision": state["revision"]}
+
     def configure_autonomy(self, request):
         """Explicit user policy; never an inferred emotion or personality update."""
         def apply(conn, state, event_id):
@@ -941,6 +978,9 @@ class Mind(Continuity):
 
     def _apply_event(self, conn, state, request, event_id, continuity_sources=None):
         refs = self._evidence(conn, request.evidence_ids)
+        # A release that adds dimensions migrates at start-up (extend_dimensions); an event committed
+        # before that, on a state without them, adds them here rather than refusing their scores.
+        self._ensure_dimensions(state, event_id=event_id, agent_version=request.agent_version)
         if request.evolution:
             return self._evolve(conn, state, request, refs, event_id)
         unknown = set(request.values) - set(state["dimensions"])
@@ -1375,6 +1415,7 @@ class Mind(Continuity):
                 projected = self._initiative_value(conn, state, at)
             values[key] = {
                 "label": state["profile"]["dimensions"][key]["label"],
+                "group": DIMENSIONS.get(key, {}).get("group"),
                 "value": round(projected),
                 "projected_value": projected,
                 "raw_value": entry["score"],
@@ -1409,6 +1450,8 @@ class Mind(Continuity):
             "agent_version": state["agent_version"],
             "profile_version": state["profile_version"],
             "dimensions": values,
+            "dimension_groups": [{"id": group, "label": spec["label"], "members": [k for k in spec["members"] if k in values]}
+                                 for group, spec in GROUPS.items()],
             # Read where the session registry keeps it now, and from the state for older stores.
             "session_advice": deepcopy(self._session_advice(conn, state)),
             "desires": desires,

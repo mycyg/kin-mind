@@ -526,6 +526,8 @@ def dispatch(config, action, request):
     if action == "recover":
         # CR-MIND-12: an older release kept the session judgment in the versioned state.
         mind.retire_session_advice()
+        # Emotion system v2: the dimensions this release adds join a state initialized before them.
+        mind.extend_dimensions(agent_version=config["agent_version"])
         # A start-up used to assume the previous service was gone and interrupt every
         # running exploration. It asks now: a row is interrupted only when its worker
         # is provably gone — the pid is dead, the pid became some other process, or

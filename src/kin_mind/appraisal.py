@@ -346,7 +346,7 @@ class NextMove(Model):
 
 
 class Appraisal(Model):
-    values: dict[str, StrictInt] = Field(default_factory=dict, max_length=20)
+    values: dict[str, StrictInt] = Field(default_factory=dict, max_length=len(DIMENSIONS))
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
     reason: str = Field(min_length=1)
     wishes: list[Wish] = Field(default_factory=list, max_length=2)

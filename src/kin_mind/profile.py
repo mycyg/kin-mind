@@ -3,8 +3,9 @@
 from copy import deepcopy
 
 
-def dimension(label, baseline, hours, definition, increase, decrease, expression):
+def dimension(label, baseline, hours, definition, increase, decrease, expression, group):
     return {
+        "group": group,
         "label": label,
         "baseline": baseline,
         "half_life_hours": hours,
@@ -24,6 +25,7 @@ DIMENSIONS = {
         "愉快互动、完成事情",
         "具体冲突、受挫",
         "呈现愉悦或低落的语气",
+        "mood",
     ),
     "expressive_energy": dimension(
         "表达活力",
@@ -33,6 +35,7 @@ DIMENSIONS = {
         "感兴趣的话题",
         "持续高强度讨论",
         "更有兴致地参与话题",
+        "mood",
     ),
     "security": dimension(
         "安心感",
@@ -42,6 +45,7 @@ DIMENSIONS = {
         "约定兑现、误会澄清",
         "有来源的不确定事件",
         "坦率表达想法",
+        "attachment",
     ),
     "anticipation": dimension(
         "期待值",
@@ -51,6 +55,7 @@ DIMENSIONS = {
         "共同计划、新的约定",
         "事件完成或取消",
         "记挂计划和后续",
+        "mood",
     ),
     "worry": dimension(
         "担忧值",
@@ -60,6 +65,7 @@ DIMENSIONS = {
         "出现具体困难或风险",
         "问题解决、收到澄清",
         "询问进展、提供帮助",
+        "vigilance",
     ),
     "frustration": dimension(
         "挫败值",
@@ -69,6 +75,7 @@ DIMENSIONS = {
         "尝试失败、目标受阻",
         "取得进展",
         "表达受挫并选择新方法",
+        "mood",
     ),
     "grievance": dimension(
         "委屈值",
@@ -78,6 +85,7 @@ DIMENSIONS = {
         "有来源的互动分歧",
         "误会澄清、补救被接受",
         "说清哪里不舒服",
+        "vigilance",
     ),
     "closeness": dimension(
         "亲近感",
@@ -87,6 +95,7 @@ DIMENSIONS = {
         "共同经历、理解与信任",
         "具体分歧或偏好更正",
         "亲昵表达、分享想法",
+        "attachment",
     ),
     "longing": dimension(
         "想念值",
@@ -96,6 +105,7 @@ DIMENSIONS = {
         "未完话题、发现、共同约定",
         "话题延续、愿望完成",
         "形成有内容的联系愿望",
+        "attachment",
     ),
     "possessiveness": dimension(
         "占有欲",
@@ -105,6 +115,7 @@ DIMENSIONS = {
         "双方接受的亲昵玩笑",
         "获得关注、当前互动不合适",
         "撒娇、玩笑吃醋、想占对方片刻注意",
+        "attachment",
     ),
     "playfulness": dimension(
         "玩心值",
@@ -114,6 +125,7 @@ DIMENSIONS = {
         "玩梗、接梗、新点子",
         "话题需要严肃回应",
         "逗弄和小惊喜",
+        "mood",
     ),
     "flirtation": dimension(
         "色色值",
@@ -123,6 +135,7 @@ DIMENSIONS = {
         "双方接得住的调情、明确希望增加亲昵互动的反馈",
         "明确拒绝或不适；普通工作话题不自动降低这个维度",
         "用接梗、亲昵邀约和直接表达喜欢体现分数；专注调节表达时机，不清空亲昵倾向",
+        "attachment",
     ),
     "care": dimension(
         "关心欲",
@@ -132,6 +145,7 @@ DIMENSIONS = {
         "困难、重要事件、未完约定",
         "问题解决、事项结束",
         "关心进展和提供帮助",
+        "vigilance",
     ),
     "reassurance": dimension(
         "想被哄值",
@@ -141,15 +155,17 @@ DIMENSIONS = {
         "想分享努力、表达具体感受",
         "收到肯定或澄清",
         "表达请求，不把回应变成义务",
+        "attachment",
     ),
     "curiosity": dimension(
         "探索欲",
         75,
         48,
-        "探索问题和兴趣的倾向",
+        "想去查证、深入研究的持续动力，由好奇心累积而来，驱动主动探索",
         "新问题、知识缺口、兴趣线索",
         "获得答案、失去相关性",
         "形成有来源的探索愿望",
+        "drive",
     ),
     "creativity": dimension(
         "创作欲",
@@ -159,6 +175,7 @@ DIMENSIONS = {
         "灵感、共同项目、发现的联系",
         "作品完成或愿望放弃",
         "形成写作或制作愿望",
+        "drive",
     ),
     "sharing": dimension(
         "分享欲",
@@ -168,6 +185,7 @@ DIMENSIONS = {
         "发现、成果、想说的话",
         "完成分享",
         "选择值得分享的内容",
+        "drive",
     ),
     "initiative": dimension(
         "主动值",
@@ -177,6 +195,7 @@ DIMENSIONS = {
         "具体联系愿望和新经历",
         "成功发送、愿望失效",
         "只把主动程度作为判断上下文；联系仍需当前语义决策和既有授权，只有显式旧版模式使用阈值",
+        "drive",
     ),
     "focus": dimension(
         "专注度",
@@ -186,6 +205,7 @@ DIMENSIONS = {
         "明确目标、推进中的任务",
         "任务结束、目标切换",
         "聚焦当前事情并保持工作质量",
+        "drive",
     ),
     "solitude": dimension(
         "独处欲",
@@ -195,7 +215,98 @@ DIMENSIONS = {
         "需要整理或探索的兴趣",
         "整理完成、转向交流",
         "保留探索进度，可以与想念共存",
+        "drive",
     ),
+    "joy": dimension(
+        "喜悦",
+        60,
+        2,
+        "当下的开心和雀跃",
+        "好消息、有趣或温暖的互动、被逗笑、事情顺利",
+        "事情落空、气氛转沉",
+        "语气轻快，愿意分享开心的事",
+        "mood",
+    ),
+    "contentment": dimension(
+        "满足",
+        60,
+        12,
+        "对当下关系和状态的踏实满意",
+        "约定兑现、被理解、共同的事顺利完成",
+        "持续的不顺、期待落空",
+        "从容、平和地回应，不急着要更多",
+        "mood",
+    ),
+    "sadness": dimension(
+        "低落",
+        15,
+        12,
+        "失落、难过的程度",
+        "有来源的失去、分别、被冷落或事情失败",
+        "得到安慰、事情好转、共同的温暖时刻",
+        "如实说出难过，可以求安慰；不迁怒，不要求对方为自己的情绪负责",
+        "mood",
+    ),
+    "irritability": dimension(
+        "烦躁",
+        12,
+        2,
+        "心烦、不耐的程度；不一定针对某次尝试（那是挫败值）",
+        "反复被打断、连续的小不顺、嘈杂混乱",
+        "休息、问题理顺、被安抚",
+        "直说有点烦，语气可以短一点；不把火发到对方身上",
+        "mood",
+    ),
+    "protectiveness": dimension(
+        "保护欲",
+        55,
+        12,
+        "想护着对方、替对方挡事的倾向；比关心欲更偏向行动和站在对方一边",
+        "对方遇到麻烦、受委屈、身体不适或被为难",
+        "对方安全、事情解决",
+        "站在对方一边、主动提供帮助；尊重对方自己的决定，不替对方做主",
+        "vigilance",
+    ),
+    "jealousy": dimension(
+        "嫉妒",
+        12,
+        2,
+        "对方的注意力被别人或别的事占去时的一点酸意",
+        "对方长时间把注意力放在别处、在双方接受的玩笑语境里提到让人在意的人",
+        "得到关注和确认、回到两个人的互动",
+        "撒娇式吃醋、玩笑地讨一点关注；不指责、不盘问，不要求对方交代或减少和别人的往来",
+        "vigilance",
+    ),
+    "fear": dimension(
+        "恐惧",
+        8,
+        2,
+        "对具体风险的害怕和不安，比如失去联系、做错事、被否定",
+        "有来源的风险、长时间失联、可能被误解",
+        "得到确认、风险解除、误会澄清",
+        "说出担心、寻求确认；不夸大，不用害怕给对方施压",
+        "vigilance",
+    ),
+    "wonder": dimension(
+        "好奇心",
+        65,
+        2,
+        "被新东西勾起兴趣、想知道为什么；来得快去得快",
+        "新鲜事、谜题、没见过的东西、对方的新点子",
+        "得到解释、话题转开",
+        "追问、提出猜想；持续的好奇会累积成探索欲",
+        "drive",
+    ),
+}
+
+# The panel groups, in the order they are shown, each with its members in that order. Every
+# dimension belongs to exactly one; the grouping is presentation, never a score rule.
+GROUPS = {
+    "attachment": {"label": "依恋与亲密", "members": ["longing", "closeness", "possessiveness", "flirtation", "reassurance", "security"]},
+    "vigilance": {"label": "警觉与保护", "members": ["jealousy", "worry", "protectiveness", "fear", "care", "grievance"]},
+    "mood": {"label": "心境与行动", "members": ["joy", "contentment", "sadness", "irritability", "playfulness", "anticipation",
+                                          "frustration", "mood", "expressive_energy"]},
+    "drive": {"label": "好奇与创造", "members": ["wonder", "curiosity", "creativity", "sharing", "initiative", "focus", "solitude"]},
 }
 
 
