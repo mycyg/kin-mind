@@ -100,7 +100,7 @@ def persona_prompt(policy):
 
 
 # In `mutable_trait_keys`: every type of trait may change. The owner approves it in the contract,
-# as for any listed type (小光 2026-09-27: "人格契约所有类型都应该能改变哦"). It widens only what
+# as for any listed type (approved 2026-09-27, the words kept in the contract). It widens only what
 # conversation and reflection may grow into a trait; core, voice and maintenance stay as approved.
 ALL_TRAIT_TYPES = "*"
 

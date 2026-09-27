@@ -6,7 +6,7 @@ instruction to write one was only in the main session's prompt, the operational 
 submit everything but the understanding, and no assessment was ever shown a diary, so none could
 ground a trait or a plan on one. A trait type the owner's contract did not list was refused after
 the fact, without the model ever being told the list; the owner has since approved every type
-(小光: "人格契约所有类型都应该能改变哦").
+(2026-09-27, their words kept with the approval in the contract).
 """
 import hashlib
 import json
@@ -158,12 +158,12 @@ def test_a_trait_type_the_contract_does_not_list_is_named_to_the_model_and_all_t
 
     # The owner's word, as the release records it: every type, the canon itself untouched.
     before = json.loads((root / "persona-policy.json").read_text())
-    done = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--quote", "人格契约所有类型都应该能改变哦",
+    done = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--quote", "测试用的批准原话",
                            "--at", "2026-09-27T09:00:00+08:00"], capture_output=True, text=True, check=True)
     assert json.loads(done.stdout)["state"] == "widened"
     after = json.loads((root / "persona-policy.json").read_text())
     assert after["mutable_trait_keys"] == ["interests", "兴趣", ALL_TRAIT_TYPES]
-    assert after["mutable_trait_keys_approval"]["quote"] == "人格契约所有类型都应该能改变哦"
+    assert after["mutable_trait_keys_approval"]["quote"] == "测试用的批准原话"
     assert {k: v for k, v in after.items() if not k.startswith("mutable_trait_keys")} == \
         {k: v for k, v in before.items() if not k.startswith("mutable_trait_keys")}
     again = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--quote", "x", "--at", "y"],

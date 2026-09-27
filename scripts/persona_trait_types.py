@@ -1,6 +1,7 @@
 """Record the owner's word that every type of trait may change (the persona contract's `mutable_trait_keys`).
 
-小光, 2026-09-27: "人格契约所有类型都应该能改变哦". The contract's texts -- core, voice and maintenance -- their
+The owner approved it on 2026-09-27; their words are kept with the approval in the contract itself,
+not in this tree. The contract's texts -- core, voice and maintenance -- their
 hashes and the owner's approval record outside the file stay exactly as approved: only the list of trait
 types that conversation and reflection may grow into a trait is widened, by ALL_TRAIT_TYPES, with the
 owner's words and the time beside it. Idempotent. The file is replaced atomically and keeps its mode.
