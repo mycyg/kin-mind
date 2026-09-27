@@ -130,6 +130,13 @@ def dispatch(config, action, request):
     if action == "recover-appraisals":
         from .recovery import recover_quarantined
         return recover_quarantined(mind, **request)
+    if action == "appraisal-triage":
+        # Operator action: every quarantined appraisal sorted into a class, with what would be done
+        # to it. Nothing is written without `--apply`; ids, classes, counts and static codes only.
+        from .recovery import triage_quarantined
+        options = {key: request[key] for key in ("command_id", "source", "resume", "retire", "job_ids",
+                                                 "per_slot", "spacing_minutes") if key in request}
+        return triage_quarantined(mind, apply=bool(request.get("apply")), **options)
     if action.startswith("history-"):
         # Operator actions on the stored history itself. Each one registers with the history
         # registry instead of adding a branch here, so a package that ships a new command does
@@ -451,7 +458,9 @@ def dispatch(config, action, request):
         if request.get("tick", True):
             review_minute()
         due = {lane: jobs.runnable(lane) for lane in ("action", "enrichment")}
-        return {"state": "due" if any(due.values()) else "idle", **due}
+        # The day's review has a gate of its own now: the host starts it only when there is something
+        # to merge or evaluate, never to be told again that it is still waiting.
+        return {"state": "due" if any(due.values()) else "idle", **due, "daily": DailyReview(mind).due()}
     if action == "review":
         paused = review_pause()
         if paused:
@@ -579,7 +588,7 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 # The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
 # are told to write. Every one of them defaults to a dry run.
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
-                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore")
+                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage")
 
 
 # The resident worker's actions (§5.7): short reads and writes on the store, no model call and

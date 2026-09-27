@@ -15,6 +15,7 @@ import uuid
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
@@ -34,14 +35,25 @@ from .continuity import ConcernProposal, RhythmProposal, Understanding, select_c
 from .dialogue import clock_context, recent_dialogue
 from .exploration_decisions import SharingDecision, apply_decisions
 from .habits import HabitProposal
-from .memory import MemoryAssessment, MemoryContinuity
+from .memory import REVIEW_CEILING_MINUTES, REVIEW_FLOOR_MINUTES, MemoryAssessment, MemoryContinuity
 from .model_runtime import ModelAdmissionWait, evaluation_slot, request_client
 from .profile import DIMENSIONS
 from .strict_schema import decode as decode_strict, strict_schema
 from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, AffectiveEvent, DesireChange, Evolution,
                     Motivation, contact_wait_seconds, timestamp)
 
+# What one DeepSeek appraisal request may hold. It used to be a fixed 64000 tokens for a model
+# whose window is sixteen times that, so an ordinary action appraisal of 52–58k tokens was one
+# owner message away from evidence compression, the costliest thing the queue did. The window
+# now comes from the model catalog the exploration executor already ships (its effective share,
+# less the output the call reserves), capped: a longer request costs more and an assessment
+# rarely needs more. The cap is the memory configuration's `appraisal_input_budget`; without a
+# readable catalog the budget stays the one that was always used.
 APPRAISAL_INPUT_BUDGET = 64000
+APPRAISAL_INPUT_CAP = 256000
+APPRAISAL_MAX_OUTPUT = 131072
+# The one catalog: codex_executor.DEEPSEEK_MODEL_CATALOG names the same file.
+MODEL_CATALOG = Path(__file__).with_name("deepseek-models.json")
 # A fork assessment that cannot run yet: the main thread has no finished turn to fork from, or the
 # session is not loaded. Asked again later, never counted as a failure (PROBE).
 FORK_UNAVAILABLE = re.compile(r"no-completed-turn|session-not-loaded|no-rollout|rollout|native-runtime")
@@ -78,9 +90,10 @@ def fork_stage(answer):
 # prompt and in the schema, and the host clamps to the same numbers; there is no separate night
 # ceiling any more (K1-03).
 # When Kin thinks again is hers to choose, from ten minutes to a day (N8). A new event still
-# wakes her earlier: the queue runs it on its own, so the earlier of the two applies.
-REVIEW_MIN_MINUTES = 10
-REVIEW_MAX_MINUTES = 1440
+# wakes her earlier: the queue runs it on its own, so the earlier of the two applies. One range:
+# the memory configuration validates the stored review minutes against the same numbers.
+REVIEW_MIN_MINUTES = REVIEW_FLOOR_MINUTES
+REVIEW_MAX_MINUTES = REVIEW_CEILING_MINUTES
 # Every lane is bounded: a charged attempt is a real appraisal call, and an
 # identical failure twice in a row is quarantined instead of paid for again.
 MAX_CHARGED_ATTEMPTS = 4
@@ -88,6 +101,11 @@ REPEATED_FAILURE_LIMIT = 2
 # The outcomes of a full appraisal call that ran to its answer: valid, or valid enough to need a
 # repair. A call preempted on the way is not one of them (CR3-MM-06).
 COMPLETED_APPRAISAL = {"ok", "schema-invalid"}
+
+
+def paid_compression_calls(calls):
+    """The compression calls of one attempt that were made, and so paid for: a cache hit reused one."""
+    return sum(1 for call in calls if call.get("purpose") == "compression" and call.get("outcome") != "cache-hit")
 
 
 def completed_appraisal(calls):
@@ -156,7 +174,13 @@ NO_REPEAT_QUARANTINE = {"deepseek-timeout"}
 # Evidence preparation is cached part by part, so a pending compression is a
 # continuation, not a failed attempt. It is still bounded by real progress.
 COMPRESSION_STALL_LIMIT = 3
-MAX_COMPRESSION_WAITS = 12
+# ...and by passes and paid calls. A pass that still leaves evidence out is not tried as it was
+# twelve more times (2026-09-27: three rows, 39 passes, 99 calls, 74 minutes of the action lane,
+# every one set aside in the end): a batch is split into its members after the first such pass,
+# and the third ends the row for an operator. Every paid compression call of every attempt of a
+# row counts against MAX_COMPRESSION_CALLS; each attempt's own count is on its ledger row.
+MAX_COMPRESSION_PASSES = 3
+MAX_COMPRESSION_CALLS = 12
 COMPRESSION_RETRY_SECONDS = 30
 # The part of the memory context no queue row freezes: every attempt reads it afresh (CL8-MM-01).
 HABITS = "conversation_habits"
@@ -174,6 +198,17 @@ PREPARATION_RETRY_SECONDS = 30
 # exhausted wait of any kind is (CL6E-MM-03).
 MAX_DELETION_REFUSALS = 6
 DELETION_RETRY_SECONDS = 120
+# A job whose every source is integrated ends with no model call. Checked for every stimulus of
+# the action lane that is about its own sources -- owner input, results, deliveries and the
+# host's internal reviews, merged or not. A follow-up restates its parent's sections from the
+# parent's (integrated) evidence, and a bootstrap, a migration, maintenance and enrichment are
+# about sources that are integrated by design: none of those is checked.
+INTEGRATION_CHECKED = MERGEABLE_STIMULI | {"interaction-batch", "internal-batch"}
+# What a job settled by another batch's commit no longer needs: its retry bookkeeping.
+SETTLED_FIELDS = ("error", "error_detail", "repair_reason", "waiting_reason", "error_signature", "error_repeats",
+                  "compression_waits", "compression_stalls", "compression_parts", "compression_calls",
+                  "transient_failures", "admission_waits", "preparation_conflicts", "deletion_refusals",
+                  "frozen_memory_context", "reuse")
 REFERENCE_PATTERN = r"(?:mem|src|work|share|topic|artifact)_[a-f0-9]{16,64}"
 
 
@@ -473,8 +508,9 @@ SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continu
 # module that applies the section: it replaces its own paragraph here and nothing else.
 TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法，也包括有来源的日记与反思。反思形成的新认识可以影响性格；保留其想法性质，不把想象当作外部事实，也不把同一篇日记的重读或复述算成新的经历。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、计时唤醒等宿主内部运行记录不能作证据。category 与 slug 决定这条证据归哪条特征：category 取 state.traits.categories 允许的类型，为 all 时任何类型都可以，同一类沿用已有特征的 category，不另起近义的新名。同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
 TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历或形成新认识的反思，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。反思形成的新认识可以直接提出、确立，不必等用户确认每一次成长；用户的更正始终优先。"
-SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
-PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
+SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。
+state.confirmed_checks 是已被宿主核验证实、配置仍然一致的行为检验，每条给出 claim_id（被检验的假设）与 assessment_id（证实它的结算）。只有其中一条能支持时，才在 evolution 里提出长期底色的小幅调整：claim_id 与 assessment_id 取同一条，baseline_changes（每个维度最多变 2）或 half_life_changes（最多变一成）只写有依据的维度；特征的变化走 trait_decisions，不写进 evolution。宿主每天最多合并一次，合并前再核一遍检验和限制。confirmed_checks 为空或都不相干时 evolution 为 null。"""
+PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。compat 为 stale 的预测是在已经变了的配置下做的，不能再结算；它和过了窗口一天仍没有结论的预测会由宿主记为 inconclusive 关闭，不再出现在这里，需要时提出新的 self_hypothesis。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
 NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
@@ -555,6 +591,16 @@ def record_refusal(conn, scope, section, code, at):
     """The last refusal of an audited section, so the projection that owns the section can show the
     model why the host refused it. A static code and a time; never the proposal and never a text."""
     conn.execute("INSERT OR REPLACE INTO mind_section_refusals VALUES(?,?,?,?)", (scope, section, code, at))
+
+
+def clear_refusal(conn, scope, section):
+    """A section that committed after it was refused has no refusal to show any more. Before this a
+    refusal stayed until the same section was refused again, so codes from days before were still
+    shown to the model as the reason for what it proposes now."""
+    try:
+        conn.execute("DELETE FROM mind_section_refusals WHERE scope=? AND section=?", (scope, section))
+    except sqlite3.OperationalError:
+        return
 
 
 def last_refusal(conn, scope, section=None):
@@ -897,7 +943,7 @@ def appraisal_context(context):
         # each with the host's counts, what an owner correction ended, and the predictions still
         # open. Structured state, so none of it is ever compressed. Each part follows its own
         # switch, so what a switched-off projection did not build is absent here too.
-        state.update({key: ledger[key] for key in ("traits", "corrections", "open_predictions") if key in ledger})
+        state.update({key: ledger[key] for key in ("traits", "corrections", "open_predictions", "confirmed_checks") if key in ledger})
     result["state"] = state
     # Several dimensions often carry the same complete appraisal account.
     # Reference it once without changing or shortening its meaning.
@@ -969,6 +1015,32 @@ RECALL_REFUSED = r"deepseek-http-4(?!29)\d\d"
 RECALL_SHOWN = ("id", "revision", "kind", "status", "title", "confirmation", "generated", "source_ids", "valid_from",
                 "valid_until", "content", "content_length", "cursor", "evidence_class", "evidence_label",
                 "evidence_labels", "evidence_mixed")
+
+
+def catalog_window(model=APPRAISAL_MODEL, catalog=None):
+    """The model's usable context window by its catalog entry: the window, less the share the
+    catalog says is not effective. None when the catalog cannot be read or names no such model."""
+    try:
+        entries = json.loads(Path(catalog or MODEL_CATALOG).read_text())["models"]
+        entry = next(e for e in entries if isinstance(e, dict) and e.get("slug") == model)
+        window = entry.get("max_context_window") or entry.get("context_window")
+        percent = entry.get("effective_context_window_percent") or 100
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        return None
+    if type(window) is not int or window <= 0 or type(percent) not in {int, float} or not 0 < percent <= 100:
+        return None
+    return int(window * percent / 100)
+
+
+def appraisal_input_budget(cap=None, *, model=APPRAISAL_MODEL, catalog=None):
+    """What one DeepSeek appraisal request may hold: the catalog window less the output the call
+    reserves (`APPRAISAL_MAX_OUTPUT`), never more than `cap` (the configured one, else
+    `APPRAISAL_INPUT_CAP`). Without a readable catalog, the fixed budget used before."""
+    window = catalog_window(model, catalog)
+    if window is None:
+        return APPRAISAL_INPUT_BUDGET
+    limit = cap if type(cap) is int and cap > 0 else APPRAISAL_INPUT_CAP
+    return max(0, min(limit, window - APPRAISAL_MAX_OUTPUT))
 
 
 class DeepSeek:
@@ -1191,7 +1263,7 @@ class DeepSeek:
         with request_client(self, timeout, "submit_appraisal") as client:
             response = client.post(self.endpoint + "/v1/messages",
                 headers={"x-api-key": os.environ[self.key_env], "anthropic-version": "2023-06-01"},
-                json={"model": self.model, "max_tokens": 131072, "system": system, "messages": messages,
+                json={"model": self.model, "max_tokens": APPRAISAL_MAX_OUTPUT, "system": system, "messages": messages,
                       "tools": tools, "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"},
                       "output_config": {"effort": APPRAISAL_EFFORT}})
         if response.status_code != 200:
@@ -1310,7 +1382,11 @@ class DeepSeek:
         purpose = getattr(self, "call_purpose", None) or "appraise"
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
         request_context = appraisal_context(context)
-        input_budget = getattr(self, "input_budget", APPRAISAL_INPUT_BUDGET)
+        # A main-session review is given its own from the session's window; a DeepSeek provider
+        # the queue ran is given the configured one (run_one); a bare provider sizes it here.
+        input_budget = getattr(self, "input_budget", None)
+        if input_budget is None:
+            input_budget = appraisal_input_budget()
         compression_receipt = None
         if hasattr(self, "engine") and request_context.get("memory_context"):
             from eventmem.core.models import Scope
@@ -1484,7 +1560,7 @@ class DeepSeek:
                 **reads,
                 "context_characters": len(rendered),
                 "request_digest": request_digest,
-                "max_output_tokens": None if getattr(self, "native_review", False) else 131072,
+                "max_output_tokens": None if getattr(self, "native_review", False) else APPRAISAL_MAX_OUTPUT,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
             }
             # A8: this call succeeded, so nothing about it may be reported as a failed
@@ -1557,7 +1633,7 @@ class DeepSeek:
         they are not, the parameters are what they always were."""
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
-        parameters = {"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"}
+        parameters = {"max_tokens": APPRAISAL_MAX_OUTPUT, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"}
         if self._recall_scope(context):
             parameters["recall"] = {"tools": RECALL_TOOLS, "rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS,
                                     "final_seconds": RECALL_FINAL_SECONDS, "call_seconds": RECALL_CALL_SECONDS,
@@ -1805,7 +1881,7 @@ class Appraisals:
                     k: v
                     for k, v in json.loads(r["data"]).items()
                     if k in {"receipt", "error", "result", "waiting_reason", "admission_waits", "last_wait_at",
-                             "error_detail", "repair_reason", "compression_waits", "compression_stalls",
+                             "error_detail", "repair_reason", "compression_waits", "compression_stalls", "compression_calls",
                              "transient_failures", "preparation_conflicts", "completed_from", "tier", "light_attempts",
                              "deletion_refusals"}
                 },
@@ -1830,24 +1906,126 @@ class Appraisals:
             queue.extend(child.get("batch_ids", []))
         return list(members), list(evidence)
 
+    def _integrated(self, conn, ids):
+        """Those of `ids` the mind has integrated already: sources in the index an appraisal's commit
+        writes (`mind_semantic_sources`). Only a source is a stimulus -- an owner message, a result, a
+        delivery, the host's own internal event -- so only a source can have been integrated; a record
+        id (`mem_...`) an internal review carries is a reference to what it is about, integrated or
+        not, and neither makes a job new nor keeps it from being done."""
+        material = sorted({i for i in ids if isinstance(i, str) and i.startswith("src_")})
+        found = set()
+        for start in range(0, len(material), 500):
+            page = material[start:start + 500]
+            found.update(row[0] for row in conn.execute(
+                "SELECT source_id FROM mind_semantic_sources WHERE scope=? AND source_id IN (" + ",".join("?" * len(page)) + ")",
+                (self.mind.scope.key(), *page)))
+        return found
+
+    def _covered(self, conn, ids):
+        """Whether everything a job was for is integrated: it has a source, and every source it has is."""
+        material = {i for i in ids if isinstance(i, str) and i.startswith("src_")}
+        return bool(material) and material <= self._integrated(conn, material)
+
+    def _resume_batch(self, conn, parent_id, data):
+        """A batch claimed again -- after a wait, a failure, or an operator's resume -- judges only what
+        is still its own to judge. A member that ended meanwhile (committed by another batch, or set
+        aside for good) leaves it, and so does one a split made solo, one running on its own and one
+        another batch took in: that one is being judged there. One that went back to the queue when
+        this row was set aside is taken back, so it is not judged twice, alone and here. What a
+        member that left brought is left out with it where this row knows its own part (`own`); a row
+        batched before that was kept keeps the evidence, and what another commit integrated of it is
+        left out at the claim like anything integrated."""
+        mine = set(self._batch_members(conn, data["batch_ids"])[0])
+        held = set()
+        for other in conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND id<>? AND state IN ('pending','running','batched') "
+                                  "AND json_extract(data,'$.batch_ids') IS NOT NULL", (self.mind.scope.key(), parent_id)):
+            if other["id"] not in mine:
+                held.update(json.loads(other["data"]).get("batch_ids") or ())
+        kept, left = [], []
+        for member_id in data["batch_ids"]:
+            member = conn.execute("SELECT state,data FROM mind_appraisals WHERE id=? AND scope=?",
+                                  (member_id, self.mind.scope.key())).fetchone()
+            solo = bool(member and json.loads(member["data"]).get("solo"))
+            if (not member or member["state"] in {"complete", "superseded", "running"} or (solo and member["state"] != "batched")
+                    or (member["state"] == "batched" and member_id in held)):
+                left.append(member_id)
+                continue
+            if member["state"] == "pending":
+                conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state='pending'", (member_id,))
+            kept.append(member_id)
+        if not left:
+            return []
+        data["batch_left"] = sorted(set(data.get("batch_left") or ()) | set(left))
+        own = data.get("own") if isinstance(data.get("own"), dict) else None
+        if own is None:
+            data["batch_ids"] = kept
+            return left
+        members, evidence = self._batch_members(conn, kept)
+        stimuli, targets = {own.get("stimulus")}, list(own.get("exploration_targets") or [])
+        for member_id in members:
+            member = conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (member_id,)).fetchone()
+            if not member:
+                continue
+            member_data = json.loads(member[0])
+            if member_id in kept:
+                stimuli.add(member_data.get("stimulus"))
+            for target in member_data.get("exploration_targets") or []:
+                if all(t.get("exploration_id") != target.get("exploration_id") for t in targets):
+                    targets.append(target)
+        data.update(evidence_ids=list(dict.fromkeys([*own["evidence_ids"], *evidence])))
+        if targets or own.get("exploration_targets") is not None:
+            data["exploration_targets"] = targets
+        else:
+            data.pop("exploration_targets", None)
+        if kept:
+            data.update(batch_ids=kept, stimulus=batch_stimulus(stimuli), stimuli=sorted(x or "interaction" for x in stimuli))
+        else:
+            # Nothing is left to carry: the row is what it was before it absorbed anything.
+            data["stimulus"] = own.get("stimulus")
+            for field in ("batch_ids", "stimuli", "own"):
+                data.pop(field, None)
+        # What was frozen was frozen for the evidence the row carried then.
+        data.pop("frozen_memory_context", None)
+        return left
+
     def _settle_children(self, conn, parent_id, data, state):
         """No terminal parent leaves an absorbed job batched. A parent that goes
-        back to pending keeps carrying its children into the next attempt."""
+        back to pending keeps carrying its children into the next attempt.
+
+        A committed parent settles every member of its flattened batch whose evidence is now
+        integrated, not only the ones still `batched`: a member that went back to the queue (its
+        parent was set aside, then resumed) or was set aside itself would otherwise run again, or
+        wait for an operator, for what this commit already judged -- the zombie batches of
+        2026-09-27, which paid for the same stimulus three times and moved the next review each
+        time. A member with anything left to judge stays where it is and runs for that."""
         if state == "pending":
             return []
         members, _ = self._batch_members(conn, data.get("batch_ids", []))
+        result = {"batch_id": parent_id, "event_id": (data.get("result") or {}).get("event_id")}
         for child_id in members:
             if state != "complete":
                 conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0 WHERE id=? AND state='batched'",
                              (time.time(), child_id))
                 continue
-            child = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND state='batched'", (child_id,)).fetchone()
-            if not child:
+            child = conn.execute("SELECT state,attempts,data FROM mind_appraisals WHERE id=?", (child_id,)).fetchone()
+            if not child or child["state"] not in {"batched", "pending", "needs-repair"}:
                 continue
-            child_data = {**json.loads(child[0]), "result": {"batch_id": parent_id, "event_id": (data.get("result") or {}).get("event_id")}}
+            child_data = json.loads(child["data"])
+            if child["state"] != "batched":
+                if not self._covered(conn, child_data.get("evidence_ids") or []):
+                    continue
+                if child["state"] == "needs-repair":
+                    child_data.setdefault("recovery_history", []).append({
+                        "command_id": "settled-by-batch", "source": parent_id, "at": self.mind.clock(), "attempts": child["attempts"],
+                        **{field: child_data.get(field) for field in ("error", "error_detail", "repair_reason")}})
+                for field in SETTLED_FIELDS:
+                    child_data.pop(field, None)
+                child_data["completed_from"] = "batch-parent"
+            child_data["result"] = result
             if data.get("receipt"):
                 child_data["receipt"] = data["receipt"]
-            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(child_data), child_id))
+            conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=? AND state=?",
+                         (dumps(child_data), child_id, child["state"]))
         return members
 
     def _review_evidence(self, job_id, data):
@@ -2073,16 +2251,66 @@ class Appraisals:
 
     def _compression_wait(self, data, progress):
         """Preparation waits are continuations, not charged attempts. The frozen
-        inputs stay so the cached parts keep their keys; progress bounds them."""
+        inputs stay so the cached parts keep their keys; progress bounds them, and so do
+        the passes and the paid calls (`compression_calls`, counted by the caller).
+
+        A batch whose first pass still left evidence out is split instead of tried again as it
+        was: its members go back to the queue as jobs of their own, and it keeps what was its
+        own (`_split_batch`). A batch recorded before its own part was kept is not split."""
         waits = data.get("compression_waits", 0) + 1
         stalls = 0 if progress else data.get("compression_stalls", 0) + 1
         data.update(compression_waits=waits, compression_stalls=stalls, compression_parts=progress,
                     waiting_reason=data["error"], last_wait_at=self.mind.clock())
         if stalls >= COMPRESSION_STALL_LIMIT:
             return self._quarantine(data, "compression-stalled:" + str(stalls))
-        if waits > MAX_COMPRESSION_WAITS:
+        if waits >= MAX_COMPRESSION_PASSES:
             return self._quarantine(data, "compression-passes-exhausted:" + str(waits))
+        if data.get("compression_calls", 0) > MAX_COMPRESSION_CALLS:
+            return self._quarantine(data, "compression-calls-exhausted:" + str(data["compression_calls"]))
+        if data.get("batch_ids") and isinstance(data.get("own"), dict):
+            self._split_batch(data)
         return "pending"
+
+    def _split_batch(self, data):
+        """A batch too large to prepare becomes its members, each a job of its own again, and this
+        row goes back to what it was before it absorbed them. Each is `solo`: never absorbed into
+        another batch nor absorbing one, so the same batch is not formed again. The members are
+        released in the transaction that ends this attempt (`release_members`), not here."""
+        own = data.pop("own")
+        members = data.pop("batch_ids")
+        data.update(evidence_ids=list(own["evidence_ids"]), stimulus=own.get("stimulus"), solo=True,
+                    split_from_batch={"members": len(members), "at": self.mind.clock()},
+                    release_members=members)
+        data.pop("stimuli", None)
+        if own.get("exploration_targets") is not None:
+            data["exploration_targets"] = own["exploration_targets"]
+        else:
+            data.pop("exploration_targets", None)
+        # What was frozen was frozen for the whole batch; the smaller job is prepared afresh.
+        for field in ("frozen_memory_context", "compression_parts", "compression_stalls"):
+            data.pop(field, None)
+
+    def _release_members(self, conn, parent_id, members):
+        """The members a split batch gave back: every one still `batched` is pending again, solo.
+        A member that has members of its own keeps them batched under it: it is a smaller batch,
+        and is split in turn if it is still too large. Its members are not released beside it,
+        or both would judge the same evidence."""
+        rows = {}
+        for member_id in members:
+            row = conn.execute("SELECT state,data FROM mind_appraisals WHERE id=? AND scope=?",
+                               (member_id, self.mind.scope.key())).fetchone()
+            if row:
+                rows[member_id] = (row["state"], json.loads(row["data"]))
+        nested = set(self._batch_members(conn, [n for _, data in rows.values() for n in data.get("batch_ids", [])])[0])
+        released = []
+        for member_id in members:
+            if member_id in nested or rows.get(member_id, (None,))[0] != "batched":
+                continue
+            member = {**rows[member_id][1], "solo": True, "split_from": parent_id}
+            conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,data=? WHERE id=? AND state='batched'",
+                         (time.time(), dumps(member), member_id))
+            released.append(member_id)
+        return released
 
     def runnable(self, lane):
         """Whether run_one(lane=lane) would find a job now, without claiming it: the host starts a
@@ -2138,22 +2366,31 @@ class Appraisals:
                 (self.mind.scope.key(), time.time(), int(semantic_enabled), 1 if maintenance else 2 if enrichment else 0),
             ).fetchone():
                 return {"state": "busy"}
+            # A judgment that already committed finishes from its durable receipt; it must not
+            # absorb evidence that commit never saw, nor take back what it had released.
+            committed_before = bool(conn.execute("SELECT 1 FROM commands WHERE id=?", (self.mind._key(row["id"]),)).fetchone())
+            if data.get("batch_ids") and not committed_before:
+                self._resume_batch(conn, row["id"], data)
             if (not data.get("batch_ids") and data.get("stimulus") in MERGEABLE_STIMULI
                     and (semantic_enabled or data.get("stimulus") not in INTERACTION_STIMULI)
-                    # A judgment that already committed finishes from its durable
-                    # receipt; it must not absorb evidence that commit never saw.
-                    and not conn.execute("SELECT 1 FROM commands WHERE id=?", (self.mind._key(row["id"]),)).fetchone()):
+                    # A job a split batch gave back is judged on its own (_split_batch).
+                    and not data.get("solo") and not committed_before):
                 # Everything the tick queued is one assessment: owner input, results, and the
                 # internal reviews (idle, wish, plan, exploration) alike (K1-06, H2a-01, E3-04, K2-04).
                 mergeable = MERGEABLE_STIMULI if semantic_enabled else MERGEABLE_STIMULI - INTERACTION_STIMULI
                 named = sorted(x for x in mergeable if x)
-                batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? AND ("
+                batch = conn.execute("SELECT id,data FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? "
+                                     "AND json_extract(data,'$.solo') IS NULL AND ("
                                      + ("json_extract(data,'$.stimulus') IS NULL OR " if None in mergeable else "")
                                      + "json_extract(data,'$.stimulus') IN (" + ",".join("?" * len(named)) + ")) ORDER BY available LIMIT 11",
                                      (self.mind.scope.key(), time.time(), row["id"], *named)).fetchall()
                 ids = list(data["evidence_ids"])
                 stimuli = {data.get("stimulus")}
                 batch_ids = []
+                # What this row is before it absorbs anything, so a batch too large to prepare can
+                # go back to being it (_split_batch).
+                own = {"evidence_ids": list(ids), "stimulus": data.get("stimulus"),
+                       **({"exploration_targets": deepcopy(data["exploration_targets"])} if data.get("exploration_targets") is not None else {})}
                 def evidence_cost(identifiers):
                     from eventmem.core.retrieval import tokens
                     total = 0
@@ -2180,7 +2417,7 @@ class Appraisals:
                             data.setdefault("exploration_targets", []).append(target)
                 if batch_ids:
                     data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus=batch_stimulus(stimuli),
-                                stimuli=sorted(x or "interaction" for x in stimuli))
+                                stimuli=sorted(x or "interaction" for x in stimuli), own=own)
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
@@ -2214,6 +2451,8 @@ class Appraisals:
         ended_before_call = False
         # This attempt only finished the row from another attempt's durable receipt (CR2-MIND-03).
         recovered = False
+        # This attempt's paid compression calls were added to the row's count already.
+        compression_counted = False
         model_admitted = False
         provider.compression_parts = set()
         # Everything up to the provider call is host-side assembly: a conflict raised
@@ -2236,10 +2475,13 @@ class Appraisals:
                 data["result"], data["completed_from"] = done, "already-committed"
                 recovered = True
             else:
-                if semantic_enabled and data.get("stimulus") in {"interaction-batch", "delivery", "runtime-result", "assistant-result", None}:
+                if semantic_enabled and data.get("stimulus") in INTEGRATION_CHECKED:
                     with self.engine.db.connect() as conn:
-                        remaining = [sid for sid in data["evidence_ids"] if not conn.execute("SELECT 1 FROM mind_semantic_sources WHERE scope=? AND source_id=?", (self.mind.scope.key(), sid)).fetchone()]
-                    if not remaining:
+                        integrated = self._integrated(conn, data["evidence_ids"])
+                    # What is integrated of a job is left out of it; a record it names as what it is
+                    # about stays with it (`_integrated`).
+                    remaining = [sid for sid in data["evidence_ids"] if sid not in integrated]
+                    if integrated and not any(sid.startswith("src_") for sid in remaining):
                         # Everything this job was for is integrated already. The attempt ends here, with
                         # no model call, no model slot and no charge: the count its claim took is given
                         # back, and the ledger records an uncharged attempt that committed nothing.
@@ -2462,6 +2704,10 @@ class Appraisals:
                 # provider's to tell from the stimulus (RECALL_WITHHELD). Set before the manifest reads
                 # the request profile it changes.
                 provider.memory_recall = True
+                if not getattr(type(provider), "native_review", False):
+                    # What the request may hold, by the configuration and the model's window. A
+                    # main-session review has its own, from the session's (NativeReview.from_engine).
+                    provider.input_budget = appraisal_input_budget(settings.get("appraisal_input_budget"))
                 # What this lane may carry, for the request and for everything the commit applies.
                 offered = offered_sections(data.get("stimulus"), audited)
                 # The host's record of what this attempt is shown: the commit's rebase and the next
@@ -2990,6 +3236,7 @@ class Appraisals:
                     if proposal.session_advice and self.session_context and not historical:
                         section("session_advice", apply_advice)
                     # The audited sections, last and in one fixed order, each inside its own savepoint.
+                    applied_sections = []
                     for name in offered:
                         value = getattr(proposal, name)
                         if name != "trait_observations" and new_interaction:
@@ -3002,7 +3249,8 @@ class Appraisals:
                         commit = SectionCommit(mind=self.mind, conn=conn, state=state, event_id=eid, section=name,
                                                value=value, proposal=proposal, receipt=receipt, sources=list(semantic_refs.values()),
                                                stimulus=data.get("stimulus"), version=effective_version, job_id=row["id"], settings=settings)
-                        section(name, lambda name=name, commit=commit: self.audit_handlers[name](commit))
+                        if section(name, lambda name=name, commit=commit: self.audit_handlers[name](commit)):
+                            applied_sections.append(name)
                     if proposal.evolution and "self_hypothesis" in offered:
                         # Not applied here: a proposal to move the slow parameters waits for the day's
                         # merge, which checks the chain and the limits. Dropping it was how a valid
@@ -3012,11 +3260,22 @@ class Appraisals:
                                                  sources=list(semantic_refs.values()), stimulus=data.get("stimulus"),
                                                  version=effective_version, job_id=row["id"], settings=settings)
                         section("evolution", lambda: behavior_chain.hold_evolution(proposed))
+                    if "prediction_outcomes" in offered:
+                        # Host bookkeeping, after the outcomes this commit gave: a prediction no outcome
+                        # can settle any more is closed as inconclusive (behavior_chain.close_lapsed).
+                        # A fault in it is recorded beside the refused sections, never the commit's.
+                        section("prediction_closing", lambda: behavior_chain.close_lapsed(conn, self.mind, event_id=eid))
                     for entry in rejected:
                         if entry["section"] in AUDIT_SECTIONS:
                             # Why the host refused it, for the projection that owns the section to show
                             # next time. A static code and a time: no follow-up and no second call.
                             record_refusal(conn, self.mind.scope.key(), entry["section"], entry["code"], self.mind.clock())
+                    refused_now = {entry["section"] for entry in rejected}
+                    for name in applied_sections:
+                        if name not in refused_now:
+                            # The section has committed since it was refused: the old refusal is no
+                            # longer why anything is the way it is, and is not shown any more.
+                            clear_refusal(conn, self.mind.scope.key(), name)
                     review_id = None
                     if asks_again(rejected, held) and not follow_up:
                         # One follow-up restates what was refused and what rests on it, durable with this commit like
@@ -3133,6 +3392,8 @@ class Appraisals:
                 # these frozen inputs, so a preparation pass keeps them and is a
                 # wait, not a charged attempt. Stalled preparation is quarantined.
                 uncharged_wait = "compression"
+                data["compression_calls"] = data.get("compression_calls", 0) + paid_compression_calls(calls)
+                compression_counted = True
                 state = self._compression_wait(data, len(provider.compression_parts))
             elif re.fullmatch(TRANSIENT_PATTERN, data["error"]) and not completed_appraisal(calls):
                 # The request never produced model output; an outage must not
@@ -3189,6 +3450,11 @@ class Appraisals:
             delay = min(1800, 60 * 2 ** min(row["attempts"], 5))
         # A light attempt is never a charged one, whether it committed or not; nor is a recovery.
         uncharged = bool(admission_wait or uncharged_wait or lighting or recovered or ended_before_call)
+        if not compression_counted and paid_compression_calls(calls):
+            # Paid for however the attempt ended: the row's cap counts every one (MAX_COMPRESSION_CALLS).
+            data["compression_calls"] = data.get("compression_calls", 0) + paid_compression_calls(calls)
+        # A split batch gives its members back in the transaction that ends this attempt.
+        release = data.pop("release_members", None)
         with self.engine.db.connect(write=True) as conn:
             # The row as this attempt leaves it, less anything deleted while it ran (CR4-MM-02).
             stored = kept(conn, data)
@@ -3198,6 +3464,8 @@ class Appraisals:
             ).rowcount
             if changed:
                 self._settle_children(conn, row["id"], stored, state)
+                if release:
+                    self._release_members(conn, row["id"], release)
             if ledger:
                 # One row per attempt, written with the row's final state in the same transaction:
                 # both commit or neither does, so a process that dies here leaves the row `running`
@@ -3217,7 +3485,7 @@ class Appraisals:
                 "appraisal": row["id"], "lane": "enrichment" if historical else "maintenance" if maintenance else "action",
                 "stimulus": data.get("stimulus"), "reason": data.get("repair_reason"), "error": data.get("error"),
                 "charged_attempts": row["attempts"] + int(not uncharged),
-                **{k: data[k] for k in ("error_detail", "error_repeats", "compression_waits", "compression_stalls",
+                **{k: data[k] for k in ("error_detail", "error_repeats", "compression_waits", "compression_stalls", "compression_calls",
                                         "transient_failures", "preparation_conflicts", "deletion_refusals") if k in data}})
         if not changed:
             # This worker lost its attempt token, so the receipt, proposal and
@@ -3247,6 +3515,8 @@ class Appraisals:
             # How the proposal came to this attempt, and what the host was shown: digests, tiers and
             # verdicts only. The reasons a revalidation gave stay on the queue row.
             "tier": data.get("tier"), "manifest_digest": data.get("manifest"),
+            # Paid compression calls are no charged attempt, and are counted here so the ledger shows them.
+            "compression_calls": paid_compression_calls(calls) or None,
             "revalidation": [{k: item[k] for k in ("conflict_id", "verdict", "patched")} for item in (data.get("revalidation") or {}).get("items", [])]
                             if data.get("tier") == "B" else None}, conn=conn)
 
@@ -3261,6 +3531,19 @@ class DailyReview:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS mind_daily_reviews(scope TEXT,day TEXT,state TEXT,data TEXT,PRIMARY KEY(scope,day))"
             )
+
+    def due(self):
+        """Whether `run` has anything to do now, read without doing it (the host's resident gate). With
+        the chain on, a merge needs a proposal to merge (behavior_chain.due); without it, the day's
+        review is due until it has been evaluated, and decides for itself whether to wait."""
+        from zoneinfo import ZoneInfo
+        with self.engine.db.connect() as conn:
+            if optimized(conn, self.mind.scope.key(), "behavior_chain"):
+                from .behavior_chain import due
+                return due(conn, self.mind)
+            day = timestamp(self.mind.clock()).astimezone(ZoneInfo("Asia/Singapore")).date().isoformat()
+            return not conn.execute("SELECT 1 FROM mind_daily_reviews WHERE scope=? AND day=? AND state!='waiting'",
+                                    (self.mind.scope.key(), day)).fetchone()
 
     def run(self, provider, agent_version):
         with self.engine.db.connect() as conn:

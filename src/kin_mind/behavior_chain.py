@@ -52,6 +52,14 @@ OUTCOMES = {"confirmed": True, "refuted": False, "inconclusive": None}
 # Why a day's merge did not happen. Static reasons; the proposals stay where they are.
 NO_PROPOSAL, INCOMPATIBLE = "need-personality-proposal", "proposal-incompatible"
 NO_EPISODES, NO_CHECK = "need-three-independent-interactions", "need-prospective-behavioral-check"
+# A prediction nothing settled stays open for a day past its window, so a verified result that
+# comes late can still settle it; then it is closed as inconclusive (`close_lapsed`). Of the 25
+# predictions made before this, 23 had run out unsettled and were still shown as open. One made
+# before the window was recorded is given the longest window a prediction may ask for.
+CLOSE_GRACE_HOURS = 24
+DEFAULT_WINDOW_HOURS = 168
+# How many confirmed checks an appraisal is shown for `evolution` to cite.
+CONFIRMED_SHOWN = 4
 
 
 def _ensure(conn):
@@ -265,10 +273,7 @@ def open_predictions(conn, mind, *, limit=4):
     current = compat.stamp(mind, conn)
     # Two passes over the self-knowledge rows, not one per candidate: this runs on the way into
     # every appraisal that offers the section.
-    settled = {row[0] for row in conn.execute(
-        "SELECT json_extract(data,'$.attributes.self_knowledge.prediction_id') FROM records"
-        " WHERE scope=? AND deleted=0 AND json_extract(data,'$.attributes.self_knowledge.entry')='assessment'",
-        (mind.scope.key(),)).fetchall()}
+    settled = _assessed(conn, mind)
     rows = conn.execute(
         "SELECT data FROM records WHERE scope=? AND deleted=0 AND status='active'"
         " AND json_extract(data,'$.attributes.self_knowledge.entry')='prediction'"
@@ -293,6 +298,101 @@ def open_predictions(conn, mind, *, limit=4):
     return items
 
 
+def _assessed(conn, mind):
+    """The predictions an assessment already settled."""
+    return {row[0] for row in conn.execute(
+        "SELECT json_extract(data,'$.attributes.self_knowledge.prediction_id') FROM records"
+        " WHERE scope=? AND deleted=0 AND json_extract(data,'$.attributes.self_knowledge.entry')='assessment'",
+        (mind.scope.key(),)).fetchall()}
+
+
+def window_end(record):
+    """When a prediction's own window ends."""
+    hours = metadata(record).get("test_window_hours") or DEFAULT_WINDOW_HOURS
+    return moment(record["valid_from"]) + timedelta(hours=hours)
+
+
+def close_lapsed(conn, mind, *, event_id, current=None):
+    """Close, as inconclusive, the open predictions no outcome can settle any more: a day past their
+    window, or made under a configuration that no longer holds (`compat.holds`, which a declared
+    addition of dimensions does not move). Closed is not deleted: the prediction becomes `archived`
+    with `closed: {outcome: inconclusive, reason, at, event_id}` and a revision that says why, so it
+    stays readable in the history and is never shown as open again, and no outcome can be recorded
+    for it any more (an assessment needs the prediction as it was made). Before this they stayed
+    `active` for ever: 23 of 25 had run out, and every appraisal was still asked to settle them.
+
+    Run inside the transaction of the appraisal whose outcomes were just committed, so an outcome
+    that came with this commit is recorded first. Returns what it closed: ids and static reasons."""
+    current = current or compat.stamp(mind, conn)
+    at = mind.clock()
+    now, settled, closed = moment(at), _assessed(conn, mind), []
+    rows = conn.execute(
+        "SELECT data FROM records WHERE scope=? AND deleted=0 AND status='active'"
+        " AND json_extract(data,'$.attributes.self_knowledge.entry')='prediction' ORDER BY valid_from,id",
+        (mind.scope.key(),)).fetchall()
+    for row in rows:
+        record = json.loads(row[0])
+        if record["id"] in settled or moment(record["valid_from"]) >= now:
+            continue
+        reason = compat.stale_reason(metadata(record).get("compat"), current)
+        if reason is None:
+            if now < window_end(record) + timedelta(hours=CLOSE_GRACE_HOURS):
+                continue
+            reason = "window-expired"
+        record["status"], record["valid_until"] = "archived", at
+        record["attributes"]["self_knowledge"]["closed"] = {"outcome": "inconclusive", "reason": reason, "at": at,
+                                                            "event_id": event_id}
+        mind.engine._save_revision(conn, record, "prediction_closed", "Closed as inconclusive: " + reason)
+        closed.append({"id": record["id"], "reason": reason})
+    if closed:
+        mind.engine.db.bump(conn)
+    return closed
+
+
+def confirmed_checks(conn, mind, *, limit=CONFIRMED_SHOWN, current=None):
+    """What an `evolution` may cite: an assessment that confirmed its prediction, with that prediction
+    and the hypothesis it tested, all three still current and made under the configuration that is
+    running now -- exactly what the day's merge and Mind._apply_event accept, which check it all
+    again. A check an applied evolution already rested on is not offered twice. The model was only
+    ever shown the open predictions, never a confirmed check, so no evolution could name one and the
+    daily merge waited for a proposal for ever. Newest first."""
+    current = current or compat.stamp(mind, conn)
+    knowledge = SelfKnowledge(mind.engine, mind.scope, clock=mind.clock)
+    try:
+        used = {row[0] for row in conn.execute(
+            "SELECT json_extract(data,'$.evolution.assessment_id') FROM mind_evolution_proposals WHERE scope=? AND state='applied'",
+            (mind.scope.key(),)).fetchall()}
+    except sqlite3.OperationalError:
+        used = set()
+    rows = conn.execute(
+        "SELECT data FROM records WHERE scope=? AND deleted=0 AND status='active'"
+        " AND json_extract(data,'$.attributes.self_knowledge.entry')='assessment'"
+        " AND json_extract(data,'$.attributes.self_knowledge.outcome')=1"
+        " ORDER BY valid_from DESC,id LIMIT ?", (mind.scope.key(), 4 * limit + len(used))).fetchall()
+    items = []
+    for row in rows:
+        if len(items) == limit:
+            break
+        assessment = json.loads(row[0])
+        if assessment["id"] in used or metadata(assessment).get("outcome") is not True:
+            continue
+        try:
+            prediction = knowledge._get(conn, metadata(assessment)["prediction_id"], "prediction")
+            claim = knowledge._get(conn, metadata(prediction)["claim_id"], "claim")
+        except (Conflict, Missing, KeyError, TypeError):
+            continue
+        if (metadata(claim).get("basis") != "hypothesis" or prediction["revision"] != 1
+                or metadata(prediction).get("claim_revision") != claim["revision"]
+                or any(entry["status"] not in {"active", "unverified"}
+                       or not compat.holds(metadata(entry).get("compat"), current)
+                       or not knowledge._fresh(conn, entry) for entry in (claim, prediction, assessment))):
+            continue
+        items.append({"claim_id": claim["id"], "assessment_id": assessment["id"], "prediction_id": prediction["id"],
+                      "hypothesis": claim["content"][:300], "behavior": prediction["content"][:300],
+                      "confirmed_at": assessment["valid_from"]})
+    return items
+
+
 def manifest_entries(conn, mind, *, limit=4):
     """The ids this chain contributes to the input-manifest class `predictions`: exactly what the
     context was shown, with the revision and whether its configuration still holds. A stored
@@ -314,6 +414,33 @@ def _confirmed(conn, knowledge, proposal, current):
             and metadata(prediction).get("claim_id") == claim["id"]
             and all(compat.holds(metadata(row).get("compat"), current)
                     for row in (claim, prediction, assessment)))
+
+
+def due(conn, mind):
+    """Whether the day's merge has anything to do: no merge recorded for today, and a proposal it
+    would look at -- one still `pending` (the merge uses it or marks it stale, once), or a `stale`
+    one whose configuration holds again (`pending` re-reads every stamp). Read only, for the host's
+    resident gate: without it the host started a merge process every minute to be told it was still
+    waiting."""
+    try:
+        states = {row[0] for row in conn.execute(
+            "SELECT DISTINCT state FROM mind_evolution_proposals WHERE scope=? AND state IN ('pending','stale')",
+            (mind.scope.key(),))}
+    except sqlite3.OperationalError:
+        # A store no appraisal has held a proposal in has nothing to merge.
+        return False
+    if not states:
+        return False
+    state = mind._load(conn)
+    day = moment(mind.clock()).astimezone(ZoneInfo(state["profile"]["evolution"]["timezone"])).date().isoformat()
+    try:
+        if conn.execute("SELECT 1 FROM mind_daily_reviews WHERE scope=? AND day=?", (mind.scope.key(), day)).fetchone():
+            return False
+    except sqlite3.OperationalError:
+        pass  # no day has been reviewed yet
+    if "pending" in states:
+        return True
+    return "stale" in states and any(not item["stale_reason"] for item in pending(conn, mind, compat.stamp(mind, conn, state)))
 
 
 def merge_daily(mind, agent_version):

@@ -640,8 +640,11 @@ def ledger_view(conn, mind, at):
                 "corrections": ledger.corrections(conn), "open_predictions": []}
     if optimized(conn, scope, "behavior_chain"):
         # On its own switch, whatever the ledger's says: the paragraph that asks the model to settle
-        # a prediction promises this key, so it is there to be empty rather than missing.
+        # a prediction promises this key, so it is there to be empty rather than missing. So does the
+        # one that lets `evolution` cite a confirmed check.
+        from .behavior_chain import confirmed_checks
         view["open_predictions"] = open_predictions(conn, mind)
+        view["confirmed_checks"] = confirmed_checks(conn, mind)
     return view or None
 
 

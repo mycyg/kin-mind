@@ -12,6 +12,14 @@ reason names the ingredient that moved.
 decision, not a side effect of editing prose. Whoever changes what Kin is asked to do bumps it
 when the earlier checks and decisions no longer describe this agent.
 
+Adding dimensions is not changing one. When emotion v2 added eight dimensions (2026-09-27 09:08
+UTC) the definitions digest moved although no definition did, and every open prediction, every
+confirmed check and every decision stamped before it went stale at once, silently: nothing had
+changed about what any of them was made under. A release that adds dimensions declares them in
+`DEFINITION_ADDITIONS`; a stamp whose definitions are exactly the current ones without the groups
+added since still holds, when nothing else moved. Changing, removing or renaming a definition
+still moves the stamp, and so does an addition that is not declared.
+
 The stamp also fences decisions: a wish, a plan step or a method decided under one stamp holds
 while it holds (state.Mind.decision_current), so a deployment that only moves agent_version no
 longer voids them (K1-13, MAIN-RUA-02).
@@ -41,6 +49,31 @@ CHAT_FIELDS = ("chat", "chat_effort")
 UNREGISTERED = "unregistered"
 # The execution facts a behavior can depend on. The rest of the environment is noise for this key.
 ENVIRONMENT_KEYS = ("python", "node", "os", "platform", "shell")
+# The dimensions releases added to the role profile, one group per release, oldest first. Declared,
+# like BEHAVIOR_CONTRACT: a release that adds dimensions adds its group here, or bumps the contract
+# when the addition does change what the earlier checks meant.
+DEFINITION_ADDITIONS = (
+    # Emotion system v2 (profile-dimensions-added, 2026-09-27).
+    ("joy", "contentment", "sadness", "irritability", "protectiveness", "jealousy", "fear", "wonder"),
+)
+
+
+def _definitions(dimensions, without=frozenset()):
+    """The digest of what the dimension definitions ask, less the dimensions in `without`."""
+    return digest({key: {name: value for name, value in entry.items() if name not in EVOLVING}
+                   for key, entry in dimensions.items() if key not in without})
+
+
+def extended(dimensions):
+    """The definitions digests the current ones extend only by declared additions: for each release
+    that added a group, the current definitions without that group and every later one. Empty when
+    the profile holds none of them."""
+    found = []
+    for index in range(len(DEFINITION_ADDITIONS)):
+        added = frozenset(key for group in DEFINITION_ADDITIONS[index:] for key in group)
+        if added & set(dimensions):
+            found.append(_definitions(dimensions, added))
+    return found
 
 
 def _setting(conn, key):
@@ -58,8 +91,7 @@ def parts(mind, conn, state=None):
     return {
         "persona": digest([policy[field] for field in PERSONA_FIELDS]) if policy else "none",
         "contract": BEHAVIOR_CONTRACT,
-        "definitions": digest({key: {name: value for name, value in entry.items() if name not in EVOLVING}
-                               for key, entry in profile["dimensions"].items()}),
+        "definitions": _definitions(profile["dimensions"]),
         "models": digest([appraisal.APPRAISAL_MODEL, appraisal.APPRAISAL_EFFORT,
                           *[chat.get(field) or UNREGISTERED for field in CHAT_FIELDS]]),
         "environment": digest(running or UNREGISTERED),
@@ -67,14 +99,29 @@ def parts(mind, conn, state=None):
 
 
 def stamp(mind, conn, state=None):
-    """What a claim, a prediction, an assessment or a pending proposal is written with."""
+    """What a claim, a prediction, an assessment or a pending proposal is written with. `extends`,
+    when there is one, lists the definitions digests the current ones only add dimensions to; it is
+    not part of the key."""
+    state = state or mind._load(conn)
     ingredients = parts(mind, conn, state)
-    return {"key": "compat_" + digest(ingredients)[:32], "parts": ingredients}
+    found = {"key": "compat_" + digest(ingredients)[:32], "parts": ingredients}
+    earlier = extended(state["profile"]["dimensions"])
+    if earlier:
+        found["extends"] = earlier
+    return found
 
 
 def holds(stored, current):
-    """Was this written under the configuration that is running now?"""
-    return bool(stored) and stored.get("key") == current["key"]
+    """Was this written under the configuration that is running now? The same key, or the same
+    ingredients but for definitions the current ones only add declared dimensions to."""
+    if not stored:
+        return False
+    if stored.get("key") == current["key"]:
+        return True
+    old, new = stored.get("parts") or {}, current["parts"]
+    return (bool(old) and set(old) == set(new)
+            and all(old[name] == new[name] for name in new if name != "definitions")
+            and old.get("definitions") in (current.get("extends") or ()))
 
 
 def stale_reason(stored, current):

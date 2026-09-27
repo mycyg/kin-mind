@@ -166,7 +166,8 @@ def outcome_for(state, data, *, owned):
 def _row(scope, entry, ordinal):
     data = {"calls": list(entry.get("calls") or []), "charged": bool(entry.get("charged"))}
     for field in ("error", "error_detail", "repair_reason", "proposal_digest",
-                  "context_digest", "waiting_reason", "attempts", "tier", "manifest_digest", "revalidation"):
+                  "context_digest", "waiting_reason", "attempts", "tier", "manifest_digest", "revalidation",
+                  "compression_calls"):
         if entry.get(field) is not None:
             data[field] = entry[field]
     reported = [c for c in data["calls"] if c.get("usage_status") == "reported"]

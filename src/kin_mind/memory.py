@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 # The quiet-review interval Kin may choose (N8, set by kin_mind.appraisal). The stored
 # review_min/max_minutes keys stay readable for older configurations and bound nothing now.
 REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
+# What `appraisal_input_budget` may be set to: enough for an ordinary request, and no more than
+# the model's window (deepseek-flash: 1,048,576 tokens).
+APPRAISAL_BUDGET_RANGE = (32000, 1048576)
 # Settings an earlier release registered and nothing reads any more. A stored configuration or a
 # caller that still carries one is not refused for it: it is left out when read, and dropped from
 # the configuration the next time it is written.
@@ -145,7 +148,10 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # by default: with none configured that lane uses generic first/second-person words.
             "recall_owner_aliases": [],
             # Charged appraisal attempts before a job is quarantined for repair.
-            "max_charged_attempts": 5}
+            "max_charged_attempts": 5,
+            # The most one DeepSeek appraisal request may hold, in tokens. None: the appraisal's own
+            # cap (kin_mind.appraisal.APPRAISAL_INPUT_CAP), within the model's catalog window.
+            "appraisal_input_budget": None}
 
 
 class MemoryNote(Model):
@@ -356,8 +362,14 @@ class MemoryContinuity:
                     any(validation.get(k) != 0 for k in ("wrong_merges", "unsupported_upgrades", "stale_facts", "background_reinforcement")) or
                     not validation.get("evaluated_at") or timestamp(validation["evaluated_at"]) < timestamp(started) + timedelta(days=7)):
                     raise Conflict("Cooling needs a current successful replay validation")
-            if not 20 <= config["review_min_minutes"] <= config["first_review_minutes"] <= config["review_max_minutes"] <= 120:
-                raise ValueError("Review range must be within 20..120 minutes")
+            # The range Kin chooses from (N8), the same numbers the appraisal states and clamps to.
+            if not REVIEW_FLOOR_MINUTES <= config["review_min_minutes"] <= config["first_review_minutes"] \
+                    <= config["review_max_minutes"] <= REVIEW_CEILING_MINUTES:
+                raise ValueError(f"Review range must be within {REVIEW_FLOOR_MINUTES}..{REVIEW_CEILING_MINUTES} minutes")
+            budget = config["appraisal_input_budget"]
+            if budget is not None and (type(budget) is not int or not APPRAISAL_BUDGET_RANGE[0] <= budget <= APPRAISAL_BUDGET_RANGE[1]):
+                raise ValueError("An appraisal input budget is a whole number of tokens, "
+                                 f"{APPRAISAL_BUDGET_RANGE[0]}..{APPRAISAL_BUDGET_RANGE[1]}, or null")
             aliases = config["recall_owner_aliases"]
             if (type(aliases) is not list or len(aliases) > 8
                     or any(type(a) is not str or not a.strip() or len(a) > 40 for a in aliases)):
