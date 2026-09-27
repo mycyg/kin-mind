@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MindLoop,interactionView,stateContext,INTERACTION_LIMITS} from '../../adapters/owner-host.mjs';
 import {createContactBatch} from '../../adapters/contact-batch.mjs';
-import {parseContactDraft} from '../../adapters/contact-draft.mjs';
+import {parseContactDraft,REASON_MAX_CHARS,UNSTATED_REASON} from '../../adapters/contact-draft.mjs';
 function fixture(overrides={}) {
  const events=[];let epoch='owner-1';let eligible=true;let busy=false;
  const loop=new MindLoop({call:async(action,req)=>{events.push([action,req]);if(action==='candidate')return{eligible:true};if(action==='claim')return{id:'stable-id',state:'drafting'};if(action==='check')return{eligible:true};return req;},eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,draft:async()=>({action:'send',text:'A sourced hello'}),send:async()=>({state:'accepted',messageId:'server-id'}),...overrides});
@@ -236,6 +236,32 @@ test('a contact wait of up to three days is kept; one past either end is taken t
  // A strict output schema always carries desire_ids; empty means every offered wish.
  assert.equal(parseContactDraft(JSON.stringify({action:'send',bubbles:[{text:'Hi',references:[]}],desire_ids:[],reason:null,condition:null,retry_after_seconds:null})).desire_ids,undefined);
  assert.deepEqual(parseContactDraft(JSON.stringify({action:'send',bubbles:['Hi'],desire_ids:['d-1']})).desire_ids,['d-1']);
+});
+test('what the strict draft schema lets through is read the one safe way, never refused (2026-09-27)',async()=>{
+ // Every field present, the unused ones null or empty: the answer a fork gives.
+ const strict=fields=>JSON.stringify({desire_ids:null,bubbles:[],reason:null,condition:null,retry_after_seconds:null,...fields});
+ const parse=fields=>parseContactDraft(strict(fields));
+ assert.deepEqual(parse({action:'wait'}),{action:'wait',reason:UNSTATED_REASON.wait,condition:'new_evidence'});
+ assert.deepEqual(parse({action:'wait',condition:'time',reason:' 晚点 '}),{action:'wait',reason:'晚点',condition:'time',retry_after_seconds:1800});
+ assert.deepEqual(parse({action:'abandon',reason:'  '}),{action:'abandon',reason:UNSTATED_REASON.abandon});
+ const long=parse({action:'abandon',reason:'😀'.repeat(REASON_MAX_CHARS+100)}).reason;
+ assert.equal(Array.from(long).length,REASON_MAX_CHARS);assert.ok(long.isWellFormed());
+ // A blank bubble says nothing and goes with its references; a blank wish id names none.
+ assert.deepEqual(parse({action:'send',desire_ids:[' ','d-1','d-1'],bubbles:[{text:' ',references:[]},{text:'想你了',references:[]}]}),
+   {action:'send',text:'想你了',bubbles:['想你了'],references:[[]],desire_ids:['d-1']});
+ // A send left with no words is still a send; the loop records it as empty output, never as a wait.
+ assert.deepEqual(parse({action:'send'}),{action:'send',text:'',bubbles:[]});
+ const {loop,events}=fixture({draft:async()=>parse({action:'send',bubbles:[{text:'  ',references:[]}]}),send:async()=>assert.fail('must not send')});
+ await loop.tick();
+ assert.equal(events.at(-1)[1].failure.code,'contact-draft-empty-output');
+ // A wait with nothing named reaches the store as her decision, not as a failure of the draft.
+ const waited=fixture({draft:async()=>parse({action:'wait'}),send:async()=>assert.fail('must not send')});
+ await waited.loop.tick();
+ assert.equal(waited.events.at(-1)[1].reason,'draft-decision');
+ assert.deepEqual(waited.events.at(-1)[1].decision,{action:'wait',reason:UNSTATED_REASON.wait,condition:'new_evidence'});
+ // What no schema lets through is still no decision.
+ for(const bad of [{action:'wait',reason:7},{action:'wait',condition:'soon'},{action:'send',bubbles:'hi'},{action:'send',bubbles:[{text:1}]},{action:'maybe'}])
+   assert.throws(()=>parse(bad),/contact-draft-invalid-result/);
 });
 test('Kin names the wishes her draft is for; check and pending carry them with the text (N11)',async()=>{
  const{loop,events}=fixture({draft:async()=>({action:'send',text:'The tea was lovely',desire_ids:['d-tea']})});

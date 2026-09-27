@@ -390,6 +390,8 @@ def dispatch(config, action, request):
         return mind.configure_behavior(request)
     if action == "configure-contact":
         return mind.configure_contact(request)
+    if action == "configure-contact-frequency":
+        return mind.configure_contact_frequency(request)
     if action == "review-enrichment":
         if config.get("review_paused") or not memory.settings()["operational_lanes"]:
             return {"state": "paused"}
@@ -540,6 +542,9 @@ def dispatch(config, action, request):
         # Emotion system v2b: the derived layers' block, with every slow layer starting where its score
         # stands, joins a state kept before them -- after the dimensions, so each gets its anchor.
         mind.ensure_affect_layers(agent_version=config["agent_version"])
+        # The owner's recorded word on contact frequency, which the host config names, becomes the
+        # state's own field (2026-09-27); it reached an assessment only through one expression style.
+        mind.adopt_contact_frequency(config.get("contact_frequency_evidence_ids"), agent_version=config["agent_version"])
         # A start-up used to assume the previous service was gone and interrupt every
         # running exploration. It asks now: a row is interrupted only when its worker
         # is provably gone — the pid is dead, the pid became some other process, or

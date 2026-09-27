@@ -22,37 +22,61 @@ function finalObject(text) {
  * end is taken to that end and kept, never refused (kin_mind.state keeps the same range). */
 export const CONTACT_WAIT_SECONDS={min:300,max:259200};
 
+/** What a wait or an abandon says when the draft gave no reason: the host's words, and only that. */
+export const UNSTATED_REASON=Object.freeze({wait:'草稿选择先等，没有写明原因',abandon:'草稿选择放下，没有写明原因'});
+/** How much of a reason is kept, in characters; a longer one is cut there, never refused. */
+export const REASON_MAX_CHARS=1200;
+const WAIT_CONDITIONS=new Set(['time','new_evidence','owner_reply']);
+
 /** A decision, or null when the output is not one. No body is ever shortened:
  * content the channel cannot carry in one message is fragmented downstream. A decision names its
- * action: an object with text and no action is not a send (AD2-17). */
+ * action: an object with text and no action is not a send (AD2-17).
+ *
+ * The strict output schema (host boundaries.mjs) carries every field for every action, so what it
+ * cannot rule out is read here the one safe way, never refused as a format failure: a fork draft
+ * never got through with a wait that named no condition, a wait or an abandon without a reason, or
+ * a send with no bubbles, and each such failure counted towards setting the wish aside (2026-09-27).
+ * A blank wish id names none; a blank bubble says nothing and goes with its references; a send left
+ * with no words is still a send, which the host records as empty output; a reason left blank is
+ * said to be so in the host's words; a wait with no condition waits for new material, as the store's
+ * own default does (kin_mind.state.ContactDecision). Her action is never changed. */
 function decide(result) {
   // Which of the offered wishes this decision acts on (N11). Unnamed, null or empty (a strict
   // output schema always carries the field) means all of them.
   let chosen={};
   if(result.desire_ids!==undefined&&result.desire_ids!==null) {
     const ids=result.desire_ids;
-    if(!Array.isArray(ids)||ids.length>12||!ids.every(x=>typeof x==='string'&&x.trim()))return null;
-    if(ids.length)chosen={desire_ids:[...new Set(ids.map(x=>x.trim()))]};
+    if(!Array.isArray(ids)||!ids.every(x=>typeof x==='string'))return null;
+    const named=[...new Set(ids.map(x=>x.trim()).filter(Boolean))];
+    if(named.length)chosen={desire_ids:named};
   }
-  if(result.action==='send'&&Array.isArray(result.bubbles)) {
-    if(result.bubbles.length&&result.bubbles.every(x=>x&&typeof x.text==='string'&&x.text.trim()&&Array.isArray(x.references??[]))) {
-      const bubbles=result.bubbles.map(x=>x.text.trim());
-      return {action:'send',text:bubbles.join('\n\n'),bubbles,references:result.bubbles.map(x=>x.references??[]),...chosen};
+  if(result.action==='send') {
+    if(result.bubbles!==undefined&&result.bubbles!==null) {
+      if(!Array.isArray(result.bubbles))return null;
+      // A bubble is a string, or {text, references} when it cites what it shares.
+      const items=result.bubbles.map(x=>typeof x==='string'?{text:x}:x&&typeof x==='object'&&typeof x.text==='string'
+        &&(x.references===undefined||x.references===null||Array.isArray(x.references))?{text:x.text,references:x.references??[]}:null);
+      if(items.some(x=>x===null))return null;
+      const kept=items.filter(x=>x.text.trim());
+      if(kept.length||typeof result.text!=='string') {
+        const bubbles=kept.map(x=>x.text.trim());
+        return {action:'send',text:bubbles.join('\n\n'),bubbles,
+          ...(kept.some(x=>x.references)?{references:kept.map(x=>x.references??[])}:{}),...chosen};
+      }
     }
-    if(result.bubbles.length&&result.bubbles.every(x=>typeof x==='string'&&x.trim())) {
-      const bubbles=result.bubbles.map(x=>x.trim());
-      return {action:'send',text:bubbles.join('\n\n'),bubbles,...chosen};
-    }
-    return null;
+    return {action:'send',text:typeof result.text==='string'?result.text.trim():'',...chosen};
   }
-  if(result.action==='send'&&typeof result.text==='string'&&result.text.trim())return {action:'send',text:result.text.trim(),...chosen};
-  if(!['wait','abandon'].includes(result.action)||typeof result.reason!=='string'||!result.reason.trim()||result.reason.length>1200)return null;
-  if(result.action==='abandon')return {action:'abandon',reason:result.reason.trim(),...chosen};
-  if(!['time','new_evidence','owner_reply'].includes(result.condition))return null;
+  if(!['wait','abandon'].includes(result.action))return null;
+  if(result.reason!==undefined&&result.reason!==null&&typeof result.reason!=='string')return null;
+  // By code points, so a cut never splits a character.
+  const reason=Array.from((result.reason??'').trim()).slice(0,REASON_MAX_CHARS).join('').trim()||UNSTATED_REASON[result.action];
+  if(result.action==='abandon')return {action:'abandon',reason,...chosen};
+  const condition=result.condition??'new_evidence';
+  if(!WAIT_CONDITIONS.has(condition))return null;
   const requested=result.retry_after_seconds??1800;
-  if(result.condition==='time'&&(typeof requested!=='number'||!Number.isFinite(requested)))return null;
+  if(condition==='time'&&(typeof requested!=='number'||!Number.isFinite(requested)))return null;
   const seconds=Math.min(CONTACT_WAIT_SECONDS.max,Math.max(CONTACT_WAIT_SECONDS.min,Math.round(requested)));
-  return {action:'wait',reason:result.reason.trim(),condition:result.condition,...(result.condition==='time'?{retry_after_seconds:seconds}:{}),...chosen};
+  return {action:'wait',reason,condition,...(condition==='time'?{retry_after_seconds:seconds}:{}),...chosen};
 }
 
 /** Public output only. A parse failure is an execution error, not a wish decision. */

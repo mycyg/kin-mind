@@ -835,7 +835,8 @@ class MemoryContinuity:
                 return None
             return actions.emit(conn, "idle-review", due["next_review"], {
                 "evidence_ids": [r["record_id"] for r in refs], "agent_version": state["agent_version"],
-                "reason": "Reconsider current interests and motives without inventing an owner message", "due_at": due["next_review"]})
+                "reason": "Reconsider current interests and motives, and decide whether to reach out now, without inventing an owner message",
+                "due_at": due["next_review"]})
 
     def commit_action(self, conn, refs, event_id, next_minutes, receipt, *, max_minutes=None):
         """The action clock progresses even when historical enrichment cannot.

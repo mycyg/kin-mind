@@ -79,6 +79,7 @@ REGISTRY = {
     "Mind revision changed; read current state before updating": ("runtime", "mind-revision-changed", "reuse"),
     "Autonomy policy requires explicit user evidence": ("semantic", "insufficient-authority", "block"),
     "Contact preferences require explicit user evidence": ("semantic", "insufficient-authority", "block"),
+    "Contact frequency requires current explicit owner evidence": ("semantic", "insufficient-authority", "block"),
     "Behavior policy requires explicit user evidence": ("semantic", "insufficient-authority", "block"),
     "Personality was already evaluated today": ("runtime", "evolution-already-today", "block"),
     "Personality changes require three independent user interactions": ("semantic", "evolution-needs-interactions", "block"),

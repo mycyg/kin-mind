@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 from urllib.parse import unquote, urlparse
@@ -43,9 +44,17 @@ from eventmem.core.models import Model, SourceInput
 
 from . import liveness
 from .memory import MemoryContinuity
-from .state import DesireChange
+from .state import DesireChange, timestamp
 
 EXECUTION_STATES = ("complete", "failed", "timed-out", "preempted")
+# A run that ends without a result -- failed, timed out, or complete with nothing -- used to leave its
+# wish waiting for new evidence, which nothing ever brought: both explorations of 2026-09-23 ran out
+# that way. The wish is tried again this many times, no sooner than this, whenever the host is next
+# idle; one more such end settles it, with the reason.
+EXPLORATION_RETRIES = 1
+EXPLORATION_RETRY_SECONDS = 1800
+# How a failure is named in the wish's reason: a code a host or an executor wrote, never words.
+FAILURE_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}")
 # What a run whose words were taken still shows of itself among the previous explorations: its
 # identity, state and time, and the wish it was for. Its report, while it stands, says the rest.
 KEPT_WHEN_ERASED = ("id", "state", "created_at", "desire_id")
@@ -492,10 +501,26 @@ class Explorations:
                 event_id = "mind_" + digest([eid, "settled"])[:32]
                 needs_condition = bool((data.get("result") or {}).get("assistance_needed"))
                 action = "complete" if state == "complete" and data.get("result") and not needs_condition else "resume" if state == "preempted" else "wait"
+                reason = "Exploration awaits a reported condition" if needs_condition else "Exploration execution: "+state
+                # A run that ended without a result is not parked on new evidence that never comes: the
+                # wish is tried again once, at the host's next idle window after a pause, and a second
+                # such end settles it with the reason. A plan step is its plan's to decide again.
+                retry = None
+                if action == "wait" and not needs_condition and not active.get("plan_id"):
+                    failures = (active.get("exploration_retry") or {}).get("failures", 0) + 1
+                    code = next((value for value in (data.get("inputs_withheld"), data.get("waiting_reason"), data.get("error"), data.get("reason"))
+                                 if isinstance(value, str) and FAILURE_CODE.fullmatch(value)), None)
+                    retry = {"failures": failures, "state": state, **({"code": code} if code else {}), "at": self.mind.clock(),
+                             "not_before": (timestamp(self.mind.clock()) + timedelta(seconds=EXPLORATION_RETRY_SECONDS)).isoformat()}
+                    action = "resume" if failures <= EXPLORATION_RETRIES else "abandon"
+                    reason = ("Exploration ended without a result; tried once more at the next idle window" if action == "resume"
+                              else "Exploration ended without a result again after its retry: " + state + (": " + code if code else ""))
                 update = DesireChange(command_id=eid+":settled", agent_version=agent_version,
                     expected_revision=current["revision"], evidence_ids=[source["id"], *data["evidence_ids"]],
-                    action=action, desire_id=desire["id"], reason="Exploration awaits a reported condition" if needs_condition else "Exploration execution: "+state)
+                    action=action, desire_id=desire["id"], reason=reason)
                 self.mind._apply_desire(conn, current, update, event_id)
+                if retry:
+                    current["desires"][desire["id"]]["exploration_retry"] = {k: v for k, v in retry.items() if k != "not_before" or action == "resume"}
                 from .plans import AutonomousPlans
                 # A finished run is not yet a finished step: with questions still open the step waits,
                 # and the next review, which reads them, is where Kin decides whether to go on (K2-10).

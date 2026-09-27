@@ -344,6 +344,8 @@ def project(entry, at):
 
 # The settings key under which the host names its live contact policy file (K1-03).
 CONTACT_POLICY_SETTING = "kin_mind.contact_policy"
+# The owner's word on how often to reach out is shown whole in every assessment: a sentence or two.
+CONTACT_FREQUENCY_MAX_CHARS = 600
 
 
 class Mind(Continuity):
@@ -776,6 +778,73 @@ class Mind(Continuity):
 
         return self._mutate(request, "contact-preference", apply)
 
+    def _contact_frequency(self, conn, evidence_ids, event_id, reason):
+        """How often the owner wants Kin to reach out, in the owner's own recorded words: the text of
+        the sources cited, never a paraphrase and never a default. Its own field, read whatever the
+        expression style: it used to reach an assessment only as the reason of the affectionate
+        style, so a later change of style took it away (2026-09-21 to 27)."""
+        refs = self._evidence(conn, evidence_ids)
+        if not refs or any(r["authority"] != "explicit" for r in refs) or not self._fresh(conn, refs):
+            raise Conflict("Contact frequency requires current explicit owner evidence")
+        texts = []
+        for sid in dict.fromkeys(r["source_id"] for r in refs):
+            row = conn.execute("SELECT blob FROM sources WHERE id=? AND deleted=0", (sid,)).fetchone()
+            if not row or not row["blob"]:
+                raise Missing("Evidence source is unavailable")
+            texts.append((self.engine.db.blobs / row["blob"]).read_text().strip())
+        text = "\n".join(t for t in texts if t)
+        if not text or len(text) > CONTACT_FREQUENCY_MAX_CHARS:
+            raise ValueError("A contact frequency preference is one short owner statement")
+        return {"text": text, "evidence": refs, "event_id": event_id, "reason": reason, "configured_at": self.clock()}
+
+    def configure_contact_frequency(self, request):
+        """The operator's route for a new owner word on contact frequency; scores stay as they are."""
+        for key in ("command_id", "agent_version", "reason"):
+            if not isinstance(request.get(key), str) or not request[key].strip():
+                raise ValueError(f"{key} is required")
+
+        def apply(conn, state, event_id):
+            state["contact_frequency"] = self._contact_frequency(conn, request["evidence_ids"], event_id, request["reason"])
+            return {"contact_frequency": {k: v for k, v in state["contact_frequency"].items() if k != "evidence"}}
+        return self._mutate(request, "contact-frequency", apply)
+
+    def adopt_contact_frequency(self, evidence_ids, *, agent_version):
+        """Start-up migration (2026-09-27): the owner-approved frequency preference the host config
+        names (`contact_frequency_evidence_ids`) becomes the state's own field, as one recorded
+        revision. Idempotent: carried already from the same sources at the same versions, it answers
+        `unchanged`. A word set since through `configure_contact_frequency` is the owner's later one
+        and stands (`kept`); a config that names other sources replaces only what an earlier config
+        put there. Never raises for what the store or the config holds: a start-up does not fail for
+        it, and a source that is missing or not the owner's is reported and left alone."""
+        if not evidence_ids:
+            return {"state": "unconfigured"}
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            version = lambda refs: sorted([r["source_id"], r["record_id"], r["hash"], r["revision"]] for r in refs)
+            try:
+                named = sorted(set(evidence_ids))
+                current = state.get("contact_frequency")
+                if current and "adopted_from" not in current:
+                    return {"state": "kept"}
+                wanted = self._evidence(conn, named)
+                if current and current["adopted_from"] == named and version(current["evidence"]) == version(wanted):
+                    # Carried already. If a newer word replaced this one since, the view says the entry
+                    # needs review; adopting the same words again would change nothing.
+                    return {"state": "unchanged"}
+                # Each adoption is a revision of its own, so a config that names an earlier word again
+                # is adopted again under a new event.
+                event_id = "mind_" + digest([self.scope.key(), "contact-frequency-adopted", version(wanted), state["revision"]])[:32]
+                state["contact_frequency"] = {**self._contact_frequency(
+                    conn, named, event_id, "The owner's recorded word on how often to reach out, carried as its own field"),
+                    "adopted_from": named}
+            except (Missing, Conflict, ValueError, OSError, KeyError, TypeError) as error:
+                return {"state": "refused", "reason": type(error).__name__}
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "contact-frequency",
+                          {"evidence_ids": named, "agent_version": agent_version, "migration": True})
+            return {"state": "adopted", "revision": state["revision"], "event_id": event_id}
+
     def register_contact_policy(self, path):
         """Name the live contact policy the host applies (its proactive-policy.json). The view reads
         the owner's current contact constraints there, so the copy kept in the state since the
@@ -836,6 +905,15 @@ class Mind(Continuity):
                 "needs_review": not self._fresh(conn, preference["evidence"]),
                 "evidence_ids": [r["record_id"] for r in preference["evidence"]],
             }
+        frequency = state.get("contact_frequency")
+        if frequency:
+            # The owner's own words while what they came from stands; a source that changed or went
+            # takes them out of the view, and the entry says it needs review.
+            fresh = self._fresh(conn, frequency["evidence"])
+            contact["frequency"] = {**({"text": frequency["text"]} if fresh else {}), "basis": "owner_statement",
+                                    "needs_review": not fresh, "event_id": frequency["event_id"],
+                                    "configured_at": frequency["configured_at"],
+                                    "evidence_ids": [r["record_id"] for r in frequency["evidence"]]}
         return contact
 
     def configure_behavior(self, request):

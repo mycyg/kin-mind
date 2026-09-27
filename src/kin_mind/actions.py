@@ -144,6 +144,20 @@ class ActionEvents:
                 queued.append(self.emit(conn, "wish-review", [desire["id"], "trait", sorted(desire["trait_revisions"].items())], {
                     "desire_id": desire["id"], "reason": "A trait this wish rested on was revised",
                     "evidence_ids": [r["record_id"] for r in desire.get("evidence", [])], "agent_version": state["agent_version"]}))
+        # A contact wish -- a share among them -- still unsent a day after it was made is put to Kin
+        # again, once a day while it stands, instead of running out unseen: a decided share sat for six
+        # days and expired without a word (2026-09-20 to 26). Her own wait until a later time stands,
+        # and a wish of a plan is its plan's to review.
+        from .initiative import UNSENT_CONTACT_HOURS, unsent_contacts
+        for entry in unsent_contacts(conn, self.mind, state, now):
+            desire = state["desires"][entry["desire_id"]]
+            wait, refs = desire.get("contact_wait") or {}, desire.get("evidence") or []
+            if (desire.get("plan_id") or not refs or not self.mind._fresh(conn, refs)
+                    or (wait.get("condition") == "time" and wait.get("retry_at") and timestamp(wait["retry_at"]) > timestamp(now))):
+                continue
+            queued.append(self.emit(conn, "wish-review", [desire["id"], "unsent", int(entry["hours_since_made"] // UNSENT_CONTACT_HOURS)], {
+                "desire_id": desire["id"], "reason": "This contact wish has stood a day or more without being sent",
+                "evidence_ids": [r["record_id"] for r in refs], "agent_version": state["agent_version"]}))
         expired = sorted(d["id"] for d in state["desires"].values()
                          if d["status"] in {"wanted", "waiting", "in_progress"} and timestamp(d["expires_at"]) <= timestamp(now))
         if expired:
@@ -335,7 +349,14 @@ class ActionEvents:
                     if verified_decision(d.get("decision_receipt", {}))
                     and (not semantic or self.mind.decision_current(conn, d.get("decision_receipt", {})))
                 ]
+        # A wish whose run ended without a result waits out a pause before its one retry (exploration.py).
+        now = timestamp(self.mind.clock())
+        pause = lambda d: (d.get("exploration_retry") or {}).get("not_before")
+        pausing = [pause(d) for d in choices if pause(d) and timestamp(pause(d)) > now]
+        choices = [d for d in choices if not (pause(d) and timestamp(pause(d)) > now)]
         if not choices:
+            if pausing:
+                return {"state": "waiting", "reason": "exploration-retry-pending", "next_at": min(pausing, key=timestamp)}
             return {"state": "waiting", "reason": "no-exploration-intent"}
         desire = min(choices, key=lambda d: (-d["strength"], d["created_at"], d["id"]))
         return {

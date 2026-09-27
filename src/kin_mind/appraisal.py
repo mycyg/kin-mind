@@ -26,7 +26,7 @@ from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, erasure, judgment_cache, revalidation
+from . import attempts, erasure, initiative, judgment_cache, revalidation
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
@@ -490,7 +490,12 @@ UPSTREAM_SECTIONS = {upstream for name, rests in SECTION_UPSTREAM.items() if nam
 # past. Nothing would ask that plan again until an unrelated reason appeared, and the model would never
 # learn why the host refused it. So a refusal of either is asked again once, with the refusal in view.
 STRANDING_SECTIONS = {"plan_changes", "action_decisions"}
-ASK_AGAIN_SECTIONS = UPSTREAM_SECTIONS | STRANDING_SECTIONS
+# Applied item by item: one wish the host refuses is undone alone, and the rest of its section commits.
+# All the wishes of a proposal used to share one savepoint, so a single refused wish took the others
+# with it -- a valid contact wish went because a sibling explore wish linked a concern still under
+# review (2026-09-27). The refused item is asked again once, with its refusal and its position.
+ITEM_SECTIONS = {"wishes", "wish_updates"}
+ASK_AGAIN_SECTIONS = UPSTREAM_SECTIONS | STRANDING_SECTIONS | ITEM_SECTIONS
 if set(SECTION_UPSTREAM) != set(Appraisal.model_fields) or not ASK_AGAIN_SECTIONS <= set(ISOLATED_SECTIONS):
     raise RuntimeError("Register every Appraisal field and its upstream sections in SECTION_UPSTREAM")
 if set(AUDIT_SECTIONS) & ASK_AGAIN_SECTIONS:
@@ -512,7 +517,7 @@ SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、
 state.confirmed_checks 是已被宿主核验证实、配置仍然一致的行为检验，每条给出 claim_id（被检验的假设）与 assessment_id（证实它的结算）。只有其中一条能支持时，才在 evolution 里提出长期底色的小幅调整：claim_id 与 assessment_id 取同一条，baseline_changes（每个维度最多变 2）或 half_life_changes（最多变一成）只写有依据的维度；特征的变化走 trait_decisions，不写进 evolution。宿主每天最多合并一次，合并前再核一遍检验和限制。confirmed_checks 为空或都不相干时 evolution 为 null。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。compat 为 stale 的预测是在已经变了的配置下做的，不能再结算；它和过了窗口一天仍没有结论的预测会由宿主记为 inconclusive 关闭，不再出现在这里，需要时提出新的 self_hypothesis。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
-NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
+NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。idle-review 时 next_move 必填，它就是这次对主动联系的决定：提出或恢复了联系愿望写 reply；这次不联系写 quiet 或 rest，reason 用一句话说明为什么不是现在。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
                    "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
                    "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
@@ -623,6 +628,10 @@ def refusal(section, error):
         return {"section": section, "code": "schema-invalid", "message": issues[:300]}
     code = getattr(error, "code", None)
     if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9-]{1,60}", code):
+        # The registry's code for the raise site's literal (conflicts.py), so the follow-up can say
+        # which rule refused it, rather than only what kind of error it was.
+        code = classify(error).code
+    if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9-]{1,60}", code):
         code = next((name for kind, name in ((Conflict, "conflict"), (Missing, "missing-reference"), (ValueError, "invalid-value"))
                      if isinstance(error, kind)), type(error).__name__)
     return {"section": section, "code": code, "message": static_message(error)}
@@ -681,7 +690,7 @@ delivery刺激仅结算已完成意图、满足感和剩余动力，不凭发送
 bootstrap是用户授权的新策略生效评估：复核有效待办，设置两项短期动力，恢复仅因缺分享时机搁置的内容。内部事件不是用户消息，也不构成长久人格变化的新独立互动。
 互动时长由interaction_timing提供。用户允许久未回复时撒娇式呼唤，例如想她时喊她理理自己；这种想念本身就是联系理由，不必另编新话题。是否开口仍结合当下情绪和主动值，不设置固定催回复日程。新一轮想念可以形成新的亲昵意图，上一条愿望仍保留完成记录；投递重试始终使用原编号。沉默不自动提高委屈或占有欲。
 wish-review请求你确认一个已有联系或探索意图；按kind复核它本来的类型，不把contact误解成explore。选定它时通过wish_updates的resume确认，不想做则wait或abandon。bootstrap时也确认要继续的现有探索意图。已有愿望的完成、等待和恢复写入wish_updates；只调整有变化的项。中文聊天使用有情绪的完整口语；普通聊天和主动分享优先用一个简短完整的气泡说完，有真实的停顿、情绪转折或更多内容时再分开，不机械拆句。深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制。
-如果state.interaction_style.preference存在，它是已核验显式偏好的摘要，可以影响主动联系和表达判断；“更频繁”仍表示更积极地考虑想念、兴致、记忆、最近聊天和当下心思，不是机械抬分、固定间隔或定时必发。
+state.contact.frequency 是用户关于主动联系频率的原话（text 是原文，已核验的显式偏好）：无论表达风格是什么，它都影响联系愿望的提出和时机；needs_review 为 true 时先不按它行事。如果state.interaction_style.preference存在，它是已核验显式偏好的摘要，可以影响主动联系和表达判断。“更频繁”表示更积极地考虑想念、兴致、记忆、最近聊天和当下心思，不是机械抬分、固定间隔或定时必发。
 """
 
 SYSTEM += """
@@ -712,7 +721,7 @@ mode为new/development/reflection/reminiscence/duplicate；新进展、新感想
 用户说忙或助手说等你回来不代表永久停止分享；只有用户明确要求暂停/停止才形成相应偏好。助手的措辞不自动变成用户约束。
 批次可能包含较早的消息。以recent_interaction里的最新上下文检查旧问题是否已经回应，已回应的内容不再新建未来回复愿望。
 memory.notes中的evidence_ids来自本轮new_evidence；关于已有作品与分享的链接可以使用memory_context中的id。只记录公开结论，不记录推理过程。
-idle-review是非对话时自主起念，允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整；它不是用户新消息。
+idle-review是非对话时自主起念，它不是用户新消息。空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出；允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整。每次idle-review都对主动联系作一个明确决定：想联系就在wishes提出kind=contact的愿望，或用wish_updates恢复在手的联系愿望；这次不联系，就用一句话写明为什么不是现在（有next_move时写在它的reason，否则写进reason）。
 next_review_minutes由你在10到1440之间选择（十分钟到一天），决定下一次安静时重新想一想的时间，不是发消息时刻。新事件仍会更早唤醒你，实际取两者中较早的。
 delivery仅结算回执；发送状态由宿主保存，memory.disclosures可以整理已发内容，不能靠回执创造新话题。
 memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新情绪、不新建或恢复愿望；它不是新经历。
@@ -733,7 +742,7 @@ memory_context.recent_interaction 中提供且未标记 needs_review 的原始�
 
 SYSTEM += """
 held-sections 是宿主对上一轮评估的校验反馈，不是用户消息，也不是新经历。new_evidence 里 kind=held-sections 的内部记录列出 rejected_sections（被宿主拒绝的段，code 与 message 是宿主的静态拒绝原因）和 held_sections（依赖被拒段、因此搁置而尚未生效的段）；上一轮的其余内容已经提交。
-本轮只按拒绝原因修正并重新给出这些段，其余字段留空，不重复打分，也不因这条记录产生新的情绪、愿望或联系理由。habits 被拒时，先用用户明确发言的来源和 memory_context.conversation_habits.revision 重新给出 habits，再给出依赖它的探索愿望、对探索愿望的 resume、探索或联系步骤的 execute 决定、plan_changes 以及 curiosity 的 values 与 motivations；habits 没有重新给出时，这些依赖段继续搁置。依据不足就留空。
+本轮只按拒绝原因修正并重新给出这些段，其余字段留空，不重复打分，也不因这条记录产生新的情绪、愿望或联系理由。带 index 的拒绝只针对 wishes 或 wish_updates 中的那一项（index 是它在上一轮该段里的位置），同段其余各项已经生效：只按 code 修正并重新给出被拒的那一项，例如 reference-needs-review 表示所关联的心事还在待复核，可以不关联它；不再重复已生效的项。依据不足就放下。habits 被拒时，先用用户明确发言的来源和 memory_context.conversation_habits.revision 重新给出 habits，再给出依赖它的探索愿望、对探索愿望的 resume、探索或联系步骤的 execute 决定、plan_changes 以及 curiosity 的 values 与 motivations；habits 没有重新给出时，这些依赖段继续搁置。依据不足就留空。
 plan_changes 或 action_decisions 本身被拒时，按拒绝原因重新给出这些计划变更与步骤决定：使用 autonomy_context 中当前的计划视图与 expected_revision，execute 自然说明原有 preconditions 为什么已满足，不必逐字复述。本轮只补充一次；仍无法成立时保留待处理，之后按新来源或复核条件再判断。没有把握时给 wait 并说明复核时间，不要为通过校验编造已满足的条件。
 """
 # The host's own feedback about the previous proposal of this same evaluation.
@@ -761,10 +770,12 @@ HISTORY_SYSTEM = """你是 Kin 的历史记忆整理器。只调用 submit_appra
 HISTORY_SYSTEM += PREVIOUS_ATTEMPT_PROMPT
 
 
-def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES):
+def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=()):
     """`sections`: the audited sections this request offers. A section left out takes its property
     and everything only it referenced with it, so a request offering none is the request as it was.
-    `review_max`: the review ceiling this request allows, the same one its prompt states."""
+    `review_max`: the review ceiling this request allows, the same one its prompt states.
+    `required`: offered fields this request must answer, listed as required and without their null
+    branch, so a strict fork cannot answer them with null either."""
     if historical:
         return HistoryAssessment.model_json_schema()
     schema = Appraisal.model_json_schema()
@@ -773,6 +784,14 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
     withheld = [name for name in AUDIT_SECTIONS if name not in sections]
     for name in withheld:
         schema["properties"].pop(name, None)
+    for name in required:
+        field = schema["properties"].get(name)
+        if field is None:
+            continue
+        branches = [branch for branch in field.get("anyOf", ()) if branch.get("type") != "null"]
+        if len(branches) == 1:
+            schema["properties"][name] = {**{k: v for k, v in field.items() if k not in {"anyOf", "default"}}, **branches[0]}
+        schema["required"] = [*schema.get("required", []), *([] if name in schema.get("required", []) else [name])]
     if not operational and not withheld:
         return schema
     if operational:
@@ -801,7 +820,7 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
 
 
 SYSTEM += """
-自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时，直接用只读记忆工具去查，本回合查到的记录可以作为证据引用；不用关键词或分数替代判断。查过仍不确定时，等还是做由你决定。
+自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。autonomy_context.initiative_facts 是宿主从记录算出的事实：上一次提出 contact、explore、create 愿望，上一次主动联系送达，上一次探索和创作，各过去了多少小时；上次提出愿望以来有过几次空闲评估；最近失败的探索；放了一天还没发出的联系愿望。它们只是事实，不是门槛、分数或指令，沉默久了要不要联系、探索或创作仍由你判断。材料不够时，直接用只读记忆工具去查，本回合查到的记录可以作为证据引用；不用关键词或分数替代判断。查过仍不确定时，等还是做由你决定。
 plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。recent_reflections 里的日记也可以作为 plan_changes、wishes 与 concerns 的依据，引用它的 source_id。
 到期只触发复核。state.expired_unsettled_wishes 是过了期限还没结算的愿望：过期不是结论，按实际情况用 wish_updates 标为 complete 或 abandon。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
 同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
@@ -902,7 +921,8 @@ def appraisal_context(context):
         # a projection built without the ledger is the projection it was, key for key.
         keys = {"id", "status", "kind", "topic", "revision", "updated_at", "expired", "concern_ids", "concern_needs_review", "trait_needs_review", "exploration_target", "exploration_id"}
         if active:
-            keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait"}
+            # `exploration_retry`: a run of this wish ended without a result and it is tried once more.
+            keys |= {"completion", "strength", "expires_at", "needs_review", "contact_wait", "exploration_retry"}
         projected = {k: v for k, v in desire.items() if k in keys}
         if isinstance(projected.get("contact_wait"), dict):
             projected["contact_wait"] = unlisted(projected["contact_wait"])
@@ -1217,7 +1237,7 @@ class DeepSeek:
         submit = {"name": "submit_appraisal", "description": "提交有来源的状态提案",
                   "input_schema": appraisal_schema(context.get("operational_only", False),
                       context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
-                      self._sections(context), self._review_max())}
+                      self._sections(context), self._review_max(), self._required(context))}
         system, scope = self._system(context, policy), self._recall_scope(context)
         messages, first, calls, rounds = [{"role": "user", "content": rendered}], time.monotonic(), [], []
         deadline = first + timeout
@@ -1397,7 +1417,7 @@ class DeepSeek:
             from .state import Mind
             request_context = redact(request_context)
             overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
-                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max()))
+                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context)))
                 + (dumps(RECALL_TOOLS) if self._recall_scope(context) else "")) + 160
             if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
@@ -1617,6 +1637,12 @@ class DeepSeek:
         """The review ceiling of this attempt. The host sets it; unset means the ordinary one."""
         return getattr(self, "review_max_minutes", None) or REVIEW_MAX_MINUTES
 
+    def _required(self, context):
+        """The offered sections this request must answer. The host names them for the attempt: one
+        that includes an idle review states its contact decision in `next_move`."""
+        offered = self._sections(context)
+        return tuple(name for name in getattr(self, "required_sections", ()) or () if name in offered)
+
     def _system(self, context, policy):
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
@@ -1640,7 +1666,7 @@ class DeepSeek:
                                     "calls": RECALL_CALLS, "items": RECALL_ITEMS, "tokens": RECALL_TOKENS,
                                     "read": {"characters": READ_CHARS, "tokens": READ_TOKENS}, "done": RECALL_DONE}
         return {"system": digest(self._system(context, policy)),
-                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max())),
+                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context))),
                 "model": self.model, "parameters": digest(parameters)}
 
 
@@ -1668,7 +1694,9 @@ class NativeReview(DeepSeek):
 
     def _system(self, context, policy):
         # The main session already loads the approved persona once as stable instructions.
-        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做，日记的写法见上；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空；空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
+        # Whether an idle assessment may start something is said in SYSTEM, for every provider: it
+        # used to be said here only, and assessments run on DeepSeek (2026-09-27).
+        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做，日记的写法见上；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
 
     def request_profile(self, context):
         return {**super().request_profile(context), "parameters": self.profile}
@@ -1726,7 +1754,7 @@ class NativeReview(DeepSeek):
         return decode_strict(schema, answer["result"]), receipt
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
-        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max())
+        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max(), self._required(context))
         # The fixed dimension definitions belong to the contract, ahead of the dynamic context, so the
         # standing prefix of every assessment stays the same.
         dynamic = json.loads(rendered)
@@ -2640,7 +2668,9 @@ class Appraisals:
                         "procedures": Procedures(self.mind).read(limit=12),
                         "execution_environment": self.engine.settings("execution_environment"),
                         "capabilities": self.exploration_capabilities,
-                        "recall_budget": {"rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS}}
+                        "recall_budget": {"rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS},
+                        # How long it has been quiet, counted from the records: facts, never a gate.
+                        "initiative_facts": initiative.facts(self.mind)}
                 if settings["usage_reinforcement"] and memory_context:
                     from .reinforcement import strengths
                     identifiers = [n["id"] for k in ("works", "shares", "graph_candidates") for n in memory_context.get(k, [])]
@@ -2708,6 +2738,9 @@ class Appraisals:
                     # What the request may hold, by the configuration and the model's window. A
                     # main-session review has its own, from the session's (NativeReview.from_engine).
                     provider.input_budget = appraisal_input_budget(settings.get("appraisal_input_budget"))
+                # An idle review states a contact decision: its move is one it must answer.
+                idle = "idle-review" in set(data.get("stimuli") or [data.get("stimulus")])
+                provider.required_sections = ("next_move",) if idle else ()
                 # What this lane may carry, for the request and for everything the commit applies.
                 offered = offered_sections(data.get("stimulus"), audited)
                 # The host's record of what this attempt is shown: the commit's rebase and the next
@@ -2943,6 +2976,35 @@ class Appraisals:
                         conn.execute("RELEASE appraisal_section")
                         return True
 
+                    def each(name, items, run):
+                        """Every (index, item) of an ITEM_SECTIONS field in a savepoint and a state snapshot of its
+                        own: one refused is undone and recorded alone, with its position in the proposal, and the
+                        others commit. The field counts as refused for what rests on it only when all of it was."""
+                        refused = 0
+                        for index, item in items:
+                            if not isolation:
+                                run(index, item)
+                                continue
+                            snapshot = deepcopy(state)
+                            conn.execute("SAVEPOINT appraisal_item")
+                            try:
+                                run(index, item)
+                            except sqlite3.Error:
+                                raise
+                            except Exception as error:  # noqa: BLE001 - recorded as a static code and host text, never the payload
+                                conn.execute("ROLLBACK TO appraisal_item")
+                                conn.execute("RELEASE appraisal_item")
+                                state.clear()
+                                state.update(snapshot)
+                                entry = {**refusal(name, error), "index": index}
+                                rejected.append(entry)
+                                data["rejected_sections"] = rejected
+                                refused += 1
+                                if refused == len(items):
+                                    blocked[name] = entry
+                                continue
+                            conn.execute("RELEASE appraisal_item")
+
                     def hold(name, items, tests=None):
                         """(index, item) pairs of a field that may still be applied. Whatever rests on a refused or
                         wholly held section is set aside with that refusal; the index keeps each command ID stable."""
@@ -3112,91 +3174,88 @@ class Appraisals:
                     wishes = hold("wishes", [] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes,
                                   {"habits": lambda wish: wish.kind == "explore", "concerns": lambda wish: bool(wish.concern_ids)})
 
-                    def apply_wishes():
-                        from .desire_archive import contents as archived_contents
-                        from .desire_archive import intent as archived_intent
-                        # Read once, and only where it is read at all: the content check reaches
-                        # finished wishes on a bootstrap and nowhere else.
-                        made = (archived_contents(conn, self.mind.scope.key())
-                                if data.get("stimulus") == "bootstrap" else set())
-                        for index, wish in wishes:
-                            if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
-                                wish = wish.model_copy(update={"exploration_id": primary_result})
-                            # Both of these read the finished wishes as well as the live ones, so
-                            # both ask the archive: an intent that moved is still this decision's
-                            # intent, and a wish a bootstrap already made is still made.
-                            if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
-                                and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
-                                for d in state["desires"].values())
-                                or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
-                                                   (state.get("exploration_decisions", {}).get(wish.exploration_id) or {}).get("revision"))):
-                                continue
-                            if any(
-                                d["content"] == wish.content
-                                and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
-                                for d in state["desires"].values()
-                            ):
-                                continue
-                            if wish.content in made:
-                                continue
-                            changed = self.mind._apply_desire(
-                                conn,
-                                state,
-                                DesireChange(
-                                    **event.model_dump(
-                                        exclude={
-                                            "values",
-                                            "motivations",
-                                            "origin",
-                                            "evolution",
-                                            "command_id",
-                                            "understanding", "rhythm",
-                                        }
-                                    ),
-                                    command_id=row["id"] + ":wish:" + str(index),
-                                    action="create",
-                                    expires_at=(
-                                        timestamp(self.mind.clock())
-                                        + timedelta(hours=wish.ttl_hours)
-                                    ).isoformat(),
-                                    **wish.model_dump(exclude={"ttl_hours"}),
+                    from .desire_archive import contents as archived_contents
+                    from .desire_archive import intent as archived_intent
+                    # Read once, and only where it is read at all: the content check reaches
+                    # finished wishes on a bootstrap and nowhere else.
+                    made = (archived_contents(conn, self.mind.scope.key())
+                            if wishes and data.get("stimulus") == "bootstrap" else set())
+
+                    def apply_wish(index, wish):
+                        if wish.kind == "contact" and primary_result and self.exploration_capabilities.get("decisions"):
+                            wish = wish.model_copy(update={"exploration_id": primary_result})
+                        # Both of these read the finished wishes as well as the live ones, so
+                        # both ask the archive: an intent that moved is still this decision's
+                        # intent, and a wish a bootstrap already made is still made.
+                        if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
+                            and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
+                            for d in state["desires"].values())
+                            or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
+                                               (state.get("exploration_decisions", {}).get(wish.exploration_id) or {}).get("revision"))):
+                            return
+                        if any(
+                            d["content"] == wish.content
+                            and (d["status"] in {"wanted", "waiting", "in_progress"} or data.get("stimulus") == "bootstrap")
+                            for d in state["desires"].values()
+                        ):
+                            return
+                        if wish.content in made:
+                            return
+                        changed = self.mind._apply_desire(
+                            conn,
+                            state,
+                            DesireChange(
+                                **event.model_dump(
+                                    exclude={
+                                        "values",
+                                        "motivations",
+                                        "origin",
+                                        "evolution",
+                                        "command_id",
+                                        "understanding", "rhythm",
+                                    }
                                 ),
-                                eid,
-                            )
-                            state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
-                    if wishes:
-                        section("wishes", apply_wishes)
+                                command_id=row["id"] + ":wish:" + str(index),
+                                action="create",
+                                expires_at=(
+                                    timestamp(self.mind.clock())
+                                    + timedelta(hours=wish.ttl_hours)
+                                ).isoformat(),
+                                **wish.model_dump(exclude={"ttl_hours"}),
+                            ),
+                            eid,
+                        )
+                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
+                    each("wishes", wishes, apply_wish)
                     updates = hold("wish_updates", proposal.wish_updates, {
                         "habits": lambda update: update.action == "resume" and (state["desires"].get(update.desire_id) or {}).get("kind") == "explore",
                         "concerns": lambda update: bool(update.concern_ids)})
 
-                    def apply_wish_updates():
-                        for _, update in updates:
-                            desire = state["desires"].get(update.desire_id)
-                            if not desire or desire["status"] in {"completed", "abandoned"}:
-                                continue
-                            if timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()) and update.action not in {"complete", "abandon"}:
-                                # Expiry is not a conclusion: an expired wish is settled by Kin, as done or
-                                # set down, and is not taken up again under its old window (K1-15, K4-18).
-                                continue
-                            # Ordinary conversation can supersede a wish without inventing
-                            # a proactive transport receipt. Retire it as abandoned.
-                            action = "update" if update.action == "link" else "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
-                            changed = self.mind._apply_desire(
-                                conn,
-                                state,
-                                DesireChange(
-                                    **event.model_dump(
-                                        exclude={"values", "motivations", "origin", "evolution", "reason", "understanding", "rhythm"}
-                                    ),
-                                    **{**update.model_dump(), "action": action,
-                                       "wait_condition": update.wait_condition if action == "wait" else None},
+                    def apply_wish_update(_, update):
+                        desire = state["desires"].get(update.desire_id)
+                        if not desire or desire["status"] in {"completed", "abandoned"}:
+                            return
+                        if timestamp(desire["expires_at"]) <= timestamp(self.mind.clock()) and update.action not in {"complete", "abandon"}:
+                            # Expiry is not a conclusion: an expired wish is settled by Kin, as done or
+                            # set down, and is not taken up again under its old window (K1-15, K4-18).
+                            return
+                        # Ordinary conversation can supersede a wish without inventing
+                        # a proactive transport receipt. Retire it as abandoned.
+                        action = "update" if update.action == "link" else "abandon" if update.action == "complete" and desire["kind"] == "contact" else update.action
+                        changed = self.mind._apply_desire(
+                            conn,
+                            state,
+                            DesireChange(
+                                **event.model_dump(
+                                    exclude={"values", "motivations", "origin", "evolution", "reason", "understanding", "rhythm"}
                                 ),
-                                eid,
-                            )
-                            state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
-                    if updates:
-                        section("wish_updates", apply_wish_updates)
+                                **{**update.model_dump(), "action": action,
+                                   "wait_condition": update.wait_condition if action == "wait" else None},
+                            ),
+                            eid,
+                        )
+                        state["desires"][changed["desire_id"]]["decision_receipt"] = receipt
+                    each("wish_updates", updates, apply_wish_update)
                     if operational:
                         self.memory.commit_action(conn, roots, eid, proposal.next_review_minutes, receipt, max_minutes=review_max)
                         # Enrichment uses the same original sources but a separate
@@ -3287,10 +3346,14 @@ class Appraisals:
                                 # A dropped memory item, and an audited section, are only recorded: no follow-up restates them.
                                 "section_review": {"rejected_sections": [r for r in rejected if "item" not in r and r["section"] not in AUDIT_SECTIONS],
                                                    "held_sections": [h for h in held if h["section"] not in AUDIT_SECTIONS]}})))
+                    # What an idle review committed about contacting, kept with its result. An owner
+                    # message that came in meanwhile leaves the question to the next round.
+                    contact = initiative.contact_decision(state, eid, proposal) if idle and not new_interaction else None
                     return {"provider": receipt, "proposal": proposal_record(proposal), "new_interaction_pending": bool(new_interaction),
                             **({"held_decisions": held_decisions} if held_decisions else {}),
                             **({"rejected_sections": rejected} if rejected else {}), **({"held_sections": held} if held else {}),
-                            **({"follow_up_id": review_id} if review_id else {})}
+                            **({"follow_up_id": review_id} if review_id else {}),
+                            **({"contact_decision": contact} if contact else {})}
 
                 def rebase(conn, state):
                     if manifest and flags[manifests.REBASE]:
@@ -3328,6 +3391,9 @@ class Appraisals:
                                              "evaluated_ids": data.get("evaluated_ids") or []})
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
+            if data["result"].get("contact_decision") and not recovered:
+                # Counted by state, so an idle review that said nothing about contacting shows.
+                self.engine.db.metric("idle_contact_decision", 1, {"state": data["result"]["contact_decision"]["state"]})
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.
             # (A commit that failed as a whole keeps the refusals apply() had recorded until then.)
             for key in ("held_decisions", "rejected_sections", "held_sections"):
