@@ -239,7 +239,11 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       attributed = attribute({identity, body: parsed}) ?? nativeTurnPurpose();
       const requestProfile=profile??(attributed.purpose==='native-assessment'?'assessment':attributed.purpose==='native-contact-draft'?'contact-draft':null);
       const kimi = parsed.model === 'k3';
-      if (kimi && (!kimiKey || attributed.lane !== 'foreground' || attributed.purpose !== 'native-chat-turn'))
+      // Returning a task result to the bound main conversation uses the creation
+      // scheduling lane. It is still her selected companion replying; only the
+      // host's verified native thread identity can admit that delivery here.
+      const mainDelivery = attributed.mainConversation === true && attributed.purpose === 'native-creation';
+      if (kimi && (!kimiKey || !(mainDelivery || attributed.lane === 'foreground' && attributed.purpose === 'native-chat-turn')))
         throw Error('kimi-main-conversation-unavailable');
       upstreamProvider = kimi ? 'kimi' : 'deepseek';
       const body = kimi ? kimiRequest(parsed, requestProfile, contracts) : deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);

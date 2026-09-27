@@ -71,7 +71,7 @@ test('a request body is read as bytes: multi-byte text split across chunks arriv
   assert.equal(attempted.requestedReasoningEffort, 'max');
 });
 
-test('K3 main traffic uses Kimi credentials and high while background K3 never reaches a provider', async t => {
+test('K3 main replies and bound task deliveries use Kimi high, while assessments and independent workers cannot', async t => {
   const calls=[], evidence=[], usage=[];
   let purpose={lane:'foreground',purpose:'native-chat-turn'};
   const gateway=await startDeepSeekGateway({key:'ds-key',kimiKey:'kimi-key',purposeFor:()=>purpose,
@@ -94,4 +94,11 @@ test('K3 main traffic uses Kimi credentials and high while background K3 never r
   assert.equal(calls[1].url,'https://api.deepseek.com/responses');
   assert.equal(calls[1].headers.Authorization,'Bearer ds-key');assert.equal(calls[1].body.reasoning.effort,'high');
   assert.equal(usage[1].provider,'deepseek');
+  purpose={lane:'background',purpose:'native-creation'};
+  assert.equal((await request('k3')).status,502);assert.equal(calls.length,2);
+  purpose={...purpose,mainConversation:true};
+  assert.equal((await request('k3')).status,200);assert.equal(calls[2].url,'https://api.kimi.com/coding/v1/responses');
+  assert.equal(usage[2].lane,'background','the delivery keeps its existing scheduling and usage attribution');
+  purpose={lane:'background',purpose:'native-assessment',mainConversation:true};
+  assert.equal((await request('k3')).status,502);assert.equal(calls.length,3);
 });
