@@ -139,14 +139,15 @@ test('render dependencies are recorded with their versions; a browser that canno
 
 test('a stop or a shutdown during the claim is not lost: the claimed run is interrupted, never started (CR-MIND-05)',async()=>{
  for(const [how,reason] of [['stop','owner-stop'],['close','host-closing']]) {
-  const calls=[],started=[];let release;
-  const loop={tick:async()=>{},review:()=>{},stopExploration:()=>{}};
+  const calls=[],started=[],told=[];let release;
+  const loop={tick:async()=>{},review:()=>{},stopExploration:(...why)=>{told.push(why);}};
   const worker=startAutonomousWork({loop,isBusy:()=>false,creator:{run:async()=>{started.push('run');return {state:'produced'};},stop(){}},
    call:async(action,input)=>{calls.push([action,input]);if(action==='plan-claim')return new Promise(resolve=>{release=()=>resolve({state:'claimed',run:{id:'r-'+how,fence:3},plan:{id:'p'}});});return {};}});
   const ticking=worker.tick();
   await new Promise(resolve=>setImmediate(resolve));
-  if(how==='stop')loop.stopExploration();else void worker.close();
+  if(how==='stop')loop.stopExploration('owner-stop');else void worker.close();
   release();await ticking;
+  assert.deepEqual(told,how==='stop'?[['owner-stop']]:[],'the exploration\'s stop hears why, as it was said (OPS-04)');
   assert.deepEqual(started,[],how);
   assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-interrupt'],how);
   assert.deepEqual(calls[1][1],{run_id:'r-'+how,owner:'creator-'+process.pid,fence:3,reason},how);

@@ -228,6 +228,7 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
     }
   };
   const originalTick=loop.tick.bind(loop);loop.tick=async()=>{const result=await originalTick();void tick();return result;};
-  const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=()=>{originalStop?.();stops++;controller?.abort();};
+  // Why it stopped goes on to the exploration's stop as it came (OPS-04).
+  const originalStop=loop.stopExploration?.bind(loop);loop.stopExploration=(...reason)=>{originalStop?.(...reason);stops++;controller?.abort();};
   return {tick,async close(){closed=true;stops++;controller?.abort();await creator.stop();},get running(){return running;},get current(){return current;}};
 }

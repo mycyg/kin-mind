@@ -224,10 +224,10 @@ for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
   assert.equal((await loop.tick()).state,'accepted');assert.equal(claims,2);assert.equal(sends,1);
  });
 }
-test('a new owner message does not stop background exploration (N7); closing does',async()=>{
- let stops=0;const{loop}=fixture({stopExploration:()=>{stops++;}});
- await loop.ingest({id:'owner-hi',text:'hi'});assert.equal(stops,0);
- loop.close();assert.equal(stops,1);
+test('a new owner message does not stop background exploration (N7); closing does, and says it is a shutdown (OPS-04)',async()=>{
+ const stops=[];const{loop}=fixture({stopExploration:reason=>{stops.push(reason);}});
+ await loop.ingest({id:'owner-hi',text:'hi'});assert.deepEqual(stops,[]);
+ loop.close();assert.deepEqual(stops,['host-shutdown']);
 });
 test('a contact wait of up to three days is kept; one past either end is taken to that end (N9)',()=>{
  const wait=seconds=>parseContactDraft(JSON.stringify({action:'wait',condition:'time',retry_after_seconds:seconds,reason:'Later'})).retry_after_seconds;

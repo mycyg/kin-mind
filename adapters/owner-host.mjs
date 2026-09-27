@@ -54,7 +54,9 @@ export class MindLoop {
     this.timer=setInterval(()=>{if(this.reviewRunning)void this.tick();else void this.review();},60000);
     this.timer.unref?.();
   }
-  close() {this.closed=true;clearInterval(this.timer);this.stopExploration?.();}
+  /** The host's own stop of what runs in the background says why: a shutdown (`stopExploration`'s
+   * reason is written into the stop file, OPS-04). */
+  close() {this.closed=true;clearInterval(this.timer);this.stopExploration?.('host-shutdown');}
   async ingest(input) {
     // A new owner message does not stop Kin's own exploration or creation: she hears of
     // it and decides. Only shutdown (close) and an explicit stop do.
