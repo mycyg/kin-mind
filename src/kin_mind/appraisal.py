@@ -2154,20 +2154,22 @@ class Appraisals:
                     # A review answers for its plan's wake-up reasons, so that plan leads the window of 40
                     # however many others are due before it.
                     plans_view = AutonomousPlans(self.mind)
-                    # Every plan review merged into this assessment answers for its own plan.
+                    # Every plan review merged into this assessment answers for its own plan. These are
+                    # plan-review targets ({event_id, plan_id}), kept apart from `targets`, the exploration
+                    # targets the sharing checks and the commit's freshness check read below.
                     members = [row["id"], *data.get("batch_ids", [])] if "plan-review" in set(data.get("stimuli") or [data.get("stimulus")]) else []
-                    targets = [t for t in (plans_view.review_target(j) for j in members) if t]
+                    plan_targets = [t for t in (plans_view.review_target(j) for j in members) if t]
                     # A follow-up restates the decisions its parent's review had refused, so it leads with
                     # the same plan. It answers for no wake-up reason of its own and registers no version.
-                    lead = (targets[0] if targets else None) or (plans_view.review_target(data["parent_id"])
+                    lead = (plan_targets[0] if plan_targets else None) or (plans_view.review_target(data["parent_id"])
                                       if data.get("stimulus") == FOLLOW_UP and data.get("parent_id") else None)
                     shown_plans = plans_view.read(limit=40, manifest=True, first=lead and lead["plan_id"])
                     data.pop("plan_review_targets", None)
-                    if targets:
+                    if plan_targets:
                         # Gone or no longer active: it cannot be shown as a plan under review. The commit
                         # then registers nothing for it and reopens the reasons its review had taken.
                         active = {p["id"] for p in shown_plans["plans"] if p.get("status") == "active"}
-                        data["plan_review_targets"] = [{**t, "shown": t["plan_id"] in active} for t in targets]
+                        data["plan_review_targets"] = [{**t, "shown": t["plan_id"] in active} for t in plan_targets]
                     # The host's own record of the plan view this attempt shows the model.
                     # Decisions are checked against it at commit, step by step.
                     data["plan_view"] = shown_plans.pop("manifest")
