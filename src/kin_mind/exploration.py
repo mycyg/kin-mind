@@ -240,6 +240,21 @@ class Explorations:
                                    "exploration-recovery", {"interrupted": len(reclaimed)})
         return reclaimed
 
+    def sweep_workdirs(self, directory):
+        """Every settled run's directory under `directory` that still has its words loses them
+        (workdirs.sweep): a run the host stopped, one settled before this release, one whose own pass
+        failed. Each run asks before it starts, and the host at every start (`recover`): with no wish
+        to explore, no run starts for days, and the pages the last ones fetched stayed whole all that
+        time (OPS-03). Returns the run ids swept."""
+        from . import workdirs
+        with self.engine.db.connect() as conn:
+            settled = {row["id"]: row["state"] for row in conn.execute(
+                "SELECT id,state FROM mind_explorations WHERE scope=? AND state!='running'", (self.mind.scope.key(),))}
+        try:
+            return workdirs.sweep(directory, settled)
+        except OSError:
+            return []
+
     def _stop_when(self, canceled, desire_id, *, every=15):
         """The run stops for the host's own stop (shutdown) or for Kin's decision, never for a
         new owner message by itself: the wish it serves is no longer in progress, its plan step
@@ -291,14 +306,9 @@ class Explorations:
             # How far the deletes went before this run read anything it hands its executor: what was
             # deleted before, the run never had the words of (CL6E-MM-02).
             mark = tombstone_mark(conn)
-            settled = {row["id"]: row["state"] for row in conn.execute(
-                "SELECT id,state FROM mind_explorations WHERE scope=? AND state!='running'", (self.mind.scope.key(),))}
-        try:
-            # A run the host stopped, or one settled before this release, left its working directory
-            # with the words of its brief, its answers and its checkpoints: they go now (CL6-MM-07).
-            workdirs.sweep(directory, settled)
-        except OSError:
-            pass
+        # A run the host stopped, or one settled before this release, left its working directory
+        # with the words of its brief, its answers and its checkpoints: they go now (CL6-MM-07).
+        self.sweep_workdirs(directory)
         actions = ActionEvents(self.mind)
         candidate = actions.exploration_candidate()
         if candidate["state"] != "ready":
@@ -318,6 +328,9 @@ class Explorations:
         data = {"desire_id": desire["id"], "selected_brief": desire["content"], "exploration_target": target,
                 "topic_selected_by": "deepseek-appraisal", "agent_version": agent_version,
                 "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                # Where its executor writes: a delete of anything the run names takes the words of
+                # that directory too, once the run is settled (workdirs.erased_runs, OPS-03).
+                "workdir": str((Path(directory) / eid).absolute()),
                 # Who is running this, so that a later start can tell an exploration
                 # that is still working from one whose process died with the host.
                 # The row is the only place there is: `mind_explorations` gains no
@@ -390,6 +403,8 @@ class Explorations:
         except Exception as error:  # noqa: BLE001 - owned helper boundary; retain a redacted failure receipt
             state = "failed"
             data.update(error=type(error).__name__, partial=True, result=None)
+        # A runner that reported no directory of its own used the one it was handed.
+        data["workdir"] = data.get("workdir") or str((Path(directory) / eid).absolute())
         # A result without a definitive answer still supports reflection and sharing.
         # Only final reports and execution receipts enter memory, never tool traces.
         observation_ids = []

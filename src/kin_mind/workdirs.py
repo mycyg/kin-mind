@@ -15,6 +15,13 @@ numbers -- and lose every word (`without_words`): a page's text goes whole. The 
 stays, as a stopped run's always has. Only words go: nothing a person wrote or asked for is
 deleted here, and the store keeps its own.
 
+Three things take the words: the run itself once it is settled, the host at every start (every
+settled run's directory not marked yet: a run stopped with the host, one settled before this
+release, one whose own pass failed -- `Explorations.sweep_workdirs`, from `recover`), and a delete
+of anything a settled run names (`erased_runs`, `sweep_erased`, from `Engine.delete`). The host's
+pass does not wait for the next exploration to start: with no wish to explore, that can be days
+(OPS-03).
+
 The same rule, word for word, is adapters/without-words.mjs, which applies it to a creation's final
 answer and to the host's status file; tests/business/helpers/without-words-cases.json holds the
 cases both answer the same."""
@@ -151,13 +158,53 @@ def scrub(directory, *, state=None):
 def sweep(root, settled):
     """Every directory under `root` named for a settled run (`settled`: run id to its state) and not
     yet marked loses its words: a run stopped with the host, or settled before this release, is
-    found at the next start. A directory no settled run is named for is left alone."""
+    found at the next start. A directory no settled run is named for is left alone, and one that
+    cannot be read or written is left for the next sweep without holding up the rest."""
     root = Path(root)
     if not root.is_dir():
         return []
     done = []
     for directory in sorted(root.iterdir()):
         if directory.name in settled and directory.is_dir() and not (directory / MARKER).exists():
-            scrub(directory, state=settled[directory.name])
+            try:
+                scrub(directory, state=settled[directory.name])
+            except OSError:
+                continue
             done.append(directory.name)
+    return done
+
+
+def erased_runs(conn, ids):
+    """The directories of the settled explorations whose rows name any of `ids` -- what a delete
+    takes -- each with its run's state, read inside the delete's transaction; `sweep_erased` takes
+    their words once it has committed. A run names its directory as `workdir`; one still running
+    settles its own (Explorations.run), and one that names none is found by the host's sweep at its
+    next start (OPS-03)."""
+    from .erasure import mentions
+
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_explorations'").fetchone():
+        return {}
+    found = {}
+    for row in mentions(conn, "mind_explorations", ids, "id,state,data"):
+        if row["state"] == "running":
+            continue
+        try:
+            workdir = json.loads(row["data"]).get("workdir")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(workdir, str) and Path(workdir).name == row["id"]:
+            found[workdir] = row["state"]
+    return found
+
+
+def sweep_erased(found):
+    """The directories `erased_runs` found without their words, as the host's sweep leaves them;
+    one already swept is passed by. Returns the run ids swept."""
+    done = []
+    for workdir, state in sorted(found.items()):
+        directory = Path(workdir)
+        try:
+            done += sweep(directory.parent, {directory.name: state})
+        except OSError:
+            continue
     return done

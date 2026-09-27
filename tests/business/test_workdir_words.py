@@ -105,6 +105,7 @@ def test_a_settled_exploration_leaves_its_directory_without_words_and_the_next_r
     assert ran["state"] == "complete"
     directory = written["directory"]
     assert directory.name == ran["id"] and directory.is_dir(), "the directory stays"
+    assert ran["workdir"] == str(directory.absolute()), "the run names it, for a later delete (OPS-03)"
     found = files_of(directory)
     assert MARKER_WORDS not in json.dumps(found, ensure_ascii=False) and "查到了" not in json.dumps(found, ensure_ascii=False)
     receipt = json.loads(found["receipt.json"])
@@ -142,3 +143,85 @@ def test_a_settled_exploration_leaves_its_directory_without_words_and_the_next_r
     for name in ("explore_going", "deploy-check-run"):
         assert MARKER_WORDS in (root / name / "input.json").read_text(), name
     assert scrub(root / "explore_old") == [], "a second pass finds nothing left"
+
+
+def exploration_store(tmp_path):
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope, SourceInput
+    from kin_mind.exploration import Explorations
+    from kin_mind.state import Mind
+
+    engine, scope = Engine(tmp_path / "memory"), Scope(persona="workdirs")
+    mind = Mind(engine, scope)
+    init = engine.receive(SourceInput(namespace="test", key="configuration", scope=scope, text="configuration",
+                                      authority="explicit"))["id"]
+    mind.initialize(agent_version="test-v1", evidence_ids=[init])
+    Explorations(mind)
+    return engine, scope, mind
+
+
+def left_behind(root, name):
+    """A run's directory as an executor leaves it: a brief with a message's words, a page whole."""
+    (root / name / "web-content").mkdir(parents=True)
+    (root / name / "input.json").write_text(dumps({"question": f"去看 {MARKER_WORDS}", "source_ids": ["src_1"]}))
+    (root / name / "web-content" / "web_1.txt").write_text(f"the page says {MARKER_WORDS}")
+
+
+def test_the_host_start_takes_the_words_no_run_took(tmp_path):
+    """No exploration had started since the release that sweeps -- there was no wish to explore -- and
+    the 58 directories the last runs left kept every page they fetched, whole (OPS-03). `recover`, the
+    host's start-up call, sweeps every settled run's directory; a run still going and a directory no
+    run is named for are left alone, and a second start finds nothing left."""
+    from kin_mind.host import dispatch
+
+    engine, scope, mind = exploration_store(tmp_path)
+    root = tmp_path / "exploration"
+    rows = {"explore_done": "complete", "explore_old": "failed", "explore_going": "running"}
+    with engine.db.connect(write=True) as conn:
+        for eid, state in rows.items():
+            conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", (eid, scope.key(), state, mind.clock(), dumps({})))
+    for name in [*rows, "deploy-check-run"]:
+        left_behind(root, name)
+    config = {"root": str(tmp_path / "memory"), "scope": scope.model_dump(), "agent_version": "test-v1",
+              "exploration_directory": str(root)}
+    result = dispatch(config, "recover", {})
+    assert result["swept_workdirs"] == 2 and result["live_explorations"] == ["explore_going"], result
+    for name in ("explore_done", "explore_old"):
+        found = files_of(root / name)
+        assert MARKER_WORDS not in json.dumps(found, ensure_ascii=False), name
+        assert json.loads(found["input.json"]) == {"question": ERASED, "source_ids": ["src_1"]}
+        assert json.loads(found[MARKER])["state"] == rows[name]
+    for name in ("explore_going", "deploy-check-run"):
+        assert MARKER_WORDS in (root / name / "web-content" / "web_1.txt").read_text(), name
+    assert dispatch(config, "recover", {})["swept_workdirs"] == 0
+    assert dispatch({**config, "exploration_directory": None}, "recover", {})["swept_workdirs"] == 0
+
+
+def test_a_delete_takes_the_words_of_the_settled_runs_that_name_what_it_takes(tmp_path):
+    """Erasure never reached the working directories (OPS-03): a run settled before its own pass, or
+    whose pass failed, kept the words of what was deleted. A delete now sweeps the directory of every
+    settled run that names anything it takes; a run that names none of it, and a run still going --
+    which settles its own -- are left as they are."""
+    from eventmem.core.models import SourceInput
+
+    engine, scope, mind = exploration_store(tmp_path)
+    doomed = engine.receive(SourceInput(namespace="test", key="doomed", scope=scope, text=f"about {MARKER_WORDS}",
+                                        authority="explicit"))["id"]
+    kept = engine.receive(SourceInput(namespace="test", key="kept", scope=scope, text="something else",
+                                      authority="explicit"))["id"]
+    root = tmp_path / "exploration"
+    rows = {"explore_named": ("complete", [doomed]), "explore_other": ("complete", [kept]),
+            "explore_going": ("running", [doomed])}
+    with engine.db.connect(write=True) as conn:
+        for eid, (state, evidence) in rows.items():
+            conn.execute("INSERT INTO mind_explorations VALUES(?,?,?,?,?)", (eid, scope.key(), state, mind.clock(),
+                         dumps({"evidence_ids": evidence, "workdir": str(root / eid)})))
+    for name in rows:
+        left_behind(root, name)
+    engine.delete(doomed)
+    found = files_of(root / "explore_named")
+    assert MARKER_WORDS not in json.dumps(found, ensure_ascii=False)
+    assert json.loads(found[MARKER])["state"] == "complete"
+    for name in ("explore_other", "explore_going"):
+        assert MARKER_WORDS in (root / name / "input.json").read_text(), name
+        assert not (root / name / MARKER).exists(), name

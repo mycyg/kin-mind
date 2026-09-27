@@ -923,6 +923,10 @@ class Engine:
                         "DELETE FROM source_evidence_class WHERE source_id=?", (sid,)
                     )
             erased = frozenset(deleted) | frozenset(source_ids)
+            # A settled exploration that names any of it kept copies in its working directory that
+            # no row of the store reaches: they lose their words once this commits (OPS-03).
+            from kin_mind.workdirs import erased_runs, sweep_erased
+            workdirs = erased_runs(conn, erased)
             # Stored command results and session sets name what they returned; the ones that
             # name something erased may hold its text. The rest are other people's receipts.
             for table, column in (("commands", "result"), ("sessions", "data"), ("metrics", "data")):
@@ -968,6 +972,7 @@ class Engine:
                     ).fetchone()
                 ):
                     (self.db.blobs / blob).unlink(missing_ok=True)
+        sweep_erased(workdirs)
         with self.cache_lock:
             self.cache.clear()
         self.gc_blobs()

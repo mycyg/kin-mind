@@ -579,8 +579,13 @@ def dispatch(config, action, request):
                 state="canceled",
                 reason="Host restarted before sending",
             )
+        # Every settled run's working directory that still has its words loses them now, the ones
+        # just interrupted among them, rather than when the next exploration starts (OPS-03).
+        directory = config.get("exploration_directory")
+        swept = explorer.sweep_workdirs(directory) if directory else []
         return {"state": "recovered", "canceled_drafts": len(attempts),
-                "interrupted_explorations": interrupted, "live_explorations": retained}
+                "interrupted_explorations": interrupted, "live_explorations": retained,
+                "swept_workdirs": len(swept)}
     raise ValueError("Unknown host action")
 
 
