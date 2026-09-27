@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from eventmem.core import Engine
-from eventmem.core.db import dumps
+from eventmem.core.db import digest, dumps
 from eventmem.core.models import Scope, SourceInput
 from kin_mind.exploration import Explorations
 from kin_mind.operational_status import embedding_service, liveness, operational_status, read_only
@@ -82,6 +82,36 @@ def test_the_store_says_whether_the_work_is_moving_through_a_connection_that_can
     assert facts["last"]["hours_since"] == {"wish": 50.0, "exploration": 100.0, "contact": 58.0}
     assert "canceled" not in json.dumps(facts), "a canceled contact reached nobody"
 
+
+
+def test_a_failure_on_a_revision_since_replaced_or_deleted_is_not_a_failure_of_the_day(store):
+    """A vector that failed for a revision its record has since moved past, or for a record since
+    deleted, is never needed: nothing shows that revision again, and repair does not queue it. It is
+    said apart (`failed_superseded_24h`) and does not count in `failed_24h`, which turns health red.
+    A failure on the record as it stands still counts."""
+    engine, scope, _mind, root = store
+    source = engine.receive(SourceInput(namespace="test", key="note", scope=scope, text="a note", authority="explicit"))["id"]
+    with engine.db.connect(write=True) as conn:
+        record_id = "mem_" + digest([source, "root"])[:32]
+        (revision,) = conn.execute("SELECT revision FROM records WHERE id=?", (record_id,)).fetchone()
+        for name, rev in (("old", revision - 1), ("current", revision)):
+            conn.execute("INSERT INTO jobs(id,kind,unique_key,payload,state,attempts,max_attempts,available,error,created_at,updated_at) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f"job_{name}", "embed", f"embed:{name}", dumps({"record_id": record_id, "revision": rev}),
+                                                           "failed", 5, 5, 0, "RuntimeError", iso(hours=4), iso(hours=1)))
+    conn = read_only(root)
+    try:
+        embeddings = liveness(conn, scope.key(), now=NOW.timestamp())["embeddings"]
+    finally:
+        conn.close()
+    assert (embeddings["failed_total"], embeddings["failed_24h"], embeddings["failed_superseded_24h"]) == (5, 3, 1)
+    with engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE records SET deleted=1 WHERE id=?", (record_id,))
+    conn = read_only(root)
+    try:
+        embeddings = liveness(conn, scope.key(), now=NOW.timestamp())["embeddings"]
+    finally:
+        conn.close()
+    assert (embeddings["failed_24h"], embeddings["failed_superseded_24h"]) == (2, 2)
 
 def test_operational_status_carries_it_for_the_phone_self_check(store):
     _engine, _scope, mind, _root = store

@@ -71,9 +71,18 @@ def liveness(conn, scope, *, now=None):
     now = time.time() if now is None else now
     facts = {"checked_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
     if _table(conn, "jobs"):
-        failed = [(row[0], _seconds(row[1])) for row in conn.execute(
-            "SELECT error,updated_at FROM jobs WHERE kind='embed' AND state='failed' ORDER BY updated_at DESC LIMIT 5000")]
-        recent = [(error, at) for error, at in failed if at is not None and at >= now - DAY]
+        # A failure on a revision its record has since moved past, or on a record since deleted or
+        # retired, needs no vector: that revision is never shown again, and repair's queue plan passes
+        # it by the same test. Only what still needs one counts as a failure of the last day; the rest
+        # is said apart. A job that names no record it can be checked against counts, as before.
+        passed = ("EXISTS(SELECT 1 FROM records r WHERE r.id=json_extract(j.payload,'$.record_id') AND NOT "
+                  "(r.revision=json_extract(j.payload,'$.revision') AND r.deleted=0 AND r.status IN ('active','unverified')))"
+                  if _table(conn, "records") else "0")
+        failed = [(row[0], _seconds(row[1]), bool(row[2])) for row in conn.execute(
+            f"SELECT j.error,j.updated_at,{passed} FROM jobs j WHERE j.kind='embed' AND j.state='failed' "
+            "ORDER BY j.updated_at DESC LIMIT 5000")]
+        day = [(error, at, gone) for error, at, gone in failed if at is not None and at >= now - DAY]
+        recent = [(error, at) for error, at, gone in day if not gone]
         waiting, oldest = conn.execute(
             f"SELECT COUNT(*),MIN(created_at) FROM jobs WHERE kind='embed' AND state IN ({','.join('?' * len(WAITING))})",
             WAITING).fetchone()
@@ -82,7 +91,7 @@ def liveness(conn, scope, *, now=None):
         unconfigured = conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='embed' AND state='waiting_config'").fetchone()[0]
         complete = conn.execute("SELECT MAX(updated_at) FROM jobs WHERE kind='embed' AND state='complete'").fetchone()[0]
         facts["embeddings"] = {
-            "failed_total": len(failed), "failed_24h": len(recent),
+            "failed_total": len(failed), "failed_24h": len(recent), "failed_superseded_24h": len(day) - len(recent),
             "last_failure": {"at": datetime.fromtimestamp(recent[0][1], timezone.utc).isoformat(),
                              "error": (recent[0][0] or "")[:240]} if recent else None,
             "waiting": waiting, "oldest_waiting_hours": _hours(_seconds(oldest), now),
