@@ -642,7 +642,7 @@ class Mind(Continuity):
                           state, "session-advice-migration", {"carrier_event_id": held[0] if held else None})
             return {"state": "moved", "revision": state["revision"], "carrier_event_id": held[0] if held else None}
 
-    def _ensure_dimensions(self, state, *, event_id, agent_version):
+    def _ensure_dimensions(self, conn, state, *, event_id, agent_version):
         """Dimensions the role profile defines (profile.py) that a state initialized before them does
         not hold yet join it as role defaults: the definition into the stored profile, a score at its
         baseline, on the evidence the role itself was initialized from. The dimensions it holds, their
@@ -653,12 +653,26 @@ class Mind(Continuity):
         at = self.clock()
         refs = next((deepcopy(entry["evidence"]) for entry in state["dimensions"].values()
                      if entry.get("basis") == "role_default" and entry.get("evidence")), [])
+        if not refs:
+            # All old dimensions may already have event evidence. Initialization remains
+            # the role source; read its verified history, never borrow an interaction.
+            from .history import materialize
+            initial = conn.execute(
+                "SELECT revision FROM mind_events WHERE scope=? AND kind='initialize' ORDER BY revision LIMIT 1",
+                (self.scope.key(),),
+            ).fetchone()
+            if initial:
+                original = materialize(conn, self.scope.key(), initial["revision"])
+                refs = next((deepcopy(entry["evidence"]) for entry in original["dimensions"].values()
+                             if entry.get("basis") == "role_default" and entry.get("evidence")), [])
+        refs = [ref for ref in refs if self._fresh(conn, [ref])]
         for key in missing:
             spec = state["profile"]["dimensions"].setdefault(key, deepcopy(DIMENSIONS[key]))
             state["dimensions"].setdefault(key, {
                 "score": spec["baseline"], "target": spec["baseline"], "baseline": spec["baseline"],
                 "half_life_hours": spec["half_life_hours"], "at": at, "basis": "role_default",
                 "evidence": refs, "event_id": event_id, "agent_version": agent_version,
+                **({"interpretation_unverified": True} if not refs else {}),
             })
         state["profile_version"] = digest([state["profile_version"], state["profile"]])[:16]
         return missing
@@ -673,7 +687,7 @@ class Mind(Continuity):
             if not missing:
                 return {"state": "unchanged"}
             event_id = "mind_" + digest([self.scope.key(), "profile-dimensions-added", missing])[:32]
-            added = self._ensure_dimensions(state, event_id=event_id, agent_version=agent_version)
+            added = self._ensure_dimensions(conn, state, event_id=event_id, agent_version=agent_version)
             state.update(revision=state["revision"] + 1, updated_at=self.clock())
             self._save(conn, state)
             self._history(conn, event_id, state, "profile-dimensions-added", {"added": added, "agent_version": agent_version})
@@ -980,7 +994,7 @@ class Mind(Continuity):
         refs = self._evidence(conn, request.evidence_ids)
         # A release that adds dimensions migrates at start-up (extend_dimensions); an event committed
         # before that, on a state without them, adds them here rather than refusing their scores.
-        self._ensure_dimensions(state, event_id=event_id, agent_version=request.agent_version)
+        self._ensure_dimensions(conn, state, event_id=event_id, agent_version=request.agent_version)
         if request.evolution:
             return self._evolve(conn, state, request, refs, event_id)
         unknown = set(request.values) - set(state["dimensions"])

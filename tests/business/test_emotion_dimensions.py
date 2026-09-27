@@ -149,3 +149,30 @@ def test_the_host_start_up_brings_an_older_state_up_to_the_profile(tmp_path):
     with engine.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM mind_events WHERE scope=? AND kind='profile-dimensions-added'",
                             (scope.key(),)).fetchone()[0] == 1
+
+
+def test_migration_keeps_initialization_evidence_after_every_old_dimension_was_scored(setup):
+    mind, source, _clock = setup
+    older = as_older_release(mind)
+    refs = deepcopy(older["dimensions"]["mood"]["evidence"])
+    mind.record(event(mind, source, "all-scored", {key: 42 for key in older["dimensions"]}))
+    as_older_release(mind)
+    mind.extend_dimensions(agent_version="synthetic-v2")
+    with mind.engine.db.connect() as conn:
+        state = mind._load(conn)
+    assert all(state["dimensions"][key]["evidence"] == refs for key in NEW)
+
+
+def test_migration_does_not_revive_unavailable_initialization_evidence(setup):
+    mind, source, _clock = setup
+    older = as_older_release(mind)
+    init_id = older["dimensions"]["mood"]["evidence"][0]["source_id"]
+    mind.record(event(mind, source, "all-scored", {key: 42 for key in older["dimensions"]}))
+    as_older_release(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE sources SET deleted=1 WHERE id=?", (init_id,))
+    mind.extend_dimensions(agent_version="synthetic-v2")
+    view = mind.read()
+    assert all(view["dimensions"][key]["needs_review"] for key in NEW)
+    with mind.engine.db.connect() as conn:
+        assert all(not mind._load(conn)["dimensions"][key]["evidence"] for key in NEW)
