@@ -193,3 +193,17 @@ def test_without_the_owners_word_a_listed_contract_still_refuses_other_types(tmp
                              capture_output=True, text=True, check=True)
     assert json.loads(planned.stdout)["state"] == "planned"
     assert json.loads((tmp_path / "persona-policy.json").read_text())["mutable_trait_keys"] == ["interests"]
+
+
+def test_today_count_is_independent_of_the_excerpt_window(env):
+    mind, source, diary, clock = env
+    clock[0] -= timedelta(days=1)
+    diary("old", "昨天。")
+    clock[0] += timedelta(days=1)
+    ids = [diary(f"today-{i}", "今天。") for i in range(25)]
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE sources SET deleted=1 WHERE id=?", (ids[0],))
+    memory = MemoryContinuity(mind)
+    assert memory.recent_reflections()["today_count"] == 24
+    assert memory.recent_reflections(limit=1)["today_count"] == 24
+    assert len(memory.recent_reflections()["entries"]) == 5

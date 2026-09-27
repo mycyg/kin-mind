@@ -893,15 +893,17 @@ class MemoryContinuity:
         how many were written today (Asia/Singapore), so a day without one can have one."""
         from zoneinfo import ZoneInfo
         zone = ZoneInfo("Asia/Singapore")
-        day = lambda at: timestamp(at).astimezone(zone).date().isoformat()
-        today = day(self.mind.clock())
+        today = timestamp(self.mind.clock()).astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
         with self.engine.db.connect() as conn:
             rows = conn.execute("SELECT id,occurred_at,data FROM sources WHERE namespace='kin-reflection' AND scope=? AND deleted=0"
                                 " ORDER BY occurred_at DESC,id DESC LIMIT ?", (self.scope.key(), max(1, limit * 4))).fetchall()
-        entries, today_count = [], 0
+            # Count the whole local day, independently of the bounded excerpt window.
+            today_count = conn.execute(
+                "SELECT COUNT(*) FROM sources WHERE namespace='kin-reflection' AND scope=? AND deleted=0"
+                " AND julianday(occurred_at)>=julianday(?) AND julianday(occurred_at)<julianday(?)",
+                (self.scope.key(), today.isoformat(), (today + timedelta(days=1)).isoformat())).fetchone()[0]
+        entries = []
         for row in rows:
-            if row["occurred_at"] and day(row["occurred_at"]) == today:
-                today_count += 1
             if len(entries) >= limit:
                 continue
             try:
