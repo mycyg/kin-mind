@@ -955,6 +955,11 @@ RECALL_PROMPT = (f"\n本轮可以用只读记忆工具：recall_memory 按问题
                  "查到的记录可以作为证据引用；最后调用 submit_appraisal 提交。")
 # Beside the results of the last round, when the next request offers the submission alone.
 RECALL_DONE = "记忆查询到此为止，现在调用 submit_appraisal 提交。"
+# A request the reads made -- one that offers them, or one that carries an exchange of them back --
+# that the endpoint refuses outright (a 4xx that is not a rate limit) is no fault of the appraisal: the
+# attempt asks once more exactly as it asked before the reads existed (`_without_reads`), so a change on
+# the endpoint's side can cost the reads, never the appraisals.
+RECALL_REFUSED = r"deepseek-http-4(?!29)\d\d"
 # What a read shows of a record: who it is and what it says, without the host's read links.
 RECALL_SHOWN = ("id", "revision", "kind", "status", "title", "confirmation", "generated", "source_ids", "valid_from",
                 "valid_until", "content", "content_length", "cursor", "evidence_class", "evidence_label",
@@ -1130,7 +1135,8 @@ class DeepSeek:
         What comes back is the answer that did not ask for reads, exactly as a single call's. Each
         answer of reads is a call of its own in the attempt's record (`recall`), and what the reads
         returned is left on `recall_receipt` for the receipt, named as a fork's tool reads are
-        (CL6E-MM-04)."""
+        (CL6E-MM-04). A request of the reads that the endpoint refuses outright is asked again as the
+        single call it was before them (`_without_reads`)."""
         submit = {"name": "submit_appraisal", "description": "提交有来源的状态提案",
                   "input_schema": appraisal_schema(context.get("operational_only", False),
                       context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
@@ -1146,9 +1152,14 @@ class DeepSeek:
             if rounds and not offer:
                 messages[-1]["content"].append({"type": "text", "text": RECALL_DONE})
             asked = time.monotonic()
-            # A request that offers the reads ends early enough for the one that must submit.
-            body = self._post(system, messages, [submit, *RECALL_TOOLS] if offer else [submit],
-                              spare if offer else max(1, deadline - now), record)
+            try:
+                # A request that offers the reads ends early enough for the one that must submit.
+                body = self._post(system, messages, [submit, *RECALL_TOOLS] if offer else [submit],
+                                  spare if offer else max(1, deadline - now), record)
+            except RuntimeError as error:
+                if not (offer or rounds) or not re.fullmatch(RECALL_REFUSED, str(error)):
+                    raise
+                return self._without_reads(system, rendered, submit, deadline, rounds, str(error), record)
             uses = [b for b in body.get("content") or () if isinstance(b, dict) and b.get("type") == "tool_use"]
             if not (offer and self._reads_only(body, uses)):
                 self.recall_receipt = {"tool_calls": calls, "recall_rounds": rounds} if rounds else None
@@ -1182,6 +1193,17 @@ class DeepSeek:
             record("http-" + str(response.status_code))
             raise RuntimeError("deepseek-http-" + str(response.status_code))
         return response_body(response, record)
+
+    def _without_reads(self, system, rendered, submit, deadline, rounds, refused, record):
+        """The request as it was before the reads existed, after the endpoint refused one the reads made
+        (RECALL_REFUSED): the prompt without the reads, the one turn, the submission alone. Nothing an
+        earlier round read is in front of this answer, so the receipt names no reads; the rounds stay on
+        it as the paid calls they were, beside the refusal."""
+        self.engine.db.metric("recall_refused", 1, {"error": refused, "rounds": len(rounds)})
+        body = self._post(system.removesuffix(RECALL_PROMPT), [{"role": "user", "content": rendered}], [submit],
+                          max(1, deadline - time.monotonic()), record)
+        self.recall_receipt = {"recall_rounds": rounds, "recall_refused": refused} if rounds else {"recall_refused": refused}
+        return body
 
     @staticmethod
     def _reads_only(body, uses):

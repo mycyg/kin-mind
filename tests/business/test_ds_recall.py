@@ -351,6 +351,51 @@ def test_every_call_is_recorded_and_a_round_of_reads_charges_nothing(setup, monk
     assert paid(mind) == 1
 
 
+
+@pytest.mark.parametrize("refused_at", [0, 1])
+def test_a_request_of_the_reads_the_endpoint_refuses_is_asked_again_as_before(setup, monkeypatch, refused_at):
+    """The endpoint refuses outright a request the reads made: the first, which offers them, or the one
+    that carries a round of them back. That is no fault of the appraisal, and a change on the endpoint's
+    side must not stop every appraisal: the attempt asks once more with the very bytes the single call
+    sent before the reads existed, and commits. That answer saw no read, so the receipt names none; the
+    round it paid for and the refusal stay on it, and the refused request is in the record."""
+    mind, source, clock = setup
+    refusal = httpx.Response(400, json={"error": {"message": "synthetic"}})
+    before = [reads(("recall_memory", {"query": "那家店"}))] * refused_at
+    ds = Endpoint(mind, monkeypatch, *before, refusal, submits({"reason": "路过那家店", "values": {"curiosity": 61}}))
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source("walk", "今天路过那家店")], "synthetic-v1")
+    assert jobs.run_one(ds.provider)["state"] == "complete"
+
+    assert ds.tools() == [READS] * (refused_at + 1) + [SUBMIT]
+    assert ds.raw[-1] == as_before(ds.sent[-1]) and ds.sent[-1]["system"].endswith(PLAIN_END)
+    assert ds.sent[-1]["messages"] == ds.sent[0]["messages"][:1]
+    state, count, data = queue_row(mind, job["id"])
+    receipt = data["receipt"]
+    assert "tool_calls" not in receipt and "tool_fetched_evidence" not in receipt
+    assert receipt["recall_refused"] == "deepseek-http-400" and len(receipt.get("recall_rounds") or ()) == refused_at
+    entry = ledger(mind, job)
+    assert [(c["purpose"], c["outcome"]) for c in entry["calls"]] == [("recall", "ok")] * refused_at + [
+        ("appraise", "http-400"), ("appraise", "ok")]
+    assert entry["charged"] is True and count == 1
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM metrics WHERE name='recall_refused'").fetchone()[0] == 1
+
+
+def test_a_refusal_of_the_plain_request_or_a_rate_limit_is_what_it_always_was(setup, monkeypatch):
+    """Only a request the reads made is asked again. A rate limit on one is an outage like any other,
+    and a refusal of a request that offered no reads -- a lane that reads nothing -- fails as before."""
+    mind, source, clock = setup
+    ds = Endpoint(mind, monkeypatch, httpx.Response(429, json={"error": "synthetic"}))
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([source("walk", "今天路过那家店")], "synthetic-v1")
+    assert jobs.run_one(ds.provider)["state"] == "pending" and len(ds.sent) == 1
+    assert queue_row(mind, job["id"])[2]["error"] == "deepseek-http-429"
+    ds = Endpoint(mind, monkeypatch, httpx.Response(400, json={"error": "synthetic"}))
+    backfill = jobs.enqueue([source("old", "很久以前的事")], "synthetic-v1", stimulus="memory-backfill")
+    jobs.run_one(ds.provider)
+    assert len(ds.sent) == 1 and queue_row(mind, backfill["id"])[2]["error"] == "deepseek-http-400"
+
 def test_a_record_read_and_deleted_while_the_model_answers_stops_the_commit(setup, monkeypatch):
     """The model reads a note and repeats it without citing it; the note is deleted while the model
     answers. The read named it, so the commit is refused for the delete -- uncharged -- and no word of
