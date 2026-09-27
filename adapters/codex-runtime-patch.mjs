@@ -662,12 +662,16 @@ function kinToolResultIds(item, turn) {
         if (!latest.turnId) return end("failed", { error: "no-completed-turn", reason: latest.reason });
         lastTurnId = latest.turnId;
       }
-      const modelId = ModelId.fromString(state.currentModelId);
+      const selectedModel = ModelId.fromString(state.currentModelId);
+      // K3 belongs only to the main conversation. Assessment, contact and topic
+      // forks use the existing DeepSeek gateway without changing the main thread.
+      const modelId = selectedModel.model === "k3" ? { model: "deepseek-flash", effort: "high" } : selectedModel;
       const config = await kinWithin(this.codexAcpClient.createSessionConfig(state.cwd, state.additionalDirectories ?? [], []), deadline, "timeout");
       const servers = await kinWithin(this.codexAcpClient.getConfigMcpServerNames(state.cwd), deadline, "timeout");
       for (const name of servers) if (name !== "memorypalace") config[\`mcp_servers.\${name}.enabled\`] = false;
       if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": "approve" });
       Object.assign(config, KIN_FORK_CLOSED);
+      if (selectedModel.model === "k3") Object.assign(config, { service_tier: "default", "features.fast_mode": false, model_reasoning_effort: "high" });
       const forkPromise = api.threadFork({ threadId: params.sessionId, lastTurnId, ephemeral: true, excludeTurns: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: "read-only", config });
       void forkPromise.then((fork) => { if (stopped && result.forkThreadId === null) void release(fork.thread.id); }, () => {});
       const fork = await kinWithin(forkPromise, deadline, "timeout");

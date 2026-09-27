@@ -70,3 +70,28 @@ test('a request body is read as bytes: multi-byte text split across chunks arriv
   assert.equal(attempted.reasoningEffort, 'high');
   assert.equal(attempted.requestedReasoningEffort, 'max');
 });
+
+test('K3 main traffic uses Kimi credentials and high while background K3 never reaches a provider', async t => {
+  const calls=[], evidence=[], usage=[];
+  let purpose={lane:'foreground',purpose:'native-chat-turn'};
+  const gateway=await startDeepSeekGateway({key:'ds-key',kimiKey:'kimi-key',purposeFor:()=>purpose,
+    onRequestEvidence:e=>evidence.push(e),onUsage:r=>usage.push(r),fetchImpl:async(url,init)=>{
+      calls.push({url,headers:init.headers,body:JSON.parse(init.body)});
+      return new Response(JSON.stringify({id:'k3-response',model:JSON.parse(init.body).model,status:'completed',output:[],usage:{input_tokens:7,output_tokens:2}}),{headers:{'content-type':'application/json'}});
+    }});
+  t.after(()=>gateway.close());
+  const request=model=>fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model,reasoning:{effort:'max'},service_tier:'priority',instructions:'base',input:[{role:'developer',content:'persona'},user('synthetic')],max_output_tokens:4096})});
+  assert.equal((await request('k3')).status,200);
+  assert.equal(calls[0].url,'https://api.kimi.com/coding/v1/responses');
+  assert.equal(calls[0].headers.Authorization,'Bearer kimi-key');
+  assert.equal(calls[0].body.reasoning.effort,'high');
+  assert.equal(calls[0].body.input[0].role,'developer');
+  assert.equal(calls[0].body.max_output_tokens,4096);assert.equal(calls[0].body.service_tier,undefined);
+  assert.equal(evidence[0].provider,'kimi');assert.equal(usage[0].provider,'kimi');
+  purpose={lane:'background',purpose:'native-assessment'};
+  assert.equal((await request('k3')).status,502);assert.equal(calls.length,1);
+  assert.equal((await request('deepseek-flash')).status,200);
+  assert.equal(calls[1].url,'https://api.deepseek.com/responses');
+  assert.equal(calls[1].headers.Authorization,'Bearer ds-key');assert.equal(calls[1].body.reasoning.effort,'high');
+  assert.equal(usage[1].provider,'deepseek');
+});

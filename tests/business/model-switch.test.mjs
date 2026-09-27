@@ -23,6 +23,7 @@ function fixture(t, options={}) {
 }
 
 const LIVE_MODELS=[
+  {id:'k3',aliases:['Kimi K3','Kimi'],provider:'openai-15m',providerKind:'gateway',reasoningEfforts:['high'],defaultReasoningEffort:'high',serviceTiers:['default'],defaultServiceTier:'default'},
   {id:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEfforts:['high'],defaultReasoningEffort:'high',serviceTiers:['default'],defaultServiceTier:'default'},
   {id:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEfforts:['low','medium','high','xhigh','max'],defaultReasoningEffort:'medium',serviceTiers:[{id:'priority'}],defaultServiceTier:'priority'},
   {id:'gpt-6-astra',aliases:['GPT‑6 Astra','ASTRA-6'],provider:'custom-gateway',providerKind:'native',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium',serviceTiers:['default',{id:'priority'}],defaultServiceTier:'default'},
@@ -580,4 +581,29 @@ test('runtime lists supplier capabilities and new defaults while preserving an o
  assert.equal(view.defaults.work.model,'gpt-6-sol');assert.equal(view.defaults.work.reasoningEffort,'medium');
  assert.equal(view.defaults.chat.model,'deepseek-flash');assert.ok(view.models.some(m=>m.id==='gpt-6-sol'));
  assert.equal(view.actual.model,'gpt-5.6-sol');assert.deepEqual(f.router.state.manualProfile,chosen);
+});
+
+test('a natural manual Kimi profile is catalog-validated, announced once and persists through work completion',async t=>{
+  const f=profileFixture(t,{classify:async input=>input.text.includes('Kimi')
+    ?{route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},force:true,reason:'explicit owner profile',recall:{mode:'light',query:input.text,reason:'current control'}}
+    :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}}});
+  const control=await f.router.dispatch({id:'astra',text:'我要切换到Kimi high'},async()=>assert.fail('host control is not a native prompt'));
+  assert.deepEqual([control.route,control.state,f.router.state.mode,f.runtime.model],['host-control','applied','manual','k3']);
+  assert.deepEqual(f.router.state.manualProfile,{provider:'openai-15m',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
+  const sent=[];
+  await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'manual-ok'};},lookup:async()=>null});
+  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 Kimi K3 · high（手动模式）。']);
+  let work;
+  await f.router.dispatch({id:'work-after-manual',text:'现在写代码并交付'},async detail=>{work=detail;return'new-turn';});
+  assert.equal(work.model,'k3');assert.equal(f.switches.length,1,'automatic work routing cannot override the manual pin');
+  const task=f.router.currentTask();
+  // The work label only proposed it; Kin takes it on before it is hers to complete (CR-LIFE-10).
+  assert.equal(task.status,'proposed');assert.equal(f.router.openWork().length,0,'a proposal holds no lock');
+  await f.router.requestMode({commandId:'take-on',mode:'work',reason:'taking it on',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};
+  await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',turnFence:task.executionEpoch});
+  await f.router.observe('delivery',{taskId:task.id,id:'manual-delivery',state:'accepted',messageId:'m-manual',inputVersion:task.inputVersion,turnFence:task.executionEpoch});
+  await f.router.reconcile();
+  assert.deepEqual([f.router.tasks().length,f.router.state.mode,f.runtime.model],[0,'manual','k3']);
+  assert.equal(Object.values(f.router.state.requests).some(request=>request.state==='pending'&&request.mode==='auto'),false);
 });
