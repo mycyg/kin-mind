@@ -1,8 +1,12 @@
 """Read progress separately from liveness, without loading private messages."""
+import argparse
 import json
+import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 from eventmem.core.integrity import verify_interpreter, verify_source_root
 
@@ -28,6 +32,167 @@ def fork_read_errors(root, now=None):
             "last_7_days": sum(n for day, n in days.items() if isinstance(day, str) and day >= since and type(n) is int),
             "last_at": str(errors.get("last_at"))[:40] if errors.get("last_at") else None,
             "last": {key: last[key][:200] for key in ("error", "where", "raised", "tool") if isinstance(last.get(key), str)}}
+
+
+DAY = 86400.0
+# The states an embed job waits in: queued, backing off, and being worked on.
+WAITING = ("pending", "retry", "running")
+
+
+def _seconds(value):
+    """Unix seconds of a stored time -- ISO text with or without a zone (UTC then), with `T` or a
+    space, or a number -- or None."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (at if at.tzinfo else at.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def _hours(then, now):
+    return None if then is None else round(max(0.0, now - then) / 3600, 1)
+
+
+def _table(conn, name):
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def liveness(conn, scope, *, now=None):
+    """Whether the work is moving, read from the store and nothing else (OPS-02): embeddings --
+    what failed for good in the last day, what waits and since when, the last one made -- the
+    appraisals in quarantine, and when Kin last formed a wish, explored and reached out.
+    Counts, times, states and job errors (sanitized by the queue) only; never a line of content.
+    `scope` is the scope's key. Read-only: the host's health reads it through `main` from a
+    connection that cannot write."""
+    now = time.time() if now is None else now
+    facts = {"checked_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
+    if _table(conn, "jobs"):
+        failed = [(row[0], _seconds(row[1])) for row in conn.execute(
+            "SELECT error,updated_at FROM jobs WHERE kind='embed' AND state='failed' ORDER BY updated_at DESC LIMIT 5000")]
+        recent = [(error, at) for error, at in failed if at is not None and at >= now - DAY]
+        waiting, oldest = conn.execute(
+            f"SELECT COUNT(*),MIN(created_at) FROM jobs WHERE kind='embed' AND state IN ({','.join('?' * len(WAITING))})",
+            WAITING).fetchone()
+        waiting_error = conn.execute(
+            "SELECT error FROM jobs WHERE kind='embed' AND state='retry' AND error IS NOT NULL ORDER BY updated_at DESC LIMIT 1").fetchone()
+        unconfigured = conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='embed' AND state='waiting_config'").fetchone()[0]
+        complete = conn.execute("SELECT MAX(updated_at) FROM jobs WHERE kind='embed' AND state='complete'").fetchone()[0]
+        facts["embeddings"] = {
+            "failed_total": len(failed), "failed_24h": len(recent),
+            "last_failure": {"at": datetime.fromtimestamp(recent[0][1], timezone.utc).isoformat(),
+                             "error": (recent[0][0] or "")[:240]} if recent else None,
+            "waiting": waiting, "oldest_waiting_hours": _hours(_seconds(oldest), now),
+            "waiting_error": (waiting_error[0] or "")[:240] if waiting_error else None,
+            "waiting_config": unconfigured,
+            "last_complete_at": complete, "hours_since_last_complete": _hours(_seconds(complete), now),
+        }
+    if _table(conn, "mind_appraisals"):
+        from .model_lanes import label
+        rows = conn.execute("SELECT available,json_extract(data,'$.attempt_started_at'),json_extract(data,'$.repair_reason') "
+                            "FROM mind_appraisals WHERE scope=? AND state='needs-repair'", (scope,)).fetchall()
+        available = [row[0] for row in rows if isinstance(row[0], (int, float))]
+        started = [_seconds(row[1]) for row in rows]
+        reasons = {}
+        for row in rows:
+            reasons[label(row[2]) if row[2] else "unknown"] = reasons.get(label(row[2]) if row[2] else "unknown", 0) + 1
+        facts["quarantine"] = {
+            "count": len(rows), "oldest_hours": _hours(min(available), now) if available else None,
+            "newest_hours": _hours(max(available), now) if available else None,
+            "new_24h": sum(1 for at in started if at is not None and at >= now - DAY), "reasons": reasons,
+        }
+    last = {}
+    if _table(conn, "mind_state"):
+        created = []
+        row = conn.execute("SELECT data FROM mind_state WHERE scope=?", (scope,)).fetchone()
+        if row:
+            desires = (json.loads(row[0]).get("desires") or {})
+            created += [_seconds(desire.get("created_at")) for desire in desires.values() if isinstance(desire, dict)]
+        if _table(conn, "mind_desire_archive"):
+            created += [_seconds(value) for (value,) in conn.execute(
+                "SELECT json_extract(data,'$.created_at') FROM mind_desire_archive WHERE scope=?", (scope,))]
+        created = [at for at in created if at is not None]
+        last["wish_created_at"] = datetime.fromtimestamp(max(created), timezone.utc).isoformat() if created else None
+    if _table(conn, "mind_explorations"):
+        last["exploration_at"] = conn.execute("SELECT MAX(created_at) FROM mind_explorations WHERE scope=?", (scope,)).fetchone()[0]
+    if _table(conn, "mind_contacts"):
+        sent = conn.execute("SELECT json_extract(data,'$.updated_at') FROM mind_contacts WHERE scope=? AND state='accepted' "
+                            "ORDER BY rowid DESC LIMIT 1", (scope,)).fetchone()
+        last["contact_sent_at"] = sent[0] if sent else None
+    names = {"wish_created_at": "wish", "exploration_at": "exploration", "contact_sent_at": "contact"}
+    facts["last"] = {**last, "hours_since": {names[key]: _hours(_seconds(value), now) for key, value in last.items()}}
+    return facts
+
+
+def embedding_service(conn, root, *, timeout=1.5, client=None):
+    """Whether the local embedding service answers now (OPS-02): the one the store's embedding role
+    names, when that role is local. It is started on demand, so silence alone is no fault; a caller
+    weighs it with the embed jobs waiting. The credential is read from its file and sent to that
+    loopback port only; the answer is reduced to whether it is ours and whether the model is loaded."""
+    row = conn.execute("SELECT data FROM settings WHERE key='models'").fetchone() if _table(conn, "settings") else None
+    try:
+        role = (json.loads(row[0]) or {}).get("embedding") or {} if row else {}
+    except ValueError:
+        role = {}
+    if not role.get("local_embedding"):
+        return {"local": False}
+    address = urlsplit(str(role.get("endpoint") or ""))
+    if address.hostname != "127.0.0.1" or not address.port:
+        return {"local": True, "reachable": False, "reason": "endpoint-not-loopback"}
+    import httpx
+
+    try:
+        credential = (Path(root) / "embedding-token").read_text().strip()
+    except OSError:
+        credential = ""
+    try:
+        with (client or httpx.Client(timeout=timeout, trust_env=False)) as http:
+            answer = http.get(f"http://127.0.0.1:{address.port}/health", headers={"Authorization": "Bearer " + credential})
+    except Exception as exc:  # noqa: BLE001 - any failure to answer is "not reachable", by its class
+        return {"local": True, "reachable": False, "port": address.port, "reason": type(exc).__name__}
+    try:
+        body = answer.json()
+    except ValueError:
+        body = {}
+    ours = answer.status_code == 200 and body.get("service") == "memorypalace-embedding"
+    return {"local": True, "reachable": True, "port": address.port, "status": answer.status_code, "ours": ours,
+            "loaded": body.get("loaded") if ours else None}
+
+
+def read_only(root):
+    """A connection to the store at `root` that cannot write: opened read-only and query-only."""
+    path = Path(root) / "memory.sqlite3"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect("file:" + quote(str(path.resolve()), safe="/") + "?mode=ro", uri=True, timeout=10)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def main(argv=None):
+    """`python -m kin_mind.operational_status liveness --root <MemoryPalace> --scope <scope JSON>`: the
+    liveness facts and the embedding service's answer, as one JSON line, from a read-only connection."""
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("action", choices=["liveness"])
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--scope", required=True, help="the deployment's scope, as mind-config names it")
+    parser.add_argument("--no-probe", action="store_true", help="leave the embedding service unasked")
+    args = parser.parse_args(argv)
+    from eventmem.core.models import Scope
+
+    scope = Scope.model_validate(json.loads(args.scope)).key()
+    conn = read_only(args.root)
+    try:
+        facts = liveness(conn, scope)
+        if not args.no_probe:
+            facts.setdefault("embeddings", {})["service"] = embedding_service(conn, args.root)
+    finally:
+        conn.close()
+    print(json.dumps(facts, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 def operational_status(mind, config=None):
@@ -81,6 +246,9 @@ def operational_status(mind, config=None):
             reasons[label(reason) if reason else "unknown"] = reasons.get(label(reason) if reason else "unknown", 0) + n
         memory["quarantined"] = {"count": count, "oldest_available_unix": oldest, "reasons": reasons}
         memory["fork_read_errors"] = fork_read_errors(mind.engine.db.root)
+        # Whether the work is moving (OPS-02): the phone's self-check reads this with the rest.
+        moving = liveness(conn, scope)
+        moving.setdefault("embeddings", {})["service"] = embedding_service(conn, mind.engine.db.root)
     action = json.loads(schedule["data"]) if schedule else {}
     latest = json.loads(last["data"]) if last else {}
     # Which copy of the source answered this call, and which other copies are still
@@ -103,4 +271,8 @@ def operational_status(mind, config=None):
             "last_completed_review": {"id": last["id"], "model": latest.get("receipt", {}).get("model")} if last else None,
             "exploration": dict(exploration) if exploration else None,
             "contact": {"id": contact["id"], "state": contact["state"], "at": json.loads(contact["data"]).get("updated_at")} if contact else None,
-            "memory": memory}
+            "memory": memory, "liveness": moving}
+
+
+if __name__ == "__main__":
+    sys.exit(main())
