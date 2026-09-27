@@ -14,6 +14,21 @@ test('an eligible wish is drafted once and an accepted receipt settles',async()=
 test('initial partial acceptance is preserved in the durable settlement',async()=>{const{loop,events}=fixture({send:async()=>({state:'accepted',messageId:'server-id',messageIds:['server-id'],partial:true,canceledBubbles:1})});await loop.tick();const settled=events.at(-1)[1];assert.equal(settled.state,'accepted');assert.equal(settled.partial,true);assert.equal(settled.canceled_bubbles,1);});
 test('an ineligible moment never drafts',async()=>{const{loop,events,quiet}=fixture();quiet();await loop.tick();assert.equal(events.length,0);});
 test('new message invalidates a draft',async()=>{let f;f=fixture({draft:async()=>{f.change();return{action:'send',text:'outdated'};},send:async()=>assert.fail('must not send')});await f.loop.tick();assert.equal(f.events.at(-1)[1].state,'canceled');});
+test('a send the owner\'s contact rules skip at the last moment went nowhere: canceled as never sent, never left unconfirmed to be checked for a batch that never was',async()=>{
+ const{loop,events}=fixture({send:async()=>({state:'skipped',eligible:false,reason:'waiting-for-reply',channel:'feishu'})});
+ await loop.tick();
+ const [action,settled]=events.at(-1);
+ assert.deepEqual([action,settled.attempt_id,settled.state,settled.aborted_before_send,settled.reason],['settle','stable-id','canceled',true,'Delivery conditions changed before sending']);
+ assert.equal(events.some(([name,request])=>name==='settle'&&request.state==='unconfirmed'),false);
+ // The owner's context moved on meanwhile: said as such.
+ let f;f=fixture({send:async()=>{f.change();return{state:'skipped',eligible:false,reason:'waiting-for-reply'};}});
+ await f.loop.tick();
+ assert.deepEqual([f.events.at(-1)[1].state,f.events.at(-1)[1].aborted_before_send,f.events.at(-1)[1].reason],['canceled',true,'contact-source-changed']);
+ // Something that says skipped and names a message is no skip: it is reconciled as any receipt without proof.
+ const named=fixture({send:async()=>({state:'skipped',messageId:'server-id'})});
+ await named.loop.tick();
+ assert.equal(named.events.at(-1)[1].state,'unconfirmed');
+});
 test('missing message ID is unconfirmed',async()=>{const{loop,events}=fixture({send:async()=>({state:'accepted'})});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');});
 test('timeout never invents another send ID',async()=>{const{loop,events}=fixture({send:async()=>{throw Error('timeout');}});await loop.tick();assert.equal(events.at(-1)[1].state,'unconfirmed');assert.equal(events.filter(x=>x[0]==='claim').length,1);});
 test('concurrent ticks share one draft',async()=>{let release;const gate=new Promise(r=>release=r);const{loop,events}=fixture({draft:async()=>{await gate;return{action:'send',text:'hello'};}});const one=loop.tick();await new Promise(r=>setImmediate(r));await loop.tick();release();await one;assert.equal(events.filter(x=>x[0]==='claim').length,1);});

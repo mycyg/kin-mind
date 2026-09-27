@@ -194,6 +194,13 @@ export class MindLoop {
       // The batch asks about this contact itself (`within`): its own attempt is not a contact before it.
       const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files,
         guard:within=>!this.closed&&!this.isBusy()&&this.eligibility(within).eligible&&epoch===this.ownerEpoch()});
+      // The owner's contact rules said no at the send itself (the Feishu contact answers `skipped`, with
+      // their reason): it returned before its batch was written, so nothing went out under this id. It is
+      // canceled as never sent, as the check just before would have, and its wishes go on. Left
+      // `unconfirmed`, it was checked again every six hours for a batch that never was, holding them.
+      if(receipt.state==='skipped'&&!receipt.messageId&&!(receipt.acceptedBubbles>0))
+        return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
+          reason:epoch!==this.ownerEpoch()?'contact-source-changed':'Delivery conditions changed before sending'});
       if(receipt.state==='needs-review') {
         if(receipt.safeToRelease===true&&(receipt.acceptedBubbles??0)===0)return this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
           reason:'contact-review-failed',failure:failure(receipt,{stage:'contact-review-model',code:'contact-review-needs-review',retry_condition:'deepseek-decision'})});
