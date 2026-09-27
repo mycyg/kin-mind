@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -12,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+
+from .providers import ProviderError
 
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
 MODEL_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
@@ -43,6 +46,60 @@ def check_preprocessing(label):
     """A preprocessing label that names a Qwen3 revision must name the one this service loads."""
     if label and "qwen3" in label.lower() and REVISION_MARK not in label:
         raise ValueError("The embedding index names another Qwen3 revision than the local service loads")
+
+
+class LocalEmbeddingUnavailable(ProviderError):
+    """The local service could not be woken: it exited while it started, never answered, or its port
+    answers for something else. The message names that, with the exit status and the error the
+    service's own log ended on -- never a word of any request -- so a job keeps it as it is (a
+    `ProviderError` is safe for durable diagnostics), and for the embed jobs, which call no paid
+    model, the queue takes it for an environment that is down rather than for the item: the job
+    waits and runs again, instead of failing for good while nothing can start the service."""
+
+
+def source_root():
+    """The directory this `eventmem` is imported from: the one the woken service imports it from."""
+    return Path(__file__).resolve().parents[2]
+
+
+def service_launch(root, port, environ=None):
+    """The command, environment and working directory the service is started with.
+
+    Whoever asks first wakes the service -- the memory service's workers, the host's mind worker, a
+    hook, the MCP server -- and they did not all have `eventmem` on `PYTHONPATH`: one that put the
+    source root on its own `sys.path` handed the child an environment in which `-m` found nothing,
+    and every wake-up from it ended in `No module named 'eventmem'` (the memory service under
+    launchd). So the child is told where the code is: the source root this module came from goes
+    first on its `PYTHONPATH`, ahead of whatever the caller had there, and it starts in that
+    directory. A shared service outlives whoever woke it: it is no execution's, so an execution's
+    mark (kin_mind.worker_groups) is not handed on to it, and the end of that execution does not
+    end it (CR5-MM-03). Everything else is inherited as it is."""
+    source = str(source_root())
+    env = {key: value for key, value in (os.environ if environ is None else environ).items()
+           if key != "KIN_WORKER_MARK"}
+    inherited = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry and entry != source]
+    env["PYTHONPATH"] = os.pathsep.join([source, *inherited])
+    command = [sys.executable, "-m", "eventmem.core.local_embedding", "--root", str(root), "--port", str(port)]
+    return command, env, source
+
+
+# The last error a Python process names in its log: its class and the first words of its message,
+# up to a parenthesis or the end of the line.
+_NAMED_ERROR = re.compile(r"\b([A-Z]\w*(?:Error|Exception)): ([^\n()]{1,120})")
+
+
+def startup_failure(log_path, since, code):
+    """Why the service ended while it started, as a job keeps it: the exit status and the last error
+    its log named after `since` (the log's size before the start), in a line."""
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(since)
+            tail = log.read()[-8192:].decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    named = _NAMED_ERROR.findall(tail)
+    detail = f", {named[-1][0]}: {named[-1][1].strip()}" if named else ""
+    return f"Local embedding service exited during startup (exit {code}{detail})"
 
 
 def token(root):
@@ -87,7 +144,7 @@ def ensure_started(root, endpoint, model):
                     response.status_code != 200
                     or response.json().get("service") != "memorypalace-embedding"
                 ):
-                    raise RuntimeError(
+                    raise LocalEmbeddingUnavailable(
                         "Local embedding port belongs to another service"
                     )
                 return True
@@ -95,36 +152,28 @@ def ensure_started(root, endpoint, model):
             if alive():
                 return auth
             log_path = root / "embedding-service.log"
-            # A shared service outlives whoever woke it: it is no execution's, so an execution's mark
-            # (kin_mind.worker_groups) is not handed on to it, and the end of that execution does
-            # not end it (CR5-MM-03).
-            service_env = {key: value for key, value in os.environ.items() if key != "KIN_WORKER_MARK"}
+            command, service_env, cwd = service_launch(root, port)
             with log_path.open("ab") as log:
                 os.chmod(log_path, 0o600)
+                since = log_path.stat().st_size
                 process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "eventmem.core.local_embedding",
-                        "--root",
-                        str(root),
-                        "--port",
-                        str(port),
-                    ],
+                    command,
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=log,
                     start_new_session=True,
                     env=service_env,
+                    cwd=cwd,
                 )
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError("Local embedding service exited during startup")
+                code = process.poll()
+                if code is not None:
+                    raise LocalEmbeddingUnavailable(startup_failure(log_path, since, code))
                 if alive():
                     return auth
                 time.sleep(0.1)
-            raise RuntimeError("Local embedding service did not become ready")
+            raise LocalEmbeddingUnavailable("Local embedding service did not become ready within 30 s")
 
 
 def create_app(root, loader=None):
