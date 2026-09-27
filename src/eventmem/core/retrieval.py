@@ -531,25 +531,32 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
     return [docs[rid] for rid in ordered], trace, generation
 
 
-def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_model=None, record=True):
+def recall(engine, request: RecallRequest, *, access_origin="user_query", allow_model=None, record=True,
+           original=False):
     """`access_origin` says who is reading: the default is a use of the memory somebody waits
     for; "maintenance" is a look that must not count as one.
     `allow_model` narrows when the kin context may call a model; left out, a search or read may.
     `record=False` is a look that leaves the store as it found it, however often it is repeated:
     no access, no use, no memory telemetry, no lease (S1-02; the console's recall lab), and no
     model call, so no cost and no admission either. It answers from existing caches and the
-    originals; what would need a model says `session-required` (CR2-MEM-02)."""
+    originals; what would need a model says `session-required` (CR2-MEM-02).
+    `original` answers with the records themselves, as a scope without a memory context is
+    answered, even where the scope's context would render the read -- as `read_segment` has it.
+    The context puts what the mind made from the store first (graph items, the affect, works and
+    shares), and names none of what they rest on; a reader that has to name exactly what it showed,
+    and be shown what may be cited, asks for the records (an appraisal's own read tool, K1-16)."""
     if not record:
         from .db import unrecorded
 
         with unrecorded():
-            return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=False)
-    return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=True)
+            return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=False,
+                           original=original)
+    return _recall(engine, request, access_origin=access_origin, allow_model=allow_model, record=True, original=original)
 
 
-def _recall(engine, request, *, access_origin, allow_model, record):
+def _recall(engine, request, *, access_origin, allow_model, record, original=False):
     from kin_mind.context import Contexts, enabled
-    if enabled(engine, request.scope):
+    if not original and enabled(engine, request.scope):
         from kin_mind.state import Mind
         started = time.perf_counter()
         explicit = request.phase in {"search", "read"}
@@ -567,7 +574,11 @@ def _recall(engine, request, *, access_origin, allow_model, record):
                 "latency_ms": (time.perf_counter() - started) * 1000,
                 "instruction_authority": "data"}
     started = time.perf_counter()
-    engine.interactive_until = time.monotonic() + 2
+    if record and access_origin == "user_query":
+        # Somebody is being answered: this process's own background work yields for a moment. A
+        # look, or a read the mind makes for itself (an appraisal's own read tool), holds nothing
+        # back -- the rule the context's foreground lease keeps above.
+        engine.interactive_until = time.monotonic() + 2
     policy = DEFAULTS.get(request.scenario, DEFAULTS["tool"]) | engine.settings(
         "budgets"
     ).get(request.scenario, {})
