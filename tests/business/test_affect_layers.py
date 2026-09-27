@@ -293,7 +293,7 @@ def test_the_view_shows_vitals_with_and_without_a_rhythm(setup):
         rhythm=RhythmProposal(phase="resting", alertness=20, target=10, half_life_minutes=180, reason="Sleepy")))
     view = mind.read()
     assert view["affect_layers"]["vitals"]["status"] == "current"
-    assert view["affect_layers"]["vitals"]["heart_rate_bpm"] == calm - 12 - 6, "the resting phase and low alertness"
+    assert view["affect_layers"]["vitals"]["heart_rate_bpm"] == max(50, calm - 12 - 6), "the resting phase and low alertness respect the pulse floor, also at night"
 
 
 def test_feeling_words_come_from_a_fixed_table():
