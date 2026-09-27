@@ -645,6 +645,7 @@ understanding 保存事件含义、话题、重要程度、置信度与来源。
 concerns 是心事变更，涵盖 care、anticipation、curiosity、distress、shared_plan。每件心事有稳定 key，先更新已有编号。create 要填 key、kind、content、topic、intensity、basis、confidence、reason；update/ease/resolve/reopen/archive 使用 concern_id。来源引用使用本次 new_evidence 中的 id，也可使用 state 中既有且有效的 evidence_ids。心事与愿望分别保存；发过询问不表示事情已经解决。resolve 需要新的结果或更正来源；已结束心事保持原状态，新发生的同类事情可以明确 reopen。相同经历的摘要只补充关联，不重复提高强度。
 wishes.concern_ids 和 wish_updates.concern_ids 关联已有心事编号，或同一结果中新建心事的 key。给已有愿望建立关联使用 action=link；心事变更后，需要继续的愿望通过 resume/link 确认当前依据。待核验心事先保留，不建立依赖它的可执行愿望。
 rhythm 采用 interaction-led 模式，依据 state.rhythm.interactions 的14天真实互动窗口、表达活力和当前话题，提出 phase、alertness、target、half_life_minutes 和 reason。phase 为 awake、settling、drowsy、resting、roused、recovering；速度为20、60、180分钟。没有固定入睡或起床时刻。forming 是样本形成期，phase 属于角色运行状态，不是观察到的生理睡眠。后台事件不算用户活跃；维护结果和发送回执本身不改变作息判断。有新互动或对当下节奏的新认识时再更新。
+state.affect_layers 和各维度的 undertone 由宿主从已提交的分数在本地推导：undertone 是大约一天才跟上分数的心境，feeling 是此刻的心绪，lingering 是上一次明显变化留下的余韵，vitals 是虚拟的心跳与呼吸。它们只是参照，不是新经历，也不是可提交的字段；分数仍只依据新证据评估。
 continuity-bootstrap 只建立仍有效愿望与原始来源支持的心事关联，并给出事件理解和节律建议。已有分数、短期动力、愿望内容及状态保持；wishes 留空，wish_updates 只使用 link。已完成、过期和放弃的愿望保持历史身份。没有足够依据的部分留空，不为迁移编造经历。
 """
 
@@ -820,7 +821,7 @@ def appraisal_context(context):
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
         "continuity", "rhythm", "appraisal_summary", "exploration_decisions", "exploration_capabilities",
-        "contact_unconfirmed",
+        "contact_unconfirmed", "affect_layers",
     }}
     if isinstance(state.get("contact_unconfirmed"), list):
         state["contact_unconfirmed"] = [unlisted(u) for u in state["contact_unconfirmed"]]
@@ -833,6 +834,9 @@ def appraisal_context(context):
         projected["reason"] = value.get("reason", "")
         if value.get("motivation"):
             projected["motivation"] = value["motivation"]
+        if isinstance(value.get("undertone"), dict):
+            # The slow layer's value alone: how it is known is said once, in state.affect_layers.
+            projected["undertone"] = value["undertone"]["value"]
         state["dimensions"][key] = projected
     state["desires"] = []
     all_desires = original.get("desires", [])
@@ -907,7 +911,8 @@ def appraisal_context(context):
             dimension["reason_ref"] = key
     if shared:
         state["shared_reasons"] = shared
-    result["context_projection"] = "affect-decision-v3"
+    # v4: the derived layers (state.affect_layers, each dimension's undertone) are shown as well.
+    result["context_projection"] = "affect-decision-v4"
     if context.get("stimulus") == "delivery":
         # Receipt settlement cannot modify concerns or rhythm. Keep the actual
         # sent content, current drives and wishes; unrelated concern history is
@@ -1472,7 +1477,7 @@ class DeepSeek:
                 **({"native_receipt": body["native_receipt"]} if body.get("native_receipt") else {}),
                 "verified_at": datetime.now(timezone.utc).isoformat(),
                 "persona_contract": persona_metadata(policy),
-                "context_projection": request_context.get("context_projection", "affect-decision-v3"),
+                "context_projection": request_context.get("context_projection", "affect-decision-v4"),
                 "schema_repair": (self.failure_receipt or {}).get("schema_repair"),
                 **({"dropped_fields": dropped} if dropped else {}),
                 **({"compression_receipt": compression_receipt} if compression_receipt else {}),

@@ -89,25 +89,36 @@ def test_the_injected_state_keeps_items_awaiting_review_marked_within_the_new_bo
     """CR-MIND-09: the memory projection follows interactionView: a dimension or a concern waiting
     for review stays, marked 待复核, and six concerns are shown, not three."""
     from kin_mind.context import affect_projection, REVIEW_MARK
+    layers = {"version": "affect-layers-v1", "basis": "derived",
+              "undertone": {"status": "tracking", "tau_hours": 24.0, "text": "踏实", "dimensions": ["contentment"], "leaning": {"contentment": 68}},
+              "feeling": {"text": "有点酸", "dimensions": ["jealousy"]},
+              "lingering": {"text": "那点小醋意还没散", "dimension": "jealousy", "direction": "up", "since": "2026-09-27T01:00:00+00:00", "strength": 9.3},
+              "vitals": {"heart_rate_bpm": 77, "breaths_per_min": 15, "basis": "derived", "status": "current"}}
     view = {"dimensions": {"mood": {"value": 61.4}, "missing": {"value": 70.2, "needs_review": True}},
             "continuity": {"activation": "active", "needs_review": False},
             "appraisal_summary": {"understanding": {"text": "她今天很累", "needs_review": True}},
             "expression": {"guidance": [{"text": g} for g in "abcd"]},
             "selected_concerns": [{"id": "c" + str(i), "content": "心事" + str(i), "status": "active", "basis": "inferred",
-                                   "needs_review": i == 4} for i in range(8)]}
+                                   "needs_review": i == 4} for i in range(8)],
+            "affect_layers": layers}
     shown = affect_projection(view)
     assert shown["dimensions"] == {"mood": 61, "missing": {"value": 70, "review": REVIEW_MARK}}
     assert shown["understanding"]["review"] == REVIEW_MARK and len(shown["expression"]) == 3
     assert [c["id"] for c in shown["concerns"]] == ["c" + str(i) for i in range(6)]
     assert shown["concerns"][4]["review"] == REVIEW_MARK and "review" not in shown["concerns"][0]
+    # The derived layers in words, and a pulse coarse enough that the item's revision holds between turns.
+    assert shown["affect_layers"] == {"basis": "derived", "undertone": {"status": "tracking", "text": "踏实", "leaning": {"contentment": 68}},
+                                      "feeling": "有点酸", "lingering": "那点小醋意还没散",
+                                      "vitals": {"heart_rate_bpm": 75, "breaths_per_min": 16, "basis": "derived", "status": "current"}}
     shadow = affect_projection({**view, "continuity": {"activation": "shadow"}})
-    assert shadow["concerns"] == [] and shadow["understanding"] is None
+    assert shadow["concerns"] == [] and shadow["understanding"] is None and "affect_layers" not in shadow
     # And it is what a built context injects.
     mind, _, _ = setup
     MemoryContinuity(mind).configure({'context': True})
     mind.read = lambda **_: view
     built = Contexts(mind).build('', purpose='chat')
     assert "待复核" in built["text"] and "missing" in built["text"] and "c5" in built["text"]
+    assert "有点酸" in built["text"] and "那点小醋意还没散" in built["text"]
 
 
 def test_each_review_attempt_is_its_own_job_and_its_answer_names_it(setup):

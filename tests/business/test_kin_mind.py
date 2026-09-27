@@ -408,6 +408,9 @@ def test_an_expired_wish_is_shown_for_settlement_and_can_be_settled(setup):
     clock[0] += timedelta(days=3)
     context = appraisal_context({"state": mind.read(), "new_evidence": []})
     assert [w["id"] for w in context["state"]["expired_unsettled_wishes"]] == [desire["id"]]
+    # v4 shows the derived layers too: each dimension's undertone, and the block beside the scores.
+    assert context["context_projection"] == "affect-decision-v4" and context["state"]["affect_layers"]["basis"] == "derived"
+    assert all(isinstance(d["undertone"], float) for d in context["state"]["dimensions"].values())
     jobs = Appraisals(mind)
     jobs.enqueue([source("settle")], "synthetic-v1")
     reviewer = FakeReviewer(Appraisal(reason="That moment passed", wish_updates=[

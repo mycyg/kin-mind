@@ -145,10 +145,15 @@ def test_the_host_start_up_brings_an_older_state_up_to_the_profile(tmp_path):
         kinds = [row[0] for row in conn.execute("SELECT kind FROM mind_events WHERE scope=? ORDER BY revision", (scope.key(),))]
     assert sorted(state["dimensions"]) == sorted(DIMENSIONS) and kinds.count("profile-dimensions-added") == 1
     assert state["dimensions"]["wonder"]["agent_version"] == "test-v2"
+    # Emotion v2b: the derived layers follow, after the dimensions, so every dimension has its anchor.
+    assert kinds[-2:] == ["profile-dimensions-added", "affect-layers-added"]
+    assert sorted(set(state["affect_layers"]) - {"version", "echo"}) == sorted(DIMENSIONS)
+    assert all(d["undertone"]["status"] == "tracking" for d in mind.read()["dimensions"].values())
     dispatch(config, "recover", {})
     with engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_events WHERE scope=? AND kind='profile-dimensions-added'",
-                            (scope.key(),)).fetchone()[0] == 1
+        for kind in ("profile-dimensions-added", "affect-layers-added"):
+            assert conn.execute("SELECT COUNT(*) FROM mind_events WHERE scope=? AND kind=?",
+                                (scope.key(), kind)).fetchone()[0] == 1
 
 
 def test_migration_keeps_initialization_evidence_after_every_old_dimension_was_scored(setup):

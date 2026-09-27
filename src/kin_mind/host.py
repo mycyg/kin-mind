@@ -528,6 +528,9 @@ def dispatch(config, action, request):
         mind.retire_session_advice()
         # Emotion system v2: the dimensions this release adds join a state initialized before them.
         mind.extend_dimensions(agent_version=config["agent_version"])
+        # Emotion system v2b: the derived layers' block, with every slow layer starting where its score
+        # stands, joins a state kept before them -- after the dimensions, so each gets its anchor.
+        mind.ensure_affect_layers(agent_version=config["agent_version"])
         # A start-up used to assume the previous service was gone and interrupt every
         # running exploration. It asks now: a row is interrupted only when its worker
         # is provably gone — the pid is dead, the pid became some other process, or

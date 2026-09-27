@@ -27,7 +27,9 @@ the affective state itself:
 
 - `read_affective_state(scope, history=0, query="")` returns scores, reasons,
   evidence IDs, configuration versions, desires and traits; `query` selects the
-  relevant concerns. History is limited to 100 snapshots.
+  relevant concerns. History is limited to 100 snapshots. Beside the scores it
+  shows the layers derived from them (`affect_layers`, see
+  [continuity](continuity.md#derived-layers)).
 - `record_affective_event(scope, event)` validates sourced partial updates. Generic
   library users can submit an appraisal directly. The private Kin host replaces this
   tool with an enqueue operation so the appraisal owns evaluation.

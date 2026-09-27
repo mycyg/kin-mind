@@ -22,6 +22,10 @@ from eventmem.core.persona import load_persona, persona_metadata, validate_trait
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
 
 from . import erasure
+from .affect_layers import KEY as AFFECT_LAYERS
+from .affect_layers import VERSION as AFFECT_LAYERS_VERSION
+from .affect_layers import anchor_of, curves, note_echo, reanchor, undertone
+from .affect_layers import fresh as fresh_layers
 from .continuity import SCHEMA as CONTINUITY_SCHEMA
 from .continuity import Continuity, RhythmProposal, Understanding
 from .profile import DIMENSIONS, GROUPS, default_profile, interaction_style
@@ -353,6 +357,10 @@ class Mind(Continuity):
         # what the row before this one holds and proves it against that row's own hash before
         # believing a word of it, so a stale one costs a rebuild and can never cost correctness.
         self._loaded = None
+        # The instant curves the state was last read with, apart from the document its caller then
+        # changes in place: the next save re-anchors the slow layer of any curve it moved from these
+        # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
+        self._curves = {}
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
@@ -377,9 +385,16 @@ class Mind(Continuity):
                 "Initialize the role profile before reading or changing state"
             )
         self._loaded = row["data"]
-        return json.loads(row["data"])
+        state = json.loads(row["data"])
+        self._curves = curves(state)
+        return state
 
     def _save(self, conn, state):
+        # Every writer of the state saves here, so whichever path moved an instant curve -- an event, an
+        # assessment, an evolution or its reversion, a wish retargeting initiative -- its slow layer is
+        # re-anchored where the old curve had brought it. A save that moved no curve anchors nothing; a
+        # command replayed or recorded only (_record_only) never saves at all.
+        reanchor(state, self._curves, self.clock())
         conn.execute(
             "INSERT INTO mind_state VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,data=excluded.data",
             (self.scope.key(), state["revision"], dumps(state)),
@@ -692,6 +707,23 @@ class Mind(Continuity):
             self._save(conn, state)
             self._history(conn, event_id, state, "profile-dimensions-added", {"added": added, "agent_version": agent_version})
             return {"state": "extended", "added": added, "revision": state["revision"]}
+
+    def ensure_affect_layers(self, *, agent_version):
+        """Emotion system v2b (2026-09-27): the state gains the derived layers' block once, as one
+        recorded revision -- every slow layer starting at its instant value, no echo yet. Until then a
+        read shows each slow layer `forming`. Idempotent: a state that holds the block, whatever its
+        version, answers `unchanged`; a later format is a later release's own migration."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            if AFFECT_LAYERS in state:
+                return {"state": "unchanged"}
+            event_id = "mind_" + digest([self.scope.key(), "affect-layers-added", AFFECT_LAYERS_VERSION])[:32]
+            state[AFFECT_LAYERS] = fresh_layers(state, self.clock())
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "affect-layers-added",
+                          {"version": AFFECT_LAYERS_VERSION, "agent_version": agent_version})
+            return {"state": "added", "version": AFFECT_LAYERS_VERSION, "revision": state["revision"]}
 
     def configure_autonomy(self, request):
         """Explicit user policy; never an inferred emotion or personality update."""
@@ -1052,6 +1084,8 @@ class Mind(Continuity):
                         motivation={**setting, "expires_at": until,
                                     "base_half_life_hours": setting.get("base_half_life_hours") or spec["half_life_hours"]},
                     )
+        # 余韵: a change this large against what was projected a moment ago is felt for a while after.
+        note_echo(state, previous_values, self.clock())
         state["last_evidence_key"] = evidence_key
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
@@ -1432,6 +1466,7 @@ class Mind(Continuity):
             projected = project(entry, at)
             if key == "initiative":
                 projected = self._initiative_value(conn, state, at)
+            slow, known = undertone(entry, anchor_of(state, key), at, instant=projected)
             values[key] = {
                 "label": state["profile"]["dimensions"][key]["label"],
                 "group": DIMENSIONS.get(key, {}).get("group"),
@@ -1449,6 +1484,8 @@ class Mind(Continuity):
                 "evidence_ids": [r["record_id"] for r in entry["evidence"]],
                 "reason": entry.get("reason", "初始化角色底色，尚无状态观测"),
                 "motivation": entry.get("motivation"),
+                # 心境: the slow layer under this score, derived locally (affect_layers.undertone).
+                "undertone": {"value": round(slow, 1), "status": known},
             }
         traits = {
             k: dict(v, needs_review=not self._entry_fresh(conn, v))

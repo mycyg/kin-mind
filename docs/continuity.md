@@ -81,11 +81,53 @@ state; this is a role runtime inference, not a claim of biological sleep.
 Rhythm influences cadence, never work completion or contact permissions.
 The minute tick does not make a new model request merely to advance rhythm.
 
+## Derived layers
+
+Emotion v2b (`affect_layers.py`, `affect-layers-v1`) adds four layers that are
+computed locally from the committed scores and the rhythm. None calls a model,
+none is evidence, and none feeds a score or the expression compiler; they are
+shown beside `expression`.
+
+- **Undertone (心境).** Each dimension has a slow value `m` that follows its
+  instant curve `x(t)` (the projection above) as `dm/dt = (x − m)/τ`, `τ = 24 h`.
+  Between two changes of a curve it has a closed form,
+  `m(t) = T + (m₀ − T)e^{−t/τ} + (x₀ − T)(e^{−λt} − e^{−t/τ})/(1 − λτ)`, taken in
+  pieces at a motivation's end and through its limit where `λτ = 1`. It is stored
+  only where a curve changes: `Mind._save`, which every writer calls, re-anchors a
+  dimension whose curve moved at the value the old curve had brought it to, as
+  `{m, x, at, fp}` under the top-level `affect_layers` key rather than in the
+  dimension entries. Reads never write, a save that moved no curve anchors
+  nothing, and a replayed or record-only command never saves. An hour's spike
+  barely stirs the undertone; a mood held all day moves it.
+- **Feeling (心绪).** At most two words from a fixed table, for the strongest
+  weighted leanings of the instant values away from their baselines (雀跃,
+  踏实, 有点闷, 心烦, 有点酸, 不安, 想念, 好奇 and a few more); 平静 when none
+  reaches the threshold. The undertone is named from the same table with gentler
+  thresholds.
+- **Lingering (余韵).** An event that moves a dimension by 12 or more against the
+  value projected just before it leaves an echo: which dimensions moved, which
+  way, how far and when, with no words or IDs. The largest move is named from a
+  table by dimension and direction while it fades (1.5-hour half-life, at most six
+  hours).
+- **Vitals (心跳/呼吸).** A virtual heart rate from 70 bpm plus weighted
+  deviations of arousal dimensions (fear, irritability, flirtation, expressive
+  energy, anticipation, joy, wonder) less contentment and security, alertness,
+  the rhythm phase (resting −12 … roused +4) and a small local-hour table,
+  clamped to 50–130; breathing follows it within 8–26. A rhythm that is disabled,
+  forming or awaiting review contributes nothing, and `status` says so.
+
+A state kept before these layers gains them once at host start-up
+(`ensure_affect_layers`, one `affect-layers-added` revision); until then each
+undertone reads `forming` at its instant value. The main session's `affect`
+item carries the words and a pulse rounded to 5 bpm (breathing to 2), so its
+revision does not move with every minute of a decaying curve. No source or
+record ID enters the block.
+
 ## Interfaces and rollout
 
 | Interface | Addition |
 |---|---|
-| `read_affective_state(scope, history=0, query="")` | `continuity`, `appraisal_summary`, `concerns`, `selected_concerns`, `rhythm`, `expression` |
+| `read_affective_state(scope, history=0, query="")` | `continuity`, `appraisal_summary`, `concerns`, `selected_concerns`, `rhythm`, `expression`, `affect_layers` and each dimension's `undertone` |
 | `manage_concern(scope, request)` | Create/update/ease/resolve/reopen/archive with command ID, agent version, expected revision and source evidence |
 | `manage_desire` | Optional concern IDs; missing field preserves existing links |
 | DeepSeek `Appraisal` | Optional understanding, concern proposals and rhythm; `wish_updates` supports `link` |

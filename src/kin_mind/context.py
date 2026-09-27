@@ -14,6 +14,7 @@ from eventmem.core.models import Model, RecallRequest
 from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
 
+from .affect_layers import compact
 from .computer import redact
 from .memory import MemoryContinuity
 
@@ -63,12 +64,16 @@ def affect_projection(view):
         return {"text": item, "review": REVIEW_MARK} if flag and item else item
 
     understanding = (view.get("appraisal_summary") or {}).get("understanding") if active else None
+    # The derived layers in words and a coarse pulse: this item's revision is its digest, and an item
+    # whose revision moved is sent again, so nothing in it may move with each minute of a curve.
+    layers = compact(view.get("affect_layers"), coarse=True) if active else None
     return {"dimensions": {k: {"value": round(v["value"]), "review": REVIEW_MARK} if v.get("needs_review") else round(v["value"])
                            for k, v in view["dimensions"].items()},
             "understanding": marked(understanding, pending or (isinstance(understanding, dict) and understanding.get("needs_review"))),
             "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:INTERACTION_LIMITS["guidance"]]] if active else [],
             "concerns": [marked({k: c.get(k) for k in ("id", "content", "status", "basis")}, pending or bool(c.get("needs_review")))
-                         for c in view.get("selected_concerns", [])[:INTERACTION_LIMITS["concerns"]]] if active else []}
+                         for c in view.get("selected_concerns", [])[:INTERACTION_LIMITS["concerns"]]] if active else [],
+            **({"affect_layers": layers} if layers else {})}
 # What a chat read is shown of a trait's counted facts: how many separate times, how many
 # counterexamples, when it was first and last seen, what is left of the support.
 FACTS = ("episodes", "counter_examples", "first_day", "last_day", "support_strength")
@@ -866,7 +871,16 @@ class Contexts:
         No full exploration result or appraisal queue is repeated on chat reads."""
         view = self.mind.read(query=query)
         result = {k: view[k] for k in ("scope", "revision", "agent_version", "as_of", "profile_version", "persona_contract") if k in view}
-        result["dimensions"] = {k: {"value": round(d["value"], 2), "basis": d.get("basis"), "needs_review": bool(d.get("needs_review"))} for k, d in view["dimensions"].items()}
+        result["dimensions"] = {k: {"value": round(d["value"], 2), "basis": d.get("basis"), "needs_review": bool(d.get("needs_review")),
+                                    **({"undertone": d["undertone"]["value"]} if isinstance(d.get("undertone"), dict) else {})}
+                                for k, d in view["dimensions"].items()}
+        # The rhythm as the continuity probe reads it (`rhythm.phase`), and the derived layers beside
+        # the scores: words and the pulse, none of it a source.
+        rhythm = view.get("rhythm") or {}
+        result["rhythm"] = {k: rhythm[k] for k in ("status", "phase", "alertness") if k in rhythm}
+        layers = compact(view.get("affect_layers"))
+        if layers:
+            result["affect_layers"] = layers
         habits = self.memory.habits.read()
         # Her words, with the messages they were set from as the background context names them
         # (`habits_item`): a fork that reads them here names those among what it read, so a delete

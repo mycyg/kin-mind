@@ -314,6 +314,22 @@ test('items whose sources moved are shown and marked 待复核; the bounds are w
  const text=stateContext({state:{...state,dimensions:{mood:{value:50}}}});
  assert.ok(!text.includes('工作质量'));assert.ok(text.includes('拒绝、忙与停止要求优先'));
 });
+test('the derived layers ride beside the scores, in words and a pulse, and say they are derived (emotion v2b)',()=>{
+ const layers={version:'affect-layers-v1',basis:'derived',undertone:{status:'tracking',tau_hours:24,text:'踏实',dimensions:['contentment'],leaning:{contentment:68}},
+   feeling:{text:'有点酸',dimensions:['jealousy']},lingering:{text:'那点小醋意还没散',dimension:'jealousy',direction:'up',since:'2026-09-27T01:00:00+00:00',strength:9.3},
+   vitals:{heart_rate_bpm:77,breaths_per_min:15,basis:'derived',status:'current'}};
+ const state={continuity:{activation:'active'},dimensions:{jealousy:{value:40,undertone:{value:18.4,status:'tracking'},basis:'event_inferred'},mood:{value:65,basis:'role_default'}},affect_layers:layers};
+ const view=interactionView(state);
+ assert.deepEqual(view.affect_layers,{basis:'derived',undertone:{status:'tracking',text:'踏实',leaning:{contentment:68}},feeling:'有点酸',lingering:'那点小醋意还没散',
+   vitals:{heart_rate_bpm:77,breaths_per_min:15,basis:'derived',status:'current'}});
+ assert.equal(view.dimensions.jealousy.undertone,18.4);assert.equal('undertone' in view.dimensions.mood,false);
+ assert.equal(interactionView({...state,affect_layers:{...layers,lingering:null}}).affect_layers.lingering,null);
+ assert.equal(interactionView({...state,continuity:{activation:'shadow'}}).affect_layers,undefined,'shadow shows nothing new');
+ assert.equal(interactionView({continuity:{activation:'active'},dimensions:{}}).affect_layers,undefined,'an older core sends none');
+ const text=stateContext({state});
+ assert.ok(text.includes('由宿主从已提交的分数本地推导')&&text.includes('"feeling":"有点酸"'));
+ assert.ok(!/(src|mem)_/.test(JSON.stringify(view.affect_layers)));
+});
 test('the minute loop runs one contact tick a minute (AD2-15)',async t=>{
  t.mock.timers.enable({apis:['setInterval']});
  const events=[];

@@ -9,6 +9,7 @@ from pydantic import Field, FiniteFloat, StrictBool, StrictInt, model_validator
 from eventmem.core.db import Conflict, Missing, digest
 from eventmem.core.models import Model
 
+from .affect_layers import build_view
 from .expression import compile_expression
 from .rhythm import INTERACTION_SCHEMA, interaction_windows, rhythm_view, stamp
 
@@ -557,6 +558,10 @@ class Continuity:
             )
         else:
             result["rhythm"] = {"status": "disabled", "mode": "interaction-led"}
+        # 心境、心绪、余韵、心跳呼吸: derived here from the scores and the rhythm, shown beside the
+        # expression and never fed into it -- compile_expression below reads the scores alone.
+        result["affect_layers"] = build_view(state, result["dimensions"], result["rhythm"], at,
+                                             (result.get("contact") or {}).get("timezone"))
         if speaking:
             result["expression"] = compile_expression(
                 result["dimensions"],
