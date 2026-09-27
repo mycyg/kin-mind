@@ -158,3 +158,33 @@ def test_map_entries_cannot_silently_overwrite_or_use_non_string_keys(keys):
     schema = Sample.model_json_schema()
     with pytest.raises(ValueError, match="strict-map-key-invalid-or-duplicate"):
         decode(schema, {"values": [{"key": key, "value": 50} for key in keys]})
+
+
+def test_optional_any_keeps_explicit_null_instead_of_applying_default():
+    class Arbitrary(Model):
+        value: Any = "default"
+    schema = Arbitrary.model_json_schema()
+    assert decode(schema, {"value": None}) == {"value": None}
+    assert Arbitrary.model_validate(decode(schema, {"value": None})).value is None
+
+
+def test_required_null_and_scalar_union_are_left_for_pydantic_validation():
+    from pydantic import ValidationError
+    class Mixed(Model):
+        path: list[str | StrictInt]
+        count: StrictInt = 3
+        nullable: str | None = "default"
+    schema = Mixed.model_json_schema()
+    result = decode(schema, {"path": ["3", 3], "count": None, "nullable": None})
+    assert result == {"path": ["3", 3], "nullable": None}
+    assert Mixed.model_validate(result).count == 3
+    with pytest.raises(ValidationError):
+        Mixed.model_validate(decode(schema, {"path": None}))
+
+
+def test_pydantic_still_rejects_bounds_after_decoding():
+    from pydantic import ValidationError
+    for answer in ({"reason": ""}, {"reason": "x", "minutes": 1},
+                   {"reason": "x", "tags": ["a"] * 4}):
+        with pytest.raises(ValidationError):
+            Sample.model_validate(decode(Sample.model_json_schema(), answer))

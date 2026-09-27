@@ -157,7 +157,8 @@ def _accepts_null(node, definitions):
     node = _resolve(node, definitions)
     if not isinstance(node, dict):
         return True
-    return _takes_null(node) or any(_accepts_null(branch, definitions) for branch in node.get("anyOf") or node.get("oneOf") or ())
+    return _shape(node) == "any" or _takes_null(node) or any(
+        _accepts_null(branch, definitions) for branch in node.get("anyOf") or node.get("oneOf") or ())
 
 
 def _fits(node, value, definitions):
