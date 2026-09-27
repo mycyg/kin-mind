@@ -34,8 +34,11 @@ CREATE INDEX IF NOT EXISTS mind_appraisal_attempt_job ON mind_appraisal_attempts
 # `reused`: a stored proposal committed with no model call (Tier A). `revalidated`: it committed
 # after one light revalidation call (Tier B). Neither is a charged attempt.
 OUTCOMES = ("committed", "failed", "quarantined", "discarded", "abandoned", "reused", "revalidated")
+# `recall`: a DeepSeek appraisal request answered with memory reads, not with the appraisal (K1-16).
+# It is paid for and recorded like any call, but it is not the appraisal call: only `appraise` makes an
+# attempt a charged one (appraisal.completed_appraisal).
 PURPOSES = ("appraise", "schema-repair", "advice-repair", "sharing-repair",
-            "compression", "expansion", "revalidate", "other")
+            "compression", "expansion", "revalidate", "recall", "other")
 # The purpose of a structured call follows its tool name, never the calling function:
 # compression has both a foreground and a background caller.
 TOOL_PURPOSES = {

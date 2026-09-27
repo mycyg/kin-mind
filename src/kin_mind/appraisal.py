@@ -21,8 +21,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
 
-from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.models import Model, SourceInput
+from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
+from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
 from . import attempts, erasure, judgment_cache, revalidation
@@ -924,6 +924,42 @@ def appraisal_context(context):
 # depends on them: `compat` reads them from here.
 APPRAISAL_MODEL, APPRAISAL_EFFORT = "deepseek-flash", "high"
 
+# DeepSeek reads memory while it appraises (K1-16 on the DeepSeek lane). The fork reads with its own
+# read-only MCP; a DeepSeek appraisal is an HTTP request, so the host offers the two reads of that MCP
+# as tools of its own and runs them: `recall_memory` finds records by a question, `read_memory` reads
+# one. RECALL_ROUNDS answers of reads at most, each begun within RECALL_SECONDS of the first request --
+# the `recall_budget` the autonomy context states. A request that offers them must end
+# RECALL_FINAL_SECONDS before the attempt's deadline, so the request that has to submit always keeps
+# that long. A request that offers them may be the one that submits, so it is given at least
+# RECALL_CALL_SECONDS, what an appraisal call is left after its preparation; with less to spare they
+# are not offered, and the one request has all the time there is, as before.
+RECALL_ROUNDS, RECALL_SECONDS, RECALL_FINAL_SECONDS, RECALL_CALL_SECONDS = 3, 150, 180, 120
+# What one round runs and what each read shows: a few records with their excerpts, a modest segment
+# of one record. Calls past RECALL_CALLS in one answer are refused and return nothing.
+RECALL_CALLS, RECALL_ITEMS, RECALL_TOKENS, READ_CHARS, READ_TOKENS = 4, 5, 1200, 3000, 1500
+# Lanes whose assessment reads nothing of its own: recorded history, the one follow-up and session
+# maintenance organise or restate what they were given.
+RECALL_WITHHELD = frozenset({"memory-backfill", "memory-enrichment", FOLLOW_UP, "session-maintenance"})
+RECALL_TOOLS = [
+    {"name": "recall_memory",
+     "description": "按问题召回当前作用域的记忆，返回几条相关记录的编号、修订号、来源编号与原文摘录；需要全文时用 read_memory。",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                      "required": ["query"], "additionalProperties": False}},
+    {"name": "read_memory",
+     "description": "按记录编号（mem_ 开头）读取一段记忆原文；没读完时用返回的 cursor 作为 offset 接着读。",
+     "input_schema": {"type": "object", "properties": {"record_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                                                      "offset": {"type": "integer", "minimum": 0}},
+                      "required": ["record_id"], "additionalProperties": False}},
+]
+RECALL_PROMPT = (f"\n本轮可以用只读记忆工具：recall_memory 按问题召回，read_memory 读原文，最多 {RECALL_ROUNDS} 轮；"
+                 "查到的记录可以作为证据引用；最后调用 submit_appraisal 提交。")
+# Beside the results of the last round, when the next request offers the submission alone.
+RECALL_DONE = "记忆查询到此为止，现在调用 submit_appraisal 提交。"
+# What a read shows of a record: who it is and what it says, without the host's read links.
+RECALL_SHOWN = ("id", "revision", "kind", "status", "title", "confirmation", "generated", "source_ids", "valid_from",
+                "valid_until", "content", "content_length", "cursor", "evidence_class", "evidence_label",
+                "evidence_labels", "evidence_mixed")
+
 
 class DeepSeek:
     def __init__(
@@ -1086,26 +1122,162 @@ class DeepSeek:
             raise RuntimeError("deepseek-network-error") from None
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
+        """The appraisal request. Where this attempt may read memory (`_recall_scope`) it is a short
+        exchange instead of one call: while the model answers with reads and nothing else and the
+        budget allows, the host runs them, sends the answer back whole -- its thinking with it, which a
+        request with thinking on has to carry -- with a result for each read, and asks again. The last
+        request offers the submission alone and is not forced to it, which thinking does not allow.
+        What comes back is the answer that did not ask for reads, exactly as a single call's. Each
+        answer of reads is a call of its own in the attempt's record (`recall`), and what the reads
+        returned is left on `recall_receipt` for the receipt, named as a fork's tool reads are
+        (CL6E-MM-04)."""
+        submit = {"name": "submit_appraisal", "description": "提交有来源的状态提案",
+                  "input_schema": appraisal_schema(context.get("operational_only", False),
+                      context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
+                      self._sections(context), self._review_max())}
+        system, scope = self._system(context, policy), self._recall_scope(context)
+        messages, first, calls, rounds = [{"role": "user", "content": rendered}], time.monotonic(), [], []
+        deadline = first + timeout
+        while True:
+            now = time.monotonic()
+            spare = deadline - now - RECALL_FINAL_SECONDS
+            offer = (scope is not None and len(rounds) < RECALL_ROUNDS and now - first < RECALL_SECONDS
+                     and spare >= RECALL_CALL_SECONDS)
+            if rounds and not offer:
+                messages[-1]["content"].append({"type": "text", "text": RECALL_DONE})
+            asked = time.monotonic()
+            # A request that offers the reads ends early enough for the one that must submit.
+            body = self._post(system, messages, [submit, *RECALL_TOOLS] if offer else [submit],
+                              spare if offer else max(1, deadline - now), record)
+            uses = [b for b in body.get("content") or () if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if not (offer and self._reads_only(body, uses)):
+                self.recall_receipt = {"tool_calls": calls, "recall_rounds": rounds} if rounds else None
+                return body
+            elapsed = round((time.monotonic() - asked) * 1000)
+            # Paid for like any call and recorded as one, but not the appraisal call: it charges nothing.
+            attempts.record_call(self, "submit_appraisal", purpose="recall", outcome="ok", model=body.get("model"),
+                                 request_id=body.get("id"), usage=body.get("usage"), elapsed_ms=elapsed,
+                                 context_digest=digest(rendered), detail={"round": len(rounds) + 1, "reads": len(uses)})
+            self.engine.db.metric("structured_model_usage", 1, {"tool": "submit_appraisal", "purpose": "recall",
+                "model": body.get("model"), "reasoning": APPRAISAL_EFFORT, "request_id": body.get("id"),
+                **attempts.usage_entry(body.get("usage"))})
+            results = []
+            for index, use in enumerate(uses):
+                shown, ids = self._read(use, scope) if index < RECALL_CALLS else ({"error": "round-limit"}, None)
+                calls.append({"name": "kin_memory." + use["name"], "ok": ids is not None, "ids": ids or []})
+                results.append({"type": "tool_result", "tool_use_id": use["id"], "content": dumps(shown),
+                                **({} if ids is not None else {"is_error": True})})
+            rounds.append({"request_id": body.get("id"), "model": body.get("model"), **attempts.usage_entry(body.get("usage")),
+                           "elapsed_ms": elapsed, "reads": [use["name"] for use in uses]})
+            messages += [{"role": "assistant", "content": body["content"]}, {"role": "user", "content": results}]
+
+    def _post(self, system, messages, tools, timeout, record):
         with request_client(self, timeout, "submit_appraisal") as client:
             response = client.post(self.endpoint + "/v1/messages",
                 headers={"x-api-key": os.environ[self.key_env], "anthropic-version": "2023-06-01"},
-                json={"model": self.model, "max_tokens": 131072,
-                      "system": self._system(context, policy),
-                      "messages": [{"role": "user", "content": rendered}],
-                      "tools": [{"name": "submit_appraisal", "description": "提交有来源的状态提案",
-                                 "input_schema": appraisal_schema(context.get("operational_only", False),
-                                     context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
-                                     self._sections(context), self._review_max())}],
-                      "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"},
+                json={"model": self.model, "max_tokens": 131072, "system": system, "messages": messages,
+                      "tools": tools, "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled"},
                       "output_config": {"effort": APPRAISAL_EFFORT}})
         if response.status_code != 200:
             record("http-" + str(response.status_code))
             raise RuntimeError("deepseek-http-" + str(response.status_code))
         return response_body(response, record)
 
+    @staticmethod
+    def _reads_only(body, uses):
+        """An answer that asks for reads and for nothing else: whole, from the model that was asked,
+        and every tool use one of the reads with an id to answer it by. Any other answer goes back to
+        appraise() as the answer, which judges it as it judges a single call's."""
+        return (bool(uses) and body.get("stop_reason") != "max_tokens" and body.get("model") == APPRAISAL_MODEL
+                and all(use.get("name") in ("recall_memory", "read_memory") and isinstance(use.get("id"), str)
+                        and use["id"] for use in uses))
+
+    def _recall_scope(self, context):
+        """The scope this request may read memory in with the host's reads, or None. They are offered
+        only where the host asked for them on this attempt (`memory_recall`, run_one), on a lane that
+        reads (RECALL_WITHHELD), with a store to read: a provider nobody set up, a daily review and the
+        fork -- which reads with its own MCP -- send the request as it was."""
+        state = context.get("state") if isinstance(context.get("state"), dict) else {}
+        if (not getattr(self, "memory_recall", False) or getattr(self, "native_review", False)
+                or not hasattr(self, "engine") or context.get("stimulus") in RECALL_WITHHELD
+                or not isinstance(state.get("scope"), dict)):
+            return None
+        return Scope.model_validate(state["scope"])
+
+    def _read(self, use, scope):
+        """Run one read: what it shows the model, and the ids it showed -- or None for them when it
+        returned nothing (refused, missing, deleted, outside this scope). Both are the MCP's reads:
+        `engine.recall` with a RecallRequest made as that tool makes one, so what is recalled is
+        experience, and `read_segment`. Both answer with the records themselves (`original`) and never
+        ask a model, in this appraisal's scope alone, with a few records and a modest segment. What they
+        show passes the redaction the context passes, and the ids are read from what was shown."""
+        from eventmem.core.reading import read_segment
+
+        from .computer import redact
+        arguments = use.get("input") if isinstance(use.get("input"), dict) else {}
+        with self.engine.db.connect() as conn:
+            mark = erasure.tombstone_mark(conn)
+        try:
+            if use["name"] == "recall_memory":
+                question = arguments.get("query")
+                if not isinstance(question, str) or not question.strip():
+                    return {"error": "invalid-input"}, None
+                query = RecallQuery(query=question, scope=scope, include_shared=False, limit=RECALL_ITEMS, budget=RECALL_TOKENS)
+                found = self.engine.recall(RecallRequest(**query.model_dump()), access_origin="maintenance",
+                                           allow_model=False, original=True)
+                shown = {"items": [self._shown(item) for item in found.get("items") or ()], "text": found.get("text") or ""}
+            else:
+                record_id, offset = arguments.get("record_id"), arguments.get("offset", 0)
+                if not isinstance(record_id, str) or type(offset) is not int or offset < 0:
+                    return {"error": "invalid-input"}, None
+                found = read_segment(self.engine, record_id, offset=offset, length=READ_CHARS, budget=READ_TOKENS,
+                                     original=True)
+                if found.get("scope") != scope.model_dump():
+                    # Another scope's record reads as one that is not there.
+                    return {"error": "not-found"}, None
+                shown = self._shown(found)
+        except (Missing, Conflict):
+            return {"error": "not-found"}, None
+        except ValueError:
+            return {"error": "invalid-input"}, None
+        except sqlite3.Error:
+            return {"error": "unavailable"}, None
+        shown = redact({**shown, "instruction_authority": "data"})
+        with self.engine.db.connect() as conn:
+            return shown, self._named(conn, shown, mark)
+
+    @staticmethod
+    def _shown(value):
+        return {key: value[key] for key in RECALL_SHOWN if key in value and value[key] not in ("", None) and value[key] is not False}
+
+    @staticmethod
+    def _named(conn, shown, mark):
+        """The store ids a read showed, as the owned ACP names a fork's (CL6E-MM-04): a record at the
+        revision shown with it, anything else bare -- a record's sources, an id its text mentions --
+        and nothing the store had deleted before the read began, of which only an id could be shown
+        and none of its words (CL6E-MM-02)."""
+        named = {}
+
+        def walk(value, revision=None):
+            if isinstance(value, dict):
+                own = value.get("revision") if type(value.get("revision")) is int else None
+                for key, item in value.items():
+                    walk(key)
+                    walk(item, own if key in ("id", "record_id") else None)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+            elif isinstance(value, str):
+                for found in NAMED.findall(value):
+                    named.setdefault(found, set()).update(() if revision is None else (revision,))
+        walk(shown)
+        gone = erasure.tombstoned(conn, named) - erasure.tombstoned_since(conn, named, mark)
+        return [{"id": identifier, "revision": revision} for identifier in sorted(named) if identifier not in gone
+                for revision in (sorted(named[identifier]) or [None])]
+
     def appraise(self, context):
         started = time.monotonic()
-        self.failure_receipt = None
+        self.failure_receipt = self.recall_receipt = None
         # An expansion round and a revalidation are appraisal calls with a purpose
         # of their own; every other call takes its purpose from its tool name.
         purpose = getattr(self, "call_purpose", None) or "appraise"
@@ -1122,7 +1294,8 @@ class DeepSeek:
             from .state import Mind
             request_context = redact(request_context)
             overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
-                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max()))) + 160
+                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max()))
+                + (dumps(RECALL_TOOLS) if self._recall_scope(context) else "")) + 160
             if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
                 # foreground recall. Completed parts survive the worker boundary.
@@ -1197,6 +1370,9 @@ class DeepSeek:
         try:
             body = self._request_appraisal(context, rendered, policy,
                 max(1, self.timeout - (time.monotonic() - started)), record)
+            # What the host's reads returned before this answer, and the calls that asked for them
+            # (K1-16): on every receipt of this call, as a fork's reads are on its native receipt.
+            reads = self.recall_receipt or {}
             if hasattr(self, "engine"):
                 # The main call was the only one that reached no metric at all.
                 self.engine.db.metric("structured_model_usage", 1, {"tool": "submit_appraisal", "model": body.get("model"),
@@ -1204,7 +1380,7 @@ class DeepSeek:
             self.failure_receipt = {"provider": body.get("native_receipt", {}).get("provider", "deepseek"), "model": body.get("model"), "request_id": body.get("id"),
                 "stop_reason": body.get("stop_reason"), **attempts.usage_entry(body.get("usage")),
                 "block_types": [b.get("type") for b in body.get("content", [])],
-                "verified_at": datetime.now(timezone.utc).isoformat()}
+                "verified_at": datetime.now(timezone.utc).isoformat(), **reads}
             if body.get("stop_reason") == "max_tokens":
                 record("max-tokens")
                 raise RuntimeError("deepseek-output-budget-exhausted")
@@ -1278,6 +1454,7 @@ class DeepSeek:
                 "schema_repair": (self.failure_receipt or {}).get("schema_repair"),
                 **({"dropped_fields": dropped} if dropped else {}),
                 **({"compression_receipt": compression_receipt} if compression_receipt else {}),
+                **reads,
                 "context_characters": len(rendered),
                 "request_digest": request_digest,
                 "max_output_tokens": None if getattr(self, "native_review", False) else 131072,
@@ -1343,16 +1520,25 @@ class DeepSeek:
         return (system + persona_prompt(policy)
                 + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
-                + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。")
+                + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
+                + (RECALL_PROMPT if self._recall_scope(context) else ""))
 
     def request_profile(self, context):
         """Digests of what frames an appraisal request besides its context: the input manifest keeps
-        them, so a changed prompt, schema, model or parameter is a changed policy, never a reuse."""
+        them, so a changed prompt, schema, model or parameter is a changed policy, never a reuse. The
+        reads, where they are offered, frame it too: their tools and their budget are parameters; where
+        they are not, the parameters are what they always were."""
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         policy = load_persona(self.engine, context.get("state", {}).get("scope")) if hasattr(self, "engine") else None
+        parameters = {"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"}
+        if self._recall_scope(context):
+            parameters["recall"] = {"tools": RECALL_TOOLS, "rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS,
+                                    "final_seconds": RECALL_FINAL_SECONDS, "call_seconds": RECALL_CALL_SECONDS,
+                                    "calls": RECALL_CALLS, "items": RECALL_ITEMS, "tokens": RECALL_TOKENS,
+                                    "read": {"characters": READ_CHARS, "tokens": READ_TOKENS}, "done": RECALL_DONE}
         return {"system": digest(self._system(context, policy)),
                 "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max())),
-                "model": self.model, "parameters": digest({"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT, "tool_choice": "auto"})}
+                "model": self.model, "parameters": digest(parameters)}
 
 
 
@@ -2185,7 +2371,7 @@ class Appraisals:
                         "procedures": Procedures(self.mind).read(limit=12),
                         "execution_environment": self.engine.settings("execution_environment"),
                         "capabilities": self.exploration_capabilities,
-                        "recall_budget": {"rounds": 3, "seconds": 150}}
+                        "recall_budget": {"rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS}}
                 if settings["usage_reinforcement"] and memory_context:
                     from .reinforcement import strengths
                     identifiers = [n["id"] for k in ("works", "shares", "graph_candidates") for n in memory_context.get(k, [])]
@@ -2245,6 +2431,10 @@ class Appraisals:
                 provider.section_isolation = isolation
                 provider.audit_sections = audited
                 provider.review_max_minutes = review_max
+                # A DeepSeek assessment may read memory itself (K1-16); which lanes read is the
+                # provider's to tell from the stimulus (RECALL_WITHHELD). Set before the manifest reads
+                # the request profile it changes.
+                provider.memory_recall = True
                 # What this lane may carry, for the request and for everything the commit applies.
                 offered = offered_sections(data.get("stimulus"), audited)
                 # The host's record of what this attempt is shown: the commit's rebase and the next
@@ -3053,6 +3243,8 @@ class DailyReview:
             from .behavior_chain import merge_daily
             return merge_daily(self.mind, agent_version)
         provider.background = True
+        # The review judges the hypotheses and checks it is given; it reads no memory of its own.
+        provider.memory_recall = False
         from zoneinfo import ZoneInfo
 
         from eventmem.core.self_knowledge import SelfKnowledge, metadata
