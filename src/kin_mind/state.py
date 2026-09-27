@@ -1371,6 +1371,11 @@ class Mind(Continuity):
         from .history import before
         previous = before(conn, self.scope.key(), row["revision"])
         for key, old in state["dimensions"].items():
+            if key not in previous["profile"]["dimensions"]:
+                # An old evolution never changed a dimension introduced by a later
+                # release. Keep its current definition and trajectory on reversion.
+                previous["profile"]["dimensions"][key] = deepcopy(state["profile"]["dimensions"][key])
+                continue
             spec = previous["profile"]["dimensions"][key]
             old.update(
                 score=project(old, self.clock()),

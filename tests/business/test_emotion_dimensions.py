@@ -176,3 +176,51 @@ def test_migration_does_not_revive_unavailable_initialization_evidence(setup):
     assert all(view["dimensions"][key]["needs_review"] for key in NEW)
     with mind.engine.db.connect() as conn:
         assert all(not mind._load(conn)["dimensions"][key]["evidence"] for key in NEW)
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_reverting_pre_upgrade_evolution_keeps_new_dimensions(setup, monkeypatch, migrated):
+    from test_history_layer import evolve, revert
+    mind, source, clock = setup
+    as_older_release(mind)
+    # Produce genuine pre-upgrade history through the old event behavior.
+    with monkeypatch.context() as patch:
+        patch.setattr(mind, "_ensure_dimensions", lambda *args, **kwargs: [])
+        mind.record(event(mind, source, "old-snapshot", {"mood": 65}))
+        changed = evolve(mind, source, clock)
+    if migrated:
+        mind.extend_dimensions(agent_version="synthetic-v2")
+        mind.record(event(mind, source, "new-joy", {"joy": 83}))
+        with mind.engine.db.connect() as conn:
+            held = deepcopy({key: mind._load(conn)["dimensions"][key] for key in NEW})
+    revert(mind, source, clock, changed["event_id"])
+    with mind.engine.db.connect() as conn:
+        state = mind._load(conn)
+    assert len(state["dimensions"]) == len(state["profile"]["dimensions"]) == 28
+    assert state["dimensions"]["curiosity"]["baseline"] == 75
+    if migrated:
+        assert {key: state["dimensions"][key] for key in NEW} == held
+    else:
+        assert all(state["dimensions"][key]["score"] == DIMENSIONS[key]["baseline"] for key in NEW)
+    assert mind.extend_dimensions(agent_version="synthetic-v2") == {"state": "unchanged"}
+
+
+def test_migration_preserves_evolved_baseline_and_active_motivation(setup, monkeypatch):
+    from test_history_layer import evolve
+    mind, source, clock = setup
+    as_older_release(mind)
+    with monkeypatch.context() as patch:
+        patch.setattr(mind, "_ensure_dimensions", lambda *args, **kwargs: [])
+        evolve(mind, source, clock)
+        request = event(mind, source, "motivated", {"curiosity": 90})
+        request = AffectiveEvent.model_validate({**request.model_dump(), "motivations": {
+            "curiosity": {"target": 95, "half_life_minutes": 60, "reason": "A live research goal"}}})
+        mind.record(request)
+    with mind.engine.db.connect() as conn:
+        before = deepcopy(mind._load(conn))
+    mind.extend_dimensions(agent_version="synthetic-v2")
+    with mind.engine.db.connect() as conn:
+        after = mind._load(conn)
+    assert before["dimensions"]["curiosity"]["baseline"] == 77
+    assert before["dimensions"]["curiosity"]["motivation"]
+    assert all(after["dimensions"][key] == value for key, value in before["dimensions"].items())
