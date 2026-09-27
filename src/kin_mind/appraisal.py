@@ -471,8 +471,8 @@ AUDIT_SECTION_SWITCH = {"trait_observations": "trait_ledger", "trait_decisions":
 SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continuity-bootstrap", "session-maintenance"}
 # One short paragraph per section, appended only where that section is offered. Each belongs to the
 # module that applies the section: it replaces its own paragraph here and nothing else.
-TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法，也包括有来源的日记与反思。反思形成的新认识可以影响性格；保留其想法性质，不把想象当作外部事实，也不把同一篇日记的重读或复述算成新的经历。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、计时唤醒等宿主内部运行记录不能作证据。category 与 slug 决定这条证据归哪条特征，同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
-TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历或形成新认识的反思，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。"
+TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法，也包括有来源的日记与反思。反思形成的新认识可以影响性格；保留其想法性质，不把想象当作外部事实，也不把同一篇日记的重读或复述算成新的经历。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、计时唤醒等宿主内部运行记录不能作证据。category 与 slug 决定这条证据归哪条特征：category 取 state.traits.categories 允许的类型，为 all 时任何类型都可以，同一类沿用已有特征的 category，不另起近义的新名。同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
+TRAIT_DECISIONS_PROMPT = "trait_decisions 决定这些特征怎么变：propose 提出候选（候选立刻生效，用 observation_refs 指认它依据的观察），establish 转为成立，revise 改写，fade 让它淡出，restore 恢复，revoke 撤销。basis=inference 的 establish 需要至少两段互不相同的经历或形成新认识的反思，并在 episodes 里点名两条观察并写明为何是不同的经历；宿主只核经历与证据，不判断特征本身。basis=owner_instruction 或 owner_correction 要在 quote 里逐字引用用户当前的原话，撤销只走这条路。改动已有特征带上 trait_id 与 expected_revision；被撤销的特征需要更新的用户原话才能重提。反思形成的新认识可以直接提出、确立，不必等用户确认每一次成长；用户的更正始终优先。"
 SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
@@ -641,6 +641,7 @@ wish-review请求你确认一个已有联系或探索意图；按kind复核它�
 SYSTEM += """
 连续性字段只在 state.continuity.features 的对应项启用时填写：
 understanding 保存事件含义、话题、重要程度、置信度与来源。basis=explicit 表示用户明确陈述，inferred 表示你的解读，internal_thought 表示自己的念头；解释写简短结论。低把握的关系解读标为 inferred 并保留低置信度。
+日记与反思：understanding 以 basis=internal_thought 写下的，是 Kin 自己的日记与感想。它存进共同记忆，之后可以回忆；也可以作为依据，经 trait_observations 与 trait_decisions 让性格成长，经 plan_changes、wishes、concerns 影响后续安排。没有用户新消息的内部评估（空闲、复核、节律、探索结算）最适合写：meaning 用自然中文写此刻真实的想法、感受或新认识，topic 写主题，evidence_ids 关联已有的真实来源。recent_reflections 是最近几篇日记（引用用 source_id），today_count 是今天（Asia/Singapore）已写的篇数：今天还没写、又有想法时写一篇；没有新想法就不写，不为写而写。日记是自己的想法，不当作外部事实；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。
 concerns 是心事变更，涵盖 care、anticipation、curiosity、distress、shared_plan。每件心事有稳定 key，先更新已有编号。create 要填 key、kind、content、topic、intensity、basis、confidence、reason；update/ease/resolve/reopen/archive 使用 concern_id。来源引用使用本次 new_evidence 中的 id，也可使用 state 中既有且有效的 evidence_ids。心事与愿望分别保存；发过询问不表示事情已经解决。resolve 需要新的结果或更正来源；已结束心事保持原状态，新发生的同类事情可以明确 reopen。相同经历的摘要只补充关联，不重复提高强度。
 wishes.concern_ids 和 wish_updates.concern_ids 关联已有心事编号，或同一结果中新建心事的 key。给已有愿望建立关联使用 action=link；心事变更后，需要继续的愿望通过 resume/link 确认当前依据。待核验心事先保留，不建立依赖它的可执行愿望。
 rhythm 采用 interaction-led 模式，依据 state.rhythm.interactions 的14天真实互动窗口、表达活力和当前话题，提出 phase、alertness、target、half_life_minutes 和 reason。phase 为 awake、settling、drowsy、resting、roused、recovering；速度为20、60、180分钟。没有固定入睡或起床时刻。forming 是样本形成期，phase 属于角色运行状态，不是观察到的生理睡眠。后台事件不算用户活跃；维护结果和发送回执本身不改变作息判断。有新互动或对当下节奏的新认识时再更新。
@@ -754,7 +755,7 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
 
 SYSTEM += """
 自主规则由 autonomy_context 启用。结合共同记忆、最近四轮公开聊天、未完成事项、作品、探索结果和已分享内容决定下一步；目标不限类别。材料不够时，直接用只读记忆工具去查，本回合查到的记录可以作为证据引用；不用关键词或分数替代判断。查过仍不确定时，等还是做由你决定。
-plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。
+plans_enabled=true 时用 plan_changes 建立持久计划。先查看已有计划，更新稳定 id；长期目标不设置固定七天过期。步骤 actor 是 explore/create/contact/owner；时间按 Asia/Singapore，not_before/not_after 表示窗口，next_review_at 是重新判断时间。依赖只引用同计划步骤，completion 写清真实完成依据。每个更改给出来源、原因和 expected_revision；新计划用 key 引用，初始 revision=1。recent_reflections 里的日记也可以作为 plan_changes、wishes 与 concerns 的依据，引用它的 source_id。
 到期只触发复核。state.expired_unsettled_wishes 是过了期限还没结算的愿望：过期不是结论，按实际情况用 wish_updates 标为 complete 或 abandon。用 action_decisions 对当前步骤决定 execute/wait/abandon；不会因到点自动执行。执行时自然说明原有 preconditions 的满足情况，不必逐字复述；时间窗口错过则改期后再决定，不能集中补发。计划变化后旧决策失效。可以规划今晚制作、明天交付，或者等用户给照片；用户步骤以 owner_request_id 关联心事。提出、发出、答应、完成分别记录。owner_accepted/owner_completed/owner_declined 需要真实用户反馈来源，不能从沉默、发出邀请或模型猜测推断答应。Kin 的完成由宿主核验结果，action_decisions 不能把工作直接标为完成。交付文件时，在 contact 步骤的 artifact_hashes 中选择同计划已完成步骤回执内的文件哈希；不能自己声称文件存在。非文本作品需要真实内容核验结果，证据不足应补做核验。
 同一计划本轮多个 action_decisions 使用相同当前 expected_revision，plan_changes 后使用变更后的 revision。create/explore/contact 分别是制作计算、调查研究、经既有渠道交付；执行助手只收到选择的目标、资料、缺口和完成要求，不修改共享状态，不自行发消息。创作与探索为当前用户任务让路。
 procedure_learning=true 时，从实际任务结果提出 procedure_candidates。result_ids 只能引用三种已核验的结果：回执显示 state=completed 且 verified=true 的计划步骤 run_id、已接收(accepted)的交付、或 verified=true 的任务结果。被打断或未核验的运行、只有产物没有核验的任务、以及聊天里对做过什么的描述都不算；没有这样的结果就把 procedure_candidates 留空。方法保存条件、步骤、工具环境、成功标准、失败反例；候选不等于当前可执行方法，独立验证由宿主完成。已有方法先读适用条件，再在行动中选择 procedure_ids；不能修改人设或新增权限。
@@ -1340,7 +1341,7 @@ class DeepSeek:
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
         return (system + persona_prompt(policy)
-                + ("\n本轮仅提交当前情绪、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
+                + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。")
 
@@ -1378,7 +1379,7 @@ class NativeReview(DeepSeek):
 
     def _system(self, context, policy):
         # The main session already loads the approved persona once as stable instructions.
-        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做。反思形成的新认识也能影响性格，通过已有 trait_observations 与 trait_decisions 记录；不必等小光确认每次成长。想记感想时，understanding.meaning 使用自然中文，basis=internal_thought，关联已有真实来源；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空；空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
+        return super()._system(context, None) + "\n本轮由当前主会话评估，沿用当前实际模型。日记和活动均可选择不做，日记的写法见上；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空；空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
 
     def request_profile(self, context):
         return {**super().request_profile(context), "parameters": self.profile}
@@ -2128,6 +2129,10 @@ class Appraisals:
                 recent = recent_dialogue(self.mind)
                 model_context.update(clock=clock_context(self.mind.clock()), recent_dialogue=recent,
                                      exploration_targets=targets)
+                if not historical and not maintenance:
+                    # Kin's latest diaries: a reflection reaches what Kin plans and who Kin becomes only
+                    # through an assessment that sees it, and cites it as the evidence below allows.
+                    model_context["recent_reflections"] = self.memory.recent_reflections()
                 if self.session_context and not historical:
                     model_context["session_context"] = self.session_context
                 if maintenance:
@@ -2198,7 +2203,8 @@ class Appraisals:
                     flags = manifests.switches(conn, self.mind.scope.key())
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
-                    for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent]:
+                    for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent,
+                                        *model_context.get("recent_reflections", {}).get("entries", [])]:
                         try:
                             recent_refs = self.mind._evidence(conn, [interaction["source_id"]])
                             if not self.mind._fresh(conn, recent_refs):

@@ -25,7 +25,7 @@ import math
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.persona import load_persona, validate_trait_changes
+from eventmem.core.persona import load_persona, mutable_trait, trait_categories, validate_trait_changes
 from eventmem.core.read_policy import ReadPolicy
 
 from . import appraisal
@@ -156,7 +156,7 @@ class Traits:
         approved is refused here, before anything about it is stored."""
         name = canonical(category)
         policy = load_persona(self.engine, self.mind.scope)
-        if policy and name not in policy["mutable_trait_keys"] and (category or "").strip() in policy["mutable_trait_keys"]:
+        if not mutable_trait(policy, name) and mutable_trait(policy, (category or "").strip()):
             name = (category or "").strip()
         validate_trait_changes(policy, {name: sample})
         return name
@@ -509,9 +509,20 @@ class Traits:
         refused = appraisal.last_refusal(conn, self.scope)
         return {"established": [t for t in shown if t["stored_status"] == "established"],
                 "candidate": [t for t in shown if t["stored_status"] != "established"],
+                # The types the owner's contract lets change, so a category is chosen from them
+                # rather than refused after the fact (the gate itself is _allowed_category's).
+                "categories": self._categories(),
                 # Only what this projection owns: why the host refused an observation or a decision.
                 "last_refusal": {k: v for k, v in refused.items() if k in SECTIONS},
                 "window": {"included": len(shown), "total": len(rows)}}
+
+    def _categories(self):
+        """What the contract lets change; a contract that needs the host's review answers nothing here
+        and still refuses at the gate, so the state stays readable."""
+        try:
+            return trait_categories(load_persona(self.engine, self.mind.scope))
+        except ValueError:
+            return None
 
     def corrections(self, conn, limit=SHOWN_CORRECTIONS):
         """What a correction ended, with the source that ended it."""

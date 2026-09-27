@@ -99,6 +99,27 @@ def persona_prompt(policy):
 
 
 
+# In `mutable_trait_keys`: every type of trait may change. The owner approves it in the contract,
+# as for any listed type (小光 2026-09-27: "人格契约所有类型都应该能改变哦"). It widens only what
+# conversation and reflection may grow into a trait; core, voice and maintenance stay as approved.
+ALL_TRAIT_TYPES = "*"
+
+
+def mutable_trait(policy, category):
+    """Whether the owner's contract lets a trait of `category` change (no contract: any)."""
+    if not policy:
+        return True
+    keys = policy["mutable_trait_keys"]
+    return ALL_TRAIT_TYPES in keys or category in keys
+
+
+def trait_categories(policy):
+    """The trait types the contract lets change, as an appraisal is shown them: "all", or the list."""
+    if not policy or ALL_TRAIT_TYPES in policy["mutable_trait_keys"]:
+        return "all"
+    return list(policy["mutable_trait_keys"])
+
+
 def validate_trait_changes(policy, traits):
-    if policy and set(traits) - set(policy["mutable_trait_keys"]):
+    if policy and any(not mutable_trait(policy, name) for name in traits):
         raise ValueError("Core persona changes require explicit owner approval")

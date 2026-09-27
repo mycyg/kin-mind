@@ -67,6 +67,10 @@ REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
 # caller that still carries one is not refused for it: it is left out when read, and dropped from
 # the configuration the next time it is written.
 RETIRED_SETTINGS = frozenset({"chunked_reply_review", "rest_review_window", "review_rest_max_minutes"})
+# Kin's own diary (kin-reflection sources) as an assessment is shown it: the latest few, each the start
+# of what was thought. Small on purpose: structured context the compressor leaves as it is.
+REFLECTIONS_SHOWN = 5
+REFLECTION_EXCERPT = 200
 
 DEFAULTS = {"native_window_context": False, "records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
@@ -881,6 +885,34 @@ class MemoryContinuity:
                       "host_event": "diary", "topic": understanding.get("topic"), "appraisal_event_id": result["event_id"],
                       "evidence_ids": understanding.get("evidence_ids", []),
                       "confidence": understanding.get("confidence")}), derived_from=derived_from, shown=shown)
+
+    def recent_reflections(self, limit=REFLECTIONS_SHOWN):
+        """Kin's latest diary entries (kin-reflection sources, newest first), for an assessment to read
+        and cite: a diary reaches what Kin plans and who Kin becomes only through an assessment that
+        sees it. Each is the source to cite, when, its topic and the start of what was thought; with
+        how many were written today (Asia/Singapore), so a day without one can have one."""
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo("Asia/Singapore")
+        day = lambda at: timestamp(at).astimezone(zone).date().isoformat()
+        today = day(self.mind.clock())
+        with self.engine.db.connect() as conn:
+            rows = conn.execute("SELECT id,occurred_at,data FROM sources WHERE namespace='kin-reflection' AND scope=? AND deleted=0"
+                                " ORDER BY occurred_at DESC,id DESC LIMIT ?", (self.scope.key(), max(1, limit * 4))).fetchall()
+        entries, today_count = [], 0
+        for row in rows:
+            if row["occurred_at"] and day(row["occurred_at"]) == today:
+                today_count += 1
+            if len(entries) >= limit:
+                continue
+            try:
+                text = self.engine.source(row["id"], content=True).read_text()
+            except (Missing, OSError):
+                continue
+            meaning = text.split("\n", 1)[1] if "\n" in text else text
+            metadata = (json.loads(row["data"]) if row["data"] else {}).get("metadata") or {}
+            entries.append({"source_id": row["id"], "at": row["occurred_at"], "topic": metadata.get("topic"),
+                            "excerpt": meaning.strip()[:REFLECTION_EXCERPT]})
+        return {"today_count": today_count, "entries": entries}
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None):
         """Called inside the same transaction as affect/concerns/wishes.
