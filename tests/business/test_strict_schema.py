@@ -151,3 +151,10 @@ def test_a_strict_answer_to_the_assessment_validates():
     appraisal = A.Appraisal.model_validate(decode(schema, answer))
     assert appraisal.values == {"curiosity": 64} and appraisal.motivations["curiosity"].target == 70
     assert appraisal.next_review_minutes == 20 and appraisal.wishes == []
+
+
+@pytest.mark.parametrize("keys", [("mood", "mood"), ([],), (1,)])
+def test_map_entries_cannot_silently_overwrite_or_use_non_string_keys(keys):
+    schema = Sample.model_json_schema()
+    with pytest.raises(ValueError, match="strict-map-key-invalid-or-duplicate"):
+        decode(schema, {"values": [{"key": key, "value": 50} for key in keys]})

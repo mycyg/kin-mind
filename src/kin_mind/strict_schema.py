@@ -203,7 +203,13 @@ def _decode(node, value, definitions):
     if shape == "map":
         values = _map_values(node)
         if isinstance(value, list) and all(isinstance(entry, dict) and set(entry) == {"key", "value"} for entry in value):
-            return {entry["key"]: _decode(values, entry["value"], definitions) for entry in value}
+            decoded = {}
+            for entry in value:
+                key = entry["key"]
+                if not isinstance(key, str) or key in decoded:
+                    raise ValueError("strict-map-key-invalid-or-duplicate")
+                decoded[key] = _decode(values, entry["value"], definitions)
+            return decoded
         # A dict answered as a dict (the original shape): its typed values are read on; values of any
         # shape stay exactly as given, a string never taken for JSON text.
         if isinstance(value, dict) and values:
