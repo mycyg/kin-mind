@@ -244,14 +244,15 @@ def dispatch(config, action, request):
         return backfill(mind, apply=bool(request.get("apply")), batch=request.get("batch", BATCH))
     if action in {"desire-archive", "desire-unarchive"}:
         # Operator actions. Neither writes without `--apply`, and the dry run asks for no flag at
-        # all: it reads what would move and what holds everything else, which is what makes it
-        # safe against a copy of a live store. The restore is never gated by the flag, because it
-        # is what runs before a rollback to a release that cannot see the archive.
-        from .desire_archive import DAYS, archive, restore
+        # all: it reads what the retention rule would keep, move and let go, and what holds the
+        # rest, which is what makes it safe against a copy of a live store. `days` and `keep`
+        # override the configured rule for this run only. The restore is never gated by the flag,
+        # because it is what runs before a rollback to a release that cannot see the archive.
+        from .desire_archive import archive, restore
         if action == "desire-unarchive":
             return restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
-        return archive(mind, apply=bool(request.get("apply")), days=request.get("days", DAYS),
-                       limit=request.get("limit"))
+        return archive(mind, apply=bool(request.get("apply")), days=request.get("days"),
+                       keep=request.get("keep"), limit=request.get("limit"))
     if action in {"exploration-decision-archive", "exploration-decision-unarchive"}:
         # Operator actions, as the wish archive's: neither writes without `--apply`, the dry run
         # needs no flag, and the restore is never gated because it runs before a rollback.
@@ -260,6 +261,19 @@ def dispatch(config, action, request):
             return decisions.restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
         return decisions.archive(mind, apply=bool(request.get("apply")), days=request.get("days", decisions.DAYS),
                                  keep=request.get("keep", decisions.KEEP), limit=request.get("limit"))
+    if action in {"archive-memory", "archive-memory-backfill"}:
+        # Operator actions. Without `--apply` both only read: the queue's counts, or what the
+        # backfill would queue and the calls that would take. `archive-memory --apply` runs one
+        # batch now (one paid DeepSeek call at most); `retry_failed` first puts back what ran out
+        # of attempts. `archive-memory-backfill --apply` queues what was archived before, once.
+        from . import archive_memory
+        if action == "archive-memory-backfill":
+            return archive_memory.backfill(mind, apply=bool(request.get("apply")), kinds_wanted=request.get("kinds"))
+        if not request.get("apply"):
+            return archive_memory.status(mind)
+        retried = archive_memory.retry_failed(mind) if request.get("retry_failed") else 0
+        return {**archive_memory.run(mind, DeepSeek.from_engine(engine), limit=request.get("limit", archive_memory.BATCH)),
+                **({"retried": retried} if retried else {})}
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -411,6 +425,12 @@ def dispatch(config, action, request):
     if action == "review-enrichment":
         if config.get("review_paused") or not memory.settings()["operational_lanes"]:
             return {"state": "paused"}
+        if not request.get("job_id"):
+            # The background lane also writes the memories of archived records (archive_memory):
+            # when it has no job of its own to run, or when they have waited an hour for it.
+            from . import archive_memory
+            if archive_memory.due(mind, waited=0 if not jobs.runnable("enrichment") else archive_memory.STARVED_SECONDS):
+                return archive_memory.run(mind, DeepSeek.from_engine(engine))
         return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment", job_id=request.get("job_id"))
     def review_provider():
         if config.get("main_session_review"):
@@ -455,6 +475,13 @@ def dispatch(config, action, request):
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
         result = run() if run else None
         plans.sync_wishes()
+        if run and isinstance(result, dict) and result.get("state") == "complete":
+            # After a committed assessment the retention rule runs (desire_archive): a read that
+            # finds nothing to move writes nothing, and a move is one revision of its own.
+            from .desire_archive import retain
+            retention = retain(mind)
+            if retention["state"] not in {"disabled", "idle"}:
+                result = {**result, "desire_retention": retention}
         actions.drain(jobs)
         # Settled exploration decisions leave the document once nothing reads them there: only with
         # `exploration_decision_archive` on, and one count query a minute while nothing can move.
@@ -480,6 +507,10 @@ def dispatch(config, action, request):
         if request.get("tick", True):
             review_minute()
         due = {lane: jobs.runnable(lane) for lane in ("action", "enrichment")}
+        if not due["enrichment"] and memory.settings()["operational_lanes"]:
+            # The memories of archived records are the background lane's work too (archive_memory).
+            from .archive_memory import due as memories_due
+            due["enrichment"] = memories_due(mind) > 0
         # The day's review has a gate of its own now: the host starts it only when there is something
         # to merge or evaluate, never to be told again that it is still waiting.
         return {"state": "due" if any(due.values()) else "idle", **due, "daily": DailyReview(mind).due()}
@@ -619,7 +650,8 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 # are told to write. Every one of them defaults to a dry run.
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
                  "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage",
-                 "exploration-decision-archive", "exploration-decision-unarchive")
+                 "exploration-decision-archive", "exploration-decision-unarchive",
+                 "archive-memory", "archive-memory-backfill")
 
 
 # The resident worker's actions (§5.7): short reads and writes on the store, no model call and

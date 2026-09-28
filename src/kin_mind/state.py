@@ -364,11 +364,12 @@ class Mind(Continuity):
         # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
         self._curves = {}
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
+        from .archive_memory import SCHEMA as ARCHIVE_MEMORY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
-                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA):
+                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA):
             return
         with self.engine.db.connect() as conn:
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
@@ -1172,14 +1173,14 @@ class Mind(Continuity):
     def _desire(self, conn, state, identifier):
         """The wish this identifier names, wherever it now lives.
 
-        A finished wish may have been moved to the archive to keep it out of a document that is
-        written again on every revision. It is still that wish: the same identifier, the same plan
-        links, the same evidence and the same receipt. Every reader that asks for a wish by its
-        identifier asks here, so a move can never turn a wish that exists into one that does not —
-        which would cost a dedupe, and a duplicate message after it.
+        A wish the retention rule moved -- finished, or let go unfinished -- lives in the archive,
+        out of a document that is written again on every revision. It is still that wish: the same
+        identifier, the same plan links, the same evidence and the same receipt. Every reader that
+        asks for a wish by its identifier asks here, so a move can never turn a wish that exists
+        into one that does not -- which would cost a dedupe, and a duplicate message after it.
 
-        What comes back from the archive is a copy of a finished wish, so writing to it writes
-        nowhere. Every path that changes a wish refuses a finished one before it reaches this."""
+        What comes back from the archive is a copy, so writing to it writes nowhere. Every path
+        that changes a wish refuses an archived one before it reaches this."""
         desire = state["desires"].get(identifier)
         if desire is not None:
             return desire
@@ -1243,6 +1244,12 @@ class Mind(Continuity):
             did = request.desire_id
             if did not in state["desires"]:
                 if self._desire(conn, state, did) is not None:
+                    from .desire_archive import let_go
+                    if let_go(conn, self.scope.key(), did):
+                        # Let go unfinished by the retention rule: it drives nothing any more, and
+                        # what it wanted is raised again as a new wish, which it does not block.
+                        raise Conflict("A wish that was let go stays in its archive; create a new desire",
+                                       code="desire-let-go", target=did)
                     # An archived wish is a finished wish that has moved, so it earns the refusal
                     # a finished wish earns — not the one for a wish that was never here.
                     raise Conflict("A finished desire stays in history; create a new desire")

@@ -913,8 +913,12 @@ def appraisal_context(context):
     if unsettled:
         state["expired_unsettled_wishes"] = [{k: d.get(k) for k in ("id", "kind", "status", "topic", "content", "completion", "expires_at", "revision")}
                                              for d in unsettled[:12]]
-    completed_desires = [d for d in all_desires if d not in active_desires]
-    chosen_desires = sorted(active_desires, key=lambda d: (d.get("updated_at", ""), d["id"]), reverse=True)[:16] + completed_desires[-8:]
+    # The finished tail: the most recently active of what the retention rule keeps, newest last, so
+    # it never shows a wish the rule would move (desire_archive.WINDOW).
+    from .desire_archive import WINDOW, activity
+    completed_desires = sorted((d for d in all_desires if d not in active_desires),
+                               key=lambda d: (activity(d) is not None, activity(d) or 0, d["id"]))
+    chosen_desires = sorted(active_desires, key=lambda d: (d.get("updated_at", ""), d["id"]), reverse=True)[:16] + completed_desires[-WINDOW:]
     for desire in chosen_desires:
         active = desire.get("status") in {"wanted", "waiting", "in_progress"} and not desire.get("expired")
         # `trait_needs_review` is only ever there when this wish really was committed on a trait, so

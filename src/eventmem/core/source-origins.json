@@ -32,7 +32,7 @@
       "experience_recall": true,
       "evidence": true,
       "indexed": true,
-      "meaning": "Kin's own diary and reflections. Recalled, and always shown as Kin's thought, never as what the owner said or as a confirmed fact."
+      "meaning": "Kin's own diary and reflections, and her short memories of archived records. Recalled, and always shown as Kin's thought, never as what the owner said or as a confirmed fact."
     },
     "observation": {
       "class": "experience",
@@ -64,6 +64,7 @@
     "synthetic-example": "synthetic_example",
     "synthetic-example:*": "synthetic_example",
     "kin-reflection": "kin_thought",
+    "kin-archive-memory": "kin_thought",
     "kin-exploration": "observation",
     "kin-computer-observation": "observation",
     "kin-web-observation": "external_excerpt"

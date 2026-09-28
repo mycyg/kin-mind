@@ -922,6 +922,13 @@ class AutonomousPlans:
                     # this decision, so this would make the same wish over again, with the contact
                     # it already had still to come.
                     desire = self.mind._desire(conn, state, did) if did else None
+                    if desire is not None and did not in state["desires"] and desire.get("status") not in {"completed", "abandoned"}:
+                        # Let go unfinished by the retention rule: the decision it came from is not
+                        # made into it again, and a new decision makes a new wish, which it does not
+                        # block (desire_archive).
+                        if desire.get("plan_decision_id") == step["decision"]["id"]:
+                            continue
+                        desire = None
                     if not ready and not desire:
                         continue
                     if desire and desire.get("plan_decision_id") == step["decision"]["id"]:

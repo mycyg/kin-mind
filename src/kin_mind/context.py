@@ -1034,6 +1034,16 @@ class Contexts:
             # A paged evidence read prioritizes the question's ranked evidence;
             # broad background and affect stay available on later pages.
             items = [*recalled, *items]
+        if explicit and query:
+            # Kin's short memories of archived records (a wish let go, a decision taken) that the
+            # question's words match: first, and few, each naming the whole record and the tool that
+            # reads it, since what the mind made from the store would otherwise fill the page before
+            # any record is reached (archive_memory).
+            from .archive_memory import recall_items
+            archived = recall_items(self, query, policy)
+            if archived:
+                lead = {"host-runtime", "current-intent"}
+                items = [*[i for i in items if i["id"] in lead], *archived, *[i for i in items if i["id"] not in lead]]
         unique = {}
         for item in items:
             unique.setdefault(item["id"], item)

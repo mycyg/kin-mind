@@ -35,8 +35,10 @@ import json
 from eventmem.core.db import digest, dumps, tombstoned
 
 JUDGMENT_CACHE = "semantic_cache_v2"
-# The clock is part of an appraisal request; the same question is never asked twice.
-NEVER_CACHED = frozenset({"submit_appraisal"})
+# The clock is part of an appraisal request; the same question is never asked twice. The memories
+# of archived records are written once per item by their own queue (archive_memory): a cached answer
+# would only be one more copy of a record's words for an erase to find.
+NEVER_CACHED = frozenset({"submit_appraisal", "submit_archive_memories"})
 TTL_SECONDS = 300
 MAX_VALIDITY_SECONDS = 86400
 # Bounded so one wide context cannot grow the dependency index without limit.

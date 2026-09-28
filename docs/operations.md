@@ -172,49 +172,94 @@ Rows that keep their whole document are the first row, every fiftieth row, every
 
 ## Wish archive
 
-The state document carries every wish that was ever made and is written again on every revision;
-most of those wishes end up finished, completed or abandoned. `mind_desire_archive` holds the
-finished ones that nothing is still waiting on, whole — the same identifier, the same plan links,
-the same evidence references, the same decision receipt — and the document carries only what is
-still live plus the tail of finished wishes the appraisal projection shows.
+The state document is written again on every revision, held whole in memory and projected into
+every assessment. On 2026-09-28 it passed the two million characters the resident worker takes back
+from a read, and the proactive contact that reads it stopped. So the document keeps only the recent
+wishes, by a rule the owner set that day, and `mind_desire_archive` holds the rest, whole -- the
+same identifier, plan links, evidence references and decision receipt.
+
+**The rule.** The document keeps the wishes whose latest activity -- made, updated or settled --
+falls within the last 7 days, and of those at most the 10 newest. Everything else moves, finished
+or not. The numbers are the memory settings `desire_retention_days` and `desire_retention_keep`
+(`configure-memory`; each at least 1). A wish an open execution still holds stays until it ends,
+beside the ten and not instead of one of them: a contact attempt drafting, pending or unconfirmed;
+an active plan or step; a plan run running or unconfirmed; an action event that has not settled,
+including one left for review; a running exploration; a delivery recorded as partial.
+
+**Finished, or let go.** A wish that reached `completed` or `abandoned` moves as it always did, and
+still blocks a duplicate: a second contact intent for the same sharing decision, the same content on
+a bootstrap. A wish that had not is **let go** (放下): it moves whole with its status as it was, which
+is how the archive marks it (`outcome: let-go` in reads and reports), it no longer drives contact or
+exploration, and it blocks nothing, so the same intent may be raised again as a new wish. An update of
+a let-go wish is refused with `desire-let-go`; the identifier a command derived stays taken.
+
+**It runs by itself.** While `desire_archive` is on, the rule runs after every committed assessment
+(the host's `review`): a read that finds nothing to move writes nothing; a move is one ordinary
+revision (`desire-archive` history row), decided again inside its own write transaction. It waits
+while an assessment that was shown the wishes is still running under its lease
+(`desire-retention-deferred`), and the next committed assessment tries again. The result of the
+`review` carries `desire_retention` with counts whenever it did or deferred something.
 
 ```sh
 python -m kin_mind.host --config PRIVATE_CONFIG desire-archive
-echo '{"days": 14}' | python -m kin_mind.host --config PRIVATE_CONFIG desire-archive
+echo '{"days": 14, "keep": 20}' | python -m kin_mind.host --config PRIVATE_CONFIG desire-archive
 python -m kin_mind.host --config PRIVATE_CONFIG desire-archive --apply
 python -m kin_mind.host --config PRIVATE_CONFIG desire-unarchive --apply
 ```
 
-The dry run is the default, writes nothing at all, and asks for no flag: run it against a copy
-first and read what it says. `would_archive` names every wish that would move; `holding` names
-every wish that would stay and **why**, by identifier, with a sentence for each reason under
-`reasons` and totals under `holding_reasons`. `days` is the floor under a settled wish and is the
-only number worth trying at several values — the rest of the decision does not change with it.
+The dry run is the default, writes nothing at all, and asks for no flag: run it against a copy first.
+`kept` names the wishes the rule keeps, newest first; `would_archive` everything that would move, of
+which `would_let_go` the unfinished; `holding` every wish an execution holds and **why**, with a
+sentence for each reason under `reasons`. `days` and `keep` try other numbers for one run.
 
-**Time is never a reason.** Only a wish the model has already settled as `completed` or
-`abandoned` can move. A long-running plan is not finished because it is old; an expired `wanted`
-or `waiting` wish is not touched at all, because expiry is not a verdict and the wish is still the
-model's to settle. Nor does a wish move while anything is still open on it: a contact attempt
-drafting, pending or unconfirmed; a plan run running or unconfirmed; an active plan or step; an
-action event that has not settled, including one left for review; a running exploration; or a
-delivery recorded as partial. Each of those appears by name in `holding`.
+A wish that moved is still this mind's. Every reader that asks for a wish by its identifier looks in
+the archive when the document misses. The count of what has moved is kept in the state document, so
+the projection's `desire_window.total` still says how many wishes this mind has. The projection's
+tail of finished wishes (`WINDOW`, 8) is the most recently active of those the rule keeps.
 
-A wish that moved is still this mind's. Every reader that asks for a wish by its identifier looks
-in the archive when the document misses, so an update of an archived wish is refused exactly as a
-finished wish is refused, a sharing decision whose contact intent has moved still refuses a second
-one, and the plan synchronisation skips it instead of making it again. The count of what has moved
-is kept in the state document, so the projection's `desire_window.total` still says how many
-wishes this mind has rather than how many are left in the document.
+`desire-unarchive` is never gated by the flag: with no identifiers it puts everything back, finished
+and let go, and it is what runs **before a rollback**, because a release without the archive cannot
+see it at all. The document sorts its keys, so a full round trip gives back the document it had.
+Restored wishes' memories (below) stop being offered as memories of an archived wish, and one not
+yet written is not written.
 
-`desire_archive` is **off by default** and the move needs the explicit command as well as the
-flag. `desire-unarchive` is never gated by it: with no identifiers it puts everything back, and it
-is what runs **before a rollback**, because a release without the archive cannot see it at all
-and would read those wishes as gone. Nothing is ever deleted — an unarchived wish leaves the
-table only in the same transaction that puts it back into the document, and the document sorts its
-keys, so a full round trip gives back the document it had.
+## Archive memory
 
-Both the move and the restore are ordinary revisions with their own history rows, `desire-archive`
-and `desire-unarchive`, whose request names the wishes that moved.
+Every archived record becomes a short memory in Kin's own voice (the owner's decision, 2026-09-28):
+one or two first-person sentences, at most about 120 Chinese characters -- what she wanted, why, how
+it ended (completed, abandoned, or let go unfinished) and roughly when. `kin_mind.archive_memory` is
+the path for any archived kind; wishes are kind `desire`, and another archive registers its own.
+
+The archive queues each record in `mind_archive_memory` in the transaction that moves it and never
+waits. The enrichment lane, which the host already starts in the background when the resident gate
+says there is work, writes them: up to 20 records in one DeepSeek call (`submit_archive_memories`,
+through the ordinary structured call, its calls accounted as `archive-memory` and kept on each row
+with the receipt), each sent only the fields a summary may use -- topic, content, kind, status, how it
+ended, completion, reason and times, never the evidence or its copied metadata. The lane's own jobs
+go first unless a record has waited an hour. Each answer is a derived source in `kin-archive-memory`
+(a `kin_thought`), resting on what the record rested on, so an erase of any of that takes the
+memory with it; a record whose evidence is gone before its turn is withheld and never sent. A failed
+call puts its records back with a backoff (5 minutes, doubling, at most 12 hours); after 8 attempts a
+record waits for an operator. One memory per (kind, id, revision), however often it is queued or run.
+`archive_memory` (default on) switches the calls off; the queue then only waits.
+
+A read that asks a question -- `recall_memory`, `read_continuity_context` -- is shown the few memories
+whose words match it first, each naming its record and `read_archived_record`, which reads the whole
+archived record from the memory's id (or from the record's id and kind), redacted like the other reads;
+its `refs` are ordinary records for `read_memory`.
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG archive-memory
+python -m kin_mind.host --config PRIVATE_CONFIG archive-memory-backfill
+python -m kin_mind.host --config PRIVATE_CONFIG archive-memory-backfill --apply
+python -m kin_mind.host --config PRIVATE_CONFIG archive-memory --apply
+echo '{"retry_failed": true}' | python -m kin_mind.host --config PRIVATE_CONFIG archive-memory --apply
+```
+
+`archive-memory` without `--apply` gives the queue's counts by kind and state, what is due and the
+codes of the latest failures. `archive-memory-backfill` counts what was archived before this and has
+no memory yet, and the calls that would take (`model_calls`, one per 20); with `--apply` it queues
+them, once. `archive-memory --apply` runs one batch now, one paid call at most; the lane runs the rest.
 
 ## Exploration decision archive
 

@@ -122,12 +122,17 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # the history reads clean. Off, `_history` writes exactly the row it wrote before.
             "history_patches": False,
             # Stage 5, the other flag read through autonomy_schema.enabled(): off unless a store
-            # says otherwise, and even on it moves nothing without the explicit command. It
-            # decides what the document the model is shown contains, and the release before it
-            # cannot see an archived wish at all — so it deploys off, a dry run is read first, and
-            # `desire-unarchive` puts everything back before any rollback. Off, a finished wish
-            # stays in the document exactly as it does today.
-            "desire_archive": False,
+            # says otherwise. It decides what the document the model is shown contains, and the
+            # release before it cannot see an archived wish at all — so it deploys off, a dry run
+            # is read first, and `desire-unarchive` puts everything back before any rollback. On,
+            # the retention rule (desire_archive) runs after every committed assessment: the
+            # document keeps the wishes active within `desire_retention_days`, at most the
+            # `desire_retention_keep` newest, and whatever an open execution still holds.
+            "desire_archive": False, "desire_retention_days": 7, "desire_retention_keep": 10,
+            # Default on, read through autonomy_schema.optimized(): an archived record becomes a
+            # short memory in Kin's own voice, written by DeepSeek in the background
+            # (archive_memory). Off, nothing is sent and the queue waits.
+            "archive_memory": True,
             # Settled exploration decisions leave the document for mind_exploration_decision_archive
             # (exploration_decision_archive.py). Off by default; on, the review minute moves what
             # nothing holds any more, and `exploration-decision-unarchive` puts it all back before
@@ -340,11 +345,18 @@ class MemoryContinuity:
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
                     "wish_version_review", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
-                    "history_patches", "desire_archive",
+                    "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
+        from .desire_archive import DAYS_RANGE, KEEP_RANGE
+        if "desire_retention_days" in values and (type(values["desire_retention_days"]) is not int
+                                                  or not max(1, DAYS_RANGE[0]) <= values["desire_retention_days"] <= DAYS_RANGE[1]):
+            raise ValueError("A wish retention window is a whole number of days, at least one")
+        if "desire_retention_keep" in values and (type(values["desire_retention_keep"]) is not int
+                                                  or not max(1, KEEP_RANGE[0]) <= values["desire_retention_keep"] <= KEEP_RANGE[1]):
+            raise ValueError("A wish retention cap is a whole number of wishes, at least one")
         with self.engine.db.connect(write=True) as conn:
             previous = self.settings(conn)
             config = previous | values

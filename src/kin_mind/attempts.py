@@ -37,8 +37,9 @@ OUTCOMES = ("committed", "failed", "quarantined", "discarded", "abandoned", "reu
 # `recall`: a DeepSeek appraisal request answered with memory reads, not with the appraisal (K1-16).
 # It is paid for and recorded like any call, but it is not the appraisal call: only `appraise` makes an
 # attempt a charged one (appraisal.completed_appraisal).
+# `archive-memory`: a background batch that writes archived records as Kin's short memories.
 PURPOSES = ("appraise", "schema-repair", "advice-repair", "sharing-repair",
-            "compression", "expansion", "revalidate", "recall", "other")
+            "compression", "expansion", "revalidate", "recall", "archive-memory", "other")
 # The purpose of a structured call follows its tool name, never the calling function:
 # compression has both a foreground and a background caller.
 TOOL_PURPOSES = {
@@ -49,6 +50,7 @@ TOOL_PURPOSES = {
     "submit_compression": "compression",
     "submit_recall_ranking": "expansion",
     "revalidate_appraisal": "revalidate",
+    "submit_archive_memories": "archive-memory",
 }
 # Fields an operator may read back. Digests and static codes only.
 CALL_FIELDS = ("purpose", "tool", "model", "request_id", "elapsed_ms", "outcome",
