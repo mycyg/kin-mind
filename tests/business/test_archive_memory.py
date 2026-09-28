@@ -298,6 +298,28 @@ def test_an_item_whose_evidence_is_erased_before_its_turn_is_never_sent(setup, m
     assert texts_everywhere(mind.engine, MARKER) == set()
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_erasure_during_the_model_call_is_not_undone_by_settlement(setup, monkeypatch, failed):
+    mind, source, clock = setup
+    allow(mind)
+    _, evidence = wish(mind, source, clock, "in-flight", text=MARKER)
+    clock[0] += 9 * DAY
+    desire_archive.archive(mind, apply=True)
+
+    def answer(sent):
+        mind.engine.delete(evidence)
+        settle_jobs(mind.engine)
+        if failed:
+            raise RuntimeError("synthetic-provider-failure")
+        return summarise(sent)
+
+    archive_memory.run(mind, Endpoint(mind, monkeypatch, answer).provider)
+    [row] = queued(mind).values()
+    assert row["state"] == "withheld"
+    assert json.loads(row["data"])["summary_input"] == {}
+    assert texts_everywhere(mind.engine, MARKER) == set()
+
+
 # --- the wishes archived before ------------------------------------------------------------------
 
 def test_the_backfill_queues_what_was_archived_before_once(setup, monkeypatch):

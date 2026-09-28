@@ -428,6 +428,10 @@ def _settle(mind, rows, outcomes, calls, receipt, asked):
             identity = (row["kind"], row["item_id"], row["item_revision"])
             state, extra = outcomes.get(identity, (PENDING, {"error": "not-settled"}))
             data = dict(row["data"]) if isinstance(row["data"], dict) else json.loads(row["data"])
+            # Erasure can finish while the provider is away, including on a failed call.
+            # Recheck under this write lock before saving the pre-call snapshot again.
+            if _erased(conn, data):
+                state, extra = WITHHELD, {"error": "evidence-erased"}
             data.pop("error", None)
             if calls:
                 data["calls"] = [{k: call.get(k) for k in ("purpose", "tool", "outcome", "model", "request_id", "usage",
