@@ -243,6 +243,44 @@ def test_the_restore_gives_back_the_document_it_had(setup):
     assert refused.value.code == "exploration-decision-archive-live"
 
 
+def test_a_decision_taken_up_after_the_survey_stays(setup, monkeypatch):
+    """The apply decides again inside its own transaction: a survey that is already stale when the
+    write begins moves only what is still free."""
+    mind, source, clock = setup
+    old, _ = older_and_newer(mind, clock)
+    held_since = old[3]
+    real = decisions.survey
+    calls = []
+
+    def stale(conn, mind_, state, at, **options):
+        calls.append(1)
+        moving, holding = real(conn, mind_, state, at, **options)
+        # The first survey, outside the write, did not see what holds `held_since` now.
+        return (sorted([*moving, held_since]), holding) if len(calls) == 1 else (moving, holding)
+    monkeypatch.setattr(decisions, "survey", stale)
+    switch(mind)
+    moved = decisions.archive(mind, apply=True)["moved"]
+    assert moved == old[:3] and held_since in document(mind)["exploration_decisions"]
+
+
+def test_revive_puts_one_decision_back_in_place(setup):
+    mind, _, clock = setup
+    old, _ = older_and_newer(mind, clock)
+    switch(mind)
+    before = document(mind)["exploration_decisions"][old[1]]
+    decisions.archive(mind, apply=True)
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        held = state["exploration_decisions"]
+        assert decisions.revive(mind, conn, state, old[1]) == before
+        assert state["exploration_decisions"] is held and list(held) == sorted(held), "the caller's dict, sorted"
+        assert state[decisions.STATE_KEY] == {"count": 2, "revisions": {old[0]: 1, old[2]: 1}}
+        assert decisions.revive(mind, conn, state, old[1]) is held[old[1]], "a live one is simply returned"
+        assert decisions.revive(mind, conn, state, "explore_never") is None
+        assert set(r[0] for r in conn.execute("SELECT id FROM mind_exploration_decision_archive")) == {old[0], old[2]}
+        conn.rollback()
+
+
 # --- memory and the way back to the records -----------------------------------------------------------
 
 def test_what_moves_is_handed_to_memory_with_the_ids_of_its_records(setup, monkeypatch):
@@ -448,6 +486,25 @@ def test_a_result_already_shared_refuses_a_second_intent_after_it_moved(setup):
         wish(mind, clock, "second-intent-after", [result], exploration_id="explore_shared")
     assert str(after_move.value) == str(before_move.value) == "This sharing decision already has a contact intent"
     assert [d["id"] for d in document(mind)["desires"].values() if d.get("exploration_id") == "explore_shared"] == [intent]
+
+
+def test_a_wish_that_comes_to_rest_on_a_moved_decision_brings_it_back(setup):
+    """No rule moves a share whose intent is not made yet; were one moved all the same, the wish that
+    takes its revision brings it back into the document instead of failing on its absence."""
+    mind, _, clock = setup
+    result, _ = decided(mind, clock, "explore_early", "share")
+
+    def move_by_hand(conn, state, event_id):
+        decisions._store(conn, mind.scope.key(), state, "explore_early",
+                         state["exploration_decisions"].pop("explore_early"), mind.clock())
+        decisions._counted(conn, mind.scope.key(), state)
+    mind._mutate({"command_id": "by-hand", "agent_version": AGENT, "expected_revision": document(mind)["revision"]},
+                 "test-move", move_by_hand)
+    assert "explore_early" in rows(mind)
+    made = wish(mind, clock, "late-intent", [result], exploration_id="explore_early")
+    state = document(mind)
+    assert state["desires"][made]["sharing_revision"] == 1 and state["exploration_decisions"]["explore_early"]["revision"] == 1
+    assert rows(mind) == {} and decisions.STATE_KEY not in state
 
 
 def test_an_appraisal_naming_a_moved_shared_result_makes_no_second_wish(setup):
