@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kin-mind"
-version = "0.1.12"
+version = "0.1.13"
 description = "Kin Mind: source-backed memory, affect, desires and personality"
 requires-python = ">=3.10"
 dependencies = [
