@@ -255,6 +255,30 @@ def test_the_host_reads_of_a_rich_store_are_clean(setup):
         assert clean(shown), (action, leaks(shown))
 
 
+def test_the_explorations_the_state_read_and_an_ingest_hand_the_host_are_shown_as_a_model_may_see_them(setup):
+    """`read` and, with the memory context off, `ingest` hand the host the latest explorations
+    (`findings`, Explorations.recent) beside the state, outside `Mind.read`: a run that kept full
+    references and a source with its metadata is handed over with neither, and still names them."""
+    from kin_mind.host import dispatch
+    mind, _, clock = setup
+    result, observed = explored(mind, clock, "explore_kept", pages=2)
+    with mind.engine.db.connect(write=True) as conn:
+        [ref] = mind._evidence(conn, [result])
+        row = json.loads(conn.execute("SELECT data FROM mind_explorations WHERE id='explore_kept'").fetchone()[0])
+        conn.execute("UPDATE mind_explorations SET data=? WHERE id='explore_kept'", (dumps(
+            {**row, "evaluated_sources": [ref], "shown_sources": [{"id": result, "text": "茶", "metadata": ref["metadata"]}]}),))
+    assert leaks(ref) and "a page explore_kept cited" in dumps(ref)
+    config = config_for(mind)
+    for action, request in (("read", {}), ("ingest", {"id": "owner-1", "text": "合成的消息", "at": mind.clock(), "channel": "wechat"})):
+        if action == "ingest":
+            MemoryContinuity(mind).configure({"context": False})
+        shown = dispatch(config, action, request)
+        [run] = [f for f in shown["findings"] if f["id"] == "explore_kept"]
+        assert not leaks(shown) and "a page explore_kept cited" not in dumps(shown), action
+        assert not set(observed) & set(dumps(run["evaluated_sources"] + run["shown_sources"]).split('"')), action
+        assert run["evaluated_sources"][0]["source_id"] == result and run["shown_sources"][0]["exploration_id"] == "explore_kept"
+
+
 def test_a_prepared_injection_is_named_and_hashed_as_it_is_shown(setup):
     from kin_mind.context import Contexts
     from kin_mind.context_delivery import ContextDelivery, text_hash
