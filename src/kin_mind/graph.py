@@ -12,8 +12,15 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
-from eventmem.core.read_policy import ISOLATED, ReadPolicy, enabled_for, ref_classes
+from eventmem.core.read_policy import (
+    ISOLATED,
+    ReadPolicy,
+    SourceFacts,
+    enabled_for,
+    ref_classes,
+)
 
+from . import evidence_refs
 from .autonomy_schema import optimized
 from .state import timestamp
 
@@ -197,7 +204,10 @@ class EventGraph:
         refs = value.get("evidence") or []
         if len(refs) < 2 or not enabled_for(conn, self.scope.key()):
             return value
-        classes = ref_classes(self.engine, conn, self.scope, refs)
+        # What a source is -- its class, its authority -- is read from the source's own row: a
+        # stored reference this item already had no longer carries it (evidence_refs).
+        sources = SourceFacts(conn)
+        classes = ref_classes(self.engine, conn, self.scope, refs, sources)
         outside = [ref for ref, found in zip(refs, classes) if found.kind in ISOLATED]
         if not outside or len(outside) == len(refs):
             return value
@@ -209,7 +219,7 @@ class EventGraph:
         out = {**value, "evidence": kept, CONFIGURATION_EVIDENCE: held,
                "source_ids": sorted(set(value.get("source_ids") or ()) - dropped)
                or sorted({ref["source_id"] for ref in kept})}
-        if out.get("basis") == "explicit" and not any(ref.get("authority") == "explicit" for ref in kept):
+        if out.get("basis") == "explicit" and not any(sources.of(ref).get("authority") == "explicit" for ref in kept):
             # The rule `apply()` uses whenever explicit evidence is lost.
             out["basis"] = "inferred"
         return out
@@ -218,12 +228,20 @@ class EventGraph:
         # `isolate=False` is for the isolation migration's own undo, which puts back exactly
         # the archived version it took apart.
         value = self._unmixed(conn, dict(value)) if isolate else dict(value)
+        # Once the graph is marked, what it stores of a reference is what its readers read
+        # (evidence_refs): the node, its revision, and every later copy of either.
+        marked = evidence_refs.table_marked(conn, self.scope.key(), "mind_graph_nodes")
+        if marked:
+            value = dict(evidence_refs.lean(value))
         try:
             old = self.get(conn, value["id"])
         except Missing:
             old = None
         strip = lambda v: {k: x for k, x in v.items() if k not in {"revision", "updated_at", "needs_review"}}
-        if old and strip(old) == strip(value):
+        if old and (strip(old) == strip(value) or (marked or evidence_refs.has_slim(old))
+                    and strip(evidence_refs.lean(old)) == strip(evidence_refs.lean(value))):
+            # Nothing changed but the shape of a reference: a row the migration has not reached
+            # yet, or one it has, is not a new revision.
             return old
         value.update(revision=(old or {}).get("revision", 0) + 1, updated_at=self.mind.clock())
         value.setdefault("state", "active")
@@ -305,11 +323,12 @@ class EventGraph:
         return found
 
     def visible(self, conn, nodes, policy):
-        """Keep the nodes and edges this read may see. Their records are loaded once."""
+        """Keep the nodes and edges this read may see. Their records are loaded once, and the rows
+        of the sources an item without records is classified by, once each."""
         if not policy.enabled:
             return list(nodes)
-        records = self.node_records(conn, nodes)
-        return [n for n in nodes if policy.node_visible(n, records)]
+        records, sources = self.node_records(conn, nodes), SourceFacts(conn)
+        return [n for n in nodes if policy.node_visible(n, records, sources)]
 
     def fresh(self, conn, node):
         return self._fresh_value(conn, node)
@@ -665,7 +684,7 @@ class EventGraph:
             value["needs_review"] = not self.fresh(conn, value)
             # A read by id is an audit read: everything is there, and what is not experience says so.
             policy = self.policy(conn, "audit")
-            label = policy.node_label(value, self.node_records(conn, [value])) if policy.enabled else None
+            label = policy.node_label(value, self.node_records(conn, [value]), SourceFacts(conn)) if policy.enabled else None
             if label:
                 value["evidence_class"] = label
             value["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_revisions WHERE id=? ORDER BY revision", (identifier,))]
@@ -790,6 +809,8 @@ class EventGraph:
             if current:
                 changed.append(self._put(conn, {**current, "revision_reason": request["reason"], "evidence": proof, "source_ids": sorted({r["source_id"] for r in proof})}, edge=current.get("kind") == "edge"))
             result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
+            # What a replay of this command reads back is what it answers now.
+            result = evidence_refs.as_stored(conn, self.scope.key(), "mind_graph_commands", result)
             conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), command_hash, dumps(result)))
             record(conn, stamp, request["command_id"], self.mind.clock())
             return result

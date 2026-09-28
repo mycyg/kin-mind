@@ -35,6 +35,7 @@ from eventmem.core.read_policy import (
     RULES_VERSION,
     SETTINGS_KEY,
     ReadPolicy,
+    SourceFacts,
     classify_scope,
     configure_registry,
     proposed_policy,
@@ -45,6 +46,7 @@ from eventmem.core.read_policy import (
 from eventmem.core.self_knowledge import SelfKnowledge
 from eventmem.core.self_knowledge import metadata as claim_facts
 
+from . import evidence_refs
 from .lifecycle import EventLifecycle, ancestors
 from .memory import MemoryContinuity
 
@@ -201,7 +203,8 @@ class IsolationMigration:
 
     def _archive(self, conn, kind, identifier, revision, data):
         conn.execute("INSERT OR IGNORE INTO mind_isolation_archive VALUES(?,?,?,?,?,?,?)",
-                     (self.scope.key(), kind, identifier, revision, RULES_VERSION, self.mind.clock(), dumps(data)))
+                     (self.scope.key(), kind, identifier, revision, RULES_VERSION, self.mind.clock(),
+                      dumps(evidence_refs.as_stored(conn, self.scope.key(), "mind_isolation_archive", data))))
 
     def _archived(self, conn, kind):
         """The newest archived version of each object of this kind. A migration applied, taken
@@ -338,10 +341,14 @@ class IsolationMigration:
                            "links": links, "skipped_ties": skipped, "blocked": blocked})
         return chains
 
-    def _node_moves(self, policy, node):
+    def _node_moves(self, policy, node, sources):
+        """The references of a stored node that cite configuration, and the rest. What a source is
+        comes from its classification row, else from its own row (`sources`, over the caller's
+        connection): a stored reference no longer carries its source's metadata (evidence_refs)."""
         refs = node.get("evidence") or []
+        sources.load(refs)
         moved = [ref for ref in refs if policy.source_class(
-            ref["source_id"], ref.get("namespace"), ref.get("metadata"), ref.get("authority")).kind in CONFIGURATION]
+            ref["source_id"], *(sources.of(ref).get(key) for key in ("namespace", "metadata", "authority"))).kind in CONFIGURATION]
         return moved, [ref for ref in refs if ref not in moved]
 
     def _nodes(self, conn, policy):
@@ -350,17 +357,18 @@ class IsolationMigration:
         nodes = [json.loads(row[0]) for row in conn.execute(
             "SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' ORDER BY id", (self.scope.key(),))]
         mixed, pending, hidden, projections = [], [], [], 0
+        sources = SourceFacts(conn)
         for start in range(0, len(nodes), CHUNK):
             page = nodes[start:start + CHUNK]
             records = self.graph.node_records(conn, page)
             for node in page:
-                if not policy.node_visible(node, records):
+                if not policy.node_visible(node, records, sources):
                     hidden.append(node["id"])
                     continue
                 if any(policy.classify(records[rid]).kind == "self_knowledge"
                        for rid in node.get("record_ids", []) if rid in records):
                     projections += 1
-                moved, kept = self._node_moves(policy, node)
+                moved, kept = self._node_moves(policy, node, sources)
                 if not moved:
                     if node.get(MARK) == RULES_VERSION:
                         # Already isolated: the references it mixed are in the configuration key.
@@ -372,7 +380,7 @@ class IsolationMigration:
         for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND state='active' ORDER BY id",
                                 (self.scope.key(),)):
             edge = json.loads(row[0])
-            moved, kept = self._node_moves(policy, edge)
+            moved, kept = self._node_moves(policy, edge, sources)
             if moved and kept:
                 edges.append({"id": edge["id"], "revision": edge["revision"], "keeps": len(kept), "edge": True})
         return {"pending": pending + edges, "configuration_only": hidden, "impact": {
@@ -491,12 +499,13 @@ class IsolationMigration:
         if node["revision"] != expected_revision:
             raise Conflict("Graph node changed after evaluation", target=node_id,
                            expected=expected_revision, actual=node["revision"])
-        moved, kept = self._node_moves(policy, node)
+        sources = SourceFacts(conn)
+        moved, kept = self._node_moves(policy, node, sources)
         if not moved:
             return None
         self._archive(conn, NODE_ARCHIVE, node_id, node["revision"], node)
         basis = node.get("basis")
-        if basis == "explicit" and not any(ref.get("authority") == "explicit" for ref in kept):
+        if basis == "explicit" and not any(sources.of(ref).get("authority") == "explicit" for ref in kept):
             # The rule `apply()` uses whenever explicit evidence is lost.
             basis = "inferred"
         value = {**node, "evidence": kept, "source_ids": sorted({ref["source_id"] for ref in kept}),

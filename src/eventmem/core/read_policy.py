@@ -443,9 +443,49 @@ def enabled_for(conn, scope_key):
 ISOLATED = ("role_configuration", "synthetic_example", "host_envelope")
 
 
-def ref_classes(engine, conn, scope, refs):
+class SourceFacts:
+    """What a stored evidence reference no longer carries, from its source's own row: the source's
+    `namespace`, `metadata` and `authority`, with its `session` and `received_at`. A source's
+    metadata is an index, read where it is kept (the owner's decision, 2026-09-28; kin_mind's
+    `evidence_refs`), and a reference only has to name its source. Rows are read a page of ids at a
+    time and each once per instance: one instance is one call's, over one connection.
+
+    `of(ref)` is the reference with its source's facts over whatever it carries itself, so a slim
+    reference and the full one it was written as read the same. A reference whose source is gone
+    (deleted, or never in this store) keeps what it carries."""
+
+    FIELDS = ("namespace", "metadata", "authority", "session", "received_at")
+
+    def __init__(self, conn):
+        self.conn, self._rows = conn, {}
+
+    def load(self, refs):
+        ids = sorted({r.get("source_id") for r in refs if isinstance(r, dict) and isinstance(r.get("source_id"), str)}
+                     - self._rows.keys())
+        for start in range(0, len(ids), 400):
+            page = ids[start:start + 400]
+            found = {}
+            for identifier, namespace, session, received_at, data in self.conn.execute(
+                    "SELECT id,namespace,session,received_at,data FROM sources WHERE id IN ("
+                    + ",".join("?" for _ in page) + ") AND deleted=0", page):
+                data = json.loads(data)
+                found[identifier] = {"namespace": namespace, "metadata": data.get("metadata", {}),
+                                     "authority": data.get("authority"), "session": session, "received_at": received_at}
+            for identifier in page:
+                self._rows[identifier] = found.get(identifier)
+        return self
+
+    def of(self, ref):
+        if not isinstance(ref, dict):
+            return ref
+        found = self.load([ref])._rows.get(ref.get("source_id"))
+        return {**ref, **found} if found else ref
+
+
+def ref_classes(engine, conn, scope, refs, sources=None):
     """The class of each evidence reference, from its source's own classification row, else
-    classified on the fly from the namespace, metadata and authority the reference carries.
+    classified on the fly from its source's namespace, metadata and authority, read from the
+    source's row (`SourceFacts`) -- what the reference itself carries only when that row is gone.
 
     For a writer inside its own transaction: it reads the rows of these sources only, never the
     whole snapshot a read policy loads."""
@@ -461,10 +501,17 @@ def ref_classes(engine, conn, scope, refs):
         except sqlite3.OperationalError:
             pass
     rules, approved = registry(engine, conn), approved_sources(engine, scope, conn)
-    return [stored.get(r.get("source_id")) or source_rule(
-                r.get("namespace") or "", r.get("metadata"), r.get("authority"), source_id=r.get("source_id"),
-                approved=approved, rules=rules) or PLAIN
-            if isinstance(r, dict) else PLAIN for r in refs]
+    sources = (sources or SourceFacts(conn)).load([r for r in refs if isinstance(r, dict) and r.get("source_id") not in stored])
+
+    def classify(r):
+        found = stored.get(r.get("source_id"))
+        if found:
+            return found
+        r = sources.of(r)
+        return source_rule(r.get("namespace") or "", r.get("metadata"), r.get("authority"), source_id=r.get("source_id"),
+                           approved=approved, rules=rules) or PLAIN
+
+    return [classify(r) if isinstance(r, dict) else PLAIN for r in refs]
 
 
 def migration_state(conn, scope_key):
@@ -665,11 +712,13 @@ class ReadPolicy:
             return f"[{found.kind} {info.get('basis', info.get('entry', 'self_knowledge'))} {info.get('agent_version', 'unknown')}] "
         return f"[{found.kind}] "
 
-    def node_class(self, node, records=None):
+    def node_class(self, node, records=None, sources=None):
         """A graph node or edge. `records` maps the ids of the records it projects or cites to
         those records, when the caller has them: a projected self-claim shows only there, because
-        the claim's own sources are the owner's words. Without them the stored evidence refs
-        decide, which carry namespace and metadata. Hidden only when nothing behind it is experience."""
+        the claim's own sources are the owner's words. Without them its evidence decides: each
+        source by its classification row, else by what its own row says of it (`sources`, a
+        `SourceFacts` over the caller's connection) -- a stored reference no longer carries its
+        source's metadata. Hidden only when nothing behind it is experience."""
         if not self.enabled:
             return PLAIN
         found = []
@@ -678,18 +727,24 @@ class ReadPolicy:
                                  *([node["id"]] if str(node.get("id", "")).startswith("mem_") else [])])
             found = [self.classify(records[i]) for i in ids if i in records]
         if not found:
+            refs = node.get("evidence", [])
+            if sources is not None:
+                # Only a source with no classification row is classified from its own row.
+                unknown = {r["source_id"] for r in refs} - self._rows.keys() - self._derived.keys()
+                sources.load([r for r in refs if r["source_id"] in unknown])
+                refs = [sources.of(r) if r["source_id"] in unknown else r for r in refs]
             found = [self.source_class(r["source_id"], r.get("namespace"), r.get("metadata"), r.get("authority"))
-                     for r in node.get("evidence", [])]
+                     for r in refs]
         return self._combine(found)
 
-    def node_visible(self, node, records=None):
+    def node_visible(self, node, records=None, sources=None):
         if not self.enabled:
             return True
-        kind = self.node_class(node, records).kind
+        kind = self.node_class(node, records, sources).kind
         return kind in self._admitted or self.purpose == "audit"
 
-    def node_label(self, node, records=None):
-        found = self.node_class(node, records)
+    def node_label(self, node, records=None, sources=None):
+        found = self.node_class(node, records, sources)
         return found.kind if found.kind != "experience" else found.label
 
 

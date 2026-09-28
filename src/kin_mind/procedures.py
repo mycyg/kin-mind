@@ -6,6 +6,7 @@ from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import RecordInput
 
+from . import evidence_refs
 from .autonomy_models import ProcedureCandidate
 from .autonomy_schema import optimized
 
@@ -29,8 +30,10 @@ class Procedures:
         procedure["updated_at"] = self.mind.clock()
         conn.execute("INSERT INTO mind_procedures VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                      "revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at,data=excluded.data",
-                     (procedure["id"], self.scope, procedure["revision"], procedure["status"], procedure["updated_at"], dumps(procedure)))
-        conn.execute("INSERT INTO mind_procedure_history VALUES(?,?,?)", (procedure["id"], procedure["revision"], dumps(procedure)))
+                     (procedure["id"], self.scope, procedure["revision"], procedure["status"], procedure["updated_at"],
+                      dumps(evidence_refs.as_stored(conn, self.scope, "mind_procedures", procedure))))
+        conn.execute("INSERT INTO mind_procedure_history VALUES(?,?,?)", (procedure["id"], procedure["revision"],
+                                                                          dumps(evidence_refs.as_stored(conn, self.scope, "mind_procedure_history", procedure))))
         refs = procedure["evidence"]
         # Every rule revision has its own ordinary procedure record. Candidates
         # remain unverified; current execution goes through require_current().
@@ -159,7 +162,8 @@ class Procedures:
             # Validation state is attached to this content revision; the
             # immutable trial ledger preserves each transition and cause.
             p.update(status=status, validated_at=self.mind.clock())
-            conn.execute("UPDATE mind_procedures SET status=?,data=? WHERE id=?", (status, dumps(p), identifier))
+            conn.execute("UPDATE mind_procedures SET status=?,data=? WHERE id=?",
+                         (status, dumps(evidence_refs.as_stored(conn, self.scope, "mind_procedures", p)), identifier))
             rid = "mem_" + digest([identifier, revision])[:32]
             record = self.engine._get(conn, rid)
             record["status"] = "active" if status == "active" else "unverified"

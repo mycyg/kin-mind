@@ -14,6 +14,7 @@ import time
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
 from . import liveness
+from .appraisal import queue_row
 from .memory import MemoryContinuity
 from .model_lanes import WAIT_CAPACITY, WAIT_FOREGROUND, WAIT_LEDGER, WAIT_USER_WORK
 
@@ -135,7 +136,7 @@ def recover_history(mind, *, job_ids, command_id, source, workers_stopped, repla
             for field in (*RETRY_COUNTERS, *REUSE_FIELDS):
                 data.pop(field, None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
-                         (time.time(), dumps(data), identifier))
+                         (time.time(), queue_row(conn, mind.scope.key(), data), identifier))
             resumed.append(identifier)
         result = {"state": "resumed", "resumed": resumed, "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
         conn.execute("INSERT INTO mind_memory_migrations VALUES(?,?,0,?)", (mind.scope.key(), name, dumps(result)))
@@ -154,7 +155,7 @@ def resume_compaction_waits(conn, at):
         return []
     from .history import COMPACTING
     resumed = []
-    for row in conn.execute("SELECT id,attempts,data FROM mind_appraisals WHERE state='needs-repair' "
+    for row in conn.execute("SELECT id,scope,attempts,data FROM mind_appraisals WHERE state='needs-repair' "
                             "AND json_extract(data,'$.error_detail.code')=?", (COMPACTING,)).fetchall():
         data = json.loads(row["data"])
         data.setdefault("recovery_history", []).append({
@@ -165,7 +166,7 @@ def resume_compaction_waits(conn, at):
                       "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
             data.pop(field, None)
         conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
-                     (time.time(), dumps(data), row["id"]))
+                     (time.time(), queue_row(conn, row["scope"], data), row["id"]))
         resumed.append(row["id"])
     return resumed
 
@@ -217,7 +218,7 @@ def recover_quarantined(mind, *, job_ids, command_id, source, retire=False):
                 data["recovery_history"][-1]["retired"] = True
                 data["retired_reason"] = data.get("repair_reason") or data.get("error") or "retired-by-operator"
                 conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0,data=? WHERE id=?",
-                             (dumps(data), identifier))
+                             (queue_row(conn, mind.scope.key(), data), identifier))
                 jobs._settle_children(conn, identifier, data, "superseded")
                 resumed.append(identifier)
                 continue
@@ -228,7 +229,7 @@ def recover_quarantined(mind, *, job_ids, command_id, source, retire=False):
                           "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
                 data.pop(field, None)
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
-                         (time.time(), dumps(data), identifier))
+                         (time.time(), queue_row(conn, mind.scope.key(), data), identifier))
             resumed.append(identifier)
         result = {"state": "retired" if retire else "resumed", "retired" if retire else "resumed": resumed,
                   "already_complete": completed, "at": mind.clock(), "fingerprint": fingerprint}
@@ -311,10 +312,10 @@ def recover_batched(mind, *, command_id, workers_stopped):
                 data["result"] = {"batch_id": ancestor, "event_id": event_id}
                 if ancestor_data.get("receipt"):
                     data["receipt"] = ancestor_data["receipt"]
-                conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (dumps(data), row["id"]))
+                conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=?", (queue_row(conn, mind.scope.key(), data), row["id"]))
             else:
                 conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,data=? WHERE id=?",
-                             (time.time(), dumps(data), row["id"]))
+                             (time.time(), queue_row(conn, mind.scope.key(), data), row["id"]))
             settled.append({"id": row["id"], "state": state, "reason": reason, "ancestor": ancestor,
                             "event_id": event_id if state == "complete" else None})
         result = {"state": "recovered", "at": mind.clock(), "rows": settled,
@@ -520,7 +521,7 @@ def triage_quarantined(mind, *, apply=False, command_id=None, source=None, resum
                 data["recovery_history"][-1]["retired"] = True
                 data["retired_reason"] = entry["reason"]
                 conn.execute("UPDATE mind_appraisals SET state='superseded',lease=0,data=? WHERE id=?",
-                             (dumps(data), entry["id"]))
+                             (queue_row(conn, mind.scope.key(), data), entry["id"]))
                 jobs._settle_children(conn, entry["id"], data, "superseded")
                 event_state = "superseded"
             else:
@@ -530,7 +531,7 @@ def triage_quarantined(mind, *, apply=False, command_id=None, source=None, resum
                               "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
                     data.pop(field, None)
                 conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
-                             (now + entry["available_in_minutes"] * 60, dumps(data), entry["id"]))
+                             (now + entry["available_in_minutes"] * 60, queue_row(conn, mind.scope.key(), data), entry["id"]))
                 # The internal event follows its appraisal to the end again (ActionEvents.drain).
                 event_state = "queued"
             conn.execute("UPDATE mind_action_events SET state=? WHERE scope=? AND state='needs-review' "

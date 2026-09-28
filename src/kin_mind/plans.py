@@ -14,7 +14,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.idempotency import record, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 
-from . import liveness
+from . import evidence_refs, liveness
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled, optimized
 from .model_runtime import verified_decision
@@ -58,12 +58,19 @@ class AutonomousPlans:
             raise Missing("Plan is missing or outside this scope")
         return json.loads(row[0])
 
+    def _row(self, conn, table, value):
+        """A plan table's row as it is written: its references kept to what their readers read once
+        the plans are marked (evidence_refs); exactly `dumps(value)` otherwise."""
+        return dumps(evidence_refs.as_stored(conn, self.scope, table, value))
+
     def _save(self, conn, plan, command):
         plan["updated_at"] = self.mind.clock()
         conn.execute("INSERT INTO mind_plans VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                      "revision=excluded.revision,status=excluded.status,next_review=excluded.next_review,updated_at=excluded.updated_at,data=excluded.data",
-                     (plan["id"], self.scope, plan["revision"], plan["status"], plan.get("next_review_at"), plan["updated_at"], dumps(plan)))
-        conn.execute("INSERT INTO mind_plan_history VALUES(?,?,?,?)", (plan["id"], plan["revision"], command, dumps(plan)))
+                     (plan["id"], self.scope, plan["revision"], plan["status"], plan.get("next_review_at"), plan["updated_at"],
+                      self._row(conn, "mind_plans", plan)))
+        conn.execute("INSERT INTO mind_plan_history VALUES(?,?,?,?)", (plan["id"], plan["revision"], command,
+                                                                        self._row(conn, "mind_plan_history", plan)))
         self.engine.db.bump(conn)
 
     @staticmethod
@@ -388,9 +395,9 @@ class AutonomousPlans:
 
     def _record_review(self, conn, plan, command, kind, detail):
         """A review that is not a revision: no history row, whose key is (id, revision)."""
-        conn.execute("UPDATE mind_plans SET next_review=?,data=? WHERE id=?", (plan.get("next_review_at"), dumps(plan), plan["id"]))
+        conn.execute("UPDATE mind_plans SET next_review=?,data=? WHERE id=?", (plan.get("next_review_at"), self._row(conn, "mind_plans", plan), plan["id"]))
         conn.execute("INSERT INTO mind_plan_reviews VALUES(?,?,?,?,?,?,?)",
-                     (plan["id"], command, self.scope, kind, plan["revision"], self.mind.clock(), dumps(detail)))
+                     (plan["id"], command, self.scope, kind, plan["revision"], self.mind.clock(), self._row(conn, "mind_plan_reviews", detail)))
         self.engine.db.bump(conn)
 
     def decide_batch(self, conn, decisions, command, receipt, allowed, view, *, version=None, job_id=None):
@@ -749,7 +756,7 @@ class AutonomousPlans:
                     attempt = {"id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
                                "step_revision": step["revision"], "actor": actor, "decision": step["decision"], "state": "running",
                                "started_at": self.mind.clock(), "owner": owner, "fence": 1}
-                    conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, self.scope, plan["id"], step["id"], actor, "running", time.time() + 90, owner, 1, dumps(attempt)))
+                    conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, self.scope, plan["id"], step["id"], actor, "running", time.time() + 90, owner, 1, self._row(conn, "mind_plan_runs", attempt)))
                     step.update(state="running", run_id=run_id)
                     plan["revision"] += 1
                     self._save(conn, plan, "claim:" + run_id)
@@ -766,7 +773,7 @@ class AutonomousPlans:
                                (self.scope, run_id)).fetchone()
             if row:
                 noted = {"shown": shown, **({"tombstone_mark": mark} if mark is not None else {})}
-                conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (dumps({**json.loads(row[0]), **noted}), run_id))
+                conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (self._row(conn, "mind_plan_runs", {**json.loads(row[0]), **noted}), run_id))
 
     def renew(self, run_id, owner, fence):
         with self.engine.db.connect(write=True) as conn:
@@ -819,7 +826,7 @@ class AutonomousPlans:
                     or not self.mind._fresh(conn, run["decision"]["evidence"])):
                 raise Conflict("Completion lost its current decision or evidence")
             run.update(state=state, result=result, finished_at=self.mind.clock())
-            conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,data=? WHERE id=?", (state, dumps(run), run_id))
+            conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,data=? WHERE id=?", (state, self._row(conn, "mind_plan_runs", run), run_id))
             step.update(state="completed" if state == "completed" else "unconfirmed" if state == "unconfirmed" else "waiting",
                         revision=step["revision"] + 1)
             step.pop("decision", None)
@@ -860,7 +867,7 @@ class AutonomousPlans:
         # uncertainty until the existing transport reconciles receipts.
         state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
         run.update(state=state, reason=reason, checkpoint_retained=True, fence=row["fence"] + 1)
-        conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, dumps(run), row["id"]))
+        conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, self._row(conn, "mind_plan_runs", run), row["id"]))
         plan = self.get(conn, row["plan_id"])
         step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
         if step.get("run_id") == row["id"]:
@@ -902,7 +909,7 @@ class AutonomousPlans:
             for row in rows:
                 plan = json.loads(row[0])
                 if plan.pop("wish_sync", None):
-                    conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (dumps(plan), plan["id"]))
+                    conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (self._row(conn, "mind_plans", plan), plan["id"]))
                 for step in plan["steps"]:
                     decision = step.get("decision", {})
                     if step["actor"] not in {"contact", "explore"} or not decision:
@@ -956,7 +963,7 @@ class AutonomousPlans:
                         delivery_artifacts=step.get("delivery_artifacts", []))
                     step["desire_id"] = did
                     # Linking a host delivery handle is not a semantic revision.
-                    conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (dumps(plan), plan["id"]))
+                    conn.execute("UPDATE mind_plans SET data=? WHERE id=?", (self._row(conn, "mind_plans", plan), plan["id"]))
                     created.append(did)
             if created:
                 self.mind._retarget(conn, state, self.mind.clock())

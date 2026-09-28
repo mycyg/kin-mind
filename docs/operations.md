@@ -324,8 +324,13 @@ host's naming of what a read rests on; the hash, revision, namespace and key for
 the conflict checks that compare `(source, hash)`; `occurred_at` for what `read_archived_record` shows.
 It no longer copies the source's `metadata`, `authority`, `session` or `received_at`. Every decision
 that reads those -- an explicit owner source, `role`, `host_event`, `exploration_id`, internal
-bookkeeping never counted as evidence, the graph's classification -- reads a reference built afresh
-from the sources table in the same transaction, which is not stored and is unchanged. A tombstone an
+bookkeeping never counted as evidence -- reads a reference built afresh from the sources table in
+the same transaction, which is not stored and is unchanged. What a *stored* reference is asked is
+read from its source's own row (`read_policy.SourceFacts`), never from a copy: the class a graph item
+is shown under when no record of it says (a source with no classification row is classified from
+its row's namespace, metadata and authority), whether what a graph item still stands on is the
+owner's explicit word, and what the isolation migration moves out of a node. A full reference and a
+slim one therefore read the same, and rows of both shapes may stand side by side. A tombstone an
 erase left keeps the shape erasure gave it.
 
 **What a model is shown.** Never a source's metadata, whether or not the document has been migrated:
@@ -342,6 +347,22 @@ exploration decision that moves to its archive moves slim. The mark is set and c
 command, in the same revision as the references it changes, so the mark and the document's shape
 never disagree; without it the document is written exactly as before.
 
+The same holds for the tables that keep references, in groups (`evidence_refs.GROUPS`): **graph**
+(`mind_graph_nodes`, `mind_graph_edges`, `mind_graph_revisions`, `mind_graph_commands`,
+`mind_event_routes`, `mind_isolation_archive`), **appraisals** (`mind_appraisals`: the sources a
+model was shown, a seed's, the exploration targets, the frozen memory context, a stored proposal's
+`sources`), **plans** (`mind_plans`, `mind_plan_history`, `mind_plan_reviews`, `mind_plan_runs`),
+**habits** (`mind_conversation_habits`, `mind_habit_commands`, `mind_habit_revisions`) and
+**records** (`mind_contacts`, `mind_reply_reviews`, `mind_expression_intent_log`,
+`mind_expression_intents`, `mind_procedures`, `mind_procedure_history`, `mind_trait_observations`).
+A group is marked in `mind_evidence_ref_marks` (one row per scope and group); marked, every writer of
+its tables stores references slim, and a graph item whose only change would be the shape of a
+reference is not revised again; unmarked, a row is written exactly as before. A command that answers
+its replay from the stored row (a graph revision, an event route, a habit change) answers the first
+call with that same row. Readers never read the marks. `mind_events`, the document's history, is
+not rewritten: its snapshots and patches keep the references they were written with, and every read
+of them already shows them slim.
+
 ```sh
 python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs
 python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs --apply
@@ -351,7 +372,9 @@ python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs --undo --appl
 
 The dry run is the default and writes nothing: `references`, `would_slim`, `originals_kept`, and for
 the document and each archive table (`mind_desire_archive`, `mind_exploration_decision_archive`) its
-size now and after (`chars`, `chars_after`). `--apply` slims them all in one ordinary revision
+size now and after (`chars`, `chars_after`); then `tables`, one entry per table (`rows`, `refs`,
+`would_slim`, `changed_rows`, `originals_kept`, `originals_chars`, `chars`, `chars_after`, `batches`,
+`seconds`, `longest_batch_seconds`), `table_marks` and `tables_total`. `--apply` slims them all in one ordinary revision
 (history kind `slim-evidence-refs`) and marks the document; a second apply finds nothing and writes
 nothing. `--undo --apply` rebuilds every reference from the sources table in one revision of its own
 (`slim-evidence-refs-undo`) and clears the mark: it is what runs **before a rollback** to a release
@@ -364,10 +387,34 @@ and its archive. An erase reaches that table as it reaches every mind table with
 and the undo empties it. Neither the apply nor the undo is gated by a memory flag: the switch is
 the document's own mark, the dry run writes nothing, and the undo must always be able to run.
 
+The tables are walked after the document, group by group, a batch per write transaction (at most
+400 rows and about 4 million characters: on a copy of the live store no batch took more than half a
+second), so the running host's writers are never kept waiting long. A group's mark is set in its
+first batch. Every batch is idempotent: an interrupted apply is finished by running it again, and a
+second apply writes nothing. `--undo --apply` clears each group's mark in its first batch and rebuilds
+its rows from the sources table, pass after pass until one finds nothing left to rebuild (a writer,
+unmarked by then, may have copied a slim reference into a row already done). What a source row
+cannot give back is kept per table row in `mind_evidence_ref_originals` (`path` "", one entry per
+reference, holding only what differs: `unset` for fields the reference lacked, `set` for fields that
+differ or for all of them when its source is gone, `metadata` as a patch of the copied metadata). An
+erase takes whatever such an entry keeps of the source or record it erases; a reference whose source
+was erased and of which nothing was kept stays slim, and the undo counts it as `unexpandable`.
+
+On a copy of the live store brought to where 0.1.14's post-release steps left it (2026-09-28;
+document already slim and marked): 316,062 references in 75,126 of 92,599 table rows, 429.0 million
+characters of rows before and 249.0 million after; 109,273 of them keep an original (101,900 a
+reference written before `received_at` was kept -- every one of the graph's 79,659 -- and about 7,100
+in the appraisal queue whose copied metadata an erase had blanked), in 50,237 rows of 26.2 million
+characters. Apply 36-39 seconds, undo 56 seconds (two passes), no batch over 0.51 seconds; a second
+apply changed nothing, the undo gave back every table row byte for byte, and every graph node and
+edge is classified as before under every purpose.
+
 Run it after `desire-archive --apply` and `exploration-decision-archive --apply`, so the revision it
 writes is of the smaller document; it slims both archive tables too, and every later move keeps them
-slim, so the order is a matter of size, not of correctness. Before a rollback, run `slim-evidence-refs --undo --apply` first, then the unarchive
-commands.
+slim, so the order is a matter of size, not of correctness. It may run while the host runs. Before a
+rollback, run `slim-evidence-refs --undo --apply` first (with the host stopped, so no writer copies a
+slim reference after the last pass), then the unarchive commands; a report whose `tables_total`
+shows `unexpandable` above zero names references to erased sources, which no release reads.
 
 ### What a model is shown, and where it is enforced
 

@@ -670,7 +670,26 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
 
 def _plain(conn, table, ids, changed_ids=None, *, write=True, keys=None):
     changed, after = 0, None
-    for row in mentions(conn, table, ids):
+    from .evidence_refs import TABLE as ORIGINALS
+    from .evidence_refs import erase_kept
+    for row in mentions(conn, table, ids, "rowid AS key,path,data" if table == ORIGINALS else "rowid AS key,data"):
+        if table == ORIGINALS and row["path"] == "":
+            # A table's kept originals: what they keep of the erased goes whole (evidence_refs).
+            try:
+                left = erase_kept(json.loads(row["data"]), ids)
+            except ValueError:
+                continue
+            if left is None:
+                continue
+            changed += 1
+            if keys is not None:
+                keys.add(row["key"])
+            if write:
+                if left:
+                    conn.execute(f"UPDATE {table} SET data=? WHERE rowid=?", (dumps(left), row["key"]))
+                else:
+                    conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["key"],))
+            continue
         try:
             data = json.loads(row["data"])
         except ValueError:

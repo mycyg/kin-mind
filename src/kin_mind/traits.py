@@ -28,7 +28,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.persona import load_persona, mutable_trait, trait_categories, validate_trait_changes
 from eventmem.core.read_policy import ReadPolicy
 
-from . import appraisal
+from . import appraisal, evidence_refs
 from .autonomy_schema import optimized
 from .evidence_classes import (
     episode_key,
@@ -288,12 +288,13 @@ class Traits:
             return json.loads(conn.execute("SELECT data FROM mind_trait_observations WHERE id=?", (kept["id"],)).fetchone()[0])
         if kept:
             conn.execute("UPDATE mind_trait_observations SET class=?,root_key=?,at=?,state='valid',data=? WHERE id=?",
-                         (row["class"], row["root_key"], row["at"], dumps({**row, "id": kept["id"]}), kept["id"]))
+                         (row["class"], row["root_key"], row["at"],
+                          dumps(evidence_refs.as_stored(conn, self.scope, "mind_trait_observations", {**row, "id": kept["id"]})), kept["id"]))
             return {**row, "id": kept["id"]}
         conn.execute("INSERT INTO mind_trait_observations(id,scope,trait_id,class,polarity,episode_key,root_key,at,state,data) "
                      "VALUES(?,?,?,?,?,?,?,?,?,?)",
                      (row["id"], self.scope, identifier, row["class"], polarity, episode, row["root_key"],
-                      row["at"], "valid", dumps(row)))
+                      row["at"], "valid", dumps(evidence_refs.as_stored(conn, self.scope, "mind_trait_observations", row))))
         return row
 
     # --- decisions --------------------------------------------------------------------------------

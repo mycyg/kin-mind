@@ -11,6 +11,7 @@ from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
 from eventmem.core.read_policy import ReadPolicy
 
+from . import evidence_refs
 from .evidence_classes import owner_statement
 
 SCHEMA = """
@@ -126,9 +127,13 @@ class ConversationHabits:
         result = {"state": "applied", "revision": current["revision"] + 1, "entries": entries}
         if supersedes:
             result["supersedes"] = supersedes
-        conn.execute("INSERT OR REPLACE INTO mind_conversation_habits VALUES(?,?,?)", (self.scope.key(), result["revision"], dumps(result)))
-        conn.execute("INSERT INTO mind_habit_revisions VALUES(?,?,?)", (self.scope.key(), result["revision"], dumps(result)))
-        conn.execute("INSERT INTO mind_habit_commands VALUES(?,?,?,?)", (self.scope.key(), command_id, hashed, dumps(result)))
+        # Once the habits are marked, each entry's evidence is kept to what its readers read
+        # (evidence_refs), and the receipt is what a replay of this command reads back.
+        result = evidence_refs.as_stored(conn, self.scope.key(), "mind_conversation_habits", result)
+        stored = dumps(result)
+        conn.execute("INSERT OR REPLACE INTO mind_conversation_habits VALUES(?,?,?)", (self.scope.key(), result["revision"], stored))
+        conn.execute("INSERT INTO mind_habit_revisions VALUES(?,?,?)", (self.scope.key(), result["revision"], stored))
+        conn.execute("INSERT INTO mind_habit_commands VALUES(?,?,?,?)", (self.scope.key(), command_id, hashed, stored))
         record(conn, stamp, command_id, self.mind.clock())
         return result
 

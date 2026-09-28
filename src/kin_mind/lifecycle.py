@@ -13,6 +13,7 @@ from eventmem.core.idempotency import record, revision_id, unchanged
 from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope
 
+from . import evidence_refs
 from .state import timestamp
 
 DIGEST_VERSION = "event-digest-v1"
@@ -336,7 +337,8 @@ class EventLifecycle:
                     inverse = {"state": "applied", "command_id": undo_id, "before": before,
                                "after_revisions": changed, "evidence": evidence, "appraisal_id": appraisal_id}
                     conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)",
-                                 (undo_id, self.scope.key(), payload_hash, dumps(inverse)))
+                                 (undo_id, self.scope.key(), payload_hash,
+                                  dumps(evidence_refs.as_stored(conn, self.scope.key(), "mind_graph_commands", inverse))))
                 result = {"state": action, "requested_action": route.action, "event_id": target["id"] if target else None,
                           "undo_command_id": undo_id,
                           "member_ids": [m["id"] for m in members], "evidence": evidence,
@@ -346,6 +348,8 @@ class EventLifecycle:
                           "reason": route.reason, "at": self.mind.clock(), "appraisal_id": appraisal_id}
                 if supersedes:
                     result["supersedes"] = supersedes
+                # What a replay of this route reads back is what it answers now.
+                result = evidence_refs.as_stored(conn, self.scope.key(), "mind_event_routes", result)
                 conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
                 record(conn, stamp, command_id, self.mind.clock())
                 results.append(result)

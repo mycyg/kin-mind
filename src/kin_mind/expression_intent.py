@@ -25,7 +25,7 @@ from datetime import timedelta
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.persona import load_persona, persona_metadata
 
-from . import appraisal, trait_refs
+from . import appraisal, evidence_refs, trait_refs
 from .autonomy_schema import optimized
 from .evidence_classes import never_evidence
 from .state import timestamp
@@ -126,9 +126,10 @@ def commit_intent(commit):
               "agent_version": commit.version, "stimulus": commit.stimulus}
     conn.execute("INSERT INTO mind_expression_intents VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
                  "id=excluded.id,at=excluded.at,valid_until=excluded.valid_until,data=excluded.data",
-                 (mind.scope.key(), identifier, at, intent["valid_until"], dumps(intent)))
+                 (mind.scope.key(), identifier, at, intent["valid_until"],
+                  dumps(evidence_refs.as_stored(conn, mind.scope.key(), "mind_expression_intents", intent))))
     conn.execute("INSERT OR REPLACE INTO mind_expression_intent_log VALUES(?,?,?,?)",
-                 (identifier, mind.scope.key(), at, dumps(intent)))
+                 (identifier, mind.scope.key(), at, dumps(evidence_refs.as_stored(conn, mind.scope.key(), "mind_expression_intent_log", intent))))
     # The intent already re-reads the ledger for itself before every reply; this is so that one
     # place answers the other question — what did this trait hold up, once it moves. One intent is
     # in force at a time, so the one this replaces leaves no row behind.

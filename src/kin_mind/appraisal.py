@@ -137,6 +137,16 @@ def kept(conn, data, since=None):
     from .erasure import drop_deleted
 
     return drop_deleted(conn, data, since=data.get("tombstone_mark") if since is None else since, process=True)
+
+
+def queue_row(conn, scope, data):
+    """A queue row's `data` as it is written: once the queue is marked, every reference it keeps --
+    the sources its model was shown, a seed's, the exploration targets, the frozen memory context's
+    -- holds what its readers read and no more (the owner's decision, 2026-09-28; evidence_refs).
+    Unmarked, exactly `dumps(data)`. Inside the transaction that writes it."""
+    from .evidence_refs import as_stored
+
+    return dumps(as_stored(conn, scope, "mind_appraisals", data))
 # A provider outage produces no model output: it spends no repair budget and
 # must not quarantine a whole queue, but it cannot retry for ever either. It is retried
 # for about two hours (1, 2, 4, 8, 16, 30, 30, 30 minutes) before the row is set aside
@@ -1880,7 +1890,7 @@ class Appraisals:
         with self.engine.db.connect(write=True) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data)),
+                (job_id, self.mind.scope.key(), "pending", time.time(), queue_row(conn, self.mind.scope.key(), data)),
             )
         return {"id": job_id, "state": self.status(job_id)["state"]}
 
@@ -1901,7 +1911,8 @@ class Appraisals:
                 **({"session_request_id": request_id} if request_id else {})}
         with self.engine.db.connect(write=True) as conn:
             created = conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                                   (job_id, self.mind.scope.key(), "pending", time.time(), dumps(data))).rowcount == 1
+                                   (job_id, self.mind.scope.key(), "pending", time.time(),
+                                    queue_row(conn, self.mind.scope.key(), data))).rowcount == 1
         return {"id": job_id, "state": self.status(job_id)["state"], "snapshotId": snapshot_id, "requestId": request_id, "created": created}
 
     def migrate_continuity(self, evidence_ids, agent_version):
@@ -2080,7 +2091,7 @@ class Appraisals:
             if data.get("receipt"):
                 child_data["receipt"] = data["receipt"]
             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,data=? WHERE id=? AND state=?",
-                         (dumps(child_data), child_id, child["state"]))
+                         (queue_row(conn, self.mind.scope.key(), child_data), child_id, child["state"]))
         return members
 
     def _review_evidence(self, job_id, data):
@@ -2111,7 +2122,8 @@ class Appraisals:
                 # Still unclaimed and unarmed: a worker that took it meanwhile arms its own attempt.
                 current = conn.execute("SELECT data FROM mind_appraisals WHERE id=? AND state='pending'", (job_id,)).fetchone()
                 if current and not json.loads(current[0]).get("review_source_id"):
-                    conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps({**json.loads(current[0]), **evidence}), job_id))
+                    conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?",
+                                 (queue_row(conn, self.mind.scope.key(), {**json.loads(current[0]), **evidence}), job_id))
         except Exception:  # noqa: BLE001
             return
 
@@ -2363,7 +2375,7 @@ class Appraisals:
                 continue
             member = {**rows[member_id][1], "solo": True, "split_from": parent_id}
             conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,data=? WHERE id=? AND state='batched'",
-                         (time.time(), dumps(member), member_id))
+                         (time.time(), queue_row(conn, self.mind.scope.key(), member), member_id))
             released.append(member_id)
         return released
 
@@ -2473,7 +2485,7 @@ class Appraisals:
                 if batch_ids:
                     data.update(batch_ids=batch_ids, evidence_ids=ids, stimulus=batch_stimulus(stimuli),
                                 stimuli=sorted(x or "interaction" for x in stimuli), own=own)
-                conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+                conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
             ledger = attempts.enabled(conn, self.mind.scope.key())
@@ -2486,7 +2498,7 @@ class Appraisals:
             data["tombstone_mark"] = erasure.tombstone_mark(conn)
             data["attempt_token"] = uuid.uuid4().hex
             data.pop("tier", None)
-            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(data), row["id"]))
+            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), data), row["id"]))
             conn.execute(
                 "UPDATE mind_appraisals SET state='running',lease=?,attempts=attempts+1 WHERE id=?",
                 # The host's absolute worker deadline is request timeout + 60s;
@@ -2544,7 +2556,7 @@ class Appraisals:
                         with self.engine.db.connect(write=True) as conn:
                             stored = kept(conn, data)
                             conn.execute("UPDATE mind_appraisals SET state='complete',lease=0,attempts=MAX(0,attempts-1),data=? WHERE id=?",
-                                         (dumps(stored), row["id"]))
+                                         (queue_row(conn, self.mind.scope.key(), stored), row["id"]))
                             self._settle_children(conn, row["id"], stored, "complete")
                             if ledger:
                                 # With the row's end, in one transaction (CR3-MM-07).
@@ -2611,7 +2623,7 @@ class Appraisals:
                 if lanes and memory_context and not data.get("frozen_memory_context"):
                     data["frozen_memory_context"] = {k: v for k, v in memory_context.items() if k != HABITS}
                     with self.engine.db.connect(write=True) as conn:
-                        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
+                        conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), kept(conn, data)), row["id"]))
                 with self.engine.db.connect() as conn:
                     refs = self._root_evidence(conn, data["evidence_ids"])
                     if not self.mind._fresh(conn, refs):
@@ -2850,7 +2862,7 @@ class Appraisals:
                         # repair that fails, is recorded by the commit and the appraisal completes.
                         data["advice_repair_attempted"] = True
                         with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), kept(conn, data)), row["id"]))
                         try:
                             advice, repair_receipt = provider.repair_session_advice(proposal.session_advice, self.session_context, problem)
                             proposal = proposal.model_copy(update={"session_advice": advice})
@@ -2887,7 +2899,7 @@ class Appraisals:
                         data.setdefault("rejected_results", []).append({"reason": "missing-target-decision", "proposal": proposal_record(proposal), "receipt": receipt,
                                                                          "tombstone_mark": data["tombstone_mark"]})
                         with self.engine.db.connect(write=True) as conn:
-                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (dumps(kept(conn, data)), row["id"]))
+                            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), kept(conn, data)), row["id"]))
                         sharing, repair_receipt = provider.repair_sharing(proposal, model_context)
                         proposal = proposal.model_copy(update={"sharing": sharing})
                         receipt = {**receipt, "sharing_repair": repair_receipt}
@@ -3307,7 +3319,8 @@ class Appraisals:
                                 "evaluated_ids": data.get("evaluated_ids") or [],
                                 "seed_tombstone_mark": data.get("tombstone_mark")}
                             conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                                (enrichment_id, self.mind.scope.key(), "pending", time.time(), dumps(enrichment_data)))
+                                (enrichment_id, self.mind.scope.key(), "pending", time.time(),
+                                 queue_row(conn, self.mind.scope.key(), enrichment_data)))
                     elif memory_context:
                         # A later bubble may extend the same share while DS runs.
                         # Keep that share pending for the next batch; independent
@@ -3556,7 +3569,7 @@ class Appraisals:
             stored = kept(conn, data)
             changed = conn.execute(
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
-                (state, time.time() + delay, int(uncharged), dumps(stored), row["id"], data["attempt_token"]),
+                (state, time.time() + delay, int(uncharged), queue_row(conn, self.mind.scope.key(), stored), row["id"], data["attempt_token"]),
             ).rowcount
             if changed:
                 self._settle_children(conn, row["id"], stored, state)
