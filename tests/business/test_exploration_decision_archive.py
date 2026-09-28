@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from eventmem.core.db import Conflict, Missing, dumps
+from eventmem.core.engine import root_id
 from eventmem.core.models import SourceInput
 
 from kin_mind import exploration_decision_archive as decisions
@@ -308,7 +309,7 @@ def test_what_moves_is_handed_to_memory_with_the_ids_of_its_records(setup, monke
                           "exploration": {"id": "explore_tea", "topic": "tea gardens", "target": "knowledge",
                                           "state": "complete", "partial": False,
                                           "summary": "what explore_tea found"}},
-        "evidence_ids": [ref["record_id"] for ref in stored["evidence"]],
+        "evidence_ids": [*[ref["record_id"] for ref in stored["evidence"]], root_id(seed)],
         "refs": ["explore_tea", result, *observed],
     }
     assert "metadata" not in dumps(item) and "a page explore_tea cited" not in dumps(item)
@@ -612,3 +613,30 @@ def test_a_moved_decision_becomes_a_memory_whose_id_reads_the_whole_decision(set
     decisions.restore(mind, apply=True)
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT state FROM mind_archive_memory WHERE item_id='explore_tea'").fetchone()[0] == "restored"
+
+
+def test_reconsidered_decision_memory_still_depends_on_the_copied_result(setup, monkeypatch):
+    from kin_mind import archive_memory
+    from test_archive_memory import Endpoint, entries
+
+    mind, source, clock = setup
+    result, _ = decided(mind, clock, "explore_reconsidered", words=MARKER)
+    thought = source("new-thought")
+    def reconsider(conn, state, event_id):
+        decision = state["exploration_decisions"]["explore_reconsidered"]
+        decision.update(revision=2, evidence=mind._evidence(conn, [thought]))
+    mind._mutate({"command_id": "reconsider", "agent_version": AGENT,
+                  "expected_revision": document(mind)["revision"], "evidence_ids": [thought]},
+                 "test-reconsider", reconsider)
+    older_and_newer(mind, clock, old=VIEW)
+    switch(mind)
+    decisions.archive(mind, apply=True)
+    def answer(sent):
+        records = json.loads(sent["messages"][0]["content"])["items"]
+        return [{"key": item["key"], "text": "我记得 " + MARKER} for item in records]
+    archive_memory.run(mind, Endpoint(mind, monkeypatch, answer).provider)
+    assert len(entries(mind)) == 1
+    mind.engine.delete(result)
+    settle(mind.engine)
+    assert all(row["deleted"] for row in entries(mind).values())
+    assert texts_everywhere(mind.engine, MARKER) == set()

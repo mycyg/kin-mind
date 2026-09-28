@@ -258,13 +258,19 @@ def _item(conn, mind, state, decision):
                    "state": run[0] if run else None, "partial": data.get("partial"),
                    "summary": summary[:SUMMARY_CHARS] if isinstance(summary, str) else None}
     refs = [identifier, data.get("source_id"), *(data.get("observation_ids") or [])]
+    from eventmem.core.engine import root_id
+    # A reconsidered decision can cite only the new thought. Its memory also copies
+    # the result and the wish's topic, so retain those deletion dependencies too.
+    dependencies = [ref["record_id"] for ref in [*(decision.get("evidence") or []),
+                                                 *((wish or {}).get("evidence") or [])]
+                    if isinstance(ref, dict) and isinstance(ref.get("record_id"), str)]
+    dependencies.extend(root_id(sid) for sid in refs[1:] if isinstance(sid, str) and sid.startswith("src_"))
     return {
         "id": identifier, "revision": decision.get("revision"),
         "summary_input": {"decision": decision.get("decision"), "reason": decision.get("reason"),
                           "reconsider_when": decision.get("reconsider_when"),
                           "decided_at": decision.get("updated_at"), "exploration": exploration},
-        "evidence_ids": list(dict.fromkeys(ref["record_id"] for ref in decision.get("evidence") or []
-                                           if isinstance(ref, dict) and isinstance(ref.get("record_id"), str))),
+        "evidence_ids": list(dict.fromkeys(dependencies)),
         "occurred_at": decision.get("updated_at"),
         "refs": list(dict.fromkeys(i for i in refs if isinstance(i, str) and i)),
     }
