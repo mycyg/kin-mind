@@ -347,6 +347,14 @@ def dispatch(config, action, request):
             "memory_context": {"state": "disabled", "text": "", "tokens": 0},
         }
     if action == "read":
+        projection = request.get("projection")
+        if projection is not None:
+            # A bounded part of the state for a reader that uses only that (interaction_projection):
+            # a contact draft. Without it the answer is the whole view, as it always was.
+            from .interaction_projection import PROJECTION, interaction_projection
+            if projection != PROJECTION or request.get("history"):
+                raise ValueError("Unknown state projection")
+            return {"projection": PROJECTION, "state": interaction_projection(mind.read(query=request.get("query", "")))}
         return {
             "state": mind.read(history=request.get("history", 0), query=request.get("query", "")),
             "exploration_capabilities": jobs.exploration_capabilities,

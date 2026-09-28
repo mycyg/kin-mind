@@ -255,7 +255,9 @@ export function stateContext(result) {
 }
 
 /** Ordinary turns and proactive drafts use this exact bounded projection. An item whose sources
- * moved is shown like any other and marked 待复核 (N12); the bounds are wider than they were. */
+ * moved is shown like any other and marked 待复核 (N12); the bounds are wider than they were. A draft
+ * reads the state already cut to what this renders (kin_mind/interaction_projection.py, which mirrors
+ * these bounds): a change here is a change there. */
 export const INTERACTION_LIMITS=Object.freeze({desires:16,concerns:6,guidance:3});
 const REVIEW='待复核';
 const marked=item=>item?.needs_review?{...item,review:REVIEW}:item;
