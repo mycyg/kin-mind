@@ -65,6 +65,7 @@ from datetime import timedelta
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
+from . import archive_memory
 from .exploration_decisions import VIEW, newest
 from .state import timestamp
 
@@ -442,6 +443,7 @@ def restore(mind, *, apply=False, ids=None, sample=SAMPLE):
             conn.execute(f"DELETE FROM {TABLE} WHERE scope=? AND id=?", (scope, identifier))
             back.append(identifier)
         current["exploration_decisions"] = {k: decisions[k] for k in sorted(decisions)}
+        archive_memory.restored(mind, conn, MEMORY_KIND, back)
         _counted(conn, scope, current)
         return {"restored": back}
 
@@ -493,3 +495,38 @@ def auto(mind, *, inject=None):
     except Exception as error:  # noqa: BLE001 -- the minute's other bookkeeping must go on
         print(f"kin mind: exploration decision archive did not run: {type(error).__name__}", file=sys.stderr)
         return {"state": "failed", "error": type(error).__name__}
+
+
+# --- memory --------------------------------------------------------------------------------------
+
+# What an entry of this kind says (archive_memory): the owner asked on 2026-09-28 that exploration
+# decisions and results leave the document as short memories the main session can still recall,
+# with the full record one read away (`read_archived_record`).
+MEMORY_INSTRUCTION = ("探索决定（kind=exploration-decision）：写你对这次探索结果作了什么决定——分享给对方（share）、"
+                      "先放着等条件满足再看（defer），还是自己留着不分享（keep）——为什么，这次探索的是什么、"
+                      "查到了什么，以及大约是什么时候。")
+
+
+def _load(mind, conn, identifier):
+    """The full archived decision, for a read: every field as the document held it, its evidence as
+    the store ids it names (the copies of the sources' metadata those references carry are left out)."""
+    decision = archived(conn, mind.scope.key(), identifier)
+    if decision is None:
+        return None
+    decision["evidence"] = [{k: ref[k] for k in ("source_id", "record_id", "revision", "namespace", "occurred_at", "erased")
+                             if k in ref} for ref in decision.get("evidence") or [] if isinstance(ref, dict)]
+    return {"outcome": decision.get("decision"), "record": decision}
+
+
+def _backfill(mind, conn):
+    """Every decision already archived, in `enqueue`'s shape."""
+    if not installed(conn):
+        return []
+    state = mind._load(conn)
+    return [_item(conn, mind, state, json.loads(row[0])) for row in conn.execute(
+        f"SELECT data FROM {TABLE} WHERE scope=? ORDER BY id", (mind.scope.key(),))]
+
+
+archive_memory.register(MEMORY_KIND, label="探索决定", instruction=MEMORY_INSTRUCTION, loader=_load, backfill=_backfill)
+# Moved decisions become memory entries, queued in the transaction that moves them.
+memory_hook = archive_memory.enqueue

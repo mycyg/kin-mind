@@ -120,7 +120,7 @@ class Kind(NamedTuple):
 KINDS: dict[str, Kind] = {}
 # The modules that register the kinds this package ships; importing one registers its kind. An
 # archive of another kind adds its module here.
-BUILTIN = ("desire_archive",)
+BUILTIN = ("desire_archive", "exploration_decision_archive")
 
 
 def register(kind, *, label, instruction, loader, backfill=None):

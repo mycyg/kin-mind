@@ -573,3 +573,42 @@ def test_an_erase_reaches_a_decision_that_moved(setup):
     assert any(ref.get("erased") for ref in kept["evidence"]), "the erased reference stays as a tombstone"
     back = decisions.restore(mind, apply=True, ids=["explore_secret"])
     assert back["restored"] == ["explore_secret"] and MARKER not in dumps(document(mind))
+
+
+def test_a_moved_decision_becomes_a_memory_whose_id_reads_the_whole_decision(setup, monkeypatch):
+    """Wired at integration (the owner, 2026-09-28: exploration decisions and results leave the
+    document as short memories the main session can recall, the full record one read away). With no
+    hook passed, what moves is queued for the archive memory in the transaction that moves it;
+    DeepSeek writes it as a memory of kind exploration-decision from the summary fields alone; the
+    entry reads the whole decision back, its result by id; a restore takes the item back out of what
+    is remembered as archived."""
+    from kin_mind import archive_memory
+    from test_archive_memory import Endpoint, entries
+
+    mind, source, clock = setup
+    result, observed = decided(mind, clock, "explore_tea", "keep", pages=2)
+    older_and_newer(mind, clock, old=VIEW)
+    switch(mind)
+    stored = document(mind)["exploration_decisions"]["explore_tea"]
+    assert decisions.archive(mind, apply=True)["moved"] == ["explore_tea"]
+    with mind.engine.db.connect() as conn:
+        queued = conn.execute("SELECT item_id,kind,state FROM mind_archive_memory WHERE scope=?",
+                              (mind.scope.key(),)).fetchall()
+    assert [tuple(row) for row in queued] == [("explore_tea", decisions.MEMORY_KIND, "pending")]
+
+    def answer(sent):
+        records = json.loads(sent["messages"][0]["content"])["items"]
+        assert [item["kind"] for item in records] == [decisions.MEMORY_KIND]
+        assert records[0]["record"]["decision"] == "keep" and "metadata" not in dumps(records)
+        assert decisions.MEMORY_INSTRUCTION in sent["system"]
+        return [{"key": item["key"], "text": "我查过茶园的事，决定先自己留着。"} for item in records]
+    archive_memory.run(mind, Endpoint(mind, monkeypatch, answer).provider)
+    [entry] = entries(mind)
+    whole = archive_memory.read(mind, entry)
+    assert (whole["kind"], whole["id"], whole["outcome"]) == (decisions.MEMORY_KIND, "explore_tea", "keep")
+    assert whole["record"]["reason"] == stored["reason"] and whole["record"]["revision"] == stored["revision"]
+    assert all("metadata" not in ref for ref in whole["record"]["evidence"])
+    assert whole["entries"][0]["refs"] == ["explore_tea", result, *observed]
+    decisions.restore(mind, apply=True)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_archive_memory WHERE item_id='explore_tea'").fetchone()[0] == "restored"
