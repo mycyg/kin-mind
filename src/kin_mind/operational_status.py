@@ -57,6 +57,81 @@ def _hours(then, now):
     return None if then is None else round(max(0.0, now - then) / 3600, 1)
 
 
+def _iso(seconds):
+    return None if seconds is None else datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+# A proactive contact attempt that ended for a technical reason (2026-09-28: an hour of drafts that all
+# failed before they started, and nothing said so). Read from the attempt's ledger row as the host
+# settled it: canceled, with a failure receipt (owner-host.mjs `failure`, state.py ContactFailure) of a
+# technical category at a stage that is not the owner's side. A wait -- a quiet window, the owner's
+# rules, a reply awaited, Kin's own choice to wait or let go -- carries no failure; a draft the owner's
+# turn, a changed source or a release freeze held back carries a `source-changed` one at a source
+# stage. Neither is a technical failure, and either one ends a streak.
+CONTACT_TECHNICAL_CATEGORIES = frozenset({"contract", "model-unavailable", "model-output", "unknown", "host-runtime"})
+CONTACT_DEFERRAL_STAGES = frozenset({"contact-draft-source", "contact-send-boundary", "contact-review-source", "mind-worker-source"})
+CONTACT_DEFERRAL_CODES = frozenset({"dispatch-frozen"})
+# The newest settled attempts read, the times of a streak listed and the wishes it names.
+CONTACT_ROWS_READ = 2000
+CONTACT_STREAK_TIMES = 32
+CONTACT_STREAK_WISHES = 8
+
+
+def technical_failure(state, failure):
+    """The failure receipt of an attempt that ended for a technical reason, or None."""
+    if state != "canceled" or not isinstance(failure, dict):
+        return None
+    if failure.get("category") not in CONTACT_TECHNICAL_CATEGORIES:
+        return None
+    if failure.get("stage") in CONTACT_DEFERRAL_STAGES or failure.get("code") in CONTACT_DEFERRAL_CODES:
+        return None
+    return failure
+
+
+def _label(value):
+    return value[:96] if isinstance(value, str) and value else None
+
+
+def contact_failures(conn, scope, now):
+    """Proactive contacts that ended for a technical reason (`technical_failure`): how many in the last
+    day, the last one, and the current streak -- the newest settled attempts back to the first that is
+    not such a failure or has another code: how many, the code, its first and last time and the wish
+    of each (the attempt's leading wish). Times, codes, counts and ids only. An attempt still being
+    drafted or sent has no outcome yet and is passed over."""
+    rows = conn.execute(
+        "SELECT state,json_extract(data,'$.updated_at'),json_extract(data,'$.failure'),json_extract(data,'$.desire_id') "
+        "FROM mind_contacts WHERE scope=? AND state NOT IN ('drafting','pending') ORDER BY rowid DESC LIMIT ?",
+        (scope, CONTACT_ROWS_READ)).fetchall()
+    failed_24h, last, streak, open_ = 0, None, None, True
+    for state, at, failure, wish in rows:
+        try:
+            failure = json.loads(failure) if isinstance(failure, str) else None
+        except ValueError:
+            failure = None
+        found = technical_failure(state, failure)
+        seconds = _seconds(at)
+        if found and seconds is not None and seconds >= now - DAY:
+            failed_24h += 1
+        if found and last is None:
+            last = {"at": _iso(seconds), "code": _label(found.get("code")), "category": _label(found.get("category")),
+                    "stage": _label(found.get("stage")), "wish_id": _label(wish)}
+        if not open_:
+            continue
+        if not found or (streak and _label(found.get("code")) != streak["code"]):
+            open_ = False
+            continue
+        if streak is None:
+            streak = {"count": 0, "code": _label(found.get("code")), "category": _label(found.get("category")),
+                      "stage": _label(found.get("stage")), "last_at": _iso(seconds), "wish_id": _label(wish), "wish_ids": [], "times": []}
+        streak["count"] += 1
+        streak["first_at"] = _iso(seconds)
+        if len(streak["times"]) < CONTACT_STREAK_TIMES and seconds is not None:
+            streak["times"].append(_iso(seconds))
+        if _label(wish) and _label(wish) not in streak["wish_ids"] and len(streak["wish_ids"]) < CONTACT_STREAK_WISHES:
+            streak["wish_ids"].append(_label(wish))
+    return {"failed_24h": failed_24h, "last": last, "streak": streak}
+
+
 def _table(conn, name):
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
 
@@ -64,7 +139,8 @@ def _table(conn, name):
 def liveness(conn, scope, *, now=None):
     """Whether the work is moving, read from the store and nothing else (OPS-02): embeddings --
     what failed for good in the last day, what waits and since when, the last one made -- the
-    appraisals in quarantine, and when Kin last formed a wish, explored and reached out.
+    appraisals in quarantine, when Kin last formed a wish, explored and reached out, and the
+    proactive contacts that failed for a technical reason (`contact_failures`).
     Counts, times, states and job errors (sanitized by the queue) only; never a line of content.
     `scope` is the scope's key. Read-only: the host's health reads it through `main` from a
     connection that cannot write."""
@@ -131,6 +207,7 @@ def liveness(conn, scope, *, now=None):
         sent = conn.execute("SELECT json_extract(data,'$.updated_at') FROM mind_contacts WHERE scope=? AND state='accepted' "
                             "ORDER BY rowid DESC LIMIT 1", (scope,)).fetchone()
         last["contact_sent_at"] = sent[0] if sent else None
+        facts["contact_failures"] = contact_failures(conn, scope, now)
     names = {"wish_created_at": "wish", "exploration_at": "exploration", "contact_sent_at": "contact"}
     facts["last"] = {**last, "hours_since": {names[key]: _hours(_seconds(value), now) for key, value in last.items()}}
     return facts

@@ -11,7 +11,7 @@ export const REVIEWER_PURPOSES={classify:'mobile-route-message',summarizeWork:'m
 const TOOL_ENTRY={route_message:'classify',summarize_open_work:'summarizeWork',review_mobile_health:'audit'};
 /** What a health reading may name. A fixed set, so the same fault is the same fault
  * however it is worded (AD2-27); `other` keeps anything new visible. */
-export const AUDIT_CODES=Object.freeze(['delivery-uncertain','session-mismatch','model-mismatch','task-stuck','input-unanswered','memory-stalled','schedule-fault','other']);
+export const AUDIT_CODES=Object.freeze(['delivery-uncertain','session-mismatch','model-mismatch','task-stuck','input-unanswered','memory-stalled','schedule-fault','contact-failing','other']);
 
 // What else the one routing call may be asked about the same message. Every addition is an
 // enum or a short bounded string: this call already times out on part of the traffic, and
@@ -135,7 +135,7 @@ export function createMobileReviewer({key,fetchImpl=fetch,onUsage=()=>{},lease=n
     },
     async audit(input,{held=null}={}) {
       const result=await request({input,name:'review_mobile_health',maxTokens:65536,timeoutMs:480000,held,
-        system:"只复核给定的手机后端健康证据，不执行修复，也不安排修复。当前证据正常时 healthy，否则 needs_attention。报告新出现的投递不确定、共同会话/模型不一致、任务卡住、输入未得到结果、记忆不推进或调度故障，code 从给定枚举中选最贴切的一项。免打扰、主动值低、用户任务运行都不是故障。loaded=false、canonicalMatch=null 表示空闲会话尚未加载，模型未核验，不等于会话错绑。积压数量不能证明停止推进，要比较进展。已结清的历史故障不报成新故障。每项发现引用给定字段及实际值。没有给出的用户消息或内部推理不能编造，也不编造命令和配置值。发现只作为事实交给 Kin，何时处理由她决定。",
+        system:"只复核给定的手机后端健康证据，不执行修复，也不安排修复。当前证据正常时 healthy，否则 needs_attention。报告新出现的投递不确定、共同会话/模型不一致、任务卡住、输入未得到结果、记忆不推进、主动联系连续因技术故障失败或调度故障，code 从给定枚举中选最贴切的一项。detected 是宿主按固定规则已确认的故障，照其 code 报告。免打扰、主动值低、用户任务运行都不是故障。loaded=false、canonicalMatch=null 表示空闲会话尚未加载，模型未核验，不等于会话错绑。积压数量不能证明停止推进，要比较进展。已结清的历史故障不报成新故障。每项发现引用给定字段及实际值。没有给出的用户消息或内部推理不能编造，也不编造命令和配置值。发现只作为事实交给 Kin，何时处理由她决定。",
         schema:{type:'object',properties:{status:{type:'string',enum:['healthy','needs_attention']},findings:{type:'array',maxItems:8,items:{type:'object',properties:{code:{type:'string',enum:[...AUDIT_CODES]},evidence:{type:'string',maxLength:600},summary:{type:'string',maxLength:600}},required:['code','evidence','summary'],additionalProperties:false}}},required:['status','findings'],additionalProperties:false}});
       if(!['healthy','needs_attention'].includes(result.status)||!Array.isArray(result.findings)||result.findings.length>8||result.findings.some(f=>!AUDIT_CODES.includes(f?.code)))throw Error('deepseek-invalid-audit');
       return result;

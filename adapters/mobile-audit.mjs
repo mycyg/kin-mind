@@ -14,6 +14,20 @@ export function appraisalProgress(operations, mind={}) {
   return {state:'unknown',at:null,lastRecordedResult:mind.appraisal?.state??null};
 }
 
+/** What the host itself found in a reading by a fixed rule (`snapshot.detected`: `{code, summary,
+ * evidence}`, a code of AUDIT_CODES) is a finding whatever the review answered, and the reading needs
+ * attention. The review reads the same snapshot, but a model's reading of it is no rule: on 2026-09-28
+ * it answered healthy with no codes while every proactive contact had failed for an hour. The host's
+ * findings come first and keep their place within the eight a reading holds; the review's finding of
+ * the same code gives way to the host's. */
+export function withDetected(result,snapshot) {
+  const detected=(Array.isArray(snapshot?.detected)?snapshot.detected:[]).filter(item=>AUDIT_CODES.includes(item?.code)&&item.code!=='other')
+    .map(item=>({code:item.code,summary:String(item.summary??'').slice(0,600),evidence:String(item.evidence??'').slice(0,600)}));
+  if(!detected.length)return result;
+  const codes=new Set(detected.map(item=>item.code));
+  return {...result,status:'needs_attention',findings:[...detected,...(result.findings??[]).filter(f=>!codes.has(f?.code))].slice(0,8)};
+}
+
 /** A failed reading is retried soon twice, then waits for its ordinary interval. */
 export const AUDIT_FAILURE_RETRY_MINUTES=Object.freeze([5,15]);
 /** A fault seen again within this long after it cleared is the same incident. */
@@ -110,8 +124,9 @@ export class MobileAudit {
     this.state.status='running';this.state.startedAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;
     try {atomicJson(this.file,this.state);}
     catch(error){this.running=false;try {await held?.release();} finally {gate?.release();}throw error;}
+    let snapshot;
     try {
-      const snapshot=await this.collect();const result=await this.review(snapshot,{held});
+      snapshot=await this.collect();const result=withDetected(await this.review(snapshot,{held}),snapshot);
       const at=this.now();
       this.state.status=result.status;this.state.failures=0;this.state.lastSuccessAt=at;this.state.nextAt=at+this.intervalHours*3600000;
       this.state.lastReview={id,at,status:result.status,codes:[...new Set(result.findings.map(f=>f.code))].sort()};
@@ -122,6 +137,10 @@ export class MobileAudit {
       // A lane that refused the run is not a failed review: nothing was spent, so it
       // costs no failure count and returns soon rather than in four hours.
       if(error?.leaseSkipped){this.state.status='skipped';this.state.nextAt=this.now()+this.skipRetryMs;return{state:'skipped',lane:this.lane,reason:error.lease?.leaseReason??error.lease?.leaseState??'model-lane-unavailable'};}
+      // What the host found by its own rule does not wait for the review: it is an incident now, and
+      // the reading is still a failed one, retried as before.
+      const found=withDetected({status:'healthy',findings:[]},snapshot);
+      if(found.findings.length)this.record(id,found,this.now());
       this.state.status='failed';this.state.failures=(this.state.failures??0)+1;
       const minutes=AUDIT_FAILURE_RETRY_MINUTES[this.state.failures-1]??this.intervalHours*60;
       this.state.nextAt=this.now()+minutes*60000;

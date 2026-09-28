@@ -170,3 +170,100 @@ def test_the_embedding_service_is_asked_on_its_own_port_with_its_own_credential(
                                                                        "ours": True, "loaded": True}
         other = Answer(200, {"service": "something-else"})
         assert embedding_service(conn, engine.db.root, client=other)["ours"] is False
+
+
+def attempt(conn, scope, identifier, state, minutes_ago, failure=None, wish="desire_a", reason="draft-failed"):
+    """One contact ledger row as the host settles it: its outcome, when, its leading wish and, for one
+    that failed, the failure receipt (owner-host.mjs `failure`)."""
+    data = {"id": identifier, "updated_at": iso(minutes=minutes_ago), "desire_id": wish, "reason": reason,
+            **({"failure": failure} if failure else {})}
+    conn.execute("INSERT INTO mind_contacts VALUES(?,?,?,?)", (identifier, scope.key(), state, dumps(data)))
+
+
+LIMIT = {"category": "model-output", "stage": "mind-worker", "code": "mind-worker-output-limit", "retry_condition": "backoff", "model_invoked": None}
+
+
+def facts_of(root, scope):
+    conn = read_only(root)
+    try:
+        return liveness(conn, scope.key(), now=NOW.timestamp())["contact_failures"]
+    finally:
+        conn.close()
+
+
+def test_contacts_that_failed_for_a_technical_reason_are_counted_and_their_streak_is_said(store):
+    """2026-09-28: every draft failed at the mind worker for an hour, each canceled with the same code,
+    and nothing said so. The store says it now: how many in the last day, the last one, and the
+    current streak of the same code -- how many, its first and last time, its wish -- times and codes
+    only. An attempt still being drafted is passed over; one older than a day is not counted."""
+    engine, scope, _mind, root = store
+    with engine.db.connect(write=True) as conn:
+        attempt(conn, scope, "old", "canceled", 30 * 60, LIMIT, wish="desire_old")
+        attempt(conn, scope, "sent", "accepted", 200, reason="Platform accepted")
+        for i, minutes in enumerate((75, 64, 53, 42, 31, 20)):
+            attempt(conn, scope, f"fail_{i}", "canceled", minutes, LIMIT, wish="desire_b" if i else "desire_a")
+        attempt(conn, scope, "drafting", "drafting", 1, wish="desire_b")
+    facts = facts_of(root, scope)
+    assert facts["failed_24h"] == 6, "the one from yesterday is history"
+    assert facts["last"] == {"at": iso(minutes=20), "code": "mind-worker-output-limit", "category": "model-output",
+                             "stage": "mind-worker", "wish_id": "desire_b"}
+    streak = facts["streak"]
+    assert (streak["count"], streak["code"], streak["category"], streak["stage"]) == (6, "mind-worker-output-limit", "model-output", "mind-worker")
+    assert (streak["first_at"], streak["last_at"]) == (iso(minutes=75), iso(minutes=20))
+    assert streak["times"] == [iso(minutes=m) for m in (20, 31, 42, 53, 64, 75)], "newest first; the accepted one ends it"
+    assert (streak["wish_id"], streak["wish_ids"]) == ("desire_b", ["desire_b", "desire_a"])
+
+
+@pytest.mark.parametrize("newest, counted", [
+    # The owner's rules, a quiet window, a reply awaited: the host cancels before sending, with no failure.
+    ({"state": "canceled", "reason": "Delivery conditions changed before sending"}, False),
+    # Kin chose to wait or let go.
+    ({"state": "canceled", "reason": "draft-decision"}, False),
+    # The owner's turn, a changed route or source, a release freeze: source-changed at a source stage.
+    ({"state": "canceled", "reason": "draft-source-changed", "failure": {"category": "source-changed", "stage": "contact-draft-source",
+                                                                        "code": "owner-task-active", "retry_condition": "source-change", "model_invoked": False}}, False),
+    ({"state": "canceled", "reason": "draft-not-started", "failure": {"category": "model-unavailable", "stage": "contact-draft-execution",
+                                                                     "code": "dispatch-frozen", "retry_condition": "backoff", "model_invoked": False}}, False),
+    ({"state": "canceled", "reason": "contact-source-changed", "failure": {"category": "model-unavailable", "stage": "contact-send-boundary",
+                                                                          "code": "contact-owner-epoch-superseded", "retry_condition": "backoff"}}, False),
+    # A send of unknown outcome is reconciled, not failed.
+    ({"state": "unconfirmed", "reason": "Receipt requires reconciliation", "failure": {"category": "delivery-uncertain", "stage": "contact-delivery",
+                                                                                       "code": "contact-review-release-unproven", "retry_condition": "reconcile"}}, False),
+    # Technical: a worker that could not start, a model that did not answer, a host error.
+    ({"state": "canceled", "reason": "draft-not-started", "failure": {"category": "model-unavailable", "stage": "mind-worker",
+                                                                     "code": "mind-worker-unavailable", "retry_condition": "backoff", "model_invoked": False}}, True),
+    ({"state": "canceled", "reason": "draft-failed", "failure": {"category": "model-unavailable", "stage": "contact-draft-model",
+                                                                "code": "fork-draft-timeout", "retry_condition": "backoff", "model_invoked": True}}, True),
+    ({"state": "canceled", "reason": "Host action failed", "failure": {"category": "host-runtime", "stage": "contact-host",
+                                                                      "code": "contact-host-action-failed", "retry_condition": "backoff"}}, True),
+])
+def test_a_deferral_is_no_technical_failure_and_ends_the_streak(store, newest, counted):
+    """Classified by the failure category and stage the ledger row records."""
+    engine, scope, _mind, root = store
+    with engine.db.connect(write=True) as conn:
+        for i, minutes in enumerate((40, 30, 20)):
+            attempt(conn, scope, f"fail_{i}", "canceled", minutes, LIMIT)
+        attempt(conn, scope, "newest", newest["state"], 10, newest.get("failure"), reason=newest["reason"])
+    facts = facts_of(root, scope)
+    assert facts["failed_24h"] == 3 + counted
+    code = newest.get("failure", {}).get("code")
+    if counted:
+        assert facts["streak"]["count"] == 1 and facts["streak"]["code"] == code, "another code is another streak"
+        assert facts["last"]["code"] == code
+    else:
+        assert facts["streak"] is None, "the newest outcome is no technical failure: nothing fails now"
+        assert facts["last"]["at"] == iso(minutes=20)
+
+
+def test_the_command_carries_the_contact_facts_and_the_phone_self_check_reads_them(store):
+    engine, scope, mind, root = store
+    with engine.db.connect(write=True) as conn:
+        attempt(conn, scope, "fail_0", "canceled", 5, LIMIT)
+    source = str(Path(__file__).resolve().parents[2] / "src")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [source, os.environ.get("PYTHONPATH")]))}
+    answer = subprocess.run([sys.executable, "-m", "kin_mind.operational_status", "liveness", "--root", str(root),
+                             "--scope", json.dumps(scope.model_dump()), "--no-probe"], capture_output=True, text=True, env=env, timeout=120)
+    assert answer.returncode == 0, answer.stderr[-2000:]
+    printed = json.loads(answer.stdout)["contact_failures"]
+    assert printed["streak"]["count"] == 1 and printed["streak"]["code"] == "mind-worker-output-limit"
+    assert "contact_failures" in operational_status(mind)["liveness"]

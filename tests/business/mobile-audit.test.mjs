@@ -3,15 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileAudit,AUDIT_FAILURE_RETRY_MINUTES,AUDIT_SCHEMA,INCIDENT_REOPEN_MS} from '../../adapters/mobile-audit.mjs';
+import {MobileAudit,AUDIT_FAILURE_RETRY_MINUTES,AUDIT_SCHEMA,INCIDENT_REOPEN_MS,withDetected} from '../../adapters/mobile-audit.mjs';
 import {AUDIT_CODES,REVIEWER_LANES,createMobileReviewer} from '../../adapters/mobile-reviewer.mjs';
 
 const HOUR=3600000;
-function fixture(t,{readings=[],state=null}={}) {
+function fixture(t,{readings=[],state=null,snapshot=()=>({})}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-audit-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const file=path.join(root,'mobile-audit.json');if(state)fs.writeFileSync(file,JSON.stringify(state));
   const clock={now:1000};let reviews=0;
-  const audit=new MobileAudit({file,collect:async()=>({checkedAt:clock.now}),now:()=>clock.now,
+  const audit=new MobileAudit({file,collect:async()=>({checkedAt:clock.now,...snapshot()}),now:()=>clock.now,
     review:async()=>{const next=readings[reviews++];if(next instanceof Error)throw next;return next;}});
   return {audit,clock,file,reviews:()=>reviews};
 }
@@ -116,4 +116,45 @@ test('fault classes are a fixed set, and no reviewer decides what becomes of an 
   assert.ok(AUDIT_CODES.includes('other'));
   assert.equal('tail' in REVIEWER_LANES,false);
   assert.equal(createMobileReviewer({key:'unused'}).tail,undefined);
+});
+
+// 2026-09-28, 09:43 SGT: every proactive draft had failed for fifty minutes and the self-check answered
+// healthy with no codes. What the host finds by its own rule (health.mjs contactFailing) is now in the
+// reading as `detected`, and is a finding whatever the review answers.
+const contactFailing={code:'contact-failing',summary:'主动联系连续因技术故障取消（宿主规则判定）',
+  evidence:JSON.stringify({error:'contact-failing',code:'mind-worker-output-limit',within:8,streak:8,lastAt:'2026-09-28T01:35:05Z',wishId:'desire_b257'})};
+
+test('what the host found by its own rule is a finding with its code, though the review answered healthy (2026-09-28)',async t=>{
+  let detected=[contactFailing];
+  const f=fixture(t,{snapshot:()=>({detected}),readings:[{status:'healthy',findings:[]},
+    {status:'needs_attention',findings:[finding('contact-failing','the review saw it too'),finding('memory-stalled')]},{status:'healthy',findings:[]}]});
+  assert.ok(AUDIT_CODES.includes('contact-failing'),'a code of the fixed set, for the review as well');
+  assert.deepEqual(await f.audit.tick(),{state:'needs_attention'});
+  assert.deepEqual(f.audit.state.lastReview.codes,['contact-failing']);
+  assert.deepEqual(f.audit.untold().map(i=>[i.codes,i.findings.map(x=>x.code)]),[[['contact-failing'],['contact-failing']]]);
+  assert.match(f.audit.untold()[0].findings[0].evidence,/mind-worker-output-limit/);
+  // The review naming it too: the host's finding stands in its place, the review's others beside it.
+  f.clock.now+=4*HOUR;await f.audit.tick();
+  assert.deepEqual(f.audit.state.lastReview.codes,['contact-failing','memory-stalled']);
+  const incident=f.audit.incidentList().find(i=>i.state==='open'&&i.codes.includes('memory-stalled'));
+  assert.deepEqual(incident.findings.map(x=>[x.code,x.summary]),[['contact-failing',contactFailing.summary],['memory-stalled','worded differently each time']]);
+  // Cleared by the host's facts, not by the review: once nothing is detected and the review is healthy, it clears.
+  detected=[];f.clock.now+=4*HOUR;assert.deepEqual(await f.audit.tick(),{state:'healthy'});
+  assert.deepEqual(f.audit.view().incidents,[]);
+});
+
+test('the host\'s finding does not wait for the review: a reading whose review failed still records it (2026-09-28)',async t=>{
+  const f=fixture(t,{snapshot:()=>({detected:[contactFailing]}),readings:[Error('deepseek-http-503')]});
+  assert.equal((await f.audit.tick()).state,'failed');
+  assert.equal(f.audit.state.failures,1);assert.equal(f.audit.state.lastError.reason,'deepseek-http-503');
+  assert.deepEqual(f.audit.untold().map(i=>i.codes),[['contact-failing']]);
+});
+
+test('only a code of the fixed set is taken from what the host detected, at most eight findings, the host\'s first',()=>{
+  const review={status:'needs_attention',findings:Array.from({length:8},(_,i)=>finding(i%2?'task-stuck':'other'))};
+  const merged=withDetected(review,{detected:[contactFailing,{code:'made-up',summary:'x',evidence:'y'},{code:'other',summary:'x',evidence:'y'}]});
+  assert.equal(merged.findings.length,8);assert.equal(merged.findings[0].code,'contact-failing');
+  assert.equal(merged.findings.some(x=>x.code==='made-up'),false);
+  assert.deepEqual(withDetected({status:'healthy',findings:[]},{}),{status:'healthy',findings:[]},'nothing detected: the review stands as it is');
+  assert.deepEqual(withDetected({status:'healthy',findings:[]},{detected:[{code:'made-up'}]}),{status:'healthy',findings:[]});
 });
