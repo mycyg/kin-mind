@@ -3176,6 +3176,7 @@ class Appraisals:
 
                     from .desire_archive import contents as archived_contents
                     from .desire_archive import intent as archived_intent
+                    from .exploration_decision_archive import revision_of as decision_revision
                     # Read once, and only where it is read at all: the content check reaches
                     # finished wishes on a bootstrap and nowhere else.
                     made = (archived_contents(conn, self.mind.scope.key())
@@ -3187,11 +3188,13 @@ class Appraisals:
                         # Both of these read the finished wishes as well as the live ones, so
                         # both ask the archive: an intent that moved is still this decision's
                         # intent, and a wish a bootstrap already made is still made.
+                        # The decision's revision is read wherever it lives: one that moved to its
+                        # archive still has the intent it had (exploration_decision_archive).
                         if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
-                            and d.get("sharing_revision") == state.get("exploration_decisions", {}).get(wish.exploration_id, {}).get("revision")
+                            and d.get("sharing_revision") == decision_revision(state, wish.exploration_id)
                             for d in state["desires"].values())
                             or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
-                                               (state.get("exploration_decisions", {}).get(wish.exploration_id) or {}).get("revision"))):
+                                               decision_revision(state, wish.exploration_id))):
                             return
                         if any(
                             d["content"] == wish.content

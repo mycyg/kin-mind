@@ -523,8 +523,11 @@ def _written(shown, state):
                      {"#total": len(state.get("concerns", {})),
                       **{k: (state.get("concerns", {}).get(k) or {}).get("revision") for k in seen}}))
     if "decisions" in shown:
+        # A decision that moved to its archive since keeps its revision there, and the document
+        # records it (exploration_decision_archive): a move is not a change of what was decided.
+        from .exploration_decision_archive import revision_of
         rows.append(("decisions", {k: e.get("revision") for k, e in shown["decisions"].items()},
-                     {k: (state.get("exploration_decisions", {}).get(k) or {}).get("revision") for k in shown["decisions"]}))
+                     {k: revision_of(state, k) for k in shown["decisions"]}))
     if "rhythm" in shown and shown["rhythm"]["rhythm"].get("status") != "disabled":
         rows.append(("rhythm", shown["rhythm"]["rhythm"].get("event_id"), (state.get("rhythm") or {}).get("event_id")))
     if "assessment" in shown and shown["assessment"]["assessment"].get("enabled"):

@@ -216,6 +216,55 @@ keys, so a full round trip gives back the document it had.
 Both the move and the restore are ordinary revisions with their own history rows, `desire-archive`
 and `desire-unarchive`, whose request names the wishes that moved.
 
+## Exploration decision archive
+
+Every exploration result Kin decided on keeps its sharing decision in the state document, with a
+full reference, metadata included, for everything it was written from. The state view shows the
+twelve newest; nothing else reads the rest from the document unless something is still open on
+it. `mind_exploration_decision_archive` holds the others, whole: the same exploration id, revision,
+evidence references and receipt. The document keeps `exploration_decision_archive` — a count and
+the revision of every decision that moved — so a commit can tell a moved decision from one never
+taken.
+
+```sh
+echo '{"exploration_decision_archive": true}' | python -m kin_mind.host --config PRIVATE_CONFIG configure-memory
+python -m kin_mind.host --config PRIVATE_CONFIG exploration-decision-archive
+echo '{"days": 14, "keep": 10}' | python -m kin_mind.host --config PRIVATE_CONFIG exploration-decision-archive
+python -m kin_mind.host --config PRIVATE_CONFIG exploration-decision-archive --apply
+python -m kin_mind.host --config PRIVATE_CONFIG exploration-decision-unarchive --apply
+```
+
+The dry run is the default, writes nothing and needs no flag. `would_archive` names what would
+move; `holding` names what stays and **why**, with a sentence per reason under `reasons`:
+`window` (one of the twelve the view shows, so the view, the appraisal projection and the manifest
+of what was shown do not change), `recent` (the owner's rule: decided in the last `days` days,
+default 7, and one of the `keep` newest, default 10), `wish-open` (a wish in the document that is
+not finished links the result), `reconsider-open` (a deferred decision whose waiting wish still
+waits on its condition), `share-open` (a share decision with no contact intent yet),
+`contact-open` (an open contact attempt offers a wish that links it), `exploration-running` and
+`undated`. `document_chars` and `document_chars_after` say what the document is and would be.
+
+With the flag on, the review minute runs it: one count query while the view could still show every
+decision, one survey an hour past that, and a move — an ordinary revision of kind
+`exploration-decision-archive` — when the survey names something. Off, nothing moves.
+
+A reader that misses in the document looks in the archive. A proposal that decides again on a
+result whose decision moved is judged against it as before: the same decision changes nothing, a
+clock or delivery event still cannot reopen it, and a reconsideration from new evidence brings it
+back into the document at its next revision. A shared result still refuses a second contact
+intent, and an appraisal shown a decision that has moved since is not refused for it.
+
+What moves is handed, in the same transaction, to the memory hook as `exploration-decision` items
+(the decision, its reason and condition, the exploration's topic, target and outcome, the evidence
+ids, and the ids of the result and the pages it read); `load_archived` reads the whole decision by
+its id. An erase reaches the table like every mind table with a `data` column, in the delete's own
+transaction.
+
+`exploration-decision-unarchive` is never gated by the flag. With no ids it puts everything back,
+and it is what runs **before a rollback**: the release before this one cannot see the table. The
+document sorts its keys, so a full round trip gives back the document it had apart from its revision
+and time.
+
 ## Derived caches and telemetry
 
 Two tables grow without an end and neither of them holds a memory. `mind_context_cache` holds **compressed context**: the summary a model produced of records that are all still there, keyed by a digest of the inputs that produced it. `metrics` holds telemetry and is already a ring. The maintenance tick bounds both, and reports what it would do before it is allowed to do anything:

@@ -366,8 +366,9 @@ class Mind(Continuity):
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
+        from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
-                             + DESIRE_ARCHIVE_SCHEMA):
+                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA):
             return
         with self.engine.db.connect() as conn:
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
@@ -1290,7 +1291,9 @@ class Mind(Continuity):
             desire["revision"] += 1
         desire = state["desires"][did]
         if desire.get("exploration_id") and request.action in {"create", "start", "resume", "update"}:
-            desire["sharing_revision"] = state["exploration_decisions"][desire["exploration_id"]]["revision"]
+            # The decision this wish now rests on is in the document, brought back if it had moved.
+            from .exploration_decision_archive import revive
+            desire["sharing_revision"] = revive(self, conn, state, desire["exploration_id"])["revision"]
         if request.concern_ids is not None:
             links = self._resolve_concern_links(conn, state, request.concern_ids)
             desire.update(concern_ids=list(links), concern_revisions=links)

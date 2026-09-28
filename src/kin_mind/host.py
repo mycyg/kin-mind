@@ -252,6 +252,14 @@ def dispatch(config, action, request):
             return restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
         return archive(mind, apply=bool(request.get("apply")), days=request.get("days", DAYS),
                        limit=request.get("limit"))
+    if action in {"exploration-decision-archive", "exploration-decision-unarchive"}:
+        # Operator actions, as the wish archive's: neither writes without `--apply`, the dry run
+        # needs no flag, and the restore is never gated because it runs before a rollback.
+        from . import exploration_decision_archive as decisions
+        if action == "exploration-decision-unarchive":
+            return decisions.restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
+        return decisions.archive(mind, apply=bool(request.get("apply")), days=request.get("days", decisions.DAYS),
+                                 keep=request.get("keep", decisions.KEEP), limit=request.get("limit"))
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -440,6 +448,10 @@ def dispatch(config, action, request):
         result = run() if run else None
         plans.sync_wishes()
         actions.drain(jobs)
+        # Settled exploration decisions leave the document once nothing reads them there: only with
+        # `exploration_decision_archive` on, and one count query a minute while nothing can move.
+        from .exploration_decision_archive import auto as archive_decisions
+        archive_decisions(mind)
         if cadence.status()["state"] == "ready":
             wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"
             if not wake.exists():
@@ -598,7 +610,8 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 # The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
 # are told to write. Every one of them defaults to a dry run.
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
-                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage")
+                 "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage",
+                 "exploration-decision-archive", "exploration-decision-unarchive")
 
 
 # The resident worker's actions (§5.7): short reads and writes on the store, no model call and

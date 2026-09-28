@@ -128,6 +128,11 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # `desire-unarchive` puts everything back before any rollback. Off, a finished wish
             # stays in the document exactly as it does today.
             "desire_archive": False,
+            # Settled exploration decisions leave the document for mind_exploration_decision_archive
+            # (exploration_decision_archive.py). Off by default; on, the review minute moves what
+            # nothing holds any more, and `exploration-decision-unarchive` puts it all back before
+            # any rollback, because the release before this one cannot see the table.
+            "exploration_decision_archive": False,
             # Stage 5 housekeeping, all three off and all three read through
             # autonomy_schema.enabled(). `context_cache_sweep` sweeps `mind_context_cache`, which
             # holds compressed context and nothing else, by age and by count, and takes a scope's
@@ -336,6 +341,7 @@ class MemoryContinuity:
                     "wish_version_review", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive",
+                    "exploration_decision_archive",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
