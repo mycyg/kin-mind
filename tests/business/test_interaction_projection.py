@@ -88,7 +88,8 @@ def test_the_projection_is_what_the_render_shows_and_what_its_words_rest_on(live
     # Named: every rendered wish's evidence, and what the waiting wish's copied reason rests on, which
     # the render strips; no finished wish, no wish past the bound, nothing of what else the view holds.
     ids = named(projection)
-    assert all(evidence_ids(d) <= ids for d in active[-16:])
+    assert all(evidence_ids(d) <= named(shown_wish) for d, shown_wish in zip(active[-16:], projection["desires"])), \
+        "each rendered wish carries what its words were written from"
     assert shown <= ids and not (shown & named(part)), "the reason's sources are named, not rendered"
     assert not any(evidence_ids(d) & ids for d in view["desires"] if d["id"] in finished)
     assert not any(evidence_ids(d) - named(active[-16:]) & ids for d in active[:-16])

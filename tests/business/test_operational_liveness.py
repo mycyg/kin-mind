@@ -226,9 +226,14 @@ def test_contacts_that_failed_for_a_technical_reason_are_counted_and_their_strea
                                                                      "code": "dispatch-frozen", "retry_condition": "backoff", "model_invoked": False}}, False),
     ({"state": "canceled", "reason": "contact-source-changed", "failure": {"category": "model-unavailable", "stage": "contact-send-boundary",
                                                                           "code": "contact-owner-epoch-superseded", "retry_condition": "backoff"}}, False),
-    # A send of unknown outcome is reconciled, not failed.
+    # A review that sent the batch back because a source changed: its stage is the review's, its category the source's.
+    ({"state": "canceled", "reason": "contact-review-failed", "failure": {"category": "source-changed", "stage": "contact-review-model",
+                                                                         "code": "contact-file-not-ready", "retry_condition": "source-change"}}, False),
+    # A send of unknown outcome is reconciled, not failed -- whatever failure an earlier settlement left on its row.
     ({"state": "unconfirmed", "reason": "Receipt requires reconciliation", "failure": {"category": "delivery-uncertain", "stage": "contact-delivery",
                                                                                        "code": "contact-review-release-unproven", "retry_condition": "reconcile"}}, False),
+    ({"state": "unconfirmed", "reason": "receipt-still-unknown", "failure": {"category": "unknown", "stage": "contact-host",
+                                                                            "code": "contact-host-action-failed", "retry_condition": "backoff"}}, False),
     # Technical: a worker that could not start, a model that did not answer, a host error.
     ({"state": "canceled", "reason": "draft-not-started", "failure": {"category": "model-unavailable", "stage": "mind-worker",
                                                                      "code": "mind-worker-unavailable", "retry_condition": "backoff", "model_invoked": False}}, True),
