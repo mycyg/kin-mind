@@ -280,10 +280,13 @@ def _hand_over(mind, conn, items, inject):
 
 def _store(conn, scope, state, identifier, decision, at):
     """One decision into the archive, whole. `archived_revision` is the revision this move makes: a
-    mutation runs before its own revision is taken."""
+    mutation runs before its own revision is taken. In a document whose references are kept slim
+    (evidence_refs), the archived decision's are kept the same way."""
+    from .evidence_refs import marked, slimmed
     conn.execute(f"INSERT INTO {TABLE} VALUES(?,?,?,?,?,?,?,?)",
                  (scope, identifier, decision.get("decision") or "", decision.get("revision") or 0,
-                  decision.get("updated_at") or "", at, state["revision"] + 1, dumps(decision)))
+                  decision.get("updated_at") or "", at, state["revision"] + 1,
+                  dumps(slimmed(decision) if marked(state) else decision)))
 
 
 def _counted(conn, scope, state):

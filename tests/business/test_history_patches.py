@@ -117,5 +117,10 @@ def test_the_flag_turned_back_off_reads_both_shapes_and_writes_the_old_one(setup
     rebuilds(mind, texts)
     view = mind.read(history=100)["history"]
     assert len(view) == len(texts)
+    # As stored, and as a model may be shown it: no source's metadata (evidence_refs, 2026-09-28).
+    from kin_mind.evidence_refs import shown
     for entry in view:
-        assert history.canonical(entry["snapshot"]) == texts[entry["revision"]]
+        assert history.canonical(entry["snapshot"]) == history.canonical(shown(json.loads(texts[entry["revision"]])))
+    with mind.engine.db.connect() as conn:
+        for entry in history.entries(conn, mind.scope.key(), 100):
+            assert history.canonical(entry["snapshot"]) == texts[entry["revision"]]

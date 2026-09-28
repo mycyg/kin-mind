@@ -836,7 +836,15 @@ def unlisted(value):
 
 
 def appraisal_context(context):
-    """Project decision inputs; immutable evidence and full history stay in storage."""
+    """Project decision inputs; immutable evidence and full history stay in storage. Every evidence
+    reference the projection keeps -- a plan's, above all, which `compact_plan` keeps whole -- names its
+    source and record without the source's metadata (the owner's decision, 2026-09-28;
+    evidence_refs). The sources under review (`new_evidence`) are not references and keep theirs."""
+    from .evidence_refs import shown
+    return shown(_appraisal_context(context))
+
+
+def _appraisal_context(context):
     result = dict(context)
     if context.get("autonomy_context"):
         from .decision_context import compact_plan

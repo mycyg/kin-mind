@@ -107,13 +107,20 @@ def revert(mind, source, clock, event_id, *, command="revert"):
         reason="Explicit user correction", evolution=Evolution(revert_event_id=event_id)))
 
 def test_read_history_keeps_its_keys_and_its_answer_across_the_two_formats(setup):
+    """Each snapshot is the revision as it was stored, as a model may be shown it: its evidence
+    references without their sources' metadata (the owner's decision, 2026-09-28; evidence_refs)."""
+    from kin_mind.evidence_refs import shown
     mind, source, clock = setup
     texts = both_formats(mind, source, clock, rounds=7)
     view = mind.read(history=30)["history"]
     assert len(view) == 30
     for entry in view:
         assert set(entry) == {"id", "kind", "revision", "occurred_at", "request", "snapshot"}
-        assert history.canonical(entry["snapshot"]) == texts[entry["revision"]]
+        assert history.canonical(entry["snapshot"]) == history.canonical(shown(json.loads(texts[entry["revision"]])))
+    # The layer itself answers with the stored revision, byte for byte.
+    with mind.engine.db.connect() as conn:
+        for entry in history.entries(conn, mind.scope.key(), 30):
+            assert history.canonical(entry["snapshot"]) == texts[entry["revision"]]
 
 def test_the_previous_release_still_finds_the_evidence_key_in_both_formats(setup):
     mind, source, clock = setup

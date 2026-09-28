@@ -261,6 +261,15 @@ def dispatch(config, action, request):
             return decisions.restore(mind, apply=bool(request.get("apply")), ids=request.get("ids"))
         return decisions.archive(mind, apply=bool(request.get("apply")), days=request.get("days", decisions.DAYS),
                                  keep=request.get("keep", decisions.KEEP), limit=request.get("limit"))
+    if action == "slim-evidence-refs":
+        # Operator action (evidence_refs). The dry run writes nothing and says how many references
+        # the document and the two archives hold, how many would change and what that does to their
+        # size. `--apply` keeps them to what their readers read, in one recorded revision, and marks
+        # the document so every later save does the same; a second apply writes nothing. `--undo
+        # --apply` puts every reference back from the sources table and clears the mark: it is what
+        # runs before a rollback to a release that expects the full references. Never gated.
+        from .evidence_refs import run as slim_evidence_refs
+        return slim_evidence_refs(mind, apply=bool(request.get("apply")), undo=bool(request.get("undo")))
     if action in {"archive-memory", "archive-memory-backfill"}:
         # Operator actions. Without `--apply` both only read: the queue's counts, or what the
         # backfill would queue and the calls that would take. `archive-memory --apply` runs one
@@ -651,7 +660,9 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
                  "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage",
                  "exploration-decision-archive", "exploration-decision-unarchive",
-                 "archive-memory", "archive-memory-backfill")
+                 "archive-memory", "archive-memory-backfill", "slim-evidence-refs")
+# The operator actions `--undo` is read for.
+UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 
 
 # The resident worker's actions (§5.7): short reads and writes on the store, no model call and
@@ -757,6 +768,10 @@ def main():
             request["apply"] = args.apply
         if args.action == MIGRATION_ACTION:
             request.update(undo=args.undo, output=args.output, registry=args.registry)
+        elif args.action in UNDO_ACTIONS:
+            request["undo"] = args.undo
+        elif args.undo:
+            raise ValueError("--undo belongs to a migration")
         result = dispatch(config, args.action, request)
     except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
         # Caller sees an error category, never provider payloads or credentials.

@@ -264,7 +264,8 @@ them, once. `archive-memory --apply` runs one batch now, one paid call at most; 
 ## Exploration decision archive
 
 Every exploration result Kin decided on keeps its sharing decision in the state document, with a
-full reference, metadata included, for everything it was written from. The state view shows the
+reference for everything it was written from (until `slim-evidence-refs` below, a full one, its
+source's metadata included). The state view shows the
 twelve newest; nothing else reads the rest from the document unless something is still open on
 it. `mind_exploration_decision_archive` holds the others, whole: the same exploration id, revision,
 evidence references and receipt. The document keeps `exploration_decision_archive` — a count and
@@ -309,6 +310,64 @@ transaction.
 and it is what runs **before a rollback**: the release before this one cannot see the table. The
 document sorts its keys, so a full round trip gives back the document it had apart from its revision
 and time.
+
+## Evidence references
+
+The owner's decision (2026-09-28): a source's metadata is an index for retrieval. It is not put into
+the state document or into anything a model is shown, and a reference need not copy it; it only has
+to stay traceable. `kin_mind.evidence_refs` is that rule.
+
+**What a reference keeps.** `source_id`, `record_id`, `revision`, `hash`, `namespace`, `source_key`
+and `occurred_at` -- exactly what its readers read: the ids for every projection, erasure and the
+host's naming of what a read rests on; the hash, revision, namespace and key for the freshness check
+(`Mind._fresh`: the source and record as they are now, and no newer source under the same key) and
+the conflict checks that compare `(source, hash)`; `occurred_at` for what `read_archived_record` shows.
+It no longer copies the source's `metadata`, `authority`, `session` or `received_at`. Every decision
+that reads those -- an explicit owner source, `role`, `host_event`, `exploration_id`, internal
+bookkeeping never counted as evidence, the graph's classification -- reads a reference built afresh
+from the sources table in the same transaction, which is not stored and is unchanged. A tombstone an
+erase left keeps the shape erasure gave it.
+
+**What a model is shown.** Never a source's metadata, whether or not the document has been migrated:
+the state `read` (its history snapshots included), the interaction projection a contact draft reads,
+the appraisal context, `read_affective_state`, and the wishes a contact attempt is offered and keeps
+give every reference as above. `read_archived_record` and the archive memory's inputs already named
+references by id. The host's read-only memory server no longer names, as what a read rests on, the
+ids a reference's copied metadata held (the pages an exploration result read, the event it came from):
+the reference's own source and record stay named.
+
+**The migration.** The document stores slim references once it carries the mark
+`evidence_refs: "trace"`; every save keeps them so, whichever section was written, and a wish or an
+exploration decision that moves to its archive moves slim. The mark is set and cleared only by the
+command, in the same revision as the references it changes, so the mark and the document's shape
+never disagree; without it the document is written exactly as before.
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs
+python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs --apply
+python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs --undo
+python -m kin_mind.host --config PRIVATE_CONFIG slim-evidence-refs --undo --apply
+```
+
+The dry run is the default and writes nothing: `references`, `would_slim`, `originals_kept`, and for
+the document and each archive table (`mind_desire_archive`, `mind_exploration_decision_archive`) its
+size now and after (`chars`, `chars_after`). `--apply` slims them all in one ordinary revision
+(history kind `slim-evidence-refs`) and marks the document; a second apply finds nothing and writes
+nothing. `--undo --apply` rebuilds every reference from the sources table in one revision of its own
+(`slim-evidence-refs-undo`) and clears the mark: it is what runs **before a rollback** to a release
+that expects full references. Undone straight after an apply, the document and both archive tables
+are what they were byte for byte, apart from the revision and its time. What a source row cannot
+give back -- a reference written before `received_at` was kept, a copy whose words an erase had
+already blanked, a reference whose source is gone -- is kept in `mind_evidence_ref_originals`, by the
+wish or decision it belongs to and the path inside it, so it follows that entry between the document
+and its archive. An erase reaches that table as it reaches every mind table with a `data` column,
+and the undo empties it. Neither the apply nor the undo is gated by a memory flag: the switch is
+the document's own mark, the dry run writes nothing, and the undo must always be able to run.
+
+Run it after `desire-archive --apply` and `exploration-decision-archive --apply`, so the revision it
+writes is of the smaller document; it slims both archive tables too, and every later move keeps them
+slim, so the order is a matter of size, not of correctness. Before a rollback, run `slim-evidence-refs --undo --apply` first, then the unarchive
+commands.
 
 ## Derived caches and telemetry
 

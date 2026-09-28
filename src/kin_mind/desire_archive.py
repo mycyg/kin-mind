@@ -371,12 +371,14 @@ def memory_item(desire, state=None):
 def _store(conn, scope, state, identifier, desire, at):
     """One wish, into the archive, whole. The columns are what a reader finds it by -- `status` among
     them, which is also its outcome; `data` is the wish itself, unchanged, which makes the move
-    reversible. `archived_revision` is the revision this move is making."""
+    reversible. `archived_revision` is the revision this move is making. In a document whose
+    references are kept slim (evidence_refs), the archived wish's are kept the same way."""
+    from .evidence_refs import marked, slimmed
     conn.execute(
         "INSERT INTO mind_desire_archive VALUES(?,?,?,?,?,?,?,?,?,?)",
         (scope, identifier, desire["status"], desire["kind"], desire.get("exploration_id"),
          desire.get("sharing_revision"), desire.get("plan_id"), at, state["revision"] + 1,
-         dumps(desire)),
+         dumps(slimmed(desire) if marked(state) else desire)),
     )
 
 

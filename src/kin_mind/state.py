@@ -28,6 +28,9 @@ from .affect_layers import anchor_of, curves, note_echo, reanchor, undertone
 from .affect_layers import fresh as fresh_layers
 from .continuity import SCHEMA as CONTINUITY_SCHEMA
 from .continuity import Continuity, RhythmProposal, Understanding
+from .evidence_refs import marked as marked_refs
+from .evidence_refs import shown as shown_refs
+from .evidence_refs import slim as slim_refs
 from .profile import DIMENSIONS, GROUPS, default_profile, interaction_style
 
 SCHEMA = """
@@ -368,8 +371,10 @@ class Mind(Continuity):
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
         from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
+        from .evidence_refs import SCHEMA as EVIDENCE_REF_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
-                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA):
+                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA
+                             + EVIDENCE_REF_SCHEMA):
             return
         with self.engine.db.connect() as conn:
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
@@ -399,6 +404,12 @@ class Mind(Continuity):
         # re-anchored where the old curve had brought it. A save that moved no curve anchors nothing; a
         # command replayed or recorded only (_record_only) never saves at all.
         reanchor(state, self._curves, self.clock())
+        # Once `slim-evidence-refs` has marked the document, every reference any section was just
+        # given is kept to what its readers read (evidence_refs.TRACE), here, where every section is
+        # written: never its source's metadata (the owner's decision, 2026-09-28). In place, so the
+        # history row below is written from the same document as this one.
+        if marked_refs(state):
+            slim_refs(state)
         conn.execute(
             "INSERT INTO mind_state VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,data=excluded.data",
             (self.scope.key(), state["revision"], dumps(state)),
@@ -1622,7 +1633,10 @@ class Mind(Continuity):
             # here does not read the move as a hundred wishes having ceased to exist. Present only
             # once something has moved, so a store that never archives sees the view it always did.
             view[DESIRE_ARCHIVE] = {"count": moved}
-        return view
+        # What a reader of the view is shown of a reference -- the read, and the wishes a contact
+        # attempt is offered and keeps -- is what the document keeps of one once it is marked:
+        # never its source's metadata, marked or not (evidence_refs, 2026-09-28).
+        return shown_refs(view)
 
     def read(self, *, as_of=None, history=0, query=""):
         if not 0 <= history <= 100:
@@ -1677,7 +1691,10 @@ class Mind(Continuity):
                 # and one revision it cannot rebuild costs that entry its snapshot, not the list.
                 from .history import entries
                 result["history"] = entries(conn, self.scope.key(), history)
-            return result
+            # Everything a read hands on -- the view, the decisions, the continuity, the snapshots of
+            # earlier revisions, which kept the full references they were written with -- names its
+            # evidence without its sources' metadata (evidence_refs).
+            return shown_refs(result)
 
     @staticmethod
     def _wait_details(decision, at, owner_epoch=None):

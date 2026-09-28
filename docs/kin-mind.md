@@ -29,7 +29,9 @@ the affective state itself:
   evidence IDs, configuration versions, desires and traits; `query` selects the
   relevant concerns. History is limited to 100 snapshots. Beside the scores it
   shows the layers derived from them (`affect_layers`, see
-  [continuity](continuity.md#derived-layers)).
+  [continuity](continuity.md#derived-layers)). Evidence references in it, the
+  snapshots included, name their source and record without the source's
+  metadata ([evidence references](operations.md#evidence-references)).
 - `record_affective_event(scope, event)` validates sourced partial updates. Generic
   library users can submit an appraisal directly. The private Kin host replaces this
   tool with an enqueue operation so the appraisal owns evaluation.
