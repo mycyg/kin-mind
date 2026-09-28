@@ -403,3 +403,25 @@ def test_a_question_is_matched_by_words_not_by_the_first_person(setup, monkeypat
     assert [item["id"] for item in archive_memory.recall_items(Contexts(mind), "harbour", policy)] == [root_id(entry)]
     unrelated = mind.engine.recall(RecallRequest(scope=mind.scope, query="我 今天 天气"))
     assert unrelated["index"][0]["id"] != root_id(entry)
+
+
+def test_a_copied_wish_reason_keeps_its_own_deletion_dependencies(setup, monkeypatch):
+    mind, source, clock = setup
+    allow(mind)
+    identifier, _ = wish(mind, source, clock, "copied-reason")
+    reason_source = source("decision-reason", MARKER)
+    def copy_reason(conn, state, event_id):
+        state["desires"][identifier].update(reason=MARKER, reason_evidence_ids=[reason_source])
+    mind._mutate({"command_id": "copy-reason", "agent_version": "synthetic-v1",
+                  "expected_revision": mind.read()["revision"], "evidence_ids": [reason_source]},
+                 "test-copied-reason", copy_reason)
+    clock[0] += 9 * DAY
+    desire_archive.archive(mind, apply=True)
+    endpoint = Endpoint(mind, monkeypatch, lambda sent: [
+        {"key": item["key"], "text": "我记得 " + item["record"]["reason"]} for item in items(sent)])
+    archive_memory.run(mind, endpoint.provider)
+    assert len(entries(mind)) == 1
+    mind.engine.delete(reason_source)
+    settle_jobs(mind.engine)
+    assert all(row["deleted"] for row in entries(mind).values())
+    assert texts_everywhere(mind.engine, MARKER) == set()

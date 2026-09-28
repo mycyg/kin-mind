@@ -360,7 +360,8 @@ def memory_item(desire, state=None):
                           "reason": desire.get("reason"), "created_at": _local(desire.get("created_at"), zone),
                           "last_activity_at": _local(latest, zone), "expires_at": _local(desire.get("expires_at"), zone),
                           "timezone": str(zone)},
-        "evidence_ids": [{k: ref[k] for k in ("source_id", "record_id") if isinstance(ref.get(k), str)} for ref in evidence],
+        "evidence_ids": [*[{k: ref[k] for k in ("source_id", "record_id") if isinstance(ref.get(k), str)} for ref in evidence],
+                         *(desire.get("reason_evidence_ids") or [])],
         "occurred_at": latest.isoformat() if latest else desire.get("created_at"),
         "refs": [ref["record_id"] for ref in evidence if isinstance(ref.get("record_id"), str)][:archive_memory.REFS_LIMIT],
     }
