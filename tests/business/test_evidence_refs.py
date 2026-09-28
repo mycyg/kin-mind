@@ -252,10 +252,11 @@ def test_no_read_a_model_is_shown_carries_a_sources_metadata(setup, marked):
     assert offered["desires"] and not carrying(offered) and MARKER not in dumps(offered)
 
 
-def test_the_appraisal_context_shows_plans_without_their_sources_metadata_and_new_evidence_as_it_was(setup):
+def test_the_appraisal_context_shows_plans_without_their_sources_metadata_and_new_evidence_by_its_facts(setup):
     """The projection an assessment is shown keeps a plan whole (`compact_plan`), its evidence
     references with it: they name their source and record only. What is under review is not a
-    reference -- its source's metadata is what the prompt reads its exploration id from -- and stays."""
+    reference: it is shown without its metadata too, the exploration id the prompt reads beside it
+    (kin_mind.model_view)."""
     from kin_mind.appraisal import appraisal_context
     from kin_mind.plans import AutonomousPlans
     mind, _, clock = setup
@@ -272,7 +273,7 @@ def test_the_appraisal_context_shows_plans_without_their_sources_metadata_and_ne
     shown = appraisal_context(context)
     assert shown["autonomy_context"]["plans"]["plans"][0]["evidence"]
     assert not carrying(shown) and MARKER not in dumps(shown)
-    assert shown["new_evidence"][0]["metadata"]["exploration_id"] == "explore_sea"
+    assert shown["new_evidence"][0]["exploration_id"] == "explore_sea" and "metadata" not in shown["new_evidence"][0]
 
 
 def test_a_contact_attempt_offers_and_keeps_its_wishes_without_their_sources_metadata(setup):

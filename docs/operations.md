@@ -369,6 +369,37 @@ writes is of the smaller document; it slims both archive tables too, and every l
 slim, so the order is a matter of size, not of correctness. Before a rollback, run `slim-evidence-refs --undo --apply` first, then the unarchive
 commands.
 
+### What a model is shown, and where it is enforced
+
+`kin_mind.model_view.for_model` is the one rule for everything Kin keeps that a model reads, whether
+the store is slimmed or not (full and slim references coexist while a migration runs, and read alike):
+
+* an evidence reference is shown as its trace (`evidence_refs.trace`); what it carries beside the
+  trace, such as an exploration target's `exploration_id`, stays;
+* a source shown as an item (its `id` is a source id and it carries `metadata`, as the sources under
+  review in an appraisal do) is shown without its metadata. The facts a prompt reads from it are
+  shown under their own names beside it: `host_event`, `role`, and for an exploration's result
+  `exploration_id`. The appraisal prompt reads the exploration id there (`new_evidence` 来源的
+  `exploration_id`) and says what the two others are;
+* a root record (the one the engine made of a whole source) is shown, where the boundary can read the
+  sources, without the attributes it copied from its source's metadata; the named facts, the engine's
+  `origin_kind` stamp and anything a correction or a later step gave it stay;
+* JSON carried as text -- a memory item's line, a rendered context -- is shown the same way, and any
+  text that holds none of it is shown byte for byte as it is.
+
+It is applied once at each boundary a model is on the other side of: the core MCP server (every tool,
+`guard_tools` in `create_mcp`), the host's memory server (every tool, `scoped_tool`, both modes), the
+host actions whose answers the host puts before a model (`kin_mind.host.MODEL_FACING`: `memory-context`,
+`read`, `ingest`, `state-overview`, the history and graph reads, `event-thread`, `autonomous-plans`,
+`procedure-memory`, `traits`, `candidate`, `claim`, `plan-claim`, `prepare-exploration`,
+`session-checkpoint`), a prepared context injection before its text is hashed
+(`ContextDelivery.prepare`), every DeepSeek request (`DeepSeek.structured`, the appraisal's own
+request `DeepSeek._post` and its projection `appraisal_context`, a main-session fork's
+`NativeReview._native`, eventmem's `Providers._json_once`), and the exploration executor's prompt
+and input files (`codex_prompt`, `input.json`, `continuation.json`). The host's naming of what a fork's
+read rests on skips exactly what is not shown (`model_view.index_only`: a reference's dropped fields, a
+kept source's own metadata). Nothing is stored differently: this changes only what is shown.
+
 ## Derived caches and telemetry
 
 Two tables grow without an end and neither of them holds a memory. `mind_context_cache` holds **compressed context**: the summary a model produced of records that are all still there, keyed by a digest of the inputs that produced it. `metrics` holds telemetry and is already a ring. The maintenance tick bounds both, and reports what it would do before it is allowed to do anything:

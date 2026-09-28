@@ -191,4 +191,9 @@ def create_mcp(engine):
         """永久删除明确选定的记忆或来源及其衍生记录。"""
         return engine.delete(object_id)
 
-    return server
+    # Every tool's answer reaches a model: its evidence references as their trace, a source it
+    # shows without its metadata, a root record without its copy of that metadata (the owner's
+    # decision, 2026-09-28; kin_mind.model_view).
+    from kin_mind.model_view import guard_tools
+
+    return guard_tools(server, engine)

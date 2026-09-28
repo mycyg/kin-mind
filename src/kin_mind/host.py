@@ -38,7 +38,26 @@ def load_config(path):
     return config
 
 
+# The actions whose answers the host puts in front of a model: the memory context before a reply, the
+# state a draft or an ordinary turn is given, the wishes a contact attempt offers, a creation step's
+# claim with its brief (the creator's prompt), the checkpoint a new session is restored from, and the
+# history and graph reads. Each is shown as `model_view.for_model` shows it: evidence references as
+# their trace, a source without its metadata (the owner's decision, 2026-09-28). The host hands none
+# of them back to the store as a reference; it names what it was given by id.
+MODEL_FACING = frozenset({"memory-context", "read", "ingest", "state-overview", "share-history", "work-history",
+                          "graph", "graph-detail", "event-thread", "autonomous-plans", "procedure-memory", "traits",
+                          "candidate", "claim", "plan-claim", "prepare-exploration", "session-checkpoint"})
+
+
 def dispatch(config, action, request):
+    result = _dispatch(config, action, request)
+    if action in MODEL_FACING:
+        from .model_view import for_model
+        return for_model(result)
+    return result
+
+
+def _dispatch(config, action, request):
     if action == "model-lease":
         # The fallback of the lease routes. Answered before any engine opens, so a busy
         # database costs the caller two seconds and never the engine's thirty.

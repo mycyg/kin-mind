@@ -296,7 +296,11 @@ class Providers:
         if role in {"extraction", "conflict", "summary", "prediction"}:
             instruction += persona_prompt(load_persona(self.engine, payload.get("scope")))
         config = self.role(role)
-        content = json.dumps(payload, ensure_ascii=False)
+        # Every JSON request of every role: what the model is shown is never a source's metadata,
+        # and an evidence reference is its trace (the owner's decision, 2026-09-28; kin_mind.model_view).
+        from kin_mind.model_view import for_model
+
+        content = json.dumps(for_model(payload), ensure_ascii=False)
         if config.protocol == "anthropic":
             if image:
                 mime, raw = image

@@ -50,6 +50,11 @@ class ContextDelivery:
     def prepare(self, session, epoch, event_id, text, items, *, budget=4000, overhead=0, kind='background', manifest_id=None):
         if not session or not event_id or not text or not 0 <= overhead <= 500:
             raise ValueError('Context preparation needs identity and public text')
+        # The text a native item carries is what a model is shown: never a source's metadata, and
+        # its references as their trace (model_view), before it is named and hashed, so the host's
+        # receipt of the injected text matches.
+        from .model_view import for_model
+        text = for_model(text)
         identifier = 'context:' + digest([self.scope, session, epoch, event_id, text, kind])
         marker = 'kin-context:' + identifier
         body = marker + '\n' + text
