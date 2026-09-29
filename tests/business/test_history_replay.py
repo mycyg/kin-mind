@@ -186,3 +186,32 @@ def test_a_digest_job_on_its_way_is_recognised_whatever_the_key_order(world):
         second = conn.execute("SELECT COUNT(*) FROM jobs WHERE kind='event_digest'").fetchone()[0]
     # A new generation while the first job is still pending does not queue a second job.
     assert first == 1 and second == 1
+
+
+def test_policy_only_digest_finishes_without_model_and_rechecks_generation(world):
+    from eventmem.core.db import Conflict
+    engine, mind, memory = world
+    memory.configure({"event_lifecycle": True, "recall_purpose_policy": True})
+    sid = engine.receive(SourceInput(namespace="mind-internal-event", key="idle", text="Internal wake-up",
+        scope=SCOPE, authority="model", extract=False, metadata={"host_event": "internal-idle-review"}))["id"]
+    with engine.db.connect(write=True) as conn:
+        refs = memory.graph.proof(conn, [sid])
+        event = memory.graph._put(conn, {"id": "policy-event", "kind": "event", "title": "Internal wake-up",
+            "text": "", "source_ids": [sid], "evidence": refs, "basis": "inferred"})
+    life = lifecycle.EventLifecycle(mind)
+    with engine.db.connect() as conn:
+        snapshot = life.snapshot(conn, event["id"])
+    assert not snapshot["records"] and snapshot["filtered"]
+    apply = life.prepare_digest(event["id"], provider=object())
+    with engine.db.connect(write=True) as conn:
+        apply(conn)
+        row = conn.execute("SELECT state,data FROM mind_event_digests WHERE event_id=?", (event["id"],)).fetchone()
+        assert row[0] == "excluded"
+        assert life.read(event["id"], conn=conn)["pending"] is False
+        assert json.loads(row[1])["excluded_reason"] == "experience-policy"
+        assert lifecycle.retry_failed(conn, SCOPE.key(), mind.clock()) == []
+        lifecycle.mark_dirty(conn, SCOPE.key(), [event["id"]], mind.clock())
+        with pytest.raises(Conflict):
+            apply(conn)
+    with engine.db.connect() as conn:
+        assert conn.execute("SELECT state FROM mind_event_digests WHERE event_id=?", (event["id"],)).fetchone()[0] == "dirty"

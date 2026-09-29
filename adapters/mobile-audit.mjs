@@ -124,9 +124,10 @@ export class MobileAudit {
     this.state.status='running';this.state.startedAt=this.now();this.state.nextAt=this.now()+this.intervalHours*3600000;
     try {atomicJson(this.file,this.state);}
     catch(error){this.running=false;try {await held?.release();} finally {gate?.release();}throw error;}
-    let snapshot;
+    let snapshot,stage='collect';
     try {
-      snapshot=await this.collect();const result=withDetected(await this.review(snapshot,{held}),snapshot);
+      snapshot=await this.collect();stage='review';const result=withDetected(await this.review(snapshot,{held}),snapshot);
+      stage='record';
       const at=this.now();
       this.state.status=result.status;this.state.failures=0;this.state.lastSuccessAt=at;this.state.nextAt=at+this.intervalHours*3600000;
       this.state.lastReview={id,at,status:result.status,codes:[...new Set(result.findings.map(f=>f.code))].sort()};
@@ -144,7 +145,7 @@ export class MobileAudit {
       this.state.status='failed';this.state.failures=(this.state.failures??0)+1;
       const minutes=AUDIT_FAILURE_RETRY_MINUTES[this.state.failures-1]??this.intervalHours*60;
       this.state.nextAt=this.now()+minutes*60000;
-      this.state.lastError={at:this.now(),reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
+      this.state.lastError={at:this.now(),stage,reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
     finally {this.running=false;try {await held?.release();} finally {gate?.release();}atomicJson(this.file,this.state);}
   }
   record(id,result,at) {

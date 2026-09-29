@@ -524,3 +524,12 @@ A release moves the package version in the commit it ships: `python scripts/rele
 `uv build` compiles console sources and includes the assets in both wheel and source distribution. Building from Git needs Node.js 22 and npm; installing a release wheel or building from its sdist needs no Node runtime. For editable development, run `npm ci --prefix console && npm run build --prefix console` when using the UI. Generated assets are ignored by Git.
 
 CI checks affected components once. Python 3.11 compatibility is run for release tags or the manual release option; ordinary checks use Python 3.13. The core and client jobs run `generate_contract.py --check`; the client job also compares `schema.ts` with the contract, builds the wheel and runs `check_wheel.py`; the DeepSeek Harness plugin has a job of its own. Real-model replay, diagram rendering and large-scale benchmarks are deliberate acceptance tasks, not per-commit gates. Diagram sources and SVGs remain in the repository; render with `npm run docs:render` when a source changes.
+
+
+### Completed exploration and later sharing
+
+A completed exploration stores its report and observed sources in the shared memory, with a stable exploration ID and separately tracked content units. Storing it does not mean it has been shared. Kin chooses share, defer or keep. When she wants to share later, she uses an existing contact plan step with a not-before window and a next-review time; the due review considers the latest conversation before sending, rescheduling or dropping the idea. An immediate contact wish is only for contact she wants to initiate now.
+
+Event digests whose actual member records are all excluded by the experience read policy finish as excluded without a model call. Missing or stale evidence still follows its existing failure path. Excluded digests contain no summary; the previous derived view is archived, and new membership or source changes make the event eligible for review again.
+
+Health audit calls retain DeepSeek high, with a 16,384-token output budget and three-minute deadline. Output exhaustion is a failed review, never a successful empty report. Failure state records a static collect/review/record stage without raw exception content.

@@ -158,3 +158,24 @@ test('only a code of the fixed set is taken from what the host detected, at most
   assert.deepEqual(withDetected({status:'healthy',findings:[]},{}),{status:'healthy',findings:[]},'nothing detected: the review stands as it is');
   assert.deepEqual(withDetected({status:'healthy',findings:[]},{detected:[{code:'made-up'}]}),{status:'healthy',findings:[]});
 });
+
+
+test('audit bounds a runaway high-effort request and retains its failure receipt',async()=>{
+  let sent;const usage=[];
+  const reviewer=createMobileReviewer({key:'fixture',onUsage:r=>usage.push(r),fetchImpl:async(_url,options)=>{
+    sent=JSON.parse(options.body);
+    return {ok:true,json:async()=>({id:'audit-fixture',model:'deepseek-flash',stop_reason:'max_tokens',usage:{output_tokens:16384},content:[]})};
+  }});
+  await assert.rejects(reviewer.audit({checkedAt:123}),error=>error.message==='deepseek-output-budget-exhausted'&&error.receipt.maxTokens===16384);
+  assert.equal(sent.output_config.effort,'high');assert.equal(sent.thinking.type,'enabled');
+  assert.equal(sent.max_tokens,16384);assert.equal(sent.tools[0].name,'review_mobile_health');
+  assert.equal(usage.length,1);
+});
+
+test('audit records the failed stage without storing raw exception content',async t=>{
+  const f=fixture(t,{readings:[Error('private request text')]});
+  await f.audit.tick();
+  assert.equal(f.audit.state.lastError.stage,'review');
+  assert.equal(f.audit.state.lastError.reason,'audit-review-unavailable');
+  assert.doesNotMatch(JSON.stringify(f.audit.state),/private request text/);
+});

@@ -411,7 +411,7 @@ class EventLifecycle:
                     records[rid] = record
                 except Missing:
                     missing.append(rid)
-        active, excluded = {}, []
+        active, excluded, filtered = {}, [], []
         from .adaptive_recall import host_envelope
         for rid, record in records.items():
             # With the policy on, one rule decides what a summary may be built from; with it off,
@@ -420,6 +420,7 @@ class EventLifecycle:
             # same way keeps its signature and is not rebuilt for nothing.
             envelope = host_envelope(record["content"])
             if not policy.visible(record) if policy.enabled else envelope:
+                filtered.append(rid)
                 if policy.enabled and not envelope:
                     excluded.append(rid)
                 continue
@@ -441,7 +442,7 @@ class EventLifecycle:
             # version re-dirties exactly those and no untouched event is rebuilt for nothing.
             signature.append([policy.rules_version, sorted(excluded)])
         return {"event": anchor, "nodes": nodes, "edges": edges, "records": active, "all_records": records,
-                "missing": sorted(missing), "excluded": sorted(excluded), "input_hash": digest(signature)}
+                "missing": sorted(missing), "excluded": sorted(excluded), "filtered": sorted(filtered), "input_hash": digest(signature)}
 
     def read(self, identifier, conn=None):
         if conn is None:
@@ -452,9 +453,9 @@ class EventLifecycle:
             return {"state": "dirty", "revision": 0, "event_id": identifier, "pending": True}
         value = dict(row)
         value["data"] = json.loads(value["data"])
-        if value["state"] == "ready" and self.snapshot(conn, identifier)["input_hash"] != value["input_hash"]:
+        if value["state"] in {"ready", "excluded"} and self.snapshot(conn, identifier)["input_hash"] != value["input_hash"]:
             value["state"] = "dirty"
-        value["pending"] = value["state"] != "ready"
+        value["pending"] = value["state"] not in {"ready", "excluded"}
         return value
 
     def archive(self, conn, kind, identifier):
@@ -483,6 +484,23 @@ class EventLifecycle:
             dirty_at = row[1] if row else self.mind.clock()
             conn.execute("UPDATE mind_event_digests SET state='refreshing' WHERE scope=? AND event_id=?", (self.scope.key(), identifier))
         if not snapshot["records"]:
+            # A real record intentionally hidden by the experience policy is not a missing
+            # dependency. Finish this generation without inventing a summary or a model call.
+            # New membership/source changes still dirty it through the existing graph refs.
+            if (snapshot["all_records"] and not snapshot["missing"]
+                    and set(snapshot["filtered"]) == set(snapshot["all_records"])):
+                def exclude(conn):
+                    current = self.snapshot(conn, identifier)
+                    row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?",
+                                       (self.scope.key(), identifier)).fetchone()
+                    if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
+                        raise Conflict("Event changed during digest exclusion")
+                    self.archive(conn, "event_digest", identifier)
+                    conn.execute("UPDATE mind_event_digests SET state='excluded',revision=revision+1,input_hash=?,"
+                                 "data=? "
+                                 "WHERE scope=? AND event_id=?",
+                                 (snapshot["input_hash"], dumps({"excluded_reason": "experience-policy", "excluded_at": self.mind.clock()}), self.scope.key(), identifier))
+                return exclude
             raise ValueError("Event has no currently valid evidence")
         inputs = [{"id": r["id"], "revision": r["revision"], "basis": r["confirmation"],
                    "occurred_at": r["valid_from"], "received_at": r["received_at"], "text": r["content"]}
