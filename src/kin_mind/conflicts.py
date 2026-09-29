@@ -151,6 +151,7 @@ REGISTRY = {
     "Event member crossed scope": ("semantic", "reference-cross-scope", "block"),
     "Event summary cited unavailable evidence": ("semantic", "evidence-out-of-bounds", "block"),
     "Event changed during digest generation": ("runtime", "event-digest-changed", "reuse"),
+    "Event changed during digest exclusion": ("runtime", "event-digest-changed", "reuse"),
     "Topic membership changed during organization": ("runtime", "topic-membership-changed", "reuse"),
     # --- continuity.py ---
     "Continuity configuration requires current owner evidence": ("semantic", "insufficient-authority", "block"),
