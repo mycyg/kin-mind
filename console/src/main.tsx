@@ -304,7 +304,11 @@ function App() {
       // A console never pointed at a scope opens on the deployment's own, once (E3-03).
       if (!adoptedScope.current && health?.default_scope) {
         adoptedScope.current = true;
-        setScopeInput(health.default_scope);
+        // An equal scope must keep its identity: debouncing a fresh copy would reload
+        // the current view and clear a graph pick made just after connecting.
+        setScopeInput(previous =>
+          (Object.keys(previous) as (keyof Scope)[]).every(key => previous[key] === health.default_scope[key])
+            ? previous : health.default_scope);
       }
       setConnected(true);
     });

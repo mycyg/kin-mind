@@ -217,14 +217,24 @@ test('settings forms change only what was edited, over what the service holds no
 
 test('picking a node or typing a filter keeps the graph scene',async({page})=>{
   const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  const graphReads:string[]=[];
+  page.on('request',r=>{if(new URL(r.url()).pathname==='/v1/graph')graphReads.push(r.url());});
+  // Let the connection's scope debounce expire while a node detail is in flight.
+  await page.route('**/v1/graph/object/**',async route=>{
+    await new Promise(resolve=>setTimeout(resolve,450));
+    await route.continue();
+  });
   await page.getByRole('button',{name:'主题与关系',exact:true}).click();
   await expect(page.locator('canvas')).toHaveCount(1);
   const canvas=await page.locator('canvas').elementHandle();
+  const detail=page.waitForResponse(r=>new URL(r.url()).pathname.startsWith('/v1/graph/object/'));
   await page.getByRole('region',{name:'事件时间线'}).getByRole('button').first().click();
+  await detail;
   await expect(page.getByRole('region',{name:'图谱详情'})).not.toContainText('点开事件或连线');
   await page.getByLabel('人物、项目或旧事').fill('迁移');
   expect(await canvas!.evaluate(el=>el.isConnected)).toBe(true);
   await expect(page.locator('canvas')).toHaveCount(1);
+  expect(graphReads).toHaveLength(1);
   expect(errors).toEqual([]);
 });
 

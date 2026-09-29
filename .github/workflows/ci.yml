@@ -54,6 +54,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
+    env:
+      TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/kin-tiktoken
     strategy:
       matrix:
         python: ${{ fromJSON((inputs.release_compat || startsWith(github.ref, 'refs/tags/')) && '["3.13", "3.11"]' || '["3.13"]') }}
@@ -63,6 +65,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --frozen --extra dev --extra vector --extra graph
+      - run: uv run python scripts/prepare_test_tokenizer.py
       - run: uv run python scripts/generate_contract.py --check
       - run: uv run pytest -q tests/business
   node:
@@ -79,6 +82,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.clients == 'true'
     runs-on: ubuntu-latest
+    env:
+      TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/kin-tiktoken
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -88,6 +93,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: uv sync --frozen --extra dev --extra vector --extra graph
+      - run: uv run python scripts/prepare_test_tokenizer.py
       - run: uv run python scripts/generate_contract.py --check
       - run: npm ci --prefix sdk/typescript && npm run generate --prefix sdk/typescript && git diff --exit-code sdk/typescript/src/schema.ts
       - run: npm run build --prefix sdk/typescript && npm test --prefix sdk/typescript
