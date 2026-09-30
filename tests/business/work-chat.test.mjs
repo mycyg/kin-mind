@@ -12,7 +12,7 @@ async function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-chat-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const clock={now:10000};let summaries=0;const told=[];
   const runtime={known:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
-    model:'gpt-6-sol',modelProvider:'custom-gateway',reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
+    model:'gpt-6.1-sol',modelProvider:'custom-gateway',reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
     providerOverride:false,active:false,queued:0,backgroundTasks:0,pendingDeliveries:0};
   const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++clock.now,
     inspect:async()=>({...runtime}),classify:async({text})=>({route:text==='work'?'work':'chat',reason:'synthetic'}),

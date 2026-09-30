@@ -273,7 +273,7 @@ test('a freeze holds mode changes nobody forced',async t=>{
   await f.router.requestMode({mode:'work',commandId:'kin-work',reason:'Kin asked for work mode'});
   assert.equal((await f.router.applyPendingMode()).state,'pending');assert.equal(f.runtime.model,'deepseek-flash');
   await f.router.thawDispatch();
-  assert.equal((await f.router.applyPendingMode()).state,'applied');assert.equal(f.runtime.model,'gpt-6-sol');
+  assert.equal((await f.router.applyPendingMode()).state,'applied');assert.equal(f.runtime.model,'gpt-6.1-sol');
 });
 
 test('a session boundary waits for inputs in play, never for history (AD1-09)',()=>{

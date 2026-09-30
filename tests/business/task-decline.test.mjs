@@ -11,7 +11,7 @@ async function fixture(t,{manual=false}={}) {
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   let tick=1000,switches=0;
   const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
-    model:'gpt-6-sol',modelProvider:'custom-gateway',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
+    model:manual?'gpt-6-sol':'gpt-6.1-sol',modelProvider:'custom-gateway',providerOverride:false,reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
     active:false,queued:0,backgroundTasks:0,pendingDeliveries:0,handoffTasks:0};
   const options={file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++tick,inspect:async()=>({...runtime}),
     classify:async({text})=>({route:text==='chat'?'chat':'work',reason:'synthetic'}),
