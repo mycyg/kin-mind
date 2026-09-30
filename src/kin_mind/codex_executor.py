@@ -466,7 +466,9 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
 
     Follows DeepSeek's official codex integration doc where this CLI version
     accepts it: wire_api responses, model_reasoning_effort, web_search disabled,
-    forced_login_method api. `preferred_auth_method` from that doc is rejected by
+    provider env_key. Do not force an account login method on the shared Kin home:
+    the gateway uses its own key and must not log out the main ChatGPT session.
+    `preferred_auth_method` from that doc is rejected by
     codex-cli 0.155.0 strict config, and its inline `experimental_bearer_token`
     violates the credential rule — the credential stays an env var NAME here.
 
@@ -483,7 +485,6 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
         "--model", model,
         "--output-last-message", str(last_file),
         "-c", 'approval_policy="never"',
-        "-c", 'forced_login_method="api"',
         "-c", "features.apps=false",
         "-c", "features.hooks=false",
         "-c", "features.multi_agent=false",

@@ -558,3 +558,12 @@ def test_an_exploration_reader_never_reads_the_host_the_memory_store_or_kins_hom
                  documents / "notes" / "shortcut" / "memory.sqlite3", home / "auth.json"):
         with pytest.raises(ValueError, match="host-execution-material-excluded"):
             reader.checked_path(path)
+
+
+def test_gateway_exploration_preserves_shared_account_login(tmp_path):
+    argv = codex_argv("codex", tmp_path, model="deepseek-flash", reasoning="high",
+                      schema_file=tmp_path / "schema.json", last_file=tmp_path / "last.json",
+                      provider=PROVIDER)
+    assert not any("forced_login_method" in value for value in argv)
+    assert 'model_providers.deepseek.env_key="KIN_TEST_DS_KEY"' in argv
+    assert '--ignore-user-config' in argv

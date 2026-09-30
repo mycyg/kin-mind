@@ -6,7 +6,7 @@ import {runtimeProfile} from './codex-models.mjs';
 export const TASK_CLOSED=Object.freeze(['completed','canceled','partial','deferred','unclaimed']);
 export const openTask=task=>Boolean(task)&&!TASK_CLOSED.includes(task.status);
 /** Only for a model the live catalog gives no display name (AD1-15). */
-const FALLBACK_NAMES={'k3':'Kimi K3','deepseek-flash':'DeepSeek Flash','gpt-6-astra':'GPT‑6 Astra','gpt-6-sol':'GPT‑6 Sol','gpt-5.6-sol':'GPT‑5.6 Sol'};
+const FALLBACK_NAMES={'k3':'Kimi K3','deepseek-flash':'DeepSeek Flash','gpt-6-astra':'GPT‑6 Astra','gpt-6.1-sol':'GPT‑6.1 Sol','gpt-6-sol':'GPT‑6 Sol','gpt-5.6-sol':'GPT‑5.6 Sol'};
 export const displayName=(model,names=null)=>names?.[model]??FALLBACK_NAMES[model]??model;
 
 export function publicMobileRuntime(state, runtime, sessionId, loaded=true) {

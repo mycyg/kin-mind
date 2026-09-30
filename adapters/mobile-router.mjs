@@ -77,7 +77,7 @@ const RECLASSIFICATION_EVIDENCE_KEYS=['acceptanceSha256','actualSessionId','conv
 /** Built-in defaults. A host passes its configured profiles; nothing here decides them (AD1-15). */
 export const ROUTER_PROFILES = Object.freeze({
   chat:Object.freeze({model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}),
-  work:Object.freeze({model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
+  work:Object.freeze({model:'gpt-6.1-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}),
 });
 export const ROUTER_MODELS = Object.freeze({chat:ROUTER_PROFILES.chat.model,work:ROUTER_PROFILES.work.model});
 const LEDGER_TAIL_BYTES=1024*1024;

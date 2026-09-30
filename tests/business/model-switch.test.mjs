@@ -26,6 +26,7 @@ const LIVE_MODELS=[
   {id:'k3',aliases:['Kimi K3','Kimi'],provider:'openai-15m',providerKind:'gateway',reasoningEfforts:['high'],defaultReasoningEffort:'high',serviceTiers:['default'],defaultServiceTier:'default'},
   {id:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEfforts:['high'],defaultReasoningEffort:'high',serviceTiers:['default'],defaultServiceTier:'default'},
   {id:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEfforts:['low','medium','high','xhigh','max'],defaultReasoningEffort:'medium',serviceTiers:[{id:'priority'}],defaultServiceTier:'priority'},
+  {id:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEfforts:['low','medium','high','xhigh','max'],defaultReasoningEffort:'medium',serviceTiers:[{id:'priority'}],defaultServiceTier:'priority'},
   {id:'gpt-6-astra',aliases:['GPT‑6 Astra','ASTRA-6'],provider:'custom-gateway',providerKind:'native',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium',serviceTiers:['default',{id:'priority'}],defaultServiceTier:'default'},
 ];
 function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},classify=null,forceSwitch=null}={}) {
@@ -45,7 +46,7 @@ test('automatic changes notify once per verified transition, including a delayed
  const f=fixture(t);f.runtime.model='deepseek-flash';
  await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
  assert.equal(Object.values(f.router.state.notices).filter(n=>n.kind==='model-switched').length,1);
- const first=Object.values(f.router.state.notices)[0];assert.equal(first.target,'gpt-6-sol');
+ const first=Object.values(f.router.state.notices)[0];assert.equal(first.target,'gpt-6.1-sol');
  f.runtime.model='deepseek-flash';await f.router.readRuntime();
  const sent=[];
  await f.router.flushNotices({send:async r=>{sent.push(r);return {state:'accepted',messageId:r.id};},lookup:async()=>null});
@@ -137,7 +138,7 @@ test('automatic work restores the exact prior full profile only after every open
   for(const task of [first,second]){task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};task.stopReason='end_turn';task.turnEndedAt=f.now();task.deliveries['delivery-'+task.id]={state:'accepted',messageId:'m-'+task.id,inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:f.now()};}
   second.deliveries['delivery-'+second.id].state='pending';
   await f.router.reconcile();
-  assert.deepEqual([f.router.state.tasks[first.id].status,f.router.state.tasks[second.id].status,f.runtime.model],['completed','running','gpt-6-sol']);
+  assert.deepEqual([f.router.state.tasks[first.id].status,f.router.state.tasks[second.id].status,f.runtime.model],['completed','running','gpt-6.1-sol']);
   second.deliveries['delivery-'+second.id].state='accepted';second.deliveries['delivery-'+second.id].messageId='m-second';second.deliveries['delivery-'+second.id].at=f.now();
   await f.router.reconcile();await f.router.applyPendingMode();
   assert.deepEqual(firstReturn,{provider:'custom-gateway',providerKind:'native',model:'gpt-6-astra',reasoningEffort:'high',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
@@ -578,7 +579,7 @@ test('runtime lists supplier capabilities and new defaults while preserving an o
  const chosen={model:'gpt-5.6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'};
  f.router.state.mode='manual';f.router.state.manualProfile=chosen;Object.assign(f.runtime,{model:chosen.model,reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off'});
  const view=await f.router.readRuntime();
- assert.equal(view.defaults.work.model,'gpt-6-sol');assert.equal(view.defaults.work.reasoningEffort,'medium');
+ assert.equal(view.defaults.work.model,'gpt-6.1-sol');assert.equal(view.defaults.work.reasoningEffort,'medium');
  assert.equal(view.defaults.chat.model,'deepseek-flash');assert.ok(view.models.some(m=>m.id==='gpt-6-sol'));
  assert.equal(view.actual.model,'gpt-5.6-sol');assert.deepEqual(f.router.state.manualProfile,chosen);
 });
