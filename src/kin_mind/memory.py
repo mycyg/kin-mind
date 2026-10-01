@@ -13,13 +13,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_serializer
+from pydantic.json_schema import SkipJsonSchema
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.engine import DERIVED_CONFLICTS
 from eventmem.core.models import Model, RecordInput, SourceInput
 
-from . import memory_items, settling
+from . import memory_formation, memory_items, settling
 from .autonomy_schema import optimized
 from .computer import redact
 from .dialogue import recent_dialogue
@@ -179,7 +180,13 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "deferred_routes": False,
             # 0 (the default) is off. Otherwise an enrichment job waits until the scope's conversation
             # has been quiet this many minutes, and the jobs waiting together are one request (settling).
-            "enrichment_settle_minutes": 0}
+            "enrichment_settle_minutes": 0,
+            # How a conversation becomes memory (kin_mind.memory_formation), all four off by default and
+            # each one off the behaviour before it exactly: an entity's name verbatim in its evidence; the
+            # faithful-note lines in the memory instructions; a disposition for every conversation source
+            # (`memory.skipped`, one follow-up, the ledger); the main session's marks (`mark_memorable`).
+            "entity_name_check": False, "faithful_notes": False, "memory_disposition": False,
+            "memorable_marks": False}
 
 
 class MemoryNote(Model):
@@ -217,6 +224,18 @@ class MemoryAssessment(Model):
     graph: GraphAssessment = Field(default_factory=GraphAssessment)
     coverage: CoverageAssessment = Field(default_factory=CoverageAssessment)
     event_routes: list[EventRoute] = Field(default_factory=list, max_length=12)
+    # The sources this assessment chose not to remember, each with a reason category
+    # (memory_formation). In no schema pydantic writes and in no dump while empty: a request that
+    # does not offer it (`memory_formation.with_skipped`), and a row that does not carry it, are the
+    # request and the row as they were, which a release before this one still reads.
+    skipped: SkipJsonSchema[list[memory_formation.MemorySkip]] = Field(default_factory=list, max_length=memory_formation.SKIPPED_MAX)
+
+    @model_serializer(mode="wrap")
+    def _without_empty_skips(self, handler):
+        value = handler(self)
+        if not self.skipped and isinstance(value, dict):
+            value.pop("skipped", None)
+        return value
 
 
 def fingerprint_file(path):
@@ -366,7 +385,8 @@ class MemoryContinuity:
                     "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
-                    "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat"):
+                    "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat",
+                    *memory_formation.SWITCHES):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         from .desire_archive import DAYS_RANGE, KEEP_RANGE
@@ -1003,15 +1023,17 @@ class MemoryContinuity:
         return {"today_count": today_count, "entries": entries}
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None,
-                         deferrals_shown=None):
+                         deferrals_shown=None, job=None):
         """Called inside the same transaction as affect/concerns/wishes.
 
         `deferrals_shown`: the ids of the deferred routes the assessment's memory context carried,
         or None when it carried none at all (event_deferrals).
+        `job`: the queue row this commit answers for ({id, stimulus, agent_version, coverage_of}), which
+        a follow-up for sources left without a disposition answers to (memory_formation).
 
         Returns what the host dropped item by item (memory_items), shaped like a refused section."""
         items = memory_items.Items(conn, optimized(conn, self.scope.key(), memory_items.SWITCH))
-        items.run(lambda: self._apply_items(conn, items, assessment, refs, event_id, receipt))
+        routes = items.run(lambda: self._apply_items(conn, items, assessment, refs, event_id, receipt))
         if deferrals_shown is not None:
             from . import event_deferrals
             # After the routes: one this assessment placed is gone, every other it was shown is looked at once more.
@@ -1020,10 +1042,17 @@ class MemoryContinuity:
         # A source whose only carrier was dropped has not been organised: it stays out of the index
         # and waits in the ledger for its memory-only pass (queue_unorganized).
         withheld = items.withheld(conn, processed)
+        # Nor has a conversation source, or a marked one, that nothing carries, routes or skips, while
+        # `memory_disposition` or `memorable_marks` is on: one follow-up asks again for it, or the
+        # ledger keeps it. Both off, nothing here runs and every set is empty (memory_formation).
+        formed = memory_formation.settle(conn, self.mind, assessment=assessment, items=items, routes=routes,
+                                         processed=processed, event_id=event_id, job=job)
         for ref in processed:
-            if ref["source_id"] not in withheld:
+            if ref["source_id"] not in withheld and ref["source_id"] not in formed.missing:
                 conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
-        abandoned = memory_items.settle(conn, self.scope.key(), [r["source_id"] for r in processed], withheld, event_id, self.mind.clock())
+        abandoned = memory_items.settle(conn, self.scope.key(), [r["source_id"] for r in processed if r["source_id"] not in formed.queued],
+                                        withheld | formed.withheld, event_id, self.mind.clock())
+        memory_formation.queue_ledger(conn, self.scope.key(), formed, event_id, self.mind.clock())
         items.metric(conn, self.mind.clock(), event_id, withheld, abandoned)
         if schedule:
             # The cursor follows the events this evaluation was given and scored, withheld or not:
@@ -1035,7 +1064,8 @@ class MemoryContinuity:
         return items.records()
 
     def _apply_items(self, conn, items, assessment, refs, event_id, receipt):
-        """One pass over every item of the section; memory_items repeats it when a cascade reaches back."""
+        """One pass over every item of the section; memory_items repeats it when a cascade reaches back.
+        Returns what the committed event routes answered, which memory_formation reads."""
         allowed_sources = {r["source_id"] for r in refs}
         allowed_records = {r["record_id"] for r in refs}
         def evidence(ids):
@@ -1086,12 +1116,13 @@ class MemoryContinuity:
             self.graph.apply(conn, graph, refs, event_id, receipt, external_aliases=note_aliases, items=items,
                              keys=(memory_items.positions("graph.nodes", assessment.graph.nodes, graph.nodes),
                                    memory_items.positions("graph.edges", assessment.graph.edges, graph.edges)))
+        routes = []
         if config["event_lifecycle"] and assessment.event_routes:
             from .lifecycle import EventLifecycle
             # The host issues these command ids itself, from the appraisal and the route key.
             # A later judgment that rewrites one of them is an explicit revision, not a client
             # reusing an id: it is validated again in full and keeps its before/after record.
-            EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases, revise=True, items=items)
+            routes = EventLifecycle(self.mind, self.graph).apply_routes(conn, assessment.event_routes, refs, event_id, aliases, revise=True, items=items)
         for key, note in zip(note_keys, assessment.notes):
             # The second part of the same item: refused here, the note inserted above goes too.
             with items.item("note", key) as live:
@@ -1144,6 +1175,7 @@ class MemoryContinuity:
             # lookup for all of them before any is applied, as before.
             allowed_shares = evaluated if items.enabled else {m.share_id for m in assessment.coverage.mappings if evaluated(m.share_id)}
             self.sharing.apply(conn, assessment.coverage, allowed_shares, items=items)
+        return routes
 
     def _record_ids(self, conn, identifier):
         if identifier.startswith(("graph_", "explore_")):

@@ -644,6 +644,10 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
     for table in UNNAMED:
         if _table(conn, table):
             counts["unnamed:" + table] = _unnamed(conn, table, changed.get(table, set()), write=write, stopped=stopped)
+    # The skip receipts and the main session's marks (memory_formation): a row that names an erased
+    # source goes whole, and a mark goes with every source it named, its reason with it.
+    from .memory_formation import erase as erase_formation
+    counts["memory_formation"] = erase_formation(conn, ids, write=write)
     # A cache that summarised a graph item the erase took words from holds those words too.
     for table in CACHES:
         every = table in GENERATION_CACHES and write and not again

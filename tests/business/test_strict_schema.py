@@ -63,6 +63,9 @@ def fork_schemas():
     yield from ((f"appraisal operational={op} sections={len(s)}", A.appraisal_schema(op, False, s, A.REVIEW_MAX_MINUTES))
                 for op in (False, True) for s in (sections, sections[:2], ()))
     yield "history", A.appraisal_schema(False, True, (), A.REVIEW_MAX_MINUTES)
+    # With `memory.skipped` offered (memory_formation): the history and the assessment that writes memory.
+    yield "history disposition", A.appraisal_schema(False, True, (), A.REVIEW_MAX_MINUTES, (), disposition=True)
+    yield "appraisal disposition", A.appraisal_schema(False, False, sections, A.REVIEW_MAX_MINUTES, (), disposition=True)
     for model in (A.Appraisal, A.HistoryAssessment, A.SessionAdvice, A.SharingReview, Compression,
                   CompletionReview, EventSummary, Findings, Revalidation):
         yield model.__name__, model.model_json_schema()

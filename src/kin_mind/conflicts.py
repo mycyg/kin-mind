@@ -32,7 +32,7 @@ COMMIT_PATH_MODULES = (
     "eventmem.core.engine", "kin_mind.model_lanes", "kin_mind.revalidation",
     "kin_mind.evidence_classes", "kin_mind.traits", "kin_mind.behavior_chain", "kin_mind.compat",
     "kin_mind.expression_intent",
-    "kin_mind.next_move", "kin_mind.trait_refs", "kin_mind.history",
+    "kin_mind.next_move", "kin_mind.trait_refs", "kin_mind.history", "kin_mind.memory_formation",
 )
 
 
@@ -104,6 +104,8 @@ REGISTRY = {
     # --- graph.py ---
     "Graph evidence is missing or needs review": ("runtime", "cited-evidence-not-current", "reuse"),
     "Graph evidence was not part of this evaluation": ("semantic", "evidence-out-of-bounds", "block"),
+    # memory_formation.check_entity, under `entity_name_check`: the node is dropped alone (memory_items).
+    "Entity name is not in its evidence": ("semantic", "entity-name-unsourced", "block"),
     "Graph reference crossed memory scopes": ("semantic", "reference-cross-scope", "block"),
     "An event cannot provide its own relationship evidence": ("semantic", "self-reference", "block"),
     "Causal claims need a stated evidence basis": ("semantic", "causal-basis-required", "block"),

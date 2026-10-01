@@ -26,7 +26,7 @@ from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, erasure, initiative, judgment_cache, revalidation, settling
+from . import attempts, erasure, initiative, judgment_cache, memory_formation, revalidation, settling
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
@@ -799,20 +799,27 @@ DEFERRED_ROUTES_PROMPT = (
     "仍不确定就不处理，不为结清而强行归并。")
 
 
-def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=(), timed=False):
+def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=(), timed=False,
+                     disposition=False):
     """`sections`: the audited sections this request offers. A section left out takes its property
     and everything only it referenced with it, so a request offering none is the request as it was.
     `review_max`: the review ceiling this request allows, the same one its prompt states.
     `required`: offered fields this request must answer, listed as required and without their null
     branch, so a strict fork cannot answer them with null either.
     `timed`: whether a concern may carry its window (`timed_concerns`). Without it the two fields are
-    taken out of the concern, and the schema is the one it was before they existed."""
+    taken out of the concern, and the schema is the one it was before they existed.
+
+    `disposition`: the request offers `memory.skipped` (memory_formation); without it, the schema
+    is the one it always was."""
     if historical:
-        return HistoryAssessment.model_json_schema()
+        schema = HistoryAssessment.model_json_schema()
+        return memory_formation.with_skipped(schema) if disposition else schema
     schema = Appraisal.model_json_schema()
     if not timed:
         for name in TIMED_FIELDS:
             schema["$defs"]["ConcernProposal"]["properties"].pop(name, None)
+    if disposition and not operational:
+        schema = memory_formation.with_skipped(schema)
     # The model bound is the widest one there is; this request's own ceiling replaces it in place.
     schema["properties"]["next_review_minutes"]["maximum"] = review_max
     withheld = [name for name in AUDIT_SECTIONS if name not in sections]
@@ -1291,7 +1298,8 @@ class DeepSeek:
         submit = {"name": "submit_appraisal", "description": "提交有来源的状态提案",
                   "input_schema": appraisal_schema(context.get("operational_only", False),
                       context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
-                      self._sections(context), self._review_max(), self._required(context), self._timed())}
+                      self._sections(context), self._review_max(), self._required(context), self._timed(),
+                      self._skipped(context))}
         system, scope = self._system(context, policy), self._recall_scope(context)
         messages, first, calls, rounds = [{"role": "user", "content": rendered}], time.monotonic(), [], []
         deadline = first + timeout
@@ -1477,7 +1485,8 @@ class DeepSeek:
             from .state import Mind
             request_context = redact(request_context)
             overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
-                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context), self._timed()))
+                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context), self._timed(),
+                self._skipped(context)))
                 + (dumps(RECALL_TOOLS) if self._recall_scope(context) else "")) + 160
             if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
@@ -1714,9 +1723,21 @@ class DeepSeek:
         offered = self._sections(context)
         return tuple(name for name in getattr(self, "required_sections", ()) or () if name in offered)
 
+    def _memory_rules(self):
+        """The memory_formation switches this attempt is framed by. The host sets them (run_one); a
+        provider that never had any is the request as it was."""
+        return frozenset(getattr(self, "memory_rules", ()) or ())
+
+    def _skipped(self, context):
+        """Whether this request offers `memory.skipped`: on a lane that carries memory, while
+        `memory_disposition` or `memorable_marks` is on."""
+        return memory_formation.offers_skipped(self._memory_rules()) and not context.get("operational_only")
+
     def _system(self, context, policy):
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
+        # The memory instructions' own lines while their switches are on; nothing otherwise.
+        system += memory_formation.prompt(self._memory_rules(), operational=context.get("operational_only"))
         return (system + persona_prompt(policy)
                 + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + (TIMED_CONCERNS_PROMPT if self._timed() and not historical else "")
@@ -1739,7 +1760,8 @@ class DeepSeek:
                                     "calls": RECALL_CALLS, "items": RECALL_ITEMS, "tokens": RECALL_TOKENS,
                                     "read": {"characters": READ_CHARS, "tokens": READ_TOKENS}, "done": RECALL_DONE}
         return {"system": digest(self._system(context, policy)),
-                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context), self._timed())),
+                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context), self._timed(),
+                                                  self._skipped(context))),
                 "model": self.model, "parameters": digest(parameters)}
 
 
@@ -1829,7 +1851,8 @@ class NativeReview(DeepSeek):
         return decode_strict(schema, answer["result"]), receipt
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
-        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max(), self._required(context), self._timed())
+        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max(), self._required(context), self._timed(),
+                                  self._skipped(context))
         # The fixed dimension definitions belong to the contract, ahead of the dynamic context, so the
         # standing prefix of every assessment stays the same.
         dynamic = json.loads(rendered)
@@ -2743,6 +2766,10 @@ class Appraisals:
                                      "clock": clock_context(self.mind.clock()), "recent_dialogue": recent}
                 if memory_context:
                     model_context["memory_context"] = memory_context
+                    if not operational and not maintenance:
+                        # The marks Kin made on these sources, and which of them a follow-up asks again
+                        # (memory_formation); nothing while its switches are off.
+                        model_context.update(memory_formation.context(self.mind, refs, data, settings))
                 # Host validation feedback about this evaluation's previous
                 # proposal: static codes and the sections the host refused.
                 detail = data.get("error_detail") or {}
@@ -2862,6 +2889,8 @@ class Appraisals:
                 # provider's to tell from the stimulus (RECALL_WITHHELD). Set before the manifest reads
                 # the request profile it changes.
                 provider.memory_recall = True
+                # How memory is formed on this attempt (memory_formation): nothing while every switch is off.
+                provider.memory_rules = memory_formation.rules(settings)
                 if not getattr(type(provider), "native_review", False):
                     # What the request may hold, by the configuration and the model's window. A
                     # main-session review has its own, from the session's (NativeReview.from_engine).
@@ -2925,6 +2954,7 @@ class Appraisals:
                 # One place decides what an audited section may carry on this lane; a proposal that
                 # came back from storage is held to it exactly like one this attempt asked for.
                 proposal = blank_sections(proposal, offered)
+                proposal = memory_formation.blank_skipped(proposal, memory_formation.rules(settings))
                 # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
                 data.pop("dropped_fields", None)
                 if receipt.get("dropped_fields"):
@@ -3422,7 +3452,9 @@ class Appraisals:
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
                         dropped = self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
                             memory_context["through_seq"], proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots, max_minutes=review_max,
-                            deferrals_shown=[d["id"] for d in memory_context["pending_deferrals"]] if "pending_deferrals" in memory_context else None)
+                            deferrals_shown=[d["id"] for d in memory_context["pending_deferrals"]] if "pending_deferrals" in memory_context else None,
+                            job={"id": row["id"], "stimulus": data.get("stimulus"), "agent_version": effective_version,
+                                 memory_formation.COVERAGE_OF: data.get(memory_formation.COVERAGE_OF)})
                         if dropped:
                             # Memory items the host dropped one by one (memory_items): recorded beside the refused sections.
                             rejected.extend(dropped)

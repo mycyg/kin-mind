@@ -21,7 +21,7 @@ from eventmem.core.read_policy import (
 )
 
 from . import evidence_refs
-from .autonomy_schema import optimized
+from .autonomy_schema import enabled, optimized
 from .state import timestamp
 
 SCHEMA = """
@@ -515,6 +515,9 @@ class EventGraph:
         # stored node introduces its key only: a reference by that id still names the stored node.
         created = {n.key for n in proposal.nodes if items.enabled and not conn.execute(
             "SELECT 1 FROM mind_graph_nodes WHERE scope=? AND id=?", (self.scope.key(), aliases[n.key])).fetchone()}
+        # `entity_name_check` (memory_formation): an entity is named in what it cites, or it is refused alone.
+        from . import memory_formation
+        names_checked = enabled(conn, self.scope.key(), memory_formation.ENTITY_CHECK)
         for key, item in zip(node_keys, proposal.nodes):
             with items.item("graph-node", key, names=(item.key, aliases[item.key] if item.key in created else None),
                             needs=(item.owner_id,), evidence=item.evidence_ids) as live:
@@ -538,11 +541,15 @@ class EventGraph:
                     basis = "inferred"
                 if item.kind == "association":
                     basis = "internal_thought"
+                named = (memory_formation.check_entity(conn, self.engine, self.scope.key(), item, evidence, previous)
+                         if names_checked and item.kind == "entity" else None)
                 value = {**(previous or {}), **item.model_dump(exclude={"id", "key", "expected_revision", "evidence_ids"}), "id": identifier,
                     "basis": basis, "source_ids": sorted({r["source_id"] for r in evidence}), "evidence": evidence,
                     "occurred_at": item.occurred_at or (previous or {}).get("occurred_at") or self.mind.clock(),
                     "assessment_event": event_id, "configuration_version": receipt.get("configuration_version"),
                     "model": receipt.get("model"), "state": "active"}
+                if named is not None:
+                    value["aliases"] = named
                 if item.kind == "finding":
                     value["content_version"] = (previous or {}).get("content_version", 1) + int(bool(previous and previous.get("text") != item.text))
                 if value.get("owner_id"):

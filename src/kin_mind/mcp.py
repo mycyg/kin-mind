@@ -3,6 +3,7 @@
 from eventmem.core.models import Scope
 
 from .continuity import ConcernChange
+from .memory_formation import MARK_TOOL_DESCRIPTION
 from .state import AffectiveEvent, DesireChange, Mind
 
 
@@ -111,6 +112,12 @@ def register_mind_tools(server, engine):
     def record_affective_event(scope: Scope, event: AffectiveEvent) -> dict:
         """在同一回合评估新的有来源经历。使用当前 revision、实际 agent_version 和原 evidence_ids，只更新有新依据的维度；重复事件不重复计分，也不凭沉默抬高委屈、占有或求安慰。简述变化缘由。evolution 沿已有事前假设及验证来源，保留假设性质；revert_event_id 需要后来的明确更正。"""
         return Mind(engine, scope).record(event)
+
+    @server.tool(description=MARK_TOOL_DESCRIPTION)
+    def mark_memorable(scope: Scope, evidence_ids: list[str], reason: str) -> dict:
+        # The description is memory_formation.MARK_TOOL_DESCRIPTION (model-facing; NEEDS 小光 OK).
+        from .memory_formation import mark
+        return mark(Mind(engine, scope), evidence_ids, reason)
 
     @server.tool()
     def manage_desire(scope: Scope, request: DesireChange) -> dict:
