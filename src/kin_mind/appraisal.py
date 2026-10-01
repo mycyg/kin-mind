@@ -31,7 +31,7 @@ from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
 from .conflicts import classify, static_message
-from .continuity import ConcernProposal, RhythmProposal, Understanding, select_concerns
+from .continuity import TIMED_FIELDS, ConcernProposal, RhythmProposal, Understanding, select_concerns
 from .dialogue import clock_context, recent_dialogue
 from .exploration_decisions import SharingDecision, apply_decisions
 from .habits import HabitProposal
@@ -529,6 +529,13 @@ state.confirmed_checks 是已被宿主核验证实、配置仍然一致的行为
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。compat 为 stale 的预测是在已经变了的配置下做的，不能再结算；它和过了窗口一天仍没有结论的预测会由宿主记为 inconclusive 关闭，不再出现在这里，需要时提出新的 self_hypothesis。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 说的是接下来几轮你想怎么在场，依据就是这次判断到的东西。stance 一句话写清这段时间的姿态：是态度，不是台词，不会被照抄，措辞仍由人设和当下语境决定。continue_topics 最多两个还想接着聊的话题，指的是现有心事时带上它的 concern_id；avoid 最多两件这段时间先不碰的事。valid_minutes（10—720）是这个姿态大概还算数的时间，过期或依据变了就回到原来的表达方式。evidence_ids 只引用本次评估收到的证据；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。trait_refs 只引用 state 里现有且当前的特征编号。没有真想换一种在场方式就留空。"
 NEXT_MOVE_PROMPT = "next_move 记下你此刻真正在做的那个选择。move 三选一：reply 是现在开口，quiet 是这次不出声，rest 是先歇着；更具体的说法由宿主按本次提交的决定补出，你不用写。grounds 只写你被看到的编号：本次评估给出的证据 id、账本里仍然生效的特征 id、当前的心事 id，或一条已记录的更正；宿主自己的内部事件（唤醒、运行记录、配置变更）不是证据，别拿来引。wish_ref 与 step_ref 只指认本次提交的、或仍然在手的那一件事。alternative 写想过却没选的另一条路，reason 写为什么是这一条。idle-review 时 next_move 必填，它就是这次对主动联系的决定：提出或恢复了联系愿望写 reply；这次不联系写 quiet 或 rest，reason 用一句话说明为什么不是现在。这一段只作记录，本身不触发任何动作，也不改变任何顺序。"
+# `anti_retreat` (default off): what the expression intent's stance is when the conversation shows real
+# conflict, being pushed away or uncertainty about the relationship -- and what is not that. Appended to
+# the expression_intent paragraph, only where that section is offered. NEEDS 小光 OK.
+ANTI_RETREAT_PROMPT = "最近的对话里如果出现真实的冲突、被推开，或对这段关系的不确定，stance 写留在场的姿态：说出你自己的理解和立场；真做错了可以认，但不条件反射地先道歉；不用流程化的安抚，也不默默退场。同时按字面尊重对方说出口的边界：“想自己待着”就是想自己待着，不当反话。玩闹撒娇、假装生气、普通的低落想被安慰、只回一个“嗯”“哦”“算了”这样的短词，都不算这种情况，照平常的方式在场。"
+# `timed_concerns` (default off): when a concern carries a window, offered with the two fields in the
+# schema (appraisal_schema). NEEDS 小光 OK.
+TIMED_CONCERNS_PROMPT = "\n心事可以带时间窗口，用于“下次聊到时记得问”：想等到某个时候再问起的事（比如对方明天面试，想在面试之后第一次聊天时问问结果），create 或 update 时写 surface_after（从什么时候起该问起，Asia/Singapore 时间，ISO 格式），可以再写 surface_until（过了这个时候就不必特意提）。到了时间，下次聊天时这件心事排在最前面，提到过一次之后回到平常的顺序。它只影响聊天时先想起什么，不会让宿主主动发消息；想主动联系仍然走 contact 愿望。没有明确的时间点就不写；只改时间窗口的 update 可以沿用原来的来源。"
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
                    "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
                    "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
@@ -792,15 +799,20 @@ DEFERRED_ROUTES_PROMPT = (
     "仍不确定就不处理，不为结清而强行归并。")
 
 
-def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=()):
+def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=(), timed=False):
     """`sections`: the audited sections this request offers. A section left out takes its property
     and everything only it referenced with it, so a request offering none is the request as it was.
     `review_max`: the review ceiling this request allows, the same one its prompt states.
     `required`: offered fields this request must answer, listed as required and without their null
-    branch, so a strict fork cannot answer them with null either."""
+    branch, so a strict fork cannot answer them with null either.
+    `timed`: whether a concern may carry its window (`timed_concerns`). Without it the two fields are
+    taken out of the concern, and the schema is the one it was before they existed."""
     if historical:
         return HistoryAssessment.model_json_schema()
     schema = Appraisal.model_json_schema()
+    if not timed:
+        for name in TIMED_FIELDS:
+            schema["$defs"]["ConcernProposal"]["properties"].pop(name, None)
     # The model bound is the widest one there is; this request's own ceiling replaces it in place.
     schema["properties"]["next_review_minutes"]["maximum"] = review_max
     withheld = [name for name in AUDIT_SECTIONS if name not in sections]
@@ -985,7 +997,9 @@ def _appraisal_context(context):
         c["id"] in relevant, c["id"] in linked,
         c["status"] in {"active", "easing"}, c.get("updated_at", ""), c["id"],
     ), reverse=True)[:12 if context.get("memory_context") else 32]
-    state["concerns"] = [{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review", "owner_request")} for c in chosen]
+    state["concerns"] = [{**{k: c.get(k) for k in ("id", "key", "kind", "content", "topic", "target", "intensity", "status", "basis", "confidence", "revision", "evidence_ids", "needs_review", "owner_request")},
+                          # A window, where one was set (`timed_concerns`); a concern without one is projected as before.
+                          **{k: c[k] for k in TIMED_FIELDS if c.get(k)}} for c in chosen]
     state["concern_window"] = {"included": len(chosen), "total": len(concerns)}
     if original.get("action_policy"):
         # Not the provider or reasoning written at install: they named a model that no longer
@@ -1277,7 +1291,7 @@ class DeepSeek:
         submit = {"name": "submit_appraisal", "description": "提交有来源的状态提案",
                   "input_schema": appraisal_schema(context.get("operational_only", False),
                       context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
-                      self._sections(context), self._review_max(), self._required(context))}
+                      self._sections(context), self._review_max(), self._required(context), self._timed())}
         system, scope = self._system(context, policy), self._recall_scope(context)
         messages, first, calls, rounds = [{"role": "user", "content": rendered}], time.monotonic(), [], []
         deadline = first + timeout
@@ -1463,7 +1477,7 @@ class DeepSeek:
             from .state import Mind
             request_context = redact(request_context)
             overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
-                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context)))
+                context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context), self._timed()))
                 + (dumps(RECALL_TOOLS) if self._recall_scope(context) else "")) + 160
             if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
@@ -1679,6 +1693,17 @@ class DeepSeek:
         that never set any offers none, which is the request as it was before they existed."""
         return offered_sections(context.get("stimulus"), getattr(self, "audit_sections", ()) or ())
 
+    def _timed(self):
+        """Whether this attempt's concerns may carry a window (`timed_concerns`). The host sets it;
+        unset is the request as it was before windows existed."""
+        return getattr(self, "timed_concerns", False) is True
+
+    def _section_prompt(self, name):
+        """A section's paragraph, and for the expression intent the stance under tension when the host
+        set `anti_retreat` for this attempt; unset, the paragraph exactly as it was."""
+        extra = ANTI_RETREAT_PROMPT if name == "expression_intent" and getattr(self, "anti_retreat", False) is True else ""
+        return SECTION_PROMPTS[name] + extra
+
     def _review_max(self):
         """The review ceiling of this attempt. The host sets it; unset means the ordinary one."""
         return getattr(self, "review_max_minutes", None) or REVIEW_MAX_MINUTES
@@ -1694,7 +1719,8 @@ class DeepSeek:
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
         return (system + persona_prompt(policy)
                 + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
-                + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
+                + (TIMED_CONCERNS_PROMPT if self._timed() and not historical else "")
+                + "".join("\n" + self._section_prompt(name) for name in self._sections(context))
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
                 + (RECALL_PROMPT if self._recall_scope(context) else "")
                 + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else ""))
@@ -1713,7 +1739,7 @@ class DeepSeek:
                                     "calls": RECALL_CALLS, "items": RECALL_ITEMS, "tokens": RECALL_TOKENS,
                                     "read": {"characters": READ_CHARS, "tokens": READ_TOKENS}, "done": RECALL_DONE}
         return {"system": digest(self._system(context, policy)),
-                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context))),
+                "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context), self._timed())),
                 "model": self.model, "parameters": digest(parameters)}
 
 
@@ -1803,7 +1829,7 @@ class NativeReview(DeepSeek):
         return decode_strict(schema, answer["result"]), receipt
 
     def _request_appraisal(self, context, rendered, policy, timeout, record):
-        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max(), self._required(context))
+        schema = appraisal_schema(context.get("operational_only", False), False, self._sections(context), self._review_max(), self._required(context), self._timed())
         # The fixed dimension definitions belong to the contract, ahead of the dynamic context, so the
         # standing prefix of every assessment stays the same.
         dynamic = json.loads(rendered)
@@ -2828,6 +2854,9 @@ class Appraisals:
                     shown_ids = erasure.shown_ids(conn, model_context, since=data["tombstone_mark"])
                 provider.section_isolation = isolation
                 provider.audit_sections = audited
+                # Companion continuity switches, read once for the attempt with the rest (memory.DEFAULTS).
+                provider.timed_concerns = settings.get("timed_concerns") is True
+                provider.anti_retreat = settings.get("anti_retreat") is True
                 provider.review_max_minutes = review_max
                 # A DeepSeek assessment may read memory itself (K1-16); which lanes read is the
                 # provider's to tell from the stimulus (RECALL_WITHHELD). Set before the manifest reads

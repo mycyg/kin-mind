@@ -48,6 +48,12 @@ a wish acknowledges the current concern revision. Closing a stale wish remains
 possible. Source-based evidence deduplication has its own durable table; removing
 old items from a display does not make old summaries new evidence.
 
+With `timed_concerns` on (off by default), the appraisal may give a concern a window,
+`surface_after` and `surface_until` ("下次聊到时记得问"). A concern entering its window is
+selected first until an accepted context delivery since the window opened names it; then it
+returns to its ordinary place. It never sends anything: contact stays Kin's own wish. See
+[operations](operations.md#companion-continuity).
+
 ## Expression and rhythm
 
 The local expression compiler covers all 20 dimensions and selects at most three

@@ -1,7 +1,9 @@
 """Source-backed continuity within Mind's existing transaction and revision log."""
 
+import json
 import re
 from copy import deepcopy
+from datetime import timezone
 from typing import Literal
 
 from pydantic import Field, FiniteFloat, StrictBool, StrictInt, model_validator
@@ -53,7 +55,9 @@ class OwnerRequest(Model):
     status: Literal["proposed", "accepted", "waiting", "completed", "declined"] = "proposed"
 
 
-class ConcernProposal(Model):
+class ConcernBase(Model):
+    """A concern change as every caller states it. The appraisal's proposal adds its window below;
+    the host's and the MCP server's `ConcernChange` take exactly what they always took."""
     action: Literal["create", "update", "ease", "resolve", "reopen", "archive"]
     concern_id: str | None = None
     key: str | None = Field(default=None, min_length=1, max_length=200)
@@ -93,6 +97,73 @@ class ConcernProposal(Model):
         return self
 
 
+# `timed_concerns` (default off): "下次聊到时记得问". The two fields exist in the model, and the schema
+# the appraisal is offered carries them only while the switch is on (appraisal.appraisal_schema); the
+# commit ignores them while it is off, so off is exactly the concern it was.
+TIMED_FIELDS = ("surface_after", "surface_until")
+
+
+class ConcernProposal(ConcernBase):
+    surface_after: str | None = Field(default=None, min_length=1, max_length=40)
+    surface_until: str | None = Field(default=None, min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def window(self):
+        after, until = (surface_moment(getattr(self, name)) for name in TIMED_FIELDS)
+        if after and until and after >= until:
+            raise ValueError("A concern's window opens before it closes")
+        return self
+
+
+def surface_moment(value):
+    """A window's edge as a moment: ISO 8601, Asia/Singapore when it names no zone."""
+    if value is None:
+        return None
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return moment if moment.tzinfo else moment.replace(tzinfo=ZoneInfo("Asia/Singapore"))
+
+
+def timed_entering(conn, scope, concerns, at):
+    """The timed concerns entering their window at `at`: open, not waiting for review, past
+    `surface_after` (or since their window was set, with none), not past `surface_until`, and not
+    yet delivered -- no context delivery accepted into a native window since the window opened names
+    them (`mind_context_deliveries`, the existing receipts). Reads only."""
+    def aware(moment):
+        return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+    now = aware(stamp(at))
+    opened = {}
+    for concern in concerns:
+        if not (concern.get("surface_after") or concern.get("surface_until")):
+            continue
+        if concern.get("status") not in {"active", "easing"} or concern.get("needs_review"):
+            continue
+        after, until = surface_moment(concern.get("surface_after")), surface_moment(concern.get("surface_until"))
+        since = max(filter(None, (after, aware(stamp(concern["surface_set_at"])) if concern.get("surface_set_at") else None)), default=None)
+        if (after and now < after) or (until and now > until) or since is None:
+            continue
+        opened[concern["id"]] = since
+    if not opened:
+        return ()
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_context_deliveries'").fetchone():
+        return tuple(opened)
+    earliest = min(opened.values()).astimezone(timezone.utc).isoformat()
+    delivered = set()
+    for (data,) in conn.execute(
+            # `at` is the row's last write, which for an accepted one is its acceptance or later.
+            "SELECT data FROM mind_context_deliveries WHERE scope=? AND state='accepted'"
+            " AND julianday(at)>=julianday(?)", (scope, earliest)):
+        value = json.loads(data)
+        accepted = aware(stamp(value["accepted_at"])) if value.get("accepted_at") else None
+        text = value.get("text") or ""
+        for identifier, since in opened.items():
+            if accepted and accepted >= since and identifier in text:
+                delivered.add(identifier)
+    return tuple(identifier for identifier in opened if identifier not in delivered)
+
+
 class ContinuityCommand(Model):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
@@ -100,7 +171,7 @@ class ContinuityCommand(Model):
     evidence_ids: list[str] = Field(min_length=1, max_length=50)
 
 
-class ConcernChange(ConcernProposal):
+class ConcernChange(ConcernBase):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
@@ -142,7 +213,7 @@ def concern_projection(entry, at):
     return result
 
 
-def select_concerns(concerns, query="", limit=3, intent=None):
+def select_concerns(concerns, query="", limit=3, intent=None, entering=()):
     def tokens(text):
         text = text.lower()
         return set(re.findall(r"[a-z0-9_]+", text)) | {
@@ -179,6 +250,11 @@ def select_concerns(concerns, query="", limit=3, intent=None):
                 picked.append(found["id"])
         order = {identifier: index for index, identifier in enumerate(picked)}
         active.sort(key=lambda c: order.get(c["id"], len(order)))
+    if entering:
+        # A timed concern entering its window (`timed_concerns`, `timed_entering`) goes ahead of all
+        # of that, in the order it was given; the rest keep the order above.
+        first = {identifier: index for index, identifier in enumerate(entering)}
+        active.sort(key=lambda c: first.get(c["id"], len(first)))
     return [
         {
             k: c.get(k)
@@ -312,8 +388,17 @@ class Continuity:
                 (self.scope.key(), cid, evidence_key(r)),
             ).fetchone()
         ]
+        timing = {}
+        if any(getattr(change, name, None) for name in TIMED_FIELDS):
+            from .autonomy_schema import enabled
+            if enabled(conn, self.scope.key(), "timed_concerns"):
+                from .plans import local_time
+                timing = {name: local_time(getattr(change, name)) for name in TIMED_FIELDS if getattr(change, name, None)}
+        # When to bring a concern up again is Kin's own judgment too, like easing it: an update that
+        # only moves its window needs no new source (`timed_concerns`).
+        retimed = change.action == "update" and bool(current) and any(current.get(k) != v for k, v in timing.items())
         settles = {"ease": "easing", "archive": "archived"}.get(change.action)
-        if current and not new_refs and (not settles or current["status"] == settles):
+        if current and not new_refs and not retimed and (not settles or current["status"] == settles):
             # Easing or archiving is Kin's own judgment about a concern and needs no new source
             # (K3-18); it is a replay only when the concern already stands that way.
             return {
@@ -373,6 +458,13 @@ class Continuity:
                 entry[name] = value
         if change.owner_request:
             entry["owner_request"] = change.owner_request.model_dump()
+        if timing:
+            # A stated edge replaces the stored one; an edge left out stays as it was.
+            window = {**{name: entry.get(name) for name in TIMED_FIELDS}, **timing}
+            after, until = (surface_moment(window[name]) for name in TIMED_FIELDS)
+            if after and until and after >= until:
+                raise Conflict("A concern's window opens before it closes")
+            entry.update(window, surface_set_at=at)
         if entry["basis"] == "explicit" and not any(
             r["authority"] == "explicit" for r in refs
         ):
@@ -546,7 +638,12 @@ class Continuity:
         if intent and intent["status"]:
             result["continuity"]["expression_intent"] = intent["status"]
         stated = (intent or {}).get("use")
-        result["selected_concerns"] = select_concerns(result["concerns"], topic, intent=stated)
+        # `timed_concerns` (default off): one entering its window goes first, until a context
+        # receipt shows it reached a native window. Off, nothing here is read.
+        from .autonomy_schema import enabled as switched_on
+        entering = (timed_entering(conn, self.scope.key(), result["concerns"], at)
+                    if result["concerns"] and switched_on(conn, self.scope.key(), "timed_concerns") else ())
+        result["selected_concerns"] = select_concerns(result["concerns"], topic, intent=stated, entering=entering)
         if flags["rhythm"]:
             interactions = interaction_windows(conn, self.scope.key(), at)
             entry = state.get("rhythm")

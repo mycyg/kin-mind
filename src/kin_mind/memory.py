@@ -150,6 +150,18 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # command, which still refuses unless the store is provably quiet and still writes
             # nothing without `--apply`.
             "context_cache_sweep": False, "metrics_name_ring": False, "vector_optimize": False,
+            # Companion continuity (2026-10-01), all four off and all four read as an explicit true
+            # (autonomy_schema.enabled() or the stored settings); off, each is the previous
+            # behaviour byte for byte. `checkpoint_texture`: the checkpoint's sourced summary also
+            # keeps forms of address, running jokes, tone and the emotional arc
+            # (session_checkpoint.TEXTURE_INSTRUCTION). `window_notes`: a session review at
+            # elevated pressure queues one background DeepSeek note per stretch of the window
+            # ("这一段的我们", kin_mind.window_notes), carried by the next checkpoint when it fits.
+            # `timed_concerns`: a concern may carry `surface_after` / `surface_until`, and one
+            # entering its window is selected first until a context receipt shows it delivered.
+            # `anti_retreat`: the expression intent's prompt gains the stance for real conflict,
+            # being pushed away and uncertainty about the relationship (appraisal.ANTI_RETREAT_PROMPT).
+            "checkpoint_texture": False, "window_notes": False, "timed_concerns": False, "anti_retreat": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -353,7 +365,8 @@ class MemoryContinuity:
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive",
-                    "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes"):
+                    "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
+                    "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         from .desire_archive import DAYS_RANGE, KEEP_RANGE

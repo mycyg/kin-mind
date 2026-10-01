@@ -72,6 +72,8 @@
 | `wish_version_review` | 对决策作于更早智能体版本的愿望，按愿望与版本各发一次 `wish-review`，而不是让它停在未就绪、再也没有人过问。 |
 | `rest_review_window` | 已退役，不再是设置项。已存配置或 `configure-memory` 调用里如果还带着它或 `review_rest_max_minutes`，不会被拒绝：读取时忽略，下次写入时去掉。下一次安静复核由 Kin 在十分钟到一天之间自己选择，宿主把它限制在这个范围内。 |
 
+另有一个默认关闭的 `anti_retreat`：在 `expression_intent` 那一段后面补上遇到真实冲突、被推开或对关系不确定时的姿态——留在场，说出自己的理解和立场，不条件反射地先道歉，不流程化安抚，不默默退场，按字面尊重对方说出口的边界；玩闹撒娇、假装生气、普通低落和只回一个短词都不算（见 [operations](operations.md#companion-continuity)）。
+
 另有一个默认关闭的 `legacy_drive_thresholds`，用于恢复固定的 75 分联系与探索门槛，且只在 `semantic_actions` 未开启时生效。无论它开或关，已存的阈值都保持为数字。
 
 ## 测什么

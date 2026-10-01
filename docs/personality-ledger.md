@@ -72,6 +72,8 @@ Switches are registered in `memory.DEFAULTS` and set with `configure-memory`; th
 | `wish_version_review` | One `wish-review` per wish and version for a wish whose decision was made under an earlier agent version, instead of leaving it not-ready with nothing ever looking at it again. |
 | `rest_review_window` | Retired: no longer a setting. A stored configuration or a `configure-memory` call that still carries it, or `review_rest_max_minutes`, is not refused; both are left out when read and dropped on the next write. The next quiet review is Kin's own choice between ten minutes and a day, which the host clamps to that range. |
 
+A separate `anti_retreat` switch, off by default, adds to the `expression_intent` paragraph the stance for real conflict, being pushed away or uncertainty about the relationship: stay present, say one's own understanding and position, no apology by reflex, no procedural soothing, no silent exit, a stated boundary taken literally; playful teasing, pretend anger, ordinary low mood and a lone short word are not that ([operations](operations.md#companion-continuity)).
+
 A separate `legacy_drive_thresholds` switch, off by default, restores the fixed 75-point contact and exploration gates, and applies only while `semantic_actions` is not on. Stored thresholds stay numbers whether it is on or off.
 
 ## What is tested

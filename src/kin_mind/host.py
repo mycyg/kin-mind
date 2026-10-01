@@ -210,7 +210,18 @@ def _dispatch(config, action, request):
         # attempt a new one, and the answer names the attempt it belongs to (CR-RT-08).
         if request.get("snapshotId") not in (None, session_context["id"]):
             return {"state": "stale", "snapshotId": session_context["id"], "requestId": request.get("id")}
-        return jobs.enqueue_maintenance(session_context["id"], config["agent_version"], request_id=request.get("id"))
+        queued = jobs.enqueue_maintenance(session_context["id"], config["agent_version"], request_id=request.get("id"))
+        # 这一段的我们 (`window_notes`, default off): a review at elevated pressure also queues the
+        # note of this stretch, one row, for the enrichment lane to write. It never holds up the
+        # review it rides on, and the answer stays the review's own.
+        try:
+            from .window_notes import observe as note_this_stretch
+            note_this_stretch(mind, session_context)
+        except Exception as error:  # noqa: BLE001 - the review stands; the failure is counted
+            with engine.db.connect(write=True) as conn:
+                conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('window_note_queue_failed',1,?,?)",
+                             (mind.clock(), json.dumps({"error": type(error).__name__})))
+        return queued
     if action == "configure-habits":
         return memory.habits.update(request)
     if action == "reply-choice":
@@ -307,6 +318,11 @@ def _dispatch(config, action, request):
         retried = archive_memory.retry_failed(mind) if request.get("retry_failed") else 0
         return {**archive_memory.run(mind, DeepSeek.from_engine(engine), limit=request.get("limit", archive_memory.BATCH)),
                 **({"retried": retried} if retried else {})}
+    if action == "window-notes":
+        # Operator action. Without `--apply` it only reads the queue's counts and failure codes;
+        # `--apply` writes the newest due note now, one paid DeepSeek call at most.
+        from . import window_notes
+        return window_notes.run(mind, DeepSeek.from_engine(engine)) if request.get("apply") else window_notes.status(mind)
     if action == "configure-memory":
         return memory.configure(request)
     if action == "runtime-event":
@@ -459,6 +475,11 @@ def _dispatch(config, action, request):
         if config.get("review_paused") or not memory.settings()["operational_lanes"]:
             return {"state": "paused"}
         if not request.get("job_id"):
+            # And the note of a window's stretch (window_notes, off by default), first: the next
+            # checkpoint carries it only once it is written.
+            from . import window_notes
+            if window_notes.due(mind):
+                return window_notes.run(mind, DeepSeek.from_engine(engine))
             # The background lane also writes the memories of archived records (archive_memory):
             # when it has no job of its own to run, or when they have waited an hour for it.
             from . import archive_memory
@@ -543,7 +564,8 @@ def _dispatch(config, action, request):
         if not due["enrichment"] and memory.settings()["operational_lanes"]:
             # The memories of archived records are the background lane's work too (archive_memory).
             from .archive_memory import due as memories_due
-            due["enrichment"] = memories_due(mind) > 0
+            from .window_notes import due as notes_due
+            due["enrichment"] = memories_due(mind) > 0 or notes_due(mind) > 0
         # The day's review has a gate of its own now: the host starts it only when there is something
         # to merge or evaluate, never to be told again that it is still waiting.
         return {"state": "due" if any(due.values()) else "idle", **due, "daily": DailyReview(mind).due()}
@@ -684,7 +706,7 @@ MIGRATION_ACTION = "migrate-evidence-isolation"
 APPLY_ACTIONS = (MIGRATION_ACTION, "evidence-keys-backfill", "desire-archive", "desire-unarchive",
                  "maintenance-tick", "vector-optimize", "history-compact", "history-restore", "appraisal-triage",
                  "exploration-decision-archive", "exploration-decision-unarchive",
-                 "archive-memory", "archive-memory-backfill", "slim-evidence-refs")
+                 "archive-memory", "archive-memory-backfill", "slim-evidence-refs", "window-notes")
 # The operator actions `--undo` is read for.
 UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 

@@ -261,6 +261,30 @@ codes of the latest failures. `archive-memory-backfill` counts what was archived
 no memory yet, and the calls that would take (`model_calls`, one per 20); with `--apply` it queues
 them, once. `archive-memory --apply` runs one batch now, one paid call at most; the lane runs the rest.
 
+## Companion continuity
+
+Four `configure-memory` switches from the owner's request of 2026-10-01 (after the Serein study),
+all off by default and each read as an explicit `true`. Off, each one is the previous behaviour byte
+for byte: the same appraisal schema and prompt, the same checkpoint, the same concern selection.
+
+| Switch | What it turns on |
+| --- | --- |
+| `checkpoint_texture` | The sourced summary of a checkpoint's older dialogue keeps, beside the facts, how the two address each other, running jokes, the tone and the emotional arc of the stretch (`session_checkpoint.TEXTURE_INSTRUCTION`). A changed instruction is a changed summary: cached ones are not reused across it. |
+| `window_notes` | 这一段的我们 (`kin_mind.window_notes`): a session review at elevated or critical pressure (the review at 65% of the window) queues one note per stretch -- per conversation, generation and last completed compaction -- in `mind_window_notes`. The enrichment lane writes it first when one is due: one DeepSeek call (`submit_window_note`) shown only the stretch's public dialogue (role, words, time), answered in four parts -- 你, 我, 这一段, 没聊完的 -- and stored as a derived source in `kin-window-note`, resting on those turns. The origin table files that namespace as host maintenance: never evidence, never recalled, never indexed, so no trait or plan can rest on it. The next checkpoint of the conversation carries the newest note as plain text (`windowNote`, with `windowNoteSource`) when the payload still fits -- the allowance may grow for it as for the recent dialogue, never past the ceiling -- and leaves it out otherwise (`windowNoteOmitted`); it never makes a checkpoint incomplete. An erase of a turn takes the note with it, and `session-validate` refuses a checkpoint whose carried note is gone. Nothing changes a persona text, an identity description or the state. |
+| `timed_concerns` | "下次聊到时记得问": the appraisal is offered `surface_after` / `surface_until` on a concern (Asia/Singapore when no zone is given; an update that only moves the window needs no new source). A concern entering its window -- past `surface_after`, not past `surface_until` -- is selected first until a context delivery accepted into a native window since the window opened names it (`mind_context_deliveries`); then it is back in its ordinary place. It sends nothing and is not a contact. The host's `manage_concern` change is unchanged. |
+| `anti_retreat` | The expression intent's paragraph gains the stance for real conflict, being pushed away and uncertainty about the relationship -- stay present, say one's own understanding and position, no apology by reflex, no procedural soothing, no silent exit, and a stated boundary taken literally -- with its exclusions: playful teasing, pretend anger, ordinary low mood asking for comfort, a lone short word (`appraisal.ANTI_RETREAT_PROMPT`). It needs `expression_intent`; no new call and no new field. |
+
+```sh
+python -m kin_mind.host --config PRIVATE_CONFIG window-notes
+python -m kin_mind.host --config PRIVATE_CONFIG window-notes --apply
+```
+
+`window-notes` without `--apply` gives the queue's counts by state and the codes of the latest
+failures; `--apply` writes the newest due note now, one paid call at most. A failed call goes back
+with a backoff (5 minutes, doubling, at most 6 hours) and after 4 attempts the note is `failed`; a
+stretch with no public dialogue is `withheld`, and an older note still waiting when a newer stretch is
+written is `superseded`, never sent. The lane needs `operational_lanes`.
+
 ## Exploration decision archive
 
 Every exploration result Kin decided on keeps its sharing decision in the state document, with a

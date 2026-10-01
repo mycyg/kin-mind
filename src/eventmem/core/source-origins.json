@@ -56,6 +56,7 @@
     "mind-internal-event": "host_maintenance",
     "mind-internal-event:*": "host_maintenance",
     "kin.desktop_receipts": "host_maintenance",
+    "kin-window-note": "host_maintenance",
     "role-configuration": "configuration",
     "role-configuration:*": "configuration",
     "persona-configuration": "configuration",
