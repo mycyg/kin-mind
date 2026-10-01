@@ -76,7 +76,7 @@ or cleared only
 - by the main session's tool `set_memory_quiet` (description `recall_admission.QUIET_TOOL_DESCRIPTION`),
   which needs 小光's own current message as `evidence_ids` -- checked as a conversation habit's
   evidence is (`evidence_classes.owner_statement`, fresh) -- and a reason; idempotent by `command_id`;
-- or by her in the console (`POST /v1/recall/quiet`).
+- or by 小光 in the console (`POST /v1/recall/quiet`).
 
 Both refuse while the setting is off. The host offers the tool only once its name is in
 `chat-permissions.json`.

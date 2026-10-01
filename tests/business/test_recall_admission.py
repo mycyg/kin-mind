@@ -396,7 +396,7 @@ def test_the_main_session_sets_a_mark_only_on_her_own_current_word(system):
     mind, memory, source, service, sources, records = system
     memory.configure({"recall_quiet_marks": True})
     marks = QuietMarks(mind)
-    request = {"command_id": "q1", "item_id": records["cat"], "quiet": True, "reason": "她说以后别主动提"}
+    request = {"command_id": "q1", "item_id": records["cat"], "quiet": True, "reason": "小光说以后别主动提"}
     with pytest.raises(ValueError):
         marks.change(request, actor="owner")
     with pytest.raises(Conflict):

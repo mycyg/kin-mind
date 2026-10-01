@@ -30,7 +30,7 @@ and timings -- ids and numbers, never text, never the query, never a source's me
 newest `VECTORS_KEPT` per scope, and an erase deletes every one kept for an item it reached.
 
 **Marks.** `mind_recall_quiet` holds the items 小光 asked Kin not to bring up on its own: set through
-the main session's tool with her own message as evidence, or by her in the console. With
+the main session's tool with 小光's own message as evidence, or by 小光 in the console. With
 `recall_quiet_marks` on, an automatic context skips them (and, for a graph node, the records it
 holds); explicit reads still return them. A mark goes with its item when the item is erased.
 """
@@ -78,9 +78,9 @@ ADMISSION_MORE_NOTE = "本轮未能按相关性筛选旧记忆，因此没有自
 # Model-facing (NEEDS 小光 OK): the main session's tool for a quiet mark (kin_mind.mcp). The host offers
 # it only once `set_memory_quiet` is in its chat-permissions.json.
 QUIET_TOOL_DESCRIPTION = (
-    "小光明确说某件旧事以后不要主动提起时使用，也可以按她的话撤回。需要 command_id、item_id（记录或图谱节点编号）、"
-    "quiet（true 为不主动提起，false 为撤回）、evidence_ids（她说这句话的消息编号）和 reason。"
-    "设置后自动带入的背景资料不再包含这一项；她问起或你主动查询时照常可以读取。")
+    "小光明确说某件旧事以后不要主动提起时使用，也可以按小光的话撤回。需要 command_id、item_id（记录或图谱节点编号）、"
+    "quiet（true 为不主动提起，false 为撤回）、evidence_ids（小光说这句话的消息编号）和 reason。"
+    "设置后自动带入的背景资料不再包含这一项；小光问起或你主动查询时照常可以读取。")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_recall_observations(
