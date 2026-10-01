@@ -143,11 +143,19 @@ def test_each_message_moves_the_wait_and_a_historical_event_does_not(setup):
     assessed(jobs, first)
     [(job_id, (_, available, _))] = enrichments(mind).items()
     assert jobs.runnable("enrichment"), "forty-five minutes of quiet"
+    backoff = time.time() + 86400
+    with mind.engine.db.connect(write=True) as conn:
+        # A job of its own time -- one waiting out a failure, or made with the setting off -- is not moved.
+        conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                     ("enrich_other", mind.scope.key(), "pending", backoff, json.dumps({"evidence_ids": [first], "stimulus": "memory-enrichment"})))
     said(memory, clock, "owner-2", "要不要一起", 5)
+    assert enrichments(mind)["enrich_other"][1] == backoff
     assert enrichments(mind)[job_id][1] > time.time() and not jobs.runnable("enrichment"), "the conversation moved on"
     moved = enrichments(mind)[job_id][1]
     memory.ingest({"id": "old-1", "kind": "owner-message", "at": at(clock, 1), "text": "以前说过的话", "historical": True})
     assert enrichments(mind)[job_id][1] == moved, "history replayed is not conversation"
+    said(memory, clock, "owner-late", "这句晚到了", 6)
+    assert enrichments(mind)[job_id][1] == moved, "a late message moves nothing; the latest is still the latest, history aside"
 
 
 def test_an_ordinary_reply_does_not_keep_the_conversation_open(setup):

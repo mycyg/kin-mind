@@ -183,14 +183,23 @@ def test_the_prompt_says_what_they_are_only_when_there_are_some(stimulus):
     assert shown == plain + DEFERRED_ROUTES_PROMPT
 
 
-def test_an_enrichment_shown_a_deferral_can_place_it(setup):
-    """Through the queue: the enrichment's model is shown the deferral and its event, places the
-    member as a new event citing the shown record, and the commit settles it. One it leaves alone
-    is counted as looked at."""
-    mind, source, clock = setup
-    memory = lifecycle(mind, deferred_routes=True, operational_lanes=True)
+def days_ago(memory, source, clock, days=4):
+    """The event and the deferred message, from days ago: older than the graph's recent window, so
+    only the deferral brings either of them before the model."""
+    clock[0] -= timedelta(days=days)
     event = trip(memory, source)
     later = unverified_append(memory, source, event, "wind", "日出的时候风好大")
+    clock[0] += timedelta(days=days)
+    return event, later
+
+
+def test_an_enrichment_shown_a_deferral_can_place_it(setup):
+    """Through the queue: the enrichment's model is shown the deferral and its event, places the
+    member as a new event citing the shown record, and the commit settles it. The material is days
+    old: nothing but the deferral shows it, and nothing but the deferral lets the route cite it."""
+    mind, source, clock = setup
+    memory = lifecycle(mind, deferred_routes=True, operational_lanes=True)
+    event, later = days_ago(memory, source, clock)
     [kept] = deferrals(mind)
     seen = []
 
@@ -249,3 +258,21 @@ def test_a_frozen_context_keeps_no_words_of_an_erased_deferral(setup):
         if jobs.run_one(Again(), lane="enrichment")["state"] == "complete":
             break
     assert MARKER not in "".join(shown[1:]) and json.loads(shown[-1]) == []
+
+
+def test_an_enrichment_that_leaves_it_alone_counts_one_look(setup):
+    mind, source, clock = setup
+    memory = lifecycle(mind, deferred_routes=True, operational_lanes=True)
+    days_ago(memory, source, clock)
+
+    class Elsewhere:
+        def appraise(self, context):
+            assert context["memory_context"]["pending_deferrals"]
+            paid(self)
+            return answered(Appraisal(reason="今天的事"))
+
+    jobs = Appraisals(mind)
+    jobs.enqueue([source("today", "今天天气不错")], "synthetic-v1", origin="reflection", stimulus="memory-backfill")
+    assert jobs.run_one(Elsewhere(), lane="enrichment")["state"] == "complete"
+    [kept] = deferrals(mind)
+    assert kept["attempts"] == 1 and kept["next_at"] > clock[0].isoformat()
