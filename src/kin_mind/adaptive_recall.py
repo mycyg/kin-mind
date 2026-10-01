@@ -165,9 +165,14 @@ class AdaptiveRecall:
             min(30, deadline - time.monotonic()))
 
     def collect(self, query, *, mode="auto", history=False, provider=None, allow_model=False, deadline=None,
-                recall_purpose="experience_recall", policy=None, owner_words=(), record=True):
+                recall_purpose="experience_recall", policy=None, owner_words=(), record=True, admission=False):
         """`allow_model` is for the paid ranking; `record=False` is a look, which asks no model at
-        all — not even for the query's embedding — and writes nothing, in any thread (CR3-MM-04)."""
+        all — not even for the query's embedding — and writes nothing, in any thread (CR3-MM-04).
+
+        `admission`: the automatic context asks what the ranking admitted (recall_admission). The
+        candidates returned are the same either way; `info["admission"]` then names the last answered
+        ranking's selection in its order (`selected`), or no selection at all when no ranking
+        answered (`state: unavailable`), beside the pinned and constraint ids and the notes' sources."""
         from eventmem.core.db import recording
 
         started = time.monotonic()
@@ -190,6 +195,9 @@ class AdaptiveRecall:
         info = {"mode_used": mode_used, "degraded_reasons": [], "pending_ids": [],
                 "expanded_ids": [], "rounds": 0, "model_requests": 0, "evidence_versions": {}}
         pool, scores, pinned, model_protected = {}, defaultdict(float), set(), set()
+        # For the admission only: what passes without a score, what coverage asks of a note, and the
+        # selection of the last ranking that answered.
+        constraint_ids, note_facts, answered = set(), {}, None
         date_match = re.search(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日", query)
         date_bounds = None
         if date_match:
@@ -224,6 +232,13 @@ class AdaptiveRecall:
             scores[item["id"]] += score
             if relevant_protection(record, query):
                 pinned.add(item["id"])
+            if admission:
+                from .recall_admission import note_facts as facts_of
+                if (record.get("attributes") or {}).get("constraint"):
+                    constraint_ids.add(item["id"])
+                found = facts_of(record)
+                if found:
+                    note_facts[item["id"]] = found
 
         def add_graph(node, edges, score):
             if policy.envelope(node.get("text", "")):
@@ -469,6 +484,8 @@ class AdaptiveRecall:
                 if set(ranking.ids) - allowed or set(ranking.protected_ids) - allowed or len(set(ranking.ids)) != len(ranking.ids) or any(f.candidate_id not in allowed for f in ranking.followups):
                     raise Conflict("Reranker returned unknown or repeated identifiers")
                 model_protected = {key_to_id[k] for k in ranking.protected_ids}
+                answered = list(dict.fromkeys([*[key_to_id[k] for k in ranking.protected_ids],
+                                               *[key_to_id[k] for k in ranking.ids]]))
                 ranked_ids = list(dict.fromkeys([*[i for i in ordered if i in pinned],
                                                 *[key_to_id[k] for k in ranking.protected_ids],
                                                 *[key_to_id[k] for k in ranking.ids], *ordered]))
@@ -527,6 +544,16 @@ class AdaptiveRecall:
         info["evidence_versions"] = {i["id"]: i["revision"] for i in selected}
         info["candidate_count"] = len(selected)
         info["candidate_ids"] = [i["id"] for i in selected]
+        if admission:
+            kept = [i["id"] for i in selected]
+            reasons = [r for r in info["degraded_reasons"] if r.startswith(("rerank:", "session-required"))]
+            info["admission"] = {
+                "state": "ranked" if answered is not None else "unavailable",
+                "reason": None if answered is not None else (reasons[0] if reasons else "model-not-asked"),
+                "selected": [i for i in answered if i in kept] if answered is not None else None,
+                "pinned": [i for i in kept if i in pinned],
+                "constraints": [i for i in kept if i in constraint_ids],
+                "notes": {i: note_facts[i] for i in kept if i in note_facts}}
         info["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
         info["degraded_reasons"] = list(dict.fromkeys(info["degraded_reasons"]))
         # A receipt whose provider reported no usage counts as unreported, not as zero

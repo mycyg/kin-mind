@@ -325,6 +325,11 @@ def _dispatch(config, action, request):
         return window_notes.run(mind, DeepSeek.from_engine(engine)) if request.get("apply") else window_notes.status(mind)
     if action == "configure-memory":
         return memory.configure(request)
+    if action == "recall-admission-calibrate":
+        # Operator action, read only: the kept admission observations replayed under other
+        # thresholds (`thresholds`, `quota`), as numbers. No text, no query, no title.
+        from .recall_admission import calibrate
+        return calibrate(mind, thresholds=request.get("thresholds"), quota=request.get("quota"))
     if action == "runtime-event":
         result = memory.ingest(request)
         if result.get("source_id") and memory.settings()["semantic"] and not request.get("historical"):
@@ -342,6 +347,8 @@ def _dispatch(config, action, request):
             request["native_pressure_managed"] = True
         if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
             request['receipt_mode'] = True
+        # The host's own injection: the one build relevance admission and quiet marks apply to.
+        request['automatic'] = True
         return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))

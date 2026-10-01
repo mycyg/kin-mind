@@ -183,6 +183,13 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # What the owner is called, for the recall lane that looks for their own words. Empty
             # by default: with none configured that lane uses generic first/second-person words.
             "recall_owner_aliases": [],
+            # Relevance admission for the automatic context (recall_admission.py), off by default:
+            # "shadow" decides and records without changing what is injected, "on" injects only what
+            # scored at the threshold, at most `quota` items. `recall_quiet_marks` makes an automatic
+            # context skip what 小光 marked "不主动提起"; `context_usage_hint` adds the usage sentence to
+            # the automatic context's envelope (context.CONTEXT_USAGE_HINT). Off, each is as before.
+            "recall_admission": "off", "recall_admission_threshold": 0.55, "recall_admission_quota": 4,
+            "recall_admission_timeout_ms": 3000, "recall_quiet_marks": False, "context_usage_hint": False,
             # Charged appraisal attempts before a job is quarantined for repair.
             "max_charged_attempts": 5,
             # The most one DeepSeek appraisal request may hold, in tokens. None: the appraisal's own
@@ -399,6 +406,7 @@ class MemoryContinuity:
                     "exploration_decision_archive", "sealed_entries",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
                     "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat", "dreams", "diary_replies", "anniversaries",
+                    "recall_quiet_marks", "context_usage_hint",
                     *memory_formation.SWITCHES):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
@@ -449,6 +457,8 @@ class MemoryContinuity:
             from .settling import SETTING, SETTLE_RANGE
             if type(config[SETTING]) is not int or not SETTLE_RANGE[0] <= config[SETTING] <= SETTLE_RANGE[1]:
                 raise ValueError(f"Enrichment settling is a whole number of minutes, {SETTLE_RANGE[0]}..{SETTLE_RANGE[1]} (0 is off)")
+            from .recall_admission import settings_valid
+            settings_valid(config)
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
             if values.get("event_lifecycle") is False:
                 conn.execute("DELETE FROM mind_foreground_leases WHERE scope=?", (self.scope.key(),))

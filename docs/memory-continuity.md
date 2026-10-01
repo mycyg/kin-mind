@@ -56,6 +56,8 @@ The tools `read_continuity_context`, `read_work_history` and `read_share_history
 
 Automatic context takes at most three relevant works, five relevant shares and a state view with three concerns, beside host runtime, current intent, habits, graph findings and lexical matches; one page holds at most 16 items within its budget. It does not append complete exploration results to every reply.
 
+With `recall_admission` set, the automatic context before a chat reply or a proactive draft holds its recall items to relevance: a local-embedding score at a threshold, or the deep ranking's selection, at most a quota of them, with no refill and nothing when no score exists; `"shadow"` records the decisions without changing what is injected. `recall_quiet_marks` lets the owner keep an item out of automatic context ("不主动提起"). See [relevance admission](recall-admission.md).
+
 | Context | Default tokens |
 | --- | ---: |
 | First chat addition in a new or compacted window | 2,000 |

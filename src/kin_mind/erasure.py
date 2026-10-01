@@ -107,7 +107,8 @@ SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "min
                      "mind_semantic_cache", "mind_memory_config", "mind_memory_migrations",
                      "mind_context_deliveries", "mind_context_windows",
                      # A deferred event route goes whole with what it names (event_deferrals).
-                     "mind_event_deferrals", "mind_sealed_entries"})
+                     "mind_event_deferrals", "mind_sealed_entries",
+                     "mind_recall_observations"})
 # What was, or was about to be, put into a native window: a delivery (its body `text` and its
 # `items`, which name what they rest on as `id`, `dependencies[].id` and the like) and a window's
 # stored receipts (`text`, `rendered_text`, `index[].id`). Handled by name below (CR-MEM-02).
@@ -117,6 +118,13 @@ CONTEXT_TABLES = ("mind_context_deliveries", "mind_context_windows")
 DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker", "text_hash", "tokens",
                  "content_tokens", "overhead", "manifest_id", "prepared_at", "accepted_at", "native_at",
                  "historical", "needs_review", "evidence", "stale_reason")
+# What relevance admission kept of a build (recall_admission): ids and numbers only, and a row that
+# names anything the erase reached goes whole; so does every item vector kept for anything it reached.
+# A quiet mark on an erased item goes with it; the plain scrub takes the rest of a mark's evidence and
+# reason, as it does any row's.
+RECALL_OBSERVATIONS = "mind_recall_observations"
+RECALL_QUIET = "mind_recall_quiet"
+RECALL_VECTORS = "mind_recall_vectors"
 # Derived caches: a row that names erased material, or a graph item the erase took words from,
 # goes whole. Rebuilding one costs a model call; keeping one keeps the words.
 CACHES = ("mind_context_cache", "mind_semantic_cache")
@@ -658,6 +666,8 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
         counts[table] = _drop_cache(conn, table, None if every else ids | touched, write=write)
     # So does everything rendered for a native window from any of them (CR-MEM-02).
     counts["context_receipts"] = _context_receipts(conn, ids | touched | frozenset(nodes), at, write=write)
+    counts["recall_observations"], counts["recall_quiet"], counts["recall_vectors"] = _recall_rows(
+        conn, ids, ids | touched | frozenset(nodes), write=write)
     # And, where a conversation habit was set from any of them, what a release before this one rendered
     # from the habits: it names nothing they rest on (CL8-MM-01).
     rendered, compressed = _unnamed_habits(conn, _habit_scopes(conn, ids), ids | touched | frozenset(nodes),
@@ -776,6 +786,36 @@ def _context_receipts(conn, doomed, at, *, write=True):
                                  (dumps({**value, "receipts": new}), row["key"]))
                 changed += sum(new[key] is not receipts[key] for key in receipts)
     return changed
+
+
+def _recall_rows(conn, erased, doomed, *, write=True):
+    """The admission observations naming anything the erase reached, the item vectors kept for it, and
+    the quiet marks on what it erased: all go whole. Counts, as (observations, marks, vectors)."""
+    observations = marks = vectors = 0
+    if doomed and _table(conn, RECALL_OBSERVATIONS):
+        rows = [row["key"] for row in mentions(conn, RECALL_OBSERVATIONS, doomed, "rowid AS key")]
+        for key in rows if write else ():
+            conn.execute(f"DELETE FROM {RECALL_OBSERVATIONS} WHERE rowid=?", (key,))
+        observations = len(rows)
+    if erased and _table(conn, RECALL_QUIET):
+        wanted = sorted(erased)
+        for start in range(0, len(wanted), 200):
+            page = wanted[start:start + 200]
+            marks_ = ",".join("?" for _ in page)
+            found = [row[0] for row in conn.execute(f"SELECT rowid FROM {RECALL_QUIET} WHERE item_id IN ({marks_})", page)]
+            for key in found if write else ():
+                conn.execute(f"DELETE FROM {RECALL_QUIET} WHERE rowid=?", (key,))
+            marks += len(found)
+    if doomed and _table(conn, RECALL_VECTORS):
+        wanted = sorted(doomed)
+        for start in range(0, len(wanted), 200):
+            page = wanted[start:start + 200]
+            marks_ = ",".join("?" for _ in page)
+            found = [row[0] for row in conn.execute(f"SELECT rowid FROM {RECALL_VECTORS} WHERE item_id IN ({marks_})", page)]
+            for key in found if write else ():
+                conn.execute(f"DELETE FROM {RECALL_VECTORS} WHERE rowid=?", (key,))
+            vectors += len(found)
+    return observations, marks, vectors
 
 
 def _drop_cache(conn, table, ids, *, write=True):

@@ -442,7 +442,9 @@ GROUPS = {
                 Table("mind_procedures", "id"),
                 Table("mind_procedure_history", "id||'@'||revision",
                       "id IN (SELECT id FROM mind_procedures WHERE scope=:scope)"),
-                Table("mind_trait_observations", "id")),
+                Table("mind_trait_observations", "id"),
+                # A quiet mark's evidence is 小光's own message (recall_admission.QuietMarks).
+                Table("mind_recall_quiet", "item_id")),
 }
 TABLES = {table.name: (group, table) for group, tables in GROUPS.items() for table in tables}
 # One write transaction of the migration: this many rows at most, and about this many characters of
