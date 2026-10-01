@@ -425,16 +425,21 @@ def test_a_shared_moment_comes_back_on_its_anniversary_as_a_fact_only(env):
     for _ in range(4):
         clock[0] += timedelta(days=1)
         seen.append([m["topic"] for m in initiative.facts(mind)["anniversaries_today"]])
-    assert seen == [[], [], [], ["推断的一天"]], "Kin's own thought, a minor day and her own words are no shared moment"
-    # What 小光 asked not to be brought up is left out, at the one place the marker plugs in.
+    assert seen == [[], [], [], ["推断的一天"]], "Kin's own thought, a minor day and Kin's own words are no shared moment"
+    # What 小光 asked not to be brought up ("不主动提起", recall_admission's quiet marks) is left out
+    # while the marks are on; a mark on one of the message's records is enough.
     clock[0] += timedelta(days=89)
     assert initiative.facts(mind)["anniversaries_today"][0]["milestone"] == "100-days"
-    original = initiative.not_raised
-    initiative.not_raised = lambda conn, scope, ids: frozenset(ids) & {said}
-    try:
-        assert initiative.facts(mind)["anniversaries_today"] == []
-    finally:
-        initiative.not_raised = original
+    from kin_mind.recall_admission import QuietMarks
+    memory.configure({"recall_quiet_marks": True})
+    record = mind.engine.source(said)["record_ids"][0]
+    QuietMarks(mind).change({"command_id": "q1", "item_id": record, "quiet": True}, actor="console")
+    assert initiative.facts(mind)["anniversaries_today"] == []
+    memory.configure({"recall_quiet_marks": False})
+    assert initiative.facts(mind)["anniversaries_today"][0]["moment_id"] == said, "off, a mark leaves nothing out"
+    memory.configure({"recall_quiet_marks": True})
+    QuietMarks(mind).change({"command_id": "q2", "item_id": record, "quiet": False}, actor="console")
+    assert initiative.facts(mind)["anniversaries_today"][0]["moment_id"] == said
     # A delete of what the moment rests on takes the moment.
     mind.engine.delete(said)
     assert initiative.facts(mind)["anniversaries_today"] == []

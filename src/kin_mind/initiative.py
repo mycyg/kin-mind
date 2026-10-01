@@ -180,10 +180,24 @@ def milestone(moment, today):
     return None
 
 
-def not_raised(conn, scope, ids):
-    """Of `ids`, the ones 小光 asked not to be brought up. The marker is recall's ("不主动提起",
-    ws4-recall), not in this base yet, so nothing is left out here; it plugs in at this one place."""
-    return frozenset()
+def not_raised(conn, mind, ids):
+    """Of `ids` (a moment's message and the sources it was understood from), the ones 小光 asked Kin
+    not to bring up on its own ("不主动提起", recall_admission's quiet marks, while
+    `recall_quiet_marks` is on): an id marked itself, or a source with a record that is marked or held
+    by a marked graph node. Off, or with nothing marked, nothing is left out."""
+    from .recall_admission import QuietMarks, stored_settings
+    if not stored_settings(conn, mind.scope)["recall_quiet_marks"]:
+        return frozenset()
+    quiet = QuietMarks(mind).active(conn)
+    if not quiet:
+        return frozenset()
+    found = set()
+    for identifier in ids:
+        if identifier in quiet or any(row[0] in quiet for row in conn.execute(
+                "SELECT e.record_id FROM evidence e JOIN records r ON r.id=e.record_id "
+                "WHERE e.source_id=? AND r.deleted=0", (identifier,))):
+            found.add(identifier)
+    return frozenset(found)
 
 
 def _owner_message(ref):
@@ -234,7 +248,7 @@ def anniversaries_today(conn, mind, at):
     found = []
     for moment in moments(conn, mind):
         reached = milestone(date.fromisoformat(moment["date"]), today)
-        if reached and not not_raised(conn, mind.scope.key(), {moment["moment_id"], *moment["cited"]}):
+        if reached and not not_raised(conn, mind, {moment["moment_id"], *moment["cited"]}):
             found.append({"moment_id": moment["moment_id"], "date": moment["date"], "milestone": reached,
                           "topic": moment["topic"]})
     return found[:ANNIVERSARIES_SHOWN]
