@@ -63,6 +63,7 @@ REGISTRY = {
     "Referenced graph identity changed during evaluation": ("runtime", "graph-node-changed", "reuse"),
     "Event identity evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
     "Topic candidate evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
+    "Deferred event evidence changed during preparation": ("runtime", "context-changed-in-preparation", "reuse"),
     # An audited section whose module is not installed: refused alone, recorded, never asked again.
     "No module has claimed this section yet": ("semantic", "section-unavailable", "section"),
     # --- state.py: evidence, mind revision, policy authority, desires ---
@@ -163,6 +164,7 @@ REGISTRY = {
     "Concern belongs to another scope or is missing": ("semantic", "reference-cross-scope", "section"),
     "A closed concern requires an explicit reopen with new evidence": ("semantic", "concern-closed", "section"),
     "Only a closed concern can reopen": ("semantic", "concern-not-closed", "section"),
+    "A concern's window opens before it closes": ("semantic", "concern-window-inverted", "section"),
     "Resolution requires a new outcome or correction source": ("semantic", "resolution-needs-new-evidence", "section"),
     "Owner participation needs a new explicit owner response": ("semantic", "insufficient-authority", "section"),
     "Explicit interpretation requires an explicit source": ("semantic", "insufficient-authority", "section"),
