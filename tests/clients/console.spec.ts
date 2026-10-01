@@ -340,6 +340,9 @@ test('a letter to Kin is sealed until its day: only its date shows, and it can b
   await rows.first().getByRole('button',{name:'永久删除…',exact:true}).click();
   await rows.first().getByRole('button',{name:'确认永久删除',exact:true}).click();
   await expect(rows).toHaveCount(before);
+  expect(errors).toEqual([]);
+});
+
 test('Kin\'s own diary entries are read in their group, with no reply box while replies are off',async({page})=>{
   // Kin's entries are kin-reflection sources whose records are episodes: the narrative list never held one.
   const headers={Authorization:'Bearer test-console-local'};
