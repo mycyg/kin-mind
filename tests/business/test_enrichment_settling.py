@@ -12,6 +12,8 @@ import json
 import time
 from datetime import timedelta
 
+import pytest
+
 from eventmem.core.models import RecallRequest
 
 from kin_mind import settling
@@ -262,3 +264,25 @@ def test_the_setting_is_a_whole_number_of_minutes(setup):
             memory.configure({"enrichment_settle_minutes": wrong})
     assert memory.configure({"enrichment_settle_minutes": 20})["enrichment_settle_minutes"] == 20
     assert memory.configure({"enrichment_settle_minutes": 0})["enrichment_settle_minutes"] == 0
+
+
+@pytest.mark.parametrize("follow_up", ["first", "second"])
+def test_a_disposition_follow_up_neither_takes_others_in_nor_is_taken_in(setup, follow_up):
+    """A follow-up for sources a commit left without a disposition (memory_formation) asks once and
+    only about them: claimed first it takes no batch, and a job claimed before it leaves it alone."""
+    mind, source, clock = setup
+    memory = configured(mind, enrichment_settle_minutes=20)
+    jobs = Appraisals(mind)
+    first = said(memory, clock, "owner-1", "今天想去海边", 50)
+    assessed(jobs, first)
+    second = said(memory, clock, "owner-2", "还是改天吧，下雨了", 40)
+    assessed(jobs, second)
+    rows = sorted(enrichments(mind).items(), key=lambda item: (item[1][1], item[0]))
+    marked = rows[0][0] if follow_up == "first" else rows[1][0]
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_appraisals SET data=json_set(data,'$.coverage_of','job-before') WHERE id=?", (marked,))
+    organizer = Organizer()
+    assert jobs.run_one(organizer, lane="enrichment")["state"] == "complete"
+    assert jobs.run_one(organizer, lane="enrichment")["state"] == "complete"
+    assert sorted(map(sorted, organizer.requests)) == sorted([[first], [second]])
+    assert not any(data.get("batch_ids") for _, _, data in enrichments(mind).values())

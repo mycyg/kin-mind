@@ -2446,16 +2446,19 @@ class Appraisals:
         evidence the union of theirs within `settling.MERGE_IDS` sources and half the input budget
         (settling). In the claim's transaction. A row that takes others in no longer uses the memory
         its parent proposed for part of it; a row already carrying a batch, given back by a split,
-        or keeping a proposal of its own for reuse takes nothing in."""
+        or keeping a proposal of its own for reuse takes nothing in. Nor does a follow-up for sources a
+        commit left without a disposition (memory_formation), and none is taken in: it asks once, only
+        about those sources, and a batch would either drop that or bring others under it."""
         data.pop("settle", None)
-        if data.get("batch_ids") or data.get("solo") or data.get("reuse"):
+        if data.get("batch_ids") or data.get("solo") or data.get("reuse") or data.get(memory_formation.COVERAGE_OF):
             return []
         own = {"evidence_ids": list(data["evidence_ids"]), "stimulus": settling.STIMULUS}
         budget = appraisal_input_budget(settings.get("appraisal_input_budget")) // settling.MERGE_BUDGET_SHARE
         ids, batch_ids, cache = list(own["evidence_ids"]), [], {}
         for child in conn.execute(
                 "SELECT id FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? "
-                "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.solo') IS NULL ORDER BY available,id LIMIT ?",
+                "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.solo') IS NULL "
+                "AND json_extract(data,'$.coverage_of') IS NULL ORDER BY available,id LIMIT ?",
                 (self.mind.scope.key(), time.time(), row["id"], settling.STIMULUS, settling.MERGE_CANDIDATES)).fetchall():
             # A child that carries a batch of its own brings its whole subtree, as the action lane's does.
             members, member_evidence = self._batch_members(conn, [child["id"]])
