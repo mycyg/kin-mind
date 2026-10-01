@@ -41,11 +41,17 @@ function failure(record={},fallback={}) {
 /** The owner's rules that hold one contact after another (owner-activity's evaluateContactPolicy):
  * they wait for a reply or keep the minimum gap before the NEXT contact. */
 const BETWEEN_CONTACTS=new Set(['waiting-for-reply','recent-conversation']);
-/** Single-session host orchestration. Each dependency is owner-bound by the adapter. */
+/** Single-session host orchestration. Each dependency is owner-bound by the adapter.
+ *
+ * `holdDraft`, when a host gives one, is asked right before a new attempt is claimed: what it answers
+ * (an object: why, until when) holds the new draft and the tick waits with reason `contact-paused`
+ * (the host's contact pause: the same technical failure again and again, 2026-09-28). It holds new
+ * drafts only -- an attempt under way, one resumed and a send of unknown outcome go on -- and sends
+ * nothing. One that cannot answer holds nothing. */
 export class MindLoop {
   constructor({call, eligibility, ownerEpoch, isBusy, draft, send, resume, recordStatus, stopExploration,
-    withHostContext=(_context,run)=>run()}) {
-    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,resume,recordStatus,stopExploration,withHostContext});
+    withHostContext=(_context,run)=>run(), holdDraft=null}) {
+    Object.assign(this,{call,eligibility,ownerEpoch,isBusy,draft,send,resume,recordStatus,stopExploration,withHostContext,holdDraft});
     this.closed=false; this.contactRunning=false; this.reviewRunning=false;
   }
   start() {
@@ -142,6 +148,9 @@ export class MindLoop {
       if(!candidate.eligible)return candidate;
       const epoch=this.ownerEpoch();
       if(this.closed||this.isBusy()||!this.eligibility().eligible)return {state:'waiting'};
+      let pause=null;
+      try{pause=await this.holdDraft?.();}catch{pause=null;}
+      if(pause&&typeof pause==='object')return {state:'waiting',reason:'contact-paused',pause};
       attempt=await this.call('claim',{owner_epoch:epoch});
       if(attempt.state!=='drafting')return attempt;
       let decision;
