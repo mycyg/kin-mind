@@ -781,6 +781,16 @@ HISTORY_SYSTEM = """你是 Kin 的历史记忆整理器。只调用 submit_appra
 
 HISTORY_SYSTEM += PREVIOUS_ATTEMPT_PROMPT
 
+# Added to either prompt only when the memory context carries deferred routes (`deferred_routes`,
+# kin_mind.event_deferrals); without them the prompt is exactly what it was. NEEDS 小光 OK.
+DEFERRED_ROUTES_PROMPT = (
+    "\nmemory_context.pending_deferrals 是之前暂缓、还没确定归属的事件材料，每项最多再请你看两次。"
+    "reason 为 binding-unverified 表示上次的延续判断没有通过宿主核验，target-missing 表示上次指向的事件已不可用，"
+    "assessment-deferred 表示上次是你自己选择暂缓。结合本轮材料重新判断：确认是同一件事，用 memory.event_routes 的 append 或 correct，"
+    "仍要从该项 members 的原文给出 quote 和 identity 判断，event_id 与 expected_revision 见 graph_candidates；"
+    "是一段新的经历就 create；只是相关就 link。member_ids 用该项的 member_ids，evidence_ids 引用该项 members 的 id。"
+    "仍不确定就不处理，不为结清而强行归并。")
+
 
 def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=()):
     """`sections`: the audited sections this request offers. A section left out takes its property
@@ -1686,7 +1696,8 @@ class DeepSeek:
                 + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + "".join("\n" + SECTION_PROMPTS[name] for name in self._sections(context))
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
-                + (RECALL_PROMPT if self._recall_scope(context) else ""))
+                + (RECALL_PROMPT if self._recall_scope(context) else "")
+                + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else ""))
 
     def request_profile(self, context):
         """Digests of what frames an appraisal request besides its context: the input manifest keeps
@@ -2603,6 +2614,9 @@ class Appraisals:
                             node["needs_review"] = not self.memory.graph.fresh(conn, node)
                             if node["kind"] in {"finding", "exploration", "work"}:
                                 node["share_coverage"] = self.memory.sharing.coverage(conn, node["id"])
+                        # The events the deferred routes name stay, as the memory context showed them (event_deferrals).
+                        named = {d["event_id"] for d in memory_context.get("pending_deferrals", []) if d.get("event_id")} - {n["id"] for n in graph}
+                        graph.extend(n for n in memory_context["graph_candidates"] if n["id"] in named)
                         memory_context["graph_candidates"] = graph
                 if memory_context and data.get("stimulus") == FOLLOW_UP and not data.get("frozen_memory_context"):
                     # A follow-up restates refused sections only. Events still pending need a full appraisal,
@@ -2755,6 +2769,14 @@ class Appraisals:
                             for ref in self.mind._evidence(conn, [record["id"]]):
                                 if ref["revision"] != record["revision"]:
                                     raise Conflict("Topic candidate evidence changed during preparation", target=record["id"],
+                                                   expected=record["revision"], actual=ref["revision"])
+                                semantic_refs[ref["record_id"]] = ref
+                    for deferral in (memory_context or {}).get("pending_deferrals", []):
+                        # A deferred route's members, as shown, may be placed by this assessment (event_deferrals).
+                        for record in deferral["members"]:
+                            for ref in self.mind._evidence(conn, [record["id"]]):
+                                if ref["revision"] != record["revision"]:
+                                    raise Conflict("Deferred event evidence changed during preparation", target=record["id"],
                                                    expected=record["revision"], actual=ref["revision"])
                                 semantic_refs[ref["record_id"]] = ref
                     for plan in model_context.get("autonomy_context", {}).get("plans", {}).get("plans", []):
@@ -3328,7 +3350,8 @@ class Appraisals:
                         # records and affect can commit without redoing the call.
                         disclosures = [d for d in proposal.memory.disclosures if d.share_id in memory_revisions and self.memory._get(conn, d.share_id)["revision"] == memory_revisions[d.share_id]]
                         dropped = self.memory.apply_assessment(conn, proposal.memory.model_copy(update={"disclosures": disclosures}), list(semantic_refs.values()), eid,
-                            memory_context["through_seq"], proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots, max_minutes=review_max)
+                            memory_context["through_seq"], proposal.next_review_minutes, receipt, schedule=not historical, processed_refs=roots, max_minutes=review_max,
+                            deferrals_shown=[d["id"] for d in memory_context["pending_deferrals"]] if "pending_deferrals" in memory_context else None)
                         if dropped:
                             # Memory items the host dropped one by one (memory_items): recorded beside the refused sections.
                             rejected.extend(dropped)

@@ -243,6 +243,9 @@ class EventLifecycle:
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
         results, aliases = [], aliases or {}
         fingerprints = optimized(conn, self.scope.key(), "idempotency_fingerprint")
+        from . import event_deferrals
+        # Deferred routes come back (event_deferrals); off, nothing below writes a deferral.
+        deferrals = event_deferrals.enabled(conn, self.scope.key())
         if len({r.key for r in routes}) != len(routes):
             raise Conflict("Event route keys must be unique")
         for key, route in zip(positions("event_routes", routes), routes):
@@ -351,6 +354,9 @@ class EventLifecycle:
                 # What a replay of this route reads back is what it answers now.
                 result = evidence_refs.as_stored(conn, self.scope.key(), "mind_event_routes", result)
                 conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
+                if deferrals:
+                    event_deferrals.after_route(conn, self.scope.key(), route, action, target, members, evidence,
+                                                appraisal_id, command_id, self.mind.clock())
                 record(conn, stamp, command_id, self.mind.clock())
                 results.append(result)
         return results

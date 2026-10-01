@@ -161,7 +161,10 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "max_charged_attempts": 5,
             # The most one DeepSeek appraisal request may hold, in tokens. None: the appraisal's own
             # cap (kin_mind.appraisal.APPRAISAL_INPUT_CAP), within the model's catalog window.
-            "appraisal_input_budget": None}
+            "appraisal_input_budget": None,
+            # Off by default. On, a route deferred for want of a verified binding, or by the
+            # assessment, is shown to later memory assessments until placed or let go (event_deferrals).
+            "deferred_routes": False}
 
 
 class MemoryNote(Model):
@@ -347,7 +350,7 @@ class MemoryContinuity:
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive",
-                    "context_cache_sweep", "metrics_name_ring", "vector_optimize"):
+                    "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes"):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
         from .desire_archive import DAYS_RANGE, KEEP_RANGE
@@ -678,6 +681,7 @@ class MemoryContinuity:
             # and labelled by one experience read, families and identity evidence included.
             policy = ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
             graph_context = self.graph.candidates(conn, query, policy=policy) if not operational and (self.settings(conn)["graph"] or self.settings(conn)["sharing"]) else []
+            deferred = self._deferred(conn, policy, query, graph_context) if not operational else None
             for node in graph_context:
                 node["needs_review"] = not self.graph.fresh(conn, node)
                 if self.settings(conn)["event_lifecycle"] and node["kind"] == "event" and not node["needs_review"]:
@@ -737,7 +741,36 @@ class MemoryContinuity:
                 "recent_interaction": recent,
                 "works": [] if operational else self.history("work", query=query, limit=3)["items"],
                 "shares": [] if operational else self.history("share", query=query, limit=12)["items"],
-                "next_review": cursor["next_review"], "revision": cursor["revision"], "latest_owner_seq": latest_owner_seq}
+                "next_review": cursor["next_review"], "revision": cursor["revision"], "latest_owner_seq": latest_owner_seq,
+                # Only with `deferred_routes` on: off, the context is exactly what it was.
+                **({"pending_deferrals": deferred} if deferred is not None else {})}
+
+    def _deferred(self, conn, policy, query, graph_context):
+        """The deferred routes due to be looked at again (event_deferrals), or None with the switch
+        off. The event each names is put among the graph candidates, where its identity evidence is
+        shown as any candidate event's; one this read cannot show is named as none."""
+        config = self.settings(conn)
+        if not (config["deferred_routes"] and config["event_lifecycle"] and config["graph"]):
+            return None
+        from . import event_deferrals
+        deferred = event_deferrals.pending(self, conn, policy, query, self.mind.clock())
+        candidates = {node["id"] for node in graph_context}
+        for entry in deferred:
+            if not entry["event_id"]:
+                continue
+            try:
+                node = self.graph.get(conn, entry["event_id"], follow=True)
+            except Missing:
+                node = None
+            if (not node or node.get("kind") != "event" or node.get("state") != "active"
+                    or not self.graph.visible(conn, [node], policy)):
+                entry["event_id"] = None
+                continue
+            entry["event_id"] = node["id"]
+            if node["id"] not in candidates:
+                graph_context.append(node)
+                candidates.add(node["id"])
+        return deferred
 
     def queue_unorganized(self, jobs, agent_version, limit=16):
         """One more memory-only pass for the sources whose only carrier a commit had to drop.
@@ -947,12 +980,20 @@ class MemoryContinuity:
                             "excerpt": meaning.strip()[:REFLECTION_EXCERPT]})
         return {"today_count": today_count, "entries": entries}
 
-    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None):
+    def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None,
+                         deferrals_shown=None):
         """Called inside the same transaction as affect/concerns/wishes.
+
+        `deferrals_shown`: the ids of the deferred routes the assessment's memory context carried,
+        or None when it carried none at all (event_deferrals).
 
         Returns what the host dropped item by item (memory_items), shaped like a refused section."""
         items = memory_items.Items(conn, optimized(conn, self.scope.key(), memory_items.SWITCH))
         items.run(lambda: self._apply_items(conn, items, assessment, refs, event_id, receipt))
+        if deferrals_shown is not None:
+            from . import event_deferrals
+            # After the routes: one this assessment placed is gone, every other it was shown is looked at once more.
+            event_deferrals.seen(conn, self.scope.key(), deferrals_shown, self.mind.clock())
         processed = refs if processed_refs is None else processed_refs
         # A source whose only carrier was dropped has not been organised: it stays out of the index
         # and waits in the ledger for its memory-only pass (queue_unorganized).

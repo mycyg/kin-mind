@@ -23,6 +23,10 @@ CREATE INDEX IF NOT EXISTS mind_digest_source ON mind_event_dependencies(scope,r
 CREATE TABLE IF NOT EXISTS mind_event_routes(
  scope TEXT NOT NULL,id TEXT NOT NULL,digest TEXT NOT NULL,data TEXT NOT NULL,
  PRIMARY KEY(scope,id));
+CREATE TABLE IF NOT EXISTS mind_event_deferrals(
+ scope TEXT NOT NULL,id TEXT NOT NULL,event_id TEXT,reason TEXT NOT NULL,
+ attempts INTEGER NOT NULL DEFAULT 0,next_at TEXT NOT NULL,created_at TEXT NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(scope,id));
 CREATE TABLE IF NOT EXISTS mind_event_usage(
  scope TEXT NOT NULL,identifier TEXT NOT NULL,usage_id TEXT NOT NULL,origin TEXT NOT NULL,
  at TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,identifier,usage_id,origin));

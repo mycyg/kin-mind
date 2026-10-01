@@ -105,7 +105,9 @@ CLAIM_KINDS = frozenset({"finding", "association"})
 SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "mind_graph_revisions",
                      "mind_graph_commands", "mind_context_cache", "mind_judgment_cache",
                      "mind_semantic_cache", "mind_memory_config", "mind_memory_migrations",
-                     "mind_context_deliveries", "mind_context_windows"})
+                     "mind_context_deliveries", "mind_context_windows",
+                     # A deferred event route goes whole with what it names (event_deferrals).
+                     "mind_event_deferrals"})
 # What was, or was about to be, put into a native window: a delivery (its body `text` and its
 # `items`, which name what they rest on as `id`, `dependencies[].id` and the like) and a window's
 # stored receipts (`text`, `rendered_text`, `index[].id`). Handled by name below (CR-MEM-02).
@@ -633,6 +635,9 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
         return {}
     graph, touched = _graph(conn, ids, frozenset(records), at, write=write)
     counts, nodes, changed = {"graph": graph}, set(), {}
+    if _table(conn, "mind_event_deferrals"):
+        from .event_deferrals import forget
+        counts["mind_event_deferrals"] = forget(conn, ids, write=write)
     for table in _tables(conn):
         counts[table] = _plain(conn, table, ids, nodes if table == "mind_memory_nodes" else None, write=write,
                                keys=changed.setdefault(table, set()))

@@ -16,6 +16,7 @@ never establishes identity by itself.
 | `auto_volumes` | Versioned topic volumes derived from graph membership |
 | `temperature_shadow` | Usage provenance and simulated thermal ordering |
 | `temperature_ranking` | Apply thermal ordering to optional automatic background |
+| `deferred_routes` | Deferred event routes are shown to later memory assessments until placed (needs `event_lifecycle` and `graph`) |
 
 Those switches default to false. Enable on a backed-up copy first. Automatic
 volumes have `generated_by=kin-lifecycle`; manually maintained volumes retain
@@ -92,6 +93,25 @@ title. Same-task binding requires a canonical host task, rather than a shared br
 topic. Artifact binding requires an actual artifact identity. An append or a
 correction whose binding does not hold is deferred; a link can rest on a semantic
 candidate. Every member must belong to the authorized evidence scope.
+
+With `deferred_routes` on, a deferred route -- an append or correction whose
+binding did not hold, or a route the assessment deferred itself -- is not only
+a receipt in `mind_event_routes`. It also leaves a row in
+`mind_event_deferrals`: the target event, the members with the sources each
+rests on, the route's evidence ids, a reason code (`binding-unverified`,
+`target-missing`, `assessment-deferred`), how often it has been looked at
+again and when it may be next; ids, codes and times only. A non-operational
+memory context carries at most four that are due, oldest first, as
+`pending_deferrals` (each member's current records as short excerpts of the
+experience read), with the target event among the graph candidates; the
+prompt then says what they are. A later route that places a member -- create,
+append, correct or link -- uses it up, and a row with nothing left goes
+(`event_deferrals_settled`). Each commit of an assessment that was shown a row
+counts one look, an hour apart; after two looks without being placed it goes
+(`event_deferrals_dropped`), as does one older than fourteen days. An erase
+takes every row that names an erased source or record. The rows keep no
+evidence references, so the slimming migration has nothing of them. Off, none
+is written or shown and neither the memory context nor the prompt changes.
 
 Membership is an active versioned `part_of` edge. Appending advances the event
 revision. Corrections retain source records and create `corrects` edges. They do
