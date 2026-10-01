@@ -152,6 +152,10 @@ def test_until_its_day_a_sealed_entry_is_in_no_file_of_the_store_and_no_model_or
     assert shown["recent_reflections"]["sealed"] == [{"at": shown["recent_reflections"]["sealed"][0]["at"],
                                                       "unlock_at": days(clock, 3)}]
     assert shown["recent_reflections"]["today_count"] == 1, "the sealed diary was written today"
+    # Switched off, the placeholder goes from what an assessment is shown; the count stays a count.
+    MemoryContinuity(mind).configure({"sealed_entries": False})
+    assert "sealed" not in MemoryContinuity(mind).recent_reflections()
+    on(mind)
     # Everything else a model or a tool reads, over a store with a graph, shares, plans and wishes.
     rich_store(mind, clock)
     on(mind)
@@ -192,7 +196,7 @@ def test_until_its_day_a_sealed_entry_is_in_no_file_of_the_store_and_no_model_or
     from kin_mind.host import dispatch
     for action, request in (("memory-context", {"query": "那个晚上 信", "purpose": "chat", "budget": 8000}),
                             ("read", {"history": 5}), ("state-overview", {"query": "晚上"}), ("graph", {"query": "晚上"}),
-                            ("autonomous-plans", {"history": True}), ("candidate", {})):
+                            ("autonomous-plans", {"history": True}), ("candidate", {}), ("prepare-exploration", {})):
         clean(dispatch(config_for(mind), action, request), action)
     clean(shown, "assessment context")
     clean(appraisal_context(shown), "assessment projection")
@@ -414,3 +418,21 @@ def test_a_repair_of_a_proposal_that_may_seal_a_diary_is_never_cached(monkeypatc
             provider.structured("repair_appraisal", Appraisal, "s", {"proposal": {}})
         with pytest.raises(AssertionError, match="cache read"):
             provider.structured("compress", Appraisal, "s", {})
+
+
+def test_a_main_session_fork_never_seals(setup):
+    """Its own transcript would keep the words: a date from one is dropped, and the diary is ordinary."""
+    mind, source, clock = setup
+    on(mind)
+
+    class Fork(Thinker):
+        native_review = True
+    primary = source("fork-evening", "她说起那个晚上")
+    jobs = Appraisals(mind)
+    jobs.enqueue([primary], "synthetic-v1")
+    fork = Fork(mind.engine.source(primary)["record_ids"][0], days(clock, 3))
+    jobs.run_one(fork)
+    assert fork.sealing is False
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sources WHERE namespace='kin-reflection'").fetchone()[0] == 1
+    assert sealed.entries(mind)["items"] == []
