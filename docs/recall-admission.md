@@ -63,9 +63,10 @@ Admitted items stand where the first recall item stood; the state items keep the
 - `mind_recall_quiet`: the marks. A mark set by the main session keeps 小光's message as its evidence
   (`evidence_refs`, group `records`) and a reason; one set in the console keeps neither.
 
-An erase deletes every observation naming anything it reached, every vector kept for it, and a mark
-on an erased item. A mark whose evidence is erased keeps the item quiet and loses the evidence's words
-(the plain scrub: a tombstone reference, `reason` blanked).
+An erase deletes every observation naming anything it reached, every vector kept for it, a mark on
+an erased item, and a mark whose evidence -- the message of 小光's the main session cited -- is erased,
+its reason with it, as a conversation habit's preference goes with what it was said in. A mark set in
+the console cites no message and goes only with its item.
 
 ## "不主动提起"
 

@@ -32,7 +32,8 @@ newest `VECTORS_KEPT` per scope, and an erase deletes every one kept for an item
 **Marks.** `mind_recall_quiet` holds the items 小光 asked Kin not to bring up on its own: set through
 the main session's tool with 小光's own message as evidence, or by 小光 in the console. With
 `recall_quiet_marks` on, an automatic context skips them (and, for a graph node, the records it
-holds); explicit reads still return them. A mark goes with its item when the item is erased.
+holds); explicit reads still return them. A mark goes with its item, and with the message it cites,
+when either is erased.
 """
 from __future__ import annotations
 

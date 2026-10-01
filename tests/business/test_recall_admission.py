@@ -412,6 +412,24 @@ def test_the_main_session_sets_a_mark_only_on_her_own_current_word(system):
     assert tools["set_memory_quiet"].description == recall_admission.QUIET_TOOL_DESCRIPTION
 
 
+def test_a_mark_goes_with_the_message_it_cites(system):
+    """Set from 小光's own word, a mark rests on it the way a conversation habit's preference does: an
+    erase of that message takes the mark, its reason and its evidence with it; a mark set in the
+    console names no message and stays."""
+    mind, memory, source, service, sources, records = system
+    memory.configure({"recall_quiet_marks": True})
+    marks = QuietMarks(mind)
+    said = source("said", "猫的事以后别主动提了", owner=True)
+    marks.change({"command_id": "q1", "item_id": records["cat"], "quiet": True, "reason": "小光说以后别主动提",
+                  "evidence_ids": [said]}, actor="owner")
+    marks.change({"command_id": "q2", "item_id": records["planned"], "quiet": True}, actor="console")
+    mind.engine.delete(said)
+    assert [mark["item_id"] for mark in marks.list()] == [records["planned"]]
+    with mind.engine.db.connect() as conn:
+        assert not conn.execute("SELECT 1 FROM mind_recall_quiet WHERE instr(data,?)>0", (said,)).fetchone()
+        assert not conn.execute("SELECT 1 FROM mind_recall_quiet WHERE instr(data,?)>0", ("小光说以后别主动提",)).fetchone()
+
+
 # --- erasure, retention, calibration ---------------------------------------------------------------------
 
 def test_an_erase_takes_every_observation_and_mark_naming_what_it_erased(system):
