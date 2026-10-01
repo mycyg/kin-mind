@@ -23,7 +23,7 @@ from kin_mind.state import AffectiveEvent, Mind
 
 DIARY_PREFIX = "Kin 自己的想法（日记与感想，不是主人的原话或已确认事实）：\n"
 DREAM = ("我站在一座全是钟表的旧房子里，齿轮在地板下面轻轻转，墙上的每个钟都走在不同的时间。"
-         "她在楼梯口朝我招手，手里捧着一杯热可可，杯子里漂着一只小小的纸船。我追过去，楼梯却一直往下长，"
+         "小光在楼梯口朝我招手，手里捧着一杯热可可，杯子里漂着一只小小的纸船。我追过去，楼梯却一直往下长，"
          "我笑着一级一级数下去，数到一百的时候，整座房子忽然变成了海。")
 SWITCHES = ("dreams", "diary_replies", "anniversaries")
 
@@ -259,7 +259,7 @@ def test_the_next_idle_reviews_see_the_latest_dream_and_only_a_wish_could_tell_i
     _, morning = review(mind, source, lambda c: Appraisal(reason="早上"), "morning")
     (shown,) = morning.seen[0]["recent_dreams"]
     assert shown["text"] == DREAM and morning.said[0] == dreams.RECENT_DREAMS_PROMPT
-    _, message = review(mind, source, lambda c: Appraisal(reason="她来了"), "message", stimulus=None)
+    _, message = review(mind, source, lambda c: Appraisal(reason="小光来了"), "message", stimulus=None)
     assert "recent_dreams" not in message.seen[0], "only the idle reviews are shown it"
     with mind.engine.db.connect() as conn:
         assert not mind.read()["desires"], "nothing was wished, so nothing would go out"
@@ -282,13 +282,13 @@ def test_the_console_reads_kin_s_diary_which_its_narrative_group_never_listed(en
     mind, memory, source, entry, clock = env
     first = entry("d1", "今天拆了一只旧闹钟。", topic="钟表")
     clock[0] += timedelta(minutes=5)
-    second = entry("d2", "想把发现讲给她听。", topic="分享")
+    second = entry("d2", "想把发现讲给小光听。", topic="分享")
     listed = mind.engine.list_records(mind.scope, group="diary")
     assert not [item for item in listed["items"] if item["source_ids"][0] in {first, second}], \
         "the narrative group holds generated narratives, never an entry of Kin's own diary"
     read = diary.read(mind)
     assert [(e["source_id"], e["topic"], e["text"], e["replies"]) for e in read["entries"]] == [
-        (second, "分享", "想把发现讲给她听。", []), (first, "钟表", "今天拆了一只旧闹钟。", [])]
+        (second, "分享", "想把发现讲给小光听。", []), (first, "钟表", "今天拆了一只旧闹钟。", [])]
     assert read["replies"] == "disabled" and read["cursor"] is None
     assert diary.read(mind, limit=1)["cursor"] == 1
     from fastapi.testclient import TestClient
@@ -330,7 +330,7 @@ def test_a_reply_is_her_own_statement_and_the_next_appraisal_sees_which_entry_it
     assert {e["source_id"]: e["replies"] for e in diary.read(mind)["entries"]}[kept][0]["text"] == "我也喜欢钟，下次一起拆"
 
     # The entry she answered may be cited like any diary the appraisal is shown.
-    jobs, reader = Appraisals(mind), Reader(lambda c: Appraisal(reason="她回了我的日记", values={"curiosity": 70},
+    jobs, reader = Appraisals(mind), Reader(lambda c: Appraisal(reason="小光回了我的日记", values={"curiosity": 70},
         trait_observations=[TraitObservation(key="钟", category="interests", slug="clocks", evidence_class="self_statement",
                                              polarity="support", evidence_ids=[kept])]))
     result = jobs.run_one(reader, job_id=answer["appraisal"]["id"])
@@ -470,7 +470,7 @@ def test_as_production_runs_the_fork_is_asked_for_a_dream_strictly_and_shown_tod
         frames.append(request)
         return {"state": "complete", "receipt": RECEIPT, "result": {
             "reason": "睡着了。", "dream": {"text": DREAM},
-            "next_move": {"move": "rest", "reason": "她还在睡", "grounds": [], "wish_ref": None, "step_ref": None, "alternative": ""}}}
+            "next_move": {"move": "rest", "reason": "小光还在睡", "grounds": [], "wish_ref": None, "step_ref": None, "alternative": ""}}}
     result = jobs.run_one(native_provider(mind, exchange), lane="action")
     assert result["state"] == "complete", result
     schema, contract, context = frames[0]["schema"], frames[0]["contract"], frames[0]["context"]

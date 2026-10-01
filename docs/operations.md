@@ -313,8 +313,8 @@ console's "日记与自述" group.
 
 **`diary_replies`** (`kin_mind.diary`). The console's "日记与自述" group shows Kin's own diary
 (`kin-reflection`, newest first; `GET /v1/diary`) whatever the setting -- the narrative records listed
-there never held one of her entries. With the setting on, 小光 can answer an entry
-(`POST /v1/diary/replies`): her words become a `kin-diary-reply` source, explicit authority, role
+there never held one of Kin's entries. With the setting on, 小光 can answer an entry
+(`POST /v1/diary/replies`): 小光's words become a `kin-diary-reply` source, explicit authority, role
 user, with the entry it answers as `reply_to` in its metadata (an index, never shown to a model), and
 are queued for an appraisal through the ordinary path. That appraisal is shown which entry each reply
 answers (`diary_replies`), the entry checked current at commit; deleting the reply takes the link,

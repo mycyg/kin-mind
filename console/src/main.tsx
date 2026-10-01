@@ -251,8 +251,8 @@ function App() {
     },
     [scope, view, browseSearch, latestRecords],
   );
-  // Kin's own diary (kin-reflection), each entry with the owner's replies, and her dreams: the
-  // narrative records listed below never held one of her entries.
+  // Kin's own diary (kin-reflection), each entry with the owner's replies, and Kin's dreams: the
+  // narrative records listed below never held one of Kin's entries.
   const loadDiary = useCallback(
     async (next?: number) => {
       const signal = latestDiary();
@@ -1433,7 +1433,7 @@ function KinDiary({
           <h2>Kin 的日记</h2>
           <p>
             Kin 自己写下的想法，最新的在前。
-            {replying ? "可以直接回复，回复会作为你的原话交给她。" : ""}
+            {replying ? "可以直接回复，回复会作为你的原话交给 Kin。" : ""}
           </p>
         </div>
         <span className="label-muted">{data.entries.length} 篇已加载</span>
@@ -1474,7 +1474,7 @@ function KinDiary({
                         [entry.source_id]: e.target.value,
                       }))
                     }
-                    placeholder="写点什么回给她"
+                    placeholder="写点什么回给 Kin"
                   />
                   <button
                     className="subtle"

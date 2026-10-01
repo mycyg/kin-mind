@@ -37,9 +37,9 @@ REPLY_LIMIT = 2000
 EXCERPT = 400
 
 # --- Model-facing wording (NEEDS 小光 OK) ----------------------------------------------------------
-REPLY_PROMPT = ("\ndiary_replies 列出这次新证据里小光对你日记的回复：reply_id 是她的回复（就在 new_evidence 里，是她本人的话），"
-                "diary 是她回复的那一篇（你当时自己的想法，可以用它的 source_id 引用）；diary 为 null 表示那篇日记已经删掉了。"
-                "小光回了你的日记，这是一次真实的新互动，照常评估；她的回复是她的原话，日记仍然只是你当时的想法。")
+REPLY_PROMPT = ("\ndiary_replies 列出这次新证据里小光对你日记的回复：reply_id 是小光的回复（就在 new_evidence 里，是小光本人的话），"
+                "diary 是这条回复所回的那一篇（你当时自己的想法，可以用它的 source_id 引用）；diary 为 null 表示那篇日记已经删掉了。"
+                "小光回了你的日记，这是一次真实的新互动，照常评估；小光的回复是小光的原话，日记仍然只是你当时的想法。")
 
 
 def _thought(text):
@@ -65,7 +65,7 @@ def _entry(engine, row, *, excerpt=None):
 
 
 def read(mind, *, cursor=0, limit=20):
-    """Kin's diary entries, newest first, each with 小光's replies (oldest first), and whether she may
+    """Kin's diary entries, newest first, each with 小光's replies (oldest first), and whether 小光 may
     reply now. Every entry is read whatever the switch says: it is the diary itself."""
     if not 1 <= limit <= 100 or int(cursor) < 0:
         raise ValueError("Invalid diary page")
@@ -94,7 +94,7 @@ def read(mind, *, cursor=0, limit=20):
 
 
 def reply(mind, request, *, agent_version=None):
-    """小光's answer to one diary entry: kept as her own statement and queued for an appraisal. A
+    """小光's answer to one diary entry: kept as 小光's own statement and queued for an appraisal. A
     repeat of the same `command_id` with the same words is the same reply."""
     from .appraisal import Appraisals
     reflection, text, command = (request.get(key) for key in ("reflection_id", "text", "command_id"))
