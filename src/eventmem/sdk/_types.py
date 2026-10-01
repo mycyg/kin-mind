@@ -213,6 +213,12 @@ class ScopeResult(TypedDict, total=False):
     collection: Required[str]
     world: Required[str]
 
+class SealedLetter(TypedDict, total=False):
+    scope: Required[Scope]
+    text: Required[str]
+    unlock_at: Required[str]
+    command_id: Required[str]
+
 class SessionBoundary(TypedDict, total=False):
     session: Required[str]
     scope: Scope

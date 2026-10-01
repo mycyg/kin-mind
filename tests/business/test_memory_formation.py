@@ -92,7 +92,7 @@ def test_unset_switches_leave_the_request_exactly_as_it_was():
         for operational in (False, True):
             plain = A.appraisal_schema(operational, historical, (), A.REVIEW_MAX_MINUTES)
             assert "skipped" not in json.dumps(plain) and "MemorySkip" not in json.dumps(plain)
-            assert A.appraisal_schema(operational, historical, (), A.REVIEW_MAX_MINUTES, (), False) == plain
+            assert A.appraisal_schema(operational, historical, (), A.REVIEW_MAX_MINUTES, (), disposition=False) == plain
     provider = A.DeepSeek("https://api.deepseek.com", A.APPRAISAL_MODEL, "UNSET", timeout=30)
     for stimulus in (None, "memory-enrichment"):
         system = provider._system({"stimulus": stimulus, "state": {}}, None)

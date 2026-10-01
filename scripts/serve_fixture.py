@@ -89,7 +89,7 @@ with engine.db.connect() as conn:
 if not initialized:
     mind.initialize(agent_version="console-synthetic-v1", evidence_ids=[ids[0]])
 memory = MemoryContinuity(mind)
-memory.configure({"records":True,"graph":True,"sharing":True,"graph_recall":True})
+memory.configure({"records":True,"graph":True,"sharing":True,"graph_recall":True,"sealed_entries":True})
 event = memory.ingest({"id":"console-migration-event","kind":"owner-message","text":"共同检查数据库迁移结果", "at":"2026-09-01T01:00:00.000000+00:00", "task_id":"synthetic-migration"})
 with engine.db.connect(write=True) as conn:
     units = memory.sharing.units(conn,event["event_id"],["隔离目录中的恢复验证已经通过。"],[event["source_id"]],owner_kind="work")

@@ -139,6 +139,12 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # nothing holds any more, and `exploration-decision-unarchive` puts it all back before
             # any rollback, because the release before this one cannot see the table.
             "exploration_decision_archive": False,
+            # Sealed entries (sealed.py, 暗房 and 时光信), read through autonomy_schema.enabled(). Off
+            # by default: nothing can be sealed, the assessment's schema and prompt are as they were,
+            # and no table is made. On, Kin may seal a diary until a day (understanding.unlock_at) and
+            # the console may write a letter to Kin opened on a day; until then their words are
+            # nowhere in the store. An entry already sealed opens on its day whatever this says.
+            "sealed_entries": False,
             # Stage 5 housekeeping, all three off and all three read through
             # autonomy_schema.enabled(). `context_cache_sweep` sweeps `mind_context_cache`, which
             # holds compressed context and nothing else, by age and by count, and takes a scope's
@@ -383,7 +389,7 @@ class MemoryContinuity:
                     "wish_version_review", "legacy_drive_thresholds",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive", "archive_memory",
-                    "exploration_decision_archive",
+                    "exploration_decision_archive", "sealed_entries",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
                     "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat",
                     *memory_formation.SWITCHES):
@@ -1008,6 +1014,10 @@ class MemoryContinuity:
                 "SELECT COUNT(*) FROM sources WHERE namespace='kin-reflection' AND scope=? AND deleted=0"
                 " AND julianday(occurred_at)>=julianday(?) AND julianday(occurred_at)<julianday(?)",
                 (self.scope.key(), today.isoformat(), (today + timedelta(days=1)).isoformat())).fetchone()[0]
+            # A diary sealed today was written today, though nothing can read it yet (sealed.py).
+            from . import sealed
+            today_count += sealed.diaries_written(conn, self.scope.key(), today.isoformat(), (today + timedelta(days=1)).isoformat())
+            waiting = sealed.sealed_diaries(conn, self.scope.key()) if sealed.enabled(conn, self.scope.key()) else []
         entries = []
         for row in rows:
             if len(entries) >= limit:
@@ -1020,7 +1030,8 @@ class MemoryContinuity:
             metadata = (json.loads(row["data"]) if row["data"] else {}).get("metadata") or {}
             entries.append({"source_id": row["id"], "at": row["occurred_at"], "topic": metadata.get("topic"),
                             "excerpt": meaning.strip()[:REFLECTION_EXCERPT]})
-        return {"today_count": today_count, "entries": entries}
+        # Sealed diaries as placeholders only, and only where the setting tells the assessment what they are.
+        return {"today_count": today_count, "entries": entries, **({"sealed": waiting} if waiting else {})}
 
     def apply_assessment(self, conn, assessment, refs, event_id, through_seq, next_minutes, receipt, *, schedule=True, processed_refs=None, max_minutes=None,
                          deferrals_shown=None, job=None):

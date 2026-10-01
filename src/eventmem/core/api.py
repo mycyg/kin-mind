@@ -53,6 +53,15 @@ class GraphCommand(Model):
     request: dict[str, Any]
 
 
+# A letter to Kin, opened on `unlock_at` (YYYY-MM-DD, Asia/Singapore, tomorrow to a year ahead;
+# kin_mind.sealed): until then its words are nowhere a model or a tool reads.
+class SealedLetter(Model):
+    scope: Scope
+    text: str = Field(min_length=1, max_length=20_000)
+    unlock_at: str = Field(min_length=10, max_length=10)
+    command_id: str = Field(min_length=1, max_length=200)
+
+
 class MaintenanceRequest(Model):
     kind: Literal[
         "organize",
@@ -819,6 +828,26 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         from kin_mind.procedures import Procedures
         from kin_mind.state import Mind
         return Procedures(Mind(engine, scope_of(project, persona, collection, world))).read(query, identifier, limit=limit)
+
+    @app.post("/v1/sealed", operation_id="seal_letter")
+    def seal_letter(request: SealedLetter) -> dict:
+        from kin_mind.sealed import seal_letter as seal
+        from kin_mind.state import Mind
+        return seal(Mind(engine, request.scope), request.text, request.unlock_at, request.command_id)
+
+    @app.get("/v1/sealed", operation_id="list_sealed")
+    def list_sealed(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None,
+                    cursor: str = "", limit: int = Query(50, ge=1, le=200)) -> dict:
+        from kin_mind.sealed import entries
+        from kin_mind.state import Mind
+        return entries(Mind(engine, scope_of(project, persona, collection, world)), cursor=cursor, limit=limit)
+
+    @app.delete("/v1/sealed/{entry_id}", operation_id="erase_sealed")
+    def erase_sealed(entry_id: str, project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None,
+                     world: ScopePart = None) -> dict:
+        from kin_mind.sealed import erase_entry
+        from kin_mind.state import Mind
+        return erase_entry(Mind(engine, scope_of(project, persona, collection, world)), entry_id)
 
     @app.put("/v1/contact/policies", operation_id="configure_contact")
     def configure_contact(request: ContactPolicy) -> dict:

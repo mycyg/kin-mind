@@ -20,18 +20,19 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
+from pydantic import Field, StrictInt, ValidationError, field_validator, model_serializer, model_validator
 
 from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, erasure, initiative, judgment_cache, memory_formation, revalidation, settling
+from . import attempts, erasure, initiative, judgment_cache, memory_formation, revalidation, sealed, settling
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
 from .conflicts import classify, static_message
-from .continuity import TIMED_FIELDS, ConcernProposal, RhythmProposal, Understanding, select_concerns
+from .continuity import TIMED_FIELDS, ConcernProposal, RhythmProposal, select_concerns
+from .continuity import Understanding as Interpretation
 from .dialogue import clock_context, recent_dialogue
 from .exploration_decisions import SharingDecision, apply_decisions
 from .habits import HabitProposal
@@ -391,6 +392,44 @@ class NextMove(Model):
     reason: str = Field(min_length=1)
 
 
+# Model-facing wording of sealed entries (sealed.py), shown only while `sealed_entries` is on: the
+# schema's description of the date, and the paragraph the prompt gains (`DeepSeek._system`).
+UNLOCK_AT_DESCRIPTION = "封存这篇日记、到哪天才打开：YYYY-MM-DD（Asia/Singapore），明天起、最多一年内；不封存填 null。"
+SEALED_ENTRIES_PROMPT = ("暗房与时光信：写日记（understanding 且 basis=internal_thought）时，如果想把这篇先封起来、过一段时间再打开，"
+                         "可以在 unlock_at 写打开的日期（YYYY-MM-DD，Asia/Singapore，明天起、最多一年内）；不封就留 null。"
+                         "封存的日记到那天之前谁也读不到，你自己也一样，也不能作为依据引用。recent_reflections.sealed 是还封着的日记，"
+                         "只有写下的时间和打开的日期。autonomy_context.initiative_facts.sealed_opened 是最近到了日子、刚刚打开的信或日记："
+                         "letter 是用户写给你的时光信，diary 是你以前封存的日记，用 record_id 读原文。要不要提起、什么时候提，由你决定。")
+
+
+# The appraisal's own understanding: the one that may carry a day to seal a diary until (sealed.py). The
+# same model otherwise, under the same name, so the schema is byte for byte the one it was wherever the
+# date is not offered (`appraisal_schema` takes the field out), and it is stored, applied and shown as it
+# always was: without a date it dumps exactly the fields it had.
+class Understanding(Interpretation):
+    unlock_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$", description=UNLOCK_AT_DESCRIPTION)
+
+    @field_validator("unlock_at")
+    @classmethod
+    def a_day(cls, v):
+        if v is not None:
+            sealed.parse_day(v)
+        return v
+
+    @model_validator(mode="after")
+    def only_a_diary(self):
+        if self.unlock_at is not None and self.basis != "internal_thought":
+            raise ValueError("Only a diary (basis internal_thought) is sealed")
+        return self
+
+    @model_serializer(mode="wrap")
+    def without_an_empty_day(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("unlock_at") is None:
+            data.pop("unlock_at", None)
+        return data
+
+
 class Appraisal(Model):
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=len(DIMENSIONS))
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
@@ -416,6 +455,14 @@ class Appraisal(Model):
     prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
     expression_intent: ExpressionIntent | None = None
     next_move: NextMove | None = None
+
+    @field_validator("understanding", mode="before")
+    @classmethod
+    def an_interpretation_as_given(cls, value):
+        # One built as the continuity layer's model is taken as this one, without a date.
+        if isinstance(value, Interpretation) and not isinstance(value, Understanding):
+            return value.model_dump()
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -800,7 +847,7 @@ DEFERRED_ROUTES_PROMPT = (
 
 
 def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=(), timed=False,
-                     disposition=False):
+                     disposition=False, sealing=False):
     """`sections`: the audited sections this request offers. A section left out takes its property
     and everything only it referenced with it, so a request offering none is the request as it was.
     `review_max`: the review ceiling this request allows, the same one its prompt states.
@@ -810,7 +857,9 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
     taken out of the concern, and the schema is the one it was before they existed.
 
     `disposition`: the request offers `memory.skipped` (memory_formation); without it, the schema
-    is the one it always was."""
+    is the one it always was.
+    `sealing`: the understanding may carry a day to seal a diary until (sealed.py); without it the
+    field is not there at all."""
     if historical:
         schema = HistoryAssessment.model_json_schema()
         return memory_formation.with_skipped(schema) if disposition else schema
@@ -820,6 +869,8 @@ def appraisal_schema(operational=False, historical=False, sections=(), review_ma
             schema["$defs"]["ConcernProposal"]["properties"].pop(name, None)
     if disposition and not operational:
         schema = memory_formation.with_skipped(schema)
+    if not sealing:
+        schema["$defs"]["Understanding"]["properties"].pop("unlock_at", None)
     # The model bound is the widest one there is; this request's own ceiling replaces it in place.
     schema["properties"]["next_review_minutes"]["maximum"] = review_max
     withheld = [name for name in AUDIT_SECTIONS if name not in sections]
@@ -1224,7 +1275,9 @@ class DeepSeek:
         # reference as its trace, a source without its metadata (the owner's decision, 2026-09-28;
         # model_view). Every structured call of every caller passes here.
         context = for_model(context)
-        cache_state, hit = self._cache_get(name, schema, system, context, judgment, depends_on)
+        # A repair of a proposal that may seal a diary is never kept: the cache would hold its words.
+        cache_state, hit = (None, None) if name == "repair_appraisal" and self._sealing() else \
+            self._cache_get(name, schema, system, context, judgment, depends_on)
         if hit is not None:
             return hit
         from eventmem.core.db import recording
@@ -1299,7 +1352,7 @@ class DeepSeek:
                   "input_schema": appraisal_schema(context.get("operational_only", False),
                       context.get("stimulus") in {"memory-backfill", "memory-enrichment"},
                       self._sections(context), self._review_max(), self._required(context), self._timed(),
-                      self._skipped(context))}
+                      self._skipped(context), self._sealing())}
         system, scope = self._system(context, policy), self._recall_scope(context)
         messages, first, calls, rounds = [{"role": "user", "content": rendered}], time.monotonic(), [], []
         deadline = first + timeout
@@ -1486,7 +1539,7 @@ class DeepSeek:
             request_context = redact(request_context)
             overhead = tokens(self._system(context, policy) + dumps(appraisal_schema(context.get("operational_only", False),
                 context.get("stimulus") in {"memory-backfill", "memory-enrichment"}, self._sections(context), self._review_max(), self._required(context), self._timed(),
-                self._skipped(context)))
+                self._skipped(context), self._sealing()))
                 + (dumps(RECALL_TOOLS) if self._recall_scope(context) else "")) + 160
             if tokens(dumps(request_context)) + overhead > input_budget:
                 # Background evidence preparation has a separate budget from a
@@ -1733,6 +1786,11 @@ class DeepSeek:
         `memory_disposition` or `memorable_marks` is on."""
         return memory_formation.offers_skipped(self._memory_rules()) and not context.get("operational_only")
 
+    def _sealing(self):
+        """Whether this attempt may seal a diary (sealed.py). The host sets it; unset is the request as
+        it was. A main-session fork never does: its transcript would keep the words."""
+        return getattr(self, "sealing", False) is True and not getattr(type(self), "native_review", False)
+
     def _system(self, context, policy):
         historical = context.get("stimulus") in {"memory-backfill", "memory-enrichment"}
         system = HISTORY_SYSTEM if historical else SYSTEM + SESSION_ADVICE_PROMPT
@@ -1744,7 +1802,8 @@ class DeepSeek:
                 + "".join("\n" + self._section_prompt(name) for name in self._sections(context))
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
                 + (RECALL_PROMPT if self._recall_scope(context) else "")
-                + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else ""))
+                + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else "")
+                + ("\n" + SEALED_ENTRIES_PROMPT if self._sealing() and not historical else ""))
 
     def request_profile(self, context):
         """Digests of what frames an appraisal request besides its context: the input manifest keeps
@@ -1761,7 +1820,7 @@ class DeepSeek:
                                     "read": {"characters": READ_CHARS, "tokens": READ_TOKENS}, "done": RECALL_DONE}
         return {"system": digest(self._system(context, policy)),
                 "schema": digest(appraisal_schema(context.get("operational_only", False), historical, self._sections(context), self._review_max(), self._required(context), self._timed(),
-                                                  self._skipped(context))),
+                                                  self._skipped(context), self._sealing())),
                 "model": self.model, "parameters": digest(parameters)}
 
 
@@ -2901,6 +2960,13 @@ class Appraisals:
                 # An idle review states a contact decision: its move is one it must answer.
                 idle = "idle-review" in set(data.get("stimuli") or [data.get("stimulus")])
                 provider.required_sections = ("next_move",) if idle else ()
+                # Whether a diary may be sealed (sealed.py): only where an understanding is kept -- not
+                # on a historical pass, a session review or a follow-up, which leave it out -- and never
+                # by a main-session fork, whose own transcript would keep the words.
+                with self.engine.db.connect() as conn:
+                    provider.sealing = (sealed.enabled(conn, self.mind.scope.key()) and not historical and not maintenance
+                                        and not (data.get("stimulus") == FOLLOW_UP and isolation)
+                                        and not getattr(type(provider), "native_review", False))
                 # What this lane may carry, for the request and for everything the commit applies.
                 offered = offered_sections(data.get("stimulus"), audited)
                 # The host's record of what this attempt is shown: the commit's rebase and the next
@@ -2958,6 +3024,10 @@ class Appraisals:
                 # came back from storage is held to it exactly like one this attempt asked for.
                 proposal = blank_sections(proposal, offered)
                 proposal = memory_formation.blank_skipped(proposal, memory_formation.rules(settings))
+                # A diary Kin sealed leaves the proposal here, before anything stores or applies it: the
+                # queue row, the state and the reflection never hold its words. It is kept by the commit.
+                proposal, sealed_diary = sealed.take(proposal, sealing=getattr(provider, "sealing", False) is True,
+                                                     at=self.mind.clock())
                 # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
                 data.pop("dropped_fields", None)
                 if receipt.get("dropped_fields"):
@@ -3106,6 +3176,15 @@ class Appraisals:
                         data["evaluated_ids"] = sorted(set(data.get("evaluated_ids") or ()) | gone)
                     if gone:
                         raise Conflict("Something the model was shown has been deleted", target=min(gone))
+                    if sealed_diary:
+                        # The sealed diary, in this commit: written from what the reflection would have been
+                        # (memory.remember_reflection), and kept where nothing reads it until its day.
+                        sealed.seal_diary(self.mind, conn, eid, sealed_diary,
+                                          derived_from=list(dict.fromkeys([*sealed_diary["understanding"].get("evidence_ids", []),
+                                                                           *data["evidence_ids"]])),
+                                          shown=[*(ref for ref in data.get("evaluated_sources") or [] if isinstance(ref, dict)),
+                                                 *(i for i in data.get("evaluated_ids") or [] if isinstance(i, str))],
+                                          at=self.mind.clock())
                     # What this commit attempt refuses or holds. It is written to the queue row as it happens, so
                     # a commit that then fails as a whole still leaves the refusals as feedback for its retry.
                     rejected, held, blocked = [], [], {}

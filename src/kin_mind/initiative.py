@@ -7,7 +7,8 @@ was invisible to the one who could end it.
 **Facts, never a gate.** `facts` counts from the records what an assessment could not see for
 itself: how long since a wish of each kind was made, since a contact was sent, since an exploration
 and a creation ran; how many idle reviews went by since the last wish; which explorations failed
-lately; which contact wishes have waited a day unsent. Hours and counts only, rounded, in the
+lately; which contact wishes have waited a day unsent; which sealed letters and diaries opened in
+the last day (`sealed_opened`, with `sealed_entries` on). Hours and counts only, rounded, in the
 host's words. No score, no threshold and nothing that asks for a contact: what to do about a
 silence stays Kin's judgment.
 
@@ -109,6 +110,9 @@ def facts(mind, at=None):
         except sqlite3.OperationalError:
             creation = None
         unsent = unsent_contacts(conn, mind, state, at)
+        # A letter or a sealed diary whose day came lately: the entry, never its words (sealed.py).
+        from . import sealed
+        opened = sealed.opened(conn, scope, at) if sealed.enabled(conn, scope) else []
     return {
         "as_of": at,
         "hours_since_last_wish": {kind: _hours(now, made.get(kind)) for kind in WISH_KINDS},
@@ -118,6 +122,7 @@ def facts(mind, at=None):
         "idle_reviews_since_last_wish": idle,
         "recent_failed_explorations": failed,
         "contact_wishes_unsent_a_day": unsent[:UNSENT_SHOWN],
+        **({"sealed_opened": opened} if opened else {}),
     }
 
 

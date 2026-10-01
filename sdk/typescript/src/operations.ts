@@ -1875,6 +1875,210 @@ export const operations = {
     ],
     "body": {}
   },
+  "seal_letter": {
+    "method": "POST",
+    "path": "/v1/sealed",
+    "parameters": [],
+    "body": {
+      "required": true,
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/SealedLetter"
+          }
+        }
+      }
+    }
+  },
+  "list_sealed": {
+    "method": "GET",
+    "path": "/v1/sealed",
+    "parameters": [
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Project"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Persona"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Collection"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "World"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "",
+          "title": "Cursor"
+        }
+      },
+      {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 200,
+          "minimum": 1,
+          "default": 50,
+          "title": "Limit"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "erase_sealed": {
+    "method": "DELETE",
+    "path": "/v1/sealed/{entry_id}",
+    "parameters": [
+      {
+        "name": "entry_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "title": "Entry Id"
+        }
+      },
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Project"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Persona"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Collection"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "World"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      }
+    ],
+    "body": {}
+  },
   "configure_contact": {
     "method": "PUT",
     "path": "/v1/contact/policies",

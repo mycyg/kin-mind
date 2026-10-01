@@ -633,6 +633,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sealed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Sealed */
+        get: operations["list_sealed"];
+        put?: never;
+        /** Seal Letter */
+        post: operations["seal_letter"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sealed/{entry_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Erase Sealed */
+        delete: operations["erase_sealed"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/contact/policies": {
         parameters: {
             query?: never;
@@ -1387,6 +1422,16 @@ export interface components {
             collection: string;
             /** World */
             world: string;
+        };
+        /** SealedLetter */
+        SealedLetter: {
+            scope: components["schemas"]["Scope"];
+            /** Text */
+            text: string;
+            /** Unlock At */
+            unlock_at: string;
+            /** Command Id */
+            command_id: string;
         };
         /** SessionBoundary */
         SessionBoundary: {
@@ -3033,6 +3078,125 @@ export interface operations {
             };
             header?: never;
             path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_sealed: {
+        parameters: {
+            query?: {
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seal_letter: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SealedLetter"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    erase_sealed: {
+        parameters: {
+            query?: {
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
+            };
+            header?: never;
+            path: {
+                entry_id: string;
+            };
             cookie?: never;
         };
         requestBody?: never;

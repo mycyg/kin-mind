@@ -527,6 +527,9 @@ def _dispatch(config, action, request):
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
                 GraphMigration(mind).queue_history(jobs, config["agent_version"])
+        # Sealed letters and diaries whose day has come become their sources (sealed.py). No model call.
+        from .sealed import open_due
+        open_due(mind)
         result = run() if run else None
         plans.sync_wishes()
         if run and isinstance(result, dict) and result.get("state") == "complete":

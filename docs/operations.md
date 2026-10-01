@@ -335,6 +335,41 @@ and it is what runs **before a rollback**: the release before this one cannot se
 document sorts its keys, so a full round trip gives back the document it had apart from its revision
 and time.
 
+## Sealed entries (暗房 and 时光信)
+
+Kin may seal a diary until a day, and the owner may write Kin a letter, from the console's diary
+view, that opens on a day: from tomorrow to a year ahead, in Asia/Singapore days. `sealed_entries`
+(memory setting, default off) allows both:
+
+```sh
+echo '{"sealed_entries": true}' | python -m kin_mind.host --config PRIVATE_CONFIG configure-memory
+```
+
+Off, nothing changes: the assessment's schema and prompt are byte for byte what they were, a diary
+that carries a date anyway is an ordinary diary, the console cannot seal a letter, and no table is
+made. On, the assessment's `understanding` gains `unlock_at` (a diary only) and the prompt a paragraph
+about it; a sealed diary leaves the proposal before anything stores or applies it and is kept by the
+assessment's own commit.
+
+**The lock is where the words are.** Until its day a sealed entry is not in the store at all: no
+source, record, blob, index row, extraction job or vector, nothing in the state, a queue row or a
+cache. Its words are one row of `mind_sealed_entries`, packed (zlib and base64, not encryption) so not
+even a byte scan of the store finds them, and only `kin_mind.sealed` reads that table. Every reader --
+recall, the context, an assessment and its recall tools, archive memories and digests, the graph, the
+MCP reads, exploration briefs, the console's record views -- reads the store as if the entry were not
+there. `GET /v1/sealed` lists entries as dates and a placeholder ("一封 2026-12-24 才能打开的信").
+
+**Erasure reaches through the lock.** `DELETE /v1/sealed/{entry_id}` (the console's delete) erases
+the source id the entry will become through `Engine.delete`; the tombstone keeps it from ever being
+received. Erasing anything a sealed diary rests on takes the diary too, in the same transaction.
+
+**On its day** the review minute (`review-due`) turns the entry into the source it would have been: a
+letter as the owner's explicit words (`kin-owner-letter`, `host_event: letter`), extracted and indexed
+then; a diary as its `kin-reflection`, resting on what it was written from. For a day after, an
+assessment's `initiative_facts.sealed_opened` names it (kind, record to read, how long it was sealed);
+whether to mention it is Kin's. Nothing is sent. An entry already sealed opens on its day whatever the
+setting says; switching the setting off only stops new seals and the assessment's mentions of them.
+
 ## Evidence references
 
 The owner's decision (2026-09-28): a source's metadata is an index for retrieval. It is not put into

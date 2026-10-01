@@ -107,7 +107,7 @@ SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "min
                      "mind_semantic_cache", "mind_memory_config", "mind_memory_migrations",
                      "mind_context_deliveries", "mind_context_windows",
                      # A deferred event route goes whole with what it names (event_deferrals).
-                     "mind_event_deferrals"})
+                     "mind_event_deferrals", "mind_sealed_entries"})
 # What was, or was about to be, put into a native window: a delivery (its body `text` and its
 # `items`, which name what they rest on as `id`, `dependencies[].id` and the like) and a window's
 # stored receipts (`text`, `rendered_text`, `index[].id`). Handled by name below (CR-MEM-02).
@@ -631,10 +631,14 @@ def erase(conn, records, sources, at, *, write=True, again=False, stopped=False)
     no longer at work. The process rows that do not name what they were shown are counted apart,
     as `unnamed:<table>` (CL6D-MM-04)."""
     ids = frozenset(records) | frozenset(sources)
+    # A sealed entry that is, or rests on, what goes goes whole: its words were never in the store,
+    # and nothing of it is left to open (sealed.py).
+    from .sealed import erase as erase_sealed
+    sealed = erase_sealed(conn, ids, write=write)
     if not ids or not _table(conn, "mind_state"):
-        return {}
+        return {"sealed_entries": sealed} if sealed else {}
     graph, touched = _graph(conn, ids, frozenset(records), at, write=write)
-    counts, nodes, changed = {"graph": graph}, set(), {}
+    counts, nodes, changed = {"graph": graph, "sealed_entries": sealed}, set(), {}
     if _table(conn, "mind_event_deferrals"):
         from .event_deferrals import forget
         counts["mind_event_deferrals"] = forget(conn, ids, write=write)

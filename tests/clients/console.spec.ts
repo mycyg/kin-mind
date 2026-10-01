@@ -319,3 +319,26 @@ test('a reminder the host answered 2xx reads as handed to the host, not as deliv
   await expect(row.locator('.badge')).toHaveText('已交给宿主');
   await expect(row).not.toContainText('已发送');
 });
+
+test('a letter to Kin is sealed until its day: only its date shows, and it can be erased',async({page})=>{
+  const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  const words='Sealed browser letter '+Date.now();
+  const tomorrow=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Singapore'}).format(Date.now()+86400000);
+  await page.locator('nav').getByRole('button',{name:'日记与自述',exact:true}).click();
+  const panel=page.getByRole('region',{name:'时光信与暗房'});
+  const rows=panel.locator('.sealed-row').filter({hasText:`一封 ${tomorrow} 才能打开的信`});
+  await expect(panel.getByLabel('写给 Kin 的信')).toBeVisible();
+  const before=await rows.count();
+  await panel.getByLabel('写给 Kin 的信').fill(words);
+  await panel.getByLabel('打开日期').fill(tomorrow);
+  await panel.getByRole('button',{name:'封存',exact:true}).click();
+  await expect(rows).toHaveCount(before+1);
+  await expect(page.getByText(words)).toHaveCount(0);
+  const headers={Authorization:'Bearer test-console-local'};
+  expect(await (await page.request.get('/v1/sealed',{headers})).text()).not.toContain(words);
+  expect(await (await page.request.post('/v1/recall',{headers,data:{query:words}})).text()).not.toContain(words);
+  await rows.first().getByRole('button',{name:'永久删除…',exact:true}).click();
+  await rows.first().getByRole('button',{name:'确认永久删除',exact:true}).click();
+  await expect(rows).toHaveCount(before);
+  expect(errors).toEqual([]);
+});

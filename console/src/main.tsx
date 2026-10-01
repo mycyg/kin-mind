@@ -39,6 +39,7 @@ import {
   type Scope,
 } from "./api";
 import { EventGraphPanel } from "./EventGraphPanel";
+import { SealedEntries } from "./Sealed";
 import { listScopes, type ScopeList } from "./scopes.mjs";
 import {
   FamilyEditor,
@@ -839,6 +840,9 @@ function App() {
                 </button>
               )}
             </section>
+          )}
+          {view === "diary" && (
+            <SealedEntries scope={scope} run={run} notice={setNotice} />
           )}
           {view === "families" && (
             <>
