@@ -40,6 +40,7 @@ import {
 } from "./api";
 import { EventGraphPanel } from "./EventGraphPanel";
 import { SealedEntries } from "./Sealed";
+import { RecallAdmissionView } from "./RecallAdmission";
 import { listScopes, type ScopeList } from "./scopes.mjs";
 import {
   FamilyEditor,
@@ -60,6 +61,7 @@ const navigation = [
   ["diary", "日记与自述", FileText],
   ["conflicts", "冲突与纠正", ShieldCheck],
   ["recall", "召回实验室", Search],
+  ["admission", "自动带入", Layers3],
   ["contact", "主动联系", Bell],
   ["settings", "设置", Settings2],
 ] as const;
@@ -1093,6 +1095,9 @@ function App() {
                 </>
               )}
             </section>
+          )}
+          {view === "admission" && (
+            <RecallAdmissionView scope={scope} run={run} notice={setNotice} />
           )}
           {view === "contact" && (
             <ContactView

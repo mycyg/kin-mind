@@ -581,6 +581,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/recall/admissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Recall Admissions
+         * @description The newest relevance-admission observations of the automatic context: titles of what was
+         *     admitted, as the store titles it now, and what was dropped, counted by reason. Read only.
+         */
+        get: operations["read_recall_admissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/recall/quiet": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change Recall Quiet
+         * @description The owner's own "不主动提起" toggle on one record or graph node: `item_id`, `quiet`, `command_id`.
+         */
+        post: operations["change_recall_quiet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/conversation/reply-choice": {
         parameters: {
             query?: never;
@@ -2946,6 +2987,82 @@ export interface operations {
         };
     };
     update_conversation_habits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_recall_admissions: {
+        parameters: {
+            query?: {
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    change_recall_quiet: {
         parameters: {
             query?: never;
             header?: never;

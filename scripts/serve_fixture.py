@@ -1,5 +1,6 @@
 """Serve synthetic, non-private fixtures for browser and protocol tests."""
 
+import json
 import os
 from pathlib import Path
 
@@ -94,6 +95,20 @@ event = memory.ingest({"id":"console-migration-event","kind":"owner-message","te
 with engine.db.connect(write=True) as conn:
     units = memory.sharing.units(conn,event["event_id"],["隔离目录中的恢复验证已经通过。"],[event["source_id"]],owner_kind="work")
 memory.ingest({"id":"console-migration-delivery","kind":"delivery","at":"2026-09-01T01:05:00.000000+00:00","channel":"synthetic", "delivery_id":"synthetic-batch", "bubble_id":"synthetic-bubble", "text":"隔离目录中的恢复验证已经通过。", "state":"accepted", "message_id":"synthetic-message", "references":[{"unit_id":units[0]["id"],"version":1}]})
+# One synthetic relevance-admission observation for the console's transparency page.
+from kin_mind import recall_admission
+
+memory.configure({"recall_admission": "shadow", "recall_quiet_marks": True})
+recall_admission.ensure(engine)
+with engine.db.connect(write=True) as conn:
+    if not conn.execute("SELECT 1 FROM mind_recall_observations WHERE scope=?", (mind.scope.key(),)).fetchone():
+        conn.execute("INSERT INTO mind_recall_observations VALUES(?,?,?,?)", (mind.scope.key(), "console-synthetic", "2026-09-01T01:00:00+00:00", json.dumps({
+            "v": 1, "state": "scored", "reason": None, "threshold": 0.55, "quota": 4, "purpose": "chat", "mode": "light",
+            "setting": "shadow", "admitted": [ids[0]], "exempt": [],
+            "candidates": [{"id": ids[0], "revision": 1, "route": "lexical", "score": 0.82},
+                           {"id": ids[3], "revision": 1, "route": "lexical", "score": 0.31}],
+            "dropped": [{"id": ids[3], "reason": "below_threshold"}],
+            "timings": {"score_ms": 412.0, "scored": 2, "embedded": 3, "cached": 0}})))
 uvicorn.run(
     create_app(engine=engine, token="test-console-local", workers=False),
     host="127.0.0.1",

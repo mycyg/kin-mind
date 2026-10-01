@@ -1651,3 +1651,14 @@ footer span:nth-child(2) {
 .graph-revision {display:grid;gap:12px;padding:12px 0}.graph-revision label {display:grid;gap:6px}.graph-prose {overflow-wrap:anywhere}
 
 .graph {position:relative;overflow:hidden}.graph-node-label {position:absolute;transform:translateX(-50%);border:0;background:#f4f2eddd;font-size:11px;line-height:1.4;padding:2px 5px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#364e43}.graph-node-label:focus-visible {outline:2px solid #bc765a}
+
+/* Automatic-context transparency (RecallAdmission.tsx). */
+.admission-row {display:grid; gap:8px; padding:15px 0; border-top:1px solid var(--line);}
+.admission-meta {display:flex; flex-wrap:wrap; align-items:baseline; gap:10px;}
+.admission-meta strong {font-size:12px; font-weight:500;}
+.admission-meta small, .admission-row .dropped {font-size:10px; color:var(--muted);}
+.admitted {list-style:none; margin:0; padding:0; display:grid; gap:6px;}
+.admitted li {display:flex; align-items:center; justify-content:space-between; gap:12px; font-size:12px; min-width:0;}
+.admitted li span {min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.admitted li button {flex:none; font-size:11px;}
+.admitted .muted, .admission-panel + .panel .muted {color:var(--muted); font-size:11px;}

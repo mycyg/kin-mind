@@ -1584,6 +1584,112 @@ export const operations = {
       }
     }
   },
+  "read_recall_admissions": {
+    "method": "GET",
+    "path": "/v1/recall/admissions",
+    "parameters": [
+      {
+        "name": "project",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Project"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "persona",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Persona"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "Collection"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "world",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。",
+          "title": "World"
+        },
+        "description": "作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。"
+      },
+      {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "maximum": 100,
+          "minimum": 1,
+          "default": 30,
+          "title": "Limit"
+        }
+      }
+    ],
+    "body": {}
+  },
+  "change_recall_quiet": {
+    "method": "POST",
+    "path": "/v1/recall/quiet",
+    "parameters": [],
+    "body": {
+      "content": {
+        "application/json": {
+          "schema": {
+            "$ref": "#/components/schemas/GraphCommand"
+          }
+        }
+      },
+      "required": true
+    }
+  },
   "choose_reply": {
     "method": "POST",
     "path": "/v1/conversation/reply-choice",

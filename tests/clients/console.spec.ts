@@ -386,3 +386,19 @@ test('a reply to a diary entry goes out once, with its words and its entry, and 
   expect(Object.keys(posted[0].scope).sort()).toEqual(['collection','persona','project','world']);
   expect(errors).toEqual([]);
 });
+
+test('automatic context: admitted titles, drop reasons and the quiet toggle',async({page})=>{
+ const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.locator('nav').getByRole('button',{name:'自动带入',exact:true}).click();
+ await expect(page.getByRole('heading',{name:'自动带入',exact:true})).toBeVisible();
+ const row=page.locator('.admission-row').first();
+ await expect(row).toContainText('一次成功的数据库迁移');await expect(row).toContainText('相关度不足 1');
+ await expect(page.locator('.admission-panel')).toContainText('影子记录');
+ await row.getByRole('button',{name:'不主动提起',exact:true}).click();
+ await expect(page.getByRole('status')).toContainText('已设为不主动提起');
+ const quiet=page.locator('.quiet-list');await expect(quiet).toContainText('一次成功的数据库迁移');
+ await quiet.getByRole('button',{name:'恢复自动带入',exact:true}).click();
+ await expect(page.locator('.quiet-list')).toHaveCount(0);
+ await page.screenshot({path:'test-results/admission.png',fullPage:true});
+ expect(errors).toEqual([]);
+});

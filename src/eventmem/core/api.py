@@ -805,6 +805,22 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         from kin_mind.state import Mind
         return ConversationHabits(Mind(engine, request.scope)).update(request.request)
 
+    @app.get("/v1/recall/admissions", operation_id="read_recall_admissions")
+    def read_recall_admissions(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None,
+                               world: ScopePart = None, limit: int = Query(30, ge=1, le=100)) -> dict:
+        """The newest relevance-admission observations of the automatic context: titles of what was
+        admitted, as the store titles it now, and what was dropped, counted by reason. Read only."""
+        from kin_mind.recall_admission import recent
+        from kin_mind.state import Mind
+        return recent(Mind(engine, scope_of(project, persona, collection, world)), limit=limit)
+
+    @app.post("/v1/recall/quiet", operation_id="change_recall_quiet")
+    def change_recall_quiet(request: GraphCommand) -> dict:
+        """The owner's own "不主动提起" toggle on one record or graph node: `item_id`, `quiet`, `command_id`."""
+        from kin_mind.recall_admission import QuietMarks
+        from kin_mind.state import Mind
+        return QuietMarks(Mind(engine, request.scope)).change(request.request, actor="console")
+
     @app.post("/v1/conversation/reply-choice", operation_id="choose_reply")
     def choose_reply(request: GraphCommand) -> dict:
         from kin_mind.habits import ConversationHabits
