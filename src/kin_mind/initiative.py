@@ -22,7 +22,7 @@ import re
 import sqlite3
 from datetime import timedelta
 
-from .state import timestamp
+from .state import host_wait, timestamp
 
 WISH_KINDS = ("contact", "explore", "create")
 # How an exploration's failure is named here: its code, never its words.
@@ -52,7 +52,9 @@ def _code(value):
 
 def unsent_contacts(conn, mind, state, at):
     """Contact wishes still standing a day or more after they were made, with no send behind them.
-    A send of unknown outcome is being reconciled under its own id and is not one of them."""
+    A send of unknown outcome is being reconciled under its own id and is not one of them. One that
+    waits because the host held it -- its draft failed or never started -- says so (`wait_decided_by`):
+    that wait is no choice of Kin's (state.py HOST_WAIT_REASONS)."""
     now, held = timestamp(at), mind._unconfirmed_desires(conn)
     found = []
     for desire in state["desires"].values():
@@ -62,7 +64,8 @@ def unsent_contacts(conn, mind, state, at):
         hours = _hours(now, desire.get("created_at"))
         if hours is not None and hours >= UNSENT_CONTACT_HOURS:
             found.append({"desire_id": desire["id"], "status": desire["status"], "hours_since_made": hours,
-                          **({"share": True} if desire.get("exploration_id") else {})})
+                          **({"share": True} if desire.get("exploration_id") else {}),
+                          **({"wait_decided_by": "host"} if desire["status"] == "waiting" and host_wait(desire.get("contact_wait")) else {})})
     return sorted(found, key=lambda entry: (-entry["hours_since_made"], entry["desire_id"]))
 
 

@@ -92,24 +92,55 @@ def _label(value):
     return value[:96] if isinstance(value, str) and value else None
 
 
+# Whose call it was that an attempt ended unsent (2026-10-01: of 17 canceled on 2026-09-28, 14 were drafts
+# that failed, and each carried the host's fallback wait as its `decision`, just like Kin's own three). Kin's
+# decision to wait or let go is settled with this reason and kept as the attempt's `decision`. Every other
+# unsent end is the host's -- a failure, a draft that never started, a moved source, a review, the owner's
+# rules at the send -- and a wait the host then puts the wishes in is kept as `host_wait` (state.py
+# settle_contact), never as a `decision`. An older row is known by its reason alone.
+KIN_DECISION_REASON = "draft-decision"
+CONTACT_OUTCOMES = ("sent", "unconfirmed", "kin_wait", "kin_abandon", "host")
+
+
+def contact_outcome(state, reason, decision_action, host_wait=None):
+    """How a settled attempt ended, as a count reads it: `sent`, `unconfirmed`, Kin's own `kin_wait` or
+    `kin_abandon`, or `host` -- ended or held by the host, which is never a choice of Kin's. None while
+    the attempt is still open."""
+    if state == "accepted":
+        return "sent"
+    if state == "unconfirmed":
+        return "unconfirmed"
+    if state != "canceled":
+        return None
+    if not host_wait and reason == KIN_DECISION_REASON and decision_action in ("wait", "abandon"):
+        return "kin_" + decision_action
+    return "host"
+
+
 def contact_failures(conn, scope, now):
     """Proactive contacts that ended for a technical reason (`technical_failure`): how many in the last
     day, the last one, and the current streak -- the newest settled attempts back to the first that is
     not such a failure or has another code: how many, the code, its first and last time and the wish
-    of each (the attempt's leading wish). Times, codes, counts and ids only. An attempt still being
-    drafted or sent has no outcome yet and is passed over."""
+    of each (the attempt's leading wish). Beside them, how the attempts of the last day ended
+    (`contact_outcome`), so that a count of Kin's choices holds hers alone. Times, codes, counts and ids
+    only. An attempt still being drafted or sent has no outcome yet and is passed over."""
     rows = conn.execute(
-        "SELECT state,json_extract(data,'$.updated_at'),json_extract(data,'$.failure'),json_extract(data,'$.desire_id') "
+        "SELECT state,json_extract(data,'$.updated_at'),json_extract(data,'$.failure'),json_extract(data,'$.desire_id'),"
+        "json_extract(data,'$.reason'),json_extract(data,'$.decision.action'),json_extract(data,'$.host_wait.decided_by') "
         "FROM mind_contacts WHERE scope=? AND state NOT IN ('drafting','pending') ORDER BY rowid DESC LIMIT ?",
         (scope, CONTACT_ROWS_READ)).fetchall()
     failed_24h, last, streak, open_ = 0, None, None, True
-    for state, at, failure, wish in rows:
+    outcomes = dict.fromkeys(CONTACT_OUTCOMES, 0)
+    for state, at, failure, wish, reason, action, host_wait in rows:
         try:
             failure = json.loads(failure) if isinstance(failure, str) else None
         except ValueError:
             failure = None
         found = technical_failure(state, failure)
         seconds = _seconds(at)
+        outcome = contact_outcome(state, reason, action, host_wait)
+        if outcome and seconds is not None and seconds >= now - DAY:
+            outcomes[outcome] += 1
         if found and seconds is not None and seconds >= now - DAY:
             failed_24h += 1
         if found and last is None:
@@ -129,11 +160,28 @@ def contact_failures(conn, scope, now):
             streak["times"].append(_iso(seconds))
         if _label(wish) and _label(wish) not in streak["wish_ids"] and len(streak["wish_ids"]) < CONTACT_STREAK_WISHES:
             streak["wish_ids"].append(_label(wish))
-    return {"failed_24h": failed_24h, "last": last, "streak": streak}
+    return {"failed_24h": failed_24h, "last": last, "streak": streak, "outcomes_24h": outcomes}
 
 
 def _table(conn, name):
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def liveness_read(mind, part=None, *, now=None):
+    """The liveness facts for the host's own loops, answered by the resident worker (`liveness-facts`).
+    `part` "contact": the proactive contacts that failed for a technical reason (`contact_failures`) alone,
+    which the contact loop reads before it starts a draft (the host's contact pause). No part: the whole
+    of `liveness` without asking the embedding service, which the host's fault watch reads between two
+    self-checks. Read-only; counts, times, states, codes and ids, as `liveness`."""
+    if part not in (None, "contact"):
+        raise ValueError("Unknown liveness part")
+    now = time.time() if now is None else now
+    with mind.engine.db.connect() as conn:
+        scope = mind.scope.key()
+        if part == "contact":
+            return {"checked_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                    "contact_failures": contact_failures(conn, scope, now) if _table(conn, "mind_contacts") else None}
+        return liveness(conn, scope, now=now)
 
 
 def liveness(conn, scope, *, now=None):

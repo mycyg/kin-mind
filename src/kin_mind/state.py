@@ -137,6 +137,31 @@ class AffectiveEvent(Model):
 CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
 # A draft that could not start waits five minutes more each time, up to half an hour (CR2-INT-06).
 DRAFT_START_WAIT_MAX_SECONDS = 1800
+# The waits the host puts the wishes of an attempt in when it ended without a decision of Kin's
+# (settle_contact): a draft that failed or never started, a source that moved, a review that sent the
+# batch back, a repeat of an unknown send, a read deleted meanwhile. They are the host's backoff, never
+# her choice: since 2026-10-01 such a wait says so itself (`decided_by: "host"`, with its `cause`) and the
+# attempt keeps it as `host_wait`, not as its `decision`. An older one is known by the host's own words,
+# which are these; nothing is rewritten.
+HOST_WAIT_REASONS = frozenset({
+    "Draft generation or parsing failed",
+    "The draft could not start yet",
+    "The wholly unsent contact batch needs a new DeepSeek decision",
+    "The draft source changed before model execution",
+    "The owner context changed before the wholly unsent contact could be delivered",
+    "这条和一次结果未知的发送相同：那次按原编号对账；想说的话换成新的内容再说",
+    "Something the draft had read was deleted while it was written",
+    "Legacy empty draft; a new related source is required",
+})
+
+
+def host_wait(wait):
+    """Whether a wish's `contact_wait` is one the host put it in (HOST_WAIT_REASONS), an older one too."""
+    if not isinstance(wait, dict):
+        return False
+    if "decided_by" in wait:
+        return wait["decided_by"] == "host"
+    return wait.get("reason") in HOST_WAIT_REASONS
 # What the host keeps of a fork turn (boundaries.mjs `forkReceipt`: 64 tool calls, 1000 ids a call and
 # 2000 a turn), and how many ids of what a draft was shown an attempt row names. Past any, the row says
 # the record was cut short, and the settlement treats it so (CL6D-MM-01, CL6E-MM-04).
@@ -1550,6 +1575,9 @@ class Mind(Continuity):
             d = deepcopy(desire)
             d["needs_review"] = not self._fresh(conn, d["evidence"])
             d["expired"] = timestamp(d["expires_at"]) <= timestamp(at)
+            if host_wait(d.get("contact_wait")):
+                # The host's backoff is shown as the host's, a wait written before it said so too.
+                d["contact_wait"]["decided_by"] = "host"
             if d.get("trait_revisions"):
                 # Only where a wish really was committed on a trait, so a view without the ledger
                 # is the view it was. It is not dropped and it does not quietly stay ready: this is
@@ -2109,14 +2137,25 @@ class Mind(Continuity):
                             desire["reason_evidence_ids"] = written_from
                         else:
                             desire.pop("reason_evidence_ids", None)
+                        hers = applied is decision
                         if applied.action == "wait":
                             desire["contact_wait"] = self._wait_details(applied, self.clock(), attempt["owner_epoch"])
                             if written_from:
                                 desire["contact_wait"]["reason_evidence_ids"] = written_from
+                            if not hers:
+                                # The host's backoff, said as such wherever the wish is shown (HOST_WAIT_REASONS).
+                                desire["contact_wait"].update(decided_by="host", cause=reason)
                         else:
                             desire.pop("contact_wait", None)
-                        attempt.setdefault("decisions", {})[desire["id"]] = applied.model_dump()
-                        attempt["decision"] = applied.model_dump()
+                        if hers:
+                            attempt.setdefault("decisions", {})[desire["id"]] = applied.model_dump()
+                            attempt["decision"] = applied.model_dump()
+                        else:
+                            # What ended the attempt was no decision of Kin's: its wait is the host's, kept
+                            # apart from `decision`, which holds hers alone (2026-10-01).
+                            held = {**applied.model_dump(), "decided_by": "host", "cause": reason}
+                            attempt.setdefault("host_waits", {})[desire["id"]] = held
+                            attempt["host_wait"] = held
                         if stranded:
                             reviews.append((desire, review_failures))
                     conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(attempt), attempt_id))

@@ -76,6 +76,11 @@ def _dispatch(config, action, request):
     if config.get("contact_policy_file"):
         # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
         mind.register_contact_policy(config["contact_policy_file"])
+    if action == "liveness-facts":
+        # The host's contact pause and fault watch: the store's liveness facts, read-only, with no
+        # model, executor or embedding service asked (operational_status.liveness_read).
+        from .operational_status import liveness_read
+        return liveness_read(mind, request.get("part"))
     if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory"}:
         from .plans import AutonomousPlans
         from .procedures import Procedures
@@ -692,7 +697,7 @@ RESIDENT_ACTIONS = frozenset({
     "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
-    "context-delivery-metrics", "configure-habits", "reply-choice", "review-due",
+    "context-delivery-metrics", "configure-habits", "reply-choice", "review-due", "liveness-facts",
 })
 
 
