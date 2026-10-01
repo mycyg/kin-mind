@@ -863,6 +863,20 @@ DEFERRED_ROUTES_PROMPT = (
     "是一段新的经历就 create；只是相关就 link。member_ids 用该项的 member_ids，evidence_ids 引用该项 members 的 id。"
     "仍不确定就不处理，不为结清而强行归并。")
 
+# Added to either prompt only with `event_continuation` (and `event_lifecycle`) on, for an assessment
+# that organises memory: the enrichment's own prompt has no route rules, and neither prompt said
+# where a continuation's prior evidence is. Off, the prompt is exactly what it was. NEEDS 小光 OK.
+EVENT_CONTINUATION_PROMPT = (
+    "\nmemory.event_routes 把材料归入事件：一段新的经历用 create 并给出 title；与已有事件只是有关用 link；拿不准用 defer 或不提。"
+    "确认材料就是 memory_context.graph_candidates 中某个事件的延续时用 append（更正旧说法用 correct）："
+    "event_id 与 expected_revision 取该事件的 id 与 revision；member_ids 与 evidence_ids 取延续它的新材料；binding 用 sourced_continuation；"
+    "quote 从这些新材料里用户的原话中逐字摘一句，不改字、不拼接、不加省略号；"
+    "identity.decision 为 same_event，并分别如实判断 participants_match、object_match、time_compatible、continuation_supported；"
+    "identity.prior_record_ids 只填该事件 identity_evidence 里的 id，不填事件本身或其他节点的 id。"
+    "same_task 与 same_artifact 只用于宿主已把双方连到同一个任务或作品编号时。"
+    "标题相近不等于同一件事：参与者、对象或时间对不上就是另一段经历，用 create 或 link。"
+    "宿主会核对引文、身份判断和所引旧证据是否确属该事件，任一不符就暂缓归属。")
+
 
 def appraisal_schema(operational=False, historical=False, sections=(), review_max=REVIEW_MAX_MINUTES, required=(), timed=False,
                      disposition=False, sealing=False):
@@ -1831,7 +1845,8 @@ class DeepSeek:
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
                 + (RECALL_PROMPT if self._recall_scope(context) else "")
                 + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else "")
-                + ("\n" + SEALED_ENTRIES_PROMPT if self._sealing() and not historical else ""))
+                + ("\n" + SEALED_ENTRIES_PROMPT if self._sealing() and not historical else "")
+                + (EVENT_CONTINUATION_PROMPT if getattr(self, "event_continuation", False) else ""))
 
     def request_profile(self, context):
         """Digests of what frames an appraisal request besides its context: the input manifest keeps
@@ -2794,6 +2809,10 @@ class Appraisals:
                         named = {d["event_id"] for d in memory_context.get("pending_deferrals", []) if d.get("event_id")} - {n["id"] for n in graph}
                         graph.extend(n for n in memory_context["graph_candidates"] if n["id"] in named)
                         memory_context["graph_candidates"] = graph
+                        if settings["event_continuation"] and settings["event_lifecycle"]:
+                            # Each event with what it already holds, as a current assessment shows it (memory.show_continuation).
+                            self.memory.show_continuation(conn, graph, historical_query,
+                                                          {d["event_id"] for d in memory_context.get("pending_deferrals", []) if d.get("event_id")})
                 if memory_context and data.get("stimulus") == FOLLOW_UP and not data.get("frozen_memory_context"):
                     # A follow-up restates refused sections only. Events still pending need a full appraisal,
                     # so none is taken in here and the source cursor stays where it is.
@@ -2997,6 +3016,9 @@ class Appraisals:
                 provider.timed_concerns = settings.get("timed_concerns") is True
                 provider.anti_retreat = settings.get("anti_retreat") is True
                 provider.review_max_minutes = review_max
+                # How a continuation cites an event's evidence, for an assessment that organises memory.
+                provider.event_continuation = bool(settings["event_continuation"] and settings["event_lifecycle"]
+                                                   and memory_context and not operational)
                 # A DeepSeek assessment may read memory itself (K1-16); which lanes read is the
                 # provider's to tell from the stimulus (RECALL_WITHHELD). Set before the manifest reads
                 # the request profile it changes.

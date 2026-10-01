@@ -17,6 +17,7 @@ never establishes identity by itself.
 | `temperature_shadow` | Usage provenance and simulated thermal ordering |
 | `temperature_ranking` | Apply thermal ordering to optional automatic background |
 | `deferred_routes` | Deferred event routes are shown to later memory assessments until placed (needs `event_lifecycle` and `graph`) |
+| `event_continuation` | An enrichment is shown each candidate event's identity evidence, and memory assessments are told how a continuation cites it (needs `event_lifecycle`) |
 
 Those switches default to false. Enable on a backed-up copy first. Automatic
 volumes have `generated_by=kin-lifecycle`; manually maintained volumes retain
@@ -113,6 +114,24 @@ counts one look, an hour apart; after two looks without being placed it goes
 takes every row that names an erased source or record. The rows keep no
 evidence references, so the slimming migration has nothing of them. Off, none
 is written or shown and neither the memory context nor the prompt changes.
+
+With `event_continuation` on (and `event_lifecycle`), a genuine continuation
+can pass that check. Routes come from the enrichment lane, whose graph
+candidates used to be rebuilt without `identity_evidence` and whose prompt had
+no route rules, so a model could cite no member of an event it wanted to grow:
+it named the event's own id, which no check accepts, and every append was
+deferred. Now the enrichment's candidate events carry their identity evidence
+as a current assessment's do -- the latest two current members of each, id,
+revision and an excerpt of at most 250 tokens -- for the first eight events in
+the candidates' order and for every event a deferral shown with them names
+(`CONTINUATION_EVENTS`, `CONTINUATION_RECORDS`, `CONTINUATION_EXCERPT_TOKENS`).
+Those records are part of what the assessment is evaluated against, at the
+revisions it was shown, exactly as before. Every assessment that organises
+memory is told how a continuation is written (`EVENT_CONTINUATION_PROMPT`):
+`sourced_continuation`, a verbatim quote of the owner's words in the new
+material, `same_event` with all four judgments, and `prior_record_ids` taken from
+that event's `identity_evidence`. The host's check is unchanged. Off, the
+enrichment's candidates and both prompts are exactly what they were.
 
 Membership is an active versioned `part_of` edge. Appending advances the event
 revision. Corrections retain source records and create `corrects` edges. They do

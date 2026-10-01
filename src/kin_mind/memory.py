@@ -75,6 +75,12 @@ RETIRED_SETTINGS = frozenset({"chunked_reply_review", "rest_review_window", "rev
 # of what was thought. Small on purpose: structured context the compressor leaves as it is.
 REFLECTIONS_SHOWN = 5
 REFLECTION_EXCERPT = 200
+# `event_continuation`: how much of its candidate events an enrichment is shown to judge a
+# continuation by. The first this many events in the candidates' order, and every event a deferral
+# shown with them names; each with its latest members, each an excerpt of at most this many tokens.
+CONTINUATION_EVENTS = 8
+CONTINUATION_RECORDS = 2
+CONTINUATION_EXCERPT_TOKENS = 250
 
 DEFAULTS = {"native_window_context": False, "records": False, "semantic": False, "context": False, "idle": False, "operational_lanes": False,
             "manifests": False, "manifest_restore": False, "context_receipts": False, "continuity_overviews": False, "continuity_quality": False,
@@ -198,6 +204,11 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # Off by default. On, a route deferred for want of a verified binding, or by the
             # assessment, is shown to later memory assessments until placed or let go (event_deferrals).
             "deferred_routes": False,
+            # Off by default. On (with `event_lifecycle`), an enrichment is shown each candidate event
+            # with its identity evidence, as a current assessment is, and every memory assessment is
+            # told how a continuation cites it, so a genuine continuation can be appended (memory.
+            # CONTINUATION_EVENTS, appraisal.EVENT_CONTINUATION_PROMPT). Off, nothing changes.
+            "event_continuation": False,
             # 0 (the default) is off. Otherwise an enrichment job waits until the scope's conversation
             # has been quiet this many minutes, and the jobs waiting together are one request (settling).
             "enrichment_settle_minutes": 0,
@@ -406,7 +417,7 @@ class MemoryContinuity:
                     "exploration_decision_archive", "sealed_entries",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
                     "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat", "dreams", "diary_replies", "anniversaries",
-                    "recall_quiet_marks", "context_usage_hint",
+                    "recall_quiet_marks", "context_usage_hint", "event_continuation",
                     *memory_formation.SWITCHES):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")
@@ -750,13 +761,7 @@ class MemoryContinuity:
             for node in graph_context:
                 node["needs_review"] = not self.graph.fresh(conn, node)
                 if self.settings(conn)["event_lifecycle"] and node["kind"] == "event" and not node["needs_review"]:
-                    from .lifecycle import EventLifecycle
-                    from .adaptive_recall import evidence_excerpt
-                    members = EventLifecycle(self.mind, self.graph).snapshot(conn, node["id"], policy=policy)["records"]
-                    node["identity_evidence"] = [{"id": r["id"], "revision": r["revision"],
-                        "basis": policy.basis(r), "occurred_at": r["valid_from"],
-                        "text": evidence_excerpt(r["content"], query)[0], "excerpt_only": evidence_excerpt(r["content"], query)[1]}
-                        for r in sorted(members.values(), key=lambda r: r["valid_from"], reverse=True)[:2]]
+                    node["identity_evidence"] = self.identity_evidence(conn, node["id"], policy, query)
                 if node["kind"] in {"finding", "exploration", "work"}:
                     node["share_coverage"] = self.sharing.coverage(conn, node["id"])
             topic_candidates = []
@@ -836,6 +841,39 @@ class MemoryContinuity:
                 graph_context.append(node)
                 candidates.add(node["id"])
         return deferred
+
+    def identity_evidence(self, conn, event_id, policy, query, *, records=2, budget=500):
+        """An event's latest current members as an assessment is shown them, to judge whether new
+        material continues it: each record's id and revision -- what a continuation cites as
+        `prior_record_ids`, and the host checks against the event at commit (lifecycle `_binding`)
+        -- with an excerpt of the experience read `policy`."""
+        from .adaptive_recall import evidence_excerpt
+        from .lifecycle import EventLifecycle
+        members = EventLifecycle(self.mind, self.graph).snapshot(conn, event_id, policy=policy)["records"]
+        shown = []
+        for record in sorted(members.values(), key=lambda r: r["valid_from"], reverse=True)[:records]:
+            text, partial = evidence_excerpt(record["content"], query, budget=budget)
+            shown.append({"id": record["id"], "revision": record["revision"], "basis": policy.basis(record),
+                          "occurred_at": record["valid_from"], "text": text, "excerpt_only": partial})
+        return shown
+
+    def show_continuation(self, conn, graph_context, query, named=()):
+        """`event_continuation`: an enrichment's candidate events with their identity evidence, as a
+        current assessment shows them (`semantic_context`), so a continuation can cite what an event
+        already holds. Bounded: the first `CONTINUATION_EVENTS` events in the candidates' order and
+        every event in `named` (those the deferrals shown with them name); an event already carrying
+        its evidence keeps it, one that needs review is shown none."""
+        from eventmem.core.read_policy import ReadPolicy
+        policy = ReadPolicy.load(self.engine, self.scope, "experience_recall", conn=conn)
+        shown = 0
+        for node in graph_context:
+            if node.get("kind") != "event" or node.get("needs_review") or "identity_evidence" in node:
+                continue
+            if shown >= CONTINUATION_EVENTS and node["id"] not in named:
+                continue
+            node["identity_evidence"] = self.identity_evidence(conn, node["id"], policy, query,
+                                                               records=CONTINUATION_RECORDS, budget=CONTINUATION_EXCERPT_TOKENS)
+            shown += 1
 
     def queue_unorganized(self, jobs, agent_version, limit=16):
         """One more memory-only pass for the sources whose only carrier a commit had to drop.
