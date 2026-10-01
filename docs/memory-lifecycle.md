@@ -45,7 +45,8 @@ features reads the columns it always read. `mind_model_leases` also serves
 admission with `model_lanes` off; every other table above belongs to its switch
 alone. A rollback leaves the tables in place, and a re-enabled switch finds its
 history. `max_charged_attempts` is a number in the same configuration rather
-than a switch. `chunked_reply_review` is retired: a configuration that still
+than a switch, and so is `enrichment_settle_minutes` (0, the default, is off; see
+[one semantic queue](memory-continuity.md#one-semantic-queue)). `chunked_reply_review` is retired: a configuration that still
 carries it is not refused, and the key is ignored when read and dropped on the
 next write.
 
@@ -163,6 +164,10 @@ served — not even as a stale one — because it was written under rules that a
 still being applied.
 
 ## Retrieval interfaces
+
+A message is a source from the moment it is received. While its enrichment
+waits for the conversation to settle (`enrichment_settle_minutes`), and before
+any note is written from it, lexical and source recall find its raw words.
 
 `read_continuity_context` / host `memory-context` accept optional
 `mode=auto|light|deep`. Generic `RecallRequest.mode` passes through the Kin

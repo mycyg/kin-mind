@@ -19,7 +19,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.engine import DERIVED_CONFLICTS
 from eventmem.core.models import Model, RecordInput, SourceInput
 
-from . import memory_items
+from . import memory_items, settling
 from .autonomy_schema import optimized
 from .computer import redact
 from .dialogue import recent_dialogue
@@ -164,7 +164,10 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "appraisal_input_budget": None,
             # Off by default. On, a route deferred for want of a verified binding, or by the
             # assessment, is shown to later memory assessments until placed or let go (event_deferrals).
-            "deferred_routes": False}
+            "deferred_routes": False,
+            # 0 (the default) is off. Otherwise an enrichment job waits until the scope's conversation
+            # has been quiet this many minutes, and the jobs waiting together are one request (settling).
+            "enrichment_settle_minutes": 0}
 
 
 class MemoryNote(Model):
@@ -397,6 +400,9 @@ class MemoryContinuity:
                 raise ValueError("Owner aliases are up to eight short names")
             if type(config["max_charged_attempts"]) is not int or not 1 <= config["max_charged_attempts"] <= 20:
                 raise ValueError("Charged appraisal attempts must be between 1 and 20")
+            from .settling import SETTING, SETTLE_RANGE
+            if type(config[SETTING]) is not int or not SETTLE_RANGE[0] <= config[SETTING] <= SETTLE_RANGE[1]:
+                raise ValueError(f"Enrichment settling is a whole number of minutes, {SETTLE_RANGE[0]}..{SETTLE_RANGE[1]} (0 is off)")
             conn.execute("INSERT OR REPLACE INTO mind_memory_config VALUES(?,?)", (self.scope.key(), dumps(config)))
             if values.get("event_lifecycle") is False:
                 conn.execute("DELETE FROM mind_foreground_leases WHERE scope=?", (self.scope.key(),))
@@ -604,6 +610,9 @@ class MemoryContinuity:
                 receipt["event_id"] = self.graph.runtime(conn, event, receipt, event_id)["id"]
             cursor = conn.execute("INSERT INTO mind_runtime_events(id,scope,kind,occurred_at,digest,data) VALUES(?,?,?,?,?,?)",
                                   (event_id, self.scope.key(), kind, event["at"], fingerprint, dumps({**event, "artifact": artifact, "source_id": source_id, "receipt": receipt})))
+            if kind in settling.CONVERSATION and not event.get("historical"):
+                # The conversation moved: what waits for it to be quiet waits from here (settling).
+                settling.push(conn, self.scope.key(), settling.minutes(self.settings(conn)))
             return {"id": event_id, "seq": cursor.lastrowid, "state": "recorded", **receipt}
 
     def _optional_sources(self, conn, identifier):

@@ -26,7 +26,7 @@ from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, erasure, initiative, judgment_cache, revalidation
+from . import attempts, erasure, initiative, judgment_cache, revalidation, settling
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
 from .autonomy_schema import optimized
@@ -2391,6 +2391,41 @@ class Appraisals:
             released.append(member_id)
         return released
 
+    def _settled_batch(self, conn, row, data, settings):
+        """An enrichment job claimed once its conversation was quiet takes in every other enrichment
+        job of the scope that is due, as one batch: one request for the whole conversation, its
+        evidence the union of theirs within `settling.MERGE_IDS` sources and half the input budget
+        (settling). In the claim's transaction. A row that takes others in no longer uses the memory
+        its parent proposed for part of it; a row already carrying a batch, given back by a split,
+        or keeping a proposal of its own for reuse takes nothing in."""
+        data.pop("settle", None)
+        if data.get("batch_ids") or data.get("solo") or data.get("reuse"):
+            return []
+        own = {"evidence_ids": list(data["evidence_ids"]), "stimulus": settling.STIMULUS}
+        budget = appraisal_input_budget(settings.get("appraisal_input_budget")) // settling.MERGE_BUDGET_SHARE
+        ids, batch_ids, cache = list(own["evidence_ids"]), [], {}
+        for child in conn.execute(
+                "SELECT id FROM mind_appraisals WHERE scope=? AND state='pending' AND available<=? AND id<>? "
+                "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.solo') IS NULL ORDER BY available,id LIMIT ?",
+                (self.mind.scope.key(), time.time(), row["id"], settling.STIMULUS, settling.MERGE_CANDIDATES)).fetchall():
+            # A child that carries a batch of its own brings its whole subtree, as the action lane's does.
+            members, member_evidence = self._batch_members(conn, [child["id"]])
+            combined = list(dict.fromkeys(ids + member_evidence))
+            if len(combined) > settling.MERGE_IDS or settling.evidence_tokens(self.engine, conn, combined, cache) > budget:
+                break
+            ids = combined
+            batch_ids.extend(m for m in members if m not in batch_ids and m != row["id"])
+        if not batch_ids:
+            return []
+        for field in settling.SEED_FIELDS:
+            data.pop(field, None)
+        # Prepared for the evidence the row had alone.
+        data.pop("frozen_memory_context", None)
+        data.update(batch_ids=batch_ids, evidence_ids=ids, stimuli=[settling.STIMULUS], own=own)
+        for child_id in batch_ids:
+            conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
+        return batch_ids
+
     def runnable(self, lane):
         """Whether run_one(lane=lane) would find a job now, without claiming it: the host starts a
         model process only then (T-14). A compaction in progress runs nothing (K3-14)."""
@@ -2500,6 +2535,8 @@ class Appraisals:
                 conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (queue_row(conn, self.mind.scope.key(), data), row["id"]))
                 for child_id in batch_ids:
                     conn.execute("UPDATE mind_appraisals SET state='batched' WHERE id=? AND state IN ('pending','batched')", (child_id,))
+            if enrichment and data.get("stimulus") == settling.STIMULUS and settling.minutes(settings) and not committed_before:
+                self._settled_batch(conn, row, data, settings)
             ledger = attempts.enabled(conn, self.mind.scope.key())
             # An expired `running` row means its claimer died without ending its attempt,
             # so nothing recorded it. Back-fill that attempt before this one starts.
@@ -3341,8 +3378,13 @@ class Appraisals:
                                 # by a model that began at its parent's mark (CL6E-MM-02).
                                 "evaluated_ids": data.get("evaluated_ids") or [],
                                 "seed_tombstone_mark": data.get("tombstone_mark")}
+                            available_at = time.time()
+                            if settling.minutes(settings):
+                                # It waits for the conversation to be quiet, and moves with it (settling).
+                                enrichment_data["settle"] = True
+                                available_at = settling.available(conn, self.mind.scope.key(), settling.minutes(settings), available_at)
                             conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                                (enrichment_id, self.mind.scope.key(), "pending", time.time(),
+                                (enrichment_id, self.mind.scope.key(), "pending", available_at,
                                  queue_row(conn, self.mind.scope.key(), enrichment_data)))
                     elif memory_context:
                         # A later bubble may extend the same share while DS runs.
