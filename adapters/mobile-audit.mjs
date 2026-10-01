@@ -30,6 +30,10 @@ export function withDetected(result,snapshot) {
 
 /** A failed reading is retried soon twice, then waits for its ordinary interval. */
 export const AUDIT_FAILURE_RETRY_MINUTES=Object.freeze([5,15]);
+/** Two readings a fault brings forward (`expedite`) are at least this far apart: at most one comes early
+ * in an hour. A regular reading does not count: one that came before the fault could not see it. */
+export const EXPEDITE_MIN_GAP_MS=3600000;
+const FAULT_CODE=/^[a-z0-9][a-z0-9:_.-]{0,79}$/;
 /** A fault seen again within this long after it cleared is the same incident. */
 export const INCIDENT_REOPEN_MS=24*3600000;
 /** The schema of the audit's state as this code writes it: incidents Kin is told of, the repair
@@ -148,6 +152,32 @@ export class MobileAudit {
       this.state.lastError={at:this.now(),stage,reason:error.message?.startsWith('deepseek-')?error.message:'audit-review-unavailable',receipt:error.receipt};return{state:'failed',nextAt:this.state.nextAt};}
     finally {this.running=false;try {await held?.release();} finally {gate?.release();}atomicJson(this.file,this.state);}
   }
+  /** A fault the host's own liveness rules call an error, seen between two readings (the host's fault
+   * watch; 2026-09-28: every proactive draft failed for an hour and the self-check said so only at its
+   * regular reading): the next reading comes soon instead of at its interval. `codes` are the faults now,
+   * as static codes. Only one not among those of the last call asks -- one that cleared and came back asks
+   * again -- and a reading so brought forward is never due within `minGapMs` of the one brought forward
+   * before it. It
+   * moves the time and nothing else: the reading still passes the router's gate, so none runs under a
+   * release freeze, and the lane's lease. Answers what it did. */
+  expedite(codes,{minGapMs=EXPEDITE_MIN_GAP_MS}={}) {
+    if(this.refused)return {state:'refused'};
+    if(this.running)return {state:'running'};
+    const now=this.now();
+    const current=[...new Set((Array.isArray(codes)?codes:[]).filter(code=>typeof code==='string'&&FAULT_CODE.test(code)))].sort();
+    const known=Array.isArray(this.state.faults?.codes)?this.state.faults.codes:[];
+    const fresh=current.filter(code=>!known.includes(code)),changed=current.join()!==known.join();
+    if(changed)this.state.faults={codes:current,at:now};
+    let answer;
+    if(!fresh.length)answer={state:current.length?'known':'clear'};
+    else {
+      const at=Math.max(now,(Number.isFinite(this.state.expedited?.nextAt)?this.state.expedited.nextAt:-Infinity)+minGapMs);
+      if(this.state.nextAt<=at)answer={state:'due',nextAt:this.state.nextAt,codes:fresh};
+      else {this.state.nextAt=at;this.state.expedited={at:now,codes:fresh,nextAt:at};answer={state:'expedited',nextAt:at,codes:fresh};}
+    }
+    if(changed||answer.state==='expedited')atomicJson(this.file,this.state);
+    return answer;
+  }
   record(id,result,at) {
     const incidents=Object.values(this.state.incidents);
     if(result.status==='healthy') {
@@ -183,6 +213,7 @@ export class MobileAudit {
   view() {
     if(this.refused)return {status:'refused',reason:this.refused.reason,schema:this.refused.schema,incidents:[]};
     return {status:this.state.status??'not-run',nextAt:this.state.nextAt,lastSuccessAt:this.state.lastSuccessAt,failures:this.state.failures??0,
+      ...(this.state.expedited?{expedited:this.state.expedited}:{}),
       incidents:this.incidentList().filter(i=>i.state==='open').map(i=>({id:i.id,codes:i.codes,seen:i.seen,firstSeenAt:i.firstSeenAt,lastSeenAt:i.lastSeenAt,told:Boolean(i.toldAt)}))};
   }
 }
