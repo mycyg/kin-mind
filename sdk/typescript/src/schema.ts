@@ -598,6 +598,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/diary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Kin Diary */
+        get: operations["read_kin_diary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/diary/replies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reply To Diary */
+        post: operations["reply_to_diary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/autonomy/plans": {
         parameters: {
             query?: never;
@@ -2947,6 +2981,83 @@ export interface operations {
         };
     };
     choose_reply: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_kin_diary: {
+        parameters: {
+            query?: {
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                project?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                persona?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                collection?: string | null;
+                /** @description 作用域的一个字段。四个都省略时读取本服务的部署作用域（health 的 default_scope）；只给出一部分时，其余字段取默认值。 */
+                world?: string | null;
+                cursor?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reply_to_diary: {
         parameters: {
             query?: never;
             header?: never;

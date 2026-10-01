@@ -49,13 +49,16 @@ def root(engine, sid):
                                        (sid,)).fetchone()[0])
 
 
-def test_the_table_is_exported_and_names_six_kinds():
+def test_the_table_is_exported_and_names_seven_kinds():
     table = json.loads(ORIGINS_FILE.read_text())
-    assert set(table["kinds"]) == {"host_maintenance", "synthetic_example", "configuration", "kin_thought",
+    assert set(table["kinds"]) == {"host_maintenance", "kin_dream", "synthetic_example", "configuration", "kin_thought",
                                    "observation", "external_excerpt"}
-    assert {kind: ORIGIN_KINDS[kind][0] for kind in ("host_maintenance", "synthetic_example", "configuration")} == {
-        "host_maintenance": "host_envelope", "synthetic_example": "synthetic_example",
+    assert {kind: ORIGIN_KINDS[kind][0] for kind in ("host_maintenance", "kin_dream", "synthetic_example", "configuration")} == {
+        "host_maintenance": "host_envelope", "kin_dream": "host_envelope", "synthetic_example": "synthetic_example",
         "configuration": "role_configuration"}
+    # A dream is never evidence and never recalled (kin_mind.dreams), and is no host bookkeeping either.
+    assert origin_of("kin-dream") == "kin_dream" and not host_maintenance({"namespace": "kin-dream"})
+    assert never_evidence({"namespace": "kin-dream"}) and not never_evidence({"namespace": "kin-reflection"})
     assert all(ORIGIN_KINDS[kind][0] == "experience" for kind in ("kin_thought", "observation", "external_excerpt"))
     assert origin_of("kin-session-maintenance") == "host_maintenance"
     assert origin_of("mind-internal-event:follow-up") == "host_maintenance"

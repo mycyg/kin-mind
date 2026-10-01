@@ -781,6 +781,54 @@ footer span:nth-child(2) {
   color: #8d9b7e;
   font-size: 11px;
 }
+.diary-entries {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.diary-entry {
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+.diary-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.diary-text {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diary-reply {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--accent);
+}
+.diary-reply p {
+  margin-top: 4px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diary-reply-form {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  margin-top: 10px;
+}
+.diary-reply-form textarea {
+  flex: 1;
+  min-width: 0;
+}
+.kin-dreams {
+  margin-top: 20px;
+}
+.diary-entry.dream .diary-text {
+  font-style: italic;
+}
 .record-id {
   font-size: 9px;
   color: #a8ae9c;

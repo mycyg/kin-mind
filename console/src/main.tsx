@@ -190,6 +190,7 @@ function App() {
     }),
     [models, setModels] = useState<any>({}),
     [revisionText, setRevisionText] = useState(""),
+    [diary, setDiary] = useState<any>(null),
     [mobile, setMobile] = useState(false),
     [notice, setNotice] = useState("");
   const busy = pending > 0;
@@ -200,7 +201,8 @@ function App() {
   const items = page.key === listKey ? page.items : [];
   const latestRecords = useLatest(),
     latestFamilies = useLatest(),
-    latestRead = useLatest();
+    latestRead = useLatest(),
+    latestDiary = useLatest();
   useEffect(() => saveScope(scope), [scope]);
   const run = useCallback(async (task: () => Promise<any>) => {
     setPending((n) => n + 1);
@@ -249,6 +251,24 @@ function App() {
     },
     [scope, view, browseSearch, latestRecords],
   );
+  // Kin's own diary (kin-reflection), each entry with the owner's replies, and her dreams: the
+  // narrative records listed below never held one of her entries.
+  const loadDiary = useCallback(
+    async (next?: number) => {
+      const signal = latestDiary();
+      const r = await api.call("read_kin_diary", {
+        query: { ...scope, limit: 20, ...(next ? { cursor: next } : {}) },
+        signal,
+      });
+      if (signal.aborted) return;
+      setDiary((previous: any) =>
+        next && previous
+          ? { ...r, entries: [...previous.entries, ...r.entries], dreams: previous.dreams }
+          : r,
+      );
+    },
+    [scope, latestDiary],
+  );
   const loadContact = useCallback(async (table?: string, cursor?: string) => {
     const tables = table ? [table] : ["policies", "schedules", "outbox"];
     const rows = await Promise.all(
@@ -287,11 +307,12 @@ function App() {
   }, [scope, family, latestFamilies]);
   const loadView = useCallback(async () => {
     if (recordViews.includes(view)) await loadRecords();
+    if (view === "diary") await loadDiary();
     if (view === "families") await loadFamilies();
     if (view === "contact") await loadContact();
     if (view === "settings")
       setModels(await api.call("read_settings", { path: { key: "models" } }));
-  }, [view, loadRecords, loadFamilies, loadContact]);
+  }, [view, loadRecords, loadDiary, loadFamilies, loadContact]);
   const refresh = useCallback(() => {
     // The picker's list is read again the next time it is opened: scopes come and go.
     setScopes(null);
@@ -777,6 +798,18 @@ function App() {
                 </span>
               </div>
             </>
+          )}
+          {view === "diary" && diary && (
+            <KinDiary
+              data={diary}
+              scope={scope}
+              run={run}
+              onSaved={async () => {
+                setNotice("回复已保存，Kin 下一次评估时会读到");
+                await loadDiary();
+              }}
+              onMore={(cursor) => void run(() => loadDiary(cursor))}
+            />
           )}
           {["memories", "timeline", "knowledge", "diary", "conflicts"].includes(
             view,
@@ -1355,6 +1388,129 @@ function Logo() {
         MemoryPalace<span>记忆宫殿</span>
       </strong>
     </div>
+  );
+}
+function KinDiary({
+  data,
+  scope,
+  run,
+  onSaved,
+  onMore,
+}: {
+  data: any;
+  scope: Scope;
+  run: (task: () => Promise<any>) => Promise<any>;
+  onSaved: () => Promise<void>;
+  onMore: (cursor: number) => void;
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // One command per draft: a retry of the same words is the same reply, other words are a new one.
+  const commands = useRef<Record<string, { text: string; id: string }>>({});
+  const replying = data.replies === "enabled";
+  const dreams = data.dreams?.state === "enabled" ? data.dreams.dreams : null;
+  const send = (entry: string) =>
+    run(async () => {
+      const text = (drafts[entry] ?? "").trim();
+      if (!text) return;
+      const held = commands.current[entry];
+      const command =
+        held && held.text === text ? held.id : commandId();
+      commands.current[entry] = { text, id: command };
+      await api.call("reply_to_diary", {
+        body: {
+          scope,
+          request: { reflection_id: entry, text, command_id: command },
+        },
+      });
+      delete commands.current[entry];
+      setDrafts((previous) => ({ ...previous, [entry]: "" }));
+      await onSaved();
+    });
+  return (
+    <section className="panel kin-diary" aria-label="Kin 的日记">
+      <div className="panel-title">
+        <div>
+          <h2>Kin 的日记</h2>
+          <p>
+            Kin 自己写下的想法，最新的在前。
+            {replying ? "可以直接回复，回复会作为你的原话交给她。" : ""}
+          </p>
+        </div>
+        <span className="label-muted">{data.entries.length} 篇已加载</span>
+      </div>
+      {data.entries.length === 0 ? (
+        <Empty title="还没有日记" detail="Kin 写下日记后会出现在这里。" />
+      ) : (
+        <ol className="diary-entries">
+          {data.entries.map((entry: any) => (
+            <li className="diary-entry" key={entry.source_id}>
+              <div className="diary-head">
+                <strong>{entry.topic || "日记"}</strong>
+                <span className="label-muted">{stamp(entry.at)}</span>
+              </div>
+              <p className="diary-text">{entry.text}</p>
+              {entry.replies.map((reply: any) => (
+                <blockquote className="diary-reply" key={reply.source_id}>
+                  <span className="label-muted">回复 · {stamp(reply.at)}</span>
+                  <p>{reply.text}</p>
+                </blockquote>
+              ))}
+              {replying && (
+                <form
+                  className="diary-reply-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void send(entry.source_id);
+                  }}
+                >
+                  <textarea
+                    aria-label="回复这篇日记"
+                    maxLength={2000}
+                    rows={2}
+                    value={drafts[entry.source_id] ?? ""}
+                    onChange={(e) =>
+                      setDrafts((previous) => ({
+                        ...previous,
+                        [entry.source_id]: e.target.value,
+                      }))
+                    }
+                    placeholder="写点什么回给她"
+                  />
+                  <button
+                    className="subtle"
+                    disabled={!(drafts[entry.source_id] ?? "").trim()}
+                  >
+                    回复
+                  </button>
+                </form>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+      {data.cursor && (
+        <button className="load-more" onClick={() => onMore(data.cursor)}>
+          加载更多日记
+        </button>
+      )}
+      {dreams && (
+        <section className="kin-dreams" aria-label="Kin 的梦">
+          <h3>梦</h3>
+          {dreams.length === 0 ? (
+            <p className="label-muted">还没有梦。</p>
+          ) : (
+            <ol className="diary-entries">
+              {dreams.map((dream: any) => (
+                <li className="diary-entry dream" key={dream.source_id}>
+                  <span className="label-muted">{stamp(dream.at)}</span>
+                  <p className="diary-text">{dream.text}</p>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      )}
+    </section>
   );
 }
 function VirtualRecords({

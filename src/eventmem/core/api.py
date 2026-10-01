@@ -811,6 +811,23 @@ def create_app(root=None, *, engine=None, token=None, workers=True, mcp_enabled=
         from kin_mind.state import Mind
         return ConversationHabits(Mind(engine, request.scope)).choose_reply(request.request)
 
+    # Kin's own diary (kin-reflection), newest first, each entry with the owner's replies; on the first
+    # page also Kin's dreams. Replies and dreams follow their switches (kin_mind.diary, kin_mind.dreams).
+    @app.get("/v1/diary", operation_id="read_kin_diary")
+    def read_kin_diary(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None, cursor: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)) -> dict:
+        from kin_mind import diary, dreams
+        from kin_mind.state import Mind
+        mind = Mind(engine, scope_of(project, persona, collection, world))
+        return {**diary.read(mind, cursor=cursor, limit=limit), "dreams": None if cursor else dreams.read(mind)}
+
+    # The owner's reply to one diary entry: request {reflection_id, text, command_id}. Kept as the
+    # owner's own statement and queued for an appraisal; refused while `diary_replies` is off.
+    @app.post("/v1/diary/replies", operation_id="reply_to_diary")
+    def reply_to_diary(request: GraphCommand) -> dict:
+        from kin_mind.diary import reply
+        from kin_mind.state import Mind
+        return reply(Mind(engine, request.scope), request.request)
+
     @app.get("/v1/autonomy/plans", operation_id="read_autonomous_plans")
     def read_autonomous_plans(project: ScopePart = None, persona: ScopePart = None, collection: ScopePart = None, world: ScopePart = None, identifier: str | None = None, status: str | None = None, cursor: int = Query(0, ge=0), limit: int = Query(24, ge=1, le=100), history: bool = False) -> dict:
         from kin_mind.plans import AutonomousPlans

@@ -94,8 +94,9 @@ NAMESPACE_REGISTRY = (
 )
 
 # The supplementary origin of a source: what kind of thing it is, over and above who wrote it.
-# Six kinds in one table, `source-origins.json` beside this module, which the hosts read too.
-# Three kinds are never experience (host maintenance, synthetic examples, configuration); three
+# Seven kinds in one table, `source-origins.json` beside this module, which the hosts read too.
+# Four kinds are never experience (host maintenance, Kin's dreams, synthetic examples,
+# configuration); three
 # are experience that keeps its nature as a label (Kin's thoughts, observations, external
 # material). A registry rule, public or private, is asked first; the owner's own explicit turns
 # stay experience whatever namespace carries them.

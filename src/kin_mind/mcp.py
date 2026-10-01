@@ -90,6 +90,12 @@ def register_mind_tools(server, engine):
         return read(Mind(engine, scope), identifier, kind=kind)
 
     @server.tool()
+    def read_dreams(scope: Scope, cursor: int = 0, limit: int = 10) -> dict:
+        """读取 Kin 自己做过的梦，最新的在前。梦是休息时的想象，不是发生过的事，不能当作记忆、事实或任何判断的依据；要不要讲给小光听由你决定，读取本身不会发出任何消息。dreams 设置关闭时返回 disabled。"""
+        from .dreams import read
+        return read(Mind(engine, scope), cursor=max(0, cursor), limit=min(max(1, limit), 50))
+
+    @server.tool()
     def read_affective_state(scope: Scope, history: int = 0, query: str = "") -> dict:
         """读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到状态时说明分数与依据，其余时候自然体现。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
         from .context import Contexts, enabled

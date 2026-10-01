@@ -340,5 +340,46 @@ test('a letter to Kin is sealed until its day: only its date shows, and it can b
   await rows.first().getByRole('button',{name:'永久删除…',exact:true}).click();
   await rows.first().getByRole('button',{name:'确认永久删除',exact:true}).click();
   await expect(rows).toHaveCount(before);
+test('Kin\'s own diary entries are read in their group, with no reply box while replies are off',async({page})=>{
+  // Kin's entries are kin-reflection sources whose records are episodes: the narrative list never held one.
+  const headers={Authorization:'Bearer test-console-local'};
+  const thought='合成日记 '+Date.now();
+  expect((await page.request.post('/v1/sources',{headers,data:{namespace:'kin-reflection',key:thought,authority:'model',
+    text:'Kin 自己的想法（日记与感想，不是主人的原话或已确认事实）：\n'+thought,metadata:{role:'assistant',host_event:'diary',topic:'合成'}}})).ok()).toBe(true);
+  await page.locator('nav').getByRole('button',{name:'日记与自述',exact:true}).click();
+  const panel=page.getByRole('region',{name:'Kin 的日记'});
+  await expect(panel).toContainText(thought);
+  await expect(panel).not.toContainText('Kin 自己的想法（');
+  await expect(panel.getByLabel('回复这篇日记')).toHaveCount(0);
+  await expect(page.getByRole('region',{name:'Kin 的梦'})).toHaveCount(0);
+});
+
+test('a reply to a diary entry goes out once, with its words and its entry, and shows under it',async({page})=>{
+  const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  const entry={source_id:'src_'+'d'.repeat(32),at:'2026-10-01T02:00:00+00:00',topic:'钟表',text:'今天拆了一只旧闹钟。'};
+  const posted:any[]=[];let replies:any[]=[];
+  await page.route(url=>url.pathname==='/v1/diary/replies',async route=>{
+    const body=route.request().postDataJSON();posted.push(body);
+    replies=[{source_id:'src_'+'e'.repeat(32),at:'2026-10-01T03:00:00+00:00',text:body.request.text}];
+    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({state:'recorded',source_id:replies[0].source_id})});
+  });
+  await page.route(url=>url.pathname==='/v1/diary',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({
+    entries:[{...entry,replies}],cursor:null,replies:'enabled',
+    dreams:{state:'enabled',cursor:null,dreams:[{source_id:'src_'+'f'.repeat(32),at:'2026-10-01T01:00:00+00:00',text:'我站在一座全是钟表的旧房子里。'}]}})}));
+  await page.locator('nav').getByRole('button',{name:'日记与自述',exact:true}).click();
+  const panel=page.getByRole('region',{name:'Kin 的日记'});
+  await expect(panel).toContainText('今天拆了一只旧闹钟。');
+  await expect(page.getByRole('region',{name:'Kin 的梦'})).toContainText('全是钟表的旧房子');
+  const box=panel.getByLabel('回复这篇日记');
+  await expect(panel.getByRole('button',{name:'回复',exact:true})).toBeDisabled();
+  await box.fill('我也喜欢钟，下次一起拆');
+  await panel.getByRole('button',{name:'回复',exact:true}).click();
+  await expect(page.locator('.notice')).toContainText('回复已保存');
+  await expect(panel.locator('.diary-reply')).toContainText('我也喜欢钟，下次一起拆');
+  await expect(box).toHaveValue('');
+  expect(posted).toHaveLength(1);
+  expect(posted[0].request).toMatchObject({reflection_id:entry.source_id,text:'我也喜欢钟，下次一起拆'});
+  expect(typeof posted[0].request.command_id).toBe('string');
+  expect(Object.keys(posted[0].scope).sort()).toEqual(['collection','persona','project','world']);
   expect(errors).toEqual([]);
 });

@@ -26,10 +26,10 @@ from eventmem.core.db import NAMED, Conflict, Missing, digest, dumps
 from eventmem.core.models import Model, RecallQuery, RecallRequest, Scope, SourceInput
 from eventmem.core.persona import load_persona, persona_metadata, persona_prompt
 
-from . import attempts, erasure, initiative, judgment_cache, memory_formation, revalidation, sealed, settling
+from . import attempts, diary, dreams, erasure, initiative, judgment_cache, memory_formation, revalidation, sealed, settling
 from . import manifest as manifests
 from .autonomy_models import ActionDecision, PlanChange, ProcedureCandidate
-from .autonomy_schema import optimized
+from .autonomy_schema import enabled, optimized
 from .conflicts import classify, static_message
 from .continuity import TIMED_FIELDS, ConcernProposal, RhythmProposal, select_concerns
 from .continuity import Understanding as Interpretation
@@ -383,6 +383,12 @@ class ExpressionIntent(Model):
     trait_refs: list[Identifier] = Field(default_factory=list, max_length=6)
 
 
+class Dream(Model):
+    # Shape only; its bounds (dreams.LENGTH) are the commit's, so a dream out of them costs the
+    # night's dream and never the review.
+    text: str = Field(min_length=1, max_length=400)
+
+
 class NextMove(Model):
     move: Literal["reply", "quiet", "rest"]
     wish_ref: Identifier | None = None
@@ -455,6 +461,7 @@ class Appraisal(Model):
     prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
     expression_intent: ExpressionIntent | None = None
     next_move: NextMove | None = None
+    dream: Dream | None = None
 
     @field_validator("understanding", mode="before")
     @classmethod
@@ -530,13 +537,14 @@ SECTION_UPSTREAM = {
     "prediction_outcomes": {},
     "expression_intent": {"trait_decisions": None, "concerns": None},
     "next_move": {"trait_decisions": None, "wishes": None, "action_decisions": None},
+    "dream": {},
 }
 # Recorded and audited, never asked again: a refusal of one of these, and anything held behind one,
 # costs no model call. They are left out of the derivation below for exactly that reason. The order
 # is the order apply() commits them in: what is observed, then what was decided from it, then the
 # move, which is checked last because it may cite anything the same commit applied.
 AUDIT_SECTIONS = ("trait_observations", "trait_decisions", "self_hypothesis", "prediction_outcomes",
-                  "expression_intent", "next_move")
+                  "expression_intent", "dream", "next_move")
 # Applied inside a savepoint and a state snapshot, so each can be refused alone. A failure of any other
 # field fails the appraisal as before: without the event nothing is left to anchor the rest to.
 ISOLATED_SECTIONS = ("habits", "plan_changes", "action_decisions", "procedure_candidates", "concerns", "wishes", "wish_updates", "session_advice", *AUDIT_SECTIONS)
@@ -562,7 +570,11 @@ if set(AUDIT_SECTIONS) & ASK_AGAIN_SECTIONS:
 # The switch each audited section is offered under. A switch that carries no section is not here.
 AUDIT_SECTION_SWITCH = {"trait_observations": "trait_ledger", "trait_decisions": "trait_ledger",
                         "self_hypothesis": "behavior_chain", "prediction_outcomes": "behavior_chain",
-                        "expression_intent": "expression_intent", "next_move": "next_move_audit"}
+                        "expression_intent": "expression_intent", "next_move": "next_move_audit",
+                        "dream": "dreams"}
+# Switches that are off unless a store turns them on (autonomy_schema.enabled); every other one is an
+# optimization, on unless a store turns it off.
+OPT_IN_SWITCHES = frozenset({"dreams"})
 # Lanes that never carry an audited section: recorded history, the one follow-up, the migration and
 # session maintenance. The model is not even offered them there, and a proposal that reaches one of
 # these lanes from somewhere else is blanked before anything is validated against it.
@@ -583,9 +595,12 @@ ANTI_RETREAT_PROMPT = "最近的对话里如果出现真实的冲突、被推开
 # `timed_concerns` (default off): when a concern carries a window, offered with the two fields in the
 # schema (appraisal_schema). NEEDS 小光 OK.
 TIMED_CONCERNS_PROMPT = "\n心事可以带时间窗口，用于“下次聊到时记得问”：想等到某个时候再问起的事（比如对方明天面试，想在面试之后第一次聊天时问问结果），create 或 update 时写 surface_after（从什么时候起该问起，Asia/Singapore 时间，ISO 格式），可以再写 surface_until（过了这个时候就不必特意提）。到了时间，下次聊天时这件心事排在最前面，提到过一次之后回到平常的顺序。它只影响聊天时先想起什么，不会让宿主主动发消息；想主动联系仍然走 contact 愿望。没有明确的时间点就不写；只改时间窗口的 update 可以沿用原来的来源。"
+from .dreams import DREAM_PROMPT  # noqa: E402 - the dream section's own paragraph
+
 SECTION_PROMPTS = {"trait_observations": TRAIT_OBSERVATIONS_PROMPT, "trait_decisions": TRAIT_DECISIONS_PROMPT,
                    "self_hypothesis": SELF_HYPOTHESIS_PROMPT, "prediction_outcomes": PREDICTION_OUTCOMES_PROMPT,
-                   "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT}
+                   "expression_intent": EXPRESSION_INTENT_PROMPT, "next_move": NEXT_MOVE_PROMPT,
+                   "dream": DREAM_PROMPT}
 
 
 class SectionCommit:
@@ -604,6 +619,7 @@ def audit_handlers():
     """Fixed sections, in the same commit order and transaction as the appraisal."""
     from .traits import commit_observations, commit_decisions
     from .behavior_chain import commit_hypothesis, commit_outcomes
+    from .dreams import commit_dream
     from .expression_intent import commit_intent
     from .next_move import commit_move
     return {
@@ -612,13 +628,15 @@ def audit_handlers():
         "self_hypothesis": commit_hypothesis,
         "prediction_outcomes": commit_outcomes,
         "expression_intent": commit_intent,
+        "dream": commit_dream,
         "next_move": commit_move,
     }
 
 
 def audit_switches(conn, scope):
     """The audited sections whose switch is on, read once per attempt like every other switch."""
-    return {name for name, switch in AUDIT_SECTION_SWITCH.items() if optimized(conn, scope, switch)}
+    return {name for name, switch in AUDIT_SECTION_SWITCH.items()
+            if (enabled(conn, scope, switch) if switch in OPT_IN_SWITCHES else optimized(conn, scope, switch))}
 
 
 def offered_sections(stimulus, enabled):
@@ -1169,6 +1187,15 @@ def appraisal_input_budget(cap=None, *, model=APPRAISAL_MODEL, catalog=None):
         return APPRAISAL_INPUT_BUDGET
     limit = cap if type(cap) is int and cap > 0 else APPRAISAL_INPUT_CAP
     return max(0, min(limit, window - APPRAISAL_MAX_OUTPUT))
+
+
+def inner_life_prompts(context):
+    """What a request that carries a dream, a reply to the diary or an anniversary is told about it,
+    each only where the context carries it: a request without them is the request it was."""
+    facts = (context.get("autonomy_context") or {}).get("initiative_facts") or {}
+    return ((dreams.RECENT_DREAMS_PROMPT if context.get("recent_dreams") else "")
+            + (diary.REPLY_PROMPT if context.get("diary_replies") else "")
+            + (initiative.ANNIVERSARY_PROMPT if "anniversaries_today" in facts else ""))
 
 
 class DeepSeek:
@@ -1800,6 +1827,7 @@ class DeepSeek:
                 + ("\n本轮仅提交当前情绪、感想与日记（understanding）、愿望、心事、习惯和行动判断。memory留空，图谱与长材料整理由独立队列继续；历史积压不是等待联系的理由。参考最新互动处理旧证据，已完成事项保持历史。" if context.get("operational_only") else "")
                 + (TIMED_CONCERNS_PROMPT if self._timed() and not historical else "")
                 + "".join("\n" + self._section_prompt(name) for name in self._sections(context))
+                + inner_life_prompts(context)
                 + "\nclock 是本轮宿主当前时间，历史 occurred_at 是事件时间，received_at 是收到或记录时间。recent_dialogue 保留最近多轮公开问答；旧话不能当成刚收到的新消息。exploration_targets 指定本次应结算的探索结果，其他探索仅作背景。"
                 + (RECALL_PROMPT if self._recall_scope(context) else "")
                 + (DEFERRED_ROUTES_PROMPT if (context.get("memory_context") or {}).get("pending_deferrals") else "")
@@ -2818,6 +2846,12 @@ class Appraisals:
                     # Kin's latest diaries: a reflection reaches what Kin plans and who Kin becomes only
                     # through an assessment that sees it, and cites it as the evidence below allows.
                     model_context["recent_reflections"] = self.memory.recent_reflections()
+                    if settings.get("dreams") is True and "idle-review" in set(data.get("stimuli") or [data.get("stimulus")]):
+                        # The latest dream, never as evidence: whether 小光 hears of it is a contact wish
+                        # this review may make (dreams.py). Shown, so the queue row names it below.
+                        dreamt = dreams.recent(self.mind)
+                        if dreamt:
+                            model_context["recent_dreams"] = dreamt
                 if self.session_context and not historical:
                     model_context["session_context"] = self.session_context
                 if maintenance:
@@ -2889,13 +2923,29 @@ class Appraisals:
                     # An audited section must never fail a whole appraisal, and without per-section
                     # isolation there is nothing that could refuse one alone: then none is offered.
                     audited = audit_switches(conn, self.mind.scope.key()) if isolation else set()
+                    data.pop("dream_material", None)
+                    if "dream" in audited:
+                        # Offered to an idle review in the resting phase only, once a night, with something
+                        # to dream of; the references it would rest on stay with the row (dreams.py).
+                        offer = dreams.offer(conn, self.mind, view, data, at=self.mind.clock())
+                        if offer:
+                            model_context["dream_material"], data["dream_material"] = offer
+                        else:
+                            audited = audited - {"dream"}
+                    if not historical and not maintenance:
+                        # Which diary entry a reply of 小光's among the new evidence answers (diary.py): the
+                        # entry is shown as Kin's thought and checked below like the latest diaries.
+                        replies = diary.replies_context(conn, self.mind, sources)
+                        if replies:
+                            model_context["diary_replies"] = replies
                     # Kin's own range, the same for the prompt, the schema and the clamp below.
                     review_max = REVIEW_MAX_MINUTES
                     flags = manifests.switches(conn, self.mind.scope.key())
                     semantic_refs = {ref["record_id"]: ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
                     for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent,
-                                        *model_context.get("recent_reflections", {}).get("entries", [])]:
+                                        *model_context.get("recent_reflections", {}).get("entries", []),
+                                        *(reply["diary"] for reply in model_context.get("diary_replies", []) if reply.get("diary"))]:
                         try:
                             recent_refs = self.mind._evidence(conn, [interaction["source_id"]])
                             if not self.mind._fresh(conn, recent_refs):
@@ -3028,6 +3078,9 @@ class Appraisals:
                 # queue row, the state and the reflection never hold its words. It is kept by the commit.
                 proposal, sealed_diary = sealed.take(proposal, sealing=getattr(provider, "sealing", False) is True,
                                                      at=self.mind.clock())
+                if light and proposal.dream is not None:
+                    # A stored proposal's dream was written from what an earlier attempt was offered.
+                    proposal = proposal.model_copy(update={"dream": None})
                 # Unknown fields the provider removed host-side; recorded with the attempt whether or not it commits.
                 data.pop("dropped_fields", None)
                 if receipt.get("dropped_fields"):
@@ -3601,7 +3654,12 @@ class Appraisals:
                     # What an idle review committed about contacting, kept with its result. An owner
                     # message that came in meanwhile leaves the question to the next round.
                     contact = initiative.contact_decision(state, eid, proposal) if idle and not new_interaction else None
+                    # A committed dream is stored after the commit; what it rests on, and the id it takes,
+                    # go with the receipt, so a delete of either finds the receipt too.
+                    dreamt = ({"source_id": dreams.source_id(self.mind, eid), "derived_from": data.get("dream_material") or []}
+                              if "dream" in applied_sections else None)
                     return {"provider": receipt, "proposal": proposal_record(proposal), "new_interaction_pending": bool(new_interaction),
+                            **({"dream": dreamt} if dreamt else {}),
                             **({"held_decisions": held_decisions} if held_decisions else {}),
                             **({"rejected_sections": rejected} if rejected else {}), **({"held_sections": held} if held else {}),
                             **({"follow_up_id": review_id} if review_id else {}),
@@ -3641,6 +3699,15 @@ class Appraisals:
             # What the appraisal was shown goes with the result: the reflection is written from it (CR5-MM-02).
             self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or [],
                                              "evaluated_ids": data.get("evaluated_ids") or []})
+            if data["result"].get("dream"):
+                dreamt = dreams.remember(self.memory, {**data["result"], "evaluated_sources": data.get("evaluated_sources") or [],
+                                                       "evaluated_ids": data.get("evaluated_ids") or []})
+                if dreamt:
+                    # From here the dream's words are its source's: the row keeps only which source, so a
+                    # delete of the dream leaves none of them behind here (the command receipt names it too).
+                    for holder in (data.get("proposed_result"), data["result"].get("proposal")):
+                        if isinstance(holder, dict) and holder.get("dream"):
+                            holder["dream"] = {"source_id": dreamt["id"]}
             if data["result"].get("follow_up_id"):
                 self._arm_follow_up(data["result"]["follow_up_id"])
             if data["result"].get("contact_decision") and not recovered:

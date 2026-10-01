@@ -11,7 +11,8 @@ One definition for every reader, built on the read policy rather than beside it.
   nothing: an exploration result is model-authored, so its text is only a self-statement, while
   the receipt of that same exploration is behaviour.
 - **Kin's own statement** is where model-authored material ends. It is admitted in no other class.
-- An **internal event** is evidence of nothing, in any class.
+- An **internal event** is evidence of nothing, in any class. Neither is a **dream** (`kin-dream`,
+  dreams.py): imagined, never something that happened, and never a reason for a trait.
 - An **episode** is the host's unit of "a separate time this happened": the execution it belongs
   to, else the interaction window it falls in, else its root. The window is the one `rhythm`
   already draws; there is no second definition of how far apart two messages must be. Callers
@@ -23,7 +24,7 @@ Pure functions over what the caller already holds: nothing here reads or writes 
 from __future__ import annotations
 
 from eventmem.core.db import digest
-from eventmem.core.read_policy import NON_EXPERIENCE, ORIGIN_LABELS, REQUEST_LABEL, host_envelope, host_maintenance
+from eventmem.core.read_policy import NON_EXPERIENCE, ORIGIN_LABELS, REQUEST_LABEL, host_envelope, host_maintenance, origin_of
 
 from .rhythm import stamp
 
@@ -35,11 +36,21 @@ INTERNAL_NAMESPACE = "mind-internal-event"
 EXECUTION_RECEIPTS = ("plan-run", "task-result", "delivery", "exploration")
 
 
+# Kin's dreams, as the origin table has it (`source-origins.json`): never experience, never evidence.
+DREAM_ORIGIN = "kin_dream"
+
+
 def never_evidence(source):
     """An internal event: the host's own bookkeeping written back as a source — internal mind
     events, session maintenance requests, receipts. Never evidence. The same definition the read
-    policy uses to keep them out of experience recall, so the two can no longer disagree."""
-    return host_maintenance(source)
+    policy uses to keep them out of experience recall, so the two can no longer disagree. A dream
+    is never evidence either (`dream`)."""
+    return host_maintenance(source) or dream(source)
+
+
+def dream(source):
+    """Whether a source — a row, or a reference carrying its namespace — is one of Kin's dreams."""
+    return isinstance(source, dict) and origin_of(source.get("namespace") or "", source.get("metadata")) == DREAM_ORIGIN
 
 
 def owner_statement(record, policy=None, *, sources=()):

@@ -42,6 +42,14 @@
       "indexed": true,
       "meaning": "What Kin actually observed while exploring or using the computer. Recalled as an observation."
     },
+    "kin_dream": {
+      "class": "host_envelope",
+      "label": null,
+      "experience_recall": false,
+      "evidence": false,
+      "indexed": false,
+      "meaning": "Kin's dreams, written while resting: imagined, never something that happened. Evidence of nothing and never recalled as experience; read only where dreams are shown (kin_mind.dreams)."
+    },
     "external_excerpt": {
       "class": "experience",
       "label": "external_material",
@@ -66,6 +74,7 @@
     "synthetic-example:*": "synthetic_example",
     "kin-reflection": "kin_thought",
     "kin-archive-memory": "kin_thought",
+    "kin-dream": "kin_dream",
     "kin-exploration": "observation",
     "kin-computer-observation": "observation",
     "kin-web-observation": "external_excerpt"

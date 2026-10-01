@@ -169,6 +169,13 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # `anti_retreat`: the expression intent's prompt gains the stance for real conflict,
             # being pushed away and uncertainty about the relationship (appraisal.ANTI_RETREAT_PROMPT).
             "checkpoint_texture": False, "window_notes": False, "timed_concerns": False, "anti_retreat": False,
+            # Kin's inner life, all three off and read through autonomy_schema.enabled(). Off, nothing
+            # of them is offered, shown or stored, and every request is the one it was before.
+            # `dreams`: an idle review in the resting phase may write one dream a night (dreams.py).
+            # `diary_replies`: the owner may answer a diary entry from the console (diary.py).
+            # `anniversaries`: the initiative facts name today's anniversaries of shared moments
+            # (initiative.py).
+            "dreams": False, "diary_replies": False, "anniversaries": False,
             "usage_reinforcement": False, "reinforcement_ranking": False, "procedure_learning": False,
             "reinforcement_started_at": None, "reinforcement_validation": None,
             "version": "memory-continuity-v1", "review_min_minutes": 20,
@@ -391,7 +398,7 @@ class MemoryContinuity:
                     "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive", "sealed_entries",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
-                    "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat",
+                    "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat", "dreams", "diary_replies", "anniversaries",
                     *memory_formation.SWITCHES):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")

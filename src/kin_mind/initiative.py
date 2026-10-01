@@ -12,17 +12,31 @@ the last day (`sealed_opened`, with `sealed_entries` on). Hours and counts only,
 host's words. No score, no threshold and nothing that asks for a contact: what to do about a
 silence stays Kin's judgment.
 
+**Anniversaries (那年今日, 2026-10-01).** With `anniversaries` on, the facts also name the shared
+moments whose anniversary is today (`anniversaries_today`): a week, a hundred days, one, three or six
+months, or whole years to the local day (Asia/Singapore). A moment is chosen conservatively, from
+what is already recorded and nothing new: an owner chat message -- 小光's own words, explicit, role
+user, a message -- that an appraisal's understanding cited when it rated what happened importance 70
+or more as stated or inferred meaning (never Kin's internal thought). Every source that understanding
+cited must still be current: a delete or a correction of any of it, or words an erase took out, and
+it is no moment. One moment a day at most, the most important; at most three shown; the ones 小光
+asked not to be brought up are left out (`not_raised`). Dates and a few words of Kin's own label,
+nothing that asks for a contact: whether to mention one, and when, stays Kin's.
+
 **The decision an idle review states.** `contact_decision` reads what one committed: a contact
 wish it made or took up again, or the move that said why not now. It records; it decides nothing.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import re
 import sqlite3
-from datetime import timedelta
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
+from .autonomy_schema import enabled
 from .state import host_wait, timestamp
 
 WISH_KINDS = ("contact", "explore", "create")
@@ -36,6 +50,17 @@ UNSENT_CONTACT_HOURS = 24
 UNSENT_SHOWN = 6
 LIVE = ("wanted", "waiting", "in_progress")
 QUIET_MOVES = ("quiet", "rest")
+# Anniversaries (`anniversaries`): what makes a shared moment, and how much of it is shown.
+ANNIVERSARIES = "anniversaries"
+MOMENT_IMPORTANCE, MOMENT_BASES = 70, ("explicit", "inferred")
+ANNIVERSARIES_SHOWN, TOPIC_CHARS = 3, 40
+ZONE = "Asia/Singapore"
+ERASED = "[已删除]"
+# NEEDS 小光 OK: what a request whose facts carry anniversaries is told about them.
+ANNIVERSARY_PROMPT = ("\nautonomy_context.initiative_facts.anniversaries_today 是今天正好满一周、一百天、一个月、三个月、半年或整年的共同时刻"
+                      "（milestone 写满了多久，例如 1-week、100-days、1-month、3-months、6-months、2-years）：moment_id 是那天小光说的话，"
+                      "date 是那一天，topic 是你当时给这件事起的标题。它们和其他 initiative_facts 一样只是日期上的事实，不是提醒、任务或联系的理由；"
+                      "要不要提、什么时候提、怎么提，由你结合眼下的心情和最近的聊天决定，不提也完全可以。需要细节时可以用只读记忆工具读 moment_id。")
 
 
 def _hours(now, value):
@@ -113,6 +138,7 @@ def facts(mind, at=None):
         # A letter or a sealed diary whose day came lately: the entry, never its words (sealed.py).
         from . import sealed
         opened = sealed.opened(conn, scope, at) if sealed.enabled(conn, scope) else []
+        anniversaries = anniversaries_today(conn, mind, at) if enabled(conn, scope, ANNIVERSARIES) else None
     return {
         "as_of": at,
         "hours_since_last_wish": {kind: _hours(now, made.get(kind)) for kind in WISH_KINDS},
@@ -123,7 +149,95 @@ def facts(mind, at=None):
         "recent_failed_explorations": failed,
         "contact_wishes_unsent_a_day": unsent[:UNSENT_SHOWN],
         **({"sealed_opened": opened} if opened else {}),
+        # Only with the switch on: off, the facts are what they always were, key for key.
+        **({"anniversaries_today": anniversaries} if anniversaries is not None else {}),
     }
+
+
+def _months_later(day, months):
+    """`day` that many months later; a day the month does not have is its last (31 Jan -> 28 Feb)."""
+    month = day.month - 1 + months
+    year, month = day.year + month // 12, month % 12 + 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def milestone(moment, today):
+    """How long ago `moment` (a local date) was, when `today` is one of the anniversaries kept: a week,
+    a hundred days, one, three or six months, or whole years. None on every other day."""
+    if today <= moment:
+        return None
+    days = (today - moment).days
+    if days == 7:
+        return "1-week"
+    if days == 100:
+        return "100-days"
+    for months in (1, 3, 6):
+        if _months_later(moment, months) == today:
+            return f"{months}-month" + ("s" if months > 1 else "")
+    years = today.year - moment.year
+    if years >= 1 and _months_later(moment, 12 * years) == today:
+        return f"{years}-year" + ("s" if years > 1 else "")
+    return None
+
+
+def not_raised(conn, scope, ids):
+    """Of `ids`, the ones 小光 asked not to be brought up. The marker is recall's ("不主动提起",
+    ws4-recall), not in this base yet, so nothing is left out here; it plugs in at this one place."""
+    return frozenset()
+
+
+def _owner_message(ref):
+    metadata = ref.get("metadata") or {}
+    return (ref.get("authority") == "explicit" and metadata.get("role") == "user"
+            and metadata.get("host_event") == "message")
+
+
+def moments(conn, mind):
+    """The shared moments the history holds, one per local day: {moment_id, date, topic, importance,
+    cited}. See the module docstring for the rule."""
+    from eventmem.core.db import Conflict, Missing
+    zone, best = ZoneInfo(ZONE), {}
+    rows = conn.execute("SELECT id,json_extract(data,'$.request.understanding') AS understanding FROM mind_events "
+                        "WHERE scope=? AND kind='affect' AND json_extract(data,'$.request.understanding.basis') IN (?,?) "
+                        "AND CAST(json_extract(data,'$.request.understanding.importance') AS INTEGER)>=? ORDER BY revision",
+                        (mind.scope.key(), *MOMENT_BASES, MOMENT_IMPORTANCE)).fetchall()
+    for row in rows:
+        try:
+            understanding = json.loads(row["understanding"])
+        except (TypeError, ValueError):
+            continue
+        cited = [i for i in understanding.get("evidence_ids") or [] if isinstance(i, str)]
+        topic = understanding.get("topic")
+        if not cited or not isinstance(topic, str) or ERASED in topic or ERASED in str(understanding.get("meaning")):
+            continue
+        try:
+            refs = mind._evidence(conn, cited)
+        except (Missing, Conflict):
+            continue
+        if not refs or not mind._fresh(conn, refs):
+            continue
+        anchors = sorted((r for r in refs if _owner_message(r)), key=lambda r: (r["occurred_at"], r["source_id"]))
+        if not anchors:
+            continue
+        day = timestamp(anchors[0]["occurred_at"]).astimezone(zone).date()
+        importance = understanding.get("importance")
+        moment = {"moment_id": anchors[0]["source_id"], "date": day.isoformat(), "topic": topic.strip()[:TOPIC_CHARS],
+                  "importance": importance, "cited": sorted({*cited, *(r["source_id"] for r in refs)})}
+        if day not in best or importance > best[day]["importance"]:
+            best[day] = moment
+    return [best[day] for day in sorted(best)]
+
+
+def anniversaries_today(conn, mind, at):
+    """Today's anniversaries of shared moments, oldest moment first, at most ANNIVERSARIES_SHOWN."""
+    today = timestamp(at).astimezone(ZoneInfo(ZONE)).date()
+    found = []
+    for moment in moments(conn, mind):
+        reached = milestone(date.fromisoformat(moment["date"]), today)
+        if reached and not not_raised(conn, mind.scope.key(), {moment["moment_id"], *moment["cited"]}):
+            found.append({"moment_id": moment["moment_id"], "date": moment["date"], "milestone": reached,
+                          "topic": moment["topic"]})
+    return found[:ANNIVERSARIES_SHOWN]
 
 
 def contact_decision(state, event_id, proposal):

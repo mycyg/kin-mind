@@ -285,6 +285,47 @@ with a backoff (5 minutes, doubling, at most 6 hours) and after 4 attempts the n
 stretch with no public dialogue is `withheld`, and an older note still waiting when a newer stretch is
 written is `superseded`, never sent. The lane needs `operational_lanes`.
 
+## Dreams, replies to the diary and anniversaries
+
+Three settings, all **off** by default and read through `autonomy_schema.enabled`. Off, nothing of
+them is offered to a model, shown to one, stored or said: every request is byte for byte the one
+before (the schema, the system prompt, the context and the initiative facts). None sends a message
+or brings anything up in a chat on its own; telling 小光 anything is a contact wish Kin makes.
+
+```sh
+echo '{"dreams": true}' | python -m kin_mind.host --config PRIVATE_CONFIG configure-memory
+echo '{"diary_replies": true}' | python -m kin_mind.host --config PRIVATE_CONFIG configure-memory
+echo '{"anniversaries": true}' | python -m kin_mind.host --config PRIVATE_CONFIG configure-memory
+```
+
+**`dreams`** (`kin_mind.dreams`). An idle review while the rhythm is `resting`, with no dream yet
+tonight (noon to noon, Asia/Singapore), is offered one audited section, `dream`, with
+`dream_material`: at most two each of the newest appraisal-made events, memory notes and diary
+entries of the last 48 hours. Kin may leave it empty, and most nights should. A dream is 80 to 220
+characters (refused alone otherwise, code `dream-length`; never the review), stored after the commit
+as a derived source in `kin-dream` resting on all of its material, so a delete of any of it takes the
+dream along. The origin table calls it `kin_dream`: never experience, never evidence
+(`never_evidence`), never indexed or recalled. Once stored, the queue row keeps only the dream's
+source id; the command receipt names it, so deleting the dream leaves none of its words behind. The
+next day's idle reviews are shown the latest dream (`recent_dreams`, 24 hours). Read with
+`read_dreams` (core MCP; the host offers it once `chat-permissions.json` lists it) and in the
+console's "日记与自述" group.
+
+**`diary_replies`** (`kin_mind.diary`). The console's "日记与自述" group shows Kin's own diary
+(`kin-reflection`, newest first; `GET /v1/diary`) whatever the setting -- the narrative records listed
+there never held one of her entries. With the setting on, 小光 can answer an entry
+(`POST /v1/diary/replies`): her words become a `kin-diary-reply` source, explicit authority, role
+user, with the entry it answers as `reply_to` in its metadata (an index, never shown to a model), and
+are queued for an appraisal through the ordinary path. That appraisal is shown which entry each reply
+answers (`diary_replies`), the entry checked current at commit; deleting the reply takes the link,
+deleting the entry leaves her reply standing alone.
+
+**`anniversaries`** (`kin_mind.initiative`). The initiative facts gain `anniversaries_today`: shared
+moments whose anniversary is today -- a week, 100 days, one, three or six months, or whole years. A
+moment is an owner chat message that an appraisal's understanding (basis explicit or inferred,
+importance 70 or more) cited, with every source it cited still current; one a day at most, three
+shown. `initiative.not_raised` is where a "不主动提起" marker leaves a moment out.
+
 ## Exploration decision archive
 
 Every exploration result Kin decided on keeps its sharing decision in the state document, with a
