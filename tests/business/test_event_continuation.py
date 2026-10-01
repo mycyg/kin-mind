@@ -301,7 +301,7 @@ def test_what_an_enrichment_is_shown_is_bounded(setup):
     memory = configured(mind, event_continuation=True)
     assert (CONTINUATION_EVENTS, CONTINUATION_RECORDS, CONTINUATION_EXCERPT_TOKENS) == (8, 2, 250)
     events, made = [], []
-    for index in range(CONTINUATION_EVENTS + 2):
+    for index in range(CONTINUATION_EVENTS + 3):
         clock[0] += timedelta(seconds=1)
         made.append(root(mind, source(f"day-{index}", f"第{index}天的早晨" + "很长的一句话。" * 400)))
         routed(memory, [EventRoute(key=f"e{index}", action="create", title=f"早晨{index}", evidence_ids=[made[-1]],
@@ -319,13 +319,18 @@ def test_what_an_enrichment_is_shown_is_bounded(setup):
                 memory.mind._evidence(conn, [more, made[0]]), "appraisal-" + later)
         assert appended["state"] == "append"
         made.append(more)
-    with memory.engine.db.connect() as conn:
+    with memory.engine.db.connect(write=True) as conn:
         graph = [memory.graph.get(conn, identifier) for identifier in events]
+        # A candidate that is not an event (a record's projection) takes no place and is shown nothing.
+        observation = memory.graph.ensure(conn, made[1])
     graph[1]["needs_review"] = True
+    graph.insert(0, observation)
     with memory.engine.db.connect() as conn:
         memory.show_continuation(conn, graph, "早晨", named={events[-1]})
+    graph.pop(0)
     shown = [node["id"] for node in graph if "identity_evidence" in node]
-    assert shown == [events[0], *events[2:CONTINUATION_EVENTS + 1], events[-1]]
+    assert "identity_evidence" not in observation and observation["kind"] != "event"
+    assert shown == [events[0], *events[2:CONTINUATION_EVENTS + 1], events[-1]], "eight, then only the named"
     assert [r["id"] for r in graph[0]["identity_evidence"]] == [made[-1], made[-2]], "the latest two of three"
     with memory.engine.db.connect() as conn:
         content = memory.engine._get(conn, made[2])["content"]

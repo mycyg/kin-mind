@@ -874,7 +874,7 @@ EVENT_CONTINUATION_PROMPT = (
     "identity.decision 为 same_event，并分别如实判断 participants_match、object_match、time_compatible、continuation_supported；"
     "identity.prior_record_ids 只填该事件 identity_evidence 里的 id，不填事件本身或其他节点的 id。"
     "same_task 与 same_artifact 只用于宿主已把双方连到同一个任务或作品编号时。"
-    "标题相近不等于同一件事：参与者、对象或时间对不上就是另一段经历，用 create 或 link。"
+    "标题相近不等于同一件事，称呼、标题不同或省略主语也不自动否定延续：参与者、对象或时间对不上就是另一段经历，用 create 或 link。"
     "宿主会核对引文、身份判断和所引旧证据是否确属该事件，任一不符就暂缓归属。")
 
 
