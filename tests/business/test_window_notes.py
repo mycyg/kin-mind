@@ -227,6 +227,20 @@ def test_an_erase_of_a_turn_takes_the_note_and_the_checkpoint_carrying_it_stops_
     assert "windowNote" not in build(mind)["payload"]
 
 
+def test_a_note_the_sealed_checkpoint_has_no_room_for_after_all_is_dropped_not_made_incomplete(setup, monkeypatch):
+    """The fit is estimated on a placeholder id; should the sealed payload come out larger, the note
+    goes and the checkpoint is sealed again without it."""
+    from kin_mind import session_checkpoint
+    mind, _, clock = setup
+    written(mind, monkeypatch, clock)
+    counted = session_checkpoint.tokens
+    monkeypatch.setattr(session_checkpoint, "tokens", lambda text: counted(text) + (
+        20000 if "windowNote" in text and "checkpoint:" + "f" * 64 not in text else 0))
+    built = build(mind)
+    assert built["complete"] is True and "windowNote" not in built["payload"] and built["windowNoteOmitted"] == "budget"
+    assert "windowNote" not in built.get("budgetPlan", {})
+
+
 def test_a_checkpoint_whose_carried_note_alone_was_erased_stops_validating(setup, monkeypatch):
     mind, _, clock = setup
     written(mind, monkeypatch, clock)
