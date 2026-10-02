@@ -139,3 +139,22 @@ test('the watchdog expires only orphaned unsubmitted inputs, even without a task
   assert.equal(restarted.state.inputs.submitted.state,'selected');
   assert.equal(restarted.state.inputs.fresh.state,'selected');
 });
+
+
+test('an invalid summary returns only existing task facts to Kin, without deciding or retrying the draft',async t=>{
+  const f=await fixture(t);f.clock.now+=2*HOUR;
+  f.review.summarize=async()=>{throw Error('deepseek-invalid-work-summary');};
+  const result=await f.review.tick();
+  assert.equal(result.state,'told');assert.equal(result.factsOnly,true);
+  assert.equal(f.told.length,1);assert.equal(f.task.status,'running');
+  assert.equal(f.task.workSummary,undefined);assert.equal(f.task.completion,undefined);
+  await f.review.tick();assert.equal(f.told.length,1,'no immediate repeated internal turn');
+});
+
+test('an invalid summary cannot return stale facts after owner cancellation or task change',async t=>{
+  for(const change of ['cancel','input']) {
+    const f=await fixture(t);f.clock.now+=2*HOUR;
+    f.review.summarize=async()=>{if(change==='cancel')f.task.cancelRequested=true;else f.task.inputVersion++;throw Error('deepseek-invalid-work-summary');};
+    assert.equal((await f.review.tick()).state,'superseded');assert.equal(f.told.length,0);
+  }
+});

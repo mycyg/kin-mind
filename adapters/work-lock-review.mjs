@@ -62,9 +62,9 @@ export class WorkLockReview {
   }
   async tick() {
     if(this.closed||this.running)return {state:'busy'};
-    this.running=true;let attempt,gate=null;
+    this.running=true;let attempt,snapshot,gate=null;
     try {
-      const snapshot=await this.router.locked(async()=>{
+      snapshot=await this.router.locked(async()=>{
         const task=this.router.tasks().filter(item=>item.requiresDelivery!==false).at(-1);
         if(!task)return null;
         const runtime=await this.router.inspect();
@@ -107,6 +107,19 @@ export class WorkLockReview {
     } catch(error) {
       // A refused lane is not a failure and costs no summary: it comes back soon.
       if(error?.leaseSkipped)return attempt?this.save({...attempt,state:'waiting',reason:'work-summary-lane-unavailable',retryAt:this.now()+this.skipRetryMs}):{state:'waiting',reason:'work-summary-lane-unavailable'};
+      // A rejected model summary must not be the only way the open task's facts
+      // can reach Kin. Discard it; the existing delivery reads the router's own
+      // facts instead. It still decides nothing and never releases the task.
+      if(error?.message==='deepseek-invalid-work-summary'&&attempt&&this.deliver&&!this.closed) {
+        const current=await this.router.locked(async()=>{
+          const task=this.router.state.tasks[snapshot.task.id];
+          return openTask(task)&&!task.cancelRequested&&taskFingerprint(this.router,task)===snapshot.key;
+        });
+        if(!current)return this.save({...attempt,state:'superseded',reason:'task-changed-during-summary',retryAt:this.now()});
+        let delivery;try{delivery=await this.deliver(snapshot.task.id);}catch{delivery={state:'failed'};}
+        if(delivery?.state==='accepted')return this.save({...attempt,state:'told',reason:'deepseek-invalid-work-summary',
+          factsOnly:true,delivery:delivery.state,retryAt:this.now()+Math.min(this.repeatMaxMs,this.idleMs*2**Math.min(attempt.repeats+1,16))});
+      }
       return attempt?this.save({...attempt,state:'failed',reason:String(error?.message??error).slice(0,160),retryAt:this.now()+this.retryMs}):{state:'waiting',reason:'work-evidence-unavailable'};
     } finally {gate?.release();this.running=false;}
   }
