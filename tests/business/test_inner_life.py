@@ -460,6 +460,9 @@ def test_as_production_runs_the_fork_is_asked_for_a_dream_strictly_and_shown_tod
     from test_initiative import RECEIPT, idle_review, world
     from test_main_session_review import native_provider
     mind, source, clock = setup
+    # This case advances another 31 minutes. Keep the synthetic moment away
+    # from Singapore midnight, independent of the wall-clock test start time.
+    clock[0] = (clock[0] + timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=1)
     said = moment(mind, source, clock, "first-clock")
     clock[0] += timedelta(days=7)
     memory, actions = world(setup)
