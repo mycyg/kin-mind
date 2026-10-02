@@ -6,7 +6,9 @@ import {normalizeModelCatalog} from './codex-models.mjs';
 // health reading are never interchangeable, and none of them decides for Kin.
 // What becomes of the unsent rest of an interrupted reply is Kin's own: it rides on
 // her next owner turn, and no reviewer is asked about it (N4).
-export const REVIEWER_LANES={classify:'foreground',summarizeWork:'background',audit:'background'};
+// An open task holds foreground priority; its own summary needs the reserved
+// user-work slot or it can never bring the facts back to Kin for settlement.
+export const REVIEWER_LANES={classify:'foreground',summarizeWork:'user-work',audit:'background'};
 export const REVIEWER_PURPOSES={classify:'mobile-route-message',summarizeWork:'mobile-work-summary',audit:'mobile-health-audit'};
 const TOOL_ENTRY={route_message:'classify',summarize_open_work:'summarizeWork',review_mobile_health:'audit'};
 /** What a health reading may name. A fixed set, so the same fault is the same fault
