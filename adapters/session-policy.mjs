@@ -47,13 +47,17 @@ export function safeBoundary({runtime,tasks=[],inputs=[],notices=[],contactRunni
  * touches the native session, so unconfirmed owner notifications do not block it —
  * but every delivery the owner never confirmed receiving is annotated on the
  * result, and the prepared artifact carries them. Everything else safeBoundary
- * checks still applies. The strict path stays the default. */
+ * checks still applies except unresolved tool ledger entries: while the verified native
+ * runtime is idle, those entries are preserved as facts, not a reason to prevent
+ * preparing the context needed to settle them. The strict path stays the default. */
 export function safeReadOnlyPreparation({runtime,tasks=[],inputs=[],notices=[],contactRunning=false}) {
-  const strict=safeBoundary({runtime,tasks,inputs,notices:[],contactRunning});
+  const strict=safeBoundary({runtime,tasks:[],inputs,notices:[],contactRunning});
   if(!strict.safe)return strict;
   const unconfirmedDeliveries=notices.filter(n=>!['accepted','superseded','suppressed'].includes(n.state))
     .map(n=>({id:n.id,kind:n.kind,state:n.state}));
-  return {safe:true,readOnly:true,...(unconfirmedDeliveries.length?{unconfirmedDeliveries}:{})};
+  const unresolvedTools=tasks.flatMap(task=>Object.entries(task.tools??{}).filter(([,tool])=>!['completed','failed'].includes(tool.status))
+    .map(([id,tool])=>({taskId:task.id,id,status:tool.status})));
+  return {safe:true,readOnly:true,...(unconfirmedDeliveries.length?{unconfirmedDeliveries}:{}),...(unresolvedTools.length?{unresolvedTools}:{})};
 }
 
 export function checkpointBudget(checkpoint,budget) {
