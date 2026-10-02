@@ -823,9 +823,9 @@ export class MobileRouter {
     this.save('prompt-refused',{canceled:refused.canceled,notSubmitted:refused.notSubmitted});
     return refused;
   }
-  /** The mind's own turns wait for the owner's work and for a coordinator that is busy. */
+  /** Pending work is context, not activity. Only actual execution holds an internal turn. */
   internalHeld(runtime,kind) {
-    return this.busy(runtime,{assessment:kind==='assessment',internal:true})||this.openWork().length>0||this.state.mode==='work';
+    return this.busy(runtime,{assessment:kind==='assessment',internal:true});
   }
   async select(input) {
     const hash=digest([input.text,input.attachments??[]]);
@@ -1142,7 +1142,7 @@ export class MobileRouter {
     if(record.state==='semantic-pending')return {wait:true};
     if(record.state!=='selected')throw Error('Input acceptance requires reconciliation');
     let runtime=await this.reconcileTransition(await this.inspect());
-    if(['proactive','assessment'].includes(input.kind)&&(this.busy(runtime,{assessment:input.kind==='assessment',internal:true})||this.openWork().length||this.state.mode==='work'))return {outcome:{route:'deferred',reason:'owner-work-held'}};
+    if(['proactive','assessment'].includes(input.kind)&&this.internalHeld(runtime,input.kind))return {outcome:{route:'deferred',reason:'owner-work-held'}};
     if(record.route==='control'||['manual','auto','work'].includes(record.command)) {
       const request=await this.acceptControl(record,runtime);
       const applied=request?await this.applyModeRequest(request,runtime):{runtime};
@@ -2088,6 +2088,7 @@ export class MobileRouter {
         storeHistorical(historicalReason,{authoritative:historicalReason==='older-fence'&&Number.isInteger(turnFence)&&Number.isSafeInteger(data.inputVersion)});
         return;
       }
+      if(task&&!open(task)&&['tool','delivery'].includes(kind)){storeHistorical('task-closed');return;}
       if(kind==='reply'&&data.final) {this.state.recent.push({role:'assistant',text:data.text.slice(0,4000),at:data.at??this.now()});this.state.recent=this.state.recent.slice(-16);}
       if(task&&open(task)) {
         if(kind==='prompt-start') {
@@ -2151,15 +2152,15 @@ export class MobileRouter {
     }
     return changed;
   }
-  /** The host's facts about Kin's declared outcome: the declaring turn ended (for any
-   * stop reason, or by an owner interruption), the task's tools are terminal, its
-   * deliveries are settled, and the report to the owner reached the platform. Time
-   * passing proves nothing about a delivery: past the report wait an unproven report is
-   * looked up by its original id and its facts go back to Kin (CR-LIFE-11, CR-MIND-02).
-   * The outcome itself is Kin's; nothing here judges it (N1). */
+  /** Kin's current declaration settles work once its turn has ended and the
+   * native runtime is idle. Delivery receipts and stale tool ledger entries are
+   * retained separately; neither turns an idle task into a perpetual work lock. */
   declarationReady(task,runtime) {
-    const facts=this.declarationFacts(task,runtime);
-    return Boolean(facts&&facts.settled&&(task.requiresDelivery===false||facts.reported));
+    const proposal=task.completion;
+    if(!proposal?.outcome||proposal.state==='historical-proposal'||proposal.inputVersion!==task.inputVersion||
+      proposal.turnFence!==task.executionEpoch||!runtime||this.busy(runtime))return false;
+    return Boolean(proposal.interruptedBy||proposal.turnStartedAt===undefined&&(task.turnEndedAt??0)>=proposal.at||
+      proposal.turnStartedAt!==undefined&&proposal.turnStartedAt<=proposal.at&&proposal.turnEndedAt>=proposal.at);
   }
   /** Declared, the turn and its tools done, and past the report wait still without a
    * proven report: what the host looks up again and tells Kin, never closes on. */
@@ -2186,9 +2187,9 @@ export class MobileRouter {
    * report wait. `lookup(id)` reads a transport receipt; nothing is sent. */
   async reconcileDeliveries(lookup) {
     const due=await this.locked(async()=>{
-      if(!this.openWork().some(task=>task.completion?.outcome))return [];
+      if(!Object.values(this.state.tasks).some(task=>task.completion?.outcome))return [];
       const runtime=await this.inspect().catch(()=>null);
-      return this.openWork().filter(task=>this.declarationStalled(task,runtime)).flatMap(task=>Object.entries(task.deliveries??{})
+      return Object.values(this.state.tasks).filter(task=>task.completion?.outcome&&(task.closure||this.declarationStalled(task,runtime))).flatMap(task=>Object.entries(task.deliveries??{})
         .filter(([,d])=>['unconfirmed','unknown'].includes(d.state)).map(([id,d])=>({taskId:task.id,id,key:d.outboxId??id})));
     });
     let changed=0;

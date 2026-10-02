@@ -21,7 +21,7 @@ export function sessionReviewCursors(cursors,inputs) {
 
 export function ownerSessionWork(session,tasks,assessmentToken) {
   const ownAssessment=assessmentToken&&session?.activeMessage?.contextToken===assessmentToken;
-  return Boolean((session?.processing&&!ownAssessment)||session?.queue?.length||tasks.length);
+  return Boolean((session?.processing&&!ownAssessment)||session?.queue?.length);
 }
 
 /** The maintenance process receives the exact non-secret profile already

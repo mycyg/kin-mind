@@ -9,7 +9,7 @@ test('assessment does not claim foreground capacity but owner input still does',
  const session={processing:true,activeMessage:{contextToken:'assessment-1'},queue:[]};
  assert.equal(ownerSessionWork(session,[],'assessment-1'),false);
  assert.equal(ownerSessionWork({...session,queue:[{contextToken:'owner'}]},[],'assessment-1'),true);
- assert.equal(ownerSessionWork(session,[{id:'owner-work'}],'assessment-1'),true);
+ assert.equal(ownerSessionWork(session,[{id:'owner-work'}],'assessment-1'),false);
  assert.equal(ownerSessionWork({...session,activeMessage:{contextToken:'owner'}},[],'assessment-1'),true);
  assert.equal(ownerSessionWork(session,[],undefined),true);
 });

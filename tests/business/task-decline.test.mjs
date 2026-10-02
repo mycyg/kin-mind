@@ -46,22 +46,23 @@ test('decline is bound to the current task and version, with an idempotent disti
   assert.equal(view.tasks[0].taskOutcome,'declined');
 });
 
-test('native end, tools and accepted refusal delivery settle only this task as canceled',async t=>{
+test('native end settles a refusal while tool and delivery receipts remain separate',async t=>{
   const f=await fixture(t,{manual:true});f.router.workReviewerEnabled=true;
   await f.router.requestMode(f.command);
   await f.router.observe('tool',{taskId:f.task.id,inputVersion:1,turnFence:0,id:'tool',status:'in_progress'});
   await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
-  await f.router.reconcile();assert.equal(f.task.status,'running');
+  await f.router.reconcile();assert.equal(f.task.status,'canceled');
   await f.router.observe('tool',{taskId:f.task.id,inputVersion:1,turnFence:0,id:'tool',status:'completed'});
   await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,sourceInputId:'original-work',id:'reply',state:'unknown'});
-  await f.router.reconcile();assert.equal(f.task.status,'running');
+  await f.router.reconcile();assert.equal(f.task.status,'canceled');
   await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,sourceInputId:'original-work',id:'reply',state:'accepted',messageId:'platform-reply'});
   await f.router.reconcile();await f.router.applyPendingMode();
   assert.equal(f.task.status,'canceled');assert.equal(f.task.completedAt,undefined);
   assert.equal(f.task.completion.outcome,'declined');
   assert.equal(f.router.state.mode,'manual');assert.equal(f.router.state.manualProfile.model,'gpt-6-sol');
   assert.equal(f.router.state.inputs['original-work'].state,'accepted');
-  assert.equal(f.task.deliveries.reply.messageId,'platform-reply');
+  assert.ok(Object.values(f.task.deliveryHistory).some(d=>d.id==='reply'&&d.messageId==='platform-reply'));
+  assert.equal(f.task.closure.reported,false,'closure did not invent a delivery receipt');
 });
 
 test('a new work input supersedes the old declined version without canceling it',async t=>{
@@ -102,7 +103,7 @@ test('a new chat dispatch keeps its input and does not revoke an already deliver
   assert.equal(f.router.state.inputs['new-chat'].taskId,undefined);
 });
 
-test('a pending refusal survives a new chat and settles only after its own bubble is accepted',async t=>{
+test('a refusal survives a new chat and settles without waiting for its bubble',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
   await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
   const originalEnd=f.task.completion.turnEndedAt;
@@ -117,14 +118,14 @@ test('a pending refusal survives a new chat and settles only after its own bubbl
   await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,sourceInputId:'new-chat',id:'chat',state:'accepted',messageId:'accepted-chat'});
   await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
   f.runtime.pendingDeliveries=0;
-  await f.router.reconcile();assert.equal(f.task.status,'running');
+  await f.router.reconcile();assert.equal(f.task.status,'canceled');
   await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,sourceInputId:'original-work',id:'refusal',state:'accepted',messageId:'accepted-refusal'});
   await f.router.reconcile();
   assert.equal(f.task.status,'canceled');
   assert.equal(f.router.state.inputs['new-chat'].state,'accepted');
 });
 
-test('a new chat reply cannot stand in for a refusal that was never delivered',async t=>{
+test('a refusal closes without requiring a later chat reply as its receipt',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
   await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
   await f.router.dispatch({id:'new-chat',kind:'owner',text:'chat'},async (_decision,markSubmitted)=>{markSubmitted();return 'new-turn';});
@@ -132,7 +133,7 @@ test('a new chat reply cannot stand in for a refusal that was never delivered',a
   await f.router.observe('delivery',{taskId:f.task.id,inputVersion:1,turnFence:0,sourceInputId:'new-chat',id:'chat',state:'accepted',messageId:'accepted-chat'});
   await f.router.observe('prompt-end',{taskId:f.task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});
   await f.router.reconcile();
-  assert.equal(f.task.status,'running');
+  assert.equal(f.task.status,'canceled');
   assert.equal(f.task.completion.outcome,'declined');
   assert.equal(f.router.state.inputs['new-chat'].state,'accepted');
 });

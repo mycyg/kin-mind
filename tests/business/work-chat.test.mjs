@@ -158,3 +158,34 @@ test('an invalid summary cannot return stale facts after owner cancellation or t
     assert.equal((await f.review.tick()).state,'superseded');assert.equal(f.told.length,0);
   }
 });
+
+
+test('idle accepted work permits autonomous turns without declaring a false completion',async t=>{
+  const f=await fixture(t);
+  for(const kind of ['proactive','assessment']) {
+    assert.equal(f.router.internalHeld(f.runtime,kind),false);
+    let called=false;
+    const result=await f.router.dispatch({id:'idle-'+kind,kind,text:'synthetic autonomous input'},async()=>{called=true;return 'new-turn';});
+    assert.equal(called,true);assert.notEqual(result.route,'deferred');
+  }
+  assert.equal(f.task.status,'running');assert.equal(f.task.completion,undefined);
+  for(const change of [{active:true},{nativeStatus:'active'},{known:false},{backgroundTasks:1},{queued:1},{pendingDeliveries:1}]) {
+    assert.equal(f.router.internalHeld({...f.runtime,...change},'proactive'),true);
+  }
+});
+
+
+test('a current declaration closes idle work without a delivery receipt or stale tool completion',async t=>{
+ for(const outcome of ['completed','partial','deferred','declined']) {
+  const f=await fixture(t);
+  f.task.tools.old={status:'in_progress'};
+  f.task.deliveries.unknown={state:'unconfirmed'};
+  f.task.completion={outcome,inputVersion:f.task.inputVersion,turnFence:f.task.executionEpoch,at:f.task.turnEndedAt};
+  assert.equal(f.router.declarationReady(f.task,f.runtime),true);
+  assert.equal(f.router.declarationReady(f.task,{...f.runtime,active:true}),false);
+  assert.equal(f.router.declarationReady({...f.task,inputVersion:2},f.runtime),false);
+  f.router.closeTask(f.task);
+  assert.equal(f.task.outcome,outcome);assert.equal(f.task.closure.reported,false);
+  assert.deepEqual(f.task.closure.unknown,['unknown']);assert.equal(f.task.tools.old.status,'in_progress');
+ }
+});

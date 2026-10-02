@@ -238,7 +238,7 @@ test('a proposal only hints at routing: no lock, no delivery duty, and it lapses
   assert.deepEqual([proposal.status,proposal.requiresDelivery,g.router.openWork().length],['running',true,1]);
 });
 
-test('waiting is never a delivery receipt: an unproven report is looked up by id and handed back to Kin (CR-LIFE-11, CR-MIND-02)',async t=>{
+test('work closes on Kin declaration while an unknown report is reconciled separately by its original id',async t=>{
   const f=fixture(t);
   await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
   const task=f.router.tasks()[0];
@@ -249,11 +249,9 @@ test('waiting is never a delivery receipt: an unproven report is looked up by id
   await f.router.observe('prompt-end',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,stopReason:'end_turn'});
   f.clock.now+=31*MINUTE;
   await f.router.reconcile();
-  assert.equal(f.router.state.tasks[task.id].status,'running','thirty minutes are not a receipt');
-  assert.equal(f.router.declarationStalled(task,f.runtime),true);
-  const review=new WorkLockReview({router:f.router,file:path.join(f.root,'review.json'),collect:async()=>({}),summarize:async()=>({}),now:()=>f.clock.now});
-  assert.equal(review.waiting(task,f.runtime),'task-recently-active','handed back to Kin once idle, not held as her decision');
-  f.clock.now+=HOUR;assert.equal(review.waiting(task,f.runtime),null);
+  assert.equal(f.router.state.tasks[task.id].status,'completed');
+  assert.equal(task.closure.reported,false);
+  assert.deepEqual(task.closure.unknown,['report']);
   // Looked up by its original id: the platform had it after all.
   const looked=[];
   assert.deepEqual(await f.router.reconcileDeliveries(async id=>{looked.push(id);return {state:'accepted',messageId:'om-report'};}),{looked:1,accepted:1});
