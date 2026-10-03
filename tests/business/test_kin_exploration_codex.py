@@ -567,3 +567,55 @@ def test_gateway_exploration_preserves_shared_account_login(tmp_path):
     assert not any("forced_login_method" in value for value in argv)
     assert 'model_providers.deepseek.env_key="KIN_TEST_DS_KEY"' in argv
     assert '--ignore-user-config' in argv
+
+
+# kin_ui answers Codex's handshake only after the Computer Use bootstrap the readiness probe already
+# ran, so Codex waits for it as long as the probe may (2026-10-03).
+UI_COMPUTER = {"enabled": True, "file_reader_enabled": False,
+               "ui": {"enabled": True, "backend": {"command": sys.executable, "args": []}}}
+
+def overrides(argv):
+    return [argv[index + 1] for index, flag in enumerate(argv) if flag == "-c"]
+
+def ready_probe(seen=None, *, delay=0.0):
+    def probe(config, **kwargs):
+        time.sleep(delay)
+        if seen is not None:
+            seen.update(kwargs)
+        return {"state": "ready", "protocol": "mcp"}
+    return probe
+
+def test_kin_ui_waits_for_its_handshake_as_long_as_the_readiness_probe(tmp_path, monkeypatch):
+    import kin_mind.computer_use as computer_use
+    from kin_mind.codex_executor import ui_startup_seconds
+
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    seen = {}
+    monkeypatch.setattr(computer_use, "probe_backend_readiness", ready_probe(seen))
+    fake = fake_codex(tmp_path / "fake-observe", OBSERVE + COMPLETE)
+    computer = {**UI_COMPUTER, "file_reader_enabled": True, "roots": [str(tmp_path)]}
+    web = {"enabled": True, "search_endpoint": "http://127.0.0.1:9/search"}
+    run_codex(fake, TOPIC, tmp_path / "job-default", computer=computer, web=web, budget_seconds=60, **codex_kwargs())
+    argv = overrides(json.loads((tmp_path / "job-default" / "observed.json").read_text())["argv"])
+    assert seen["timeout_seconds"] == 45
+    assert "mcp_servers.kin_ui.startup_timeout_sec=45" in argv
+    assert "mcp_servers.kin_web.startup_timeout_sec=10" in argv
+    assert "mcp_servers.kin_computer.startup_timeout_sec=10" in argv
+    assert "mcp_servers.kin_ui.required=true" in argv and "mcp_servers.kin_ui.tool_timeout_sec=90" in argv
+    assert not any(flag.startswith(("mcp_servers.kin_web.required", "mcp_servers.kin_computer.required")) for flag in argv)
+
+    configured = {**UI_COMPUTER, "ui": {**UI_COMPUTER["ui"], "readiness_timeout_seconds": 60}}
+    run_codex(fake, TOPIC, tmp_path / "job-60", computer=configured, budget_seconds=60, **codex_kwargs())
+    argv = overrides(json.loads((tmp_path / "job-60" / "observed.json").read_text())["argv"])
+    assert seen["timeout_seconds"] == 60 and "mcp_servers.kin_ui.startup_timeout_sec=60" in argv
+
+    # Never shorter than the other servers' wait, never past the probe's own ceiling.
+    assert [ui_startup_seconds(value) for value in (None, 1, 9.5, 10, 30.2, 120, 500)] == [45, 10, 10, 10, 31, 120, 120]
+    server = {"command": "python", "args": [], "env": {"PYTHONPATH": "src"}}
+    for readiness, expected in ((None, 45), (5, 10), (90, 90), (300, 120)):
+        ui = {**server, **({"readiness_timeout_seconds": readiness} if readiness is not None else {})}
+        argv = codex_argv("codex", tmp_path, model="deepseek-flash", reasoning="high", schema_file=tmp_path / "s.json",
+                          last_file=tmp_path / "l.json", provider=PROVIDER, ui_mcp=ui, web_mcp=server, computer_mcp=server)
+        assert f"mcp_servers.kin_ui.startup_timeout_sec={expected}" in argv
+        assert "mcp_servers.kin_web.startup_timeout_sec=10" in argv and "mcp_servers.kin_computer.startup_timeout_sec=10" in argv
+        assert "mcp_servers.kin_ui.required=true" in argv

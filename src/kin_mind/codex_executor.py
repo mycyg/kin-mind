@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -55,6 +56,20 @@ PROVIDER_PASSTHROUGH = ("request_max_retries", "stream_max_retries", "stream_idl
 
 ERROR_TAGS = ("timeout", "unauthorized", "rate limit", "permission", "not found", "429", "401", "403", "error")
 DEEPSEEK_MODEL_CATALOG = Path(__file__).with_name("deepseek-models.json")
+
+# How long the Computer Use bootstrap may take before a run gives up on it, unless the host's
+# `computer_exploration.ui.readiness_timeout_seconds` says otherwise.
+UI_READINESS_SECONDS = 45
+
+
+def ui_startup_seconds(readiness_seconds=None):
+    """How long Codex waits for `kin_ui`'s handshake. The server answers `initialize` only after
+    the same Computer Use bootstrap the readiness probe ran, so Codex waits as long as the probe
+    may (`readiness_timeout_seconds`), never less than the other servers' 10 s nor past the
+    probe's own 120 s ceiling."""
+    seconds = UI_READINESS_SECONDS if readiness_seconds is None else float(readiness_seconds)
+    return math.ceil(min(120.0, max(10.0, seconds)))
+
 
 # ``codex exec --json`` includes MCP arguments and full results on the item.
 # Exploration receipts only need enough information to prove whether the call
@@ -525,7 +540,10 @@ def codex_argv(executable, directory, *, model, reasoning, schema_file, last_fil
                 "-c", f"mcp_servers.{name}.env={{" + ", ".join(key + "=" + dumps(value) for key, value in server_env.items()) + "}",
                 "-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"',
                 "-c", f"mcp_servers.{name}.omit_tools_from=[]",
-                "-c", f"mcp_servers.{name}.startup_timeout_sec=10",
+                # kin_ui answers the handshake once its Computer Use bootstrap is done, which the
+                # readiness probe just took up to its own limit to prove; the readers start at once.
+                "-c", f"mcp_servers.{name}.startup_timeout_sec=" + str(
+                    ui_startup_seconds(server.get("readiness_timeout_seconds")) if name == "kin_ui" else 10),
                 # kin_ui reads the target before and after an interaction. It stays
                 # bounded by both this tool timeout and the executor's total budget.
                 "-c", f"mcp_servers.{name}.tool_timeout_sec=" + ("90" if name == "kin_ui" else "30"),
@@ -750,12 +768,13 @@ def run_codex(
             "args": [str(value) for value in backend.get("args", [])],
             "env_vars": backend_env_keys,
         }
+        readiness_seconds = ui.get("readiness_timeout_seconds", UI_READINESS_SECONDS)
         try:
             backend_readiness = probe_backend_readiness(
                 backend_config, execution_id=directory.name, attempt=attempt, model=model,
                 allowed_apps=ui.get("allowed_apps", []),
                 allowed_app_actions=ui.get("allowed_app_actions", ["observe"]),
-                timeout_seconds=ui.get("readiness_timeout_seconds", 45),
+                timeout_seconds=readiness_seconds,
                 execution_env=marked,
             )
         except Exception as error:
@@ -791,7 +810,7 @@ def run_codex(
         ui_mcp = {"command": sys.executable,
                   "args": ["-m", "kin_mind.computer_use", str(ui_config_file)],
                   "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[1])},
-                  "env_vars": ui_env_keys}
+                  "env_vars": ui_env_keys, "readiness_timeout_seconds": readiness_seconds}
     web_ledger = None
     web_mcp = None
     if web and web.get("enabled", True):

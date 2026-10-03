@@ -141,8 +141,11 @@ also omits all UI/backend configuration and always denies its own execution
 directory, even if an authorized root contains it. The
 owning Codex/Computer Use process must already have macOS Accessibility access
 for native apps, and the chosen browser must be available. This route never
-grants OS permission itself. At startup the executor waits up to ten seconds for
-`kin_ui` and approves only this host-owned MCP server. [DeepSeek's official
+grants OS permission itself. Before Codex starts, a readiness probe runs the
+Computer Use bootstrap within `ui.readiness_timeout_seconds` (45 by default);
+`kin_ui` runs the same bootstrap before it answers Codex's handshake, so Codex
+waits for it just as long (kept within 10–120 seconds; the read-only servers get
+ten). `kin_ui` is required, and Codex approves only this host-owned MCP server. [DeepSeek's official
 Responses documentation](https://api-docs.deepseek.com/guides/responses_api/)
 accepts ordinary function tools but rejects a custom `exec`
 tool, so this profile keeps code mode disabled and uses a bundled DeepSeek model
