@@ -26,6 +26,15 @@ LAYER_SUPERSEDED = "superseded"
 
 CITABLE = {"observed", "historical"}
 MEMORY_LOCATOR = re.compile(r"^memory://([A-Za-z0-9_.:-]{1,200})$")
+# `citation_key`: an http(s) locator as scheme, authority, path with query (the #fragment is never
+# sent), and in the last the characters RFC 3986 respells. A backslash stays: browsers read a slash.
+WEB_LOCATOR = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)([^#]*)", re.S)
+HOST_PORT = re.compile(r"(\[[^\]]*\]|[^:]*)(?::(.*))?", re.S)
+UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+RESPELLED = re.compile(r"%[0-9A-Fa-f]{2}|[^A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%\\]")
+DEFAULT_PORTS = {"http": "80", "https": "443"}
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+EVIDENCE_ID_SHAPE = re.compile(r"(?:web|computer|mem)_[0-9a-f]*|[0-9a-f]{64}")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RECEIPT_FORMAT = "kin-source-receipt-v1"
 SOURCE_RECEIPT_V2 = "kin-source-receipt-v2"
@@ -204,7 +213,7 @@ def build_ledger(topic, *, web_observations=(), computer_observations=(), contin
             receipt = source.get("receipt") if isinstance(source, dict) else None
             if (not isinstance(source, dict) or not source.get("url")
                     or not valid_source_receipt(receipt, execution_id=previous.get("id"))
-                    or receipt.get("locator") != source.get("url")):
+                    or not _named_by([receipt.get("locator")])(source.get("url"))):
                 continue
             entries.append(_entry(
                 LAYER_HISTORICAL, source["url"], evidence_id=receipt.get("evidence_id"),
@@ -289,8 +298,44 @@ def validate_continuation_sources(continuation, topic):
     return valid, dropped
 
 
+def _respelled(match):
+    text = match.group()
+    if len(text) == 3:
+        char = chr(int(text[1:], 16))
+        return char if char in UNRESERVED else text.upper()
+    return "".join("%{:02X}".format(byte) for byte in text.encode("utf-8", "surrogatepass"))
+
+
+def citation_key(locator):
+    """What two spellings of one http(s) request share, or None for any other locator (memory://
+    and the rest are compared as written). Scheme and host in lower case, no default port, no
+    #fragment; in the path and query a non-ASCII or otherwise unsafe character and a %xx are one
+    uppercase %XX, an unreserved character and its %XX are one (RFC 3986). A reserved character
+    is never decoded, the query keeps its content and order, a trailing slash and http/https stay
+    as written."""
+    match = WEB_LOCATOR.match(locator) if isinstance(locator, str) else None
+    scheme = match and match.group(1).lower()
+    if scheme not in DEFAULT_PORTS:
+        return None
+    userinfo, at, host_port = match.group(2).rpartition("@")
+    host, port = HOST_PORT.fullmatch(host_port).groups()
+    if not host:
+        return None
+    port = "" if port is None or port == DEFAULT_PORTS[scheme] else ":" + port
+    return (scheme + "://" + userinfo + at + host.translate(ASCII_LOWER) + port
+            + RESPELLED.sub(_respelled, match.group(3)))
+
+
+def _named_by(locators):
+    """Whether a value names one of `locators`: as written, or an http(s) one by `citation_key`."""
+    exact = {value for value in locators if isinstance(value, str)}
+    keys = {citation_key(value) for value in exact} - {None}
+    return lambda value: value in exact or (bool(keys) and citation_key(value) in keys)
+
+
 def legitimize(ledger, url):
-    """The exact-match receipt for a citation, or None. No prefix matching."""
+    """The receipt for a citation, or None. Exact first; then, among citable receipts only, another
+    spelling of the same http(s) request (`citation_key`). No prefix matching."""
     if url == "computer://current-context":
         for entry in reversed(ledger):
             if entry["state"] == LAYER_OBSERVED and entry["basis"] == "computer" and entry["locator"] == url:
@@ -305,26 +350,90 @@ def legitimize(ledger, url):
     # What this run read itself comes before a receipt carried in from a checkpoint or an earlier
     # exploration: a page read again now is the version the result was written from (K4-17).
     matches = [entry for entry in ledger if entry["state"] in CITABLE and entry["locator"] == url]
+    key = None if matches else citation_key(url)
+    if key is not None:
+        matches = [entry for entry in ledger
+                   if entry["state"] in CITABLE and citation_key(entry["locator"]) == key]
     observed = [entry for entry in matches if entry["state"] == LAYER_OBSERVED]
     return (observed or matches or [None])[-1]
 
 
+def _backed(ledger):
+    """Whether an evidence_map id names a citable receipt: its full evidence_id, or its locator."""
+    citable = [entry for entry in ledger if entry["state"] in CITABLE]
+    ids = {entry["evidence_id"] for entry in citable if entry.get("evidence_id")}
+    named = _named_by(entry["locator"] for entry in citable)
+    return lambda identifier: identifier in ids or named(identifier)
+
+
 def verify_citations(findings, ledger):
-    """(rejected citations, rejected evidence ids). A citation must map exactly to
-    a citable receipt; an evidence_map id must exist with a citable state."""
+    """(rejected citations, rejected evidence ids). A citation must map to a citable
+    receipt (`legitimize`); an evidence_map id must exist with a citable state."""
     rejected = [citation.url for citation in findings.sources
                 if legitimize(ledger, citation.url) is None]
     unknown_ids = []
     if findings.evidence_map:
-        known = {entry["evidence_id"] for entry in ledger
-                 if entry["state"] in CITABLE and entry.get("evidence_id")}
-        known |= {entry["locator"] for entry in ledger if entry["state"] in CITABLE}
+        backed = _backed(ledger)
         for claim, ids in findings.evidence_map.items():
             if not isinstance(ids, list) or not ids:
                 unknown_ids.append(claim)
                 continue
-            unknown_ids.extend(str(identifier) for identifier in ids if identifier not in known)
+            unknown_ids.extend(str(identifier) for identifier in ids if not backed(identifier))
     return rejected, sorted(set(unknown_ids))
+
+
+def rejection_counts(findings, ledger, web_observations=()):
+    """Why each refused citation and evidence_map id was refused, as counts by class: no locator,
+    title or text, so the counts outlast the words a settled run's files lose (workdirs). A locator
+    is `memory-unknown`, `failed-read` (a read of it failed), `search-only` (a search result),
+    `linked-only` (a link in a page read) or `unread`; an id that is no locator is `failed-read` or
+    `search-only` by its receipt, else `id-shape` (a cut or miscopied id, a version hash) or
+    `not-evidence`; a claim mapped to nothing is `empty-mapping`."""
+    receipts = [receipt for receipt in web_observations or [] if isinstance(receipt, dict)]
+    reads = [receipt for receipt in receipts if receipt.get("tool") == "read_page"]
+    failed = _named_by([value for receipt in reads if receipt.get("state") == LAYER_FAILED
+                        for value in (receipt.get("locator"), receipt.get("requested_locator"))])
+    searched = _named_by([result.get("url") for receipt in receipts
+                          if receipt.get("state") == LAYER_SEARCH_RESULT
+                          for result in receipt.get("results") or [] if isinstance(result, dict)])
+    linked = _named_by([link for receipt in reads if receipt.get("state") == LAYER_OBSERVED
+                        for link in receipt.get("links") or []])
+    failed_ids = {receipt.get("evidence_id") for receipt in reads if receipt.get("state") == LAYER_FAILED}
+    search_ids = {receipt.get("evidence_id") for receipt in receipts if receipt.get("tool") == "web_search"}
+
+    def locator_class(value):
+        if str(value).startswith("memory://"):
+            return "memory-unknown"
+        return ("failed-read" if failed(value) else "search-only" if searched(value)
+                else "linked-only" if linked(value) else "unread")
+
+    def id_class(value):
+        if "://" in value:
+            return locator_class(value)
+        if value in failed_ids:
+            return "failed-read"
+        if value in search_ids:
+            return "search-only"
+        return "id-shape" if EVIDENCE_ID_SHAPE.fullmatch(value) else "not-evidence"
+
+    counts = {"sources": {}, "evidence_map": {}}
+
+    def count(part, name):
+        counts[part][name] = counts[part].get(name, 0) + 1
+
+    for citation in findings.sources:
+        if legitimize(ledger, citation.url) is None:
+            count("sources", locator_class(citation.url))
+    backed = _backed(ledger)
+    refused = set()
+    for ids in (findings.evidence_map or {}).values():
+        if not isinstance(ids, list) or not ids:
+            count("evidence_map", "empty-mapping")
+            continue
+        refused.update(str(identifier) for identifier in ids if not backed(identifier))
+    for identifier in sorted(refused):
+        count("evidence_map", id_class(identifier))
+    return counts
 
 
 def verified_sources(findings, ledger, *, execution_id=None, attempt=None):
@@ -345,11 +454,9 @@ def coverage(findings, ledger):
     """Evidence-map coverage for the receipt: claims named, claims backed."""
     if not findings.evidence_map:
         return {"mapped_claims": 0, "covered_claims": 0}
-    known = {entry["evidence_id"] for entry in ledger
-             if entry["state"] in CITABLE and entry.get("evidence_id")}
-    known |= {entry["locator"] for entry in ledger if entry["state"] in CITABLE}
+    backed = _backed(ledger)
     covered = sum(1 for ids in findings.evidence_map.values()
-                  if isinstance(ids, list) and ids and all(identifier in known for identifier in ids))
+                  if isinstance(ids, list) and ids and all(backed(identifier) for identifier in ids))
     return {"mapped_claims": len(findings.evidence_map), "covered_claims": covered}
 
 

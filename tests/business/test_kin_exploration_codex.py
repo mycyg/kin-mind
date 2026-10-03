@@ -388,6 +388,131 @@ def test_a_citation_prefers_what_this_run_read_over_a_carried_receipt():
     assert legitimize([new, old], "https://site.example/a")["version"] == "v2"
     assert legitimize([old], "https://site.example/a")["version"] == "v1"
 
+
+def _web_receipt(state, locator, n, *, tool="read_page", **extra):
+    observed = {"version": format(n, "064x"), "read_at": "2026-01-01T00:00:00+00:00"} if state == "observed" else {}
+    return {"execution_id": "explore_cite", "attempt": 1, "state": state, "tool": tool,
+            "evidence_id": "web_" + format(n, "032x"), "locator": locator, "requested_locator": locator,
+            **observed, **extra}
+
+
+def test_a_citation_may_respell_the_request_it_read_and_nothing_more():
+    """ws6-cite: a page read by its %-encoded address is backed in its Unicode spelling, with a
+    #fragment or with the host in capitals -- one request. Another query, a search hit, a failed
+    read and its spellings, a cut id, http for https or another trailing slash stay unbacked, and
+    the refusals are counted by class without a word."""
+    from kin_mind.exploration import Findings
+    from kin_mind.source_ledger import (build_ledger, citation_key, coverage, legitimize, rejection_counts,
+                                        verified_sources, verify_citations)
+    from kin_mind.workdirs import without_words
+    read = _web_receipt("observed", "https://zh.example.org/wiki/%e4%b8%ad%e6%96%87", 1)
+    query = _web_receipt("observed", "https://site.example/page?a=1&b=2", 2, links=["https://linked.example/d"])
+    search = _web_receipt("search_result", "https://search.example/html", 5, tool="web_search",
+                          results=[{"title": "Seen", "url": "https://seen.example/c", "snippet": ""}])
+    observations = [read, query, _web_receipt("failed", "https://blocked.example/a", 3, failure_reason="http-status:403"),
+                    _web_receipt("failed", "https://down.example/b", 4, failure_reason="fetch-failed"), search]
+    ledger = build_ledger({}, web_observations=observations, execution_id="explore_cite", attempt=1)
+
+    def findings(*urls, ids=None):
+        return Findings.model_validate({"summary": "s", "findings": ["f"], "open_questions": [],
+                                        "sources": [{"url": url, "title": "t"} for url in urls], "evidence_map": ids})
+
+    respelled = ["https://zh.example.org/wiki/中文", "https://zh.example.org/wiki/中文#section",
+                 "https://ZH.Example.ORG/wiki/%E4%B8%AD%E6%96%87", "https://zh.example.org:443/wiki/中文"]
+    for url in respelled:
+        assert (legitimize(ledger, url) or {}).get("evidence_id") == read["evidence_id"], url
+    backed = findings(*respelled, ids={"1": respelled, "2": [read["evidence_id"]]})
+    assert verify_citations(backed, ledger) == ([], [])
+    assert coverage(backed, ledger) == {"mapped_claims": 2, "covered_claims": 2}
+    # A reserved character is never decoded; memory:// is compared as written.
+    assert citation_key("https://a.example/x%2Fy") != citation_key("https://a.example/x/y")
+    assert citation_key("memory://s1") is None
+
+    refused = ["https://site.example/page?b=2&a=1", "https://site.example/page?a=1&b=3",
+               "https://seen.example/c", "https://blocked.example/a", "https://BLOCKED.example/a#top",
+               "https://down.example/b", "http://zh.example.org/wiki/中文", "https://zh.example.org/wiki/中文/",
+               "https://linked.example/d", "https://never.example/e", "memory://s9"]
+    unbacked = findings(*refused, ids={"1": [read["evidence_id"][:-4], "https://down.example/b", search["evidence_id"]],
+                                       "2": [], "3": ["the page says so"]})
+    rejected, unknown = verify_citations(unbacked, ledger)
+    assert rejected == refused and len(unknown) == 5
+    counts = rejection_counts(unbacked, ledger, observations)
+    assert counts == {"sources": {"unread": 5, "search-only": 1, "failed-read": 3, "linked-only": 1, "memory-unknown": 1},
+                      "evidence_map": {"id-shape": 1, "failed-read": 1, "search-only": 1, "empty-mapping": 1,
+                                       "not-evidence": 1}}
+    words = json.dumps(counts, ensure_ascii=False, separators=(",", ":"))
+    assert without_words(counts) == counts and words.isascii() and not set(words) & set("/%?&# ")
+
+    # A finished run that cited the respelling keeps it as a historical source for the next run.
+    sealed = verified_sources(findings(respelled[0]), ledger, execution_id="explore_cite", attempt=1)
+    later = build_ledger({"previous_explorations": [{"id": "explore_cite", "state": "complete", "result": {
+        "sources": [{"url": respelled[0], "title": "t", "receipt": sealed[0]}]}}]})
+    assert legitimize(later, read["locator"])["state"] == "historical"
+
+
+CITE_TAIL = """pages = [reader.read_page(url) for url in {reads}]
+for n, page in enumerate(pages):
+    call(n + 1, 'read_page', {{'state': page['state'], 'evidence_id': page['evidence_id'], 'locator': page['locator']}})
+ids = [pages[0]['evidence_id']] + ([pages[0]['evidence_id'][:-4]] if {cut} else [])
+payload = {{'summary': 'The answer is teal.', 'findings': ['The page says teal.'],
+           'sources': [{{'url': url, 'title': 'Probe Page'}} for url in {cites}], 'open_questions': [],
+           'suggested_share': None, 'evidence_map': {{'1': ids}}}}
+open(last, 'w').write(json.dumps(payload))
+emit({{'type': 'turn.completed', 'usage': {{'input_tokens': 50, 'output_tokens': 10}}}})
+"""
+
+
+def test_a_page_read_encoded_is_cited_in_unicode_and_a_refused_read_is_counted(tmp_path, monkeypatch):
+    """ws6-cite through the host's own reader: a page read by its %-encoded address and cited in
+    Unicode with a #fragment completes the run; citing the page whose read got a 403 fails it, and
+    the receipt says why in classes and counts that keep through the settled run's word removal."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from kin_mind.workdirs import without_words
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><head><title>Probe Page</title></head><body>The answer is teal.</body></html>"
+            self.send_response(403 if self.path.startswith("/forbidden") else 200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    encoded, forbidden = base + "/wiki/%e4%b8%ad%e6%96%87", base + "/forbidden"
+
+    def run(name, cites, *, cut=False):
+        driver = tmp_path / name
+        driver.write_text((DRIVER.split("found = reader.search")[0] + CITE_TAIL).format(
+            python=sys.executable, reads=ascii([encoded, forbidden]), cites=ascii(cites), cut=cut))
+        driver.chmod(0o700)
+        return run_codex(driver, {"question": "What does the probe page say?"}, tmp_path / ("job-" + name),
+                         web={"enabled": True, "search_endpoint": base + "/search", "allow_hosts": ["127.0.0.1"]},
+                         budget_seconds=60, **codex_kwargs())
+
+    try:
+        cited = run("respelled", [base + "/wiki/中文#section"])
+        refused = run("refused", [base + "/wiki/中文", forbidden], cut=True)
+    finally:
+        server.shutdown()
+    assert cited["state"] == "complete", cited.get("reason")
+    source = cited["result"]["sources"][0]
+    assert source["url"] == base + "/wiki/中文#section" and source["receipt"]["locator"] == encoded
+    assert "citation_rejections" not in cited
+    assert refused["state"] == "failed" and refused["reason"] == "unbacked-citation"
+    counts = refused["citation_rejections"]
+    assert counts == {"sources": {"failed-read": 1}, "evidence_map": {"id-shape": 1}}
+    words = json.dumps(counts, ensure_ascii=False, separators=(",", ":"))
+    assert without_words(counts) == counts and words.isascii() and not set(words) & set("/%?&# ")
+
 def test_exploration_runs_the_runtime_bundle_codex_not_the_floating_cli(tmp_path):
     """K2-15, item 9: an explicit native_codex_command wins; else the verified runtime bundle's
     binary; the legacy command only where no bundle is installed; a changed manifest waits."""

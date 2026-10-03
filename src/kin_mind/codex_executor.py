@@ -33,6 +33,7 @@ from .model_view import for_model
 from .source_ledger import (
     build_ledger,
     coverage,
+    rejection_counts,
     seal_source_receipt,
     valid_computer_receipt,
     valid_web_receipt,
@@ -1046,6 +1047,7 @@ def run_codex(
         partial_findings = None
         extra_gaps = []
         evidence_coverage = None
+        citation_rejections = None
         if state == "failed":
             if child.returncode == 0 and turn_completed:
                 if final_text is None:
@@ -1085,6 +1087,9 @@ def run_codex(
                         reason = "unbacked-citation"
                         extra_gaps = ["rejected unbacked citation: " + citation for citation in rejected[:10]]
                         extra_gaps += ["rejected unknown evidence id: " + identifier for identifier in unknown_ids[:10]]
+                        # The same refusals by class, no words: what is left to read of them once
+                        # the settled run's files lose theirs.
+                        citation_rejections = rejection_counts(result, ledger, web_observations)
                         evidence_coverage = coverage(result, ledger)
                         # The run still failed and nothing of it reaches memory; what it
                         # concluded stays the draft a later attempt starts from (K2-08).
@@ -1195,6 +1200,7 @@ def run_codex(
                            "reconcile": "gateway usage rows purpose=native-exploration in [started_at, finished_at]"},
             "source_ledger": ledger_summary(ledger),
             "evidence_coverage": evidence_coverage,
+            **({"citation_rejections": citation_rejections} if citation_rejections else {}),
             "continuation_dropped": continuation_dropped,
             "rejected_tool_receipts": {"computer": rejected_computer_receipts,
                                        "web": rejected_web_receipts},
