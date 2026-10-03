@@ -48,6 +48,9 @@ export const REQUEUE_BUDGET=3;
 const requeuesOf=record=>Number.isSafeInteger(record?.requeues)?record.requeues:record?.retry?.requeues??0;
 /** A deferral whose plan port could not answer is asked again after these waits, then left to Kin (CR-MIND-03). */
 export const DEFERRAL_PLAN_RETRY_MS=Object.freeze([60000,5*60000,15*60000,3600000,3*3600000]);
+/** A closed task's unproven report is looked up again 1, 2, 4… minutes apart, at most this
+ * far apart, until this long after the task closed; then it stays unknown. */
+export const CLOSED_LOOKUP_MAX_GAP_MS=3600000,CLOSED_LOOKUP_MAX_MS=24*3600000;
 /** The channels an input may arrive on, kept as its receipt fact (CR-LIFE-17). */
 const INPUT_CHANNELS=new Set(['feishu','wechat','desktop-handoff','cli']);
 /** An input's kind as the journal may name it (owner, handoff, work-result, the mind's own…). */
@@ -237,7 +240,7 @@ export class MobileRouter {
     this.runtimeId=typeof runtimeId==='string'&&runtimeId?runtimeId.slice(0,120):null;
     this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
     this.profiles=Object.freeze({chat:Object.freeze({...ROUTER_PROFILES.chat,...profiles?.chat}),work:Object.freeze({...ROUTER_PROFILES.work,...profiles?.work})});
-    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();this.deadlines=new Map();this.activities=new Map();this.watching=false;
+    this.tail=Promise.resolve();this.inflight=new Map();this.progress=new Map();this.acceptance=new Map();this.reservations=new Map();this.deadlines=new Map();this.activities=new Map();this.closedLookups=new Map();this.watching=false;
     const loaded=loadState(file,{now,validate:value=>typeof value.sessionId==='string'&&Boolean(value.tasks&&value.inputs&&value.requests)});
     this.state=loaded.value??{schema:1,sessionId,revision:0,mode:'auto',exitRequested:false,tasks:{},inputs:{},requests:{},history:[],recent:[],config:{classifierTimeoutMs:15000,auditIntervalHours:4},ledgerVersion:2};
     if(this.state.schema!==1)throw Error('Router schema mismatch');
@@ -2183,27 +2186,66 @@ export class MobileRouter {
     return {endedAt:proposal.turnEndedAt??task.turnEndedAt??proposal.at,settled:deliveries.every(settledDelivery),reported,
       unknown:deliveries.filter(d=>['unconfirmed','unknown'].includes(d.state)).map(d=>d.id)};
   }
-  /** Look up, by their original ids, the unproven deliveries of a declaration past its
-   * report wait. `lookup(id)` reads a transport receipt; nothing is sent. */
+  /** Look up, by their original ids, the unproven deliveries of an open declaration past
+   * its report wait, and of a closed task's report. Only an open declaration's stall needs
+   * the native runtime. A closed task's are looked up again with a backoff kept in memory
+   * (a restart only starts it over) until CLOSED_LOOKUP_MAX_MS after it closed.
+   * `lookup(id)` reads a transport receipt; nothing is sent. */
   async reconcileDeliveries(lookup) {
     const due=await this.locked(async()=>{
-      if(!Object.values(this.state.tasks).some(task=>task.completion?.outcome))return [];
-      const runtime=await this.inspect().catch(()=>null);
-      return Object.values(this.state.tasks).filter(task=>task.completion?.outcome&&(task.closure||this.declarationStalled(task,runtime))).flatMap(task=>Object.entries(task.deliveries??{})
-        .filter(([,d])=>['unconfirmed','unknown'].includes(d.state)).map(([id,d])=>({taskId:task.id,id,key:d.outboxId??id})));
+      const now=this.now(),declared=Object.values(this.state.tasks).filter(task=>task.completion?.outcome);
+      const pending=declared.filter(task=>!task.closure&&open(task));
+      const runtime=pending.length?await this.inspect().catch(()=>null):null;
+      const unknown=task=>Object.entries(task.deliveries??{}).filter(([,d])=>['unconfirmed','unknown'].includes(d.state));
+      return [...pending.filter(task=>this.declarationStalled(task,runtime)).flatMap(task=>unknown(task).map(([id,d])=>({taskId:task.id,id,key:d.outboxId??id}))),
+        ...declared.filter(task=>task.closure&&now-task.closure.at<CLOSED_LOOKUP_MAX_MS).flatMap(task=>unknown(task)
+          .filter(([id])=>!(this.closedLookups.get(task.id+'\n'+id)?.nextAt>now)).map(([id,d])=>({taskId:task.id,id,key:d.outboxId??id,closed:true})))];
     });
     let changed=0;
     for(const item of due) {
       let receipt=null;try{receipt=await lookup(item.key);}catch{receipt=null;}
+      if(item.closed) {
+        const key=item.taskId+'\n'+item.id,attempts=(this.closedLookups.get(key)?.attempts??0)+1;
+        this.closedLookups.set(key,{attempts,nextAt:this.now()+Math.min(CLOSED_LOOKUP_MAX_GAP_MS,60000*2**Math.min(attempts-1,16))});
+      }
       if(receipt?.state!=='accepted'||!receipt.messageId)continue;
       await this.locked(async()=>{
         const delivery=this.state.tasks[item.taskId]?.deliveries?.[item.id];
         if(!delivery||!['unconfirmed','unknown'].includes(delivery.state))return;
         Object.assign(delivery,{state:'accepted',messageId:receipt.messageId,reconciledAt:this.now()});changed++;
+        this.closedLookups.delete(item.taskId+'\n'+item.id);
         this.save('delivery-reconciled',{taskId:item.taskId,id:item.id});
       });
     }
     return {looked:due.length,accepted:changed};
+  }
+  /** A closed task's report to 小光 that was refused or is still unproven, as facts for
+   * Kin: its ledger entries and the receipts that came after it closed. Null when there is
+   * nothing to tell, or the task owed no report. */
+  closureFacts(taskId) {
+    const task=this.state.tasks[taskId],report=task?.closure&&task.requiresDelivery!==false?closedReport(task):null;
+    if(!report||!report.undelivered.length&&!report.unknown.length)return null;
+    return {id:task.id,status:task.status,request:String(task.summary??'').slice(0,200),closed:{outcome:task.closure.outcome,at:task.closure.at},
+      reported:report.reported,undelivered:report.undelivered.slice(0,16),unknownDeliveries:report.unknown.slice(0,16)};
+  }
+  /** Closed tasks whose refused or unproven report Kin has not been told about. One is due
+   * once none of its unproven deliveries is younger than the report wait, so a single
+   * telling covers it; only while its lookups still run. Told once (`closure.told`). */
+  closuresToTell() {
+    const now=this.now(),wait=(this.state.config.reportWaitMinutes??30)*60000;
+    return Object.values(this.state.tasks).filter(task=>{
+      if(!task.closure||task.closure.told||now-task.closure.at>=CLOSED_LOOKUP_MAX_MS||!this.closureFacts(task.id))return false;
+      const report=closedReport(task);
+      return !report.unknown.some(id=>now-Math.max(task.closure.at,report.latest.get(id).at??0)<wait);
+    }).map(task=>task.id);
+  }
+  markClosureTold(taskId) {
+    return this.locked(async()=>{
+      const task=this.state.tasks[taskId];if(!task?.closure||task.closure.told)return false;
+      const facts=this.closureFacts(taskId);
+      task.closure.told={at:this.now(),deliveries:facts?[...facts.undelivered,...facts.unknownDeliveries]:[]};
+      this.save('closure-told',{taskId});return true;
+    });
   }
   /** Close a task on its declared outcome, keeping the facts it closed on. */
   closeTask(task,{event='task-closed'}={}) {
@@ -2561,6 +2603,19 @@ function restoredCancel(id,kind,{canceledBy,scope,state},at,submit) {
 }
 /** A deferred task the router still owes its plan to, or owes Kin its failure. */
 function deferralOwed(task){const plan=task.deferral?.plan;return task.status==='deferred'&&(plan?.state==='pending'||plan?.state==='needs-kin'&&!plan.toldAt);}
+const proven=delivery=>delivery?.state==='accepted'&&Boolean(delivery.messageId);
+/** A closed task's deliveries as they stand now: each id's ledger entry or a receipt that
+ * came after the task closed, whichever is later. A proven delivery stays proven. */
+function closedReport(task) {
+  const latest=new Map(),late=Object.values(task.deliveryHistory??{}).filter(d=>d.reason==='task-closed'&&typeof d.id==='string').map(d=>[d.id,d]);
+  for(const [id,delivery] of [...Object.entries(task.deliveries??{}),...late]) {
+    const prior=latest.get(id);
+    if(!prior||!proven(prior)&&(proven(delivery)||(delivery.at??0)>=(prior.at??0)))latest.set(id,delivery);
+  }
+  const ids=states=>[...latest].filter(([,d])=>states.includes(d.state)).map(([id])=>id);
+  return {latest,undelivered:ids(['rejected','undeliverable']),unknown:ids(['unconfirmed','unknown']),
+    reported:task.closure.reported||[...latest.values()].some(d=>proven(d)&&(d.at??0)>=(task.completion?.at??0))};
+}
 /** A task keeps a bounded history of replaced and late entries (AD1-08). */
 function trim(task,key,limit=64) {
   const entries=Object.entries(task[key]??{});

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,ACTIVITY_KINDS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
+import {MobileRouter,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,NOTICE_ROUND_REST_MS,NOTICE_REJECT_RETRY_MS,REQUEUE_BUDGET,DEFERRAL_PLAN_RETRY_MS,CLOSED_LOOKUP_MAX_MS,ACTIVITY_KINDS,literalCommand,reconciliationState} from '../../adapters/mobile-router.mjs';
 import {inputSummary,holdsSession} from '../../adapters/input-ledger.mjs';
 import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 import {MobileAudit} from '../../adapters/mobile-audit.mjs';
@@ -265,6 +265,98 @@ test('work closes on Kin declaration while an unknown report is reconciled separ
   await g.router.requestMode({commandId:'done2',mode:'auto',reason:'finished',completedTaskId:other.id,completedInputVersion:other.inputVersion});
   await g.router.requestMode({commandId:'partial2',mode:'auto',reason:'only half',taskOutcome:'partial',completedTaskId:other.id,completedInputVersion:other.inputVersion});
   assert.equal(other.completion.outcome,'partial');
+});
+
+/** A task Kin took on, declared done with these deliveries in its turn, and closed. */
+async function closedWork(f,deliveries) {
+  await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  const task=f.router.tasks()[0],basis={taskId:task.id,inputVersion:task.inputVersion,turnFence:0};
+  await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  await f.router.observe('prompt-start',{...basis,inputIds:['job']});
+  await f.router.requestMode({commandId:'done',mode:'auto',reason:'finished',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'job'});
+  for(const [id,state,messageId] of deliveries)await f.router.observe('delivery',{...basis,id,outboxId:'kin-frag-'+id,state,messageId,sourceInputId:'job'});
+  await f.router.observe('prompt-end',{...basis,stopReason:'end_turn'});
+  await f.router.reconcile();
+  assert.equal(task.status,'completed','closed on the declaration, receipts or not');
+  return {task,late:(id,state,messageId)=>f.router.observe('delivery',{...basis,id,state,messageId,sourceInputId:'job'})};
+}
+
+test('a closed task\'s refused report is told to Kin once, across a restart, and a later failure adds nothing',async t=>{
+  const f=fixture(t);
+  const {task,late}=await closedWork(f,[['report','rejected'],['part','accepted','om-part']]);
+  assert.deepEqual(f.router.closuresToTell(),[task.id],'nothing unproven to wait for: due at once');
+  const facts=f.router.closureFacts(task.id);
+  assert.deepEqual([facts.closed.outcome,facts.undelivered,facts.unknownDeliveries,facts.reported],['completed',['report'],[],true]);
+  assert.equal(await f.router.markClosureTold(task.id),true);
+  assert.deepEqual(task.closure.told,{at:f.clock.now,deliveries:['report']});
+  assert.deepEqual(f.router.closuresToTell(),[]);
+  assert.equal(await f.router.markClosureTold(task.id),false,'once');
+  const restarted=new MobileRouter(f.args);
+  assert.deepEqual([restarted.closuresToTell(),restarted.state.tasks[task.id].closure.told.deliveries],[[],['report']],'the mark is durable');
+  await late('again','rejected');
+  assert.ok(Object.values(task.deliveryHistory).some(d=>d.id==='again'&&d.reason==='task-closed'),'a late receipt goes to history');
+  assert.deepEqual(f.router.closuresToTell(),[],'told once per task');
+  // A send still pending when the task closed that is refused afterwards is told too.
+  const g=fixture(t);
+  const pending=await closedWork(g,[['slow','pending']]);
+  assert.deepEqual(g.router.closuresToTell(),[]);
+  await pending.late('slow','rejected');
+  assert.deepEqual([g.router.closuresToTell(),g.router.closureFacts(pending.task.id).undelivered],[[pending.task.id],['slow']]);
+});
+
+test('a closed task\'s unproven report is told once past the report wait, and never once it is proven',async t=>{
+  const f=fixture(t);
+  const {task}=await closedWork(f,[['report','unconfirmed']]);
+  assert.deepEqual(f.router.closuresToTell(),[],'still within the report wait');
+  f.clock.now+=29*MINUTE;assert.deepEqual(f.router.closuresToTell(),[]);
+  f.clock.now+=MINUTE;
+  assert.deepEqual(f.router.closuresToTell(),[task.id]);
+  assert.deepEqual(f.router.closureFacts(task.id).unknownDeliveries,['report']);
+  await f.router.markClosureTold(task.id);
+  await f.router.reconcileDeliveries(async()=>({state:'accepted',messageId:'om-report'}));
+  assert.equal(task.deliveries.report.state,'accepted','still looked up after the telling');
+  assert.deepEqual([f.router.closuresToTell(),f.router.closureFacts(task.id)],[[],null],'and nothing more is said');
+  // Proven in time by its lookup, or by a receipt that came after the close: never told.
+  // A proven delivery stays proven though an unknown receipt for it came later.
+  for(const prove of [g=>g.router.reconcileDeliveries(async id=>id==='kin-frag-report'?{state:'accepted',messageId:'om-report'}:null),
+    (g,late)=>{g.clock.now+=MINUTE;return late('report','accepted','om-late');},
+    async (g,late)=>{g.clock.now+=MINUTE;await late('report','unconfirmed');await g.router.reconcileDeliveries(async()=>({state:'accepted',messageId:'om-report'}));}]) {
+    const g=fixture(t),closed=await closedWork(g,[['report','unconfirmed']]);
+    await prove(g,closed.late);
+    g.clock.now+=HOUR;
+    assert.deepEqual([g.router.closuresToTell(),g.router.closureFacts(closed.task.id)],[[],null]);
+  }
+  // A task that owed no report, or closed past the lookup window, is not told about.
+  const h=fixture(t),other=await closedWork(h,[['report','rejected']]);
+  h.clock.now+=CLOSED_LOOKUP_MAX_MS;
+  assert.deepEqual(h.router.closuresToTell(),[]);
+  h.clock.now-=CLOSED_LOOKUP_MAX_MS;other.task.requiresDelivery=false;
+  assert.deepEqual([h.router.closuresToTell(),h.router.closureFacts(other.task.id)],[[],null]);
+});
+
+test('delivery lookups read the runtime only for an open declaration; a closed task\'s back off and stop a day after it closed',async t=>{
+  const f=fixture(t);let inspected=0;const inspect=f.router.inspect;
+  f.router.inspect=async()=>{inspected++;return inspect();};
+  await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  const task=f.router.tasks()[0];
+  await f.router.requestMode({commandId:'done',mode:'auto',reason:'finished',completedTaskId:task.id,completedInputVersion:task.inputVersion});
+  inspected=0;await f.router.reconcileDeliveries(async()=>null);
+  assert.equal(inspected,1,'an open declaration may have stalled');
+  const g=fixture(t),{task:closed}=await closedWork(g,[['report','unknown']]);
+  let reads=0;const inner=g.router.inspect;g.router.inspect=async()=>{reads++;return inner();};
+  const looked=[],start=g.clock.now;
+  const tick=async minute=>{
+    g.clock.now=start+minute*MINUTE;
+    const result=await g.router.reconcileDeliveries(async id=>{looked.push(minute);assert.equal(id,'kin-frag-report');return {state:'unknown'};});
+    assert.equal(result.accepted,0);
+  };
+  for(let minute=0;minute<=3*60+5;minute++)await tick(minute);
+  assert.deepEqual(looked,[0,1,3,7,15,31,63,123,183],'1, 2, 4… minutes apart, then at most an hour');
+  await tick(24*60-1);assert.equal(looked.at(-1),24*60-1,'still looked up within the day');
+  for(const minute of [24*60,24*60+1,26*60])await tick(minute);
+  assert.equal(looked.at(-1),24*60-1,'none past a day');
+  assert.equal(reads,0,'a closed task needs no runtime');
+  assert.equal(closed.deliveries.report.state,'unknown','left unknown');
 });
 
 test('a deferral\'s plan is retried when the port cannot answer, and handed back to Kin only when it cannot be made (CR-MIND-03)',async t=>{
