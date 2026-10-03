@@ -145,7 +145,9 @@ grants OS permission itself. Before Codex starts, a readiness probe runs the
 Computer Use bootstrap within `ui.readiness_timeout_seconds` (45 by default);
 `kin_ui` runs the same bootstrap before it answers Codex's handshake, so Codex
 waits for it just as long (kept within 10–120 seconds; the read-only servers get
-ten). `kin_ui` is required, and Codex approves only this host-owned MCP server. [DeepSeek's official
+ten). `kin_ui` is required, and Codex approves only this host-owned MCP server.
+The receipt's `startup` times the version probe, the readiness probe and the
+CLI's start to its session, in milliseconds with their outcomes only. [DeepSeek's official
 Responses documentation](https://api-docs.deepseek.com/guides/responses_api/)
 accepts ordinary function tools but rejects a custom `exec`
 tool, so this profile keeps code mode disabled and uses a bundled DeepSeek model

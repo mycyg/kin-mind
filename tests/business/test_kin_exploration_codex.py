@@ -570,7 +570,7 @@ def test_gateway_exploration_preserves_shared_account_login(tmp_path):
 
 
 # kin_ui answers Codex's handshake only after the Computer Use bootstrap the readiness probe already
-# ran, so Codex waits for it as long as the probe may (2026-10-03).
+# ran, so Codex waits for it as long as the probe may; the receipt times each startup step (2026-10-03).
 UI_COMPUTER = {"enabled": True, "file_reader_enabled": False,
                "ui": {"enabled": True, "backend": {"command": sys.executable, "args": []}}}
 
@@ -619,3 +619,72 @@ def test_kin_ui_waits_for_its_handshake_as_long_as_the_readiness_probe(tmp_path,
         assert f"mcp_servers.kin_ui.startup_timeout_sec={expected}" in argv
         assert "mcp_servers.kin_web.startup_timeout_sec=10" in argv and "mcp_servers.kin_computer.startup_timeout_sec=10" in argv
         assert "mcp_servers.kin_ui.required=true" in argv
+
+SESSION_LATE = "import time\ntime.sleep(0.3)\n"
+HANDSHAKE_FAILED = (
+    "import time\ntime.sleep(0.3)\n"
+    "sys.stderr.write('MCP startup failed: required MCP server kin_ui timed out\\n')\n"
+    "raise SystemExit(1)\n"
+)
+
+def test_the_receipt_times_each_startup_step_whether_the_session_comes_or_not(tmp_path, monkeypatch):
+    import kin_mind.computer_use as computer_use
+
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    monkeypatch.setattr(computer_use, "probe_backend_readiness", ready_probe(delay=0.2))
+    fake = fake_codex(tmp_path / "fake-late", SESSION_LATE + COMPLETE)
+    report = run_codex(fake, TOPIC, tmp_path / "job-ok", computer=UI_COMPUTER, budget_seconds=60, **codex_kwargs())
+    assert report["state"] == "complete"
+    startup = report["startup"]
+    assert set(startup) == {"version_probe", "readiness_probe", "session"}
+    assert startup["version_probe"]["state"] == "complete" and isinstance(startup["version_probe"]["elapsed_ms"], int)
+    assert startup["readiness_probe"]["state"] == "ready" and startup["readiness_probe"]["elapsed_ms"] >= 200
+    assert startup["session"]["state"] == "established" and startup["session"]["elapsed_ms"] >= 300
+    assert startup["session"]["kin_ui_timeout_ms"] == 45000 and "stage" not in startup["session"]
+    assert json.loads((tmp_path / "job-ok" / "receipt.json").read_text())["startup"] == startup
+
+    # Codex gives up on kin_ui's handshake: no session, the time to that end, and nothing of what it said.
+    fake = fake_codex(tmp_path / "fake-handshake", HANDSHAKE_FAILED)
+    report = run_codex(fake, TOPIC, tmp_path / "job-failed", computer=UI_COMPUTER, budget_seconds=60,
+                       cli_version="0.159.2", version_probe_ms=812.4, **codex_kwargs())
+    assert report["state"] == "failed" and report["reason"] == "native-run-incomplete"
+    startup = report["startup"]
+    assert startup["version_probe"] == {"state": "complete", "elapsed_ms": 812}
+    assert startup["readiness_probe"]["state"] == "ready"
+    session = startup["session"]
+    assert session["state"] == "failed" and session["stage"] == "session-start" and session["elapsed_ms"] >= 300
+    assert set(session) == {"state", "stage", "elapsed_ms", "kin_ui_timeout_ms"}
+    assert "MCP startup" not in json.dumps(startup) and "timed out" not in json.dumps(startup)
+
+    # Without kin_ui and without a version probe of its own the run times its session alone.
+    report = run_codex(fake_codex(tmp_path / "fake-plain", COMPLETE), TOPIC, tmp_path / "job-plain",
+                       cli_version="0.159.2", budget_seconds=60, **codex_kwargs())
+    assert set(report["startup"]) == {"session"} and report["startup"]["session"]["state"] == "established"
+    assert "kin_ui_timeout_ms" not in report["startup"]["session"]
+
+def test_a_failed_readiness_probe_is_timed_in_the_exploration_record(tmp_path, monkeypatch):
+    """No Codex starts when the Computer Use bootstrap fails; the record still says how long the
+    version and readiness probes took and how each ended."""
+    import kin_mind.computer_use as computer_use
+    from kin_mind.host import dispatch
+
+    def failed(config, **kwargs):
+        time.sleep(0.1)
+        raise TimeoutError("synthetic")
+
+    monkeypatch.setattr(computer_use, "probe_backend_readiness", failed)
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
+    _, mind, source = exploration_world(tmp_path)
+    fake = fake_codex(tmp_path / "fake-codex", complete_citing(source))
+    config = host_config(tmp_path, mind, exploration_backend="codex", exploration_command=str(fake),
+                         exploration_model="deepseek-flash", exploration_reasoning="high",
+                         exploration_model_provider=PROVIDER, computer_exploration=UI_COMPUTER)
+    result = dispatch(config, "explore", {})
+    assert result["state"] == "failed" and result["waiting_reason"] == "computer-use-backend-unavailable"
+    startup = result["startup"]
+    assert startup["version_probe"]["state"] == "complete" and isinstance(startup["version_probe"]["elapsed_ms"], int)
+    assert startup["readiness_probe"]["state"] == "failed" and startup["readiness_probe"]["elapsed_ms"] >= 100
+    assert "session" not in startup and "synthetic" not in json.dumps(startup)
+    with pytest.raises(CodexUnavailable) as caught:
+        run_codex(fake, TOPIC, tmp_path / "job", computer=UI_COMPUTER, budget_seconds=60, **codex_kwargs())
+    assert caught.value.startup["readiness_probe"]["state"] == "failed"

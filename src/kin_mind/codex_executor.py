@@ -71,6 +71,10 @@ def ui_startup_seconds(readiness_seconds=None):
     return math.ceil(min(120.0, max(10.0, seconds)))
 
 
+def _elapsed_ms(since):
+    return round((time.monotonic() - since) * 1000)
+
+
 # ``codex exec --json`` includes MCP arguments and full results on the item.
 # Exploration receipts only need enough information to prove whether the call
 # succeeded and, when it did not, which stable host/tool error stopped it.  Raw
@@ -681,6 +685,7 @@ def run_codex(
     repair=None,
     codex_home=None,
     executor_source=None,
+    version_probe_ms=None,
 ):
     """One bounded codex attempt. Returns the ExecutionReport-shaped receipt.
 
@@ -693,6 +698,12 @@ def run_codex(
     terminal event is failed, keeping any validated partial findings as the basis
     of a checkpoint a later attempt continues from. A preempted or timed-out run
     always writes that checkpoint. Nothing here ever resumes a codex session.
+
+    `startup` in the receipt times each step before the model is reached, in milliseconds with
+    its outcome and nothing else: the version probe (`version_probe_ms` when the caller ran it),
+    the Computer Use readiness probe, and the CLI from its start to its session (`established`),
+    or to its end where no session came (`stage` names the step). A `CodexUnavailable` raised
+    here carries the steps timed so far.
     """
     if not 1 <= budget_seconds <= 1200:
         raise ValueError("Exploration budget must be between 1 and 1200 seconds")
@@ -714,8 +725,17 @@ def run_codex(
     # whatever those start, in a group or a session of their own as well. Each is handed it by name
     # (CR4-MM-03, CR5-MM-03).
     marked = worker_groups.execution_env()
+    startup = {}
     if cli_version is None:
-        cli_version = codex_cli_version(executable, execution_env=marked)
+        probing = time.monotonic()
+        try:
+            cli_version = codex_cli_version(executable, execution_env=marked)
+        except CodexUnavailable as error:
+            error.startup = {"version_probe": {"state": "failed", "elapsed_ms": _elapsed_ms(probing)}}
+            raise
+        startup["version_probe"] = {"state": "complete", "elapsed_ms": _elapsed_ms(probing)}
+    elif version_probe_ms is not None:
+        startup["version_probe"] = {"state": "complete", "elapsed_ms": round(version_probe_ms)}
     started = time.monotonic()
     started_at = time.time()
     directory = Path(directory)
@@ -769,6 +789,7 @@ def run_codex(
             "env_vars": backend_env_keys,
         }
         readiness_seconds = ui.get("readiness_timeout_seconds", UI_READINESS_SECONDS)
+        probing = time.monotonic()
         try:
             backend_readiness = probe_backend_readiness(
                 backend_config, execution_id=directory.name, attempt=attempt, model=model,
@@ -781,9 +802,10 @@ def run_codex(
             # Never start the provider with a configured-but-absent tool surface.
             # The cause stays chained for local diagnostics; the public waiting
             # reason is stable and carries no runtime paths or process output.
-            raise CodexUnavailable(
-                "computer-use-backend-unavailable", type(error).__name__
-            ) from error
+            unavailable = CodexUnavailable("computer-use-backend-unavailable", type(error).__name__)
+            unavailable.startup = {**startup, "readiness_probe": {"state": "failed", "elapsed_ms": _elapsed_ms(probing)}}
+            raise unavailable from error
+        startup["readiness_probe"] = {"state": "ready", "elapsed_ms": _elapsed_ms(probing)}
         ui_ledger = directory / "computer-use-observations.json"
         ui_config = {
             "execution_id": directory.name, "attempt": attempt, "model": model,
@@ -880,10 +902,12 @@ def run_codex(
                           output_schema=bool(provider.get("supports_output_schema")))
     thread_id = None
     turn_completed = False
+    # When the CLI was started, and how long it took to report its session.
+    spawned = session_ms = None
     usages, errors, tool_results, frames = [], [], [], []
 
     def record_frame(line):
-        nonlocal thread_id, turn_completed
+        nonlocal thread_id, turn_completed, session_ms
         try:
             frame = json.loads(line)
         except (ValueError, TypeError):
@@ -896,6 +920,8 @@ def run_codex(
         del frames[:-20]
         if ftype == "thread.started":
             thread_id = frame.get("thread_id")
+            if session_ms is None:
+                session_ms = _elapsed_ms(spawned)
         elif ftype == "turn.completed":
             turn_completed = True
             usages.append(frame.get("usage"))
@@ -915,6 +941,7 @@ def run_codex(
 
     buffer = b""
     with tempfile.TemporaryFile() as diagnostic:
+        spawned = time.monotonic()
         try:
             # The CLI's session is a group of its own, reported to the host that owns the worker
             # before anything can end the worker (CR3-MM-02, worker_groups).
@@ -925,7 +952,10 @@ def run_codex(
                 )
                 report_group(child.pid)
         except OSError as error:
-            raise CodexUnavailable("codex-cli-missing", error) from error
+            unavailable = CodexUnavailable("codex-cli-missing", error)
+            unavailable.startup = {**startup, "session": {"state": "failed", "stage": "spawn",
+                                                          "elapsed_ms": _elapsed_ms(spawned)}}
+            raise unavailable from error
         state = "failed"
         reason = None
         outgoing = prompt.encode()
@@ -972,6 +1002,7 @@ def run_codex(
                                 buffer = b""
                             break
         finally:
+            ended_ms = _elapsed_ms(spawned)
             # Only the process group created for this invocation is signaled: the CLI and
             # whatever it started there, until the group is empty; then the host is told.
             worker_groups.end(child)
@@ -1135,6 +1166,12 @@ def run_codex(
                 {**source, "receipt": by_locator[source["url"]]}
                 for source in result_dump["sources"]
             ]
+        # The CLI's session: when it was reported, or that none came and the run ended starting it.
+        startup["session"] = ({"state": "established", "elapsed_ms": session_ms} if session_ms is not None else
+                              {"state": state if state in {"timed-out", "preempted"} else "failed",
+                               "stage": "session-start", "elapsed_ms": ended_ms})
+        if ui_mcp:
+            startup["session"]["kin_ui_timeout_ms"] = ui_startup_seconds(ui_mcp["readiness_timeout_seconds"]) * 1000
         receipt = {
             "state": state,
             "reason": reason,
@@ -1167,6 +1204,7 @@ def run_codex(
             "started_at": started_at,
             "finished_at": time.time(),
             "seconds": elapsed,
+            "startup": startup,
             "attempt": attempt,
             "workdir": str(directory),
             "input_sources": input_sources,
@@ -1189,14 +1227,14 @@ def run_codex(
 
 
 def codex_runner(*, reasoning, provider, cli_version, model_catalog=None, repair=None,
-                 codex_home=None, executor_source=None):
+                 codex_home=None, executor_source=None, version_probe_ms=None):
     """Bind the injected model configuration into an `Explorations.run` runner."""
 
     def run(executable, topic, directory, **kwargs):
         return run_codex(executable, topic, directory, reasoning=reasoning,
                          provider=provider, cli_version=cli_version,
                          model_catalog=model_catalog, repair=repair, codex_home=codex_home,
-                         executor_source=executor_source, **kwargs)
+                         executor_source=executor_source, version_probe_ms=version_probe_ms, **kwargs)
 
     run.wants_continuation = True
     return run
@@ -1262,6 +1300,7 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
     if max_running != 1:
         raise ValueError("exploration_max_running > 1 is not supported: the exploration "
                          "store admits one running worker per scope")
+    probing = time.monotonic()
     try:
         # The explore worker's first process for the run: it carries the run's mark like the rest
         # (CR5-MM-03, CL6-MM-09); `run_codex` does not ask again once it has the version.
@@ -1269,6 +1308,7 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
     except CodexUnavailable as error:
         return {"state": "waiting", "reason": "exploration-executor-unavailable",
                 "detail": error.reason, "backend": "codex"}
+    version_probe_ms = _elapsed_ms(probing)
     if provider.get("env_key") and provider["env_key"] not in environ:
         return {"state": "waiting", "reason": "exploration-credential-env-missing",
                 "detail": provider["env_key"], "backend": "codex"}
@@ -1287,5 +1327,6 @@ def prepare_codex_exploration(config, *, environ=None, repair=None):
                                provider=provider, cli_version=version,
                                model_catalog=config.get("exploration_model_catalog")
                                or DEEPSEEK_MODEL_CATALOG,
-                               codex_home=native_codex_home(config), executor_source=source),
+                               codex_home=native_codex_home(config), executor_source=source,
+                               version_probe_ms=version_probe_ms),
     }

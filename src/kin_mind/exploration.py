@@ -100,11 +100,13 @@ class ExecutionReport(Model):
 class CodexUnavailable(RuntimeError):
     """The codex executor cannot start: CLI missing, too old, or a configured
     credential absent. The exploration pauses with the recorded reason; there is
-    never a silent fallback to another backend or to a default model."""
+    never a silent fallback to another backend or to a default model. `startup`: the
+    executor's startup steps timed before it gave up, when it timed any."""
 
     def __init__(self, reason, detail=None, *, executor="codex-cli", provider=None):
         super().__init__(reason if detail is None else reason + ": " + str(detail))
         self.reason, self.executor, self.provider = reason, executor, provider
+        self.startup = None
 
 
 def normalize_execution_report(raw):
@@ -408,7 +410,8 @@ class Explorations:
             # Pause with the reason recorded; never a silent fallback to kimi or a default model.
             state = "failed"
             data.update(error="exploration-executor-unavailable", waiting_reason=error.reason,
-                        executor=error.executor, provider=error.provider, partial=True, result=None)
+                        executor=error.executor, provider=error.provider, partial=True, result=None,
+                        **({"startup": error.startup} if error.startup else {}))
         except Exception as error:  # noqa: BLE001 - owned helper boundary; retain a redacted failure receipt
             state = "failed"
             data.update(error=type(error).__name__, partial=True, result=None)
