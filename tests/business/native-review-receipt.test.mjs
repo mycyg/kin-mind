@@ -7,11 +7,11 @@ import {ownerSessionWork} from '../../adapters/mobile-session-host.mjs';
 import {developerInstructionEvidence,instructionTextEvidence} from '../../adapters/instruction-evidence.mjs';
 test('assessment does not claim foreground capacity but owner input still does',()=>{
  const session={processing:true,activeMessage:{contextToken:'assessment-1'},queue:[]};
- assert.equal(ownerSessionWork(session,[],'assessment-1'),false);
- assert.equal(ownerSessionWork({...session,queue:[{contextToken:'owner'}]},[],'assessment-1'),true);
- assert.equal(ownerSessionWork(session,[{id:'owner-work'}],'assessment-1'),false);
- assert.equal(ownerSessionWork({...session,activeMessage:{contextToken:'owner'}},[],'assessment-1'),true);
- assert.equal(ownerSessionWork(session,[],undefined),true);
+ assert.equal(ownerSessionWork(session,'assessment-1'),false);
+ assert.equal(ownerSessionWork({...session,queue:[{contextToken:'owner'}]},'assessment-1'),true);
+ assert.equal(ownerSessionWork({...session,activeMessage:{contextToken:'owner'}},'assessment-1'),true);
+ assert.equal(ownerSessionWork(session,undefined),true);
+ assert.equal(ownerSessionWork({processing:false,queue:[]},'assessment-1'),false,'an idle session holds nothing, open work or not');
 });
 test('native collaboration envelope retains the exact approved developer body',()=>{
  const approved='当前人格和二十三组范本。\n';

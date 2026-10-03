@@ -19,7 +19,7 @@ export function sessionReviewCursors(cursors,inputs) {
   return {...cursors,inputs:digest(inputs.filter(i=>i.kind!=='assessment').map(i=>[i.id,i.state,i.hash]))};
 }
 
-export function ownerSessionWork(session,tasks,assessmentToken) {
+export function ownerSessionWork(session,assessmentToken) {
   const ownAssessment=assessmentToken&&session?.activeMessage?.contextToken===assessmentToken;
   return Boolean((session?.processing&&!ownAssessment)||session?.queue?.length);
 }
@@ -153,7 +153,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const pending=bridge.mindHost?.memoryJournal?.snapshot?.()??[];
     const state=router.snapshot(),inputs=Object.values(state.inputs),tasks=router.tasks();
     const session=bridge.sessionManager.getSession(bridge.ownerId);
-    const foreground=ownerSessionWork(session,tasks,bridge.mainAssessment?.token);
+    const foreground=ownerSessionWork(session,bridge.mainAssessment?.token);
     const snapshot=await mindCall('session-snapshot',{pending,tasks,foreground});
     const outstanding=inputs.filter(holdsSession);
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
