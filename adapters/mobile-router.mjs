@@ -491,7 +491,8 @@ export class MobileRouter {
   }
   nativeBusy(runtime,{confirmedForce=false}={}) {
     const wrongNative=!runtime.known || runtime.sessionId!==this.sessionId || runtime.threadId!==this.sessionId ||
-      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) || runtime.nativeStatus!=='idle';
+      runtime.nativeSessionId!==(this.state.nativeSessionId??this.sessionId) ||
+      !(runtime.nativeStatus==='idle'||runtime.nativeStatus==='systemError'&&runtime.active===false&&runtime.backgroundTasks===0);
     // Once forceSwitch has confirmed `interrupted`/`idle`, `active` and
     // backgroundTasks may still describe the old coordinator sender/tool ledger.
     // They remain durable evidence, but no longer veto the hot switch.
@@ -1591,7 +1592,7 @@ export class MobileRouter {
     if(request.forceBoundary)return request.forceBoundary;
     if(request.forceState==='unconfirmed'&&!this.nativeBusy(runtime)) {
       if(this.unfencedForce()!==request)return null;
-      return this.applyForceFence(request,{state:'idle',reconciled:true,checkedAt:runtime.checkedAt});
+      return this.applyForceFence(request,{state:'idle',reconciled:true,nativeStatus:runtime.nativeStatus,checkedAt:runtime.checkedAt});
     }
     if(request.forceState==='unconfirmed')return null;
     if(!this.forceSwitch){this.failModeRequest(request,'force-switch-unavailable','没有切换：当前宿主不能安全中断正在进行的任务。');this.save('force-switch-failed',{commandId:request.commandId,reason:'force-switch-unavailable'});return null;}

@@ -6,6 +6,7 @@ import path from 'node:path';
 import {MobileRouter,modeCommand,recentConversation,attachmentMetadata,CLASSIFIER_DECISION,NOTICE_SEND_BUDGET,NOTICE_LOOKUP_BUDGET,noticeReceiptClass} from '../../adapters/mobile-router.mjs';
 import {compactPrompt,publicMobileRuntime} from '../../adapters/mobile-controls.mjs';
 import {TransportManifests} from '../../adapters/transport-manifest.mjs';
+import {switchCodexModel} from '../../adapters/codex-models.mjs';
 import {ReplyGuard} from '../../adapters/reply-guard.mjs';
 import {createFakeTransport} from './helpers/fake-transport.mjs';
 
@@ -203,13 +204,13 @@ test('an unconfirmed force request completes its original fence when the same na
   let forceCalls=0;
   const f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'},force:true,reason:'owner model change'}),
     forceSwitch:async()=>{forceCalls++;return {state:'unconfirmed',reason:'native-not-idle'};}});
-  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';
+  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';f.runtime.active=true;
   const first=await f.router.dispatch({id:'force-after-system-error',kind:'owner',text:'切到 Sol medium'},async()=>assert.fail('control does not submit'));
   const request=f.router.state.requests['owner-mode:force-after-system-error'];
   assert.deepEqual([first.state,request.forceState,f.router.state.executionEpoch,forceCalls],['pending','unconfirmed',4,1]);
   await f.router.applyPendingMode();
   assert.equal(f.router.state.forceBoundaries.length,0,'an unknown native turn cannot be fenced');
-  f.runtime.nativeStatus='idle';
+  f.runtime.nativeStatus='idle';f.runtime.active=false;
   await f.router.applyPendingMode();
   assert.deepEqual([request.state,request.forceState,f.router.state.executionEpoch,forceCalls],['applied','confirmed',5,1]);
   assert.equal(request.forceBoundary.receipt.state,'idle');
@@ -230,13 +231,13 @@ test('an already applied unconfirmed force is fenced once only while its origina
     result:{mode:'manual',sessionId:'synthetic',provider:'custom-gateway',model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'}};
   f.router.state.requests[request.commandId]=request;f.router.save('fixture-applied-without-force-fence');
   const restored=new MobileRouter(f.args);
-  f.runtime.nativeStatus='systemError';await restored.applyPendingMode();assert.equal(restored.state.executionEpoch,4);
+  f.runtime.nativeStatus='systemError';f.runtime.active=true;await restored.applyPendingMode();assert.equal(restored.state.executionEpoch,4);
   restored.state.requests['owner-mode:later']={commandId:'owner-mode:later',mode:'manual',state:'failed'};
   assert.equal(restored.unfencedForce()?.commandId,request.commandId,'a failed later choice does not erase the old interruption');
   restored.state.requests[request.commandId].result.sessionId='other-session';
   assert.equal(restored.unfencedForce(),null,'a different native session cannot release the old epoch');
   restored.state.requests[request.commandId].result.sessionId='synthetic';
-  f.runtime.nativeStatus='idle';await restored.applyPendingMode();
+  f.runtime.nativeStatus='idle';f.runtime.active=false;await restored.applyPendingMode();
   assert.equal(restored.state.executionEpoch,5);
   assert.equal(restored.state.requests[request.commandId].result.forceBoundaryId,restored.state.forceBoundaries[0].id);
   await restored.applyPendingMode();assert.equal(restored.state.forceBoundaries.length,1);
@@ -249,12 +250,12 @@ test('a later deferred mode uses the earlier confirmed interruption fence withou
   let forces=0;
   const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:input.text==='first'?'gpt-6-sol':'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:input.text==='first'?'fast':'default'},force:input.text==='first',reason:'owner model choice'}),
     forceSwitch:async()=>{forces++;return {state:'unconfirmed',reason:'native-not-idle'};}});
-  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';
+  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';f.runtime.active=true;
   await f.router.dispatch({id:'first',kind:'owner',text:'first'},async()=>assert.fail('control'));
   await f.router.dispatch({id:'second',kind:'owner',text:'second'},async()=>assert.fail('control'));
   const first=f.router.state.requests['owner-mode:first'],second=f.router.state.requests['owner-mode:second'];
   assert.deepEqual([first.state,second.state,f.router.state.executionEpoch,forces],['superseded','pending',4,1]);
-  f.runtime.nativeStatus='idle';await f.router.applyPendingMode();
+  f.runtime.nativeStatus='idle';f.runtime.active=false;await f.router.applyPendingMode();
   assert.equal(first.state,'superseded');assert.equal(first.forceState,'confirmed');
   assert.equal(f.router.state.forceBoundaries[0].commandId,first.commandId);
   assert.deepEqual([second.state,f.runtime.model,f.router.state.executionEpoch],['applied','gpt-6-astra',5]);
@@ -607,4 +608,29 @@ test('a natural manual Kimi profile is catalog-validated, announced once and per
   await f.router.reconcile();
   assert.deepEqual([f.router.tasks().length,f.router.state.mode,f.runtime.model],[0,'manual','k3']);
   assert.equal(Object.values(f.router.state.requests).some(request=>request.state==='pending'&&request.mode==='auto'),false);
+});
+
+test('a pending owner switch recovers from terminal provider error in its original session and ID',async t=>{
+  let f,forces=0;
+  f=profileFixture(t,{initial:{model:'k3',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},
+    classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6.1-sol',reasoningEffort:'medium',serviceTierPreference:'fast'},force:true,reason:'owner switch back'}),
+    forceSwitch:async()=>{forces++;return{state:'unconfirmed'};}});
+  f.runtime.nativeStatus='systemError';f.runtime.active=true;
+  await f.router.dispatch({id:'switch-back',kind:'owner',text:'切回 Sol'},async()=>assert.fail('no native prompt'));
+  const request=f.router.state.requests['owner-mode:switch-back'];assert.equal(request.state,'pending');
+  const calls=[];
+  f.router.switchModel=async(model,profile,context)=>switchCodexModel({sessionId:'synthetic',profile,modelCatalog:LIVE_MODELS,forceBoundary:context.forceBoundary,
+    connection:{extMethod:async method=>{calls.push(method);if(method==='_kin/runtime')return {...f.runtime};
+      if(method==='providers/disable')Object.assign(f.runtime,{providerOverride:false,modelProvider:'custom-gateway'});},
+      setSessionConfigOption:async({configId,value})=>Object.assign(f.runtime,{[({model:'model',reasoning_effort:'reasoningEffort','fast-mode':'fastMode'})[configId]]:value,serviceTierPreference:configId==='fast-mode'?(value==='on'?'fast':'default'):f.runtime.serviceTierPreference})}});
+  for(const changed of [{active:false,backgroundTasks:1},{active:false,backgroundTasks:0,nativeSessionId:'wrong'}]){
+    Object.assign(f.runtime,changed);await f.router.applyPendingMode();assert.equal(request.state,'pending');assert.deepEqual(calls,[]);
+  }
+  Object.assign(f.runtime,{nativeSessionId:'synthetic',backgroundTasks:0});
+  await f.router.applyPendingMode();
+  assert.equal(request.state,'applied');assert.equal(request.forceBoundary.receipt.nativeStatus,'systemError');
+  assert.equal(f.runtime.model,'gpt-6.1-sol');assert.equal(f.runtime.reasoningEffort,'medium');assert.equal(f.runtime.fastMode,'on');
+  assert.equal(f.runtime.nativeSessionId,'synthetic');assert.equal(forces,1);
+  assert.equal(f.router.state.executionEpoch,1);assert.equal(calls.filter(x=>x==='providers/disable').length,1);
+  await f.router.applyPendingMode();assert.equal(f.router.state.executionEpoch,1);
 });

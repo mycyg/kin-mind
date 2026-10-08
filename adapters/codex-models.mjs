@@ -106,8 +106,10 @@ export async function switchCodexModel({connection,sessionId,profile=null,model=
   // was interrupted (or was already idle) and that hot switching is safe. The
   // coordinator can still report processing while an old sender/tool ledger is
   // settling; that state must not undo the confirmed interrupt. Identity and the
-  // native idle receipt are always rechecked.
-  if(!before.known||before.sessionId!==sessionId||before.threadId!==sessionId||before.nativeSessionId!==sessionId||before.nativeStatus!=='idle'||(!forced&&(before.active||before.backgroundTasks)))throw Error('Native task is active or unconfirmed');
+  // native stopped receipt are always rechecked. A failed native turn may remain
+  // systemError after cancel; only a confirmed owner force with no running work
+  // may switch that terminal state.
+  if(!before.known||before.sessionId!==sessionId||before.threadId!==sessionId||before.nativeSessionId!==sessionId||!(before.nativeStatus==='idle'||forced&&before.nativeStatus==='systemError'&&before.active===false&&before.backgroundTasks===0)||(!forced&&(before.active||before.backgroundTasks)))throw Error('Native task is active or unconfirmed');
   let target;
   if(profile)target=modelCatalog?resolveModelProfile(profile,modelCatalog):{...profile};
   else {

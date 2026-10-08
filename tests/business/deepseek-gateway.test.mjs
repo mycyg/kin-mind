@@ -102,3 +102,18 @@ test('K3 main replies and bound task deliveries use Kimi high, while assessments
   purpose={lane:'background',purpose:'native-assessment',mainConversation:true};
   assert.equal((await request('k3')).status,502);assert.equal(calls.length,3);
 });
+
+test('provider HTTP errors retain bounded machine diagnostics without private text or a retry',async t=>{
+  for(const body of [JSON.stringify({error:{code:'invalid_request_error',type:'invalid_request_error',param:'max_output_tokens',message:'secret user dialogue',request:'private',headers:{Authorization:'Bearer secret'}}}),JSON.stringify({error:{message:'Invalid request: total message size 2200000 exceeds limit 2097152'}}),'<html>secret proxy error</html>',JSON.stringify({error:{code:'x'.repeat(9000)}})]){
+    let calls=0;const rows=[];
+    const gateway=await startDeepSeekGateway({key:'ds-key',kimiKey:'kimi-key',onUsage:r=>rows.push(r),fetchImpl:async()=>{calls++;return new Response(body,{status:400,headers:{'Content-Type':'application/json'}});}});
+    try{
+      const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model:'k3',input:[user('synthetic')],reasoning:{effort:'high'}})});
+      assert.equal(response.status,400);const value=await response.json();
+      const expected=body.includes('max_output_tokens')?{code:'invalid_request_error',type:'invalid_request_error',param:'max_output_tokens'}:body.includes('2200000')?{category:'request-size-limit',requested:2200000,limit:2097152}:null;
+      assert.deepEqual(rows[0].providerError,expected);assert.deepEqual(value.error.providerError??null,expected);
+      assert.equal(rows[0].usage,null);assert.equal(rows[0].usageStatus,'unknown');assert.equal(calls,1);
+      assert.doesNotMatch(JSON.stringify([rows,value]),/secret|private|Bearer|dialogue|<html>/);
+    }finally{await gateway.close();}
+  }
+});

@@ -175,6 +175,30 @@ export function responseNormalizer(reverseTools = new Map()) {
   };
 }
 
+/** Provider diagnostics never retain free text, headers or request bodies. Even an
+ * error message can echo a private input; keep only bounded machine identifiers. */
+async function providerErrorFields(response) {
+  const reader=response.body?.getReader?.();
+  if(!reader)return null;
+  let bytes=0;const chunks=[];
+  try {
+    while(true){const {done,value}=await reader.read();if(done)break;
+      bytes+=value.byteLength;if(bytes>8192){await reader.cancel();return null;}chunks.push(Buffer.from(value));}
+    const error=JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error;
+    const fields={};
+    for(const key of ['code','type','param'])if(typeof error?.[key]==='string'&&/^[A-Za-z0-9][A-Za-z0-9_.\[\]-]{0,95}$/.test(error[key]))fields[key]=error[key];
+    const message=error?.message;
+    // Recognize two documented size errors without retaining the echoed message.
+    const size=typeof message==='string'&&message.length<=256
+      ?/^(?:Invalid request: )?total message size (\d+) exceeds limit (\d+)$/.exec(message):null;
+    const context=typeof message==='string'&&message.length<=256
+      ?/^(?:Invalid request: )?Your request exceeded model token limit: (\d+) \(requested: (\d+)\)$/.exec(message):null;
+    if(size)Object.assign(fields,{category:'request-size-limit',requested:Number(size[1]),limit:Number(size[2])});
+    if(context)Object.assign(fields,{category:'context-limit',requested:Number(context[2]),limit:Number(context[1])});
+    return Object.keys(fields).length?fields:null;
+  } catch {return null;} finally {reader.releaseLock();}
+}
+
 export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fetch, onUsage = () => {}, onRequestEvidence = null,
   requiredIncomingInstructions = null, timeoutMs = 300000, reasoningEffort = 'high', lease = null,
   purposeFor = null, profile = null, ownerName = NEUTRAL_OWNER_NAME}) {
@@ -283,10 +307,11 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         body: JSON.stringify(body),
       });
       if (!upstream.ok) {
+        const providerError=await providerErrorFields(upstream);
         finishEvidence('provider-http-' + upstream.status);
-        report({usage: null, usageStatus: 'unknown', outcome: 'provider-http-' + upstream.status});
+        report({usage: null, usageStatus: 'unknown', outcome: 'provider-http-' + upstream.status,providerError});
         res.writeHead(upstream.status, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify({error: {message: (kimi ? 'Kimi' : 'DeepSeek') + ' HTTP ' + upstream.status, type: 'provider_error'}})); return;
+        res.end(JSON.stringify({error: {message: (kimi ? 'Kimi' : 'DeepSeek') + ' HTTP ' + upstream.status, type: 'provider_error',...(providerError?{providerError}:{})}})); return;
       }
       const normalize = responseNormalizer(reverseTools);
       if (!(upstream.headers.get('content-type') ?? '').includes('text/event-stream')) {
