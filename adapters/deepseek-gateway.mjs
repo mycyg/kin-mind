@@ -175,9 +175,19 @@ export function responseNormalizer(reverseTools = new Map()) {
   };
 }
 
-/** Provider diagnostics never retain free text, headers or request bodies. Even an
- * error message can echo a private input; keep only bounded machine identifiers. */
-async function providerErrorFields(response) {
+/** Never persist arbitrary error prose: providers can echo private conversation
+ * or code. Recognize only fixed validation vocabulary; retain a digest otherwise. */
+export function providerMessageDiagnostic(message) {
+  const result={messageSha256:sha256(message),messageUtf8Bytes:Buffer.byteLength(message)};
+  const match=/^(Unsupported|Unknown|Unrecognized) parameter:? ['"]?([a-z_]+)['"]?\.?$/i.exec(message);
+  const fields=new Set(['include','store','stream','model','input','instructions','tools','tool_choice','reasoning','max_output_tokens','temperature','top_p','text','parallel_tool_calls','previous_response_id','conversation','service_tier']);
+  if(match&&fields.has(match[2]))Object.assign(result,{category:'unsupported-parameter',parameter:match[2]});
+  return result;
+}
+
+/** Public diagnostics contain machine identifiers only. The optional local sink
+ * gets classified error structure and a digest, never arbitrary provider prose. */
+async function providerErrorFields(response, privateDiagnostic = null) {
   const reader=response.body?.getReader?.();
   if(!reader)return null;
   let bytes=0;const chunks=[];
@@ -188,6 +198,7 @@ async function providerErrorFields(response) {
     const fields={};
     for(const key of ['code','type','param'])if(typeof error?.[key]==='string'&&/^[A-Za-z0-9][A-Za-z0-9_.\[\]-]{0,95}$/.test(error[key]))fields[key]=error[key];
     const message=error?.message;
+    if(typeof message==='string')privateDiagnostic?.(message);
     // Recognize two documented size errors without retaining the echoed message.
     const size=typeof message==='string'&&message.length<=256
       ?/^(?:Invalid request: )?total message size (\d+) exceeds limit (\d+)$/.exec(message):null;
@@ -199,7 +210,7 @@ async function providerErrorFields(response) {
   } catch {return null;} finally {reader.releaseLock();}
 }
 
-export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fetch, onUsage = () => {}, onRequestEvidence = null,
+export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fetch, onUsage = () => {}, onRequestEvidence = null, onProviderError = null,
   requiredIncomingInstructions = null, timeoutMs = 300000, reasoningEffort = 'high', lease = null,
   purposeFor = null, profile = null, ownerName = NEUTRAL_OWNER_NAME}) {
   if (!key) throw Error('deepseek-key-unavailable');
@@ -307,7 +318,13 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         body: JSON.stringify(body),
       });
       if (!upstream.ok) {
-        const providerError=await providerErrorFields(upstream);
+        const providerError=await providerErrorFields(upstream,message=>{
+          if(typeof onProviderError!=='function')return;
+          try{onProviderError({provider:upstreamProvider,status:upstream.status,recordedAt:new Date().toISOString(),
+            requestAttemptId:requestEvidence.requestAttemptId,...providerMessageDiagnostic(message),
+            requestShape:{model:body.model,reasoningEffort:body.reasoning?.effort,inputItems:body.input.length,
+              toolCount:Array.isArray(body.tools)?body.tools.length:0,utf8Bytes:Buffer.byteLength(JSON.stringify(body))}});}catch{}
+        });
         finishEvidence('provider-http-' + upstream.status);
         report({usage: null, usageStatus: 'unknown', outcome: 'provider-http-' + upstream.status,providerError});
         res.writeHead(upstream.status, {'Content-Type': 'application/json'});

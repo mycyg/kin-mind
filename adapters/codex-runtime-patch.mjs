@@ -155,7 +155,10 @@ const runtimeMethods = `
   async kinAssertProviderIdle() {
     for (const sessionId of this.sessions.keys()) {
       const state = await this.kinRuntime(sessionId);
-      if (!state.known || state.active || state.backgroundTasks || state.nativeStatus !== "idle") {
+      // A failed provider leaves a stopped native thread in systemError. Blocking
+      // that terminal state here prevents the owner from switching away to recover.
+      if (!state.known || state.active || state.backgroundTasks ||
+          !["idle", "systemError"].includes(state.nativeStatus)) {
         throw new Error("KIN_PROVIDER_BUSY_OR_UNCONFIRMED");
       }
     }

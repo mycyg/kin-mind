@@ -2,10 +2,30 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import {deepseekRequest,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway} from '../../adapters/deepseek-gateway.mjs';
+import {deepseekRequest,kimiRequest,providerMessageDiagnostic,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway} from '../../adapters/deepseek-gateway.mjs';
 
 const source = fs.readFileSync(new URL('../../adapters/deepseek-gateway.mjs', import.meta.url), 'utf8');
 const user = text => ({type: 'message', role: 'user', content: [{type: 'input_text', text}]});
+
+test('Kimi Code request preserves public tool history, image input and caller output budget',()=>{
+ const input=[user('synthetic'),{type:'message',role:'developer',content:[{type:'input_text',text:'synthetic contract'}]},
+  {type:'function_call',call_id:'call-test',name:'read_file',arguments:'{"path":"synthetic.txt"}'},
+  {type:'function_call_output',call_id:'call-test',output:'synthetic result'},
+  {type:'message',role:'user',content:[{type:'input_image',image_url:'data:image/png;base64,c3ludGhldGlj'}]}];
+ const tools=[{type:'function',name:'read_file',parameters:{type:'object',properties:{path:{type:'string'}}}}];
+ const value=kimiRequest({model:'k3',input,tools,tool_choice:'auto',reasoning:{effort:'high'},max_output_tokens:4096,stream:true,service_tier:'priority',previous_response_id:'synthetic',conversation:'synthetic'});
+ assert.deepEqual(value.input,input);assert.deepEqual(value.tools,tools);assert.equal(value.max_output_tokens,4096);
+ assert.deepEqual(value.reasoning,{effort:'high'});assert.equal(value.store,false);assert.equal(value.stream,true);
+ for(const key of ['service_tier','previous_response_id','conversation'])assert.equal(value[key],undefined);
+});
+
+test('provider message diagnostics classify only fixed known parameter names and never retain arbitrary prose',()=>{
+ assert.equal(providerMessageDiagnostic('Unsupported parameter: include').parameter,'include');
+ for(const text of ['Unsupported parameter: private_code','Unsupported parameter: include; private dialogue','secret code and conversation']){
+  const result=providerMessageDiagnostic(text);assert.deepEqual(Object.keys(result),['messageSha256','messageUtf8Bytes']);
+  assert.equal(result.messageSha256.length,64);assert.equal(result.messageUtf8Bytes,Buffer.byteLength(text));
+ }
+});
 
 test('the public gateway names no particular owner; the host supplies the name', () => {
   assert.doesNotMatch(source, /小光/);
@@ -116,4 +136,18 @@ test('provider HTTP errors retain bounded machine diagnostics without private te
       assert.doesNotMatch(JSON.stringify([rows,value]),/secret|private|Bearer|dialogue|<html>/);
     }finally{await gateway.close();}
   }
+});
+
+test('provider message goes only to a private sink with known credentials removed, never to ACP or usage',async()=>{
+ const privateRows=[],usage=[];
+ const gateway=await startDeepSeekGateway({key:'synthetic-ds-secret',kimiKey:'synthetic-kimi-secret',onUsage:r=>usage.push(r),onProviderError:r=>privateRows.push(r),
+  fetchImpl:async()=>new Response(JSON.stringify({error:{type:'invalid_request_error',message:'Unsupported parameter include; synthetic-kimi-secret synthetic-ds-secret Bearer unknown-secret',headers:{Authorization:'not retained'}}}),{status:400})});
+ try{
+  const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model:'k3',input:[user('private input')],reasoning:{effort:'high'}})});
+  const value=await response.json();assert.equal(response.status,400);assert.equal(privateRows.length,1);
+  assert.equal(typeof privateRows[0].messageSha256,'string');assert.equal(privateRows[0].message,undefined);
+  assert.doesNotMatch(JSON.stringify(privateRows),/synthetic-.*-secret|unknown-secret|private input|not retained/);
+  assert.equal(privateRows[0].requestShape.reasoningEffort,'high');assert.equal(privateRows[0].provider,'kimi');
+  assert.doesNotMatch(JSON.stringify([value,usage]),/Unsupported parameter|redacted|private input/);
+ }finally{await gateway.close();}
 });
