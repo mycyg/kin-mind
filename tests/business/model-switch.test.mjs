@@ -30,7 +30,7 @@ const LIVE_MODELS=[
   {id:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEfforts:['low','medium','high','xhigh','max'],defaultReasoningEffort:'medium',serviceTiers:[{id:'priority'}],defaultServiceTier:'priority'},
   {id:'gpt-6-astra',aliases:['GPT‑6 Astra','ASTRA-6'],provider:'custom-gateway',providerKind:'native',reasoningEfforts:['medium','high'],defaultReasoningEffort:'medium',serviceTiers:['default',{id:'priority'}],defaultServiceTier:'default'},
 ];
-function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},classify=null,forceSwitch=null}={}) {
+function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},classify=null,forceSwitch=null,preflightProfile=null}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-profile-routing-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   let now=1000;
   const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',active:false,backgroundTasks:0,queued:0,pendingDeliveries:0,handoffTasks:0,
@@ -39,7 +39,7 @@ function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m'
   const args={file:path.join(root,'state.json'),sessionId:'synthetic',inspect:async()=>({...runtime}),modelCatalog:async()=>structuredClone(LIVE_MODELS),
     classify:async input=>{classifications.push(input);return classify?classify(input):{route:'chat',reason:'casual',recall:{mode:'light',query:input.text,reason:'current message'}};},
     switchModel:async(model,profile,context)=>{switches.push({model,profile:structuredClone(profile),context:structuredClone(context)});Object.assign(runtime,{model,modelProvider:profile.provider,providerOverride:profile.providerKind==='gateway',reasoningEffort:profile.reasoningEffort,serviceTierPreference:profile.serviceTierPreference,fastMode:profile.serviceTierPreference==='fast'?'on':'off'});return{...runtime};},
-    forceSwitch,waitForIdle:async()=>{throw Error('must not wait');},now:()=>++now};
+    preflightProfile,forceSwitch,waitForIdle:async()=>{throw Error('must not wait');},now:()=>++now};
   return {root,router:new MobileRouter(args),runtime,args,switches,classifications,now:()=>++now};
 }
 
@@ -633,4 +633,25 @@ test('a pending owner switch recovers from terminal provider error in its origin
   assert.equal(f.runtime.nativeSessionId,'synthetic');assert.equal(forces,1);
   assert.equal(f.router.state.executionEpoch,1);assert.equal(calls.filter(x=>x==='providers/disable').length,1);
   await f.router.applyPendingMode();assert.equal(f.router.state.executionEpoch,1);
+});
+
+test('incompatible Kimi history fails explicitly before force interruption and persists without an unconfirmed transition',async t=>{
+ const {historyError}=await import('../../adapters/provider-history.mjs');let forces=0;
+ const f=profileFixture(t,{preflightProfile:async target=>{if(target.model==='k3')throw historyError();},forceSwitch:async()=>{forces++;throw Error('must not interrupt');},
+ classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},force:true,reason:'synthetic owner control'})});
+ f.runtime.active=true;
+ const before={...f.runtime};await f.router.dispatch({id:'blocked-kimi',text:'切换Kimi'},()=>assert.fail('no prompt'));
+ assert.equal(forces,0);assert.deepEqual(f.runtime,before);assert.equal(f.switches.length,0);
+ const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_INCOMPATIBLE');
+ assert.notEqual(f.router.state.transition?.state,'unconfirmed');
+ const persisted=JSON.parse(fs.readFileSync(f.router.file));assert.equal(persisted.requests[request.commandId].state,'failed');
+ const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return{state:'accepted',messageId:'synthetic'};},lookup:async()=>null});assert.ok(notices.some(s=>s.includes('压缩历史')&&s.includes('原会话')));
+});
+test('a history refusal at the final switch boundary settles the transition without changing the prior profile',async t=>{
+ const {historyError}=await import('../../adapters/provider-history.mjs');const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
+ const before={...f.runtime};f.router.switchModel=async()=>{throw historyError(true);};
+ await f.router.dispatch({id:'late-history',text:'切到Kimi'},()=>assert.fail('no prompt'));
+ const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
+ assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_UNVERIFIED');assert.equal(f.router.state.transition.state,'failed-before-switch');assert.deepEqual(f.runtime,before);
+ const restarted=new MobileRouter(f.args);assert.equal(restarted.state.requests[request.commandId].state,'failed');assert.notEqual(restarted.state.transition.state,'unconfirmed');
 });

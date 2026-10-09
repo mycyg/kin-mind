@@ -1,3 +1,4 @@
+import {assertKimiInputCompatible,isHistoryRefusal,KIMI_HISTORY_MESSAGE} from './provider-history.mjs';
 import http from 'node:http';
 import {privateReplyBoundary} from './chat-bubbles.mjs';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
@@ -107,6 +108,7 @@ export function deepseekRequest(body, reasoningEffort = 'high', profile = null, 
 /** K3 is a foreground companion option. It speaks Responses natively; unlike
  * DeepSeek, it retains developer roles and the caller's output budget. */
 export function kimiRequest(body, profile = null, contracts = gatewayContracts()) {
+  assertKimiInputCompatible(body.input);
   if (profile !== null && profile !== 'chat') throw Error('kimi-main-conversation-only');
   return companionRequest(body, 'high', profile, contracts, true);
 }
@@ -367,7 +369,11 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       pending += decoder.decode(); if (pending.trim()) emit(pending);
       if(!terminal)throw Error('missing-terminal-event');
       res.end();
-    } catch {
+    } catch (error) {
+      if(!attempted&&isHistoryRefusal(error)&&!res.headersSent){
+        res.writeHead(409, {'Content-Type':'application/json'});
+        res.end(JSON.stringify({error:{code:error.code,type:'provider_history_incompatible',message:KIMI_HISTORY_MESSAGE.replace('没有切换到 Kimi：','请求未发送给 Kimi：')}}));return;
+      }
       // An abort, a timeout and a broken stream all spent a call whose usage nobody
       // ever reported. That is unknown, not zero, and not nothing.
       if (attempted) {

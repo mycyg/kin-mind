@@ -151,3 +151,12 @@ test('provider message goes only to a private sink with known credentials remove
   assert.doesNotMatch(JSON.stringify([value,usage]),/Unsupported parameter|redacted|private input/);
  }finally{await gateway.close();}
 });
+
+test('Kimi compaction is refused locally before lease or upstream; request content is not dropped or exposed',async()=>{
+ let calls=0,leases=0;const input=[user('synthetic private marker'),{type:'compaction',encrypted_content:'synthetic opaque marker'}];
+ assert.throws(()=>kimiRequest({model:'k3',input}),{code:'KIMI_HISTORY_INCOMPATIBLE'});
+ const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic',fetchImpl:async()=>{calls++;throw Error('must not call');},lease:{acquire:async()=>{leases++;throw Error('must not lease');}}});
+ try{const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model:'k3',input})});
+ const body=await response.json();assert.equal(response.status,409);assert.equal(body.error.code,'KIMI_HISTORY_INCOMPATIBLE');assert.match(body.error.message,/压缩历史/);assert.equal(JSON.stringify(body).includes('synthetic'),false);assert.equal(calls,0);assert.equal(leases,0);assert.equal(input.length,2);
+ }finally{await gateway.close();}
+});

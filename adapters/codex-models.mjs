@@ -1,3 +1,5 @@
+import {checkModelHistory} from './provider-history.mjs';
+export {checkModelHistory} from './provider-history.mjs';
 const text=value=>typeof value==='string'&&value.trim()?value.trim():null;
 /** One mapping for every layer: Codex 0.153+ may report a Fast thread as
  * `priority`, and the owned ACP's fast-mode patch reads it the same way. */
@@ -120,6 +122,7 @@ export async function switchCodexModel({connection,sessionId,profile=null,model=
       serviceTierPreference:model!=='deepseek-flash'&&workFast===true?'fast':'default'};
   }
   if(!target.model||!target.reasoningEffort)throw Error('Incomplete model profile');
+  await checkModelHistory(target,before);
   const gatewayTarget=target.providerKind==='gateway'||(!target.providerKind&&target.model==='deepseek-flash');
   if(gatewayTarget) {
     if(!gateway?.baseUrl||!gateway?.token)throw Error('Gateway profile unavailable');

@@ -1,3 +1,4 @@
+import {isHistoryRefusal} from './provider-history.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
@@ -234,8 +235,8 @@ export class MobileRouter {
    * narrows what the state file keeps (see HOT_LIMITS). `withdrawQueued(ids)` is the
    * host's own: it takes the messages carrying only those input ids out of its session
    * queue before their prompts begin and answers the ids it took (CR3-FLOW-02). */
-  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,profiles=null,hotLimits=null,runtimeId=null,withdrawQueued=null}) {
-    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn,withdrawQueued});
+  constructor({file,sessionId,inspect,switchModel,classify,waitForIdle,now=()=>Date.now(),binding=null,replyTail=null,classifyIntents=false,modelCatalog=null,resolveProfile=null,forceSwitch=null,interruptTurn=null,preflightProfile=null,profiles=null,hotLimits=null,runtimeId=null,withdrawQueued=null}) {
+    Object.assign(this,{file,sessionId,inspect,switchModel,classify,waitForIdle,now,replyTail,classifyIntents:classifyIntents===true,modelCatalog,resolveProfile,forceSwitch,interruptTurn,withdrawQueued,preflightProfile});
     // The runtime bundle this host runs, named on every submission it makes (CR2-INT-02).
     this.runtimeId=typeof runtimeId==='string'&&runtimeId?runtimeId.slice(0,120):null;
     this.hotLimits=Object.freeze({...HOT_LIMITS,...hotLimits});
@@ -1655,6 +1656,10 @@ export class MobileRouter {
       this.failModeRequest(request,String(error.message??error),'没有切换：当前宿主不支持这组模型设置。');
       this.save('mode-failed',{commandId:request.commandId,reason:'unsupported-profile'});return {runtime};
     }
+    try {await this.preflightProfile?.(target,runtime);} catch(error) {
+      if(!isHistoryRefusal(error))throw error;
+      this.failModeRequest(request,error.code,error.message);this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
+    }
     // A prior owner force can suppress the current epoch before a newer mode
     // choice supersedes it. Settle that interruption, never its old mode choice.
     const prior=this.unfencedForce();
@@ -1695,6 +1700,10 @@ export class MobileRouter {
       for(const prior of Object.values(this.state.requests))if(prior!==request&&prior.state==='pending'){prior.state='superseded';prior.supersededBy=request.commandId;}
       this.modeApplied(request,this.state.actual,{unchanged});this.save(unchanged?'mode-unchanged':'mode-applied',{commandId:request.commandId,model:target.model,forced});return {runtime:this.state.actual};
     } catch(error) {
+      if(isHistoryRefusal(error)){
+        if(this.state.transition){this.finishTransition(runtime);this.state.transition.state='failed-before-switch';}
+        this.failModeRequest(request,error.code,error.message);this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
+      }
       request.failedAt=this.now();request.waitingReason='switch-unconfirmed';
       if(this.state.transition)this.state.transition.state='unconfirmed';
       this.pendingModeNotice(request);
