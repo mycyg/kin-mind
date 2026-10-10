@@ -110,7 +110,23 @@ export function deepseekRequest(body, reasoningEffort = 'high', profile = null, 
 export function kimiRequest(body, profile = null, contracts = gatewayContracts()) {
   assertKimiInputCompatible(body.input);
   if (profile !== null && profile !== 'chat') throw Error('kimi-main-conversation-only');
-  return companionRequest(body, 'high', profile, contracts, true);
+  const result = companionRequest(body, 'high', profile, contracts, true);
+  // Codex asks for its own encrypted reasoning. Kimi Responses only documents
+  // include values for web-search results/sources; do not forward that OpenAI
+  // extension. This changes the requested response fields, never input history.
+  if (Array.isArray(result.include)) {
+    result.include = result.include.filter(value => value !== 'reasoning.encrypted_content');
+    if (!result.include.length) delete result.include;
+  }
+  // Client telemetry is local attribution, not a Kimi Responses request field.
+  delete result.client_metadata;
+  // Kimi Responses documents auto only. Preserve "no tools" semantics by
+  // removing the tools themselves, rather than changing none into auto.
+  if (result.tool_choice === 'none') {
+    result.tools = [];
+    delete result.tool_choice;
+  }
+  return result;
 }
 
 function companionRequest(body, reasoningEffort, profile, contracts, kimi) {
