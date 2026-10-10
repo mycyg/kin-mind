@@ -167,7 +167,7 @@ class ConversationHabits:
                 if request["action"] == "defer":
                     from .state import contact_wait_seconds
                     if current.get("retry_after_seconds") != contact_wait_seconds(request.get("retry_after_seconds", 1800)):
-                        raise Conflict("Reply choice already recorded with another time")
+                        raise Conflict("Reply choice already recorded for this input")
                 return current
             if request["action"] == "defer":
                 from .state import DesireChange, contact_wait_seconds, timestamp
