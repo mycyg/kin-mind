@@ -220,7 +220,7 @@ class Traits:
             (kind for kind, entries in groups.items() if entries), None)
         if chosen is None:
             raise Conflict("No conversation, reflection or completed action in the cited material",
-                           code="trait-evidence-missing")
+                           code="trait-evidence-class" if refs else "trait-evidence-missing")
         return observation.model_copy(update={"evidence_class": chosen, "result_ids": []}), groups[chosen]
 
     def _material(self, conn, observation, refs, policy, cache):
