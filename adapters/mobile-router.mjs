@@ -1741,7 +1741,7 @@ export class MobileRouter {
       const silent=transition.source==='host-restart'&&actual.model===this.lastToldModel();
       const notice=this.queueNotice(transition.id,'model-switched',{transitionId:transition.id,sourceInputId:this.state.inputs[transition.sourceId]?transition.sourceId:this.state.requests[transition.sourceId]?.sourceInputId,
         target:actual.model,targetProfile:transition.targetProfile,from:transition.from,runtime:view.actual,mode:this.state.mode,
-        ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true,names:this.modelNames})})});
+        ...(silent?{state:'suppressed',reason:NOTICE_SUPPRESSED,settledAt:this.now()}:{text:runtimeReply(view,{switched:true,names:this.modelNames})+(actual.contextHandoff?' 已带入接续资料；更早的原始历史仍保留在来源会话中。':'')})});
       transition.noticeId=notice.id;
       // KIN-ITER-20260918-03: every real change records what became of its owner
       // notification. A suppressed notice is the record of a message deliberately
@@ -1819,7 +1819,8 @@ export class MobileRouter {
     request.result={model:runtime.model,provider:runtime.modelProvider,reasoningEffort:runtime.reasoningEffort,
       serviceTier:runtime.serviceTier??null,serviceTierVerified:runtime.serviceTierVerified===true&&Boolean(runtime.serviceTier),
       serviceTierPreference:runtime.serviceTierPreference??(runtime.fastMode==='on'||runtime.fastMode===true?'fast':runtime.fastMode==='off'||runtime.fastMode===false?'default':null),
-      mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id};
+      mode:this.state.mode,sessionId:this.sessionId,verifiedAt:runtime.checkedAt,transitionId:this.state.transition?.id,forceBoundaryId:request.forceBoundary?.id,
+      ...(runtime.contextHandoff?{contextHandoff:clone(runtime.contextHandoff)}:{})};
     request.waitingReason=null;
     // Kept as it was: she still hears what is in effect, which answers her control (CR-LIFE-07).
     if(unchanged){if(request.notify&&this.state.inputs[request.sourceInputId]?.route==='control')this.queueNotice(request.notificationOrigin??request.commandId,'status',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId]});return;}

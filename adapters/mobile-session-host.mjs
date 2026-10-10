@@ -5,6 +5,7 @@ import {SessionManager,candidateVerificationReady} from './session-manager.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
 import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
+import {ModelHandoff} from './model-handoff.mjs';
 import {atomicJson} from './mobile-router.mjs';
 import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
 import {holdsSession} from './input-ledger.mjs';
@@ -227,7 +228,10 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     return result;
   };
   router.state.conversationId=manager.fence().conversationId;router.state.generation=manager.fence().generation;router.state.nativeSessionId=manager.fence().nativeSessionId;router.save('logical-conversation-bound');
-  const api={manager,view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state,checkpointId:s.candidate.checkpoint?.id??null,checkedAt:s.candidate.checked?.at??null,checkRetryAt:s.candidateRetry?.generation===s.binding.generation?s.candidateRetry.nextAt:null}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
+  const handoff=new ModelHandoff({manager,native,collect,inspect,
+    checkpoint:(snapshot,binding)=>buildCheckpoint({snapshot,binding,budget:8000,allow_model:false}),
+    validate:async checkpoint=>(await mindCall('session-validate',{checkpoint})).valid});
+  const api={manager,switchProfile:(profile,options)=>handoff.switchProfile(profile,options),view:()=>{const s=manager.view(),c=s.compactions.at(-1),review=s.events[s.observation?.id];return {binding:s.binding,policy:s.config,configRevision:s.configRevision??0,...(s.configDrift?{configDrift:s.configDrift}:{}),pressure:s.observation?.pressure,advice:s.sessionAdvice,review:review?{state:review.state,attempts:review.attempts,nextAt:review.nextAt??null}:null,candidate:s.candidate?{id:s.candidate.id,state:s.candidate.state,checkpointId:s.candidate.checkpoint?.id??null,checkedAt:s.candidate.checked?.at??null,checkRetryAt:s.candidateRetry?.generation===s.binding.generation?s.candidateRetry.nextAt:null}:null,lastCompaction:c?{id:c.id,state:c.state,completedAt:c.completedAt,before:c.before,after:c.after}:null,compactionCount:s.compactions.length,status:s.lastTick};},
     deliverBackground:context=>background.deliver(context),
     fence:()=>manager.fence(),assertFence:fence=>manager.assertFence(fence),collect,waitForBinding:()=>router.locked(async()=>{}),
     request:request=>manager.request(request),configure:request=>manager.locked(()=>manager.configure(request)),checkpoint:(sourceCursor=null)=>{
@@ -262,7 +266,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
           if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
         });
         if(snapshot.manifestVersion&&preparation.safe){
-          const key=digest(snapshot.cursors);
+          const key=digest([manager.fence().generation,snapshot.cursors]);
           if(manager.state.rollingCursor!==key)await manager.maintained('rolling-checkpoint',async()=>{
             const cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});

@@ -1,6 +1,7 @@
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import fs from 'node:fs';
+import {portableHistory} from './portable-history.mjs';
 import {checkpointMarker} from './native-window.mjs';
 import {conversationClock} from './conversation-time.mjs';
 import {isCompanionInstructionBinding,sameInstructionBinding} from './instruction-evidence.mjs';
@@ -78,12 +79,13 @@ export class NativeCandidate {
   }
   requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
   params(profile){return this.requestParams(this.launch(profile));}
-  async create({id,model,profile}){
+  async create({id,model,profile,name}){
     const launch=this.launch(profile??{model});await this.start();const value=await this.request('thread/start',this.requestParams(launch));
     const receipt=responseReceipt(value,launch);
     if(!value?.thread?.id||!value.thread.sessionId||!profileEvidenceVerified(receipt.profileEvidence))throw Error('Native candidate started with another profile');
     const native={threadId:value.thread.id,nativeSessionId:value.thread.sessionId,path:value.thread.path,model:launch.profile.model,reasoningEffort:launch.profile.reasoningEffort,
       profile:structuredClone(launch.profile),providerBinding:structuredClone(launch.providerBinding),instructionBinding:structuredClone(launch.instructionBinding??null),creationReceipt:{id,at:new Date().toISOString(),...receipt}};
+    if(name)await this.request('thread/name/set',{threadId:native.threadId,name});
     this.loaded.add(native.threadId);return native;
   }
   async load(native){const launch=this.launch(native.profile);
@@ -103,6 +105,21 @@ export class NativeCandidate {
     await this.request('thread/inject_items',{threadId:native.threadId,items});
     const proof=native.path?await checkpointMarker(native.path,marker):{found:false};
     return {verified:proof.found,accepted:true,operationId,at:proof.at,checkpointId:checkpoint.id};
+  }
+  /** Structural handoff proof: persisted context and native profile receipts.
+   * This never opens a model turn or claims a model understood the summary. */
+  async verifyHandoff({checkpoint,operationId,...native}) {
+    await this.load(native);
+    const history=await portableHistory({known:true,rolloutPath:native.path,threadId:native.threadId,sessionId:native.threadId},{maxBytes:2*1024*1024,unfold:false});
+    const texts=history.items.filter(i=>i.type==='message').flatMap(i=>(i.content??[]).filter(c=>typeof c.text==='string').map(c=>({role:i.role,text:c.text})));
+    const marker='kin-checkpoint:'+operationId;
+    const envelope=texts.some(i=>{try{const value=JSON.parse(i.text);return value.marker===marker&&JSON.stringify(value.continuity)===JSON.stringify(checkpoint.payload.continuity);}catch{return false;}});
+    const publicItems=checkpoint.items.every(item=>texts.some(i=>i.role===item.role&&i.text===item.text));
+    const launch=this.launch(native.profile);
+    const actual=await this.request('thread/resume',{...this.requestParams(launch),threadId:native.threadId,excludeTurns:true});
+    const receipt=responseReceipt(actual,launch);
+    return {...receipt,verified:envelope&&publicItems&&actual?.thread?.id===native.threadId&&profileEvidenceVerified(receipt.profileEvidence),
+      basis:'persisted-context-and-native-profile',checkpointId:checkpoint.id,taskIds:(checkpoint.tasks??[]).map(t=>t.id)};
   }
   async verify({checkpoint,...native}){
     await this.load(native);const launch=this.launch(native.profile),profile=launch.profile;

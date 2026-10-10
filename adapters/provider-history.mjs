@@ -3,7 +3,7 @@ import fs from 'node:fs';
 export const KIMI_HISTORY_MESSAGE='没有切换到 Kimi：当前会话含 Kimi 不支持的压缩历史，不能在保留完整上下文的前提下安全交接。原会话和内容已保留；请继续使用 GPT，或另开独立 Kimi 会话并明确提供所需上下文。';
 export const KIMI_HISTORY_UNKNOWN_MESSAGE='没有切换到 Kimi：无法完整核验当前会话历史，已保留当前模型和全部内容。请继续使用当前会话，待历史核验恢复后再试。';
 export const historyError=(unknown=false)=>Object.assign(Error(unknown?KIMI_HISTORY_UNKNOWN_MESSAGE:KIMI_HISTORY_MESSAGE),{code:unknown?'KIMI_HISTORY_UNVERIFIED':'KIMI_HISTORY_INCOMPATIBLE',beforeMutation:true});
-export const isHistoryRefusal=error=>error?.beforeMutation===true&&['KIMI_HISTORY_UNVERIFIED','KIMI_HISTORY_INCOMPATIBLE'].includes(error.code);
+export const isHistoryRefusal=error=>error?.beforeMutation===true&&['KIMI_HISTORY_UNVERIFIED','KIMI_HISTORY_INCOMPATIBLE','HANDOFF_NOT_COMMITTED','HANDOFF_CANCELED'].includes(error.code);
 export function assertKimiInputCompatible(input){
   if(Array.isArray(input)&&input.some(item=>item?.type==='compaction'))throw historyError();
 }
