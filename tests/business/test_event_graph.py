@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -145,3 +146,27 @@ def test_a_preference_keeps_its_value_while_its_source_needs_review(system):
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE sources SET deleted=1 WHERE id=?", (first["source_id"],))
     assert memory.habits.read()["preferences"]["exploration_paused"] is False
+
+
+def test_deferred_reply_is_atomic_durable_and_resumes_through_contact(system):
+    mind, memory, _, clock = system
+    first = memory.ingest({"id":"later", "kind":"owner-message", "at":mind.clock(),
+                           "text":"You may choose when to reply to casual chat."})
+    memory.habits.update({"command_id":"timing", "expected_revision":0, "evidence_ids":[first["source_id"]],
+                         "reason":"Owner preference", "preferences":{"reply_choice":"autonomous"}})
+    request = {"input_id":"later", "action":"defer", "reason":"Finish my current thought first", "retry_after_seconds":600}
+    choice = memory.habits.choose_reply(request)
+    assert memory.habits.choose_reply(request) == choice
+    restarted = MemoryContinuity(Mind(mind.engine, mind.scope, clock=mind.clock))
+    assert restarted.habits.reply_choices(["later"])[0]["action"] == "defer"
+    with mind.engine.db.connect() as conn:
+        wishes = mind._load(conn)["desires"]
+    assert len(wishes) == 1
+    assert wishes[choice["desire_id"]]["status"] == "waiting"
+    assert first["source_id"] in json.dumps(wishes)
+    assert mind.reconsider_contacts(owner_epoch="synthetic")["resumed"] == []
+    clock[0] += timedelta(minutes=11)
+    assert mind.reconsider_contacts(owner_epoch="synthetic")["resumed"] == [choice["desire_id"]]
+    assert mind.reconsider_contacts(owner_epoch="synthetic")["resumed"] == []
+    with pytest.raises(Conflict):
+        memory.habits.choose_reply({**request,"retry_after_seconds":1200})

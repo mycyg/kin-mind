@@ -197,6 +197,32 @@ class Traits:
                 return {**data, "execution_id": data.get("task_id") or data.get("delivery_id") or identifier}
         return None
 
+    def _classify_material(self, conn, observation, refs, policy):
+        """Use source provenance, not the model's label, to admit an observation.
+
+        A mixed citation often includes a delivery receipt or a host envelope. Keep the
+        usable conversation/reflection instead of rejecting the whole growth section.
+        Execution claims still need an actual receipt; text never proves an execution.
+        """
+        groups = {"owner_statement": [], "self_statement": []}
+        for ref in refs:
+            record = self.engine._get(conn, ref["record_id"])
+            if owner_statement(record, policy, sources=[ref]):
+                groups["owner_statement"].append(ref)
+            elif self_statement(record, sources=[ref]):
+                groups["self_statement"].append(ref)
+        if observation.evidence_class == "verified_behavior":
+            valid = [i for i in observation.result_ids
+                     if (r := self._receipt(conn, i)) and verified_behavior(r)]
+            if valid:
+                return observation.model_copy(update={"result_ids": valid}), []
+        chosen = observation.evidence_class if groups.get(observation.evidence_class) else next(
+            (kind for kind, entries in groups.items() if entries), None)
+        if chosen is None:
+            raise Conflict("No conversation, reflection or completed action in the cited material",
+                           code="trait-evidence-missing")
+        return observation.model_copy(update={"evidence_class": chosen, "result_ids": []}), groups[chosen]
+
     def _material(self, conn, observation, refs, policy, cache):
         """Whether the cited material may stand for the class it was given, and which single time
         it came from. The episode is the host's: a caller may merge episodes, never split one."""
@@ -262,6 +288,7 @@ class Traits:
             category = self._allowed_category(observation.category, observation.key)
             refs = (AutonomousPlans(self.mind)._refs(conn, observation.evidence_ids, allowed)
                     if observation.evidence_ids else [])
+            observation, refs = self._classify_material(conn, observation, refs, policy)
             episode, root, receipts = self._material(conn, observation, refs, policy, cache)
             identifier = "trait_" + digest([self.scope, category, observation.slug.strip()])[:32]
             oid = "obs_" + digest([identifier, observation.evidence_class, observation.polarity, root])[:32]

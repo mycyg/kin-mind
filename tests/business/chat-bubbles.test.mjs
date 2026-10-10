@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {splitChatText,chatEnvelope,chatVoice} from '../../adapters/chat-bubbles.mjs';
 
-test('voice prefers one complete everyday bubble without making it a transport limit',()=>{
-  assert.match(chatVoice,/优先用一个简短完整的气泡/);
+test('voice leaves the number of complete bubbles to the speaker',()=>{
+  assert.match(chatVoice,/选择一个或多个完整气泡/);
   assert.match(chatVoice,/深度讨论、工作、分析与交付按内容展开/);
   assert.doesNotMatch(chatVoice,/20字|1[—-]4|1-4/);
   // Multiple intentional paragraphs remain supported; this preference is not

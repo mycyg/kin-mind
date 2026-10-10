@@ -60,7 +60,7 @@ export class ReplyGuard {
       let choice;
       try{choice=await this.call?.('reply-status',{input_id:inputId});}
       catch{/* Memory availability does not prevent a public reply. */}
-      if(['silent','merged'].includes(choice?.action))return {state:choice.action,choice};
+      if(['silent','merged','defer'].includes(choice?.action))return {state:choice.action,choice};
     }
     return directReply(entries);
   }

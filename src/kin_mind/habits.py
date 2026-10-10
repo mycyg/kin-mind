@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 from pydantic import Field
 
@@ -143,14 +144,14 @@ class ConversationHabits:
             return self.apply(conn, proposal, request["command_id"])
 
     def choose_reply(self, request):
-        if request.get("action") not in {"reply", "silent", "merged"} or not request.get("input_id") or not request.get("reason"):
+        if request.get("action") not in {"reply", "silent", "merged", "defer"} or not request.get("input_id") or not request.get("reason"):
             raise ValueError("Reply choice needs input_id, action and a brief reason")
         with self.engine.db.connect(write=True) as conn:
             row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?", (self.scope.key(), request["input_id"])).fetchone()
             if not row:
                 raise Missing("Reply choice must refer to a received owner input")
             preferences = self.read(conn)
-            if request["action"] == "silent" and preferences["preferences"]["reply_choice"] != "autonomous":
+            if request["action"] in {"silent", "defer"} and preferences["preferences"]["reply_choice"] != "autonomous":
                 raise Conflict("Autonomous silence has not been enabled by the owner")
             if request["action"] == "merged":
                 other = conn.execute("SELECT 1 FROM mind_reply_inputs WHERE scope=? AND id=?", (self.scope.key(), request.get("merged_into"))).fetchone()
@@ -163,7 +164,31 @@ class ConversationHabits:
                 current = json.loads(old[0])
                 if any(current.get(k) != value.get(k) for k in ("action", "reason", "merged_into")):
                     raise Conflict("Reply choice already recorded for this input")
+                if request["action"] == "defer":
+                    from .state import contact_wait_seconds
+                    if current.get("retry_after_seconds") != contact_wait_seconds(request.get("retry_after_seconds", 1800)):
+                        raise Conflict("Reply choice already recorded with another time")
                 return current
+            if request["action"] == "defer":
+                from .state import DesireChange, contact_wait_seconds, timestamp
+                seconds = contact_wait_seconds(request.get("retry_after_seconds", 1800))
+                state = self.mind._load(conn)
+                eid = "mind_" + digest([self.scope.key(), "reply-deferred", request["input_id"]])[:32]
+                common = dict(agent_version=state["agent_version"], expected_revision=state["revision"],
+                              evidence_ids=[row[0]], reason=request["reason"])
+                made = self.mind._apply_desire(conn, state, DesireChange(
+                    **common, command_id=eid, action="create", kind="contact", strength=50,
+                    topic="稍后接回对话", content="重新看这条输入及后续对话，再决定怎样接回：" + request["reason"],
+                    completion="结合后续对话回复；已回答或话题已结束时放下，不重复发送。",
+                    expires_at=(timestamp(self.mind.clock()) + timedelta(seconds=seconds, days=3)).isoformat()), eid)
+                self.mind._apply_desire(conn, state, DesireChange(
+                    **common, command_id=eid + ":wait", action="wait", desire_id=made["desire_id"],
+                    wait_condition="time", retry_after_seconds=seconds), eid)
+                state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
+                self.mind._save(conn, state)
+                value.update(desire_id=made["desire_id"], retry_after_seconds=seconds,
+                             retry_at=state["desires"][made["desire_id"]]["contact_wait"]["retry_at"])
+                self.mind._history(conn, eid, state, "reply-deferred", value)
             conn.execute("INSERT INTO mind_reply_choices VALUES(?,?,?)", (self.scope.key(), request["input_id"], dumps(value)))
             return value
 
@@ -171,3 +196,22 @@ class ConversationHabits:
         with self.engine.db.connect() as conn:
             row = conn.execute("SELECT data FROM mind_reply_choices WHERE scope=? AND input_id=?", (self.scope.key(), input_id)).fetchone()
             return json.loads(row[0]) if row else {"input_id": input_id, "action": "reply", "state": "default"}
+
+    def reply_choices(self, input_ids):
+        """Reconcile explicit choices even when the model emitted no public text."""
+        from hashlib import sha256
+        wanted = set(input_ids)
+        if not wanted:
+            return []
+        with self.engine.db.connect() as conn:
+            choices = []
+            for row in conn.execute("SELECT input_id,data FROM mind_reply_choices WHERE scope=?", (self.scope.key(),)):
+                identifier = row[0]
+                ledger_id = ("wechat-" + sha256(identifier[7:].encode()).hexdigest()[:32]
+                             if identifier.startswith("wechat:") else identifier)
+                if identifier not in wanted and ledger_id not in wanted:
+                    continue
+                value = json.loads(row[1])
+                if value["action"] in {"silent", "merged", "defer"}:
+                    choices.append({k: value[k] for k in ("input_id", "action", "merged_into", "desire_id", "retry_at") if k in value})
+            return choices

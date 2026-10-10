@@ -2022,7 +2022,7 @@ export class MobileRouter {
   inputAnswered(kind,data) {
     const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
     if(!record)return null;
-    const state=kind==='reply-complete'?'accepted':['silent','merged'].includes(data.state)?data.state:null;if(!state)return null;
+    const state=kind==='reply-complete'?'accepted':['silent','merged','defer'].includes(data.state)?data.state:null;if(!state)return null;
     const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
     const settled=[record.id];
     if(ownerInput(record))for(const id of new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'))) {

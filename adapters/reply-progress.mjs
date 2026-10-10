@@ -30,13 +30,13 @@ export function replyProgress(previous,event,detail={},at=new Date().toISOString
  if(event==='reply-tail'||detail.tail)return group;
  if(!detail.inputId||detail.inputId!==previous.awaitingReplyInputId)return group;
  if(event==='share-held'||event==='reply-review'){
-  const resolved=['silent','merged'].includes(detail.state);
+  const resolved=['silent','merged','defer'].includes(detail.state);
   const complete=detail.state==='accepted';
   return {replyDisposition:detail.state,replyWaitingReason:detail.reason??null,
    ...(resolved||complete?{awaitingReplySince:null,lastResolvedInputId:detail.inputId,lastResolvedAt:at}:{}),
    ...(detail.state==='merged'?{mergedInto:detail.mergedInto??null}:{}),...group};
  }
- if(event==='reply-choice'&&['silent','merged'].includes(detail.state))return {awaitingReplySince:null,replyDisposition:detail.state,lastResolvedInputId:detail.inputId,lastResolvedAt:at,mergedInto:detail.mergedInto??null,...group};
+ if(event==='reply-choice'&&['silent','merged','defer'].includes(detail.state))return {awaitingReplySince:null,replyDisposition:detail.state,lastResolvedInputId:detail.inputId,lastResolvedAt:at,mergedInto:detail.mergedInto??null,...group};
  if(event==='reply-complete')return {awaitingReplySince:null,replyDisposition:'accepted',lastResolvedInputId:detail.inputId,lastResolvedAt:at,...group};
  return group;
 }

@@ -74,7 +74,7 @@ function bubbleState(bubble) {
 /** The state older callers know: what `ReplyGuard` used to return and what the
  * reply-progress events carry. The manifest's own state travels beside it. */
 export function legacyState(manifest) {
-  if(manifest.state==='retired')return ['silent','merged'].includes(manifest.reason)?manifest.reason:'canceled';
+  if(manifest.state==='retired')return ['silent','merged','defer'].includes(manifest.reason)?manifest.reason:'canceled';
   return {draft:'pending',held:'pending',reviewed:'prepared',sending:'prepared','blocked-unknown':'unconfirmed'}[manifest.state]??manifest.state;
 }
 
@@ -101,7 +101,7 @@ export function tailOpen(manifest) {
 }
 
 /** Kin chose these herself: nothing about them is owed back to her. */
-const OWN_CHOICES=['silent','merged'];
+const OWN_CHOICES=['silent','merged','defer'];
 /** What of a finished reply group the owner never received, owed to Kin's next
  * owner turn (N4): every withdrawn, refused or undeliverable bubble that she did
  * not withdraw herself and that was not handed to her before. A group whose
@@ -332,7 +332,7 @@ export class TransportManifests {
     const requests=manifest.bubbles.map(b=>b.request),pending=manifest.bubbles.flatMap((b,i)=>open(b)&&!started(b)?[i]:[]);
     const verdict=context.review?await context.review(requests,{frozen:Boolean(manifest.review),pending,groupId:manifest.group_id,sent:this.sentEvidence(manifest)}):{state:'ready',checked:requests.map(()=>({}))};
     context.worked=true;
-    if(['silent','merged'].includes(verdict.state)){manifest.choice=verdict.choice;return this.retire(manifest,context,{reason:verdict.state});}
+    if(['silent','merged','defer'].includes(verdict.state)){manifest.choice=verdict.choice;return this.retire(manifest,context,{reason:verdict.state});}
     if(verdict.state!=='ready')return this.refused(manifest,context,verdict);
     if(!manifest.review){this.finalize(manifest,verdict);await this.save(manifest,context.lease);}
     // A review reads every request of the group. Whatever it reserved for a bubble that was withdrawn before is released once more.

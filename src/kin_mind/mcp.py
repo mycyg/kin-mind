@@ -34,7 +34,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def choose_reply(scope: Scope, request: dict) -> dict:
-        """为当前真实 input_id 选择 reply、silent 或 merged，附简短决定缘由；merged 需要 merged_into。主人允许闲聊自主安静时可以不回复，每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
+        """为当前真实 input_id 选择 reply、silent、defer（稍后接回）或 merged，附简短决定缘由；merged 需要 merged_into。defer 可带 retry_after_seconds，默认1800秒，宿主保存为可恢复的联系愿望，到期结合后续对话再判断。主人允许闲聊自主安静时可以不回复，每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
         from .habits import ConversationHabits
         return ConversationHabits(Mind(engine, scope)).choose_reply(request)
 

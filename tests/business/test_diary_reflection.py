@@ -207,3 +207,44 @@ def test_today_count_is_independent_of_the_excerpt_window(env):
     assert memory.recent_reflections()["today_count"] == 24
     assert memory.recent_reflections(limit=1)["today_count"] == 24
     assert len(memory.recent_reflections()["entries"]) == 5
+
+
+@pytest.mark.parametrize("claimed", ["owner_statement", "self_statement", "verified_behavior"])
+def test_mixed_citations_and_wrong_labels_still_form_a_persistent_trait(env, claimed):
+    from kin_mind.appraisal import TraitDecision
+    from kin_mind.context import Contexts
+    mind, source, diary, _ = env
+    thought = diary("growing", "我发现自己喜欢机械结构。")
+    bookkeeping = source("receipt", namespace="kin-runtime", authority="operation",
+                         text="Synthetic delivery receipt", internal=True, host_event="delivery")
+    def answer(context):
+        return Appraisal(reason="形成自己的兴趣", trait_observations=[TraitObservation(
+            key="机械结构", category="interests", slug="mechanisms", evidence_class=claimed,
+            polarity="support", evidence_ids=[thought, bookkeeping])], trait_decisions=[TraitDecision(
+            action="propose", text="我喜欢机械结构，也愿意花时间弄懂它。", basis="inference",
+            observation_refs=[thought], reason="日记形成的新认识")])
+    jobs = Appraisals(mind)
+    job = jobs.enqueue([thought, bookkeeping], "diary-v1")
+    result = jobs.run_one(Reader(answer), job_id=job["id"])
+    assert result["state"] == "complete", result
+    restarted = Mind(mind.engine, mind.scope, clock=mind.clock)
+    ledger = Traits(restarted).read()
+    assert len(ledger["traits"]) == 1, result
+    with mind.engine.db.connect() as conn:
+        rows = conn.execute("SELECT class,data FROM mind_trait_observations").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "self_statement"
+    assert bookkeeping not in json.dumps(json.loads(rows[0][1])["evidence"])
+    MemoryContinuity(restarted).configure({"context": True})
+    context = Contexts(restarted).build(purpose="chat", budget=8000, allow_model=False)
+    assert "self-traits" in json.dumps(context)
+    assert "我喜欢机械结构" in json.dumps(context, ensure_ascii=False)
+
+
+def test_host_bookkeeping_alone_cannot_create_a_trait(env):
+    from eventmem.core.db import Conflict
+    mind, source, _, _ = env
+    receipt = source("only-receipt", namespace="kin-runtime", authority="operation", internal=True, host_event="delivery")
+    with mind.engine.db.connect(write=True) as conn:
+        with pytest.raises(Conflict, match="No conversation"):
+            Traits(mind).observe(conn, [TraitObservation(key="兴趣", category="interests", slug="x",
+                evidence_class="self_statement", polarity="support", evidence_ids=[receipt])], "invalid", {}, None, "invalid")

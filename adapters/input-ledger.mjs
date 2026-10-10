@@ -22,7 +22,7 @@ const PRE_NATIVE=new Set(['semantic-pending','selected','preparing','queued']);
 export const ownerInput=record=>!record?.kind||record.kind==='owner';
 /** A router input whose prompt has begun in the native session and whose turn has not ended. */
 export const turnRunning=record=>Boolean(record?.turnStartedAt&&!(record.turnEndedAt>=record.turnStartedAt));
-export const answered=record=>Boolean(record?.answer&&['accepted','silent','merged','covered','legacy'].includes(record.answer.state));
+export const answered=record=>Boolean(record?.answer&&['accepted','silent','merged','defer','covered','legacy'].includes(record.answer.state));
 
 /** Still moving through the host: classification, dispatch, the native queue or
  * an unfinished native turn. A deploy waits for these; it never waits for a

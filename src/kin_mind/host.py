@@ -226,6 +226,8 @@ def _dispatch(config, action, request):
         return memory.habits.update(request)
     if action == "reply-choice":
         return memory.habits.choose_reply(request)
+    if action == "reply-choices":
+        return memory.habits.reply_choices(request["input_ids"])
     if action == "reply-status":
         return memory.habits.reply_status(request["input_id"])
     if action == "configure-model-capacity":
@@ -725,7 +727,7 @@ UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 # no long executor. Exploration, creation's completion review, memory preparation and every
 # request that may take a native review keep their own process, executor and lease.
 RESIDENT_ACTIONS = frozenset({
-    "reply-status", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
+    "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
     "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",

@@ -22,7 +22,7 @@ export const NEUTRAL_OWNER_NAME = '主人';
 export function gatewayContracts(owner = NEUTRAL_OWNER_NAME) {
   if (typeof owner !== 'string' || !/^[^\s`$\\]{1,20}$/u.test(owner)) throw Error('invalid-owner-name');
   return Object.freeze({
-    reply: `只输出给${owner}的回复或对她有用的进度，不叙述你如何理解她、如何规划回答、内部分析或工具结果旁白；历史回复出现过这些内容也不照搬。工具调用和聊天正文分开。运行信息用于核验，不必复述为开场白。遵循当前语言和人设。${owner}已允许自主接话时，可以用 choose_reply 对当前输入选择 silent 或 merged；宿主负责落实。每条新输入独立判断，工作交付沿任务流程。`,
+    reply: `只输出给${owner}的回复或对她有用的进度，不叙述你如何理解她、如何规划回答、内部分析或工具结果旁白；历史回复出现过这些内容也不照搬。工具调用和聊天正文分开。运行信息用于核验，不必复述为开场白。遵循当前语言和人设。${owner}已允许自主接话时，可以用 choose_reply 对当前输入选择 silent、defer（retry_after_seconds 指定稍后接回的时间）或 merged；宿主负责落实。每条新输入独立判断，工作交付沿任务流程。`,
     'contact-draft': `这是宿主发起的主动联系草稿，不是${owner}的新消息。只给宿主返回一个 JSON 决定，不在 JSON 外对${owner}说话、播报进度、直接发送、提醒或修改共同状态。内部背景不是用户输入；需要时可使用已授权的只读记忆工具。` + contactDraftInstructions,
     assessment: `这是当前主会话空闲时的内部评估，不是${owner}发来的消息。按本轮结构提交结论，不发送手机消息、不输出进度；需要时可用已有授权工具回忆或做些自己想做的小事，共享状态由最终提案核验后保存。宿主核验后才保存提案；未提交的内容不是已生效状态。可以形成感想、心事、行动或安静决定，也可以不写。保留事实、推断与角色表达的区别，不输出内部推理。`,
     'continuity-check': continuityContract,
