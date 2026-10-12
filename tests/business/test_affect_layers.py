@@ -95,7 +95,7 @@ def test_the_closed_form_is_the_integral_of_the_instant_curve(name):
     for hours in (0, 0.4, 1, 1.7, 2.5, 3, 5, 12, 30):
         piece = [p for p in L._pieces(entry) if p[0] <= L._hours(at(hours))][-1]
         assert L._along(piece, L._hours(at(hours))) == pytest.approx(project(entry, at(hours)), abs=1e-9)
-    anchor = {"m": 42.0, "x": project(entry, at(0)), "at": at(0), "fp": L.fingerprint(entry)}
+    anchor = {"m": 42.0, "x": project(entry, at(0)), "at": at(0), "segment": L.segment(entry)}
     m, reached = 42.0, 0.0
     for hours in (0.5, 3, 10, 30):
         m, reached = integrate(entry, m, reached, hours), hours
@@ -132,7 +132,7 @@ def test_a_save_trusts_only_the_curve_its_anchor_was_made_on():
     assert saved({})["m"] == pytest.approx(shown, abs=1e-6)
     followed = saved({"joy": L.curve(made)})
     assert followed["m"] == pytest.approx(L.undertone(made, anchor, at(5))[0], abs=1e-6)
-    assert followed["fp"] == L.fingerprint(now) and followed["x"] == pytest.approx(project(now, at(5)), abs=1e-6)
+    assert followed["segment"] == L.segment(now) and followed["x"] == pytest.approx(project(now, at(5)), abs=1e-6)
 
 
 def test_a_spike_and_a_lasting_mood_are_distinct(setup):
@@ -166,7 +166,7 @@ def test_only_the_dimensions_whose_curve_changed_are_reanchored(setup):
     spiked = raw(mind)
     held = anchors(spiked)
     assert {key for key in held if held[key] != first[key]} == {"joy"}
-    assert held["joy"] == {"m": 60.0, "x": 90.0, "at": mind.clock(), "fp": L.fingerprint(spiked["dimensions"]["joy"])}
+    assert held["joy"] == {"m": 60.0, "x": 90.0, "at": mind.clock(), "segment": L.segment(spiked["dimensions"]["joy"])}
     later(clock, hours=1)
     mind.record(event(mind, source, "gloom", {"mood": 30}))
     assert anchors(raw(mind))["joy"] == held["joy"], "another dimension's event leaves joy's anchor alone"
@@ -190,12 +190,13 @@ def test_every_writer_leaves_each_anchor_on_its_curve(setup, monkeypatch):
 
     def on_curve():
         state = raw(mind)
-        assert all(anchors(state)[k]["fp"] == L.fingerprint(e) for k, e in state["dimensions"].items())
+        assert all(anchors(state)[k]["segment"] == L.segment(e) for k, e in state["dimensions"].items())
         assert all(d["undertone"]["status"] == "tracking" for d in mind.read()["dimensions"].values())
 
     initiative = anchors(raw(mind))["initiative"]
     wish(mind, source, "tea", strength=90, content="Tell her about the tea")
-    assert anchors(raw(mind))["initiative"] != initiative, "the wish retargeted initiative"
+    assert raw(mind)["dimensions"]["initiative"]["target"] == 90, "the wish retargeted the numerical curve"
+    assert anchors(raw(mind))["initiative"]["m"] == initiative["m"], "retargeting at the same moment has no value jump"
     on_curve()
     later(clock, minutes=30)
     attempt = mind.claim_contact(owner_epoch="owner-1")
@@ -357,7 +358,7 @@ def test_the_migration_is_one_revision_and_history_rebuilds_with_patches_on(setu
     reverted = revert(mind, source, clock, changed["event_id"])
     state = raw(mind)
     assert state["revision"] == reverted["revision"] and set(anchors(state)) == set(state["dimensions"])
-    assert all(anchors(state)[k]["fp"] == L.fingerprint(e) for k, e in state["dimensions"].items())
+    assert all(anchors(state)[k]["segment"] == L.segment(e) for k, e in state["dimensions"].items())
     assert anchors(state)["curiosity"]["at"] == state["dimensions"]["curiosity"]["at"]
     texts[reverted["revision"]] = live(mind)
     rebuilds(mind, texts)

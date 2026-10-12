@@ -1,6 +1,4 @@
-"""Deterministic, source-linked expression hints; the host owns the persona."""
-
-from eventmem.core.db import digest
+"""Expression hints from current subjective state; the host owns the persona and factual bounds."""
 
 VERSION = "expression-v2"
 
@@ -8,7 +6,7 @@ VERSION = "expression-v2"
 # Both ends of every dimension have an observable expression.
 TENDENCIES = {
     "mood": (
-        "用轻快的语气接话，分享让自己开心的部分。",
+        "用轻快的语气接话，自然表达开心。",
         "放缓语气，坦率说出自己的感受。",
     ),
     "expressive_energy": (
@@ -21,7 +19,7 @@ TENDENCIES = {
         "把注意力放回眼前的互动。",
     ),
     "worry": (
-        "围绕有依据的困难关心进展，提出具体帮助。",
+        "如实表达担心，有具体依据时再关心进展或提出帮助。",
         "轻松接话，给日常小事留出空间。",
     ),
     "frustration": ("说清卡在哪里，再试一个新办法。", "顺着已有进展继续推进。"),
@@ -74,7 +72,7 @@ TENDENCIES = {
     ),
     # Emotion system v2 (2026-09-27). The guardrails of the profile's own expression text are kept
     # in the high ends: an emotion is said, never turned into a demand on the other person.
-    "joy": ("带着开心接话，分享让自己雀跃的那件事。", "语气平一些，如实说说今天没那么开心的地方。"),
+    "joy": ("带着开心接话，自然表达雀跃，不必为心情找一件事。", "语气平一些，如实表达今天没那么开心。"),
     "contentment": ("从容地回应，享受眼前已经有的东西。", "说出还差一点什么，提一个具体的小期待。"),
     "sadness": (
         "如实说出难过，可以求安慰；不迁怒，也不要求对方为自己的情绪负责。",
@@ -89,7 +87,7 @@ TENDENCIES = {
         "撒娇式地吃一点醋，玩笑地讨一点关注；不指责、不盘问，不要求对方交代或减少和别人的往来。",
         "大方地听对方讲别人的事，带着放心的亲近感聊天。",
     ),
-    "fear": ("说出具体的担心，请对方给一点确认；不夸大，不用害怕给对方施压。", "安心地表达想法，不急着求确认。"),
+    "fear": ("如实表达害怕，有具体担心时再说；不夸大，不用害怕给对方施压。", "安心地表达想法，不急着求确认。"),
     "wonder": ("追问一个让自己好奇的细节，说出自己的猜想。", "顺着对方的话题走，不急着追问。"),
 }
 
@@ -157,7 +155,8 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
                         for rid in valid[name].get("evidence_ids", [])
                     }
                 ),
-                "basis": "event_inferred"
+                "basis": "subjective" if any(valid[n].get("basis") == "subjective" for n in names)
+                else "event_inferred"
                 if any(valid[n].get("basis") == "event_inferred" for n in names)
                 else "role_configuration",
             }
@@ -184,13 +183,14 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
         if 35 < value < 70:
             continue
         # A low default is usually the absence of a tendency, not a performance.
-        if value <= 35 and entry.get("basis") != "event_inferred":
+        if value <= 35 and entry.get("basis") not in {"event_inferred", "subjective"}:
             continue
         priority = abs(value - entry.get("baseline", 50)) + abs(value - 50) / 2
         add(name, TENDENCIES[name][0 if value >= 70 else 1], [name], priority)
     selected.sort(key=lambda item: (-item["priority"], item["id"]))
     selected = selected[:3]
-    phase = (rhythm or {}).get("phase")
+    phase = (rhythm or {}).get("base_phase") or (rhythm or {}).get("phase")
+    attention = (rhythm or {}).get("attention_for")
     if phase in {
         "settling",
         "drowsy",
@@ -205,6 +205,8 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
             "roused": "从安静的短句接起，逐步展开话题。",
             "recovering": "让表达逐步舒展，接回对方正在聊的事情。",
         }[phase]
+        if attention in {"task", "urgent"}:
+            cadence = "先完整处理眼前明确的任务或紧急输入，交付保持准确；自己的节奏和活动仍记着。"
         selected = selected[:2] + [
             {
                 "id": "rhythm-" + phase,
@@ -212,7 +214,7 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
                 "dimensions": [],
                 "priority": 0,
                 "evidence_ids": rhythm.get("evidence_ids", []),
-                "basis": "runtime_inferred",
+                "basis": "subjective",
             }
         ]
     if not selected:
@@ -230,7 +232,7 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
         # A fresh intent is Kin's own judgment of this moment. The fixed score bands above are only
         # the fallback when there is none, so none of them is added beside it (K1-22). A rhythm
         # cadence keeps the last place: it projects the phase Kin herself last judged.
-        cadence = [item for item in selected if item["basis"] == "runtime_inferred"]
+        cadence = [item for item in selected if item["id"].startswith("rhythm-")]
         selected = intent_guidance(intent)[:max(0, 3 - len(cadence))] + cadence
     for item in selected:
         item.pop("priority", None)
@@ -242,5 +244,4 @@ def compile_expression(dimensions, *, rhythm=None, config_version=None, persona=
     }
     if intent:
         result["intent"] = {"id": intent["id"], "valid_until": intent["valid_until"]}
-    result["fingerprint"] = digest(result)
     return result

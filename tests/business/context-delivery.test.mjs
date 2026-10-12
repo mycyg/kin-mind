@@ -39,12 +39,10 @@ test('one uncertain identity does not hold unrelated fresh background forever',a
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
 import {NativeWindow,checkpointMarker,reconcileLegacyInjections,nativeWindowFor} from '../../adapters/native-window.mjs';
 
-const sha=value=>createHash('sha256').update(value).digest('hex');
 const line=value=>JSON.stringify(value)+'\n';
-const assistant=(text,at='2026-09-24T00:00:00Z')=>line({timestamp:at,type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text}]}});
+const assistant=(text,at='2026-09-24T00:00:00Z',id=null)=>line({timestamp:at,type:'response_item',payload:{id,type:'message',role:'assistant',content:[{type:'output_text',text}]}});
 const user=(text,at='2026-09-24T00:00:00Z')=>line({timestamp:at,type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text}]}});
 function rollout(t,prefix='') {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-native-window-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -58,20 +56,21 @@ function reads(t) {
   t.after(()=>{fs.createReadStream=original;});
   return starts;
 }
-const ctx=(id,text)=>{const marker='kin-context:context:'+id,body=marker+'\n'+text;return {id:'context:'+id,session:'main',epoch:'e1',marker,text:body,text_hash:sha(body)};};
+const ctx=(id,text)=>{const marker='kin-context:context:'+id,body=marker+'\n'+text;return {id:'context:'+id,session:'main',epoch:'e1',marker,text:body};};
 
-test('the receipt index keeps hashes, markers, offsets and times of injections, never text',async t=>{
+test('the receipt index keeps native item ids, markers, offsets and times of injections, never text or content hashes',async t=>{
   const f=rollout(t),context=ctx('a1','PRIVATE BACKGROUND');
-  fs.appendFileSync(f.file,line({type:'turn_context',payload:{turn_id:'t1'}})+user('小光的话 <kin-host-event>'+'b'.repeat(32)+'</kin-host-event>')+assistant(context.text,'2026-09-24T01:00:00Z'));
+  fs.appendFileSync(f.file,line({type:'turn_context',payload:{turn_id:'t1'}})+user('小光的话 <kin-host-event>'+'b'.repeat(32)+'</kin-host-event>')+assistant(context.text,'2026-09-24T01:00:00Z','native-a1'));
   const window=new NativeWindow({file:f.file,threadId:'main',stateFile:f.stateFile});
   await window.poll();
-  const hit=window.receipts.get(context.text_hash);
+  const hit=window.receipts.get('native-a1');
   assert.equal(hit.m[0],context.marker);assert.equal(hit.at,'2026-09-24T01:00:00Z');assert.ok(Number.isSafeInteger(hit.o));
   assert.equal(window.state.receipts.items.length,1,'an owner message without a marker is not indexed');
+  assert.equal('h' in hit,false);assert.equal(hit.native_item_id,'native-a1');
   const saved=fs.readFileSync(f.stateFile,'utf8');
   assert.ok(!saved.includes('PRIVATE BACKGROUND')&&!saved.includes('小光的话'),'no message text is kept');
   assert.equal(nativeWindowFor(f.file),window);
-  assert.deepEqual(await checkpointMarker(f.file,context.marker,{textHash:context.text_hash,role:'assistant'}),{found:true,at:hit.at,offset:hit.o});
+  assert.deepEqual(await checkpointMarker(f.file,context.marker,{role:'assistant'}),{found:true,at:hit.at,offset:hit.o,native_item_id:'native-a1'});
 });
 
 test('T-14: a delivery reads only what was appended since the last read, however long the history is',async t=>{
@@ -81,8 +80,8 @@ test('T-14: a delivery reads only what was appended since the last read, however
   const calls=[];
   const delivery=new NativeContextDelivery({runtime:async()=>({known:true,threadId:'main',rolloutPath:f.file,active:false,nativeStatus:'idle'}),
     call:async(action,args)=>{calls.push(action);if(action==='context-delivery-pending')return [];if(action==='context-delivery-begin')return {...context,state:'sending',acquired:true};
-      if(action==='context-delivery-ack'){assert.equal(args.text_hash,context.text_hash);return {...context,state:'accepted'};}assert.fail(action);},
-    inject:async request=>{assert.equal(request.items[0].role,'assistant');fs.appendFileSync(f.file,assistant(request.items[0].content[0].text));}});
+      if(action==='context-delivery-ack'){assert.equal('text_hash' in args,false);assert.equal(args.native_item_id,'native-fresh');return {...context,state:'accepted'};}assert.fail(action);},
+    inject:async request=>{assert.equal(request.items[0].role,'assistant');fs.appendFileSync(f.file,assistant(request.items[0].content[0].text,undefined,'native-fresh'));}});
   assert.equal((await delivery.deliver(context)).state,'accepted');
   assert.ok(starts.length>0&&starts.every(start=>start>=size),'no read went back into the old history');
   assert.deepEqual(calls,['context-delivery-pending','context-delivery-begin','context-delivery-ack']);
@@ -160,4 +159,33 @@ test('CR-LIFE-09: the legacy pass needs an explicit budget, and a marker it coul
   assert.deepEqual(result.unknown,[early.marker]);
   assert.equal(window.covers(early.marker),false,'a bounded stretch proves nothing before it');
   assert.equal(window.migrated(),false,'no caller said every identity was handed over');
+});
+
+
+test('a legacy indexed receipt is reconciled by its marker and role without a body hash gate',async t=>{
+  const f=rollout(t),context={...ctx('legacy-index','new context wording'),text_hash:'obsolete-content-hash'};
+  const offset=fs.statSync(f.file).size;
+  fs.writeFileSync(f.stateFile,JSON.stringify({offset,threadId:'main',events:[],eventIds:[],compactions:0,
+    receipts:{from:0,items:[{h:'old-content-hash',m:[context.marker],r:'assistant',o:20,at:'2026-09-24T00:00:00Z'}]}}));
+  const window=new NativeWindow({file:f.file,threadId:'main',stateFile:f.stateFile});
+  const acknowledgments=[];
+  const delivery=new NativeContextDelivery({window:()=>window,runtime:async()=>({known:true,threadId:'main',rolloutPath:f.file,active:false,nativeStatus:'idle'}),
+    inject:async()=>assert.fail('A previously persisted marker is never appended again'),
+    call:async(action,args)=>{if(action==='context-delivery-pending')return [context];
+      if(action==='context-delivery-ack'){acknowledgments.push(args);return {...context,state:'accepted'};}assert.fail(action);}});
+  assert.equal((await delivery.deliver(context)).state,'accepted');
+  assert.equal(acknowledgments.length,1);assert.equal('text_hash' in acknowledgments[0],false);
+  assert.equal(window.receipts.find({marker:context.marker,role:'assistant',textHash:'different'}).o,20);
+});
+
+test('marker lookup requires an actual assistant message and ignores the legacy text hash argument',async t=>{
+  const f=rollout(t),context=ctx('native-proof','current text');
+  fs.appendFileSync(f.file,user(context.text));
+  const window=new NativeWindow({file:f.file,threadId:'main',stateFile:f.stateFile});await window.poll();
+  assert.equal((await checkpointMarker(f.file,context.marker,{role:'assistant'})).found,false);
+  fs.appendFileSync(f.file,assistant(context.marker+'\nDifferent stored words',undefined,'native-proof-id'));
+  const proof=await checkpointMarker(f.file,context.marker,{role:'assistant',textHash:'obsolete'});
+  assert.equal(proof.found,true);assert.equal(proof.native_item_id,'native-proof-id');
+  assert.ok(Number.isSafeInteger(proof.offset));
+  assert.equal(window.state.receipts.items.filter(r=>r.r==='assistant').every(r=>!('h' in r)),true);
 });

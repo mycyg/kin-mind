@@ -321,9 +321,9 @@ def test_checkpoint_budget_is_fixed_and_does_not_shrink_with_the_window(setup):
         checkpoint.build(snapshot(40),binding,budget=9000,adaptive_budget=True,allow_model=False)
 
 
-def test_checkpoint_identity_ignores_its_allowance(setup):
-    # K3-09: the same content is the same checkpoint, so a prepared candidate is not
-    # judged stale and rebuilt because a budget number moved.
+def test_checkpoint_instances_have_correlation_ids_without_a_content_fingerprint(setup):
+    # Each prepared instance has its own ID; a retry retains that actual object.
+    # Budget bookkeeping does not alter its public history or turn its body into identity.
     from kin_mind.session_checkpoint import SessionCheckpoint
     mind, _, _ = setup
     checkpoint = SessionCheckpoint(mind)
@@ -332,8 +332,13 @@ def test_checkpoint_identity_ignores_its_allowance(setup):
     binding = {'conversationId':'same','generation':1}
     small = checkpoint.build(snapshot,binding,budget=2000,adaptive_budget=True,allow_model=False)
     large = checkpoint.build(snapshot,binding,budget=4000,adaptive_budget=True,allow_model=False)
-    assert small['budgetPlan'] != large['budgetPlan'] and small['id'] == large['id']
-    assert 'budgetPlan' not in small['payload'] and small['payload'] == large['payload']
+    assert small['budgetPlan'] != large['budgetPlan'] and small['id'] != large['id']
+    assert 'budgetPlan' not in small['payload']
+    assert {k: v for k, v in small['payload'].items() if k != 'checkpointId'} == {k: v for k, v in large['payload'].items() if k != 'checkpointId'}
+    identity = small['id']
+    small['budgetPlan'] = large['budgetPlan']
+    checkpoint._seal(small)
+    assert small['id'] == identity
 
 
 def test_a_failed_native_assessment_waits_and_is_tried_again(setup):

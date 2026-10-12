@@ -136,6 +136,7 @@ export function normalizeReceipt(record) {
   const messageId=record.messageId??record.message_id??literal;
   const unproven=unprovenRefusal(record)||(record.state==='unconfirmed'&&record.refusal==='unproven');
   return {state:unproven?'unconfirmed':record.state,...(unproven?{refusal:'unproven'}:{}),...(messageId?{messageId:String(messageId)}:{}),
+    ...(typeof (record.conversationId??record.conversation_id)==='string'?{conversationId:record.conversationId??record.conversation_id}:{}),
     ...(typeof (record.submissionStarted??record.submission_started)==='boolean'?{submissionStarted:record.submissionStarted??record.submission_started}:{}),
     ...(record.acceptedAt?{acceptedAt:record.acceptedAt}:{}),...(record.checkedAt?{checkedAt:record.checkedAt}:{}),
     ...(record.attemptedAt?{attemptedAt:record.attemptedAt}:{}),...(token(record.stage??record.reason)?{reason:token(record.stage??record.reason)}:{})};

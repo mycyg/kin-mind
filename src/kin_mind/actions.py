@@ -56,9 +56,7 @@ class ActionEvents:
                 "threshold": None if semantic else 75,
                 "budget_seconds": 1200,
             }
-            state["profile_version"] = digest(
-                [state["profile"], state["action_policy"]]
-            )[:16]
+            state["profile_version"] = eid
             self.emit(
                 conn,
                 "bootstrap",
@@ -171,13 +169,13 @@ class ActionEvents:
                 "desire_ids": expired[:12], "reason": "These wishes passed their window without being settled",
                 "evidence_ids": list(dict.fromkeys(fresh))[:24], "agent_version": state["agent_version"]}))
         rhythm = state.get("rhythm")
-        if rhythm and rhythm.get("evidence") and rhythm.get("half_life_minutes"):
+        if rhythm and rhythm.get("half_life_minutes"):
             ends = stamp(rhythm["at"]) + timedelta(minutes=rhythm["half_life_minutes"])
-            if ends <= stamp(now) and self.mind._fresh(conn, rhythm["evidence"]):
+            if ends <= stamp(now) and self.mind._fresh(conn, rhythm.get("evidence", [])):
                 queued.append(self.emit(conn, "rhythm-review", [rhythm.get("event_id"), ends.isoformat()], {
                     "phase": rhythm.get("phase"), "ended_at": ends.isoformat(),
                     "reason": "The rhythm phase Kin gave has passed its half-life",
-                    "evidence_ids": [r["record_id"] for r in rhythm["evidence"]], "agent_version": state["agent_version"]}))
+                    "evidence_ids": [r["record_id"] for r in rhythm.get("evidence", [])], "agent_version": state["agent_version"]}))
         return queued
 
     def drain(self, jobs):

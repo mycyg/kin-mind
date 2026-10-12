@@ -136,7 +136,7 @@ def test_a_possibly_sent_reminder_is_not_sent_again_but_the_next_occurrence_come
     assert [row["state"] for row in outbox(engine, sid)] == ["uncertain", "sent"]
 
 
-def test_a_verified_idempotent_channel_is_retried_past_five_unknown_outcomes(world):
+def test_a_verified_idempotent_channel_keeps_an_unknown_outcome_for_reconciliation(world):
     engine, clock, scheduler, run = world
     channel = Channel(503, 503, 503, 503, 503, 503, 503)
     found, sid = scheduler(channel, idempotent=True)
@@ -145,7 +145,9 @@ def test_a_verified_idempotent_channel_is_retried_past_five_unknown_outcomes(wor
                      ("http://127.0.0.1:9/deliver",))
     run(found, DELIVERY_WINDOW, step=60)
     rows = outbox(engine, sid)
-    assert rows[0]["state"] == "sent" and rows[0]["attempts"] == 8
+    assert rows[0]["state"] == "uncertain" and rows[0]["attempts"] == 1
+    assert len(channel.calls) == 1
+    assert "body_sha256" not in rows[0]["data"]["dispatch"]
 
 
 def test_a_schedule_whose_policy_is_gone_pauses_and_the_others_still_run(world):

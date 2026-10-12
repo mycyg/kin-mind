@@ -12,11 +12,12 @@ test('startup skips committed delivery identities after mutable metadata changes
  f.put({...r,taskId:'task-later',inputVersion:2});
  assert.deepEqual(reconcileOutbox({...f,historicalBefore:at}),{queued:0,recorded:1});
  assert.equal(f.journal.snapshot().length,0);assert.equal(f.calls(),1);
- assert.throws(()=>f.journal.append({...original,text:'A different live event'}),/conflicts with committed/,'live writes still cannot replace the old event');
+ assert.equal(f.journal.append({...original,text:'A different live event'}).state,'recorded');
+ assert.equal(f.calls(),1,'the existing event ID remains the original committed event');
 });
-test('one conflicting uncommitted outbox record does not block another delivery gap',async t=>{
+test('an existing uncommitted event keeps its original payload and does not block another delivery gap',async t=>{
  const f=fixture(t),r=receipt('conflict');f.journal.append(deliveryEvent(r));f.put({...r,text:'changed metadata'});f.put(receipt('next'));
- assert.deepEqual(reconcileOutbox({...f,historicalBefore:at}),{queued:1,failed:1});
+ assert.deepEqual(reconcileOutbox({...f,historicalBefore:at}),{queued:2});
  assert.deepEqual(f.journal.snapshot().map(e=>e.bubble_id).sort(),['conflict','next']);
  assert.equal(f.journal.snapshot().find(e=>e.bubble_id==='conflict').text,r.text);assert.equal(f.calls(),0);
 });

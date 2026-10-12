@@ -48,6 +48,10 @@ UNCLASSIFIED = Classification("unknown", None, "block")
 # the kind is then the same for all of them, while the handling follows the raise site
 # (the same fault is refused alone inside an isolated section and blocks outside one).
 REGISTRY = {
+    "Event source was deleted": ("semantic", "evidence-erased", "section"),
+    "Share source was deleted": ("semantic", "evidence-erased", "section"),
+    "Share reference must name a saved finding": ("semantic", "share-reference-invalid", "section"),
+    "A closed concern requires an explicit reopen": ("semantic", "concern-reopen-required", "section"),
     # --- appraisal.py: the evaluation's own preparation and commit guards ---
     "Migration requires current owner evidence": ("semantic", "migration-needs-owner-evidence", "block"),
     "Migration source set needs a bounded batch": ("semantic", "migration-batch-unbounded", "block"),
@@ -95,6 +99,15 @@ REGISTRY = {
     "Desire is outside this scope or missing": ("semantic", "desire-unknown", "section"),
     "Only exploration wishes have an exploration target": ("semantic", "wish-kind-mismatch", "section"),
     "Only contact wishes link a communication decision": ("semantic", "wish-kind-mismatch", "section"),
+    "Activity and exploration references name different content": ("semantic", "activity-reference-mismatch", "section"),
+    "Only contact wishes link an activity sharing decision": ("semantic", "wish-kind-mismatch", "section"),
+    "Attention must refer to a received owner input": ("semantic", "attention-input-missing", "block"),
+    "Attention requires a current received owner input": ("runtime", "attention-input-changed", "reuse"),
+    "Only contact plan steps link an activity sharing reference": ("semantic", "plan-activity-kind-mismatch", "section"),
+    "Finding does not belong to the referenced activity": ("semantic", "activity-finding-mismatch", "section"),
+    "Activity reference cannot name another content unit": ("semantic", "activity-unit-mismatch", "section"),
+    "Share activity version is unavailable": ("runtime", "activity-content-changed", "reuse"),
+    "This activity has no current decision to communicate": ("semantic", "activity-not-selected-for-sharing", "section"),
     "A finished desire stays in history; create a new desire": ("semantic", "desire-finished", "section"),
     "An unresolved contact attempt already exists": ("runtime", "contact-attempt-open", "block"),
     "Action appraisal is pending": ("runtime", "action-appraisal-pending", "block"),

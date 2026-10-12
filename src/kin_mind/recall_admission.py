@@ -179,12 +179,9 @@ def _cosine(left, right):
 
 
 def embed(engine, scope, entries, deadline):
-    """Vectors of `entries` -- `(item_id, text)`, item_id None for the query -- from the local
-    embedding service, within `deadline` (monotonic), and how many the service computed now. An
-    item's vector is kept (`mind_recall_vectors`, by the hash of the model and the text, beside the
-    item's id, which an erase finds it by) and reused while its text is the same; the query's never
-    is. Raises Unavailable with a code. Only the local service is ever asked: a remote embedding role
-    would be a paid call on the reply's path, and is refused (`embedding-not-local`)."""
+    """Vectors of `(item_id, text)` from the bounded local embedding service.
+    No content-hash cache is read or written; legacy vector rows remain erasable by item id.
+    """
     from eventmem.core.db import recording
     from eventmem.core.providers import NotConfigured, Providers
 
@@ -199,26 +196,8 @@ def embed(engine, scope, entries, deadline):
         raise Unavailable("embedding-not-configured") from None
     if not config.local_embedding:
         raise Unavailable("embedding-not-local")
-    base = [config.model, config.preprocessing, config.dimensions]
-    keys = [digest([*base, text]) if item_id else None for item_id, text in entries]
-    out, kept = [None] * len(entries), {}
-    wanted = sorted({key for key in keys if key})
-    if wanted:
-        with engine.db.connect() as conn:
-            for start in range(0, len(wanted), 400):
-                page = wanted[start:start + 400]
-                for key, blob in conn.execute(f"SELECT key,vector FROM {VECTORS} WHERE scope=? AND key IN ({','.join('?' for _ in page)})",
-                                              (scope, *page)):
-                    vector = array("f")
-                    vector.frombytes(blob)
-                    kept[key] = vector
-    missing = []
-    for index, key in enumerate(keys):
-        if key in kept:
-            out[index] = kept[key]
-        else:
-            missing.append(index)
-    computed = []
+    out = [None] * len(entries)
+    missing = list(range(len(entries)))
     for start in range(0, len(missing), BATCH):
         page = missing[start:start + BATCH]
         remaining = deadline - time.monotonic()
@@ -241,20 +220,6 @@ def embed(engine, scope, entries, deadline):
             raise Unavailable("embedding-incomplete")
         for index, row in zip(page, rows):
             out[index] = array("f", row["embedding"])
-            if keys[index]:
-                computed.append((keys[index], entries[index][0], out[index]))
-    if computed:
-        import sqlite3
-        try:
-            with engine.db.connect(write=True) as conn:
-                at = time.time()
-                conn.executemany(f"INSERT OR REPLACE INTO {VECTORS} VALUES(?,?,?,?,?)",
-                                 [(scope, key, item_id, at, vector.tobytes()) for key, item_id, vector in computed])
-                conn.execute(f"DELETE FROM {VECTORS} WHERE scope=? AND key IN (SELECT key FROM {VECTORS} WHERE scope=? "
-                             "ORDER BY at DESC,key LIMIT -1 OFFSET ?)", (scope, scope, VECTORS_KEPT))
-        except sqlite3.OperationalError:
-            # A busy store keeps no vector this time; the next build computes it again.
-            pass
     return out, len(missing)
 
 

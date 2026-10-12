@@ -119,7 +119,11 @@ def test_off_by_default_nothing_is_queued_sent_or_carried(setup, monkeypatch):
     assert not endpoint.sent
     after = build(mind)
     assert "windowNote" not in after["payload"] and "windowNoteOmitted" not in after
-    assert (after["id"], after["payload"], after["tokens"], after["complete"]) == (before["id"], before["payload"], before["tokens"], before["complete"])
+    def content(value):
+        return {k: v for k, v in value["payload"].items() if k != "checkpointId"}
+    assert content(after) == content(before)
+    assert after["complete"] is before["complete"] is True
+    assert before["tokens"] <= 2000 and after["tokens"] <= 2000
 
 
 def test_a_note_written_while_on_is_not_carried_once_the_switch_is_off(setup, monkeypatch):

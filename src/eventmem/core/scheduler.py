@@ -440,8 +440,8 @@ class Scheduler:
         self.automatic_greetings(stamp)
         created = []
         with self.engine.db.connect(write=True) as conn:
-            # A send that outlived its lease has an unknown outcome. It goes out again
-            # on its own only over a declared and verified idempotent channel.
+            # A send that outlived its lease has an unknown outcome and stays under its
+            # delivery id for reconciliation. It is never sent again on a declaration alone.
             stale = conn.execute(
                 "SELECT o.id,o.attempts,o.data,o.schedule_id,s.policy_id FROM outbox o LEFT JOIN schedules s ON s.id=o.schedule_id WHERE o.state='sending' AND o.lease_until<?",
                 (self.clock(),),
@@ -450,21 +450,13 @@ class Scheduler:
                 policy = self._policy(conn, row["policy_id"])
                 data = json.loads(row["data"])
                 known = self._due(conn, row["id"], row["schedule_id"], data)
-                retry = (
-                    policy
-                    and policy.channel
-                    and policy.idempotent_channel
-                    and known
-                    and window_open(data, self.clock())
-                    and self._verified(conn, policy.channel)
-                )
                 if not known:
                     data["hold"] = {"at": stamp, "reason": "due-time-unknown"}
                 changed = conn.execute(
                     "UPDATE outbox SET state=?,lease_until=NULL,data=? WHERE id=? AND state='sending'",
-                    ("retry" if retry else "uncertain", dumps(data), row["id"]),
+                    ("uncertain", dumps(data), row["id"]),
                 ).rowcount
-                if changed and not retry and policy:
+                if changed and policy:
                     # Possibly sent and not to be sent again: this occurrence is over, and a
                     # recurring reminder goes on to its next one.
                     schedule = conn.execute("SELECT * FROM schedules WHERE id=?", (row["schedule_id"],)).fetchone()
@@ -681,22 +673,14 @@ class Scheduler:
             )
             if quiet or today_count >= policy.max_per_day or interval:
                 return release("ready", self.clock() + 60)
-            dispatch = data.get("dispatch") or {}
+            dispatch = {key: value for key, value in (data.get("dispatch") or {}).items() if key != "body_sha256"}
             channel = digest(policy.channel)[:32]
             body = dispatch.get("body")
-            intact = body is not None and hashlib.sha256(
-                body.encode()
-            ).hexdigest() == dispatch.get("body_sha256")
-            if not clean and not (
-                policy.idempotent_channel
-                and self._verified(conn, policy.channel)
-                and dispatch.get("channel") in (None, channel)
-                and (body is None or intact)
-            ):
-                # Possibly sent before: another send needs a declared and verified
-                # idempotent channel, the same channel, and the same bytes.
+            if not clean:
+                # A possibly sent delivery remains under its actual id for reconciliation.
+                # Neither channel declarations nor a body fingerprint authorize another send.
                 return release("uncertain")
-            if not intact:
+            if body is None:
                 # The first dispatch freezes what the record says now. Every later one
                 # repeats these bytes under the same Idempotency-Key, whatever the
                 # record has become since.
@@ -714,7 +698,6 @@ class Scheduler:
                 "generation": claim["generation"],
                 "at": stamp,
                 "body": body,
-                "body_sha256": hashlib.sha256(raw).hexdigest(),
                 "channel": channel,
             }
             updated = conn.execute(
@@ -809,11 +792,7 @@ class Scheduler:
                     and json.loads(schedule["data"]).get("generation", 0)
                     == dispatch.get("generation")
                 )
-                resend = clean or (
-                    policy
-                    and policy.idempotent_channel
-                    and self._verified(conn, request["channel"])
-                )
+                resend = clean
                 if not wanted:
                     state = "canceled" if clean else "uncertain"
                 elif not self._due(conn, row["id"], row["schedule_id"], data):

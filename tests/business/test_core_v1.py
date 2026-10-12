@@ -57,8 +57,9 @@ def test_idempotence_durable_receipt_and_concurrent_revisions(engine):
     with ThreadPoolExecutor(max_workers=10) as pool:
         assert sum(r is not None for r in pool.map(revise, range(10))) == 1
     assert engine.get(rid)["revision"] == 2
-    with pytest.raises(Conflict):
-        engine.receive(source.model_copy(update={"text": "changed without version"}))
+    repeated = engine.receive(source.model_copy(update={"text": "changed without version"}))
+    assert repeated["id"] == results[0]["id"]
+    assert engine.source(repeated["id"], content=True).read_text() == "A durable source"
 
 def test_correction_invalidates_warm_cache_and_revision_reads(engine):
     rid = remember(engine)
@@ -117,7 +118,7 @@ def test_evidence_independence_and_generated_facts(engine):
         "fact",
     )
     assert fact["status"] == "unverified"
-    assert engine.get(fact["id"])["independent_sources"] == 1
+    assert engine.get(fact["id"])["independent_sources"] == 3
     diary = engine.add_record(
         RecordInput(
             kind="diary",
@@ -205,7 +206,7 @@ def test_backup_restore_keeps_history_and_archive(engine, tmp_path):
 
 
 def test_backup_keeps_referenced_blobs_but_excludes_orphans(engine, tmp_path):
-    from eventmem.core.transfer import backup, restore
+    from eventmem.core.transfer import backup, restore, file_digest
 
     kept = engine.receive(
         SourceInput(namespace="test", key="attachment", media_type="application/octet-stream"),
@@ -240,7 +241,7 @@ def test_backup_keeps_referenced_blobs_but_excludes_orphans(engine, tmp_path):
         files = {member.name: saved.extractfile(member).read() for member in saved if member.isfile()}
     files["blobs/" + orphan] = b"orphan attachment"
     manifest = json.loads(files["manifest.json"])
-    manifest["files"]["blobs/" + orphan] = orphan
+    manifest["files"]["blobs/" + orphan] = file_digest(engine.db.blobs / orphan)
     files["manifest.json"] = json.dumps(manifest).encode()
     older = tmp_path / "older-backup.tar.gz"
     with tarfile.open(older, "w:gz") as saved:

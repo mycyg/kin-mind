@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, FiniteFloat, StrictInt, field_validator, model_validator
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope, now, utc
 from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
 from eventmem.core.self_knowledge import SelfKnowledge, metadata
@@ -100,17 +99,18 @@ class Motivation(Model):
     # A short-term drive, in minutes: ten for a passing impulse, twelve hours for a slow one.
     # Anything outside the range is refused by the schema, like every other bound here.
     half_life_minutes: StrictInt = Field(ge=10, le=720)
-    reason: str = Field(min_length=1)
+    reason: str = ""
 
 
 class AffectiveEvent(Model):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
-    evidence_ids: list[str] = Field(min_length=1, max_length=50)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    subjective: bool = False
     values: dict[str, StrictInt] = Field(default_factory=dict, max_length=len(DIMENSIONS))
     motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
-    reason: str = Field(min_length=1)
+    reason: str = ""
     origin: Literal["interaction", "exploration", "reflection"] = "interaction"
     evolution: Evolution | None = None
     understanding: Understanding | None = None
@@ -125,6 +125,8 @@ class AffectiveEvent(Model):
 
     @model_validator(mode="after")
     def separate_evolution(self):
+        if not self.evidence_ids and (not self.subjective or self.evolution):
+            raise ValueError("Observed state and evolution require source evidence")
         if set(self.motivations) - {"initiative", "curiosity"}:
             raise ValueError("Motivation applies to initiative and curiosity")
         if self.evolution and (self.values or self.motivations or self.understanding or self.rhythm):
@@ -207,7 +209,8 @@ class DesireChange(Model):
         "create", "update", "start", "wait", "resume", "complete", "abandon"
     ]
     desire_id: str | None = None
-    evidence_ids: list[str] = Field(min_length=1, max_length=50)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    subjective: bool = False
     content: str | None = Field(default=None, min_length=1)
     topic: str | None = Field(default=None)
     kind: Literal["contact", "explore", "create"] | None = None
@@ -217,8 +220,9 @@ class DesireChange(Model):
     concern_ids: list[str] | None = Field(default=None, max_length=10)
     exploration_target: Literal["knowledge", "computer"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
-    reason: str = Field(min_length=1)
-    wait_condition: Literal["time", "new_evidence", "owner_reply"] | None = None
+    activity_ref: dict | None = None
+    reason: str = ""
+    wait_condition: Literal["time", "new_evidence", "owner_reply", "review"] | None = None
     retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
 
     _time = field_validator("expires_at")(lambda v: utc(v) if v else v)
@@ -226,6 +230,8 @@ class DesireChange(Model):
 
     @model_validator(mode="after")
     def shape(self):
+        if not self.evidence_ids and not self.subjective:
+            raise ValueError("A sourced wish requires evidence; an independent wish must be subjective")
         if self.wait_condition is not None and self.action != "wait":
             raise ValueError("Only waiting desires have a resume condition")
         if self.action == "create":
@@ -233,6 +239,8 @@ class DesireChange(Model):
                 raise ValueError("Only exploration wishes have an exploration target")
             if self.exploration_id and self.kind != "contact":
                 raise ValueError("Only contact wishes link a communication decision")
+            if self.activity_ref and self.kind != "contact":
+                raise ValueError("Only contact wishes link an activity sharing decision")
             if self.desire_id or any(
                 getattr(self, k) is None
                 for k in (
@@ -254,8 +262,8 @@ class DesireChange(Model):
 
 class ContactDecision(Model):
     action: Literal["wait", "abandon"]
-    reason: str = Field(min_length=1)
-    condition: Literal["time", "new_evidence", "owner_reply"] = "new_evidence"
+    reason: str = ""
+    condition: Literal["time", "new_evidence", "owner_reply", "review"] = "review"
     retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
 
     _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
@@ -379,24 +387,20 @@ CONTACT_FREQUENCY_MAX_CHARS = 600
 class Mind(Continuity):
     def __init__(self, engine, scope: Scope, clock=now):
         self.engine, self.scope, self.clock = engine, scope, clock
-        # What the dedupe guard found while its two records of scored evidence disagreed. It is
-        # carried out of the write rather than written inside it, because such a disagreement is
-        # always a refusal and a refusal takes its own transaction, and the note, back with it.
-        self._guard_mismatches = []
         # The exact text the state was last read from. The history layer takes it as a hint about
-        # what the row before this one holds and proves it against that row's own hash before
-        # believing a word of it, so a stale one costs a rebuild and can never cost correctness.
+        # what the row before this one holds, matched by its database revision. A stale revision
+        # is reconstructed from the existing rows instead.
         self._loaded = None
         # The instant curves the state was last read with, apart from the document its caller then
         # changes in place: the next save re-anchors the slow layer of any curve it moved from these
         # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
         self._curves = {}
-        from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .archive_memory import SCHEMA as ARCHIVE_MEMORY_SCHEMA
+        from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
         from .evidence_keys import SCHEMA as EVIDENCE_KEY_SCHEMA
-        from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         from .evidence_refs import SCHEMA as EVIDENCE_REF_SCHEMA
+        from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
                              + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA
                              + EVIDENCE_REF_SCHEMA):
@@ -479,7 +483,6 @@ class Mind(Continuity):
             raise Conflict("Evidence is not current", code="evidence-not-current", target=rid)
         return {
             "source_id": sid,
-            "hash": row["hash"],
             "record_id": rid,
             "revision": record["revision"],
             "authority": data["authority"],
@@ -497,7 +500,7 @@ class Mind(Continuity):
                 current = self._reference(conn, ref["source_id"], ref["record_id"])
             except (Missing, Conflict):
                 return False
-            if current["hash"] != ref["hash"] or current["revision"] != ref["revision"]:
+            if current["revision"] != ref["revision"]:
                 return False
             newer = conn.execute(
                 "SELECT 1 FROM sources WHERE namespace=? AND source_key=? AND scope=? AND deleted=0 AND id<>? AND received_at>(SELECT received_at FROM sources WHERE id=?) LIMIT 1",
@@ -516,7 +519,7 @@ class Mind(Continuity):
     def _entry_fresh(self, conn, entry):
         if entry.get("interpretation_unverified"):
             return False
-        if not self._fresh(conn, entry["evidence"]):
+        if not self._subjective_available(conn, entry["evidence"]):
             return False
         if entry.get("claim_id"):
             sk = SelfKnowledge(self.engine, self.scope)
@@ -532,6 +535,15 @@ class Mind(Continuity):
                 ):
                     return False
         return True
+
+    def _subjective_available(self, conn, refs):
+        """Historical origins of an inner state need only exist in this scope, without deletion.
+
+        A revised source does not invalidate Kin's mood or rhythm. Actual facts and authorization
+        continue to use `_evidence` and `_fresh`, which retain their record revision checks.
+        """
+        return all(conn.execute("SELECT 1 FROM sources WHERE id=? AND scope=? AND deleted=0",
+                                (ref["source_id"], self.scope.key())).fetchone() for ref in refs)
 
     def initialize(self, *, agent_version, evidence_ids, command_id="initialize"):
         payload = {"agent_version": agent_version, "evidence_ids": evidence_ids}
@@ -568,7 +580,7 @@ class Mind(Continuity):
                 state = {
                     "revision": 1,
                     "profile": profile,
-                    "profile_version": digest(profile)[:16],
+                    "profile_version": event_id,
                     "dimensions": values,
                     "desires": {},
                     "traits": {},
@@ -604,32 +616,17 @@ class Mind(Continuity):
                 dumps(row_for(conn, self.scope.key(), state, kind, payload, loaded=self._loaded)),
             ),
         )
-        # The one place history is written is the one place the evidence key index hears about it,
-        # so no commit can leave the index behind the row that introduced a key.
-        from .evidence_keys import record as record_evidence_key
-        record_evidence_key(conn, self.scope.key(), state, kind, event_id)
 
     def _mutate(self, request, kind, fn, *, rebase=None):
         payload = request.model_dump() if hasattr(request, "model_dump") else request
-        try:
-            return self._transact(payload, kind, fn, rebase)
-        finally:
-            # Outside the transaction, so a refusal that rolled the write back still leaves the
-            # sign of what the guard disagreed with itself about.
-            from .evidence_keys import flush_mismatches
-            flush_mismatches(self.engine, self._guard_mismatches)
+        return self._transact(payload, kind, fn, rebase)
 
     def _transact(self, payload, kind, fn, rebase):
         with self.engine.db.connect(write=True) as conn:
-            from .autonomy_schema import optimized
-            # The expected revision is this command's precondition, checked inside run(); it
-            # is not what the command is. A retry that reread the state keeps its identity.
-            stamp = fingerprint("mind-state", self.scope.key(), payload,
-                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
-
             def run():
                 state = self._load(conn)
-                if state["revision"] != payload["expected_revision"] and not (rebase and rebase(conn, state)):
+                subjective = kind == "affect" and payload.get("subjective") is True
+                if state["revision"] != payload["expected_revision"] and not subjective and not (rebase and rebase(conn, state)):
                     raise Conflict(
                         "Mind revision changed; read current state before updating",
                         code="mind-revision-changed", target=self.scope.key(),
@@ -651,7 +648,7 @@ class Mind(Continuity):
                 return receipt
 
             return self.engine.command(
-                conn, self._key(payload["command_id"]), payload, run, stamp=stamp
+                conn, self._key(payload["command_id"]), payload, run
             )
 
     def _record_only(self, request, fn):
@@ -660,17 +657,13 @@ class Mind(Continuity):
         snapshot. `fn` reads a copy of the current state; whatever it changes there is dropped."""
         payload = request.model_dump() if hasattr(request, "model_dump") else request
         with self.engine.db.connect(write=True) as conn:
-            from .autonomy_schema import optimized
-            stamp = fingerprint("mind-state", self.scope.key(), payload,
-                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
-
             def run():
                 state = self._load(conn)
                 event_id = "mind_" + digest([self.scope.key(), payload["command_id"]])[:32]
                 result = fn(conn, deepcopy(state), event_id) or {}
                 return dict(event_id=event_id, revision=state["revision"], **result)
 
-            return self.engine.command(conn, self._key(payload["command_id"]), payload, run, stamp=stamp)
+            return self.engine.command(conn, self._key(payload["command_id"]), payload, run)
 
     def retire_session_advice(self):
         """CR-MIND-12: a judgment an older release kept in the versioned state moves to the registry
@@ -729,7 +722,7 @@ class Mind(Continuity):
                 "evidence": refs, "event_id": event_id, "agent_version": agent_version,
                 **({"interpretation_unverified": True} if not refs else {}),
             })
-        state["profile_version"] = digest([state["profile_version"], state["profile"]])[:16]
+        state["profile_version"] = event_id
         return missing
 
     def extend_dimensions(self, *, agent_version):
@@ -781,7 +774,7 @@ class Mind(Continuity):
                 "event_id": event_id,
                 "reason": request["reason"],
             }
-            state["profile_version"] = digest([state["profile"], state["autonomy"]])[:16]
+            state["profile_version"] = event_id
             self._retarget(conn, state, self.clock())
             return {"autonomy": state["autonomy"]}
         return self._mutate(request, "autonomy-policy", apply)
@@ -808,10 +801,7 @@ class Mind(Continuity):
                 "event_id": event_id, "reason": request["reason"],
                 "configured_at": self.clock(),
             }
-            state["profile_version"] = digest([
-                state["profile"], state.get("autonomy"), state.get("behavior"),
-                state["contact_preference"],
-            ])[:16]
+            state["profile_version"] = event_id
             return {"contact_preference": state["contact_preference"]}
 
         return self._mutate(request, "contact-preference", apply)
@@ -858,7 +848,7 @@ class Mind(Continuity):
             return {"state": "unconfigured"}
         with self.engine.db.connect(write=True) as conn:
             state = self._load(conn)
-            version = lambda refs: sorted([r["source_id"], r["record_id"], r["hash"], r["revision"]] for r in refs)
+            version = lambda refs: sorted([r["source_id"], r["record_id"], r["revision"]] for r in refs)
             try:
                 named = sorted(set(evidence_ids))
                 current = state.get("contact_frequency")
@@ -972,7 +962,7 @@ class Mind(Continuity):
                 state["profile"]["dimensions"]["flirtation"][key] = DIMENSIONS["flirtation"][key]
             if start is not None:
                 state["profile"]["contact"]["quiet_start"] = start
-            state["profile_version"] = digest([state["profile"], state.get("autonomy"), state["behavior"]])[:16]
+            state["profile_version"] = event_id
             return {"behavior": state["behavior"]}
 
         return self._mutate(request, "behavior-policy", apply)
@@ -1004,12 +994,13 @@ class Mind(Continuity):
             from .plans import AutonomousPlans
             if not AutonomousPlans(self).linked_ready(conn, desire, current):
                 return False
-        if state is None and (desire.get("exploration_id") or desire.get("concern_revisions")):
+        if state is None and (desire.get("exploration_id") or desire.get("activity_ref") or desire.get("concern_revisions")):
             state = self._load(conn)
-        if desire.get("exploration_id"):
-            from .exploration_decisions import require_share
+        if desire.get("activity_ref") or desire.get("exploration_id"):
+            from .exploration_decisions import require_activity_share, require_share
             try:
-                decision = require_share(self, conn, state, desire["exploration_id"])
+                decision = (require_activity_share(self, conn, state, desire["activity_ref"]) if desire.get("activity_ref")
+                            else require_share(self, conn, state, desire["exploration_id"]))
                 if desire.get("sharing_revision") != decision["revision"]:
                     return False
             except Conflict:
@@ -1062,11 +1053,6 @@ class Mind(Continuity):
                           "checks": attempt.get("reconcile_checks", 0),
                           "next_check_at": attempt.get("next_check_at") or at})
         return facts
-
-    def _repeats_unconfirmed(self, conn, text):
-        wanted = digest(" ".join(str(text).split()))
-        return any(json.loads(row[0]).get("text_digest") == wanted for row in conn.execute(
-            "SELECT data FROM mind_contacts WHERE scope=? AND state='unconfirmed'", (self.scope.key(),)))
 
     def _initiative_value(self, conn, state, at):
         entry = state["dimensions"]["initiative"]
@@ -1148,17 +1134,6 @@ class Mind(Continuity):
         unknown = set(request.values) - set(state["dimensions"])
         if unknown:
             raise ValueError("Unknown affective dimension")
-        # A single underlying event cannot be scored again under another command. What has been
-        # scored is kept in its own table now, because the snapshots this used to scan are about to
-        # become patches; until that is finished the old scan still answers beside it, and either
-        # one saying yes is enough to refuse.
-        from .evidence_keys import already_scored
-        evidence_key = digest(sorted({(r["source_id"], r["hash"]) for r in refs}))
-        if already_scored(conn, self.scope.key(), evidence_key, at=self.clock(),
-                          deferred=self._guard_mismatches):
-            raise Conflict(
-                "This evidence was already appraised; use a source correction or new evidence"
-            )
         previous_values = {key: project(entry, self.clock()) for key, entry in state["dimensions"].items()}
         if continuity_sources is None and (request.understanding or request.rhythm):
             continuity_sources = self._continuity_sources(conn, state, refs)
@@ -1173,7 +1148,7 @@ class Mind(Continuity):
                 "target": spec["baseline"],
                 "half_life_hours": spec["half_life_hours"],
                 "at": self.clock(),
-                "basis": "event_inferred",
+                "basis": "subjective" if request.subjective else "event_inferred",
                 "evidence": refs,
                 "reason": request.reason,
                 "event_id": event_id,
@@ -1202,7 +1177,7 @@ class Mind(Continuity):
                     )
         # 余韵: a change this large against what was projected a moment ago is felt for a while after.
         note_echo(state, previous_values, self.clock())
-        state["last_evidence_key"] = evidence_key
+        state.pop("last_evidence_key", None)
         self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
         self._retarget(conn, state, self.clock())
 
@@ -1231,19 +1206,20 @@ class Mind(Continuity):
         )
 
     def _apply_desire(self, conn, state, request, event_id):
-        from .desire_archive import intent as archived_intent
         refs = self._evidence(conn, request.evidence_ids)
-        if request.exploration_id:
-            from .exploration_decisions import require_share
-            decision = require_share(self, conn, state, request.exploration_id)
-            # Whatever their status, including the finished ones that have moved: one sharing
-            # decision has one contact intent, and an intent that left the document did not stop
-            # being the intent this decision already has.
-            if request.action == "create" and (any(d.get("exploration_id") == request.exploration_id
-                                                   and d.get("sharing_revision") == decision["revision"]
-                                                   for d in state["desires"].values())
-                                               or archived_intent(conn, self.scope.key(),
-                                                                  request.exploration_id, decision["revision"])):
+        activity = request.activity_ref
+        if activity:
+            from .activities import validate_activity_ref
+            activity = validate_activity_ref(self, activity, conn=conn)
+            if request.exploration_id and (activity["kind"] != "exploration" or activity["id"] != request.exploration_id):
+                raise Conflict("Activity and exploration references name different content")
+        elif request.exploration_id:
+            from .activities import canonical_activity_ref
+            activity = canonical_activity_ref(self, "exploration", request.exploration_id, conn=conn)
+        if activity:
+            from .exploration_decisions import require_activity_share
+            decision = require_activity_share(self, conn, state, activity)
+            if request.action == "create" and self._activity_intent(conn, state, activity, decision["revision"]):
                 raise Conflict("This sharing decision already has a contact intent")
         link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
         at = self.clock()
@@ -1274,7 +1250,8 @@ class Mind(Continuity):
                     )
                 },
                 exploration_target=request.exploration_target or "knowledge",
-                exploration_id=request.exploration_id,
+                exploration_id=activity["id"] if activity and activity["kind"] == "exploration" else request.exploration_id,
+                activity_ref=activity,
             )
         else:
             did = request.desire_id
@@ -1295,14 +1272,16 @@ class Mind(Continuity):
                 raise Conflict("Only exploration wishes have an exploration target")
             if request.exploration_id and desire["kind"] != "contact":
                 raise Conflict("Only contact wishes link a communication decision")
-            if desire.get("exploration_id") and request.action in {"start", "resume", "update"}:
-                from .exploration_decisions import require_share
-                linked_result = request.exploration_id or desire["exploration_id"]
-                decision = require_share(self, conn, state, linked_result)
-                if (any(d["id"] != did and d.get("exploration_id") == linked_result
-                        and d.get("sharing_revision") == decision["revision"] for d in state["desires"].values())
-                        or archived_intent(conn, self.scope.key(), linked_result,
-                                           decision["revision"], exclude=did)):
+            linked_activity = activity or desire.get("activity_ref")
+            if not linked_activity and desire.get("exploration_id"):
+                from .activities import canonical_activity_ref
+                linked_activity = canonical_activity_ref(self, "exploration", desire["exploration_id"], conn=conn)
+            if linked_activity and desire["kind"] != "contact":
+                raise Conflict("Only contact wishes link an activity sharing decision")
+            if linked_activity and request.action in {"start", "resume", "update"}:
+                from .exploration_decisions import require_activity_share
+                activity_decision = require_activity_share(self, conn, state, linked_activity)
+                if self._activity_intent(conn, state, linked_activity, activity_decision["revision"], exclude=did):
                     raise Conflict("This sharing decision already has another contact intent")
             if desire["status"] in {"completed", "abandoned"}:
                 raise Conflict(
@@ -1325,14 +1304,23 @@ class Mind(Continuity):
             if request.action == "wait":
                 desire["contact_wait"] = self._wait_details(
                     ContactDecision(action="wait", reason=request.reason,
-                                    condition=request.wait_condition or "new_evidence",
+                                    condition=request.wait_condition or "review",
                                     retry_after_seconds=request.retry_after_seconds), at)
             if request.action == "update":
                 for k in ("content", "topic", "strength", "expires_at", "completion", "exploration_target", "exploration_id"):
                     if getattr(request, k) is not None:
                         desire[k] = getattr(request, k)
+                if activity:
+                    desire["activity_ref"] = activity
+                    if activity["kind"] == "exploration":
+                        desire["exploration_id"] = activity["id"]
             desire["revision"] += 1
         desire = state["desires"][did]
+        if desire.get("activity_ref"):
+            desire["source_ids"] = [desire["activity_ref"]["source_id"]]
+        if desire.get("activity_ref") and request.action in {"create", "start", "resume", "update"}:
+            from .exploration_decisions import require_activity_share
+            desire["sharing_revision"] = require_activity_share(self, conn, state, desire["activity_ref"])["revision"]
         if desire.get("exploration_id") and request.action in {"create", "start", "resume", "update"}:
             # The decision this wish now rests on is in the document, brought back if it had moved.
             from .exploration_decision_archive import revive
@@ -1361,9 +1349,22 @@ class Mind(Continuity):
             updated_at=at,
             event_id=event_id,
             agent_version=request.agent_version,
+            basis="subjective" if request.subjective else "inferred",
         )
         self._retarget(conn, state, at)
         return {"desire_id": did, "desire_revision": desire["revision"]}
+
+    def _activity_intent(self, conn, state, activity, revision, *, exclude=None):
+        def matches(desire):
+            linked = desire.get("activity_ref") or {"kind": "exploration", "id": desire.get("exploration_id")}
+            return (desire.get("id") != exclude and linked.get("kind") == activity["kind"]
+                    and linked.get("id") == activity["id"] and desire.get("sharing_revision") == revision)
+        if any(matches(d) for d in state["desires"].values()):
+            return True
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_desire_archive'").fetchone():
+            return any(matches(json.loads(row[0])) for row in conn.execute(
+                "SELECT data FROM mind_desire_archive WHERE scope=? AND status IN ('completed','abandoned')", (self.scope.key(),)))
+        return False
 
     def _evolve(self, conn, state, request, refs, event_id):
         from .autonomy_schema import optimized
@@ -1392,7 +1393,7 @@ class Mind(Continuity):
             interactions = owner_episodes(self, conn, refs)
         else:
             interactions = {
-                r["hash"]
+                r["source_id"]
                 for r in refs
                 if r["authority"] == "explicit"
                 and r["metadata"].get("role") == "user"
@@ -1409,7 +1410,8 @@ class Mind(Continuity):
         if chain:
             # What decides how Kin behaves, not the version string that moves for every unrelated
             # edit. An entry written before the stamp existed carries none and is not compatible.
-            from .compat import holds, stamp as compat_stamp
+            from .compat import holds
+            from .compat import stamp as compat_stamp
             current = compat_stamp(self, conn, state)
             def compatible(row):
                 return holds(metadata(row).get("compat"), current)
@@ -1490,7 +1492,7 @@ class Mind(Continuity):
             )
             state["profile_reviews"][key] = proof
         state["last_evolution_day"] = day
-        state["profile_version"] = digest([state["profile"], state["traits"]])[:16]
+        state["profile_version"] = event_id
         self._retarget(conn, state, self.clock())
         return {
             "previous_profile": before,
@@ -1523,7 +1525,7 @@ class Mind(Continuity):
                 "A later personality revision exists; review it before reverting"
             )
         # What the profile was before that evolution, read through the history layer: the row
-        # before it rather than the revision before it, and verified against its own hash. A
+        # before it rather than the revision before it, reconstructed from database parents. A
         # reversion that cannot show the state it is restoring restores nothing — the layer
         # raises `history-rebuild-failed` here and the whole commit goes back.
         from .history import before
@@ -1560,9 +1562,7 @@ class Mind(Continuity):
         validate_trait_changes(load_persona(self.engine, self.scope), previous["traits"])
         state["profile"], state["traits"] = previous["profile"], previous["traits"]
         state["profile_reviews"] = previous.get("profile_reviews", {})
-        state["profile_version"] = digest(
-            [state["profile"], state["traits"], event_id]
-        )[:16]
+        state["profile_version"] = event_id
         self._retarget(conn, state, self.clock())
         return {
             "reverted_event_id": request.evolution.revert_event_id,
@@ -1574,6 +1574,21 @@ class Mind(Continuity):
         for desire in state["desires"].values():
             d = deepcopy(desire)
             d["needs_review"] = not self._fresh(conn, d["evidence"])
+            if d.get("activity_ref"):
+                from .activities import validate_activity_ref
+                try:
+                    validate_activity_ref(self, d["activity_ref"], conn=conn)
+                except (Missing, Conflict):
+                    d["needs_review"] = True
+            if d["kind"] == "contact" and d["status"] in {"wanted", "waiting", "in_progress"} and (d.get("activity_ref") or d.get("exploration_id")):
+                from .exploration_decisions import require_activity_share, require_share
+                try:
+                    sharing = (require_activity_share(self, conn, state, d["activity_ref"]) if d.get("activity_ref")
+                               else require_share(self, conn, state, d["exploration_id"]))
+                    d["sharing_needs_review"] = d.get("sharing_revision") != sharing["revision"]
+                except (Missing, Conflict):
+                    d["sharing_needs_review"] = True
+                d["needs_review"] = d["needs_review"] or d["sharing_needs_review"]
             d["expired"] = timestamp(d["expires_at"]) <= timestamp(at)
             if host_wait(d.get("contact_wait")):
                 # The host's backoff is shown as the host's, a wait written before it said so too.
@@ -1708,6 +1723,8 @@ class Mind(Continuity):
             # One snapshot per read: the block above neither writes nor mutates it.
             from .exploration_decisions import decision_view
             result["exploration_decisions"] = decision_view(self, conn, state)
+            from .exploration_decisions import activity_decision_view
+            result["activity_decisions"] = activity_decision_view(self, conn, state)
             behavior = state.get("behavior", {})
             if behavior and self._fresh(conn, behavior["evidence"]):
                 result["interaction_style"] = interaction_style(result["dimensions"], behavior)
@@ -1897,7 +1914,7 @@ class Mind(Continuity):
             )
             return attempt
 
-    def check_contact(self, attempt_id, owner_epoch, desire_ids=None, text=None):
+    def check_contact(self, attempt_id, owner_epoch, desire_ids=None, text=None, include_pending=False):
         with self.engine.db.connect() as conn:
             attempt = self._attempt(conn, attempt_id)
             state = self._load(conn)
@@ -1905,15 +1922,13 @@ class Mind(Continuity):
             chosen = list(dict.fromkeys(desire_ids)) if desire_ids else offered
             if set(chosen) - set(offered):
                 return {"eligible": False, "reason": "desire-not-offered", "attempt": attempt}
-            if text is not None and self._repeats_unconfirmed(conn, text):
-                return {"eligible": False, "reason": "repeats-unconfirmed-send", "attempt": attempt}
             view = self._view(conn, state, self.clock())
             value = view["dimensions"]["initiative"]
             from .autonomy_schema import legacy_thresholds
             legacy = legacy_thresholds(conn, self.scope.key())
             current = [state["desires"].get(i) for i in chosen]
             valid = (
-                attempt["state"] == "drafting"
+                (attempt["state"] == "drafting" or include_pending and attempt["state"] == "pending")
                 and not (view.get("action_policy") or {}).get("needs_review")
                 and not view["contact"].get("preference", {}).get("needs_review")
                 and attempt["owner_epoch"] == owner_epoch
@@ -1986,8 +2001,8 @@ class Mind(Continuity):
 
     def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False, desire_ids=None, text=None, shown_ids=None, draft_receipt=None):
         """`desire_ids`: the wishes Kin's draft acts on, among those the attempt offered her; unnamed
-        means all of them. `text`: the text about to be sent, kept as a digest and an excerpt so a
-        send of unknown outcome can be recognised and never said again under another id.
+        means all of them. `text`: a short excerpt for discussing an uncertain send. Its existing
+        attempt and delivery IDs, rather than its wording, own reconciliation.
 
         `shown_ids` and `draft_receipt`, from the host once a draft is back: the ids the memory
         context and the state it was handed name, and the host's record of its fork turn -- what its
@@ -2046,7 +2061,7 @@ class Mind(Continuity):
             if state == "pending":
                 attempt["chosen"] = list(dict.fromkeys(desire_ids or offered))
                 if text is not None:
-                    attempt["text_digest"] = digest(" ".join(str(text).split()))
+                    attempt.pop("text_digest", None)
                     attempt["text_excerpt"] = str(text).strip()[:160]
             attempt.update(state=state, updated_at=self.clock(), reason=reason)
             if state == "unconfirmed":

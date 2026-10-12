@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import contextvars
 import json
 import os
 import time
@@ -9,7 +8,6 @@ from contextlib import contextmanager
 
 import httpx
 
-from .db import digest, dumps, tombstoned
 from .models import ModelRole
 
 
@@ -31,51 +29,18 @@ class ParseError(ValueError):
     """A reply came back and is not one JSON object. Only this is asked again in place."""
 
 
-# The job this thread is preparing, and the model answers it has paid for on the way, by the
-# digest of the exact request. A run that cannot commit hands them to the run that took the job
-# over, through the store (CR-MEM-09).
-_JOB = contextvars.ContextVar("eventmem_job_answers", default=None)
+# Compatibility for retired content-hash job answer reuse. Old rows are only purged.
 KEPT_PREFIX = "job-answer:"
-
-
-def _kept_id(job_id, request):
-    return f"{KEPT_PREFIX}{job_id}:{request[:40]}"
 
 
 @contextmanager
 def job_answers(job):
-    """Around one job's preparation: the model answers it pays for are collected, and a request
-    this job already paid for under a run that could not commit is answered from the store."""
-    answers = []
-    token = _JOB.set({"job": job["id"], "answers": answers})
-    try:
-        yield answers
-    finally:
-        _JOB.reset(token)
+    """A failed commit retains its cost receipt, without a second cache of model output."""
+    yield []
 
 
 def keep_answers(conn, job, answers):
-    """A run whose job was taken over leaves what it paid for with the job, in the stored
-    command results. Beside the answer, the job's payload: the identifiers in it are what an
-    erase finds such a row by. Returns how many answers were kept.
-
-    Only for a job that can still use them, checked inside the caller's transaction (CR2-MEM-01):
-    it is still to run or running, its payload is the one this run was given, and nothing that
-    payload names has been deleted. A delete cancels the job and blanks its payload after taking
-    the stored results that named what it erased; a late answer kept after that would put the
-    erased words back. The cost of the call is already recorded; that is all such a call leaves."""
-    if not answers:
-        return 0
-    row = conn.execute("SELECT state,payload FROM jobs WHERE id=?", (job["id"],)).fetchone()
-    if row is None or row["state"] not in ("pending", "retry", "running") or row["payload"] != job.get("payload"):
-        return 0
-    if tombstoned(conn, row["payload"]):
-        return 0
-    for request, answer in answers:
-        conn.execute("INSERT OR REPLACE INTO commands VALUES(?,?,?)",
-                     (_kept_id(job["id"], request), request,
-                      dumps({"job": job["id"], "kind": job["kind"], "payload": job.get("payload"), "answer": answer})))
-    return len(answers)
+    return 0
 
 
 def drop_answers(conn, job_id):
@@ -175,18 +140,6 @@ class Providers:
 
         from kin_mind.attempts import cost_entry, token_counts
         from kin_mind.model_runtime import model_slot
-        job = _JOB.get()
-        request = (digest([role, route, config.endpoint, config.model, json_])
-                   if job is not None and json_ is not None and files is None and data is None else None)
-        if request:
-            with self.engine.db.connect() as conn:
-                kept = conn.execute("SELECT result FROM commands WHERE id=? AND digest=?",
-                                    (_kept_id(job["job"], request), request)).fetchone()
-            if kept:
-                # Checked again before it is used: the same job, and the very same request, so an
-                # input that changed since is asked afresh. Nothing is paid, nothing is billed twice.
-                self.engine.db.metric("model_answer_reused", 1, {"role": role, "model": config.model})
-                return json.loads(kept[0])["answer"]
         with self.engine.db.connect() as conn:
             has_shared_slots = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_model_leases'").fetchone())
         start = time.perf_counter()
@@ -226,8 +179,6 @@ class Providers:
                         f"Model role {role} returned HTTP {response.status_code}"
                     )
                 result = response.json()
-                if request:
-                    job["answers"].append((request, result))
                 break
             except httpx.TimeoutException:
                 unknown_usage("timeout")

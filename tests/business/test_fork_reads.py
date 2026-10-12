@@ -125,7 +125,7 @@ def test_a_wait_kin_decided_loses_its_reason_on_the_wish_once_what_her_draft_was
 def test_a_sent_draft_stays_her_message_and_only_its_row_loses_the_words(setup):
     """The draft read a note with its tool and was sent: the text is Kin's message to her, which
     the conversation keeps. The note is deleted afterwards. The message is not deleted after the
-    fact; the attempt row's copy of the text goes, its digest stays, and no other layer of the mind
+    fact; the attempt row's copy of the text goes, its receipt identity stays, and no other layer of the mind
     holds the words (CL6D-MM-01)."""
     mind, source, clock = setup
     read_source, read_record = read_note(mind, clock, "sent-read", f"那家店叫 {MARKER}")
@@ -143,7 +143,8 @@ def test_a_sent_draft_stays_her_message_and_only_its_row_loses_the_words(setup):
     mind.engine.delete(read_source)
     settle(mind.engine)
     state, row = contact_row(mind, attempt["id"])
-    assert state == "accepted" and row["text_excerpt"] == ERASED and row["text_digest"]
+    assert state == "accepted" and row["text_excerpt"] == ERASED and row["message_id"] == "om-1"
+    assert "text_digest" not in row
     assert MARKER in mind.engine.get(mind.engine.source(sent)["record_ids"][0])["content"], "her message stays"
     found = texts_everywhere(mind.engine, MARKER)
     assert found and not {table for table, _ in found if table.startswith("mind_")}, found
@@ -152,8 +153,8 @@ def test_a_sent_draft_stays_her_message_and_only_its_row_loses_the_words(setup):
 def test_a_send_of_unknown_outcome_loses_its_excerpt_in_every_copy(setup):
     """A send of unknown outcome is told to the next draft and shown in the state by an excerpt,
     which names what its draft had before it beside every copy. Once that is deleted the excerpt
-    goes from its own row, from the next attempt's copy and from the state; its digest still
-    recognises the same words (CL6D-MM-01)."""
+    goes from its own row, from the next attempt's copy and from the state. The original attempt
+    is still reconciled by its ID; another wish is not judged by a body hash (CL6D-MM-01)."""
     mind, source, clock = setup
     shown_source, shown_record = read_note(mind, clock, "unknown-shown", f"她养的猫叫 {MARKER}")
     wish(mind, source, "unknown-wish", content="Ask about the cat")
@@ -174,7 +175,10 @@ def test_a_send_of_unknown_outcome_loses_its_excerpt_in_every_copy(setup):
     assert contact_row(mind, second["id"])[1]["unconfirmed"][0]["excerpt"] == ERASED
     assert mind.read()["contact_unconfirmed"][0]["excerpt"] == ERASED
     assert texts_everywhere(mind.engine, MARKER) == set()
-    assert mind.check_contact(second["id"], "owner-1", text=said)["reason"] == "repeats-unconfirmed-send"
+    assert mind.check_contact(second["id"], "owner-1", text=said)["reason"] == "ready"
+    state, original = contact_row(mind, first["id"])
+    assert state == "unconfirmed" and original["id"] == first["id"] and original["text_excerpt"] == ERASED
+    assert "text_digest" not in original
 
 
 def test_a_draft_whose_reads_were_cut_short_counts_any_delete_since_its_claim(setup):
@@ -439,11 +443,11 @@ def test_a_daily_review_whose_reads_were_cut_short_keeps_no_reason_and_no_change
     assert texts_everywhere(mind.engine, MARKER) == set()
 
 
-def test_a_compression_whose_reads_were_cut_short_is_used_and_not_kept(system):
+def test_a_compression_is_used_without_a_content_hash_cache_even_with_full_reads(system):
     """An appraisal's evidence compressed in the fork, whose receipt is cut short: no later delete
     could be sure to find a cached copy, so it is used by the appraisal that asked for it -- whose
-    commit counts every delete since it began -- and not kept. A full receipt is kept
-    (CL6D-MM-01)."""
+    commit counts every delete since it began -- and not kept. A full receipt also uses the result
+    directly without creating a content hash cache (CL6D-MM-01)."""
     mind, memory, source, clock = system
     engine = mind.engine
     filler = "They checked the harbour path, the tide table and the lamps along the pier. " * 12
@@ -471,4 +475,5 @@ def test_a_compression_whose_reads_were_cut_short_is_used_and_not_kept(system):
     assert cut["state"] == "compressed" and "They walked the harbour." in cut["text"]
     assert cached() == 0
     full = compress("full", False)
-    assert full["state"] == "compressed" and cached() > 0
+    assert full["state"] == "compressed" and "They walked the harbour." in full["text"]
+    assert cached() == 0

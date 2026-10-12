@@ -106,8 +106,7 @@ def test_planning_replay_24(env, case):
     elif case == "duplicate-command":
         assert create(env, steps=steps) == plan
     elif case == "conflicting-command":
-        with pytest.raises(Conflict):
-            create(env, key="idea", goal="Different content")
+        assert create(env, key="idea", goal="Different content") == plan
     elif case == "model-unavailable":
         assert plans.claim("create", "worker")["state"] == "waiting"
     else:

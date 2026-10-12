@@ -185,20 +185,17 @@ def seal_letter(mind, text, unlock_at, command_id):
     if not first <= day <= last:
         raise ValueError("A letter opens on a day from tomorrow to a year from today")
     entry = "seal_" + digest([mind.scope.key(), "letter", command_id])[:32]
-    fingerprint = digest(["letter", text, day.isoformat()])
     with mind.engine.db.connect(write=True) as conn:
         if not enabled(conn, mind.scope.key()):
             raise Conflict("Sealed entries are switched off", code="sealed-entries-off")
         _ensure(conn)
         row = conn.execute(f"SELECT * FROM {TABLE} WHERE id=?", (entry,)).fetchone()
         if row:
-            if json.loads(row["data"]).get("fingerprint", fingerprint) != fingerprint:
-                raise Conflict("Idempotency key reused with different content", code="payload-changed", target=entry)
             return view(row)
         sid = source_id(LETTER_NAMESPACE, entry, mind.scope)
         conn.execute(f"INSERT INTO {TABLE} VALUES(?,?,?,?,?,?,?,?,?,?)",
                      (entry, mind.scope.key(), "letter", "sealed", day.isoformat(), at, None, sid,
-                      dumps(sorted({sid, root_id(sid)})), dumps({"packed": _pack({"text": text}), "fingerprint": fingerprint})))
+                      dumps(sorted({sid, root_id(sid)})), dumps({"packed": _pack({"text": text})})))
         return view(conn.execute(f"SELECT * FROM {TABLE} WHERE id=?", (entry,)).fetchone())
 
 

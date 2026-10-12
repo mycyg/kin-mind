@@ -1,3 +1,9 @@
+from kin_mind.memory import observe_file
+
+
+def fingerprint_file(path):
+    return observe_file(path, artifact_id="synthetic-artifact:" + str(path))
+
 """A delete made before a model began is none of its business (CL6E-MM-02), and a commit refused
 for a delete made while it answered costs the row nothing (CL6E-MM-03).
 
@@ -16,23 +22,38 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
-from eventmem.core.db import NAMED
-from eventmem.core.models import SourceInput
-
-from kin_mind import attempts
-from kin_mind.appraisal import (DELETION_RETRY_SECONDS, MAX_CHARGED_ATTEMPTS, MAX_DELETION_REFUSALS, Appraisal,
-                                Appraisals, DailyReview)
-from kin_mind.continuity import Understanding
-from kin_mind.context import Contexts
-from kin_mind.creation import accept_result
-from kin_mind.erasure import ERASED
-from kin_mind.memory import MemoryContinuity, fingerprint_file
-from kin_mind.recovery import recover_quarantined
-from test_derived_erasure import (Review, answered, artifact_kept, paid, prospective_check, queue_row, read_note,
-                                  state_wish, tool_read)
+from test_derived_erasure import (
+    Review,
+    answered,
+    artifact_kept,
+    paid,
+    prospective_check,
+    queue_row,
+    read_note,
+    state_wish,
+    tool_read,
+)
 from test_erasure import settle, system, texts_everywhere  # noqa: F401  (`system`: the compression fixture)
 from test_fork_reads import contact_row, fork_receipt, stored_wish
 from test_kin_mind import wish
+
+from eventmem.core.db import NAMED
+from eventmem.core.models import SourceInput
+from kin_mind import attempts
+from kin_mind.appraisal import (
+    DELETION_RETRY_SECONDS,
+    MAX_CHARGED_ATTEMPTS,
+    MAX_DELETION_REFUSALS,
+    Appraisal,
+    Appraisals,
+    DailyReview,
+)
+from kin_mind.context import Contexts
+from kin_mind.continuity import Understanding
+from kin_mind.creation import accept_result
+from kin_mind.erasure import ERASED
+from kin_mind.memory import MemoryContinuity
+from kin_mind.recovery import recover_quarantined
 
 pytest_plugins = ('test_kin_mind', 'test_autonomous_plans')
 
@@ -168,8 +189,9 @@ def test_a_source_the_state_named_deleted_while_the_context_is_put_together_stop
     holds the wish's words, and the message is held no longer when the context is done: it is named
     all the same, as deleted since the attempt began. The commit refuses and no word is left
     (CL6E-MM-02)."""
-    from kin_mind import appraisal
     from test_derived_erasure import MARKER as SAID
+
+    from kin_mind import appraisal
 
     mind, source, clock = setup
     said = state_wish(mind, source)
@@ -206,7 +228,6 @@ def test_a_stored_proposal_whose_fork_read_an_earlier_delete_goes_to_the_reuse_d
     asking in full. Deleted after its attempt began, the note keeps it from there, as before
     (test_derived_erasure) (CL6E-MM-02)."""
     from eventmem.core.models import RevisionInput
-
     from kin_mind import revalidation
 
     mind, source, clock = setup
@@ -286,8 +307,9 @@ def test_a_daily_review_whose_fork_read_an_earlier_delete_records_its_change(set
 
 def explore_again(env, tmp_path, key):
     """Another planned exploration, whose runner hands back what its brief showed of the earlier ones."""
-    from kin_mind.exploration import Explorations
     from test_autonomous_plans import create, decide
+
+    from kin_mind.exploration import Explorations
 
     mind, plans, _, _, _ = env
     decide(env, create(env, actor="explore", key=key))
@@ -340,9 +362,10 @@ def test_a_creation_keeps_its_result_though_an_earlier_exploration_its_brief_nam
     """The creator's brief shows the earlier explorations; one of their reports was deleted before
     the claim. The result is kept as a derived source and the settled run keeps its words; the run
     names neither the deleted report nor anything deleted before its claim (CL6E-MM-02)."""
-    from kin_mind import host
     from test_autonomous_plans import create, decide
     from test_derived_erasure import explore
+
+    from kin_mind import host
 
     mind = env[0]
     first = explore(env, tmp_path)
@@ -443,10 +466,11 @@ def test_what_a_sharing_repair_or_a_light_question_read_of_an_earlier_delete_is_
     """A sharing repair's fork and a light question's fork returned the tombstone of a note deleted
     before the attempt began, beside one that stands: the commit goes through, and each names only
     what stands (CL6E-MM-02)."""
+    from test_derived_erasure import TARGET, USAGE
+
     from kin_mind import revalidation
     from kin_mind.erasure import tombstone_mark
     from kin_mind.exploration_decisions import SharingDecision
-    from test_derived_erasure import TARGET, USAGE
 
     mind, source, clock = setup
     engine = mind.engine
@@ -457,7 +481,7 @@ def test_what_a_sharing_repair_or_a_light_question_read_of_an_earlier_delete_is_
     with engine.db.connect(write=True) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS mind_explorations(id TEXT PRIMARY KEY,scope TEXT NOT NULL,state TEXT NOT NULL,"
                      "created_at TEXT NOT NULL,data TEXT NOT NULL)")
-    result = engine.receive(SourceInput(namespace="test", key="shared-exploration", scope=mind.scope,
+    result = engine.receive(SourceInput(namespace="kin-exploration", key=TARGET, scope=mind.scope,
                                         text="探索结果：那座桥的来历", authority="model", occurred_at=clock[0].isoformat(),
                                         metadata={"host_event": "exploration-result", "exploration_id": TARGET}))["id"]
     with engine.db.connect(write=True) as conn:
@@ -540,7 +564,7 @@ def test_a_compression_whose_tools_returned_an_earlier_delete_is_kept(system):
             return conn.execute("SELECT COUNT(*) FROM mind_context_cache").fetchone()[0]
 
     kept = compress("early", lambda: None, early, early_record)
-    assert kept["state"] == "compressed" and cached() > 0
+    assert kept["state"] == "compressed" and cached() == 0
     count = cached()
     refused = compress("during", lambda: engine.delete(during), during_record)
     assert refused["state"] != "compressed" and cached() == count

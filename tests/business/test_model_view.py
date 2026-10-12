@@ -37,7 +37,7 @@ PAGE = "src_" + "c" * 32
 
 def full_ref(**extra):
     """A reference as `Mind._reference` writes one, with a copy of its source's metadata."""
-    return {"source_id": SID, "record_id": RID, "hash": "h" * 64, "revision": 2, "namespace": "kin-exploration",
+    return {"source_id": SID, "record_id": RID, "revision": 2, "namespace": "kin-exploration",
             "source_key": "explore_x", "occurred_at": "2026-09-01T00:00:00+00:00", "authority": "model",
             "session": "session-x", "received_at": "2026-09-01T00:00:01+00:00",
             "metadata": {"host_event": "exploration-result", "exploration_id": "explore_x", "observation_ids": [PAGE],
@@ -59,7 +59,7 @@ def config_for(mind):
 
 def traced(ref):
     """A reference shown as its trace: its ids and versions, nothing it drops."""
-    return {"source_id", "record_id", "hash", "revision"} <= set(ref) and not set(ref) & set(DROPPED)
+    return {"source_id", "record_id", "revision"} <= set(ref) and not set(ref) & set(DROPPED)
 
 
 def clean(value):
@@ -80,6 +80,17 @@ def test_a_reference_is_shown_as_its_trace_full_or_slim_alike():
     shown = for_model(nested)
     assert shown["plans"][0]["steps"][0]["decision"]["evidence"] == [slim] and shown["targets"] == (slim,)
     assert leaks(nested) and not leaks(shown)
+
+
+def test_reference_ids_are_recognized_without_hash_and_legacy_hash_is_only_removed():
+    current = full_ref()
+    legacy = {**current, 'hash': 'legacy-unused-field'}
+    assert evidence_refs.is_ref(current) and evidence_refs.is_ref(legacy)
+    assert 'hash' not in current
+    assert for_model(current) == for_model(legacy) == evidence_refs.trace(current)
+    assert leaks(current) and leaks(legacy), 'both reference formats expose index-only metadata before projection'
+    shown = for_model(dumps({'evidence': [legacy]}))
+    assert not leaks(shown) and MARKER not in shown and 'legacy-unused-field' not in shown
 
 
 def test_a_source_is_shown_with_the_facts_a_prompt_reads_under_their_own_names():
@@ -110,7 +121,7 @@ def test_json_carried_as_text_is_shown_the_same_way_and_any_other_text_exactly_a
     assert leaks(lines) and not leaks(shown) and MARKER not in shown
     assert shown.split("\n")[0] == "记忆资料：" and shown.split("\n")[2:] == lines.split("\n")[2:]
     # A text that names nothing taken out is never parsed, and never changed.
-    for text in ('{"id": "c3",  "revision": 1}', dumps({"source_id": SID, "record_id": RID, "hash": "h"}),
+    for text in ('{"id": "c3",  "revision": 1}', dumps({"source_id": SID, "record_id": RID}),
                  "[" * 30000, '{"metadata": ', ""):
         assert for_model(text) is text or for_model(text) == text
     # A JSON text holding a reference that has nothing to drop is left byte for byte.
@@ -279,15 +290,16 @@ def test_the_explorations_the_state_read_and_an_ingest_hand_the_host_are_shown_a
         assert run["evaluated_sources"][0]["source_id"] == result and run["shown_sources"][0]["exploration_id"] == "explore_kept"
 
 
-def test_a_prepared_injection_is_named_and_hashed_as_it_is_shown(setup):
+def test_a_prepared_injection_uses_its_actual_id_after_model_projection(setup):
     from kin_mind.context import Contexts
-    from kin_mind.context_delivery import ContextDelivery, text_hash
+    from kin_mind.context_delivery import ContextDelivery
     mind, _, _ = setup
     delivery = ContextDelivery(Contexts(mind))
     text = "共享记忆资料：\n" + dumps({"id": "c1", "text": dumps({"evidence": [full_ref()]})})
     prepared = delivery.prepare("thread-shown", "initial", "event-1", text, [])
     body = prepared["text"]
-    assert not leaks(body) and MARKER not in body and prepared["text_hash"] == text_hash(body)
+    assert not leaks(body) and MARKER not in body and 'text_hash' not in prepared
+    assert prepared['id'] and prepared['marker']
     assert body.endswith(for_model(text))
     plain = delivery.prepare("thread-shown", "initial", "event-2", "plain words", [])
     assert plain["text"].endswith("\nplain words")

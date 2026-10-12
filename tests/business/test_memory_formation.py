@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -188,8 +189,9 @@ def test_the_faithful_lines_frame_every_memory_request_and_not_the_digest():
     assert F.FAITHFUL_NOTE_RULES not in inspect.getsource(lifecycle), "every digest would be dirty at once"
     # The switches change what frames the request, so a stored proposal is never reused across them.
     plain = A.DeepSeek("https://api.deepseek.com", A.APPRAISAL_MODEL, "UNSET", timeout=30)
-    assert provider.request_profile({"stimulus": "memory-enrichment", "state": {}})["system"] != \
-        plain.request_profile({"stimulus": "memory-enrichment", "state": {}})["system"]
+    assert provider.request_profile({"stimulus": "memory-enrichment", "state": {}}) == \
+        plain.request_profile({"stimulus": "memory-enrichment", "state": {}})
+    assert "system" not in provider.request_profile({"stimulus": "memory-enrichment", "state": {}})
 
 
 # --- 3. Every conversation source has a disposition ---------------------------------------------------------
@@ -297,6 +299,7 @@ def test_a_mark_holds_the_assessment_that_organises_its_source_and_is_consumed(s
     # By the owner input's id, as the main session knows it.
     result = F.mark(mind, ["in-1"], "她第一次说起灯塔")
     assert result["state"] == "recorded" and result["marked"] == [owner] and result["quota"]["used"] == 1
+    assert uuid.UUID(hex=result["mark_id"][5:]).version == 4
     assert F.mark(mind, [owner], "再标一次")["state"] == "already-marked"
     assert jobs.run_one(Seeing(), lane="action")["state"] == "complete"
     seeing = Seeing(Appraisal(reason="记下", memory=noted(owner)))

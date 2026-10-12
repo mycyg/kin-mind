@@ -9,7 +9,6 @@ the ledger. Nothing here sends messages or touches shared memory.
 
 from __future__ import annotations
 
-import hashlib
 import html.parser
 import ipaddress
 import json
@@ -18,6 +17,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
@@ -177,11 +177,9 @@ class WebReader:
 
     def _receipt(self, *, tool, status, requested, final=None, text="", title="", reason=None,
                  tool_call_id=None, extra=None, persist_text=False):
-        version = hashlib.sha256(text.encode()).hexdigest() if text else None
         recorded_at = now()
-        evidence_id = "web_" + hashlib.sha256(
-            (self.config["execution_id"] + "\0" + str(requested) + "\0" + str(version) + "\0" + recorded_at).encode()
-        ).hexdigest()[:32]
+        evidence_id = "web_" + uuid.uuid4().hex
+        version = evidence_id if text else None
         entry = {"evidence_id": evidence_id, "execution_id": self.config["execution_id"],
                  "receipt_format": "kin-web-receipt-v2",
                  "attempt": self.config["attempt"], "tool": tool, "tool_call_id": tool_call_id,
@@ -191,15 +189,14 @@ class WebReader:
                  "truncated": len(text) > MAX_TEXT, "failure_reason": reason, **(extra or {})}
         if persist_text:
             entry.update(content_ref=self._write_content(evidence_id, text),
-                         content_sha256=version, content_chars=len(text))
+                         capture_id=evidence_id, content_chars=len(text))
         return self._record(entry)
 
     @staticmethod
     def _page(text, offset, limit):
         end = min(len(text), offset + limit)
         delivered = text[offset:end]
-        delivered_range = {"start": offset, "end": end,
-                           "sha256": hashlib.sha256(delivered.encode()).hexdigest()}
+        delivered_range = {"start": offset, "end": end}
         return {"text": delivered, "delivered_range": delivered_range,
                 "next_offset": end if end < len(text) else None,
                 "truncated": end < len(text),
@@ -224,7 +221,7 @@ class WebReader:
         """Read at most 512 KiB plus one of decoded HTTP entity bytes.
 
         ``httpx.Response.iter_bytes`` applies Content-Encoding decoders, so this
-        bound and the associated digest intentionally describe the decoded entity,
+        bound and byte count describe the decoded entity,
         not compressed wire bytes.
         """
         declared = response.headers.get("content-length")
@@ -262,7 +259,7 @@ class WebReader:
                 url, "continuation-not-found", evidence_id=evidence_id,
                 expected_version=expected_version, tool_call_id=tool_call_id,
             )
-        if not isinstance(expected_version, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_version):
+        if not isinstance(expected_version, str) or not expected_version:
             return self._continuation_failure(
                 url, "expected-version-required", evidence_id=evidence_id,
                 expected_version=expected_version, tool_call_id=tool_call_id,
@@ -280,7 +277,7 @@ class WebReader:
                 reason = "continuation-not-found"
             elif url not in {source.get("requested_locator"), source.get("locator")}:
                 reason = "continuation-source-mismatch"
-            elif source.get("version") != expected_version or source.get("content_sha256") != expected_version:
+            elif source.get("version") != expected_version:
                 reason = "source-version-changed"
             else:
                 target = self._content_path(evidence_id)
@@ -291,17 +288,14 @@ class WebReader:
                     reason = "content-unavailable"
                 else:
                     text = target.read_text(encoding="utf-8")
-                    if (len(text) != source.get("content_chars")
-                            or hashlib.sha256(text.encode()).hexdigest() != expected_version):
-                        reason = "content-integrity-failed"
-                    elif offset >= len(text):
+                    if offset >= len(text):
                         reason = "page-offset-out-of-range"
                     else:
                         page = self._page(text, offset, limit)
                         delivered = {**page["delivered_range"], "delivered_at": now()}
                         delivered_at = now()
                         ranges = list(source.get("delivered_ranges") or [])
-                        identity = {key: delivered[key] for key in ("start", "end", "sha256")}
+                        identity = {key: delivered[key] for key in ("start", "end")}
                         existing = next((item for item in ranges if isinstance(item, dict) and
                             all(item.get(key) == value for key, value in identity.items())
                         ), None)
@@ -313,7 +307,7 @@ class WebReader:
                             else:
                                 delivered = existing
                             page["delivered_range"] = delivered
-                            source = {**source, "delivered_ranges": ranges,
+                            source = {**source, "content_chars": len(text), "delivered_ranges": ranges,
                                       "last_delivered_at": delivered_at}
                             data[evidence_id] = source
                             self._write_ledger_unlocked(data)
@@ -414,7 +408,6 @@ class WebReader:
             "content_type": WebReader._content_type(response),
             "redirect_chain": chain,
             "raw_body_bytes": len(raw),
-            "raw_body_sha256": hashlib.sha256(raw).hexdigest(),
             "raw_body_complete": not response["body_over_limit"],
             "body_bytes_representation": "decoded-http-entity",
         }
@@ -473,13 +466,6 @@ class WebReader:
             return self._receipt(
                 tool="read_page", status="failed", requested=url, final=final,
                 title=title, reason="empty-content", tool_call_id=tool_call_id, extra=facts,
-            )
-        version = hashlib.sha256(text.encode()).hexdigest()
-        if expected_version is not None and expected_version != version:
-            return self._receipt(
-                tool="read_page", status="failed", requested=url, final=final,
-                text=text, title=title, reason="source-version-changed", tool_call_id=tool_call_id,
-                extra={**facts, "expected_version": expected_version, "observed_version": version},
             )
         page = self._page(text, 0, limit)
         delivered = {**page["delivered_range"], "delivered_at": now()}
@@ -573,7 +559,7 @@ def create_server(config):
     @server.tool()
     def read_page(url: str, offset: int = 0, limit: int = MAX_TEXT,
                   evidence_id: str | None = None, expected_version: str | None = None) -> dict:
-        """分段读取公开 HTML、文本或 JSON。首次读取冻结可读正文；之后沿 continuation 字段读取其他字符范围，避免混用版本。HTTP 成功只证明取到了返回文本；先辨认登录、验证、同意或错误页，再引用确切 locator。"""
+        """分段读取公开 HTML、文本或 JSON。首次读取保留 capture ID；之后沿 continuation 的 evidence_id 和 expected_version 读取这次捕获的其他字符范围。HTTP 成功只证明取到了返回文本；先辨认登录、验证、同意或错误页，再引用确切 locator。"""
         receipt = reader.read_page(
             url, offset=offset, limit=limit, evidence_id=evidence_id,
             expected_version=expected_version,
@@ -595,9 +581,8 @@ def create_server(config):
             "requested_locator": receipt["requested_locator"],
             "title": receipt["title"],
             "version": receipt["version"],
-            "content_sha256": receipt["content_sha256"],
+            "capture_id": receipt.get("capture_id", receipt["evidence_id"]),
             "content_chars": receipt["content_chars"],
-            "raw_body_sha256": receipt["raw_body_sha256"],
             "raw_body_bytes": receipt["raw_body_bytes"],
             "body_bytes_representation": receipt["body_bytes_representation"],
             "http_status": receipt["http_status"],

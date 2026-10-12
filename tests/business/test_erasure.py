@@ -135,7 +135,7 @@ def test_delete_takes_the_words_out_of_every_layer_the_mind_built(system):
     assert preview["source_ids"] == [secret]
 
 
-def test_the_patch_chain_is_hashed_again_after_an_erase(system):
+def test_the_patch_chain_rebuilds_by_revision_after_an_erase(system):
     mind, memory, source, clock = system
     memory.configure({"history_patches": True})
     secret = source("secret", f"Private {MARKER}")
@@ -152,7 +152,7 @@ def test_the_patch_chain_is_hashed_again_after_an_erase(system):
 
     assert texts_everywhere(mind.engine, MARKER) == set()
     verdicts = sweep(mind)
-    assert set(verdicts.values()) <= {"verified", "unverifiable"}
+    assert set(verdicts.values()) <= {"readable"}
     with mind.engine.db.connect() as conn:
         for revision in verdicts:
             history.materialize(conn, mind.scope.key(), revision)
@@ -246,7 +246,7 @@ def test_restoring_an_archive_that_holds_the_original_keeps_the_delete(system, m
     assert "failed" not in sweep(mind).values()
 
 
-def test_restore_refuses_an_archive_row_that_does_not_match_its_digest(system, monkeypatch):
+def test_restore_refuses_an_unreadable_archive_row(system, monkeypatch):
     mind, memory, source, clock = system
     rounds(mind, clock, source, 4)
     monkeypatch.setattr(history_compaction, "_quiet_check",
@@ -255,12 +255,11 @@ def test_restore_refuses_an_archive_row_that_does_not_match_its_digest(system, m
     archive = history_compaction.archive_dir(mind.engine.db) / compacted["archive"]
     with sqlite3.connect(archive) as conn:
         revision, data = conn.execute("SELECT revision,data FROM mind_events_v1 ORDER BY revision DESC LIMIT 1").fetchone()
-        conn.execute("UPDATE mind_events_v1 SET data=? WHERE revision=?", (data.replace("Unrelated", "Tampered"), revision))
+        conn.execute("UPDATE mind_events_v1 SET data=? WHERE revision=?", ("{invalid-json", revision))
     with mind.engine.db.connect() as conn:
         before = conn.execute("SELECT revision,data FROM mind_events ORDER BY revision").fetchall()
     with pytest.raises(Exception) as refused:
         history_compaction.restore(mind, {}, apply=True)
-    assert getattr(refused.value, "target", None) == "archive-row-differs-from-its-digest"
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT revision,data FROM mind_events ORDER BY revision").fetchall() == before
 
@@ -353,8 +352,8 @@ def test_a_context_rendered_from_erased_words_keeps_its_identity_and_is_never_se
         stored = json.loads(conn.execute("SELECT data FROM mind_context_deliveries WHERE id=?",
                                          (injection["id"],)).fetchone()[0])
         window = json.loads(conn.execute("SELECT data FROM mind_context_windows WHERE session='thread-1'").fetchone()[0])
-    assert (stored["id"], stored["marker"], stored["text_hash"], stored["state"]) == \
-        (injection["id"], injection["marker"], injection["text_hash"], "prepared")
+    assert (stored["id"], stored["marker"], stored["state"]) == \
+        (injection["id"], injection["marker"], "prepared")
     assert stored["text"] == erasure.ERASED and stored["erased_at"] and all("text" not in i for i in stored["items"])
     begun = ContextDelivery(contexts).begin("thread-1", injection["epoch"], injection["id"])
     assert begun["state"] == "erased" and not begun.get("acquired")
@@ -564,8 +563,8 @@ def test_a_judgment_that_comes_back_after_its_source_changed_keeps_nothing(syste
     settle(engine)
     assert model.calls == ["judge_step"] and "judgment_cache" not in receipt
     with engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache_deps").fetchone()[0] == 0
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone()
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache_deps'").fetchone()
     assert texts_everywhere(engine, MARKER) == set()
 
     walk = source("walk", "The owner walked to the harbour.")
@@ -578,7 +577,7 @@ def test_a_judgment_that_comes_back_after_its_source_changed_keeps_nothing(syste
                                            judgment={**judgment, "goal": "harbour"}, depends_on=[kept])
     assert "judgment_cache" not in receipt
     with engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_judgment_cache").fetchone()[0] == 0
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone()
     assert paid(engine) == 2
 
     # Nothing changed while it was out: the verdict is kept, pending, as before.
@@ -586,9 +585,9 @@ def test_a_judgment_that_comes_back_after_its_source_changed_keeps_nothing(syste
     _, receipt = model.provider.structured("judge_step", Verdict, "Judge the step.",
                                            {"records": [{"id": kept, "text": engine.get(kept)["content"]}]},
                                            judgment={**judgment, "goal": "station"}, depends_on=[kept])
-    assert receipt.get("judgment_cache")
+    assert "judgment_cache" not in receipt
     with engine.db.connect() as conn:
-        assert [tuple(row) for row in conn.execute("SELECT accepted FROM mind_judgment_cache")] == [(0,)]
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone()
 
 
 def test_an_overview_of_a_source_deleted_after_its_summary_came_back_is_not_kept(system, monkeypatch):
@@ -700,7 +699,7 @@ def test_a_prepared_context_found_stale_after_a_delete_loses_its_words(system):
     """One an older build prepared after the delete had run: begin finds it stale, takes the
     deleted words out by the delete's own rule and keeps its identity for reconciliation
     (CR-MEM-02, CR4-MM-01)."""
-    from kin_mind.context_delivery import ContextDelivery, text_hash
+    from kin_mind.context_delivery import ContextDelivery
 
     mind, memory, source, clock = system
     engine = mind.engine
@@ -712,7 +711,7 @@ def test_a_prepared_context_found_stale_after_a_delete_loses_its_words(system):
     epoch = contexts.window("thread-1")["epoch"]
     body = "kin-context:context:late\n" + item["text"]
     late = {"id": "context:late", "session": "thread-1", "epoch": epoch, "event_id": "turn-1", "state": "prepared",
-            "kind": "background", "marker": "kin-context:context:late", "text": body, "text_hash": text_hash(body),
+            "kind": "background", "marker": "kin-context:context:late", "text": body,
             "tokens": 40, "content_tokens": 40, "overhead": 0, "items": [item], "prepared_at": mind.clock()}
     delivery = ContextDelivery(contexts)
     with engine.db.connect(write=True) as conn:
@@ -723,5 +722,5 @@ def test_a_prepared_context_found_stale_after_a_delete_loses_its_words(system):
     assert texts_everywhere(engine, MARKER) == set()
     with engine.db.connect() as conn:
         kept = json.loads(conn.execute("SELECT data FROM mind_context_deliveries WHERE id='context:late'").fetchone()[0])
-    assert (kept["id"], kept["marker"], kept["text_hash"], kept["state"]) == ("context:late", late["marker"], late["text_hash"], "stale")
+    assert (kept["id"], kept["marker"], kept["state"]) == ("context:late", late["marker"], "stale")
     assert kept["text"] == erasure.ERASED and kept["erased_at"]

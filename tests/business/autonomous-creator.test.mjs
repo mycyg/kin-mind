@@ -20,10 +20,10 @@ function records(log=[]) {
 test('manifest rejects traversal, symlink escape and duplicate artifact paths',()=>{
  const root=temporary();try{fs.mkdirSync(path.join(root,'inside'));fs.writeFileSync(path.join(root,'file.txt'),'actual output');
  fs.symlinkSync(path.join(root,'file.txt'),path.join(root,'inside','escape'));
- assert.throws(()=>artifactManifest(path.join(root,'inside'),['../file.txt']),/escaped/);
- assert.throws(()=>artifactManifest(path.join(root,'inside'),['escape']),/escaped/);
- assert.throws(()=>artifactManifest(root,['file.txt','file.txt']),/duplicated/);
- assert.equal(artifactManifest(root,['file.txt'])[0].bytes,13);
+ assert.throws(()=>artifactManifest(path.join(root,'inside'),['../file.txt'],'run-1'),/escaped/);
+ assert.throws(()=>artifactManifest(path.join(root,'inside'),['escape'],'run-1'),/escaped/);
+ assert.throws(()=>artifactManifest(root,['file.txt','file.txt'],'run-1'),/duplicated/);
+ assert.deepEqual(artifactManifest(root,['file.txt'],'run-1')[0],{artifact_id:'run-1:artifact:0',path:fs.realpathSync(path.join(root,'file.txt')),relative:'file.txt',bytes:13});
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 test('isolated worker uses configured model and returns native and artifact receipts without phone tools',async()=>{
@@ -34,6 +34,7 @@ test('isolated worker uses configured model and returns native and artifact rece
  try{const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root,FEISHU_APP_SECRET:'must-not-pass'},executions:records()});
  const result=await creator.run({plan:{id:'p',goal:'Create a text'},step:{id:'s'},run:{id:'r'},brief:{known_evidence:[]}});
  assert.equal(result.state,'produced');assert.equal(result.receipt.thread_id,'isolated-only');assert.equal(result.artifacts.length,1);
+ assert.equal(result.artifacts[0].artifact_id,'r:artifact:0');assert.equal('sha256' in result.artifacts[0],false);
  assert.equal(captured.options.env.FEISHU_APP_SECRET,undefined);assert.ok(captured.args.includes('--ignore-user-config'));assert.ok(captured.args.includes('features.apps=false'));assert.ok(captured.args.includes('sandbox_workspace_write.network_access=false'));assert.ok(!captured.args.includes('resume'));
  assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-6-sol');assert.ok(captured.args.includes('model_reasoning_effort="medium"'));
  assert.equal(captured.args.includes('service_tier="fast"'),false,'the default creator never opts into paid Fast');
@@ -131,7 +132,7 @@ test('render dependencies are recorded with their versions; a browser that canno
   assert.deepEqual({playwright:verifier.runtime().playwright.version,browser:verifier.runtime().browser.version},{playwright:'1.99.0',browser:'150.0.1'});
   assert.equal(verifier.capabilities().static_html_render,true);
   const page=path.join(root,'index.html');fs.writeFileSync(page,'<p>hi</p>');
-  const checked=await verifier.verify({state:'produced',receipt:{workspace:root},artifacts:[{path:page,sha256:'x'}]});
+  const checked=await verifier.verify({state:'produced',receipt:{workspace:root},artifacts:[{path:page,artifact_id:'r:artifact:0'}]});
   assert.equal(checked.host_verification[0].reason,'browser-launch-failed');
   assert.equal(verifier.capabilities().static_html_render,false);
  }finally{fs.rmSync(root,{recursive:true,force:true});}

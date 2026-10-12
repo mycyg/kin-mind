@@ -55,9 +55,9 @@ export const chatVoice = '普通聊天和主动分享按自己的话意选择一
  *   - the top-level value is a plain object with exactly the keys `action`
  *     and `bubbles` — no extra fields, known or unknown;
  *   - `action` is the string "send" (the only chat-deliverable action);
- *   - `bubbles` is a non-empty array of strings that each contain
- *     non-whitespace; each is trimmed on conversion. There are no per-bubble
- *     references in this schema, so a converted bubble carries none.
+ *   - `bubbles` is a non-empty array of non-empty strings or
+ *     {text,references,bubble_id?} objects. References remain on their own
+ *     bubble, identified by the registered bubble ID or its array index.
  *
  * Return values:
  *   {state:'send',bubbles}     a complete envelope; convert it into bubbles.
@@ -96,8 +96,15 @@ export function chatEnvelope(text) {
   if(!value||typeof value!=='object'||Array.isArray(value))return null;
   if(!('bubbles' in value)&&!PROTOCOL_ACTIONS.has(value.action))return null;
   const keys=Object.keys(value);
+  const referenced=bubble=>bubble&&typeof bubble==='object'&&!Array.isArray(bubble)&&
+    Object.keys(bubble).every(key=>['text','references','bubble_id'].includes(key))&&
+    typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
+    (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
   if(value.action==='send'&&keys.length===2&&Array.isArray(value.bubbles)&&value.bubbles.length
-    &&value.bubbles.every(bubble=>typeof bubble==='string'&&bubble.trim()))
-    return {state:'send',bubbles:value.bubbles.map(bubble=>bubble.trim())};
+    &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)))
+    return {state:'send',bubbles:value.bubbles.map(bubble=>(typeof bubble==='string'?bubble:bubble.text).trim()),
+      ...(value.bubbles.some(bubble=>typeof bubble==='object')?{
+        references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references:undefined),
+        reference_bubble_ids:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.bubble_id??null:null)}:{})};
   return {state:'invalid',reason:'chat-envelope-incomplete'};
 }

@@ -96,7 +96,7 @@ ID_KEYS = ("source_id", "record_id", "id")
 # A topic candidate copies a family of records, titled by one of them, and the store deletes the family
 # with any of its members (`Engine.delete`): the copy goes with any member it shows (CL7B-MM-03).
 MEMBER_LISTS = ("members",)
-TOMBSTONE_KEYS = ("source_id", "record_id", "hash", "revision", "authority")
+TOMBSTONE_KEYS = ("source_id", "record_id", "revision", "authority")
 # Graph kinds whose words are a claim the model wrote from its evidence: they go whenever any of
 # that evidence does. Other nodes keep their words while evidence of theirs remains.
 CLAIM_KINDS = frozenset({"finding", "association"})
@@ -116,7 +116,7 @@ SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "min
 CONTEXT_TABLES = ("mind_context_deliveries", "mind_context_windows")
 # What an erased delivery keeps: its identity, the hash of what it carried, where it was going and
 # how far it got, so it can still be reconciled with the native history by marker and hash.
-DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker", "text_hash", "tokens",
+DELIVERY_KEPT = ("id", "session", "epoch", "event_id", "state", "kind", "marker", "native_item_id", "tokens",
                  "content_tokens", "overhead", "manifest_id", "prepared_at", "accepted_at", "native_at",
                  "historical", "needs_review", "evidence", "stale_reason")
 # What relevance admission kept of a build (recall_admission): ids and numbers only, and a row that
@@ -157,6 +157,18 @@ def cites(value, ids):
     what was only read: it goes with what it cites (decision 1, CL6E-MM-01). What a model read counts
     on the rows of its own process alone, `scrub_process`. A copy of an erased record, named by its own
     `id`, rests on it, and a topic candidate on each member it shows (CL7B-MM-03)."""
+    # An activity pointer is a dependency of its surrounding words, rather than
+    # evidence that its dream or reflection happened in the outside world.
+    # This also reaches older registered bubbles that predate source_ids.
+    activity = value.get("activity_ref")
+    if isinstance(activity, dict) and activity.get("source_id") in ids:
+        return True
+    for key in ("references", "activity_refs"):
+        references = value.get(key)
+        if isinstance(references, list) and any(isinstance(ref, dict) and (
+                ref.get("source_id") in ids or isinstance(ref.get("activity_ref"), dict)
+                and ref["activity_ref"].get("source_id") in ids) for ref in references):
+            return True
     for key in REF_LISTS:
         refs = value.get(key)
         if isinstance(refs, list) and any(isinstance(ref, dict) and (ref.get("source_id") in ids or ref.get("record_id") in ids)
@@ -1179,17 +1191,10 @@ def _wake(engine, conn):
 
 
 def _start(conn, scope, first):
-    """Where a pass begins: the row before the first one naming the identifiers, and the hash
-    that row claims, which is what the next row's `base_hash` has to match."""
-    row = conn.execute("SELECT revision,data FROM mind_events WHERE scope=? AND revision<? ORDER BY revision DESC LIMIT 1",
+    """Resume from the preceding database revision."""
+    row = conn.execute("SELECT revision FROM mind_events WHERE scope=? AND revision<? ORDER BY revision DESC LIMIT 1",
                        (scope, first)).fetchone()
-    if row is None:
-        return first - 1, None
-    try:
-        claimed = json.loads(row["data"]).get("state_hash")
-    except (ValueError, AttributeError):
-        claimed = None
-    return row["revision"], claimed
+    return (row["revision"] if row else first - 1), None
 
 
 def _scrub_ops(patch, ids):
@@ -1250,112 +1255,54 @@ def _patched(state, patch, ids):
 
 
 class Walk:
-    """One forward pass over a scope's rows, carrying the scrubbed state from row to row.
-
-    `step` answers what a stored row has to say now. A row whose chain was already unreadable
-    before the walk came — a patch whose `base_hash` is not what the row below it claimed, a
-    whole document that does not hash to its own claim — loses its words and keeps its claims,
-    so it stays exactly as unreadable as it was: this never turns a broken history into one that
-    verifies. `trusted` is for rows just read back from an archive whose bytes were checked
-    against the digest taken when they were archived; their claims were true of the originals,
-    and the walk hashes the scrubbed states again without asking."""
-
-    def __init__(self, ids, state, previous, orig_hash, *, trusted=False):
+    """Scrub existing snapshots/patches in database revision order."""
+    def __init__(self, ids, state, previous, orig_hash=None, *, trusted=False):
         self.ids, self.state, self.previous = frozenset(ids), state, previous
-        self.orig, self.orig_whole = orig_hash, None
-        self.known = None
-        self.trusted = trusted
+        self.orig = None  # old queued cursors may still carry the unused field
         self.broken = 0
 
     @classmethod
     def before(cls, conn, scope, revision, ids, *, orig_hash=None, trusted=False):
-        """A walk that starts after the row at `revision`, from that row's verified state."""
         from . import history
-
         if revision is None or not conn.execute("SELECT 1 FROM mind_events WHERE scope=? AND revision=?",
                                                 (scope, revision)).fetchone():
-            return cls(ids, None, revision, orig_hash, trusted=trusted)
+            return cls(ids, None, revision)
         try:
             state = history.materialize(conn, scope, revision)
         except Conflict as error:
             if error.code != history.REBUILD_FAILED:
                 raise
             state = None
-        walk = cls(ids, state, revision, orig_hash, trusted=trusted)
-        return walk
-
-    def _state_hash(self):
-        from . import history
-        if self.known is None and self.state is not None:
-            self.known = history.row_hash(self.state)
-        return self.known
-
-    def _claimed_below(self):
-        from . import history
-        if self.orig is None and self.orig_whole is not None:
-            self.orig = history.row_hash(self.orig_whole)
-            self.orig_whole = None
-        return self.orig
+        return cls(ids, state, revision)
 
     def step(self, revision, data):
-        """(what the row stores now, whether that differs from what it stored)."""
         from . import history
-
-        ids = self.ids
         request = data.get("request")
-        cleaned_request = scrub(request, ids) if isinstance(request, (dict, list)) else request
+        out = {k: v for k, v in data.items() if k not in {"base_hash", "state_hash"}}
         if history.is_patch(data):
-            wanted = data.get("base_hash")
-            linked = (self.state is not None and data.get("base") == self.previous
-                      and (self.trusted or wanted is None or self._claimed_below() in (None, wanted)))
-            out = dict(data)
+            linked = self.state is not None and data.get("base") == self.previous
             if linked:
                 try:
-                    new = _patched(self.state, data["patch"], ids)
+                    new = _patched(self.state, data["patch"], self.ids)
                 except ValueError:
                     linked = False
             if linked:
-                out["patch"] = history.diff(self.state, new)
-                out["snapshot"] = history.shim(new)
-                if wanted is not None:
-                    out["base_hash"] = self._state_hash()
-                if "state_hash" in data:
-                    out["state_hash"] = history.row_hash(new)
-                self.state, self.known = new, out.get("state_hash")
+                out["patch"], out["snapshot"] = history.diff(self.state, new), history.shim(new)
+                self.state = new
             else:
                 self.broken += 1
-                out["patch"] = _scrub_ops(data["patch"], ids)
-                self.state, self.known = None, None
-            self.orig, self.orig_whole = data.get("state_hash"), None
+                out["patch"] = _scrub_ops(data["patch"], self.ids)
+                self.state = None
         else:
             whole = history.snapshot_of(data)
             if whole is None:
-                # Neither a patch nor a whole state: nothing here can be read, or scrubbed.
                 self.broken += 1
-                self.state = self.known = self.orig = self.orig_whole = None
-                self.previous = revision
-                return data, False
-            new = scrub(whole, ids)
-            claimed = data.get("state_hash")
-            out = dict(data)
-            out["snapshot"] = new
-            if claimed is None:
-                # Written before rows carried a hash: nothing to recompute, and what the next
-                # row's `base_hash` has to match is the hash of the original, taken if asked.
-                self.known = None
-            elif new is whole:
-                # Unchanged, so its claim stands exactly as it was, true or not.
-                self.known = claimed
-            elif self.trusted or history.row_hash(whole) == claimed:
-                out["state_hash"] = self.known = history.row_hash(new)
+                self.state = None
             else:
-                # It never verified. Its words go and its claim stays.
-                self.broken += 1
-                self.known = claimed
-            self.state = new
-            self.orig, self.orig_whole = claimed, (whole if claimed is None else None)
+                self.state = scrub(whole, self.ids)
+                out["snapshot"] = self.state
         if request is not None:
-            out["request"] = cleaned_request
+            out["request"] = scrub(request, self.ids) if isinstance(request, (dict, list)) else request
         self.previous = revision
         changed = history.canonical(out) != history.canonical(data)
         return (out if changed else data), changed
@@ -1364,7 +1311,7 @@ class Walk:
 def rewrite_history(conn, scope, ids, *, after, last=None, orig_hash=None, fresh=False, trusted=False,
                     rows=HISTORY_ROWS, budget=HISTORY_BYTES):
     """Rewrite one scope's history forward from the row after `after`, so that no revision holds
-    erased words and every hash on the way is the hash of what the row now rebuilds to.
+    erased words while retaining existing revision links.
 
     Stops at the first row that no longer changes once it is past `last` — the last row that
     named the identifiers when the pass was planned — because from there on the state is what it
@@ -1372,8 +1319,6 @@ def rewrite_history(conn, scope, ids, *, after, last=None, orig_hash=None, fresh
     what the last row claimed before it was rewritten, which is what the next batch checks the
     row after it against. Nothing before `after` is touched."""
     walk = Walk.before(conn, scope, after, ids, orig_hash=orig_hash, trusted=trusted)
-    if fresh and orig_hash is None and walk.state is not None:
-        walk.orig_whole = walk.state
     rewritten = done = spent = 0
     while True:
         page = conn.execute("SELECT revision,data FROM mind_events WHERE scope=? AND revision>? ORDER BY revision LIMIT 50",

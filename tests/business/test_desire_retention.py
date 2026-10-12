@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from eventmem.core.db import Conflict, digest, dumps
+from eventmem.core.models import SourceInput
 from kin_mind import archive_memory, desire_archive, manifest
 from kin_mind.appraisal import Appraisals, appraisal_context
 from kin_mind.exploration import Explorations
@@ -85,6 +86,10 @@ def config(mind):
 def share(mind, source, exploration_id, revision=1):
     """A current decision to communicate one result, as the appraisal writes it."""
     evidence = source("sharing-" + exploration_id)
+    # A communication decision names a real saved original; it is not just an arbitrary label.
+    mind.engine.receive(SourceInput(namespace="kin-exploration", key=exploration_id, scope=mind.scope,
+        authority="model", text=dumps({"state": "complete", "result": {"summary": "Synthetic " + exploration_id}, "partial": False}),
+        occurred_at=mind.clock(), extract=False, metadata={"exploration_id": exploration_id}))
     with mind.engine.db.connect(write=True) as conn:
         state = mind._load(conn)
         state.setdefault("exploration_decisions", {})[exploration_id] = {

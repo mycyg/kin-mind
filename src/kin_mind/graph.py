@@ -9,8 +9,6 @@ from typing import Literal
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
-from eventmem.core.idempotency import record, unchanged
-from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model
 from eventmem.core.read_policy import (
     ISOLATED,
@@ -21,7 +19,7 @@ from eventmem.core.read_policy import (
 )
 
 from . import evidence_refs
-from .autonomy_schema import enabled, optimized
+from .autonomy_schema import enabled
 from .state import timestamp
 
 SCHEMA = """
@@ -227,7 +225,9 @@ class EventGraph:
     def _put(self, conn, value, *, edge=False, isolate=True):
         # `isolate=False` is for the isolation migration's own undo, which puts back exactly
         # the archived version it took apart.
-        value = self._unmixed(conn, dict(value)) if isolate else dict(value)
+        value = dict(value)
+        self._guard_fact_proof(conn, value.get("evidence") or [], kind=value.get("kind"), basis=value.get("basis"))
+        value = self._unmixed(conn, value) if isolate else value
         # Once the graph is marked, what it stores of a reference is what its readers read
         # (evidence_refs): the node, its revision, and every later copy of either.
         marked = evidence_refs.table_marked(conn, self.scope.key(), "mind_graph_nodes")
@@ -264,6 +264,20 @@ class EventGraph:
         from .lifecycle import graph_changed
         graph_changed(conn, self.scope.key(), value, old, self.mind.clock())
         return value
+
+    def _guard_fact_proof(self, conn, refs, *, kind, basis):
+        """Imagination can inform an internal association; it cannot certify external facts."""
+        if kind == "finding" and basis == "internal_thought":
+            raise Conflict("Internal imagination cannot be stored as a factual finding", code="graph-imagination-not-evidence")
+        if kind not in {"finding", "event", "entity", "thread", "edge"} or basis == "internal_thought":
+            return
+        sources = SourceFacts(conn)
+        for ref in refs:
+            facts = sources.of(ref)
+            metadata = facts.get("metadata") or {}
+            if (facts.get("namespace") == "kin-dream" or metadata.get("basis") in ("imagined", "imagination")
+                    or metadata.get("content_class") == "dream_imagination"):
+                raise Conflict("Dream or imagined content cannot provide factual graph evidence", code="graph-imagination-not-evidence", target=ref.get("source_id"))
 
     def _repoint(self, conn, edge, subject, object_id, before, changed):
         """An edge moved to new ends is the edge of those ends (K4-09). Its identity is computed
@@ -353,7 +367,7 @@ class EventGraph:
                 # These are exactly the fields Mind._fresh reads. Metadata and display
                 # fields do not affect whether this evidence reference is current.
                 key = tuple(ref.get(field) for field in (
-                    "source_id", "record_id", "hash", "revision", "namespace", "source_key"))
+                    "source_id", "record_id", "namespace", "source_key"))
                 if key not in evidence_cache:
                     evidence_cache[key] = self.mind._fresh(conn, [ref])
                 if not evidence_cache[key]:
@@ -475,6 +489,22 @@ class EventGraph:
             "source_ids": [receipt["source_id"]], "record_ids": [receipt["record_id"]], "evidence": refs,
             "basis": "explicit" if kind == "owner-message" else "inferred" if kind in {"assistant-message", "exploration-result"} else "observed",
             "occurred_at": event["at"], "channel": event.get("channel"), "operation": kind, "historical": bool(event.get("historical"))})
+        routing = {k: event[k] for k in ("conversation_id", "platform_message_id", "reply_to_message_id", "root_message_id", "thread_id", "reply_context") if k in event}
+        resolution = event.get("reply_resolution") or {}
+        if kind == "owner-message" and resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:
+            candidate = resolution["candidates"][0]
+            self.link(conn, identifier, "responds_to", candidate["share_id"], refs,
+                      reason="Host-observed reply to an accepted platform message", role=candidate["bubble_id"])
+            routing.update(reply_share_id=candidate["share_id"], reply_bubble_id=candidate["bubble_id"],
+                           activity_refs=candidate.get("activity_refs", []), reply_basis=resolution.get("basis"))
+            for activity in candidate.get("activity_refs", []):
+                # This edge identifies the report the accepted message referred to. A dream stays
+                # an autobiographical pointer, never a graph finding or an observed event.
+                if activity.get("kind") == "exploration":
+                    self.link(conn, identifier, "about", activity["id"], refs,
+                              reason="Original exploration referenced by the accepted share")
+        if routing:
+            node = self._put(conn, {**node, **routing})
         for key, relation in (("work_id", "produces" if kind == "artifact-created" else "about"), ("artifact_id", "about"), ("share_id", "delivers")):
             if receipt.get(key):
                 self.link(conn, identifier, relation, receipt[key], refs, reason="Host operation record")
@@ -705,18 +735,10 @@ class EventGraph:
         """Commands and inverse patches are durable; evidence stays immutable."""
         if not request.get("command_id") or not request.get("reason"):
             raise ValueError("Graph revisions need command_id and reason")
-        command_hash = digest(request)
         with self.engine.db.connect(write=True) as conn:
-            # The expected node and merge-target revisions gate this command; the action,
-            # the reason and the correction itself are what it is.
-            stamp = fingerprint("graph-revision", self.scope.key(), request,
-                                enabled=optimized(conn, self.scope.key(), "idempotency_fingerprint"))
-            prior = conn.execute("SELECT digest,data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["command_id"])).fetchone()
+            prior = conn.execute("SELECT data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["command_id"])).fetchone()
             if prior:
-                if not unchanged(conn, stamp, request["command_id"], legacy=(prior[0], command_hash)):
-                    raise Conflict("Graph command ID reused with other data", kind="runtime",
-                                   code="payload-changed", target=request["command_id"])
-                return json.loads(prior[1])
+                return json.loads(prior[0])
             proof = self.proof(conn, request.get("evidence_ids", []))
             identifier = request["id"]; current = self.get(conn, identifier)
             if current["revision"] != request.get("expected_revision"):
@@ -818,6 +840,5 @@ class EventGraph:
             result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
             # What a replay of this command reads back is what it answers now.
             result = evidence_refs.as_stored(conn, self.scope.key(), "mind_graph_commands", result)
-            conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), command_hash, dumps(result)))
-            record(conn, stamp, request["command_id"], self.mind.clock())
+            conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), "", dumps(result)))
             return result

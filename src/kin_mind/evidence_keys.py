@@ -1,34 +1,8 @@
-"""What evidence has already been scored, kept where running does not need the snapshots.
+"""Legacy evidence-key index retained for existing stores and operator maintenance tools.
 
-A single underlying event may be appraised once. Until now the only record of that was the state
-snapshot inside each `affect` history row: the guard asked whether any row's
-`snapshot.last_evidence_key` matched, which is an unindexed scan of every snapshot ever written —
-0.2 s inside the write transaction of every new appraisal, and growing with history. That is
-tolerable only while the snapshots are still there. History is about to be stored as patches and
-then compacted, so the one thing the running system reads out of those snapshots has to live in a
-table of its own first. This module is that table, and it is step two of an order that must not be
-rearranged: the index moves out before the format changes under it.
-
-`mind_evidence_keys` is keyed by `(scope, evidence_key)` and says which event first introduced that
-key and at which revision. First, not last: an `affect` row that never went through the scoring path
-— an evolution or a reversion submitted through the appraisal lane takes that kind — carries the key
-of the row before it, so the same key can appear on several rows. Ascending revision order plus
-`INSERT OR IGNORE` means the row that really introduced the key is the one recorded, and that is the
-same answer the scan gives, which is what lets the two be compared at all.
-
-Three things keep the table honest:
-
-- every history row records its own key as it is written, so the table cannot fall behind a commit;
-- a **catch-up scan** runs before the table is read, because a period spent on the previous release,
-  or an import, writes rows this code never saw. The cursor in `mind_memory_migrations` says how far
-  the rows have been read, so the catch-up is normally an indexed no-op;
-- while the stage is open the guard refuses if **either** the table or the old scan says it has seen
-  the key, and a disagreement is a metric. The scan is the authority until compaction removes its
-  evidence; the table only has to prove it agrees first.
-
-`evidence-keys-backfill` fills the table for a store written before it existed, in batches, resumable
-from the cursor, idempotent, and writing nothing at all without `--apply`. `evidence-keys-verify`
-compares the two directions row by row and names what does not line up.
+Current appraisals neither create content keys nor consult this index as a psychological gate.
+Historical keys may still be read or copied by the compatibility maintenance commands below.
+Their presence, absence or disagreement cannot refuse a new subjective judgment.
 """
 
 from __future__ import annotations
@@ -140,16 +114,8 @@ def _insert(conn, scope, key, event_id, revision):
 # --- keeping up ----------------------------------------------------------------------------------
 
 def record(conn, scope, state, kind, event_id):
-    """The key this history row carries, written with the row itself.
-
-    Called from the one place that writes history, so no commit can leave the table behind. The same
-    filter the backfill uses, on purpose: a row that inherited its key inserts nothing."""
-    if kind != KIND or not installed(conn):
-        return 0
-    key = state.get("last_evidence_key")
-    if not key:
-        return 0
-    return _insert(conn, scope, key, event_id, state["revision"])
+    """Compatibility entry point: new subjective history produces no content keys."""
+    return 0
 
 
 def catch_up(conn, scope, at):
@@ -172,35 +138,13 @@ def catch_up(conn, scope, at):
 # --- the guard -----------------------------------------------------------------------------------
 
 def already_scored(conn, scope, key, *, at, deferred=None):
-    """Whether this evidence has been appraised before, asked of the table and of the old scan.
-
-    Either one is enough to refuse. The scan is still the authority — it reads the snapshots, which
-    are still there — and the table is on trial beside it until they are not.
-
-    A disagreement is always a refusal, and a refusal rolls this transaction back, so it cannot be
-    written down here: it is handed to `deferred` and recorded once the failed write is out of the
-    way. A metric written inside the refusal would be a metric nobody ever sees."""
-    from .autonomy_schema import optimized
-    index = installed(conn) and optimized(conn, scope, INDEX_FLAG)
-    # A guard both switches can turn off would be no guard at all, so without the table the scan
-    # runs whatever the legacy flag says.
-    legacy = not index or optimized(conn, scope, LEGACY_FLAG)
-    if index:
-        catch_up(conn, scope, at)
-    table_says = bool(index and conn.execute(
-        "SELECT 1 FROM mind_evidence_keys WHERE scope=? AND evidence_key=?", (scope, key)).fetchone())
-    legacy_says = bool(legacy and conn.execute(LEGACY_QUERY, (scope, key)).fetchone())
-    if index and legacy and table_says != legacy_says and deferred is not None:
-        deferred.append({"evidence_key": key, "table": table_says, "legacy": legacy_says})
-    return table_says or legacy_says
+    """Compatibility entry point: prior content never refuses a new appraisal."""
+    return False
 
 
 def flush_mismatches(engine, found):
-    """Write down what the guard saw, now that the write it saw it in has been rolled back.
-
-    A digest, and which of the two said it had seen it. No evidence text and no source id."""
-    while found:
-        engine.db.metric(MISMATCH_METRIC, 1, found.pop(0))
+    """Discard legacy deferred gate reports; the current workflow has no such gate."""
+    found.clear()
 
 
 # --- the operator's own routes -------------------------------------------------------------------

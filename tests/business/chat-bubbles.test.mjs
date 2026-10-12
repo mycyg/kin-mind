@@ -34,13 +34,18 @@ test('envelope-shaped but not deliverable: incomplete, never a text fallback',()
     [JSON.stringify({action:'send',bubbles:'不是数组'}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'send',bubbles:[]}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'send',bubbles:['  ']}),'chat-envelope-incomplete'],
-    [JSON.stringify({action:'send',bubbles:[{text:'带引用的气泡',references:[]}]}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'send',bubbles:['甲'],note:'多出来的字段'}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'send',text:'旧草稿形态的纯文本'}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'wait',condition:'time',reason:'稍后'}),'chat-envelope-incomplete'],
     [JSON.stringify({action:'abandon',reason:'失效'}),'chat-envelope-incomplete'],
     [JSON.stringify({bubbles:['缺 action']}),'chat-envelope-incomplete'],
   ])assert.deepEqual(chatEnvelope(body),{state:'invalid',reason});
+});
+
+test('an envelope retains references by bubble ID and index while converting its public words',()=>{
+  const references=[{activity_ref:{kind:'dream',id:'dream-one'},mode:'new',reason:''}];
+  const hit=chatEnvelope(JSON.stringify({action:'send',bubbles:[{text:'  梦里的小事。 ',references,bubble_id:'owner-1:bubble:0'},'普通一句。']}));
+  assert.deepEqual(hit,{state:'send',bubbles:['梦里的小事。','普通一句。'],references:[references,undefined],reference_bubble_ids:['owner-1:bubble:0',null]});
 });
 
 test('a truncated or malformed envelope is recognised as one and refused',()=>{

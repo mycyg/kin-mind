@@ -106,13 +106,10 @@ def window_of(windows, at):
 
 
 def root_key(*, text=None, window=None, source_id=None):
-    """What two ingestions of one utterance share. The same words inside the same window are one
-    origin however many namespaces carried them; without a window the source is its own root."""
-    if text is not None and window:
-        return "root_" + digest(["utterance", " ".join(text.split()).casefold(), window["start"]])[:32]
+    """The actual source is its origin. Legacy text/window arguments do not merge words."""
     if source_id:
         return "root_" + digest(["source", str(source_id)])[:32]
-    raise ValueError("A root needs an utterance inside a window or a source")
+    raise ValueError("A root needs a source id")
 
 
 def episode_key(*, execution_id=None, window=None, root=None):

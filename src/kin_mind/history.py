@@ -1,42 +1,8 @@
-"""One reader and one writer for the state history, whatever shape its rows were written in.
+"""State history as existing snapshots or bounded patches linked by database revision.
 
-`mind_events` has always kept a whole state document per revision. That is what makes the
-history inspectable, and it is also why it grew to a third of the database: a document whose
-wishes are never pruned is copied again on every change, however little of it moved. Stage 5
-moves the writer to keyed patches, and the two shapes then stand side by side for as long as
-the old rows do — which is for ever, because nothing here ever deletes one.
-
-So this module is where every reader goes, and it answers one question: what did the state look
-like at revision r. A row that carries its own snapshot answers by itself. A row that carries a
-patch answers by asking the row before it and applying what changed. Either way the answer is
-checked against the hash the writer recorded, before anyone is allowed to use it — a snapshot
-that cannot be verified is not evidence of anything, and the one caller that restores a
-personality from it would otherwise put back a profile nobody can vouch for.
-
-The writer is here too, rather than in the one place that inserts a row, so that the two shapes
-cannot drift apart: what `row_for` decides to store is read back by `materialize` a few lines
-down, and a change to either is a change made while looking at the other. It is off unless a
-store asks for it. Every other optimization in this stage defaults on, because turning one on
-changes how fast something runs; turning this one on changes what gets written, and the release
-that can no longer be rolled back to is not an optimization.
-
-What this module will not do is guess. A parent that is missing, a patch that does not fit, a
-`base` that points forward, a rebuild whose bytes do not hash to what the row claims: all of them
-are the one refusal, `history-rebuild-failed`. The two callers then differ, deliberately. On the
-commit path `Mind._revert` lets it fail the transaction, because a half-known profile is worse
-than no reversion. On the read path `Mind.read(history=N)` puts `snapshot: null` and a static
-`history_error` on that one entry and returns the rest, because one unreadable revision is not a
-reason to withhold the ninety-nine beside it that are fine.
-
-The patch format is a keyed diff of depth two — `["set", [k] or [k1, k2], value]` and
-`["del", path]`, with lists replaced whole. It is deliberately not general. Depth two is where
-the measured saving is (about 95 % against the full snapshots; a top-level diff gives 73 % and a
-fully recursive one only 2 MB more), and anything deeper buys little and costs a parser no
-reviewer can hold in their head.
-
-The parent of a row is the row **before** it, not `revision - 1`. The mind's revision has always
-been allowed to move without a row here, so a chain built on arithmetic would break on the first
-hole; one built on "the previous row for this scope" does not.
+History records what was stored and when. It does not hash subjective content or treat agreement
+with an old checksum as permission to read, change, or remember it. Legacy checksum fields are
+ignored. Missing database parents and malformed patch operations remain structural read errors.
 """
 
 from __future__ import annotations
@@ -44,15 +10,14 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-from eventmem.core.db import Conflict, digest, dumps
+from eventmem.core.db import Conflict, dumps
 
 # A row written as a patch says so in its own data. Everything without this marker is a full
 # snapshot: the rows production already holds, and the checkpoints the patch writer keeps
 # among them.
 PATCH_FORMAT = 2
 # The only keys a patch row's `snapshot` may carry. That stub is not a state — it exists so the
-# previous release's dedupe query and the evidence-key table still find what they look for in a
-# row they have no code to rebuild.
+# legacy readers can identify its revision. Old evidence-key shims remain readable.
 SHIM_KEYS = frozenset({"last_evidence_key", "revision"})
 # How deep a keyed path may go. Two, measured; see above.
 MAX_DEPTH = 2
@@ -60,7 +25,7 @@ MAX_DEPTH = 2
 # checkpoint policy keeps real chains two orders of magnitude below it.
 MAX_CHAIN = 1000
 # What every refusal in here carries. One code for every cause on purpose: whether the parent was
-# missing or its hash was wrong is an operator's question, and the caller's answer is the same.
+# missing or its patch malformed is an operator's question, and the caller's answer is the same.
 REBUILD_FAILED = "history-rebuild-failed"
 
 # --- what the writer is told -------------------------------------------------------------------
@@ -94,12 +59,7 @@ def _unreadable(at=None):
     )
 
 
-def row_hash(state) -> str:
-    """The digest a row records as `state_hash`: sha256 over the canonical serialization.
 
-    Canonical because `dumps` sorts keys and fixes the separators, so a rebuilt document hashes to
-    the stored value regardless of the order the patches happened to put its keys back in."""
-    return digest(state)
 
 
 def is_patch(data) -> bool:
@@ -116,16 +76,9 @@ def snapshot_of(data):
 
 
 def snapshot_row(payload, state):
-    """What a full-snapshot row stores.
+    """A request and the state it stored, without a content proof."""
+    return {"request": payload, "snapshot": state}
 
-    The request and the snapshot are exactly what they have always been, so the previous release
-    reads this row without noticing anything. `state_hash` is the one addition, and it is what
-    makes every later rebuild checkable at all: a row written before the release that introduced the hash carries none, so
-    nothing can be said about it beyond that it parsed."""
-    return {"request": payload, "snapshot": state, "state_hash": row_hash(state)}
-
-
-# --- the diff ------------------------------------------------------------------------------
 
 def diff(base, target, *, depth=MAX_DEPTH):
     """What has to happen to `base` for it to become `target`, as keyed operations.
@@ -145,10 +98,8 @@ def alike(left, right) -> bool:
 
     Where they are not the same object, equality is not enough to skip a key. Python reads `1`,
     `1.0` and `True` as one value; JSON writes three different things. A diff that took `==` for
-    an answer would leave the older of the two in the rebuilt document, which is a state that
-    hashes to something its row never claimed — the whole history would fail verification one
-    revision after such a value first appeared, and the cause would be invisible in the patch,
-    because the patch would be the one place it is not mentioned."""
+    an answer would leave the older of the two in the rebuilt document and silently lose the
+    changed JSON type. The patch therefore records type changes as well as value changes."""
     if left is right:
         return True
     if type(left) is not type(right):
@@ -190,8 +141,7 @@ def _apply(state, patch, *, at=None):
     does not pay for a second copy of a nine-hundred-kilobyte document at every step.
 
     Every shape this does not recognise is a refusal rather than a best effort. A patch that half
-    applies leaves a document that looks like a state and is not one, and the hash check after it
-    would only tell us so once the damage was already in someone's hands."""
+    applies would leave a document that looks like a state but misses part of its recorded change."""
     if not isinstance(patch, list):
         _unreadable(at)
     for op in patch:
@@ -219,14 +169,8 @@ def _apply(state, patch, *, at=None):
 
 # --- reading it back -----------------------------------------------------------------------
 
-def verify(state, expected, *, at=None):
-    """Hand back `state` only when its canonical bytes hash to what the row recorded.
-
-    `expected` is None for every row written before that release. There is nothing to check against
-    those and nothing is claimed about them: they are trusted exactly as far as they were before
-    this module existed, and no further."""
-    if expected is not None and row_hash(state) != expected:
-        _unreadable(at)
+def verify(state, expected=None, *, at=None):
+    """Legacy caller compatibility: old checksum arguments do not gate historical state."""
     return state
 
 
@@ -246,19 +190,7 @@ def _data(conn, scope, revision):
 
 
 def materialize(conn, scope, revision, *, data=None, listing=False):
-    """The verified state as of `revision`.
-
-    Walk back to the nearest row that carries a whole document, then forward again applying what
-    each row in between says changed, checking the hash at every step. `data` is the row's already
-    parsed contents where the caller has them, which saves reading the largest column twice.
-
-    `listing` narrows one check, and only one. A row that carries its own whole state and is being
-    read for itself — the hundred entries of a history view — is taken at the word of its columns:
-    the document says which revision it belongs to, and that is checked, but its bytes are not
-    hashed. The moment anything is rebuilt *through* that document it is hashed again, because
-    then it is not an answer but the ground under one. Sweeping every row belongs to
-    `history-verify`, which is an operator's command and says what it could not check; it does not
-    belong on the path a reply is waiting behind."""
+    """Follow existing database revisions and apply the recorded changes."""
     chain, at = [], revision
     data = _data(conn, scope, at) if data is None else data
     while is_patch(data):
@@ -270,32 +202,9 @@ def materialize(conn, scope, revision, *, data=None, listing=False):
     state = snapshot_of(data)
     if state is None:
         _unreadable(at)
-    known = data.get("state_hash")
-    if chain or not listing:
-        verify(state, known, at=at)
-    for index, (at, step) in enumerate(reversed(chain)):
-        wanted = step.get("base_hash")
-        if wanted is not None:
-            if known is None:
-                known = row_hash(state)
-            if known != wanted:
-                # The parent is readable and is not the one this patch was computed against. That
-                # is the case the checkpoint policy exists to end, not one to paper over.
-                _unreadable(at)
+    for at, step in reversed(chain):
         state = _apply(state, step["patch"], at=at)
-        known = step.get("state_hash")
-        # Each step's recorded hash is compared with the next step's `base_hash` above, which
-        # costs nothing and is what says the chain is the chain it claims to be. Hashing the
-        # document itself is what costs, and under `listing` it is paid once, on the answer: a
-        # step whose bytes are wrong gives a final document whose bytes are wrong, and that is
-        # the one this row is being asked for.
-        if not listing or index == len(chain) - 1:
-            verify(state, known, at=at)
     if state.get("revision") not in (None, revision):
-        # A row written before the release that introduced the hash carries none, so the only thing that can be checked
-        # about it is that the document it holds says it belongs to the revision it was filed
-        # under. Every row in production does. A document with no revision of its own — another
-        # table's history, later — is not asked for one.
         _unreadable(revision)
     return state
 
@@ -320,7 +229,7 @@ def preceding(conn, scope, revision):
 
 
 def parent(conn, scope, revision):
-    """The same row, as its revision and its verified state.
+    """The same row, as its revision and its reconstructed state.
 
     Both halves, because both callers need both: a reader wants the document, and a writer wants
     the number to record as the patch's `base` as well as the document to compute it against. One
@@ -330,7 +239,7 @@ def parent(conn, scope, revision):
 
 
 def before(conn, scope, revision):
-    """The verified state as the row before `revision` left it."""
+    """The reconstructed state as the row before `revision` left it."""
     return parent(conn, scope, revision)[1]
 
 
@@ -356,7 +265,7 @@ def entries(conn, scope, limit):
     """The last `limit` revisions, in the shape `read(history=N)` has always returned.
 
     The keys are the six a caller already knows. Nothing about how a row was stored appears here:
-    `format`, `base`, `patch` and the hashes are this module's business, and a projection that
+    `format`, `base` and `patch` are this module's business, and a projection that
     leaked them would make the storage format part of the contract. A revision that cannot be
     rebuilt is the single exception — it says so, in a static code, and the others still arrive."""
     found = []
@@ -402,43 +311,23 @@ def entries(conn, scope, limit):
 
 
 def canonical(state) -> str:
-    """The bytes a snapshot is stored and hashed as. The archive and the compaction check compare
-    against this, so there is one answer to "what should this row say" and it lives here."""
+    """The serialization used to store or export a state document."""
     return dumps(state)
 
 
 def shape_of(data) -> str:
-    """What a parsed row is, by the only three things that decide it.
-
-    `patch` says what changed. `checkpoint` carries a whole state and the hash to check it by —
-    which a row this release wrote with the flag off does too, and it serves the same purpose for
-    the reader, so it is not given a name of its own. `legacy` carries a whole state and no hash:
-    every row production already holds."""
     if not isinstance(data, dict):
         return "unreadable"
     if is_patch(data):
         return "patch"
-    return "checkpoint" if data.get("state_hash") else "legacy"
+    return "checkpoint" if data.get("format") == PATCH_FORMAT else "legacy"
 
 
 def sweep(conn, scope):
-    """Every row of this scope's history, oldest first, and what can be said about each one.
-
-    One pass, carrying the state forward. Rebuilding each revision from its own checkpoint would
-    read the same patch fifty times over; here each row is one step from the row before it, which
-    is the order they were written in and the order they verify in.
-
-    Three verdicts, and the middle one is the point of having three. **verified** means the bytes
-    hash to what the row claims. **failed** means they do not, or the row will not parse, or the
-    patch does not fit what it says it was computed against. **unverifiable** means the row was
-    written before this release and carries no hash at all: there is nothing to check it against,
-    and saying so is the only honest thing that can be said about eight hundred and seventy rows
-    that are otherwise perfectly readable. A caller that folds those into the verified count is
-    reporting a clean history it never looked at."""
-    state = known = previous = None
+    """Read every recorded revision; report readability, never content consistency proof."""
+    state = previous = None
     for row in conn.execute(
-        "SELECT revision,kind,data,LENGTH(data) AS bytes FROM mind_events WHERE scope=? ORDER BY revision",
-        (scope,),
+        "SELECT revision,kind,data,LENGTH(data) AS bytes FROM mind_events WHERE scope=? ORDER BY revision", (scope,)
     ):
         revision = row["revision"]
         found = {"revision": revision, "kind": row["kind"], "bytes": row["bytes"]}
@@ -446,87 +335,46 @@ def sweep(conn, scope):
             data = json.loads(row["data"])
         except ValueError:
             data = None
-        if not isinstance(data, dict):
-            state = known = None
-            previous = revision
-            yield {**found, "shape": shape_of(data), "verdict": "failed"}
-            continue
         found["shape"] = shape_of(data)
+        if not isinstance(data, dict):
+            state, previous = None, revision
+            yield {**found, "verdict": "failed"}
+            continue
         if is_patch(data):
             carried = isinstance(data.get("snapshot"), dict) and SHIM_KEYS.issuperset(data["snapshot"])
             found.update(depth=chain_depth(data), shim=carried)
-            wanted = data.get("base_hash")
-            usable = state is not None and data.get("base") == previous
-            if usable and wanted is not None:
-                # Hashing the row below is paid for here and nowhere else: a store with no patch
-                # rows in it yet — which is every store until the flag goes on — never hashes a
-                # document it is only carrying forward.
-                known = row_hash(state) if known is None else known
-                usable = known == wanted
-            try:
-                # The cheap step where the chain is intact, and a full rebuild where it is not —
-                # a row after a break is answered on its own terms rather than blamed for the
-                # break, and a row whose `base` points somewhere unexpected is followed there.
-                state = _apply(state, data["patch"]) if usable else materialize(conn, scope, revision, data=data)
-                known = row_hash(state)
-                verdict = "verified" if known == data.get("state_hash") else "failed"
-            except Conflict as error:
-                if error.code != REBUILD_FAILED:
-                    raise
-                verdict = "failed"
-        else:
-            whole, claimed = snapshot_of(data), data.get("state_hash")
-            if whole is None or whole.get("revision") not in (None, revision):
-                state, verdict = None, "failed"
-            elif claimed is None:
-                # Every row production already holds. It is trusted exactly as far as it was
-                # before this module existed, which is far enough to build on and not far enough
-                # to call verified.
-                state, verdict = whole, "unverifiable"
-            else:
-                state = whole
-                verdict = "verified" if row_hash(whole) == claimed else "failed"
-            known = claimed if state is not None else None
-        if verdict == "failed":
-            state = known = None
+        try:
+            state = (_apply(state, data["patch"], at=revision)
+                     if is_patch(data) and state is not None and data.get("base") == previous
+                     else materialize(conn, scope, revision, data=data))
+            if state.get("revision") not in (None, revision):
+                _unreadable(revision)
+            verdict = "readable"
+        except Conflict as error:
+            if error.code != REBUILD_FAILED:
+                raise
+            state, verdict = None, "failed"
         previous = revision
         yield {**found, "verdict": verdict}
 
 
-# --- writing it down -------------------------------------------------------------------------
-
 def shim(state):
-    """The two keys a patch row puts where a whole state used to be.
-
-    Not a state and not a summary of one: the previous release's dedupe guard looks for the
-    evidence key at `$.snapshot.last_evidence_key`, and the evidence key table can be rebuilt from
-    the same place. Rolled back, that release finds both of them here and goes on working against
-    rows it has no code to rebuild. `last_evidence_key` is written even when the state has none —
-    a mind that has not yet appraised anything — because absent and null read the same through
-    `json_extract`, and writing it always keeps the two keys of the shim visible as two."""
-    return {"last_evidence_key": state.get("last_evidence_key"), "revision": state["revision"]}
+    """The database revision carried by a patch instead of a whole snapshot."""
+    return {"revision": state["revision"]}
 
 
 def checkpoint_row(payload, state, *, healed=None, state_hash=None):
-    """A whole state again, and the foot every patch after it stands on.
-
-    `healed` says the writer chose this rather than reached it: the row before could not be read
-    or did not hash to what it claims, or the patch computed against it did not rebuild this
-    state. Either way the chain from here on is sound again, and the reason stays in the row,
-    because the only place a write transaction could put a metric is a second connection it is
-    itself holding the lock against."""
-    row = {"request": payload, "format": PATCH_FORMAT, "snapshot": state,
-           "state_hash": state_hash or row_hash(state)}
+    """A whole state. Legacy checksum input is accepted and ignored."""
+    row = {"request": payload, "format": PATCH_FORMAT, "snapshot": state}
     if healed:
         row["healed"] = healed
     return row
 
 
-def patch_row(payload, state, *, base, base_hash, depth, since, patch, state_hash):
-    """What changed, what it changed from, and how to tell whether the answer came out right."""
-    return {"request": payload, "format": PATCH_FORMAT, "base": base, "base_hash": base_hash,
-            "depth": depth, "since": since, "patch": patch, "state_hash": state_hash,
-            "snapshot": shim(state)}
+def patch_row(payload, state, *, base, depth, since, patch, base_hash=None, state_hash=None):
+    """Recorded changes linked to an existing database parent revision."""
+    return {"request": payload, "format": PATCH_FORMAT, "base": base,
+            "depth": depth, "since": since, "patch": patch, "snapshot": shim(state)}
 
 
 def keeps_whole(depth, since, weight, size) -> bool:
@@ -553,69 +401,27 @@ def writes_patches(conn, scope) -> bool:
 
 
 def row_for(conn, scope, state, kind, payload, *, loaded=None):
-    """The row this revision stores, in whichever shape this store is writing.
-
-    With the flag off this is the row the previous release wrote, key for key, so a store that
-    never turns it on cannot tell this module is here. With it on, most rows become a keyed diff
-    against the row before them and the rest are checkpoints — because a chain that only ever
-    grows is a chain whose oldest end nobody can afford to read.
-
-    A checkpoint is written when the kind is one that must answer for itself, when the chain under
-    this row would reach `CHECKPOINT_DEPTH`, when the patches since the last whole state have cost
-    as much as one, when this single patch would cost more than half of one, and when anything at
-    all is wrong with the row before. That last case is the one that matters: the writer never
-    tries to repair a broken chain, and it never builds on one either. It writes a whole state,
-    says so in the row, and everything after that stands on the new ground.
-
-    `loaded` is the text the command read the state from. Almost always that is the parent row's
-    own state, and one hash says so, which is the difference between a write that walks forty
-    rows back to a checkpoint and one that reads a single row. What that shortcut cannot see is a
-    break further down the chain: it proves this row's ground, not the ground under it. So the
-    self-heal answers for a parent that is gone, unreadable, or not the state this revision was
-    computed from — and `history-verify` is what finds a break deeper than that. The repair for
-    one is an operator's: with the flag off for a single revision the next row is a whole state
-    again, which is a checkpoint by another name, and the chain starts over from there."""
+    """Store a snapshot or bounded changes, without calculating or comparing content hashes."""
     if compacting(conn):
-        raise Conflict(
-            "History is being compacted; no revision can be written until it finishes",
-            kind="runtime", code=COMPACTING,
-        )
+        raise Conflict("History is being compacted; no revision can be written until it finishes",
+                       kind="runtime", code=COMPACTING)
     if not writes_patches(conn, scope):
         return snapshot_row(payload, state)
     if kind in CHECKPOINT_KINDS:
         return checkpoint_row(payload, state)
     try:
         at, data = preceding(conn, scope, state["revision"])
-        known = data.get("state_hash")
-        if loaded is not None and known is not None and digest(loaded.encode()) == known:
-            before = json.loads(loaded)
-        else:
-            before = materialize(conn, scope, at, data=data)
-            known = known if known is not None else row_hash(before)
-    except Conflict as error:
-        if error.code != REBUILD_FAILED:
+        prior = json.loads(loaded) if loaded is not None else None
+        before = (prior if isinstance(prior, dict) and prior.get("revision") == at
+                  else materialize(conn, scope, at, data=data))
+    except (ValueError, Conflict) as error:
+        if isinstance(error, Conflict) and error.code != REBUILD_FAILED:
             raise
         return checkpoint_row(payload, state, healed="parent")
-    blob = canonical(state).encode()
-    state_hash, size = digest(blob), len(blob)
+    size = len(canonical(state).encode())
     patch = diff(before, state)
     weight = len(dumps(patch).encode())
-    since = chain_bytes(data) + weight
-    depth = chain_depth(data) + 1
+    since, depth = chain_bytes(data) + weight, chain_depth(data) + 1
     if keeps_whole(depth, since, weight, size):
-        return checkpoint_row(payload, state, state_hash=state_hash)
-    # The last thing checked is the only thing that matters: does this patch, against this parent,
-    # give back exactly the document being stored. `before` is this function's own copy and is
-    # spent here. A patch that does not reproduce the state is not stored as one, ever — and a
-    # writer that could not write at all would be worse than one that writes a larger row, so the
-    # refusal `_apply` raises is a reason to keep the whole state rather than to fail the commit.
-    try:
-        rebuilt = row_hash(_apply(before, patch)) == state_hash
-    except Conflict as error:
-        if error.code != REBUILD_FAILED:
-            raise
-        rebuilt = False
-    if not rebuilt:
-        return checkpoint_row(payload, state, healed="patch", state_hash=state_hash)
-    return patch_row(payload, state, base=at, base_hash=known, depth=depth, since=since,
-                     patch=patch, state_hash=state_hash)
+        return checkpoint_row(payload, state)
+    return patch_row(payload, state, base=at, depth=depth, since=since, patch=patch)

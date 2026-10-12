@@ -18,7 +18,7 @@ from kin_mind.state import AffectiveEvent, DesireChange
 
 pytest_plugins = ("test_kin_mind",)
 
-UNCHANGED_ROW = {"request", "snapshot", "state_hash"}
+UNCHANGED_ROW = {"request", "snapshot"}
 
 def patches(mind, on=True):
     MemoryContinuity(mind).configure({"history_patches": on})

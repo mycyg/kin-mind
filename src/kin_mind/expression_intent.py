@@ -8,12 +8,15 @@ that the material is real: evidence of this same evaluation, traits the ledger c
 revision it showed, concerns this scope holds. What the stance says is Kin's own, and it is never
 quoted: it says how to be present, and the persona still decides the words.
 
+The stance is subjective and needs no explanation or factual citation. Leaving evidence_ids empty
+is valid; any ids Kin elects to cite are checked without making them proof of her psychological cause.
+
 An intent is used while it is fresh and never after. A new owner message is deliberately not what
 ends it: the reply to a message is written before the appraisal of that message, so an intent that
 expired on arrival could never be used at all. It ends when its own minutes run out, when the
 evidence under it moved, when a trait it cited was revised or revoked, when continuity is not
-active, or when the persona changed. In every one of those cases the callers fall back to the
-table, byte for byte.
+active. An approved persona version is context; edits to its text do not automatically expire
+Kin's subjective stance. In the expiry cases callers fall back to the table.
 """
 
 from __future__ import annotations
@@ -34,13 +37,13 @@ from .traits import EFFECTIVE, Traits, installed
 SECTION = SWITCH = "expression_intent"
 # One current intent per scope, and every accepted one kept readable beside it.
 SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS mind_expression_intents("
+    ("CREATE TABLE IF NOT EXISTS mind_expression_intents("
     " scope TEXT PRIMARY KEY,id TEXT NOT NULL,at TEXT NOT NULL,valid_until TEXT NOT NULL,"
-    " data TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS mind_expression_intent_log("
-    " id TEXT PRIMARY KEY,scope TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS mind_expression_intent_history"
-    " ON mind_expression_intent_log(scope,at)",
+    " data TEXT NOT NULL)"),
+    ("CREATE TABLE IF NOT EXISTS mind_expression_intent_log("
+     " id TEXT PRIMARY KEY,scope TEXT NOT NULL,at TEXT NOT NULL,data TEXT NOT NULL)"),
+    ("CREATE INDEX IF NOT EXISTS mind_expression_intent_history"
+     " ON mind_expression_intent_log(scope,at)"),
 )
 # Why the wording falls back to the table. Static reasons; no row is ever deleted for one.
 NO_INTENT, EXPIRED, INACTIVE = "no-intent", "intent-expired", "continuity-inactive"
@@ -57,8 +60,8 @@ def _ensure(conn):
 
 
 def identity(persona):
-    """What the intent was stated under. A persona contract that changed voids it."""
-    return digest(persona) if persona else "none"
+    """The approved persona version is context, never a hash proof of subjective stance."""
+    return persona.get("version") if persona else None
 
 
 # --- what the host will vouch for -------------------------------------------------------------
@@ -154,8 +157,6 @@ def stale_reason(intent, at, *, evidence_fresh=True, traits_current=True,
         return INACTIVE
     if timestamp(at) > timestamp(intent["valid_until"]):
         return EXPIRED
-    if intent.get("persona") != identity(persona):
-        return PERSONA
     if not evidence_fresh:
         return EVIDENCE
     if not traits_current:

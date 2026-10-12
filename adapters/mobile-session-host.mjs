@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
 import {SessionManager,candidateVerificationReady} from './session-manager.mjs';
 import {NativeWindow,checkpointMarker,nativePressureRuntime} from './native-window.mjs';
 import {NativeContextDelivery} from './context-delivery.mjs';
@@ -11,13 +10,12 @@ import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
 import {holdsSession} from './input-ledger.mjs';
 import {switchCodexModel,runtimeProfile,profileMatches} from './codex-models.mjs';
 import {sameInstructionBinding,verifyCompanionInstructions} from './instruction-evidence.mjs';
-const digest=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 const SAFE_PROVIDER=/^[A-Za-z0-9_-]{1,120}$/;
 
 export function sessionReviewCursors(cursors,inputs) {
   // Assessment turns change the execution snapshot, not their own review cause.
-  return {...cursors,inputs:digest(inputs.filter(i=>i.kind!=='assessment').map(i=>[i.id,i.state,i.hash]))};
+  return {...cursors,inputs:inputs.filter(i=>i.kind!=='assessment').map(i=>[i.id,i.state,i.revision??i.version??0])};
 }
 
 export function ownerSessionWork(session,assessmentToken) {
@@ -43,16 +41,16 @@ export function candidateConfigForRuntime(value,{catalogFile,gateway,companionIn
   const profile=candidateRuntimeProfile(value),config={model_catalog_json:catalogFile};
   const companion=verifyCompanionInstructions(companionInstructions);
   if(companion.enabled)config.model_instructions_file=companion.modelInstructionsFile;
-  let modelProvider=profile.provider,endpointSha256=null;
+  let modelProvider=profile.provider,endpoint=null;
   if(profile.providerKind==='gateway') {
     if(!gateway?.baseUrl||!gateway?.token)throw Error('Candidate gateway profile is unavailable');
     // The router's provider is the serving identity. The isolated candidate has
     // a separate local provider alias whose endpoint is explicitly bound here;
     // equal names are neither required nor treated as verification.
-    modelProvider='kin_session_gateway';endpointSha256=digest(gateway.baseUrl);
+    modelProvider='kin_session_gateway';endpoint=gateway.baseUrl;
     config['model_providers.'+modelProvider]={name:'Kin session gateway',base_url:gateway.baseUrl,env_key:'KIN_SESSION_GATEWAY_TOKEN',wire_api:'responses',requires_openai_auth:false};
   }
-  const providerBinding={sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,launchProvider:modelProvider,endpointSha256};
+  const providerBinding={sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,launchProvider:modelProvider,endpoint};
   return {profile,providerBinding,modelProvider,reasoningEffort:profile.reasoningEffort,
     fastMode:profile.serviceTierPreference==='fast'?'on':'off',config,
     developerInstructions:companion.enabled?companion.developerInstructions:undefined,
@@ -68,9 +66,10 @@ export function currentCheckpoint(state){return state.restorePending&&state.rest
  * Keep the public context body and dependency items out of that registry. */
 export function bindAcceptedPrivateContext({bridge,contextToken,source,receipt}) {
   if(receipt?.state!=='accepted')throw Error('Restore receipt remains unconfirmed');
-  const identity={id:source?.id,marker:source?.marker,text_hash:source?.text_hash,session:source?.session,epoch:source?.epoch};
-  if(!identity.id||!identity.marker||!identity.text_hash||!identity.session||!identity.epoch||
-    receipt.id!==identity.id||receipt.marker!==identity.marker||receipt.text_hash!==identity.text_hash||
+  const identity={id:source?.id,marker:source?.marker,session:source?.session,epoch:source?.epoch,
+    ...(receipt.native_item_id?{native_item_id:receipt.native_item_id}:{})};
+  if(!identity.id||!identity.marker||!identity.session||!identity.epoch||
+    receipt.id!==identity.id||receipt.marker!==identity.marker||
     receipt.session!==identity.session||receipt.epoch!==identity.epoch)
     throw Error('Restore accepted receipt identity mismatch');
   if(typeof bridge?.bindPrivateContext!=='function'||bridge.bindPrivateContext(contextToken,identity)!==true)
@@ -142,10 +141,12 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   const initial=await routing.inspect();
   if(!initial.known||!initial.threadId||!initial.nativeSessionId)throw Error('Native session identity unverified');
   let reader,readerId,initialScan=true,closed=false,running=false,writtenObservation=null;
-  // The observation a review reads, written when it changes rather than every minute.
+  // The observation a review reads, written when the manager records a new
+  // observation identity or time, rather than hashing its private recent text.
   const writeObservation=(observation=manager.state.observation)=>{
-    const written=observation&&digest(observation);
-    if(written&&written!==writtenObservation){atomicJson(observationFile,observation);writtenObservation=written;}
+    if(observation&&(observation.id!==writtenObservation?.id||observation.at!==writtenObservation?.at)) {
+      atomicJson(observationFile,observation);writtenObservation={id:observation.id,at:observation.at};
+    }
   };
   const native=new NativeCandidate({command:config.codex_command,cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
     configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:candidateCatalogFile(config),gateway:routing.gateway,companionInstructions}),
@@ -158,7 +159,8 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const snapshot=await mindCall('session-snapshot',{pending,tasks,foreground});
     const outstanding=inputs.filter(holdsSession);
     snapshot.inputStates=inputs.slice(-24).map(i=>({id:i.id,state:i.state,taskId:i.taskId,at:i.at}));
-    snapshot.cursors={...snapshot.cursors,inputs:digest(inputs.map(i=>[i.id,i.state,i.hash])),tasks:digest(tasks),config:state.configRevision??0};
+    snapshot.cursors={...snapshot.cursors,inputs:inputs.map(i=>[i.id,i.state,i.revision??i.version??0]),
+      tasks:tasks.map(task=>[task.id,task.inputVersion,task.status]),config:state.configRevision??0};
     return {...snapshot,reviewCursors:sessionReviewCursors(snapshot.cursors,inputs),tasks,inputs:outstanding,notices:Object.values(state.notices),contactRunning:Boolean(bridge.mindHost?.contactRunning)};
   };
   const inspect=async()=>{
@@ -263,20 +265,19 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         // freeze neither starts; the first tick after the thaw prepares them.
         if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe)await manager.maintained('restore-checkpoint',async()=>{
           const {checkpoint:cp}=await manager.preparedCheckpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
-          if(cp.complete&&digest(snapshot.cursors)===digest((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
+          if(cp.complete&&JSON.stringify(snapshot.cursors)===JSON.stringify((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
         });
         if(snapshot.manifestVersion&&preparation.safe){
-          const key=digest([manager.fence().generation,snapshot.cursors]);
+          const key=JSON.stringify([manager.fence().generation,snapshot.cursors]);
           if(manager.state.rollingCursor!==key)await manager.maintained('rolling-checkpoint',async()=>{
             const cp=await buildCheckpoint({snapshot,binding:manager.fence(),budget:router.tasks().length?4000:manager.state.config.restoreBudget,allow_model:false,shadow:true});
             manager.state.rollingCheckpoint=cp;manager.state.rollingCursor=key;manager.save('rolling-manifest-prepared',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});
           });
         }
         // The judgment arrives with the snapshot the tick reads anyway (K3-04, DB1-03).
-        const result=await manager.tick({runtime,context:snapshot}),{checkedAt,...previous}=manager.state.lastTick??{};
+        const result=await manager.tick({runtime,context:snapshot});
         writeObservation();
         manager.state.lastTick={...result,checkedAt:new Date().toISOString()};
-        if(digest(previous)!==digest(result))manager.save('tick');
         recordStatus({sessionManagement:api.view()});
       }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.name,checkedAt:new Date().toISOString()}});}
       finally{running=false;}
@@ -304,10 +305,10 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         if(prepared.state==='incomplete')throw Error('Restore envelope exceeds budget');
         const receipt=await background.deliver(prepared);
         bindAcceptedPrivateContext({bridge,contextToken,source:prepared,receipt});
-        manager.state.restoration={id:prepared.id,state:'complete',checkpointId:cp.id,receipt:{state:receipt.state,textHash:receipt.text_hash}};
+        manager.state.restoration={id:prepared.id,state:'complete',checkpointId:cp.id,receipt:{state:receipt.state,...(receipt.native_item_id?{native_item_id:receipt.native_item_id}:{})}};
         manager.state.restorePending=false;manager.state.restoreRequired=false;manager.save('manifest-restore-complete');return;
       }
-      const operationId='restore:'+digest([cp.id,manager.state.restoreEpoch]);
+      const operationId='restore:'+cp.id+':'+manager.state.restoreEpoch;
       let op=manager.state.restoration;
       const marker='kin-checkpoint:'+operationId;
       let proof=await checkpointMarker(runtime.rolloutPath,marker);

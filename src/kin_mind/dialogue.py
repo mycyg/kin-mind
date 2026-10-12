@@ -128,7 +128,13 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
             except (Conflict, Missing, KeyError):
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
-            item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "state", "message_id", "input_id", "bubble_id") if k in event}
+            item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "state", "message_id", "input_id", "bubble_id",
+                                          "conversation_id", "platform_message_id", "reply_to_message_id", "root_message_id", "thread_id", "reply_context", "reply_resolution") if k in event}
+            resolution = event.get("reply_resolution") or {}
+            if resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:
+                candidate = resolution["candidates"][0]
+                item.update(reply_share_id=candidate["share_id"], reply_bubble_id=candidate["bubble_id"],
+                            activity_refs=candidate.get("activity_refs", []))
             item.update(seq=row["seq"], role=role, occurred_at=utc_time(event["at"]),
                         received_at=utc_time(event.get("received_at") or (source[0] if source else None)),
                         time_basis=event.get("time_basis", "recorded-event"), historical=bool(event.get("historical")), instruction_authority="historical-data")

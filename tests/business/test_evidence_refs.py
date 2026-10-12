@@ -39,9 +39,9 @@ DROPPED = set(evidence_refs.DROPPED)
 # --- looking at references ---------------------------------------------------------------------------
 
 def refs_in(value, path=()):
-    """Every dict that names a source, a record and a hash, wherever it sits, with its path."""
+    """Every dict that names a source and record, wherever it sits, with its path."""
     if isinstance(value, dict):
-        if all(isinstance(value.get(k), str) for k in ("source_id", "record_id", "hash")):
+        if all(isinstance(value.get(k), str) for k in ("source_id", "record_id")):
             yield path, value
             return
         for key, item in value.items():
@@ -411,7 +411,7 @@ def legacy(mind, clock):
             elif topic == "topic blanked":
                 ref["metadata"]["title"] = ERASED
             elif topic == "topic tomb":
-                desire["evidence"][0] = {**{k: ref[k] for k in ("source_id", "record_id", "hash", "revision", "authority")},
+                desire["evidence"][0] = {**{k: ref[k] for k in ("source_id", "record_id", "revision", "authority")},
                                          "erased": True}
             elif topic == "topic gone":
                 gone_source = ref["source_id"]

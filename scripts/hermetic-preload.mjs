@@ -145,6 +145,23 @@ function install() {
       if(env.KIN_BLOCKED_PORTS)out.KIN_BLOCKED_PORTS=merged('KIN_BLOCKED_PORTS',',',out.KIN_BLOCKED_PORTS);
       if(env.KIN_PROTECTED_PIDS)out.KIN_PROTECTED_PIDS=merged('KIN_PROTECTED_PIDS',',',out.KIN_PROTECTED_PIDS);
       if(!(out.NODE_OPTIONS??'').includes(self))out.NODE_OPTIONS=`${out.NODE_OPTIONS??''} --import=${self}`.trim();
+      // A rehearsal may route its child after reading the old configuration. Resolve only
+      // explicitly mapped Python import entries, before inspecting the environment actually
+      // passed to the child. Missing targets stay unmapped and are still refused; an existing
+      // directory through a link into production is refused too. No command, cwd or other env
+      // value is rewritten, and no protected-root exemption is added.
+      if(out.PYTHONPATH)out.PYTHONPATH=out.PYTHONPATH.split(path.delimiter).map(entry=>{
+        if(!path.isAbsolute(entry))return entry;
+        for(const [from,to] of parseRemap(out.KIN_REMAP)){
+          if(!path.isAbsolute(from)||!path.isAbsolute(to)||!(entry===from||entry.startsWith(from+'/')))continue;
+          const target=to+entry.slice(from.length);
+          check('child PYTHONPATH',target);
+          try {if(fs.statSync(target).isDirectory())return target;} catch {}
+          break;
+        }
+        check('child PYTHONPATH',entry);
+        return entry;
+      }).join(path.delimiter);
       if(!(out.PYTHONPATH??'').split(':').includes(pyguard))out.PYTHONPATH=out.PYTHONPATH?pyguard+':'+out.PYTHONPATH:pyguard;
       return out;
     };
@@ -179,8 +196,11 @@ function install() {
         let at=1,args=[];
         if(withArgs&&(Array.isArray(values[1])||(values[1]==null&&values.length>2))){args=values[1]??[];at=2;}
         const options=values[at]&&typeof values[at]==='object'?values[at]:null;
-        inspect(name,values[0],args,options,!withArgs||Boolean(options?.shell));
-        if(options?.env){values=[...values];values[at]={...options,env:carry(options.env)};}
+        const effective={...options,env:carry(options?.env??env)};
+        inspect(name,values[0],args,effective,!withArgs||Boolean(options?.shell));
+        values=[...values];
+        if(typeof values[at]==='function')values.splice(at,0,effective);
+        else values[at]=effective;
         return original.apply(this,values);
       }}[name];
       // exec and execFile promisify to {stdout, stderr}; the original helper would bypass the guard.

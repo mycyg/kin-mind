@@ -145,7 +145,7 @@ class OldStore:
     def ref(self, sid):
         with self.engine.db.connect() as conn:
             refs = self.mind._evidence(conn, [sid])
-        return {key: refs[0][key] for key in ("source_id", "record_id", "hash", "revision", "authority")}
+        return {key: refs[0][key] for key in ("source_id", "record_id", "revision", "authority")}
 
     def row(self, table, key, column="data"):
         with self.engine.db.connect() as conn:

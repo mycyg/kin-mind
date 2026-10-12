@@ -8,17 +8,17 @@ the local day from noon to noon (Asia/Singapore), so 23:00 and 03:00 are the sam
 **From what.** What the last 48 hours left behind (`material`): the newest events the appraisals
 recorded in the graph, the newest memory notes and the newest diary entries, at most two of each,
 read the way an experience read reads them. The model is shown short excerpts by their ids; the host
-keeps their references at the versions shown.
+keeps their source and record identities.
 
 **What it is.** 80 to 220 characters, first person, present tense; dream logic is allowed, advice and
 the interpretation of symbols are not (`DREAM_PROMPT`). It is kept as a derived source of its own
 namespace (`kin-dream`) that rests on every piece of material it was offered: a delete of any of it
 takes the dream along, and one that came in before it was stored keeps it from being stored. The
 origin table calls it `kin_dream`: never experience, never evidence (`evidence_classes.never_evidence`),
-never in the text index, never recalled; it is read only where dreams are shown -- `recent` for the
-next idle reviews, `read` for the console and the tool.
+never in the text index or ordinary fact recall; autobiography readers keep its imagined identity --
+`recent` for the next idle reviews, `read` and activity pointers for later conversation.
 
-**Telling.** Nothing here sends anything or brings a dream into a chat. The idle reviews of the next
+**Telling.** Nothing here sends anything. The idle reviews of the next
 day are shown the latest dream (`recent`); whether 小光 hears about it is the contact wish Kin makes
 or does not make, through the ordinary path.
 """
@@ -55,10 +55,11 @@ DREAM_PREFIX = "Kin 的梦（想象出来的，不是发生过的事）：\n"
 DREAM_PROMPT = ("dream 只在休息相位的空闲评估里出现：今晚要不要做梦由你决定，不必每晚都有，大多数夜里留空就好。"
                 "想做时，只从 dream_material 里取材料（最近 48 小时的经历、记忆和日记片段），写 text：80 到 220 个字，"
                 "第一人称、现在时，像刚醒时还记得的那一段；可以不合逻辑、场景跳转、人和事错位。"
-                "不给建议，不解释象征，不写成日记或总结。梦不是发生过的事，不能当作任何记忆、心事、特征或判断的依据。")
+                "不给建议，不解释象征，不写成日记或总结。梦中事件不是发生过的事，不能当作现实事实或特征的证据。"
+                "可以记得自己梦过什么，也可以留下醒后的主观感受。")
 # Said once beside the latest dream, which the next idle reviews are shown.
 RECENT_DREAMS_PROMPT = ("\nrecent_dreams 是你最近做的梦，是想象，不是发生过的事，也不能作为任何证据。"
-                        "可以只放在心里；想讲给小光听时，照常提出 contact 愿望，把想讲的梦写进愿望内容里。梦不会自己发出去。")
+                        "可以只放在心里；想讲给小光听时，照常提出 contact 愿望，带上对应 activity_ref，选想讲的片段和感受。梦不会自己发出去。")
 
 
 def night_start(at):
@@ -156,7 +157,7 @@ def material(conn, mind, at):
     shown.sort(key=lambda item: (item.get("at") or "", item["id"]), reverse=True)
     kept = {}
     for ref in refs:
-        trace = {key: ref[key] for key in ("source_id", "record_id", "hash", "revision") if ref.get(key) is not None}
+        trace = {key: ref[key] for key in ("source_id", "record_id") if ref.get(key) is not None}
         kept[(trace.get("source_id"), trace.get("record_id"))] = trace
     return shown, list(kept.values())
 
@@ -191,7 +192,7 @@ def source_id(mind, event_id):
 def remember(memory, result):
     """Keep a committed dream. The appraisal event is its identity; a replay returns the source it
     stored. It rests on the material it was offered and was written from everything the appraisal
-    was shown: one deleted or changed since, and it is not kept."""
+    was shown: one deleted since, and it is not kept."""
     proposal = (result.get("proposal") or {}).get("dream") or {}
     committed = result.get("dream") or {}
     if not proposal.get("text") or not committed.get("derived_from") or committed.get("source_id") != source_id(memory.mind, result.get("event_id")):
@@ -206,7 +207,8 @@ def remember(memory, result):
         return None
     if kept:
         return engine._source(kept)
-    shown = [ref for ref in result.get("evaluated_sources") or [] if isinstance(ref, dict)]
+    shown = [{key: ref[key] for key in ("source_id", "record_id") if ref.get(key) is not None}
+             for ref in result.get("evaluated_sources") or [] if isinstance(ref, dict)]
     shown += [identifier for identifier in result.get("evaluated_ids") or [] if isinstance(identifier, str)]
     try:
         return engine.receive(SourceInput(
@@ -214,7 +216,8 @@ def remember(memory, result):
             authority="model", kind="diary", title=TITLE, text=DREAM_PREFIX + proposal["text"].strip(),
             metadata={"role": "assistant", "basis": "imagined", "internal": True, "host_event": "dream",
                       "appraisal_event_id": result["event_id"]}),
-            derived_from=committed["derived_from"], shown=shown)
+            derived_from=[{key: ref[key] for key in ("source_id", "record_id") if ref.get(key) is not None}
+                          if isinstance(ref, dict) else ref for ref in committed["derived_from"]], shown=shown)
     except Conflict as error:
         if getattr(error, "code", None) in DERIVED_CONFLICTS:
             return None
@@ -226,7 +229,9 @@ def _entry(engine, row):
         text = engine.source(row["id"], content=True).read_text()
     except (Missing, OSError):
         return None
-    return {"source_id": row["id"], "at": row["occurred_at"], "text": text.split(DREAM_PREFIX, 1)[-1]}
+    from .activities import _ref
+    return {"source_id": row["id"], "at": row["occurred_at"], "text": text.removeprefix(DREAM_PREFIX),
+            "activity_ref": _ref("dream", row), "basis": "imagined", "evidence": False}
 
 
 def recent(mind, at=None):
@@ -234,20 +239,46 @@ def recent(mind, at=None):
     at = at or mind.clock()
     since = (timestamp(at) - timedelta(hours=RECENT_HOURS)).isoformat()
     with mind.engine.db.connect() as conn:
-        row = conn.execute("SELECT id,occurred_at FROM sources WHERE namespace=? AND scope=? AND deleted=0 "
+        row = conn.execute("SELECT * FROM sources WHERE namespace=? AND scope=? AND deleted=0 "
                            "AND julianday(occurred_at)>=julianday(?) ORDER BY occurred_at DESC,id DESC LIMIT 1",
                            (NAMESPACE, mind.scope.key(), since)).fetchone()
     entry = _entry(mind.engine, row) if row else None
     return [entry] if entry else []
 
 
-def read(mind, *, cursor=0, limit=20):
-    """Kin's dreams, newest first, for the console and the tool. Off, nothing is read."""
+def read(mind, *, cursor=0, limit=20, identifier=None, query="", since=None, until=None,
+         detail="original", budget=None):
+    """Dream autobiography remains readable when new dream generation is off.
+
+    `state` describes readability; `generation_enabled` is the separate switch.
+    The old cursor/limit call still reads complete entries. Optional lookup and
+    a token budget provide bounded expansion, without sending or fact recall.
+    """
+    from eventmem.core.db import dumps
+    from eventmem.core.retrieval import tokens
+
+    from .activities import select_activities
+
+    if detail not in {"index", "summary", "original", "full"}:
+        raise ValueError("Dream detail must be index, summary or original")
+    if budget is not None and (not isinstance(budget, int) or budget < 0):
+        raise ValueError("Invalid dream budget")
     with mind.engine.db.connect() as conn:
-        if not enabled(conn, mind.scope.key(), SWITCH):
-            return {"state": "disabled", "dreams": [], "cursor": None}
-        rows = conn.execute("SELECT id,occurred_at FROM sources WHERE namespace=? AND scope=? AND deleted=0 "
-                            "ORDER BY occurred_at DESC,id DESC LIMIT ? OFFSET ?",
-                            (NAMESPACE, mind.scope.key(), limit + 1, cursor)).fetchall()
-    dreams = [entry for entry in (_entry(mind.engine, row) for row in rows[:limit]) if entry]
-    return {"state": "enabled", "dreams": dreams, "cursor": cursor + limit if len(rows) > limit else None}
+        generation = enabled(conn, mind.scope.key(), SWITCH)
+        found = select_activities(mind, kind="dream", identifier=identifier, query=query, since=since, until=until,
+                                  cursor=cursor, limit=limit, detail=detail, conn=conn, historical=True)
+    result = {"state": "enabled", "generation_enabled": generation,
+              "dreams": [], "cursor": found["cursor"], "instruction_authority": "data"}
+    omitted = []
+    for entry in found["activities"]:
+        shown = {key: entry[key] for key in ("source_id", "at", "text", "activity_ref", "basis", "evidence", "superseded", "detail")}
+        candidate = {**result, "dreams": [*result["dreams"], shown]}
+        if budget is None or tokens(dumps(candidate)) + 80 <= budget:
+            result["dreams"].append(shown)
+        else:
+            omitted.append(entry["source_id"])
+    if omitted:
+        result.update(omitted_ids=omitted, next_action="increase_budget_or_read_by_id")
+    if budget is not None:
+        result["tokens"] = tokens(dumps(result))
+    return result

@@ -14,12 +14,11 @@
  *  - Python hears about whole bubbles only. */
 import fs from 'node:fs';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {readJsonFile,writeJsonAtomic,createJsonExclusive,quarantineFile} from './atomic-json.mjs';
 import {acquireLease,inspectLease,removeLease,LeaseLost,LEASE_DEFAULTS} from './state-lease.mjs';
 import {channelContract,classifyReceipt,normalizeReceipt,mayResend,fileReceipts,RECONCILE_FIRST_CODES} from './channel-contract.mjs';
-import {fragmentText,fileFragment,verifyFragments} from './text-fragments.mjs';
+import {fragmentText,fileFragment} from './text-fragments.mjs';
 import {deliveryEvent} from './memory-events.mjs';
 
 export const MANIFEST_SCHEMA=1;
@@ -31,7 +30,6 @@ const TERMINAL_BUBBLES=['accepted','rejected','undeliverable','canceled'];
 const EVENT_FOR={accepted:'accepted',unconfirmed:'unconfirmed',canceled:'canceled',rejected:'canceled',undeliverable:'canceled'};
 const SAFE_ID=/^[A-Za-z0-9_-]{1,160}$/;
 
-const sha256=value=>createHash('sha256').update(value).digest('hex');
 const iso=ms=>new Date(ms).toISOString();
 const terminal=manifest=>TERMINAL_GROUP_STATES.includes(manifest.state);
 const started=bubble=>bubble.fragments.some(f=>f.state!=='unsent');
@@ -53,11 +51,11 @@ const routingBasis=value=>JSON.stringify([
 ]);
 
 /** Stored once in the manifest, never derived again. */
-export function transportId(bubbleId,index,bodySha256){return 'kin-frag-'+sha256(bubbleId+'\0'+index+'\0'+bodySha256).slice(0,48);}
+export function transportId(bubbleId,index){return 'kin-frag-'+bubbleId+'-'+index;}
 
 export function groupIdFor(entries) {
   const batch=entries[0].delivery.memoryBatchId;
-  return typeof batch==='string'&&SAFE_ID.test(batch)?batch:'group-'+sha256(String(batch??entries[0].delivery.id)).slice(0,48);
+  return typeof batch==='string'&&SAFE_ID.test(batch)?batch:'group-'+entries[0].delivery.id;
 }
 
 function bubbleState(bubble) {
@@ -168,8 +166,8 @@ export class TransportManifests {
     if(manifest?.schema!==MANIFEST_SCHEMA||manifest.group_id!==id||!GROUP_STATES.includes(manifest.state)||!Array.isArray(manifest.bubbles)||!manifest.bubbles.length)return false;
     if((Object.hasOwn(manifest,'inputVersion')&&!executionNumber(manifest.inputVersion))||
       (Object.hasOwn(manifest,'turnFence')&&!executionNumber(manifest.turnFence)))return false;
-    return manifest.bubbles.every(b=>typeof b.text==='string'&&Array.isArray(b.fragments)&&BUBBLE_STATES.includes(b.state)&&sha256(b.text)===b.body_sha256&&
-      b.fragments.every(f=>FRAGMENT_STATES.includes(f.state))&&(!b.fragments.length||verifyFragments(b.text,b.fragments)===null));
+    return manifest.bubbles.every(b=>typeof b.text==='string'&&Array.isArray(b.fragments)&&BUBBLE_STATES.includes(b.state)&&
+      b.fragments.every(f=>FRAGMENT_STATES.includes(f.state)));
   }
   /** The manifest that counts: the current file, unless it is unreadable or a
    * lower-generation write landed over a higher one; then `.prev`. A lease
@@ -234,7 +232,7 @@ export class TransportManifests {
     let id=groupIdFor(entries);
     const existing=this.load(id);
     // A batch ID that already names other bubbles: keep both, under separate groups.
-    if(existing&&existing.bubbles.map(b=>b.bubble_id).join('\0')!==ids.join('\0'))id=(id+'-b'+sha256(ids.join('\0')).slice(0,12)).slice(-160);
+    if(existing&&existing.bubbles.map(b=>b.bubble_id).join('\0')!==ids.join('\0'))id='group-'+ids[0];
     else if(existing&&routingBasis(existing)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
     const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
       ...(answeredIds(first.request)?{answered_input_ids:answeredIds(first.request)}:{}),
@@ -246,7 +244,7 @@ export class TransportManifests {
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:'draft',reason:null,leaseGeneration:0,revision:0,review:null,
       created_at:now,updated_at:now,retryAt:0,failures:0,
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
-        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,body_sha256:sha256(text),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
+        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
     const loaded=this.load(id);
     if(loaded) {
       if(routingBasis(loaded)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
@@ -266,23 +264,21 @@ export class TransportManifests {
     for(const [index,bubble] of manifest.bubbles.entries()) {
       if(started(bubble)||!open(bubble))continue;
       const checked=review.checked[index]??{},text=checked.text??bubble.request.text??bubble.text;
-      const bodyHash=sha256(text);
-      if(checked.text_hash&&checked.text_hash!==bodyHash)throw Error('Reviewed reply body does not match its hash');
-      Object.assign(bubble,{text,body_sha256:bodyHash,references:checked.references??bubble.references??[]});
+      Object.assign(bubble,{text,references:checked.references??bubble.references??[]});
       if(!text.trim()){Object.assign(bubble,{state:'undeliverable',reason:'empty-body',fragments:[]});continue;}
-      const plan=bubble.legacy?{kind:'text',fragments:[{index:0,start:0,end:text.length,body_sha256:bubble.body_sha256}]}:fragmentText(text,contract.text);
-      if(plan.kind==='text')bubble.fragments=plan.fragments.map(f=>({transport_id:bubble.legacy?bubble.bubble_id:transportId(bubble.bubble_id,f.index,f.body_sha256),...f,kind:'text',state:'unsent',receipt:null}));
+      const plan=bubble.legacy?{kind:'text',fragments:[{index:0,start:0,end:text.length}]}:fragmentText(text,contract.text);
+      if(plan.kind==='text')bubble.fragments=plan.fragments.map(f=>({transport_id:bubble.legacy?bubble.bubble_id:transportId(bubble.bubble_id,f.index),...f,kind:'text',state:'unsent',receipt:null}));
       else {
         // Unsplittable: the complete bubble goes as one file, with no words of the host's own.
         const whole=fileFragment(text);
-        bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0,whole.body_sha256),...whole,state:'unsent',receipt:null}];
+        bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),...whole,state:'unsent',receipt:null}];
         if(Buffer.byteLength(text,'utf8')>contract.file.maxBytes)Object.assign(bubble,{state:'undeliverable',reason:'file-exceeds-channel-limit'});
       }
     }
     // What this reply is reported to cover of an older group's remainder: IDs only.
     // It is a claim; only this group's own receipts settle it.
     const claims=Array.isArray(review.covers_remainder)?review.covers_remainder.filter(c=>c?.item_id&&c.covered_by).map(c=>({item_id:String(c.item_id),covered_by:String(c.covered_by)})):[];
-    manifest.review={id:review.review_id??null,mode:review.mode??'semantic',checked_hashes:manifest.bubbles.map(b=>b.body_sha256),
+    manifest.review={id:review.review_id??null,mode:review.mode??'semantic',
       ...(claims.length?{covers_remainder:claims}:{}),...(Array.isArray(review.remainder_owed)?{remainder_owed:review.remainder_owed.map(String)}:{})};
     Object.assign(manifest,{state:'reviewed',reason:null,retryAt:0});
   }
@@ -440,7 +436,7 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
       ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{}),
       // Python hears about bubbles from this layer; the transport stays silent.
-      memory:false,bubbleId:bubble.bubble_id,fragment:{index:fragment.index,count:bubble.fragments.length,start:fragment.start,end:fragment.end,body_sha256:fragment.body_sha256}};
+      memory:false,bubbleId:bubble.bubble_id,fragment:{index:fragment.index,count:bubble.fragments.length,start:fragment.start,end:fragment.end}};
     return fragment.kind==='file'?{...base,media:{type:'file',name:fragment.name,data:Buffer.from(body,'utf8')}}:{...base,text:body};
   }
 
@@ -469,6 +465,13 @@ export class TransportManifests {
       if(kind==='absent'||kind==='never-started') {
         const gap=contract.maxSendsPerSecond?Math.ceil(1000/contract.maxSendsPerSecond):0,wait=this.lastSubmitAt===null?0:this.lastSubmitAt+gap-this.clock();
         if(wait>0)await this.sleep(wait);
+        // Reconcile first, then revalidate before any new fragment is submitted.
+        // This preview also covers a begun bubble and keeps its frozen identity.
+        if(bubble.references?.length&&context.review) {
+          const request={...bubble.request,text:bubble.text,references:bubble.references};
+          const verdict=await context.review([request],{frozen:true,source_only:true,pending:[0],groupId:manifest.group_id,sent:this.sentEvidence(manifest)});
+          if(verdict.state!=='ready'){await this.refused(manifest,context,verdict);return 'stop';}
+        }
         const now=this.lastSubmitAt=this.clock(),before={firstSubmitAt:fragment.firstSubmitAt,attempts:fragment.attempts};
         Object.assign(fragment,{state:'submitting',firstSubmitAt:fragment.firstSubmitAt??now,attempts:(fragment.attempts??0)+1});
         Object.assign(manifest,{state:'sending',reason:null,retryAt:0});this.refresh(manifest);
@@ -539,8 +542,8 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
       ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
       ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
-      references:bubble.references,draftId:bubble.draft_id,replyInputId:manifest.reply_id,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
-      ...(kind==='accepted'?{messageId:receipts[0]?.messageId}:{})},{channel:manifest.channel});
+      references:bubble.references,draftId:bubble.draft_id,replyInputId:manifest.reply_id,referenceBubbleId:bubble.request.reference_bubble_id,replyBubbleIndex:bubble.request.reply_bubble_index,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
+      ...(kind==='accepted'?{messageId:receipts[0]?.messageId,conversationId:receipts[0]?.conversationId}:{})},{channel:manifest.channel});
     return kind==='accepted'&&receipts.length>1?{...event,message_ids:receipts.map(r=>r.messageId)}:event;
   }
   /** Bubble-level side effects, at least once and in order: release a dead
@@ -728,17 +731,17 @@ export class TransportManifests {
       const items=entry.entries??[{request:entry.request,delivery:entry.delivery,state:entry.state==='unconfirmed'?'unconfirmed':'unsent',receipt:entry.receipt}];
       if(!items.length||items.some(item=>!item?.request||!item.delivery?.id)){skipped.push(name);continue;}
       const ids=items.map(item=>item.delivery.id),now=this.clock();
-      let id=groupIdFor(items).startsWith('group-')?'legacy-'+sha256(name).slice(0,48):groupIdFor(items);
+      let id=groupIdFor(items);
       // Two old files of one batch stay two groups; neither hides the other's bubble.
       const holder=this.load(id);
-      if(holder&&!ids.every(bubbleId=>holder.bubbles.some(b=>b.bubble_id===bubbleId)))id=(id+'-b'+sha256(ids.join('\0')).slice(0,12)).slice(-160);
+      if(holder&&!ids.every(bubbleId=>holder.bubbles.some(b=>b.bubble_id===bubbleId)))id='group-'+ids[0];
       if(!this.load(id)) {
         const reviewed=Boolean(entry.review||entry.checked);
         const bubbles=items.map((item,order)=>{
-          const text=item.delivery.text??item.request.text,body=sha256(text),state={unconfirmed:'submitting',accepted:'accepted'}[item.state]??'unsent';
-          const fragments=reviewed||state!=='unsent'?[{transport_id:item.delivery.id,index:0,start:0,end:text.length,body_sha256:body,kind:'text',state,receipt:normalizeReceipt(item.receipt)}]:[];
+          const text=item.delivery.text??item.request.text,state={unconfirmed:'submitting',accepted:'accepted'}[item.state]??'unsent';
+          const fragments=reviewed||state!=='unsent'?[{transport_id:item.delivery.id,index:0,start:0,end:text.length,kind:'text',state,receipt:normalizeReceipt(item.receipt)}]:[];
           // The old sender already told Python about a bubble it saw accepted.
-          return {bubble_id:item.delivery.id,draft_id:item.request.draft_id,order,request:item.request,text,body_sha256:body,references:item.delivery.references??[],legacy:true,
+          return {bubble_id:item.delivery.id,draft_id:item.request.draft_id,order,request:item.request,text,references:item.delivery.references??[],legacy:true,
             state:'unsent',fragments,...(state==='accepted'?{emitted:{accepted:true}}:{})};
         });
         const firstDelivery=items[0].delivery;
@@ -749,7 +752,7 @@ export class TransportManifests {
           ...(executionNumber(firstDelivery.turnFence)?{turnFence:firstDelivery.turnFence}:{}),
           ...(Object.hasOwn(firstDelivery,'sessionFence')?{sessionFence:firstDelivery.sessionFence}:{}),ownerEpoch:entry.ownerEpoch,
           expected_bubbles:items[0].delivery.expectedBubbles??items.length,state:reviewed?'reviewed':'held',reason:reviewed?null:entry.reason??'share-review-pending',
-          leaseGeneration:0,revision:0,review:reviewed?{id:entry.review?.review_id??null,checked_hashes:bubbles.map(b=>b.body_sha256)}:null,
+          leaseGeneration:0,revision:0,review:reviewed?{id:entry.review?.review_id??null}:null,
           created_at:entry.at??now,updated_at:now,retryAt:entry.retryAt??0,failures:0,origin:'legacy-import',bubbles};
         this.refresh(manifest);
         createJsonExclusive(this.file(id),manifest);

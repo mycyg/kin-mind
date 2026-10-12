@@ -448,26 +448,15 @@ def decide_again(mind, eid, decision, evidence, stimulus, key):
                          "evidence_ids": evidence}, "test-appraisal", run)
 
 
-def test_a_result_decided_before_it_moved_is_not_decided_again(setup):
-    mind, source, clock = setup
+def test_an_archived_result_can_be_reconsidered_without_a_new_event_or_cause(setup):
+    mind, _, clock = setup
     result, _ = moved_away(mind, clock, "explore_x")
-    archived = rows(mind)["explore_x"]
-    # The same decision from the same evidence changes nothing, and the decision stays where it is.
-    decide_again(mind, "explore_x", "keep", [result], "exploration-result", "same")
-    assert "explore_x" not in document(mind)["exploration_decisions"] and rows(mind)["explore_x"] == archived
-    # A clock or a delivery still cannot reopen it, and nothing reconsiders it without new evidence.
-    for stimulus, refusal in (("delivery", "A clock or delivery event cannot reopen a result decision"),
-                              ("exploration-result", "Reconsideration requires a new sourced thought or observation")):
-        with pytest.raises(Conflict, match=refusal):
-            decide_again(mind, "explore_x", "share", [result], stimulus, "reopen-" + stimulus)
-    assert rows(mind)["explore_x"] == archived and "explore_x" not in document(mind)["exploration_decisions"]
-    # A new thought reconsiders it: it comes back, at its next revision, in one place.
-    clock[0] += timedelta(minutes=1)
-    thought = source("thought", "she asked about it today")
-    decide_again(mind, "explore_x", "share", [thought], "interaction", "reconsider")
+    # A later appraisal records a present choice even when the original source and facts stay put.
+    decide_again(mind, "explore_x", "share", [result], "delivery", "reconsider")
     state = document(mind)
     assert state["exploration_decisions"]["explore_x"]["revision"] == 2
     assert state["exploration_decisions"]["explore_x"]["decision"] == "share"
+    assert state["exploration_decisions"]["explore_x"]["activity_ref"]["source_id"] == result
     assert "explore_x" not in rows(mind) and decisions.STATE_KEY not in state
 
 

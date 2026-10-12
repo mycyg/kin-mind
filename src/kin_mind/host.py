@@ -235,6 +235,14 @@ def _dispatch(config, action, request):
         return configure_capacity(engine, request["limit"])
     if action == "share-cancel":
         return memory.sharing.cancel(request["draft_id"])
+    if action == "share-references":
+        with engine.db.connect() as conn:
+            return {"references": memory.sharing.references(conn, reply_id=request.get("reply_id"),
+                bubble_id=request.get("reference_bubble_id"), bubble_index=request.get("reply_bubble_index"))}
+    if action == "sharing-preflight":
+        # Only the concrete send boundary reserves content across channels;
+        # registering a draft's reference alone remains a reversible draft.
+        return memory.sharing.preview(request) if request.get("dry_run") or request.get("dryrun") else memory.sharing.prepare(request)
     if action == "reply-references":
         return memory.sharing.register(request)
     if action == "graph":
@@ -351,6 +359,11 @@ def _dispatch(config, action, request):
             request['receipt_mode'] = True
         # The host's own injection: the one build relevance admission and quiet marks apply to.
         request['automatic'] = True
+        request['activity_recall'] = True
+        # The source pointer follows a wish/draft into the actual context build;
+        # the context reads the original even with graph recall or dreams off.
+        if not request.get('activity_focus') and isinstance(request.get('intent'), dict):
+            request['activity_focus'] = request['intent'].get('activity_ref') or request['intent'].get('exploration_id')
         return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
@@ -371,6 +384,13 @@ def _dispatch(config, action, request):
         return Contexts(mind).read_history("share" if action == "share-history" else "work", **request)
     if action == "configure-continuity":
         return mind.configure_continuity(ContinuityConfig.model_validate(request))
+    if action in {"attention", "continuity-attend", "continuity-finish-attention"}:
+        operation = request.get("op", "finish" if action == "continuity-finish-attention" else "attend")
+        if operation == "attend":
+            return mind.attend(request["input_id"], request.get("attention_for", "owner_message"))
+        if operation == "finish":
+            return mind.finish_attention(request["input_id"])
+        raise ValueError("Attention operation must be attend or finish")
     if action == "concern":
         return mind.manage_concern(ConcernChange.model_validate(request))
     if action == "migrate-continuity":
@@ -732,6 +752,8 @@ RESIDENT_ACTIONS = frozenset({
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
     "context-delivery-metrics", "configure-habits", "reply-choice", "review-due", "liveness-facts",
+    "attention", "continuity-attend", "continuity-finish-attention",
+    "sharing-preflight", "share-references", "share-cancel",
 })
 
 

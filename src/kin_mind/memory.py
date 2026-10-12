@@ -5,7 +5,6 @@ links and summaries; they cannot certify a file operation or a delivery.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import zipfile
@@ -269,44 +268,26 @@ class MemoryAssessment(Model):
         return value
 
 
-def fingerprint_file(path):
-    """Read bytes without executing/extracting archives; ignore ZIP packaging."""
+def observe_file(path, *, artifact_id=None):
+    """Read file metadata without content addressing or an integrity hash."""
     path = Path(path).resolve(strict=True)
     if not path.is_file():
         raise ValueError("Artifact must be a file")
-    h = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    result = {"sha256": h.hexdigest(), "name": path.name, "bytes": path.stat().st_size,
-              "path": str(path)}
+    result = {"name": path.name, "bytes": path.stat().st_size, "path": str(path)}
+    if artifact_id:
+        result["artifact_id"] = artifact_id
     if zipfile.is_zipfile(path):
-        members, total = [], 0
         try:
             with zipfile.ZipFile(path) as archive:
-                infos = [x for x in archive.infolist() if not x.is_dir()]
-                if len(infos) > 10000 or sum(x.file_size for x in infos) > 512 * 1024 * 1024:
-                    result["member_status"] = "budget-exceeded"
-                    return result
-                for info in infos:
-                    member = hashlib.sha256()
-                    with archive.open(info) as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            total += len(chunk)
-                            if total > 512 * 1024 * 1024:
-                                raise ValueError("Archive expanded beyond declared budget")
-                            member.update(chunk)
-                    members.append({"name": info.filename, "sha256": member.hexdigest(), "bytes": info.file_size})
+                result["members"] = [{"name": x.filename, "bytes": x.file_size}
+                                     for x in archive.infolist()[:10000] if not x.is_dir()]
         except (OSError, EOFError, RuntimeError, zipfile.BadZipFile) as error:
-            # A split archive tail may have an EOCD but no local members.
-            # Its byte hash still proves the delivered file; it cannot prove
-            # member contents until the complete archive is available.
             result.update(member_status="unavailable", member_error=type(error).__name__)
-            return result
-        # Member names remain evidence, while the bag of member contents handles
-        # renamed root folders and changed ZIP compression/timestamps.
-        result.update(members=members, members_sha256=digest(sorted((x["sha256"], x["bytes"]) for x in members)))
     return result
+
+
+# Old callers remain source compatible; this performs no fingerprinting.
+fingerprint_file = observe_file
 
 
 # Set in `meta` once the memory index shares its rowids with `mind_memory_nodes` (see graph.py).
@@ -515,6 +496,8 @@ class MemoryContinuity:
         if not self.settings()["records"]:
             return {"state": "disabled"}
         event = dict(request)
+        # Computed route attention belongs to the host's attend transaction.
+        event.pop("attention_marker", None)
         kind = event.get("kind")
         if kind not in {"owner-message", "assistant-message", "artifact-created", "artifact-observed", "delivery", "task-result", "exploration-result"}:
             raise ValueError("Unsupported runtime event")
@@ -522,44 +505,48 @@ class MemoryContinuity:
             raise ValueError("Runtime event requires stable id and observation time")
         timestamp(event["at"])
         event = redact(event)
+        registration_unavailable = False
+        if kind == "delivery" and event.get("reply_input_id") and not event.get("references"):
+            try:
+                with self.engine.db.connect() as conn:
+                    event["references"] = self.sharing.references(conn, reply_id=event["reply_input_id"],
+                        bubble_id=event.get("reference_bubble_id"), bubble_index=event.get("reply_bubble_index"))
+            except (Missing, Conflict):
+                registration_unavailable = True
         event_id = self._id("runtime", event["id"])
-        # Receipt metadata is recorded on the first commit. A delivery retry
-        # may observe a later receipt time without changing the original event.
-        fingerprint = digest({k:v for k,v in event.items() if k not in {"received_at", "time_basis"}})
-        def same_observation(old):
-            if old["digest"] == fingerprint:
-                return True
-            # Older hosts included receipt metadata in the immutable digest.
-            stored, original = json.loads(old["data"]), dict(event)
-            for key in ("received_at", "time_basis"):
-                if key in stored:
-                    original[key] = stored[key]
-                else:
-                    original.pop(key, None)
-            return old["digest"] == digest(original)
+        # A stable event ID names its first transaction receipt.
         with self.engine.db.connect() as conn:
             old = conn.execute("SELECT * FROM mind_runtime_events WHERE id=?", (event_id,)).fetchone()
             if old:
-                if not same_observation(old):
-                    raise Conflict("Runtime event id belongs to different data")
                 return {"id": event_id, "seq": old["seq"], "state": "recorded", **json.loads(old["data"])["receipt"]}
-        artifact = dict(event.get("artifact") or {})
+        artifact = {k: v for k, v in (event.get("artifact") or {}).items()
+                    if k not in {"sha256", "members_sha256"}}
         if artifact.get("path"):
-            observed = fingerprint_file(artifact["path"])
-            if artifact.get("sha256") and artifact["sha256"] != observed["sha256"]:
-                raise Conflict("Observed artifact version changed before ingestion",
-                               expected=artifact["sha256"], actual=observed["sha256"])
+            observed = observe_file(artifact["path"])
             artifact = {**artifact, **observed, **({"name": artifact["name"]} if artifact.get("name") else {})}
-        if artifact and not artifact.get("sha256"):
-            raise ValueError("Artifacts require a host-observed fingerprint")
+        if artifact:
+            artifact["artifact_id"] = artifact.get("artifact_id") or event_id + ":artifact"
         if event.get("state") == "accepted" and not event.get("message_id"):
             raise ValueError("Accepted delivery requires a platform message ID")
         authority = "explicit" if kind == "owner-message" else "model" if kind in {"assistant-message", "exploration-result"} else "operation"
         source_id = event.get("source_id")
+        references_withheld = False
+
+        def withhold_delivery(reason):
+            from .erasure import scrub
+            nonlocal event, references_withheld
+            event = {**scrub(event, (), erase=True), "references": [], "input_source_ids": [], "shown_sources": [],
+                     "inputs_withheld": reason}
+            references_withheld = True
+
+        if registration_unavailable:
+            withhold_delivery("registered-reference-unavailable")
+
         if not source_id:
             def received(observed, derived_from, shown):
                 return self.engine.receive(SourceInput(
                     namespace="kin-runtime", key=event_id, scope=self.scope, session=observed.get("session", "host"),
+                    version="receipt-only-v1" if observed.get("inputs_withheld") else "1",
                     text=dumps({**observed, "artifact": artifact}) if kind != "owner-message" else observed.get("text", ""),
                     authority=authority, occurred_at=observed["at"], extract=False,
                     metadata={"host_event": kind, "role": "user" if kind == "owner-message" else "assistant",
@@ -569,6 +556,17 @@ class MemoryContinuity:
             # derived source: they are checked where it is stored and become its dependencies, and
             # what its writer was shown besides (`shown_sources`) is checked with them (CR5-MM-02).
             inputs = event.get("input_source_ids") or None
+            if kind == "delivery" and event.get("references"):
+                try:
+                    with self.engine.db.connect() as conn:
+                        activity_sources = self.sharing.reference_sources(conn, event["references"])
+                    if activity_sources:
+                        inputs = list(dict.fromkeys([*(inputs or []), *activity_sources]))
+                except (Missing, Conflict, ValueError):
+                    # The platform outcome is still a fact. Keep its stable IDs
+                    # while withholding words and coverage whose source is gone.
+                    withhold_delivery("activity-reference-unavailable")
+                    inputs = None
             shown = event.get("shown_sources") or None
             try:
                 source_id = received(event, inputs, shown)
@@ -589,35 +587,53 @@ class MemoryContinuity:
                 event = {**scrub({key: value for key, value in event.items() if key != "artifact"}, (), erase=True),
                          **({"artifact": artifact} if "artifact" in event else {}),
                          "input_source_ids": [], "shown_sources": [], "inputs_withheld": error.code}
+                if kind == "delivery":
+                    withhold_delivery(error.code)
                 source_id = received(event, None, None)
+            if kind == "delivery" and not references_withheld:
+                try:
+                    with self.engine.db.connect() as conn:
+                        available = self.mind._evidence(conn, [source_id])
+                        current = self.mind._fresh(conn, available)
+                except (Missing, Conflict):
+                    current = False
+                if not current:
+                    withhold_delivery("activity-reference-unavailable")
+                    source_id = received(event, None, None)
         with self.engine.db.connect(write=True) as conn:
             # Another host may have committed while file/source IO ran.
             old = conn.execute("SELECT * FROM mind_runtime_events WHERE id=?", (event_id,)).fetchone()
             if old:
-                if not same_observation(old):
-                    raise Conflict("Conflicting runtime event")
                 return {"id": event_id, "seq": old["seq"], "state": "recorded", **json.loads(old["data"])["receipt"]}
             refs = self.mind._evidence(conn, [source_id])
             if not self.mind._fresh(conn, refs):
                 raise Conflict("Runtime evidence needs review")
             root = refs[0]["record_id"]
             receipt = {"source_id": source_id, "record_id": root}
+            if references_withheld:
+                receipt["references_withheld"] = True
             if kind == "owner-message":
                 conn.execute("INSERT OR IGNORE INTO mind_reply_inputs VALUES(?,?,?,?)", (self.scope.key(), event["id"], source_id, event["at"]))
+                if not event.get("historical"):
+                    state = self.mind._load(conn)
+                    attention = event.get("attention_for", "owner_message")
+                    if self.mind._attend(conn, state, event["id"], attention, event_id):
+                        state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
+                        self.mind._save(conn, state)
+                        self.mind._history(conn, event_id, state, "attention", {"input_id": event["id"], "attention_for": attention})
+                resolution = self.sharing.resolve_reply_context(conn, event)
+                event["reply_resolution"] = resolution
+                if resolution["state"] == "resolved":
+                    linked = resolution["candidates"][0]
+                    receipt.update(related_share_id=linked["share_id"], activity_refs=linked["activity_refs"])
             work_id = event.get("work_id")
             if artifact:
-                aliases = [artifact["sha256"], artifact.get("members_sha256")]
-                for alias in filter(None, aliases):
-                    matched = conn.execute("SELECT work_id FROM mind_artifact_aliases WHERE scope=? AND fingerprint=?", (self.scope.key(), alias)).fetchone()
-                    if matched:
-                        work_id = matched[0]
-                        break
-                work_id = work_id or self._id("work", event.get("task_id") or artifact.get("members_sha256") or artifact["sha256"])
+                work_id = work_id or self._id("work", event.get("task_id") or artifact["artifact_id"])
                 try:
                     work = self._get(conn, work_id)
                 except Missing:
                     work = {"id": work_id, "kind": "work", "title": artifact["name"], "versions": [], "event_ids": [], "source_ids": [], "record_ids": [], "task_ids": [], "created_by": "unknown"}
-                version_id = self._id("artifact", artifact["sha256"])
+                version_id = artifact["artifact_id"]
                 version = self._put(conn, {"id": version_id, "kind": "artifact", "work_id": work_id, **artifact, "basis": "observed", "source_ids": list(dict.fromkeys([*self._optional_sources(conn, version_id), source_id]))})
                 work["versions"] = list(dict.fromkeys([*work["versions"], version_id]))
                 work["event_ids"] = list(dict.fromkeys([*work["event_ids"], event_id]))
@@ -636,8 +652,6 @@ class MemoryContinuity:
                 work["last_event"] = kind
                 work["last_at"] = max(work.get("last_at", event["at"]), event["at"])
                 self._put(conn, work)
-                for alias in filter(None, aliases):
-                    conn.execute("INSERT OR IGNORE INTO mind_artifact_aliases VALUES(?,?,?)", (self.scope.key(), alias, work_id))
                 receipt.update(work_id=work_id, artifact_id=version["id"])
             if kind == "delivery":
                 share_id = self._id("share", [event.get("channel"), event.get("delivery_id") or event["id"]])
@@ -648,20 +662,19 @@ class MemoryContinuity:
                 bubble = event.get("bubble_id") or event.get("delivery_id") or event["id"]
                 prior = share["bubbles"].get(bubble, {})
                 content = event.get("text", "")
-                if prior.get("text", content) != content:
-                    # The bubble's identity only; the two bodies stay where they are.
-                    raise Conflict("Bubble content changed under the same ID", target=bubble)
                 state = event.get("state", "prepared")
                 if state not in {"prepared", "pending", "unconfirmed", "accepted", "canceled"}:
                     raise ValueError("Invalid delivery state")
                 if prior.get("state") != "accepted":
                     share["bubbles"][bubble] = {"id": bubble, "text": content, "state": state, "message_id": event.get("message_id"), "at": event["at"], "artifact_id": receipt.get("artifact_id"),
+                        "conversation_id": event.get("conversation_id"), "message_ids": event.get("message_ids", []),
+                        "source_ids": self.sharing.reference_sources(conn, event.get("references", prior.get("references", []))),
                         "references": event.get("references", prior.get("references", [])), "draft_id": event.get("draft_id"),
                         "reply_id": event.get("reply_input_id") or prior.get("reply_id")}
                 elif event.get("message_id") and prior["message_id"] != event["message_id"]:
                     raise Conflict("Accepted bubble cannot change platform ID")
                 states = {b["state"] for b in share["bubbles"].values()}
-                share.update(channel=event.get("channel"), delivery_id=event.get("delivery_id"), visibility="unverified",
+                share.update(channel=event.get("channel"), conversation_id=event.get("conversation_id", share.get("conversation_id")), delivery_id=event.get("delivery_id"), visibility="unverified",
                              last_at=max(share.get("last_at", event["at"]), event["at"]),
                              expected_bubbles=event.get("expected_bubbles", share.get("expected_bubbles")),
                              source_ids=list(dict.fromkeys([*share["source_ids"], source_id])), record_ids=list(dict.fromkeys([*share["record_ids"], root])))
@@ -676,7 +689,7 @@ class MemoryContinuity:
             if self.settings(conn)["graph"]:
                 receipt["event_id"] = self.graph.runtime(conn, event, receipt, event_id)["id"]
             cursor = conn.execute("INSERT INTO mind_runtime_events(id,scope,kind,occurred_at,digest,data) VALUES(?,?,?,?,?,?)",
-                                  (event_id, self.scope.key(), kind, event["at"], fingerprint, dumps({**event, "artifact": artifact, "source_id": source_id, "receipt": receipt})))
+                                  (event_id, self.scope.key(), kind, event["at"], "", dumps({**event, "artifact": artifact, "source_id": source_id, "receipt": receipt})))
             if kind in settling.CONVERSATION and not event.get("historical"):
                 # The conversation moved: what waits for it to be quiet waits from here (settling).
                 settling.push(conn, self.scope.key(), settling.minutes(self.settings(conn)))
@@ -1240,7 +1253,7 @@ class MemoryContinuity:
             # Isolated, each mapping answers for its own share inside its savepoint; otherwise one
             # lookup for all of them before any is applied, as before.
             allowed_shares = evaluated if items.enabled else {m.share_id for m in assessment.coverage.mappings if evaluated(m.share_id)}
-            self.sharing.apply(conn, assessment.coverage, allowed_shares, items=items)
+            self.sharing.apply(conn, assessment.coverage, allowed_shares, items=items, allowed_activity_sources=allowed_sources)
         return routes
 
     def _record_ids(self, conn, identifier):

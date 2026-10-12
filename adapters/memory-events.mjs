@@ -22,22 +22,18 @@ export class MemoryEventJournal {
   append(event) {
     if(!event.id||!event.kind||!event.at)throw Error('Memory event requires stable identity, kind and time');
     fs.mkdirSync(this.directory,{recursive:true,mode:0o700});
-    const file=path.join(this.directory,hash(event.id)+'.json'),body=JSON.stringify(canonical(event));
+    const file=path.join(this.directory,hash(event.id)+'.json');
     const receipt=path.join(this.directory,'receipts',hash(event.id)+'.json');
     // A receipt that was archived still says this event was ingested. Missing it
     // would ingest the same delivery a second time, which is the one thing the
     // receipt exists to stop, so the miss looks in the archive before giving up.
     const recorded=readThroughArchive(receipt,this.archivedState);
     if(recorded.state!=='missing') {
-      // An unreadable receipt is a conflict, never a reason to ingest the event twice.
-      if(recorded.value?.digest!==hash(body))throw Error('Memory event ID conflicts with committed contents');
+      if(recorded.value?.id!==event.id)throw Error('Memory event receipt requires reconciliation');
       return {state:'recorded',id:event.id};
     }
-    if(fs.existsSync(file)) {
-      if(fs.readFileSync(file,'utf8')!==body)throw Error('Memory event ID conflicts with earlier contents');
-      return {state:'queued',id:event.id};
-    }
-    if(!createJsonExclusive(file,canonical(event))&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event ID conflicts with earlier contents');
+    if(fs.existsSync(file))return {state:'queued',id:event.id};
+    if(!createJsonExclusive(file,canonical(event)))return {state:'queued',id:event.id};
     this.notify(event);
     return {state:'queued',id:event.id};
   }
@@ -72,22 +68,20 @@ export class MemoryEventJournal {
   snapshot() {return this.queued().entries.map(entry=>entry.event);}
   acknowledge(event) {
     const file=path.join(this.directory,hash(event.id)+'.json'),directory=path.join(this.directory,'receipts');
-    const body=JSON.stringify(canonical(event));
-    if(fs.existsSync(file)&&fs.readFileSync(file,'utf8')!==body)throw Error('Memory event changed before acknowledgement');
     // When this was settled, so that the receipt can later be told how old it is
     // without anyone reading the file's own timestamps — those are rewritten by
-    // reconciliation and say nothing true about the record. Earlier code reads
-    // only `digest` here, so the extra key costs a rollback nothing.
-    writeJsonAtomic(path.join(directory,path.basename(file)),{id:event.id,digest:hash(body),at:new Date(this.clock()).toISOString()},{previous:false});
+    // reconciliation and say nothing true about the record.
+    writeJsonAtomic(path.join(directory,path.basename(file)),{id:event.id,at:new Date(this.clock()).toISOString()},{previous:false});
     fs.rmSync(file,{force:true});
     for(const suffix of ['','.prev'])fs.rmSync(this.errorFile(path.basename(file))+suffix,{force:true});
   }
   async deliver(event) {
     this.append(event);
-    const owner=event.kind==='owner-message';
-    const receipt=await this.call(owner?'ingest':'runtime-event',event);
+    const persisted=readJsonFile(path.join(this.directory,hash(event.id)+'.json')).value??event;
+    const owner=persisted.kind==='owner-message';
+    const receipt=await this.call(owner?'ingest':'runtime-event',persisted);
     if(owner?!(receipt.source_id&&receipt.appraisal?.id):receipt.state!=='recorded')throw Error('Memory ingestion awaits a receipt');
-    this.acknowledge(event);return receipt;
+    this.acknowledge(persisted);return receipt;
   }
   async drain(limit=24) {
     if(this.running)return {state:'busy'};
@@ -122,6 +116,7 @@ export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,a
   if(!at)throw Error('Delivery observation needs the persisted receipt timestamp');
   return {id:`delivery:${channel}:${record.id}:${state}`,kind:'delivery',at,
     channel,delivery_id:batchId??record.memoryBatchId??record.id,bubble_id:record.id,
+    ...(record.conversationId??record.conversation_id?{conversation_id:record.conversationId??record.conversation_id}:{}),
     ...(expectedBubbles??record.expectedBubbles?{expected_bubbles:expectedBubbles??record.expectedBubbles}:{}),
     text:record.text??'',state,...(record.messageId?{message_id:record.messageId}:{}),
     ...(artifact??record.artifact?{artifact:artifact??record.artifact}:{}),
@@ -129,22 +124,24 @@ export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,a
     ...(Number.isSafeInteger(record.inputVersion)?{input_version:record.inputVersion}:{}),
     ...(Number.isSafeInteger(record.turnFence)?{turn_fence:record.turnFence}:{}),
     ...(record.replyInputId?{reply_input_id:record.replyInputId}:{}),
+    ...(record.referenceBubbleId?{reference_bubble_id:record.referenceBubbleId}:{}),
+    ...(Number.isSafeInteger(record.replyBubbleIndex)?{reply_bubble_index:record.replyBubbleIndex}:{}),
     ...(record.memoryHistorical?{historical:true}:{}),
     ...(record.references?.length?{references:record.references}:{}),...(record.draftId?{draft_id:record.draftId}:{}),origin:record.kind??'direct'};
 }
-export function artifactFromBytes(media) {
-  return {sha256:hash(media.data),name:media.name??'attachment',bytes:media.data.length};
+export function artifactFromBytes(media,{artifact_id=media.artifact_id??null}={}) {
+  return {artifact_id,name:media.name??'attachment',bytes:media.data.length};
 }
-export function snapshotArtifact(file,directory) {
+export function snapshotArtifact(file,directory,{artifact_id=null}={}) {
   const stat=fs.statSync(file);
   if(!stat.isFile()||stat.size>50*1024*1024)throw Error('Artifact snapshot is outside the file budget');
-  const bytes=fs.readFileSync(file),sha256=hash(bytes);
+  if(!artifact_id)return {path:file,observed_path:file,name:path.basename(file),bytes:stat.size,artifact_id:null,snapshot:false};
+  const bytes=fs.readFileSync(file);
   fs.mkdirSync(directory,{recursive:true,mode:0o700});
-  const target=path.join(directory,sha256);
-  // The snapshot is the proof that these were the bytes. It is written whole or
-  // not at all, because a half-written one keeps a name that promises the rest.
+  const target=path.join(directory,encodeURIComponent(artifact_id));
+  // The actual artifact ID owns its snapshot; content does not name the file.
   createFileExclusive(target,bytes);
-  return {path:target,observed_path:file,sha256,name:path.basename(file),bytes:bytes.length};
+  return {path:target,observed_path:file,artifact_id,name:path.basename(file),bytes:fs.statSync(target).size};
 }
 /** Reconcile the local outbox/journal gap; never call a transport API here. */
 export function reconcileOutbox({directory,journal,historicalBefore}) {
@@ -228,21 +225,14 @@ export function spoolHostEvent(root,record) {
   return file;
 }
 /** Only an observed edit effect establishes creator provenance. */
-/** Files up to this size are copied whole as the proof of their bytes; a larger
- * one is recorded by its streamed fingerprint only, and one beyond the second
- * bound not at all (AD2-12). */
+/** Small observed files can be copied by their tool effect ID. Larger files
+ * keep their actual path and size; no content fingerprint is constructed. */
 export const ARTIFACT_SNAPSHOT_BYTES=8*1024*1024;
-export const ARTIFACT_FINGERPRINT_BYTES=512*1024*1024;
+export const ARTIFACT_OBSERVED_BYTES=512*1024*1024;
 /** A tool call that never reports completed or failed is forgotten after this
  * long, and at most this many are remembered at once. */
 export const ARTIFACT_PENDING_MS=30*60000;
 export const ARTIFACT_PENDING_MAX=200;
-function streamedSha256(file) {
-  const digest=createHash('sha256'),buffer=Buffer.allocUnsafe(1024*1024),fd=fs.openSync(file,'r');
-  try {for(let read;(read=fs.readSync(fd,buffer,0,buffer.length,null))>0;)digest.update(buffer.subarray(0,read));}
-  finally {fs.closeSync(fd);}
-  return digest.digest('hex');
-}
 export class ToolArtifactObserver {
   constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),now=()=>Date.now()}) {Object.assign(this,{journal,task,clock,now});this.before=new Map();}
   update(update) {
@@ -258,23 +248,24 @@ export class ToolArtifactObserver {
       this.before.set(id,previous);return;
     }
     const before=this.before.get(id);this.before.delete(id);
-    for(const file of new Set([...paths,...(before?.keys()??[])])) {
+    for(const [index,file] of [...new Set([...paths,...(before?.keys()??[])])].entries()) {
       const after=this.stat(file),prior=before?.get(file);
       if(!after||after===prior)continue;
       const created=(update.kind??before?.kind)==='edit'&&before?.has(file);
       // One file that cannot be read is not a reason to lose the others, nor
       // to throw into the session's update stream.
-      let artifact;try{artifact=this.capture(file);}catch{continue;}
+      const artifactId='artifact:'+id+':'+index;
+      let artifact;try{artifact=this.capture(file,artifactId);}catch{continue;}
       if(!artifact)continue;
-      this.journal.append({id:`tool-artifact:${id}:${hash(file)}`,kind:created?'artifact-created':'artifact-observed',
+      this.journal.append({id:`tool-artifact:${id}:${index}`,kind:created?'artifact-created':'artifact-observed',
         at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact});
     }
   }
-  capture(file) {
+  capture(file,artifact_id=null) {
     const size=fs.statSync(file).size;
-    if(size<=ARTIFACT_SNAPSHOT_BYTES)return snapshotArtifact(file,path.join(this.journal.directory,'artifacts'));
-    if(size>ARTIFACT_FINGERPRINT_BYTES)return null;
-    return {observed_path:file,name:path.basename(file),bytes:size,sha256:streamedSha256(file),snapshot:false};
+    if(size<=ARTIFACT_SNAPSHOT_BYTES)return snapshotArtifact(file,path.join(this.journal.directory,'artifacts'),{artifact_id});
+    if(size>ARTIFACT_OBSERVED_BYTES)return null;
+    return {artifact_id,observed_path:file,name:path.basename(file),bytes:size,snapshot:false};
   }
   prune() {
     const cutoff=this.now()-ARTIFACT_PENDING_MS;

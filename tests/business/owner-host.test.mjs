@@ -241,7 +241,7 @@ test('what the strict draft schema lets through is read the one safe way, never 
  // Every field present, the unused ones null or empty: the answer a fork gives.
  const strict=fields=>JSON.stringify({desire_ids:null,bubbles:[],reason:null,condition:null,retry_after_seconds:null,...fields});
  const parse=fields=>parseContactDraft(strict(fields));
- assert.deepEqual(parse({action:'wait'}),{action:'wait',reason:UNSTATED_REASON.wait,condition:'new_evidence'});
+ assert.deepEqual(parse({action:'wait'}),{action:'wait',reason:UNSTATED_REASON.wait,condition:'review'});
  assert.deepEqual(parse({action:'wait',condition:'time',reason:' 晚点 '}),{action:'wait',reason:'晚点',condition:'time',retry_after_seconds:1800});
  assert.deepEqual(parse({action:'abandon',reason:'  '}),{action:'abandon',reason:UNSTATED_REASON.abandon});
  const long=parse({action:'abandon',reason:'😀'.repeat(REASON_MAX_CHARS+100)}).reason;
@@ -258,7 +258,7 @@ test('what the strict draft schema lets through is read the one safe way, never 
  const waited=fixture({draft:async()=>parse({action:'wait'}),send:async()=>assert.fail('must not send')});
  await waited.loop.tick();
  assert.equal(waited.events.at(-1)[1].reason,'draft-decision');
- assert.deepEqual(waited.events.at(-1)[1].decision,{action:'wait',reason:UNSTATED_REASON.wait,condition:'new_evidence'});
+ assert.deepEqual(waited.events.at(-1)[1].decision,{action:'wait',reason:UNSTATED_REASON.wait,condition:'review'});
  // What no schema lets through is still no decision.
  for(const bad of [{action:'wait',reason:7},{action:'wait',condition:'soon'},{action:'send',bubbles:'hi'},{action:'send',bubbles:[{text:1}]},{action:'maybe'}])
    assert.throws(()=>parse(bad),/contact-draft-invalid-result/);

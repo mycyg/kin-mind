@@ -268,9 +268,10 @@ def test_the_prompt_says_how_only_with_the_switch(stimulus):
     assert provider._system(context, None) == plain and EVENT_CONTINUATION_PROMPT not in plain
     provider.event_continuation = True
     assert provider._system(context, None) == plain + EVENT_CONTINUATION_PROMPT
-    profile = provider.request_profile(context)["system"]
+    profile = provider.request_profile(context)
     provider.event_continuation = False
-    assert provider.request_profile(context)["system"] != profile, "a changed prompt is a changed policy, never a reuse"
+    assert provider.request_profile(context) == profile
+    assert "system" not in profile and "schema" not in profile
 
 
 def test_a_current_assessment_shows_identity_evidence_as_it_always_did(setup):

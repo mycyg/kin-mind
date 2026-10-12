@@ -8,7 +8,6 @@ from pathlib import Path
 
 from .db import Conflict, Database, Deleted, Missing, digest, dumps, tokenize
 from .envelopes import current_message
-from .idempotency import record, unchanged
 from .models import RecordInput, RevisionInput, Scope, SourceInput, now
 
 
@@ -55,27 +54,20 @@ class Engine:
         self.interactive_until = 0.0
 
     def command(self, conn, key, payload, run, stamp=None):
-        """`stamp` is an optional idempotency.Stamp built by the caller, which owns the scope
-        and the host switch. Without one this compares the legacy digest of the whole payload,
-        exactly as before; with one the effective payload decides and the precondition does
-        not, so a retry that only refreshed its expected revision gets the original receipt."""
-        hashed = digest(payload)
-        row = conn.execute("SELECT * FROM commands WHERE id=?", (key,)).fetchone()
+        """A stable command id names its durable receipt. First effects validate in `run`;
+        retries return that receipt without interpreting a new payload as another command.
+        The legacy digest column and optional stamp remain call/schema compatible only."""
+        row = conn.execute("SELECT result FROM commands WHERE id=?", (key,)).fetchone()
         if row:
-            if not unchanged(conn, stamp, key, legacy=(row["digest"], hashed)):
-                # The key, not the payload: the digests stay out of the failure record.
-                raise Conflict("Idempotency key reused with different content",
-                               kind="runtime", code="payload-changed", target=key)
             return json.loads(row["result"])
         result = run()
-        conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, hashed, dumps(result)))
-        record(conn, stamp, key, now())
+        conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, "", dumps(result)))
         return result
 
     def _derivable(self, conn, derived_from, scope, shown=()):
         """What a derived source rests on, checked in the transaction that stores it: nothing of it
         deleted, and nothing changed since it was read where a read version is given. Refs as the
-        mind keeps them (source_id, record_id, hash, revision) or bare ids. `derived_from` is what
+        mind keeps them (source_id, record_id, revision) or bare ids. `derived_from` is what
         the new source cites: in its own scope, and its records become the root record's
         dependencies (a bare source id stands for its root record, or for the records parsed from
         it). `shown` is what its writer was only shown: checked the same way, and not kept.
@@ -95,13 +87,11 @@ class Engine:
                             named).fetchone():
                 raise Deleted("What this was written from has been deleted", code="derived-from-deleted", target=named[0])
             if sid:
-                row = conn.execute("SELECT hash,deleted,scope FROM sources WHERE id=?", (sid,)).fetchone()
+                row = conn.execute("SELECT deleted,scope FROM sources WHERE id=?", (sid,)).fetchone()
                 if not row or row["deleted"]:
                     raise Deleted("What this was written from has been deleted", code="derived-from-deleted", target=sid)
                 if cited and row["scope"] != scope.key():
                     raise Conflict("A derived source rests on another scope", code="derived-from-scope", target=sid)
-                if item.get("hash") and item["hash"] != row["hash"]:
-                    raise Conflict("What this was written from has changed", code="derived-from-changed", target=sid)
             if rid:
                 row = conn.execute("SELECT revision,deleted,scope FROM records WHERE id=?", (rid,)).fetchone()
                 if not row or row["deleted"]:
@@ -118,7 +108,7 @@ class Engine:
                     r[0] for r in conn.execute("SELECT e.record_id FROM evidence e JOIN records r ON r.id=e.record_id"
                                                " WHERE e.source_id=? AND r.deleted=0", (sid,))]
             if cited:
-                kept.append({key: value for key, value in (("source_id", sid), ("record_id", rid), ("hash", item.get("hash")),
+                kept.append({key: value for key, value in (("source_id", sid), ("record_id", rid),
                                                            ("revision", item.get("revision"))) if value is not None})
                 records.update(rests)
         return kept, sorted(records)
@@ -131,7 +121,6 @@ class Engine:
         source with it (`maintenance.erase_set`). `shown` is what the writer read besides -- recent
         dialogue, earlier results: checked with it, not kept as dependencies (CR5-MM-02)."""
         identity = [source.namespace, source.key, source.version, source.scope.key()]
-        sid = "src_" + digest(identity)[:32]
         raw = attachment if attachment is not None else source.text.encode()
         record_text = source.text
         if (
@@ -140,20 +129,14 @@ class Engine:
             and source.metadata.get("role") == "user"
         ):
             record_text = current_message(record_text)
-        hash_ = digest(raw)
-        # Only immutable blob IO precedes the transaction; unreferenced blobs are GC'd.
-        blob = self.db.blob(raw)
         with self.db.connect(write=True) as conn:
+            previous = conn.execute(
+                "SELECT * FROM sources WHERE namespace=? AND source_key=? AND version=? AND scope=?", identity
+            ).fetchone()
+            sid = previous["id"] if previous else "src_" + digest(identity)[:32]
             if conn.execute("SELECT 1 FROM tombstones WHERE key=?", (sid,)).fetchone():
                 raise Deleted("This source was explicitly deleted")
-            if not (self.db.blobs / blob).exists():
-                self.db.blob(raw)
-            previous = conn.execute(
-                "SELECT * FROM sources WHERE id=?", (sid,)
-            ).fetchone()
             if previous:
-                if previous["hash"] != hash_:
-                    raise Conflict("Source changed: provide a new version")
                 return self._source(previous)
             rests_on = []
             if derived_from is not None or shown:
@@ -161,6 +144,9 @@ class Engine:
                     raise ValueError("A derived source is inline text")
                 kept, rests_on = self._derivable(conn, derived_from or (), source.scope, shown or ())
                 derived_from = kept if derived_from is not None else None
+            # Source identity and dependencies are settled before bytes are stored. The source
+            # row owns this UUID blob reference; a retry reuses it through its existing receipt.
+            blob = self.db.blob(raw)
             stamp = now()
             data = source.model_dump(exclude={"text"})
             data["byte_length"] = len(raw)
@@ -177,7 +163,7 @@ class Engine:
                     source.session,
                     stamp,
                     source.occurred_at,
-                    hash_,
+                    "",
                     blob,
                     dumps(data),
                     "pending"
@@ -328,7 +314,7 @@ class Engine:
         value.update(
             {
                 k: row[k]
-                for k in ("id", "hash", "received_at", "mechanical", "model", "deleted")
+                for k in ("id", "received_at", "mechanical", "model", "deleted")
             }
         )
         value.update(
@@ -468,8 +454,7 @@ class Engine:
         from kin_mind.lifecycle import record_changed
         record_changed(conn, data)
         from kin_mind.judgment_cache import invalidate
-        # A revised source ends every judgment that rested on it. A request digest
-        # proves two requests are equal, not that the evidence behind them still holds.
+        # A revised record ends every judgment that rested on its earlier revision.
         invalidate(conn, [data["id"]])
         conn.execute(
             "INSERT INTO dirty VALUES(?,?) ON CONFLICT(record_id) DO UPDATE SET revision=excluded.revision",
@@ -525,7 +510,7 @@ class Engine:
                     not data["valid_until"] or data["valid_until"] > at
                 )
             data["independent_sources"] = conn.execute(
-                "SELECT COUNT(DISTINCT s.hash) FROM evidence e JOIN sources s ON s.id=e.source_id WHERE e.record_id=? AND s.deleted=0",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT s.namespace,s.source_key,s.scope FROM evidence e JOIN sources s ON s.id=e.source_id WHERE e.record_id=? AND s.deleted=0)",
                 (rid,),
             ).fetchone()[0]
             return data

@@ -9,13 +9,12 @@ or read, and archiving it is an operator step.
 """
 import json
 
-from eventmem.core.db import Missing, digest, dumps
+from eventmem.core.db import Missing, dumps
 
-from .computer import redact
 from .graph import query_terms
 from .state import timestamp
 
-FIELDS = ('content', 'topic', 'target', 'status', 'kind', 'completion', 'reason', 'owner_request', 'concern_ids', 'expires_at')
+FIELDS = ('content', 'topic', 'target', 'status', 'kind', 'completion', 'reason', 'owner_request', 'concern_ids', 'expires_at', 'activity_ref')
 
 
 class ContinuityManifest:
@@ -25,7 +24,7 @@ class ContinuityManifest:
             contexts = Contexts(mind)
         self.ctx, self.mind, self.memory = contexts, mind, contexts.memory
 
-    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None):
+    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None, activity_focus=None, activity_recall=False):
         """Bounded candidate expansion, with open matters independent of recency."""
         if policy is None:
             from eventmem.core.read_policy import ReadPolicy
@@ -37,6 +36,9 @@ class ContinuityManifest:
         active_matters = set((intent or {}).get('concern_ids', [])) | {c for t in tasks for c in t.get('concern_ids', [])}
         focus_ids = list(dict.fromkeys([r.get('unit_id') for e in pending for r in e.get('references', []) if r.get('unit_id')]
                                      + [x for x in ((intent or {}).get('exploration_id'), (intent or {}).get('work_id')) if x]))
+        activity_focus = activity_focus or (intent or {}).get('activity_ref') or (intent or {}).get('exploration_id')
+        activity_items = self.ctx.activity_items(activity_focus=activity_focus, query=query, detail='summary') if activity_focus or activity_recall else []
+        items.extend({**item, 'priority': 0 if activity_focus else 2} for item in activity_items)
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
             entry_terms = {}
@@ -52,13 +54,13 @@ class ContinuityManifest:
                 for entry in active[:3 if kind == 'concerns' else 2]:
                     if entry.get('expires_at') and timestamp(entry['expires_at']) <= timestamp(self.mind.clock()):
                         continue
-                    if not self.mind._fresh(conn, entry.get('evidence', [])):
+                    if not self.ctx._references_available(conn, entry.get('evidence', [])):
                         warnings.append(entry['id']); continue
                     value = {k: entry[k] for k in FIELDS if k in entry}
-                    items.append({'id': entry['id'], 'revision': digest(entry), 'text': dumps(value),
+                    items.append({'id': entry['id'], 'revision': state['revision'], 'text': dumps(value),
                         'basis': entry.get('basis', 'inferred'), 'facts': {'kind': kind, 'status': entry['status']},
                         'dependencies': [{'id': r['record_id'], 'revision': r['revision']} for r in entry.get('evidence', [])],
-                        'state_dependency': {'kind': kind, 'id': entry['id'], 'digest': digest(entry)}, 'priority': 0 if entry['id'] in active_matters else 1 if overlap(entry) else 3})
+                        'state_dependency': {'kind': kind, 'id': entry['id']}, 'priority': 0 if entry['id'] in active_matters else 1 if overlap(entry) else 3})
             for task_id in sorted(task_ids):
                 for row in conn.execute("SELECT DISTINCT n.data FROM mind_memory_nodes n, json_each(n.data,'$.task_ids') t WHERE n.scope=? AND n.kind='work' AND t.value=? ORDER BY n.updated_at DESC LIMIT 3", (self.mind.scope.key(), task_id)):
                     node = json.loads(row[0])
@@ -111,12 +113,12 @@ class ContinuityManifest:
             facts = {k: event[k] for k in ('kind', 'at', 'task_id', 'tool_call_id', 'state', 'operation_status', 'account_basis') if k in event}
             if event['kind'] == 'task-result':
                 facts['public_result'] = event.get('text', '')
-            facts['artifact'] = {k: artifact[k] for k in ('name', 'sha256', 'members_sha256', 'bytes') if k in artifact}
+            facts['artifact'] = {k: artifact[k] for k in ('id', 'artifact_id', 'name', 'bytes', 'media_type', 'work_id') if k in artifact}
             facts['created_by'] = event.get('actor', 'Kin') if event['kind'] == 'artifact-created' else 'unknown'
             facts['journal_state'] = 'pending-semantic-ingestion'
-            item = {'id': 'journal:' + event['id'], 'revision': digest(redact(event)), 'text': dumps(facts),
+            item = {'id': 'journal:' + event['id'], 'revision': event.get('seq', event.get('revision', 1)), 'text': dumps(facts),
                     'basis': 'public-output' if event['kind'] == 'task-result' else 'host-operation', 'facts': {'kind': event['kind']}, 'priority': -1,
-                    'pending_dependency': {'id': event['id'], 'digest': digest(redact(event))}}
+                    'pending_dependency': {'id': event['id']}}
             if self.ctx._current(item, policy):
                 items.append(item)
         # Raw accepted outbox receipts override stale semantic sharing views.
@@ -128,12 +130,9 @@ class ContinuityManifest:
                         continue
                     facts = item.setdefault('facts', {})
                     coverage = facts.get('share_coverage', {})
-                    if ref.get('version') != coverage.get('version', ref.get('version')):
-                        continue
                     if event.get('kind') == 'delivery' and event.get('state') == 'accepted' and event.get('message_id'):
                         facts['share_coverage'] = {**coverage, 'state': 'shared', 'last_shared_at': event['at'],
                             'last_message_id': event['message_id'], 'visibility': 'unverified', 'basis': 'pending-host-receipt'}
-                        item['revision'] = digest([item['revision'], facts['share_coverage']])
                         item['priority'] = -2
             item.pop('cached_summary', None)
         unique = {}
@@ -149,5 +148,5 @@ class ContinuityManifest:
             durable = conn.execute('SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=?', (self.mind.scope.key(),)).fetchone()[0]
             row = conn.execute('SELECT seq FROM mind_semantic_cursor WHERE scope=?', (self.mind.scope.key(),)).fetchone()
         return {'durable_event_seq': durable, 'semantic_seq': row[0] if row else 0,
-                'pending_journal_count': len(pending), 'pending_digest': digest(pending),
+                'pending_journal_count': len(pending), 'pending_event_ids': [event['id'] for event in pending if event.get('id')],
                 'semantic_lag_is_not_missing_evidence': True}

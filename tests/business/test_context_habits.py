@@ -12,12 +12,11 @@ that read only the habits did not read the message as she corrected it since, an
 (K1-16, CL10-MM-01). An update of the habits says it expects the state read's revision (CL10-MM-03), and a
 change to the defaults moves the habits' revision too (CL10-MM-04)."""
 import json
-import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from eventmem.core.db import NAMED, digest, dumps
+from eventmem.core.db import NAMED, dumps
 from eventmem.core.models import RevisionInput
 
 from kin_mind import context, erasure
@@ -161,6 +160,17 @@ def notes(engine, contexts, source):
             for index in range(2)]
 
 
+def seed_legacy_compressions(contexts, packed, items, identity):
+    """Old cached rows remain erasure fixtures; current packs do not make them."""
+    refs = sorted({identifier for item in items for key in RESTS_ON for identifier in item.get(key, [])})
+    values = [{"value": {"entries": packed["items"], "omitted_ids": packed["omitted_ids"]}, "receipt": {}, CACHE_RESTS_ON: refs},
+              {**packed, CACHE_RESTS_ON: refs}]
+    with contexts.engine.db.connect(write=True) as conn:
+        for index, value in enumerate(values):
+            conn.execute("INSERT INTO mind_context_cache VALUES(?,?,?,?)",
+                         (f"legacy:{identity}:{index}", contexts.mind.scope.key(), dumps(value), contexts.mind.clock()))
+
+
 @pytest.mark.parametrize("receipt_mode", [True, False])
 def test_a_context_that_rendered_only_the_habits_keeps_none_of_her_words_once_the_message_is_deleted(system, receipt_mode):
     """A background context with no query renders the habits and nothing that names the messages that
@@ -197,8 +207,8 @@ def test_a_compression_that_summarised_the_habits_is_dropped_with_the_message(sy
     """The habits are compressed with two notes; the model's summary repeats her words, and both the
     batch and the whole result are cached, as is the model's answer among the cached semantic
     answers. The message is deleted: the two rows go, since they name what the habits were set from,
-    and so does every semantic answer cached before the delete, none of which is served again; no
-    table holds her words."""
+    old cache fixtures are still erased, while current packs produce no content-hash memo rows;
+    no table holds her words after the delete."""
     mind, memory, source, clock = system
     engine = mind.engine
     directions, reply = habits_from(memory, clock)
@@ -213,14 +223,16 @@ def test_a_compression_that_summarised_the_habits_is_dropped_with_the_message(sy
         "omitted_ids": []})
     packed = contexts.pack(items, "harbour walk", 300, provider=model.provider, allow_model=True, persist=True)
     assert packed["state"] == "compressed" and "rests_on" not in packed
+    assert rows_in(engine, "mind_context_cache") == [], "no content-hash memo rows are produced"
+    seed_legacy_compressions(contexts, packed, items, "habits")
     with engine.db.connect() as conn:
         cached = [row[0] for row in conn.execute("SELECT data FROM mind_context_cache")]
     assert len(cached) == 2 and all(DIRECTIONS[0] in row and directions in row for row in cached)
     with engine.db.connect() as conn:
         answers = [row[0] for row in conn.execute("SELECT data FROM mind_semantic_cache")]
-    assert answers and any(DIRECTIONS[0] in row for row in answers) and not any(directions in row for row in answers)
+    assert answers == [], "model answers are not cached by their content"
     again = contexts.pack(items, "harbour walk", 300, provider=model.provider, allow_model=True, persist=True)
-    assert again["cache_hit"] and "rests_on" not in again
+    assert not again["cache_hit"] and "rests_on" not in again
 
     engine.delete(directions)
     settle(engine)
@@ -269,8 +281,10 @@ def test_what_a_release_before_rendered_from_the_habits_goes_with_the_message_th
         contexts.build("", purpose="chat", session="thread-1", event_id=turn, receipt_mode=receipt_mode)
     walks, model = notes(engine, contexts, source), summarising(engine, monkeypatch)
     habits = contexts.habits_item(memory.habits.read())
-    for items in ([habits, contexts.record_item(engine.get(record)), walks[0]], [habits, *walks]):
-        assert contexts.pack(items, "harbour walk", 300, provider=model.provider, allow_model=True, persist=True)["state"] == "compressed"
+    for index, items in enumerate(([habits, contexts.record_item(engine.get(record)), walks[0]], [habits, *walks])):
+        packed = contexts.pack(items, "harbour walk", 300, provider=model.provider, allow_model=True, persist=True)
+        assert packed["state"] == "compressed"
+        seed_legacy_compressions(contexts, packed, items, "before-" + str(index))
     as_a_release_before_kept_them(engine, showing={"turn-2": record})
     table = "mind_context_deliveries" if receipt_mode else "mind_context_windows"
     before = (rows_in(engine, table), rows_in(engine, "mind_context_cache"))
@@ -315,8 +329,10 @@ def test_the_release_reerase_takes_what_a_release_before_rendered_from_the_habit
     contexts.build("", purpose="chat", session="thread-1", event_id="turn-1", receipt_mode=True)
     walks = notes(engine, contexts, source)
     model = summarising(engine, monkeypatch)
-    assert contexts.pack([contexts.habits_item(memory.habits.read()), *walks], "harbour walk", 300, provider=model.provider,
-                         allow_model=True, persist=True)["state"] == "compressed"
+    items = [contexts.habits_item(memory.habits.read()), *walks]
+    packed = contexts.pack(items, "harbour walk", 300, provider=model.provider, allow_model=True, persist=True)
+    assert packed["state"] == "compressed"
+    seed_legacy_compressions(contexts, packed, items, "reerase")
     as_a_release_before_kept_them(engine)
     with monkeypatch.context() as before:
         before.setattr(erasure, "_unnamed_habits", lambda *args, **options: (0, 0))
@@ -340,7 +356,7 @@ def test_the_release_reerase_takes_what_a_release_before_rendered_from_the_habit
     quiet = summarising(engine, monkeypatch, words=False)
     assert contexts.pack([habits, *walks], "tide table", 300, provider=quiet.provider, allow_model=True, persist=True)["state"] == "compressed"
     with engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_semantic_cache").fetchone()[0]
+        assert conn.execute("SELECT COUNT(*) FROM mind_semantic_cache").fetchone()[0] == 0
     [window] = [value for value in rows_in(engine, "mind_context_windows") if "turn-1" in value["receipts"] and not value["receipts"]["turn-1"].get("erased_at")]
     assert [entry for entry in window["receipts"]["turn-1"]["index"] if entry["id"] == HABITS_ITEM][0]["source_ids"] == []
     again = repair.run(engine.db.root, steps=("reerase",))["steps"]["reerase"]["plan"]
@@ -393,20 +409,15 @@ def test_the_state_read_names_the_messages_the_habits_were_set_from(setup):
     mind.engine.delete(directions)
     settle(mind.engine)
     state, row = contact_row(mind, attempt["id"])
-    assert row["text_excerpt"] == ERASED and row["text_digest"]
+    assert row["text_excerpt"] == ERASED and "text_digest" not in row
     assert texts_everywhere(mind.engine, DIRECTIONS[0]) == set()
     assert Contexts(mind).affective()["conversation_habits"]["source_ids"] == [reply], "a message that is gone is named no more"
 
 
 @pytest.mark.parametrize("receipt_mode", [True, False])
 def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value(system, monkeypatch, receipt_mode):
-    """The habits reach a native window -- a window receipt, or a delivery the host confirms -- and a
-    later read there leaves them out as already seen. The message that set the directions is deleted:
-    the habits lose the value and keep the table's revision. The next background read in the same
-    window sends them again, as they are now: without her directions, with the reply choice the other
-    message set (CL9-MM-03). Their revision is a hash of the table's revision, of the keys the delete took
-    and of the defaults, never of anything she said: what the window keeps of it before and after names
-    none of it (CL10-MM-02, CL10-MM-04)."""
+    """Current preferences stay visible in the window without a content fingerprint.
+    Deleting their source clears its words and references; the table revision remains metadata."""
     mind, memory, source, clock = system
     engine = mind.engine
     directions, reply = habits_from(memory, clock)
@@ -418,14 +429,14 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
             sent, deliveries = packed["injection"], ContextDelivery(contexts)
             deliveries.begin("thread-1", sent["epoch"], sent["id"])
             deliveries.acknowledge("thread-1", sent["epoch"], sent["id"], actual_session="thread-1", marker=sent["marker"],
-                                   text_hash=sent["text_hash"], verified=True)
+                                   native_item_id="synthetic-native-" + turn, verified=True)
         return packed
 
     first = read("turn-1")
     assert HABITS_ITEM in first["covered_ids"] and all(word in first["text"] for word in WORDS)
     seen = contexts.window("thread-1")["seen"][HABITS_ITEM]
-    assert re.fullmatch(r"[0-9a-f]{64}", seen), "a hash, never her words"
-    assert HABITS_ITEM not in read("turn-2")["covered_ids"], "seen in this window"
+    assert seen == memory.habits.read()["revision"], "existing table revision, not a content hash"
+    assert HABITS_ITEM in read("turn-2")["covered_ids"], "current preferences stay visible without content fingerprints"
 
     before = memory.habits.read()
     engine.delete(directions)
@@ -435,16 +446,12 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     again = read("turn-3")
     assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
     assert not any(word in again["text"] for word in WORDS) and "autonomous" in again["text"]
-    assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
-    assert HABITS_ITEM not in read("turn-4")["covered_ids"], "and seen again"
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == seen
+    assert HABITS_ITEM in read("turn-4")["covered_ids"]
     assert her_words(engine) == {}
 
-    hashed = []
-    monkeypatch.setattr(context, "digest", lambda value: hashed.append(value) or digest(value))
+    assert not hasattr(context, "digest")
     assert [Contexts.habits_item(habits)["revision"] for habits in (before, after)] == [seen, contexts.window("thread-1")["seen"][HABITS_ITEM]]
-    assert hashed == [[before["revision"], [], habit_rules.DEFAULTS],
-                      [before["revision"], ["exploration_directions", "exploration_frequency"], habit_rules.DEFAULTS]]
-    assert not any(value in json.dumps(hashed, ensure_ascii=False) for value in (*WORDS, "autonomous")), "no preference of hers"
 
 
 @pytest.mark.parametrize("tool", ["read_affective_state", "read_continuity_context"])
@@ -495,8 +502,8 @@ def test_a_fork_that_read_the_habits_may_cite_their_message_only_as_they_were_se
 
 
 def test_an_update_of_the_habits_expects_the_revision_the_state_read_shows(system):
-    """The background item's revision is a hash, which no update takes. The update tool says where its
-    `expected_revision` comes from -- the state read's `conversation_habits.revision`, the table's -- and
+    """The update tool says where its `expected_revision` comes from -- the state read's
+    `conversation_habits.revision`, the table's -- and
     an update with that one applies (CL10-MM-03)."""
     import asyncio
 
@@ -512,10 +519,8 @@ def test_an_update_of_the_habits_expects_the_revision_the_state_read_shows(syste
                                  "preferences": {"exploration_frequency": "每周一次"}})["revision"] == shown + 1
 
 
-def test_a_change_to_the_defaults_moves_the_habits_revision(system, monkeypatch):
-    """A release that changes a default changes what the habits show, with nothing she said changed or
-    deleted and the table's revision where it was: their revision moves too, so a window that saw them
-    gets them again, with the new default (CL10-MM-04)."""
+def test_current_defaults_are_visible_without_computing_a_content_revision(system, monkeypatch):
+    """Current defaults are shown with the existing table revision, without a checksum."""
     mind, memory, source, clock = system
     habits_from(memory, clock)
     contexts = Contexts(mind)
@@ -523,7 +528,7 @@ def test_a_change_to_the_defaults_moves_the_habits_revision(system, monkeypatch)
     def read(turn):
         return contexts.build("", purpose="chat", session="thread-1", event_id=turn)
 
-    assert HABITS_ITEM in read("turn-1")["covered_ids"] and HABITS_ITEM not in read("turn-2")["covered_ids"]
+    assert HABITS_ITEM in read("turn-1")["covered_ids"] and HABITS_ITEM in read("turn-2")["covered_ids"]
     seen, revision = contexts.window("thread-1")["seen"][HABITS_ITEM], memory.habits.read()["revision"]
     monkeypatch.setattr(habit_rules, "DEFAULTS", {**habit_rules.DEFAULTS, "exploration_min_interval_minutes": 45})
     assert memory.habits.read()["revision"] == revision
@@ -531,4 +536,4 @@ def test_a_change_to_the_defaults_moves_the_habits_revision(system, monkeypatch)
     assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
     lines = [json.loads(line) for line in again["text"].splitlines() if line.startswith("{")]
     assert json.loads(next(line for line in lines if line["id"] == HABITS_ITEM)["text"])["exploration_min_interval_minutes"] == 45
-    assert contexts.window("thread-1")["seen"][HABITS_ITEM] != seen
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == seen

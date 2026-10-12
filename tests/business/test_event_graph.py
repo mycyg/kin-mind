@@ -93,6 +93,28 @@ def test_graph_links_roles_and_association_keep_their_basis(system):
     assert any(e["layer"] == "association" for e in graph["edges"])
     assert not any(e["predicate"] == "causes" for e in graph["edges"])
 
+def test_two_hosts_recording_the_same_event_keep_one_receipt(system, monkeypatch):
+    mind, memory, _, _ = system
+    event = {"id": "overlapping-owner-input", "kind": "owner-message", "at": mind.clock(),
+             "text": "A synthetic input retried while the first host performs source IO."}
+    receive = mind.engine.receive
+    other_receipts = []
+    entering = False
+
+    def overlap(*args, **kwargs):
+        nonlocal entering
+        result = receive(*args, **kwargs)
+        if not entering:
+            entering = True
+            other_receipts.append(MemoryContinuity(mind).ingest(event))
+        return result
+
+    monkeypatch.setattr(mind.engine, "receive", overlap)
+    receipt = memory.ingest(event)
+    assert receipt == other_receipts[0]
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_runtime_events WHERE id=?", (receipt["id"],)).fetchone()[0] == 1
+
 def test_merge_and_split_retain_inverse_history(system):
     mind, memory, source, _ = system
     sid = source("identity", "The two synthetic labels name the same project")

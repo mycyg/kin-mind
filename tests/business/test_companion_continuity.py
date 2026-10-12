@@ -6,6 +6,7 @@ conversation shows real conflict, being pushed away or uncertainty (`anti_retrea
 No model is called: the compressor and the reviewer are stand-ins."""
 import json
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -137,10 +138,10 @@ def deliver(mind, text, session="thread-1"):
     contexts = Contexts(mind)
     deliveries = ContextDelivery(contexts)
     epoch = contexts.window(session)["epoch"]
-    prepared = deliveries.prepare(session, epoch, "event-" + mind.clock(), text, [{"id": "affect", "revision": "r"}])
+    prepared = deliveries.prepare(session, epoch, "synthetic-delivery-" + uuid4().hex, text, [{"id": "affect", "revision": "r"}])
     deliveries.begin(session, epoch, prepared["id"])
     return deliveries.acknowledge(session, epoch, prepared["id"], actual_session=session, marker=prepared["marker"],
-                                  text_hash=prepared["text_hash"], verified=True)
+                                  native_item_id="synthetic-native-" + prepared["id"], verified=True)
 
 
 def test_a_concern_entering_its_window_goes_first_until_a_receipt_shows_it_delivered(setup):

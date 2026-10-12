@@ -11,8 +11,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.idempotency import record, unchanged
-from eventmem.core.idempotency import stamp as fingerprint
 
 from . import evidence_refs, liveness
 from .autonomy_models import ActionDecision, PlanChange
@@ -31,9 +29,9 @@ def local_time(value):
 
 
 def receipt_ids(step):
-    # Receipts are append-only. An owner response has no host identifier, so its
-    # stable serialization identifies it.
-    return [r.get("id") or r.get("run_id") or "receipt_" + digest(r)[:32] for r in step.get("receipts", [])]
+    # Append-only owner responses are identified by their stored row position.
+    return [r.get("id") or r.get("run_id") or f"{step['id']}:receipt:{index}"
+            for index, r in enumerate(step.get("receipts", []))]
 
 
 def fence(entry):
@@ -41,9 +39,13 @@ def fence(entry):
     return entry and {k: entry[k] for k in ("revision", "state", "decision_id")}
 
 
+def artifact_id(value, parent, index):
+    return value.get("artifact_id") or value.get("id") or f"{parent}:artifact:{index}"
+
+
 # Why a ready step may no longer run as decided; each asks for a review, not for a retry.
 REVIEW_REASONS = {"configuration-changed", "new-owner-evidence", "source-needs-review", "missed-window-review-required",
-                  "window-review-required", "procedure-needs-review", "trait-needs-review"}
+                  "window-review-required", "procedure-needs-review", "trait-needs-review", "activity-needs-review"}
 # Ledger marker: the review that took this reason finished without being able to show the plan.
 UNSHOWN = "unshown:"
 
@@ -94,22 +96,18 @@ class AutonomousPlans:
         return self.get(conn, row[0] if row else plan_id)
 
     def basis(self, plan, step, epoch):
-        """What a decision about this step relies on beyond the step's own revision.
-
-        Stable JSON serialization only; strings are compared exactly as stored.
-        """
+        """Actual task dependencies and document revisions, without comparing content."""
         by_id = {s["id"]: s for s in plan["steps"]}
-        return digest({
-            "definition": {k: step.get(k) for k in ("actor", "preconditions", "depends_on", "not_before", "not_after", "completion", "owner_request_id")},
+        return {
             "dependencies": [[i, by_id[i]["revision"], by_id[i]["state"], receipt_ids(by_id[i])] if i in by_id else [i, None, None, None]
                              for i in step.get("depends_on", [])],
-            "receipts": receipt_ids(step), "goal": plan.get("goal"), "motivation": plan.get("motivation"),
-            "evidence": [[r["record_id"], r["revision"]] for r in plan.get("evidence", [])], "owner_epoch": epoch})
+            "receipts": receipt_ids(step),
+            "evidence": [[r["record_id"], r["revision"]] for r in plan.get("evidence", [])], "owner_epoch": epoch}
 
     def _entry(self, plan, epoch):
         return {"revision": plan["revision"], "steps": {s["id"]: {"revision": s["revision"], "state": s["state"],
             "decision_id": s.get("decision", {}).get("id"), "strength": s.get("strength"),
-            "delivery_artifacts": [a["sha256"] for a in s.get("delivery_artifacts", [])],
+            "delivery_artifacts": [artifact_id(a, s["id"], index) for index, a in enumerate(s.get("delivery_artifacts", []))],
             "basis": self.basis(plan, s, epoch)} for s in plan["steps"]}}
 
     def manifest(self, conn, plans):
@@ -178,6 +176,11 @@ class AutonomousPlans:
             updated = []
             for s in p.steps:
                 definition = s.model_dump()
+                if definition.get("activity_ref"):
+                    if s.actor != "contact":
+                        raise Conflict("Only contact plan steps link an activity sharing reference")
+                    from .activities import validate_activity_ref
+                    definition["activity_ref"] = validate_activity_ref(self.mind, definition["activity_ref"], conn=conn)
                 definition.update(not_before=local_time(s.not_before), not_after=local_time(s.not_after))
                 if s.not_before and s.not_after and timestamp(definition["not_before"]) >= timestamp(definition["not_after"]):
                     raise ValueError("Time window must end after it begins")
@@ -214,22 +217,14 @@ class AutonomousPlans:
 
     def manage(self, request):
         command = request["command_id"]
-        raw = PlanChange.model_validate({k: v for k, v in request.items() if k != "command_id"}).model_dump()
         key = "plan_command_" + digest([self.scope, command])[:32]
         with self.engine.db.connect(write=True) as conn:
-            # The expected revision fences the change; it is not what the change is. A client
-            # that retries the same change after rereading the plan gets its original receipt.
-            stamp = fingerprint("plan-change", self.scope, raw,
-                                enabled=optimized(conn, self.scope, "idempotency_fingerprint"))
-            prior = conn.execute("SELECT digest,result FROM commands WHERE id=?", (key,)).fetchone()
+            prior = conn.execute("SELECT result FROM commands WHERE id=?", (key,)).fetchone()
             if prior:
-                if not unchanged(conn, stamp, key, legacy=(prior[0], digest(raw))):
-                    raise Conflict("A command ID cannot be reused for a different change",
-                                   kind="runtime", code="payload-changed", target=command)
-                return json.loads(prior[1])
+                return json.loads(prior[0])
+            raw = PlanChange.model_validate({k: v for k, v in request.items() if k != "command_id"}).model_dump()
             plan = self.change(conn, raw, command)
-            conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, digest(raw), dumps(plan)))
-            record(conn, stamp, key, self.mind.clock())
+            conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, "", dumps(plan)))
             return plan
 
     def defer_owner_task(self, request):
@@ -319,16 +314,28 @@ class AutonomousPlans:
         step = next((s for s in plan["steps"] if s["id"] == d.step_id), None)
         if not step or step["state"] in {"running", "completed", "unconfirmed", "abandoned"}:
             raise Conflict("Step is not available for this decision")
-        available_artifacts = {a["sha256"]: a for s in plan["steps"] if s["state"] == "completed"
-            for r in s["receipts"] if r.get("verified") for a in r.get("artifacts", [])}
-        if d.artifact_hashes and (step["actor"] != "contact" or set(d.artifact_hashes) - set(available_artifacts)):
+        available_artifacts, legacy_aliases = {}, {}
+        for saved in plan["steps"]:
+            if saved["state"] != "completed":
+                continue
+            for receipt_index, result in enumerate(saved["receipts"]):
+                if not result.get("verified"):
+                    continue
+                parent = result.get("id") or result.get("run_id") or f"{saved['id']}:receipt:{receipt_index}"
+                for index, artifact in enumerate(result.get("artifacts", [])):
+                    identifier = artifact_id(artifact, parent, index)
+                    available_artifacts[identifier] = {**{k: v for k, v in artifact.items() if k != "sha256"}, "artifact_id": identifier}
+                    if artifact.get("sha256"):
+                        legacy_aliases[artifact["sha256"]] = identifier
+        selected = [legacy_aliases.get(identifier, identifier) for identifier in d.artifact_ids]
+        if selected and (step["actor"] != "contact" or set(selected) - set(available_artifacts)):
             raise Conflict("Delivery selection requires host-verified artifacts from completed steps")
-        artifacts = [available_artifacts[h] for h in dict.fromkeys(d.artifact_hashes)]
+        artifacts = [available_artifacts[identifier] for identifier in dict.fromkeys(selected)]
         version, epoch = self.mind._load(conn)["agent_version"], self.owner_epoch(conn)
         stored = step.get("decision") or {}
         record_only = (unchanged_view and d.action == "wait" and step["state"] == "waiting" and stored.get("action") == "wait"
                        and (d.strength is None or d.strength == step.get("strength"))
-                       and [a["sha256"] for a in artifacts] == [a["sha256"] for a in step.get("delivery_artifacts", [])]
+                       and [a["artifact_id"] for a in artifacts] == [artifact_id(a, step["id"], index) for index, a in enumerate(step.get("delivery_artifacts", []))]
                        and d.procedure_ids == stored.get("procedure_ids", []) and d.conditions_met == stored.get("conditions_met", [])
                        and optimized(conn, self.scope, "plan_review_record_only"))
         now = timestamp(self.mind.clock())
@@ -580,6 +587,12 @@ class AutonomousPlans:
             return "new-owner-evidence"
         if not self.mind._fresh(conn, plan["evidence"]) or not self.mind._fresh(conn, decision["evidence"]):
             return "source-needs-review"
+        if step.get("activity_ref"):
+            from .activities import validate_activity_ref
+            try:
+                validate_activity_ref(self.mind, step["activity_ref"], conn=conn)
+            except (Missing, Conflict):
+                return "activity-needs-review"
         from .trait_refs import decision_needs_review
         if decision_needs_review(conn, self.scope, plan["id"], step, decision):
             # A trait this decision was taken on has moved. Like a moved source, that asks for one
@@ -951,6 +964,9 @@ class AutonomousPlans:
                         evidence_ids=[r["record_id"] for r in step["decision"]["evidence"]], reason=step["decision"]["reason"],
                         content=step["goal"], topic=plan["goal"][:500], kind=step["actor"], strength=strength,
                         expires_at=plan["next_review_at"], completion=step["completion"])
+                    activity = step.get("activity_ref") or plan.get("activity_ref") or (desire or {}).get("activity_ref")
+                    if activity and step["actor"] == "contact":
+                        args["activity_ref"] = activity
                     if desire:
                         args.update(action="update", desire_id=did)
                     else:

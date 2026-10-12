@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .db import Missing, digest
+from .db import Missing
 from .engine import derived_source, uid
 
 
@@ -133,7 +133,7 @@ def snapshot_url(engine, url, scope, title=""):
             SourceInput(
                 namespace="web",
                 key=url,
-                version=digest(raw)[:20],
+                version=uid("capture"),
                 scope=scope,
                 title=title or url,
                 origin=url,

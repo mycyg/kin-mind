@@ -68,21 +68,40 @@ def test_checkpoints_are_not_copied_into_the_mind_store(setup):
 
 
 def test_automatic_background_has_a_fixed_ceiling_and_ignores_free_room(setup):
-    # K3-10: in native-window mode nothing bounded an automatic injection except the
-    # room left, and the room left was part of the runtime item's revision, so the
-    # same runtime facts were injected again on every turn.
+    # Current runtime information is shown without content fingerprints. Its
+    # automatic injection allowance remains bounded independently of free room.
     mind, _, _ = setup
     MemoryContinuity(mind).configure({'context': True, 'native_window_context': True})
     contexts = Contexts(mind)
     first = contexts.build('', purpose='chat', session='main', runtime={'model': 'synthetic', 'contextAvailableTokens': 90000})
     assert any(i['id'] == 'host-runtime' for i in first['index'])
     again = contexts.build('', purpose='chat', session='main', runtime={'model': 'synthetic', 'contextAvailableTokens': 60000})
-    assert not any(i['id'] == 'host-runtime' for i in again['index'])
+    assert any(i['id'] == 'host-runtime' for i in again['index'])
     changed = contexts.build('', purpose='chat', session='main', runtime={'model': 'another', 'contextAvailableTokens': 60000})
     assert any(i['id'] == 'host-runtime' for i in changed['index'])
     large = contexts.build('', purpose='chat', session='other', runtime={'model': 'synthetic', 'contextAvailableTokens': 200000,
                                                                           'note': '很长的运行说明。' * 6000})
     assert large['budget'] == INJECTION_CEILING and large['tokens'] <= INJECTION_CEILING
+
+
+def test_snapshot_cursors_name_actual_events_without_a_body_fingerprint(setup):
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'manifests': True})
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    event = {'id': 'synthetic-public-event', 'seq': 51, 'kind': 'owner-message', 'at': mind.clock(), 'text': '我在海边看到纸鹤。'}
+    before = checkpoints.snapshot([event])
+    after = checkpoints.snapshot([{**event, 'text': '我在海边看到一盏灯。'}])
+    assert before['cursors']['public'] == after['cursors']['public'] == [{'id': event['id'], 'seq': 51}]
+    assert before['sourceRevisions'] == after['sourceRevisions'] == {event['id']: 51}
+    assert before['watermarks']['pending_event_ids'] == [event['id']]
+    assert 'pending_digest' not in before['watermarks']
+    assert before['items'][0]['text'] != after['items'][0]['text']
+    built = checkpoints.build(before, {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    correlation = built['id']
+    assert correlation.startswith('checkpoint:') and len(correlation) == len('checkpoint:') + 32
+    built['items'][0]['text'] = '整理后的公开历史资料。'
+    checkpoints._seal(built)
+    assert built['id'] == correlation, 'one prepared object retains its correlation ID independently of its body'
 
 
 def test_the_injected_state_keeps_items_awaiting_review_marked_within_the_new_bounds(setup):

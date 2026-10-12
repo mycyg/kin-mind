@@ -32,8 +32,15 @@ from eventmem.core.self_knowledge import (
 )
 
 from . import appraisal, compat, trait_refs
-from .evidence_classes import episode_key, never_evidence, verified_behavior, window_of
-from .rhythm import interaction_windows, stamp as moment
+from .evidence_classes import (
+    episode_key,
+    never_evidence,
+    root_key,
+    verified_behavior,
+    window_of,
+)
+from .rhythm import interaction_windows
+from .rhythm import stamp as moment
 from .state import AffectiveEvent, Evolution
 
 SCHEMA = (
@@ -251,8 +258,7 @@ def owner_episodes(mind, conn, refs):
     """How many separate times the owner spoke, among these references.
 
     One interaction window is one episode, however many messages it holds and however many
-    namespaces carried them. A message outside every window keeps the content hash it used to be
-    counted by, so this can only be stricter than counting hashes."""
+    namespaces carried them. A message outside every window keeps its existing source identity."""
     windows = interaction_windows(conn, mind.scope.key(), mind.clock())["recent_windows"]
     episodes = set()
     for ref in refs:
@@ -260,7 +266,7 @@ def owner_episodes(mind, conn, refs):
                 or ref["metadata"].get("role") != "user" or ref["metadata"].get("host_event") != "message"):
             continue
         window = window_of(windows, ref["occurred_at"])
-        episodes.add(episode_key(window=window) if window else episode_key(root="hash:" + ref["hash"]))
+        episodes.add(episode_key(window=window) if window else episode_key(root=root_key(source_id=ref["source_id"])))
     return episodes
 
 
@@ -474,7 +480,7 @@ def merge_daily(mind, agent_version):
             " AND json_extract(data,'$.metadata.host_event')='message' AND json_extract(data,'$.metadata.role')='user'"
             " ORDER BY received_at DESC LIMIT 60", (scope,)).fetchall()
         refs = mind._evidence(conn, [row["id"] for row in rows]) if rows else []
-        unique = {ref["hash"]: ref for ref in refs if mind._fresh(conn, [ref])}
+        unique = {ref["source_id"]: ref for ref in refs if mind._fresh(conn, [ref])}
         shown = list(unique.values())[:20]
         if len(owner_episodes(mind, conn, shown)) < state["profile"]["evolution"]["minimum_interactions"]:
             return {"state": "waiting", "day": day, "reason": NO_EPISODES}

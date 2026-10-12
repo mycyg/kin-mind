@@ -53,6 +53,15 @@ def event(mind, source, key, values):
         reason="A sourced synthetic event",
     )
 
+def test_action_policy_uses_its_committed_event_as_the_profile_version(setup):
+    from kin_mind.actions import ActionEvents
+    mind, source, clock = setup
+    request = {"command_id": "action-policy", "agent_version": "synthetic-v1", "expected_revision": mind.read()["revision"],
+               "evidence_ids": [source("policy-evidence", "允许她自行安排探索")], "reason": "沿实际约定安排"}
+    assert ActionEvents(mind).configure(request)["state"] == "configured"
+    state = mind.read()
+    assert state["profile_version"] == state["action_policy"]["event_id"]
+
 def wish(mind, source, key="wish", strength=95, **extra):
     args = {
         "command_id": key,
@@ -93,12 +102,8 @@ def test_independent_defaults_decay_restart_dedup(setup):
     v = mind.read()["dimensions"]
     assert v["mood"]["value"] == 42 and v["longing"]["value"] > 80
     assert v["flirtation"]["value"] == 68 and v["focus"]["value"] == 79
-    with pytest.raises(Conflict):
-        mind.record(
-            request.model_copy(
-                update={"command_id": "replay-as-new", "expected_revision": 2}
-            )
-        )
+    reconsidered = mind.record(request.model_copy(update={"command_id": "replay-as-new", "expected_revision": 2}))
+    assert reconsidered["revision"] == 3, "A prior source does not prohibit a later subjective appraisal"
     with pytest.raises(Conflict):
         mind.record(
             event(mind, source, "new", {"mood": 60}).model_copy(
@@ -259,7 +264,8 @@ def test_an_unknown_send_holds_only_its_own_wish(setup):
     mind.settle_contact(attempt_id=attempt["id"], state="unconfirmed", reason="receipt-still-unknown")
     assert mind.contact_candidate()["reconcile"] == []
     second = mind.claim_contact(owner_epoch="owner-1")
-    assert mind.check_contact(second["id"], "owner-1", text="Did you  see the moon?")["reason"] == "repeats-unconfirmed-send"
+    assert mind.check_contact(second["id"], "owner-1", text="Did you  see the moon?")["eligible"]
+    assert mind.read()["contact_unconfirmed"][0]["attempt_id"] == attempt["id"], "The unknown delivery still belongs to its original attempt"
     assert mind.check_contact(second["id"], "owner-1", text="How was your day?")["eligible"]
 
 

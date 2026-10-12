@@ -1,7 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
-import {createInterface} from 'node:readline';
 import {atomicJson} from './mobile-router.mjs';
 
 export function nativePressureRuntime(runtime,history) {
@@ -24,7 +22,6 @@ export const RECEIPTS_KEPT=512;
 export const LEGACY_MARKERS_KEPT=4096;
 const INJECTION=/kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+/g;
 const INDEXED=/^kin-(?:context|checkpoint|effect):[A-Za-z0-9._:-]+$/;
-const sha256=value=>createHash('sha256').update(value).digest('hex');
 const windows=new Map();
 /** The incremental reader this process keeps for a native history file, if any. */
 export function nativeWindowFor(file){return typeof file==='string'&&file?windows.get(path.resolve(file))??null:null;}
@@ -39,20 +36,21 @@ async function readLines(file,start,end,visit) {
 }
 const publicParts=item=>item?.type==='response_item'&&item.payload?.type==='message'&&['user','assistant'].includes(item.payload.role)&&Array.isArray(item.payload.content)
   ?item.payload.content.filter(p=>['input_text','output_text'].includes(p?.type)&&typeof p.text==='string'):[];
-/** What a public message proves without keeping its words: the exact hash of each
- * text part that carries an injection marker. */
+/** A public message's actual receipt: marker, role, native item id and rollout position.
+ * No message text or content fingerprint is kept. */
 function receiptsOf(item,offset) {
   const found=[];
-  for(const part of publicParts(item)) {
+  for(const [partIndex,part] of publicParts(item).entries()) {
     const markers=[...new Set(part.text.match(INJECTION)??[])].slice(0,4);
-    if(markers.length)found.push({h:sha256(part.text),m:markers,r:item.payload.role,o:offset,at:item.timestamp??null});
+    if(markers.length)found.push({m:markers,r:item.payload.role,o:offset,p:partIndex,
+      native_item_id:item.payload.id??item.id??null,at:item.timestamp??null});
   }
   return found;
 }
 
 /** Read native receipts incrementally. Deliberately skip compaction summaries,
  * message bodies, reasoning and tool output. File bytes are only a read cursor;
- * the receipt index keeps hashes, markers, offsets and times, never text. */
+ * the receipt index keeps item ids, markers, offsets and times, never text. */
 export class NativeWindow {
   constructor({file,threadId,stateFile}) {
     Object.assign(this,{file,threadId,stateFile});
@@ -75,16 +73,17 @@ export class NativeWindow {
   migrated(){return this.state.receipts.from===0||this.state.receipts.legacy?.complete===true;}
   index(entries) {
     const items=this.state.receipts.items;
-    for(const entry of entries)if(!items.some(r=>r.o===entry.o&&r.h===entry.h))items.push(entry);
+    for(const entry of entries)if(!items.some(r=>r.o===entry.o&&r.p===entry.p))items.push(entry);
     // Oldest indexed first out: a receipt found late by reconciliation is kept as long as a fresh one.
     if(items.length>RECEIPTS_KEPT)items.splice(0,items.length-RECEIPTS_KEPT);
   }
-  /** The receipt index (interface `nativeWindow.receipts`): by exact text hash or by marker. */
+  /** The receipt index (interface `nativeWindow.receipts`): by native item id or marker.
+   * Old entries may still contain `h`; it has no part in lookup or reconciliation. */
   get receipts() {
     const items=this.state.receipts.items,from=this.state.receipts.from,legacy=this.state.receipts.legacy??null;
     return {from,legacy,covers:this.covers(),migrated:this.migrated(),
-      get:hash=>items.findLast(r=>r.h===hash)??null,
-      find:({marker,textHash,role}={})=>items.findLast(r=>r.m&&(!marker||r.m.includes(marker))&&(!textHash||r.h===textHash)&&(!role||r.r===role))??null};
+      get:id=>typeof id==='string'?items.findLast(r=>r.native_item_id===id)??null:null,
+      find:({marker,nativeItemId,role}={})=>items.findLast(r=>r.m&&(!marker||r.m.includes(marker))&&(!nativeItemId||r.native_item_id===nativeItemId)&&(!role||r.r===role))??null};
   }
   save(){atomicJson(this.stateFile,this.state);}
   async poll() {
@@ -146,27 +145,30 @@ export async function reconcileLegacyInjections(window,markers,{maxBytes,complet
   for(const marker of kept.slice(0,Math.max(0,kept.length-LEGACY_MARKERS_KEPT)))delete legacy.markers[marker];
   legacy.checkedAt=at;if(complete)legacy.complete=true;
   window.save();
-  return {state:'reconciled',found:found.map(r=>({markers:r.m,hash:r.h,offset:r.o,at:r.at})),unknown:wanted.filter(marker=>!settled.has(marker))};
+  return {state:'reconciled',found:found.map(r=>({markers:r.m,native_item_id:r.native_item_id,offset:r.o,at:r.at})),unknown:wanted.filter(marker=>!settled.has(marker))};
 }
 
 /** Injection receipt reconciliation reads only public message items and the
  * exact marker. An unknown operation is never retried on absence alone. With an
  * incremental reader for this file, an injection marker is answered from its
  * receipt index; otherwise one pass reads only lines that can contain it. */
-export async function checkpointMarker(file,marker,{textHash,role}={}) {
+export async function checkpointMarker(file,marker,{role}={}) {
   if(!fs.existsSync(file))return {found:false,state:'unconfirmed'};
   const window=nativeWindowFor(file);
   if(window&&INDEXED.test(marker)) {
     await window.poll();
-    const hit=window.receipts.find({marker,textHash,role});
-    if(hit)return {found:true,at:hit.at,offset:hit.o};
+    const hit=window.receipts.find({marker,role});
+    if(hit)return {found:true,at:hit.at,offset:hit.o,native_item_id:hit.native_item_id??null};
     // Unknown, never absent. Once the legacy pass is done this reads no history from its
     // first byte; a checkpoint's own operation state guards what that cannot prove.
     if(window.covers(marker)||window.migrated())return {found:false,state:'unconfirmed'};
   }
-  const lines=createInterface({input:fs.createReadStream(file),crlfDelay:Infinity});
-  for await(const line of lines){if(!line.includes(marker))continue;let item;try{item=JSON.parse(line);}catch{continue;}
-    if(item.type==='response_item'&&item.payload?.type==='message'&&['user','assistant'].includes(item.payload.role)&&(!role||item.payload.role===role)&&item.payload.content?.some(p=>['input_text','output_text'].includes(p.type)&&p.text?.includes(marker)&&(!textHash||sha256(p.text)===textHash))){lines.close();return {found:true,at:item.timestamp};}
-  }
-  return {found:false,state:'unconfirmed'};
+  let proof={found:false,state:'unconfirmed'};
+  await readLines(file,0,fs.statSync(file).size,(line,offset)=>{
+    if(!line.includes(marker))return;let item;try{item=JSON.parse(line);}catch{return;}
+    if((!role||item.payload?.role===role)&&publicParts(item).some(part=>part.text.includes(marker))){
+      proof={found:true,at:item.timestamp,offset,native_item_id:item.payload.id??item.id??null};return false;
+    }
+  });
+  return proof;
 }

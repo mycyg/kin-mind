@@ -6,12 +6,10 @@ provider is never copied into a ranking thread (K1-12). A reflection
 names no owner and no role, and one kept under the old wording is returned as it is (K1-21, K3-03).
 Nothing is claimed or paid for while history compaction holds the store, and what compaction alone
 set aside goes back to the queue with the marker (K3-14). Frequency ranking is gated on the
-replay's own output file (E3-10). A cached judgment is written in one transaction and keeps the
-validity it was given (K3-17). A context delivery from an earlier window ends (DB1-12). Settings
+replay's own output file (E3-10). The retired judgment cache writes and reuses no content-hash verdict. A context delivery from an earlier window ends (DB1-12). Settings
 nothing reads any more are ignored where a stored configuration or a caller still has them."""
 import hashlib
 import json
-import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -218,30 +216,23 @@ def test_frequency_ranking_is_gated_on_the_replays_own_output(world, tmp_path):
             reinforcement.validate_enable(conn, SCOPE.key(), config(replay_output=str(path), replay_sha256=sha), at)
 
 
-def test_a_cached_judgment_is_written_in_one_transaction(tmp_path, monkeypatch):
+def test_the_retired_judgment_cache_writes_and_reuses_nothing(tmp_path, monkeypatch):
     engine = Engine(tmp_path / "db")
-    held, real = [], judgment_cache.environment_digest
-
-    def probe(engine_, conn, scope):
-        # Inside put(): another writer has to wait for the row and its dependencies.
-        other = sqlite3.connect(engine.db.path, timeout=0, isolation_level=None)
-        try:
-            other.execute("BEGIN IMMEDIATE")
-            other.execute("ROLLBACK")
-            held.append(False)
-        except sqlite3.OperationalError:
-            held.append(True)
-        finally:
-            other.close()
-        return real(engine_, conn, scope)
-
-    monkeypatch.setattr(judgment_cache, "environment_digest", probe)
+    monkeypatch.setattr(judgment_cache, "environment_digest", lambda *args: pytest.fail("No environment hash is computed"))
     token = judgment_cache.put(engine, "judge_step", "request-1", {"scope": "synthetic", "type": "step-complete"},
                                {"verdict": "done"}, now=1000.0, depends_on=["src_synthetic"], valid_for=3600)
-    assert held == [True]
+    assert token is None
     with engine.db.connect() as conn:
-        assert conn.execute("SELECT expires_at,valid_until FROM mind_judgment_cache WHERE token=?", (token,)).fetchone()[:] == (4600.0, 4600.0)
-        assert conn.execute("SELECT dependency FROM mind_judgment_cache_deps WHERE token=?", (token,)).fetchone()[0] == "src_synthetic"
+        assert judgment_cache.get(engine, conn, "judge_step", "request-1", {"scope": "synthetic"}, now=1000.0) is None
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone()
+
+
+def test_evidence_origins_follow_actual_source_ids_without_merging_words():
+    from kin_mind.evidence_classes import root_key
+    window = {"start": "2026-09-24T00:00:00Z"}
+    first = root_key(source_id="source-one", text="The same words", window=window)
+    assert first != root_key(source_id="source-two", text="The same words", window=window)
+    assert first == root_key(source_id="source-one", text="Changed words", window=window)
 
 
 def test_a_delivery_that_can_no_longer_arrive_ends(world):

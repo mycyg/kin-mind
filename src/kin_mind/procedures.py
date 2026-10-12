@@ -2,13 +2,10 @@
 import json
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.idempotency import record, unchanged
-from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import RecordInput
 
 from . import evidence_refs
 from .autonomy_models import ProcedureCandidate
-from .autonomy_schema import optimized
 
 
 class Procedures:
@@ -74,7 +71,7 @@ class Procedures:
                     data = json.loads(completion[0])
                 from .behavior_chain import settled_task
                 if (data.get("kind") == "delivery" and data.get("state") == "accepted" and data.get("message_id")) or (
-                    data.get("kind") == "artifact-created" and data.get("artifact", {}).get("sha256")) or (
+                    data.get("kind") == "artifact-created" and data.get("artifact", {}).get("artifact_id")) or (
                     data.get("kind") == "task-result" and data.get("verified") is True and settled_task(conn, self.scope, data)):
                     return {"case_id": self._case(conn, data.get("task_id")) or data.get("delivery_id") or identifier,
                             "source_id": data["source_id"], "external": data.get("kind") == "delivery"}
@@ -82,22 +79,21 @@ class Procedures:
 
     def propose(self, conn, proposal, command, receipt, allowed):
         from .plans import AutonomousPlans
+        prior = conn.execute("SELECT h.data FROM mind_procedure_history h JOIN mind_procedures p ON p.id=h.id "
+            "WHERE p.scope=? AND json_extract(h.data,'$.command_id')=? ORDER BY h.revision DESC LIMIT 1",
+            (self.scope, command)).fetchone()
+        if prior:
+            return json.loads(prior[0])
         p = ProcedureCandidate.model_validate(proposal)
         refs = AutonomousPlans(self.mind)._refs(conn, p.evidence_ids, allowed)
         outcomes = [self.outcome(conn, identifier) for identifier in p.result_ids]
         refs += self.mind._evidence(conn, [o["source_id"] for o in outcomes])
         identifier = p.id or "procedure_" + digest([self.scope, p.key])[:32]
-        # This family stored no digest at all: the same command id used to return the previous
-        # method whatever the payload said. Without a side row that legacy behavior is kept.
-        stamp = fingerprint("procedure", self.scope, p.model_dump(),
-                            enabled=optimized(conn, self.scope, "idempotency_fingerprint"))
+        # Revisions use actual document concurrency, rather than comparing body fingerprints.
         old = conn.execute("SELECT data FROM mind_procedures WHERE scope=? AND id=?", (self.scope, identifier)).fetchone()
         if old:
             previous = json.loads(old[0])
             if previous["command_id"] == command:
-                if not unchanged(conn, stamp, command):
-                    raise Conflict("Procedure command changed", kind="runtime",
-                                   code="payload-changed", target=identifier)
                 return previous
             if p.expected_revision != previous["revision"]:
                 raise Conflict("Procedure changed during evaluation", target=identifier,
@@ -108,7 +104,6 @@ class Procedures:
                   "command_id": command, "receipt": receipt, "outcomes": outcomes,
                   "agent_version": self.mind._load(conn)["agent_version"], "compat": compat.stamp(self.mind, conn)}
         self._save(conn, result)
-        record(conn, stamp, command, self.mind.clock())
         if len({o["case_id"] for o in outcomes}) >= 2:
             self.engine.enqueue("procedure_replay", {"scope": self.mind.scope.model_dump(), "id": identifier, "revision": version},
                 "procedure-replay:" + identifier + ":" + str(version), conn=conn, priority=120)

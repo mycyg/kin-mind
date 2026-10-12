@@ -144,7 +144,8 @@ def test_a_slim_reference_classifies_as_its_full_one_from_the_sources_own_row(sy
         # A reference whose source is gone keeps what it carries itself.
         facts = SourceFacts(conn)
         assert facts.of({"source_id": "src_gone", "record_id": "mem_gone", "hash": "h", "namespace": "n"})["namespace"] == "n"
-        assert all(facts.of(lean)[key] == ref[key] for lean, ref in zip(slim, full) for key in evidence_refs.DROPPED)
+        assert all(facts.of(lean)[key] == ref[key] for lean, ref in zip(slim, full)
+                   for key in evidence_refs.DROPPED if key in ref)
 
 
 def test_a_graph_read_hides_what_a_slim_reference_says_is_not_experience(system):
@@ -310,7 +311,7 @@ def legacy(mind, memory):
         by = {ref["source_id"]: ref for ref in mind._evidence(conn, [first, second, third, gone])}
         refs = [by[first], by[second], by[third], by[gone]]
         quirks = [dict(refs[0]), dict(refs[0]), dict(refs[1]), dict(refs[2]), refs[3],
-                  {**{k: refs[2][k] for k in ("source_id", "record_id", "hash", "revision", "authority")}, "erased": True}]
+                  {**{k: refs[2][k] for k in ("source_id", "record_id", "revision", "authority")}, "erased": True}]
         quirks[1].pop("received_at")
         quirks[2]["metadata"] = {**quirks[2]["metadata"], "title": ERASED}
         # A copy with words its source's row no longer has: kept for the undo, and an erase's to take.

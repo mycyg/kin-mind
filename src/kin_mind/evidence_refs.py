@@ -16,10 +16,8 @@ metadata, every copy byte for byte the source row's own.
 * `source_id`, `record_id` -- every reader: `evidence_ids` projections, the archive memory's
   `derived_from`, erasure's `cites` and `drop_refs`, the host's `rests_on` and `shown_ids` naming,
   `_action_review_pending`, `_draft_read`.
-* `revision`, `hash` -- `Mind._fresh` compares both with the source and record as they are now;
-  `continuity.evidence_key` and the exploration decision's reconsideration read `source_id`+`hash`;
-  `manifest._reference` and `adopt_contact_frequency` read the four identity fields; erasure's
-  tombstone keeps both.
+* `revision` -- the historical record version. A content hash is neither reference identity
+  nor psychological evidence; legacy copies of it are dropped when references are shown.
 * `namespace`, `source_key` -- `Mind._fresh` asks whether a newer source replaced this one under the
   same namespace and key.
 * `occurred_at` -- what a read of an archived record shows of each reference (`read_archived_record`).
@@ -89,11 +87,11 @@ from typing import NamedTuple
 from eventmem.core.db import Conflict, digest, dumps
 
 # What a stored or shown reference keeps. See the module docstring for who reads each.
-TRACE = ("source_id", "record_id", "revision", "hash", "namespace", "source_key", "occurred_at")
+TRACE = ("source_id", "record_id", "revision", "namespace", "source_key", "occurred_at")
 # What it no longer carries. Anything else a reference holds (a tombstone's `erased`) is left to it.
-DROPPED = ("metadata", "authority", "session", "received_at")
+DROPPED = ("metadata", "authority", "session", "received_at", "hash")
 # Fields that make a dict a reference to a source (a tombstone has them too).
-IDENTITY = ("source_id", "record_id", "hash")
+IDENTITY = ("source_id", "record_id")
 # The lists a reference is stored in, in the document and in the archived records.
 REF_KEYS = ("evidence", "resolution_evidence")
 # The document's own mark: present, and "trace", once its references are slim.

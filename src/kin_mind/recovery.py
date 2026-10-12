@@ -294,14 +294,14 @@ def recover_batched(mind, *, command_id, workers_stopped):
                 refs = mind._evidence(conn, data.get("evidence_ids", [])) if ancestor else []
             except (Conflict, Missing):
                 refs = []
-            manifest = {(r["source_id"], r["hash"], r["revision"]) for r in ancestor_data.get("evaluated_sources", [])}
+            manifest = {(r["source_id"], r["revision"]) for r in ancestor_data.get("evaluated_sources", [])}
             if not ancestor:
                 state, reason = "pending", "no-committed-ancestor"
             elif not refs:
                 state, reason = "pending", "evidence-unresolved"
             elif not mind._fresh(conn, refs):
                 state, reason = "pending", "source-no-longer-current"
-            elif any((r["source_id"], r["hash"], r["revision"]) not in manifest for r in refs):
+            elif any((r["source_id"], r["revision"]) not in manifest for r in refs):
                 state, reason = "pending", "outside-ancestor-manifest"
             elif not all(_source_committed(conn, mind, r["source_id"]) for r in refs):
                 state, reason = "pending", "commit-receipt-missing"

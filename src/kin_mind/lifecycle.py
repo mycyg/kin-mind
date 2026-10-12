@@ -9,8 +9,6 @@ from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.idempotency import record, revision_id, unchanged
-from eventmem.core.idempotency import stamp as fingerprint
 from eventmem.core.models import Model, Scope
 
 from . import evidence_refs
@@ -232,17 +230,13 @@ class EventLifecycle:
         return bool(target_anchors and all(target_anchors & anchors(m["id"]) for m in members))
 
     def apply_routes(self, conn, routes, refs, appraisal_id, aliases=None, *, revise=False, items=None):
-        """`revise`: the caller accepts an explicit revision when a route key comes back with
-        different content. The host's own commit path does; a client that supplies its own
-        command id does not, because a reused id with other content is that client's mistake.
+        """An actual route command ID returns its stored receipt on retry.
         `items` (memory_items.Items): the memory section applies each route whole or not at all;
         without it every fault raises, as it always did."""
-        from .autonomy_schema import optimized
         from .memory_items import Items, positions
         items = items or Items(conn, False)
         allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
         results, aliases = [], aliases or {}
-        fingerprints = optimized(conn, self.scope.key(), "idempotency_fingerprint")
         from . import event_deferrals
         # Deferred routes come back (event_deferrals); off, nothing below writes a deferral.
         deferrals = event_deferrals.enabled(conn, self.scope.key())
@@ -254,27 +248,10 @@ class EventLifecycle:
                 if not live:
                     continue
                 command_id = digest([appraisal_id, route.key])
-                payload_hash = digest(route.model_dump())
-                # The expected revisions are this route's precondition, checked below against the
-                # live target and thread; title, quote, reason, binding and identity are its content.
-                stamp = fingerprint("event-route", self.scope.key(), route.model_dump(), enabled=fingerprints)
-                supersedes = None
-                old = conn.execute("SELECT digest,data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
-                if old and unchanged(conn, stamp, command_id, legacy=(old["digest"], payload_hash)):
+                old = conn.execute("SELECT data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+                if old:
                     results.append(json.loads(old["data"]))
                     continue
-                if old:
-                    if stamp is None or not revise:
-                        raise Conflict("Event route command changed", kind="runtime",
-                                       code="payload-changed", target=command_id)
-                    # An explicit revision: its own command id, superseding the one it replaces,
-                    # validated in full below and recorded with its own before/after.
-                    supersedes, command_id = command_id, revision_id(command_id, stamp)
-                    stamp = stamp._replace(supersedes=supersedes)
-                    again = conn.execute("SELECT data FROM mind_event_routes WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
-                    if again:
-                        results.append(json.loads(again["data"]))
-                        continue
                 evidence = self.graph.proof(conn, route.evidence_ids, allowed)
                 ids = route.member_ids or list(dict.fromkeys(r["record_id"] for r in evidence))
                 members = [self.graph.ensure(conn, aliases.get(i, i)) for i in ids]
@@ -340,7 +317,7 @@ class EventLifecycle:
                     inverse = {"state": "applied", "command_id": undo_id, "before": before,
                                "after_revisions": changed, "evidence": evidence, "appraisal_id": appraisal_id}
                     conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)",
-                                 (undo_id, self.scope.key(), payload_hash,
+                                 (undo_id, self.scope.key(), "",
                                   dumps(evidence_refs.as_stored(conn, self.scope.key(), "mind_graph_commands", inverse))))
                 result = {"state": action, "requested_action": route.action, "event_id": target["id"] if target else None,
                           "undo_command_id": undo_id,
@@ -349,15 +326,12 @@ class EventLifecycle:
                           "identity_evidence_versions": {r["record_id"]: r["revision"] for r in refs
                               if route.identity and r["record_id"] in route.identity.prior_record_ids},
                           "reason": route.reason, "at": self.mind.clock(), "appraisal_id": appraisal_id}
-                if supersedes:
-                    result["supersedes"] = supersedes
                 # What a replay of this route reads back is what it answers now.
                 result = evidence_refs.as_stored(conn, self.scope.key(), "mind_event_routes", result)
-                conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, payload_hash, dumps(result)))
+                conn.execute("INSERT INTO mind_event_routes VALUES(?,?,?,?)", (self.scope.key(), command_id, "", dumps(result)))
                 if deferrals:
                     event_deferrals.after_route(conn, self.scope.key(), route, action, target, members, evidence,
                                                 appraisal_id, command_id, self.mind.clock())
-                record(conn, stamp, command_id, self.mind.clock())
                 results.append(result)
         return results
 
@@ -420,10 +394,7 @@ class EventLifecycle:
         active, excluded, filtered = {}, [], []
         from .adaptive_recall import host_envelope
         for rid, record in records.items():
-            # With the policy on, one rule decides what a summary may be built from; with it off,
-            # the prefix heuristic this replaced still keeps host envelopes out. `excluded` counts
-            # only what the policy newly removes, so an event the old rule already trimmed the
-            # same way keeps its signature and is not rebuilt for nothing.
+            # The read policy determines which saved records may be summarized.
             envelope = host_envelope(record["content"])
             if not policy.visible(record) if policy.enabled else envelope:
                 filtered.append(rid)
@@ -435,20 +406,17 @@ class EventLifecycle:
                     active[rid] = record
             except (Missing, Conflict):
                 pass
-        sources = []
-        for sid in sorted({sid for r in records.values() for sid in r["source_ids"]}):
-            source = conn.execute("SELECT id,version,hash,deleted FROM sources WHERE id=? AND scope=?", (sid, self.scope.key())).fetchone()
-            sources.append(tuple(source) if source else (sid, "missing"))
-        signature = [DIGEST_VERSION, [(i, n["revision"], n["state"]) for i, n in sorted(nodes.items())],
-                     [(i, e["revision"], e["state"]) for i, e in sorted(edges.items())],
-                     [(i, r["revision"], r["status"], r.get("valid_until")) for i, r in sorted(records.items())],
-                     sorted(missing), sources, sorted(active)]
-        if excluded:
-            # Only a summary the policy actually changed carries the rules version, so a later
-            # version re-dirties exactly those and no untouched event is rebuilt for nothing.
-            signature.append([policy.rules_version, sorted(excluded)])
         return {"event": anchor, "nodes": nodes, "edges": edges, "records": active, "all_records": records,
-                "missing": sorted(missing), "excluded": sorted(excluded), "filtered": sorted(filtered), "input_hash": digest(signature)}
+                "missing": sorted(missing), "excluded": sorted(excluded), "filtered": sorted(filtered)}
+
+    def _sources_available(self, conn, snapshot):
+        """A deleted source cannot be resurrected by a prepared derived result."""
+        for record in snapshot["all_records"].values():
+            if not conn.execute("SELECT 1 FROM records WHERE id=? AND scope=? AND deleted=0", (record["id"], self.scope.key())).fetchone():
+                raise Missing("Event source was deleted")
+            for source_id in record.get("source_ids", []):
+                if not conn.execute("SELECT 1 FROM sources WHERE id=? AND scope=? AND deleted=0", (source_id, self.scope.key())).fetchone():
+                    raise Missing("Event source was deleted")
 
     def read(self, identifier, conn=None):
         if conn is None:
@@ -458,9 +426,8 @@ class EventLifecycle:
         if not row:
             return {"state": "dirty", "revision": 0, "event_id": identifier, "pending": True}
         value = dict(row)
+        value.pop("input_hash", None)
         value["data"] = json.loads(value["data"])
-        if value["state"] in {"ready", "excluded"} and self.snapshot(conn, identifier)["input_hash"] != value["input_hash"]:
-            value["state"] = "dirty"
         value["pending"] = value["state"] not in {"ready", "excluded"}
         return value
 
@@ -496,16 +463,16 @@ class EventLifecycle:
             if (snapshot["all_records"] and not snapshot["missing"]
                     and set(snapshot["filtered"]) == set(snapshot["all_records"])):
                 def exclude(conn):
-                    current = self.snapshot(conn, identifier)
+                    self._sources_available(conn, snapshot)
                     row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?",
                                        (self.scope.key(), identifier)).fetchone()
-                    if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
+                    if not row or row[0] != generation:
                         raise Conflict("Event changed during digest exclusion")
                     self.archive(conn, "event_digest", identifier)
                     conn.execute("UPDATE mind_event_digests SET state='excluded',revision=revision+1,input_hash=?,"
                                  "data=? "
                                  "WHERE scope=? AND event_id=?",
-                                 (snapshot["input_hash"], dumps({"excluded_reason": "experience-policy", "excluded_at": self.mind.clock()}), self.scope.key(), identifier))
+                                 ("", dumps({"excluded_reason": "experience-policy", "excluded_at": self.mind.clock()}), self.scope.key(), identifier))
                 return exclude
             raise ValueError("Event has no currently valid evidence")
         inputs = [{"id": r["id"], "revision": r["revision"], "basis": r["confirmation"],
@@ -541,7 +508,7 @@ class EventLifecycle:
             max_tokens=65536,
             judgment={"scope": self.scope.key(), "type": "event-digest", "goal": identifier,
                       "completion": "every unit cites a supplied record id",
-                      "obligation_version": snapshot["input_hash"]},
+                      "obligation_version": str(generation)},
             depends_on=[identifier, *snapshot["all_records"]])
         result = summary.model_dump()
         unit_count = 0
@@ -559,18 +526,14 @@ class EventLifecycle:
                       prompt_version=DIGEST_VERSION)
 
         def apply(conn):
-            current = self.snapshot(conn, identifier)
+            self._sources_available(conn, snapshot)
             row = conn.execute("SELECT generation FROM mind_event_digests WHERE scope=? AND event_id=?", (self.scope.key(), identifier)).fetchone()
-            if not row or row[0] != generation or current["input_hash"] != snapshot["input_hash"]:
+            if not row or row[0] != generation:
                 raise Conflict("Event changed during digest generation")
             if snapshot["excluded"]:
                 self.archive(conn, "event_digest", identifier)
-            # Second phase: the digest is servable only now that the event is still the
-            # one it was made from. The projection branch carries no token and is a no-op.
-            from .judgment_cache import accept
-            accept(self.engine, receipt, conn=conn)
             conn.execute("UPDATE mind_event_digests SET state='ready',revision=revision+1,input_hash=?,data=? WHERE scope=? AND event_id=?",
-                         (snapshot["input_hash"], dumps(result), self.scope.key(), identifier))
+                         ("", dumps(result), self.scope.key(), identifier))
             conn.execute("DELETE FROM mind_event_dependencies WHERE scope=? AND event_id=?", (self.scope.key(), identifier))
             conn.executemany("INSERT INTO mind_event_dependencies VALUES(?,?,?,?)",
                 [(self.scope.key(), identifier, r["id"], r["revision"]) for r in snapshot["all_records"].values()])
@@ -620,8 +583,7 @@ class EventLifecycle:
         def apply(conn):
             active_ids = set()
             for snapshot, page, members, matched in plans:
-                if self.snapshot(conn, snapshot["event"]["id"])["input_hash"] != snapshot["input_hash"]:
-                    raise Conflict("Topic membership changed during organization")
+                self._sources_available(conn, snapshot)
                 identifier = "volume_" + digest([self.scope.key(), "lifecycle", snapshot["event"]["id"], page])[:28]
                 active_ids.add(identifier)
                 row = conn.execute("SELECT revision,data FROM families WHERE id=?", (identifier,)).fetchone()
@@ -630,7 +592,7 @@ class EventLifecycle:
                     "title": snapshot["event"]["title"], "members": members, "positions": {},
                     "basis": "Sourced event membership", "generated_by": "kin-lifecycle",
                     "thread_id": snapshot["event"]["id"], "event_ids": sorted(n["id"] for n in snapshot["nodes"].values() if n["kind"] == "event"),
-                    "input_hash": snapshot["input_hash"], "candidate_families": matched, "page": page}
+                    "candidate_families": matched, "page": page}
                 if all(old.get(k) == v for k, v in value.items()):
                     continue
                 value["revision"] = (row["revision"] if row else 0) + 1
@@ -763,10 +725,9 @@ def schedule(engine, conn, at):
             old = conn.execute("SELECT 1 FROM mind_lifecycle_runs WHERE scope=? AND kind=? AND slot=?", (raw_scope, kind, slot)).fetchone()
             if old:
                 continue
-            # Snapshot metadata supplies a stable work identity, independent of
-            # unrelated metrics and settings writes.
-            watermark = digest([tuple(r) for r in conn.execute(
-                "SELECT id,revision FROM mind_graph_nodes WHERE scope=? AND kind IN ('event','thread') AND state='active' ORDER BY id", (raw_scope,))])
+            # An actual database revision-row sequence is a work watermark.
+            watermark = str(conn.execute("SELECT COALESCE(MAX(rowid),0) FROM mind_graph_revisions WHERE id IN "
+                "(SELECT id FROM mind_graph_nodes WHERE scope=? AND kind IN ('event','thread'))", (raw_scope,)).fetchone()[0])
             previous = conn.execute("SELECT input_hash FROM mind_lifecycle_runs WHERE scope=? AND kind=? AND state='complete' ORDER BY slot DESC LIMIT 1", (raw_scope, kind)).fetchone()
             unchanged = kind == "volumes" and previous and previous[0] == watermark
             conn.execute("INSERT INTO mind_lifecycle_runs VALUES(?,?,?,?,?,?)", (raw_scope, kind, slot, watermark, "complete" if unchanged else "pending", dumps({"scheduled_at": at, "unchanged": bool(unchanged)})))

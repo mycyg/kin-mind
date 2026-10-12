@@ -1,21 +1,34 @@
 import fs from 'node:fs';
-import {createHash,randomUUID} from 'node:crypto';
+import {randomUUID} from 'node:crypto';
+import {isDeepStrictEqual} from 'node:util';
 import {readJsonFile,claimPidLock,releasePidLock} from './atomic-json.mjs';
 import {atomicJson,loadState} from './mobile-router.mjs';
 import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validateCheckpoint} from './session-policy.mjs';
 import {runtimeProfile} from './codex-models.mjs';
 import {sameInstructionBinding} from './instruction-evidence.mjs';
-const hash=v=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const copy=v=>structuredClone(v);
+const BINDING_FIELDS=['conversationId','generation','threadId','nativeSessionId'];
+const bindingFacts=binding=>Object.fromEntries(BINDING_FIELDS.map(key=>[key,binding?.[key]??null]));
+const taskFacts=tasks=>(tasks??[]).map(task=>({id:task.id,inputVersion:task.inputVersion??null,status:task.status??null}));
+const recentRefs=items=>(items??[]).map(item=>({id:item.id,revision:item.revision??null,role:item.role,at:item.at??null}));
+/** Actual maintenance facts, never the dialogue, reasons, quotes or other business words. */
+const reviewBasis=observation=>{
+  if(!observation)return null;
+  const {inputTokens,expectedInputTokens,ratio,...window}=observation.pressure??{};
+  return {binding:bindingFacts(observation.binding),configVersion:observation.configVersion??null,policyVersion:observation.policyVersion??null,
+    config:observation.cursors?.config??null,profile:observation.profile,window,tasks:taskFacts(observation.tasks),
+    requested:(observation.requested??[]).map(request=>request.id).sort(),evidence:(observation.evidence??[]).map(item=>[item.id,item.revision]),
+    corrections:observation.corrections??[]};
+};
 const candidateProfile=value=>{
   const source=Object.hasOwn(value??{},'provider')?value:runtimeProfile(value),profile={provider:source.provider,providerKind:source.providerKind,model:source.model,reasoningEffort:source.reasoningEffort,serviceTierPreference:source.serviceTierPreference};
   return profile.provider&&['gateway','native'].includes(profile.providerKind)&&profile.model&&profile.reasoningEffort&&['default','fast'].includes(profile.serviceTierPreference)?profile:null;
 };
 const sameCandidateProfile=(left,right)=>Boolean(left&&right&&['provider','providerKind','model','reasoningEffort','serviceTierPreference'].every(key=>left[key]===right[key]));
-const sameProviderBinding=(left,right)=>Boolean(left&&right&&['sourceProvider','sourceProviderKind','launchProvider','endpointSha256'].every(key=>left[key]===right[key]));
+const sameProviderBinding=(left,right)=>Boolean(left&&right&&['sourceProvider','sourceProviderKind','launchProvider','endpoint'].every(key=>left[key]===right[key]));
 const validProviderBinding=(binding,profile)=>Boolean(binding&&profile&&binding.sourceProvider===profile.provider&&binding.sourceProviderKind===profile.providerKind&&
-  (profile.providerKind==='native'?binding.launchProvider===profile.provider&&binding.endpointSha256===null:
-    binding.launchProvider!==profile.provider&&/^[a-f0-9]{64}$/.test(binding.endpointSha256??'')));
+  (profile.providerKind==='native'?binding.launchProvider===profile.provider&&binding.endpoint===null:
+    binding.launchProvider!==profile.provider&&typeof binding.endpoint==='string'&&binding.endpoint.length>0));
 const candidateHasProfileAuthority=candidate=>{
   const profile=candidateProfile(candidate?.profile),nativeProfile=candidateProfile(candidate?.native?.profile),binding=candidate?.native?.providerBinding;
   return Boolean(sameCandidateProfile(profile,nativeProfile)&&validProviderBinding(binding,profile));
@@ -108,7 +121,7 @@ export class SessionManager {
    * `configure`; the host's configured values seed a new registry. A difference is kept
    * where the operator can see it instead of being dropped without a word. */
   recordConfigDrift(configured) {
-    const keys=Object.keys(configured??{}).filter(key=>key!=='version'&&hash(configured[key]??null)!==hash(this.state.config[key]??null)).sort();
+    const keys=Object.keys(configured??{}).filter(key=>key!=='version'&&!Object.is(configured[key]??null,this.state.config[key]??null)).sort();
     if(!keys.length){delete this.state.configDrift;return null;}
     this.state.configDrift={keys,configured:Object.fromEntries(keys.map(key=>[key,configured[key]])),registry:Object.fromEntries(keys.map(key=>[key,this.state.config[key]??null]))};
     return keys;
@@ -139,7 +152,7 @@ export class SessionManager {
     // The current file only: a fence is never checked against an older revision.
     const current=readJsonFile(this.file);
     if(current.state!=='ok'||!current.value?.binding)throw Error('KIN_SESSION_REGISTRY_UNREADABLE');
-    if(hash(current.value.binding)!==hash(fence))throw Error('KIN_STALE_SESSION_GENERATION');
+    if(BINDING_FIELDS.some(key=>current.value.binding[key]!==fence[key]))throw Error('KIN_STALE_SESSION_GENERATION');
     return true;
   }
   async locked(fn){return this.coordinator.locked(async()=>{this.assertFence(this.state.binding);return fn();});}
@@ -171,26 +184,25 @@ export class SessionManager {
   evidence(event) {
     if(!event.id||!event.sourceId||!event.revision||!Number.isFinite(event.at))throw Error('Session evidence needs a source and time');
     const old=this.state.evidence[event.id];
-    if(old&&old.revision===event.revision){if(hash(old)!==hash({...event,generation:event.generation??this.state.binding.generation}))throw Error('Evidence ID conflict');return old;}
+    if(old&&old.revision===event.revision)return old;
     this.state.evidence[event.id]={...copy(event),generation:event.generation??this.state.binding.generation};this.save('evidence',{id:event.id});return this.state.evidence[event.id];
   }
   request({id,action='review',reason,sourceId}) {
     if(!id||!reason||!sourceId||!['review','compact','rotate'].includes(action))throw Error('Invalid session request');
     const input={id,action,reason,sourceId};const prior=this.state.requests[id];
-    if(prior){if(prior.hash!==hash(input))throw Error('Session request ID conflict');return copy(prior);}
-    this.state.requests[id]={...input,hash:hash(input),state:'pending',at:this.now()};this.save('request',{id});return copy(this.state.requests[id]);
+    if(prior)return copy(prior);
+    this.state.requests[id]={...input,state:'pending',at:this.now()};this.save('request',{id});return copy(this.state.requests[id]);
   }
   configure({id,sourceId,reason,expectedRevision,changes}) {
-    const input={id,sourceId,reason,expectedRevision,changes};
     if(!id||!sourceId||!reason||!changes)throw Error('Configuration requires a sourced command');
     this.state.configReceipts??={};const prior=this.state.configReceipts[id];
-    if(prior){if(prior.hash!==hash(input))throw Error('Configuration command conflict');return copy(prior);}
+    if(prior)return copy(prior);
     if(expectedRevision!==(this.state.configRevision??0))throw Error('Configuration revision changed');
     const booleans=['observe','compact','prepare','rotate'],numbers={preparePressure:[0.4,0.9],criticalPressure:[0.6,0.98],compactCooldownMs:[300000,86400000],rotationCooldownMs:[300000,86400000],restoreBudget:[500,4000]};
     for(const [key,value] of Object.entries(changes))if(!(booleans.includes(key)&&typeof value==='boolean')&&!(numbers[key]&&Number.isFinite(value)&&value>=numbers[key][0]&&value<=numbers[key][1]))throw Error('Unsupported session configuration');
     const next={...this.state.config,...changes};if(next.criticalPressure<=next.preparePressure)throw Error('Pressure thresholds out of order');
     this.state.configRevision=(this.state.configRevision??0)+1;next.version='compact-first-v1:'+this.state.configRevision;this.state.config=next;
-    const receipt={id,sourceId,reason,changes,hash:hash(input),state:'applied',revision:this.state.configRevision,version:next.version,at:this.now()};this.state.configReceipts[id]=receipt;this.state.sessionAdvice=null;this.save('configuration-applied',{id});return copy(receipt);
+    const receipt={id,sourceId,reason,changes,state:'applied',revision:this.state.configRevision,version:next.version,at:this.now()};this.state.configReceipts[id]=receipt;this.state.sessionAdvice=null;this.save('configuration-applied',{id});return copy(receipt);
   }
   /** Callers save: the revision that settles the requests is the one that answered them. */
   settleRequests(state,receipt) {
@@ -275,7 +287,7 @@ export class SessionManager {
     if(current)for(const finding of advice.findings??[]){
       const source=this.state.observation.recent?.find(i=>i.id===finding.sourceId&&i.role==='user'&&i.text?.includes(finding.quote));
       if(!source)throw Error('Session finding has no exact owner source');
-      const id='session:'+hash([source.id,finding.kind]).slice(0,32);
+      const id='session:'+source.id+':'+finding.kind;
       if(!this.state.evidence[id])this.evidence({id,sourceId:source.id,revision:source.revision,dependencies:source.dependencies??[],kind:finding.kind,at:Date.parse(source.at),basis:'owner-statement',accountBasis:'model-interpretation-of-owner-correction',quote:finding.quote,reason:finding.reason});
     }
     const answer={action:advice.action,requestId:requestId??event?.requestId??null,turnId:native?.native_turn_id??null,forkThreadId:native?.fork_thread_id??null,at:now};
@@ -311,18 +323,24 @@ export class SessionManager {
       profile:candidateProfile(runtime),window,tasks:(context.tasks??[]).map(t=>({id:t.id,inputVersion:t.inputVersion,status:t.status})),
       requested:requested.map(r=>r.id).sort(),evidence:evidence.map(e=>[e.id,e.revision]),
       corrections:[...new Set([...(context.invalidatedSources??[]),...(context.linked?.needs_review_ids??[])])].sort()};
-    const id=hash(cause);
     const content={binding:cause.binding,configVersion:cause.configVersion,policyVersion:cause.policyVersion,cursors,profile:cause.profile,pressure,
       lastCompaction:last?{id:last.id,completedAt:last.completedAt,before:last.before,after:last.after,origin:last.origin}:null,
       evidence,tasks:cause.tasks,corrections:cause.corrections,
       recent:(context.items??[]).slice(-8).map(i=>({id:i.id,role:i.role,at:i.at,revision:i.revision,dependencies:i.dependencies??[],...(i.text.length<=2000?{text:i.text}:{readId:i.sourceId,textOmitted:true})})),
       requested};
-    // Exact token counts stay current in memory without a write for each token used.
-    const stable=value=>value&&hash({...value,id:undefined,at:undefined,pressure:{...value.pressure,inputTokens:undefined,expectedInputTokens:undefined,ratio:undefined}});
-    const changed=previous?.id!==id||stable(previous)!==stable(content);
-    const semantic=Boolean(previous&&previous.binding?.generation===generation&&(SEMANTIC_CAUSES.some(key=>hash(previous[key]??null)!==hash(content[key]??null))||
-      hash(previous.cursors?.config??null)!==hash(cursors?.config??null)));
-    this.state.observation={...content,id,at:changed?now:previous.at};
+    // An observation's id is its recorded event identity. Reuse a prior question only for
+    // the same actual maintenance facts; no business text is compared or fingerprinted.
+    const basis=reviewBasis(content),previousBasis=previous?.reviewBasis??reviewBasis(previous);
+    const known=previous&&isDeepStrictEqual(previousBasis,basis)?previous.id:
+      Object.values(this.state.events).find(event=>isDeepStrictEqual(event.reviewBasis,basis))?.cause;
+    const id=known??'observation:'+randomUUID();
+    // Exact token counts and current words stay in memory. Writes follow changed database
+    // cursors, record references and maintenance events, rather than changed text bytes.
+    const changed=previous?.id!==id||!isDeepStrictEqual(previous?.cursors??null,cursors??null)||
+      previous?.lastCompaction?.id!==content.lastCompaction?.id||!isDeepStrictEqual(recentRefs(previous?.recent),recentRefs(content.recent));
+    const semantic=Boolean(previous&&previous.binding?.generation===generation&&(SEMANTIC_CAUSES.some(key=>!isDeepStrictEqual(previousBasis?.[key]??null,basis[key]??null))||
+      previousBasis?.config!==basis.config));
+    this.state.observation={...content,reviewBasis:basis,id,at:changed?now:previous.at};
     if(changed)this.save('observation',{id});
     const urgent=['elevated','critical'].includes(window.level)||evidence.length>0||requested.length>0;
     await this.review(id,{entered:previous?.id!==id,worth:urgent||semantic,spaced:!urgent&&semantic});
@@ -340,9 +358,10 @@ export class SessionManager {
     const advised=this.state.sessionAdvice?.snapshotId===cause&&this.state.sessionAdvice.generation===this.state.binding.generation;
     if(!event&&worth){
       const nextAt=spaced?Math.max(now,(this.state.semanticReviewAt??-Infinity)+this.state.config.compactCooldownMs):now;
-      event=events[cause]={cause,state:'pending',attempts:0,failures:0,at:now,nextAt,...(spaced?{spaced:true}:{})};this.prune();
+      event=events[cause]={cause,reviewBasis:copy(this.state.observation.reviewBasis),state:'pending',attempts:0,failures:0,at:now,nextAt,...(spaced?{spaced:true}:{})};this.prune();
     }
     if(!event)return;
+    event.reviewBasis??=copy(this.state.observation.reviewBasis);
     if(event.state==='queued'&&now-event.queuedAt>=this.limits.reviewTimeoutMs)Object.assign(event,{state:'pending',unanswered:(event.unanswered??0)+1,nextAt:now+this.backoff(event.attempts)});
     else if(SETTLED.has(event.state)&&!advised&&worth&&now>=(event.nextAt??0))event.state='pending';
     if(event.state!=='pending'||now<event.nextAt)return;
@@ -380,14 +399,16 @@ export class SessionManager {
       return await this.prepare(advice,context,{runtime,eligibility});
     }finally{this.running=false;}
   }
-  /** Checkpoints are built once per cursor state (K3-05, K3-09, AD1-13): an unchanged
-   * conversation is not rebuilt every minute, and an incomplete one is retried after a
-   * growing wait instead of at every tick. */
+  /** Reuse an actual checkpoint for its recorded conversation, cursors and budget. An
+   * incomplete build retains the existing growing wait. No payload memo key is computed. */
   async preparedCheckpoint(context,binding,budget) {
-    const key=hash([binding,context.cursors,context.configVersion,budget]),memo=this.checkpointMemo,now=this.now();
-    if(memo?.key===key&&(memo.checkpoint.complete||now<memo.retryAt))return {checkpoint:memo.checkpoint,retryAt:memo.checkpoint.complete?null:memo.retryAt};
-    const checkpoint=await this.checkpoint(context,binding,budget),failures=checkpoint?.complete?0:(memo?.key===key?memo.failures:0)+1;
-    this.checkpointMemo={key,checkpoint,failures,retryAt:now+Math.min(HOUR,300000*2**Math.max(0,failures-1))};
+    const memo=this.checkpointMemo,now=this.now(),prior=memo?.checkpoint;
+    const matches=prior&&memo.budget===budget&&isDeepStrictEqual(memo.binding,bindingFacts(binding))&&
+      memo.configVersion===context.configVersion&&isDeepStrictEqual(memo.cursors,context.cursors);
+    if(matches&&(prior.complete||now<memo.retryAt))return {checkpoint:prior,retryAt:prior.complete?null:memo.retryAt};
+    const checkpoint=await this.checkpoint(context,binding,budget),failures=checkpoint?.complete?0:(matches?memo.failures:0)+1;
+    this.checkpointMemo={checkpoint,binding:bindingFacts(binding),cursors:copy(context.cursors),configVersion:context.configVersion,
+      budget,failures,retryAt:now+Math.min(HOUR,300000*2**Math.max(0,failures-1))};
     return {checkpoint,retryAt:null};
   }
   async runCompaction(advice,context) {
@@ -414,7 +435,7 @@ export class SessionManager {
       if(invalid)return {state:'waiting',reason:invalid};
       // A failed attempt is settled first; the next one has an ID of its own.
       const attempt=this.state.compactions.filter(c=>c.snapshotId===advice.snapshotId&&c.generation===this.state.binding.generation).length;
-      const id='compact:'+hash(attempt?[this.fence(),advice.snapshotId,attempt]:[this.fence(),advice.snapshotId]).slice(0,32);
+      const id='compact:'+advice.snapshotId+':'+attempt;
       const operation={id,state:'running',generation:this.state.binding.generation,snapshotId:advice.snapshotId,startedAt:this.now(),before:windowPressure(before,this.state.config),model:before.model,tasks:copy(current.tasks??[]),checkpoint};
       this.state.compactions.push(operation);this.save('compact-start',{id});
       // N1-03: a native compaction that fails may never answer. The host stops waiting and
@@ -427,7 +448,7 @@ export class SessionManager {
           operation.state='failed';operation.failure={reason:receipt.reason??'native-compaction-failed',at:this.now()};this.save('compact-failed',{id});return {state:'failed',operationId:id};
         }
         const after=await this.inspect();
-        if(!receipt?.completed||receipt.actual_session!==this.state.binding.threadId||after.model!==before.model||!after.known||hash((await this.collect()).tasks??[])!==hash(current.tasks??[]))throw Error('Compaction ownership unconfirmed');
+        if(!receipt?.completed||receipt.actual_session!==this.state.binding.threadId||after.model!==before.model||!after.known||!isDeepStrictEqual(taskFacts((await this.collect()).tasks),taskFacts(current.tasks)))throw Error('Compaction ownership unconfirmed');
         await this.ackCompact(receipt,checkpoint);
         operation.state='complete';operation.receipt=receipt;operation.completedAt=this.now();operation.after=windowPressure(after,this.state.config);
         this.executed(advice.snapshotId);this.settleRequests('complete',receipt);this.save('compact-complete',{id});return {state:'complete',operationId:id};
@@ -506,7 +527,7 @@ export class SessionManager {
    * replaced, and the new one checked, only for what `standby` names. It is handed over only with a
    * checkpoint exactly as far as the conversation. */
   async advanceCandidate(advice,context,candidate,{runtime:observed=null,eligibility=null}={}) {
-    const fence=this.fence(),judgment=hash([advice.snapshotId,advice.at??null]);
+    const fence=this.fence(),judgment=advice.snapshotId+':'+(advice.turnId??advice.at??'');
     const budget=Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0);
     // Her judgment to hand over now, with handovers enabled: no bound below holds it back.
     const handover=advice.action==='rotate'&&Boolean(this.state.config.rotate);
@@ -546,7 +567,7 @@ export class SessionManager {
     const checkpoint=candidate.checkpoint;
     if(candidate.state==='created'){
       if(this.frozen())return frozenWait();
-      candidate.state='injecting';candidate.injectionId=hash([candidate.id,checkpoint.id]);this.save('candidate-injecting',{id:candidate.id});
+      candidate.state='injecting';candidate.injectionId=candidate.id+':checkpoint:'+checkpoint.id;this.save('candidate-injecting',{id:candidate.id});
       try{candidate.injection=await this.injectCandidate({...candidate.native,checkpoint,operationId:candidate.injectionId});if(!candidate.injection?.verified)throw Error('Injection unconfirmed');candidate.state='injected';this.save('candidate-injected',{id:candidate.id});}
       catch(error){candidate.state='unconfirmed';candidate.error=error.name;this.save('candidate-unconfirmed',{id:candidate.id});return {state:'unconfirmed'};}
     }
@@ -613,7 +634,7 @@ export class SessionManager {
     const replace=
       // It can no longer be used, or its check no longer stands.
       candidate.generation!==fence.generation?'binding-changed':candidate.state==='waiting'?'check-failed':
-      checked&&checked.key!==this.checkKey(candidate)?'check-basis-changed':
+      checked&&!isDeepStrictEqual(checked.key,this.checkKey(candidate))?'check-basis-changed':
       checked&&this.now()-checked.at>=this.limits.candidateCheckMs?'check-interval':
       checked&&(candidate.verification?.checkpointId!==candidate.checkpoint?.id||!candidateVerificationReady(candidate.verification,candidate))?'check-unverified':
       profile&&!sameCandidateProfile(candidate.profile,profile)?'profile-changed':launch==='changed'?'launch-changed':
@@ -650,9 +671,9 @@ export class SessionManager {
    * configuration revision and the candidate itself, its checkpoint with it. */
   checkKey(candidate) {
     const native=candidate.native??{};
-    return hash({binding:this.state.binding,configRevision:this.state.configRevision??0,candidate:{id:candidate.id,threadId:native.threadId,
+    return {binding:bindingFacts(this.state.binding),configRevision:this.state.configRevision??0,candidate:{id:candidate.id,threadId:native.threadId,
       nativeSessionId:native.nativeSessionId,checkpointId:candidate.checkpoint?.id,profile:candidate.profile,providerBinding:native.providerBinding,
-      instructionBinding:native.instructionBinding??null}});
+      instructionBinding:native.instructionBinding??null}};
   }
   /** A failed check: the candidate is not checked again. Nothing is made or checked for the same
    * judgment before a wait that doubles from `candidateRetryMs`, up to `candidateCheckMs`; then a new

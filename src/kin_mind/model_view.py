@@ -5,7 +5,7 @@ the source it is, and never a source's metadata.
 -- a source's metadata is an index for retrieval. It is not put into anything a model is shown and
 is not cited; what is shown only has to stay traceable, by its ids.
 
-**References** (`evidence_refs.is_ref`: a dict with a string `source_id`, `record_id` and `hash`) are
+**References** (`evidence_refs.is_ref`: a dict with string `source_id` and `record_id`) are
 shown as `evidence_refs.trace` gives them -- whatever they carry besides `evidence_refs.DROPPED` --
 whether the document that holds them is slimmed or not: a full reference and a slim one are shown
 alike. What a reference carries besides the trace and the dropped fields (an exploration target's
@@ -39,7 +39,7 @@ what this takes out.
 * the host's actions whose answers the host puts in front of a model (`kin_mind.host.MODEL_FACING`:
   the memory context, the state read, the contact candidate and claim, a creation's claim and brief,
   the session checkpoint, the history and graph reads);
-* a prepared context injection (`ContextDelivery.prepare`), before its text is hashed;
+* a prepared context injection (`ContextDelivery.prepare`), before its actual delivery ID is recorded;
 * every DeepSeek request: `DeepSeek.structured`, the appraisal's own request (`DeepSeek._post`, what
   the user turns carry, the recall reads' results among them) and its projection (`appraisal_context`),
   a main-session fork's (`NativeReview._native`) and eventmem's providers (`Providers._json_once`);

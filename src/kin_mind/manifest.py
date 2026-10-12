@@ -1,26 +1,8 @@
-"""The input manifest: what one appraisal attempt was actually shown, recorded by the host.
+"""An appraisal attempt records actual IDs, DB revisions and execution policy.
 
-The host writes it while it builds the context, before any model call, and stores it content
-addressed in `mind_appraisal_manifests`; the queue row keeps the digest only. It holds identifiers,
-revisions, digests, enumerated states and the numeric and time values shown to the model. It never
-holds a message body, a proposal or any other free text.
-
-Two readers share this one record:
-
-* the commit transaction, whose rebase asks whether a moved mind revision touched anything this
-  judgment wrote or relied on (`rebase`);
-* the next attempt after a commit conflict, which rebuilds its context as usual, compares the two
-  manifests class by class (`compare`) and decides whether the stored proposal may be reused.
-
-Relevance is decided by the **judgment type**, never by what the proposal happened to output: an
-empty section is a judgment too. A judgment type or a class this module does not know is relevant.
-Inside a class, the fields named in BOOKKEEPING are the only ones whose change does not count.
-
-Equal request digests prove that two requests were equal, not that the context is still fresh. So
-the manifest also keeps the clock the model saw, the time-derived values shown to it and the time
-boundaries shown, and states its own validity: one ordinary attempt's bound or the nearest shown
-boundary, whichever comes first. An old judgment is never valid merely because no predicate
-flipped and no curve parameter changed.
+One existing manifest row carries the attempt; no content-addressed parts or
+psychological consistency fingerprint participates in commit or reuse. Source,
+permission and task checks still run where their real transactions apply.
 """
 
 from __future__ import annotations
@@ -28,7 +10,8 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from eventmem.core.db import digest, dumps
+from eventmem.core.db import dumps
+from uuid import uuid4
 
 from .autonomy_schema import optimized
 from .state import timestamp
@@ -39,8 +22,7 @@ MANIFEST_VERSION = "appraisal-manifest-v1"
 REBASE, REUSE, REVALIDATION = "manifest_rebase", "appraisal_reuse", "appraisal_revalidation"
 RETENTION_DAYS = 7
 
-# One table, content addressed at two levels. A manifest row names its classes by digest, and each
-# class is a row of its own (lane '#part'), so consecutive attempts share whatever did not move.
+# The existing digest-named column stores an attempt ID for schema compatibility.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_appraisal_manifests(
  digest TEXT PRIMARY KEY,scope TEXT NOT NULL,judgment TEXT NOT NULL,lane TEXT NOT NULL,
@@ -119,11 +101,11 @@ def attempt_bound(provider):
 
 
 def _reference(ref):
-    return [ref["source_id"], ref["hash"], ref["revision"]]
+    return [ref["source_id"], ref["revision"]]
 
 
 def _shown(value, skipped=("revision", "updated_at")):
-    return digest({k: v for k, v in value.items() if k not in skipped})
+    return {k: value.get(k) for k in ("id", "revision", "status", "source_ids") if k in value}
 
 
 def _owner(conn, scope):
@@ -188,13 +170,18 @@ def _mind_state(view, shown):
         classes["decisions"] = {d["exploration_id"]: {"revision": d.get("revision"), "decision": d.get("decision"),
                                                       "needs_review": d.get("needs_review")}
                                 for d in shown["exploration_decisions"] or []}
+    if "activity_decisions" in shown:
+        classes.setdefault("decisions", {}).update({
+            "dream:" + d["activity_ref"]["id"]: {"revision": d.get("revision"), "decision": d.get("decision"),
+                "needs_review": d.get("needs_review"), "activity_ref": d["activity_ref"]}
+            for d in shown["activity_decisions"] or [] if (d.get("activity_ref") or {}).get("kind") == "dream"})
     if "rhythm" in shown:
         rhythm = shown["rhythm"] or {}
         classes["rhythm"] = {"rhythm": {
             "status": rhythm.get("status"), "phase": rhythm.get("phase"), "proposed_phase": rhythm.get("proposed_phase"),
             "target": rhythm.get("target"), "half_life_minutes": rhythm.get("half_life_minutes"),
             "event_id": rhythm.get("event_id"), "needs_review": rhythm.get("needs_review"),
-            "interactions": (rhythm.get("interactions") or {}).get("fingerprint")}}
+            "interactions": (rhythm.get("interactions") or {}).get("source_ids")}}
         values["rhythm"] = rhythm.get("alertness")
     if "appraisal_summary" in shown:
         summary = shown["appraisal_summary"] or {}
@@ -296,7 +283,7 @@ def build(jobs, provider, data, context, *, refs, targets, sources, view, lane, 
                                  for p in (autonomy.get("procedures") or {}).get("procedures", [])}
     habits = (memory or {}).get("conversation_habits") or (jobs.memory.habits.read() if judgment != MAINTENANCE else None)
     if habits:
-        classes["habits"] = {"habits": {"revision": habits.get("revision"), "preferences": digest(habits.get("preferences"))}}
+        classes["habits"] = {"habits": {"revision": habits.get("revision")}}
     if memory:
         classes["graph"] = {n["id"]: {"revision": n.get("revision"), "kind": n.get("kind"), "needs_review": n.get("needs_review"),
                                       "shown": _shown(n)} for n in shown_memory.get("graph_candidates", [])}
@@ -327,25 +314,23 @@ def build(jobs, provider, data, context, *, refs, targets, sources, view, lane, 
     profile = provider.request_profile(context) if hasattr(provider, "request_profile") else {}
     capabilities = jobs.exploration_capabilities
     if context.get("effective_memory_use"):
-        values["reinforcement"] = digest(context["effective_memory_use"])
+        values["reinforcement"] = context["effective_memory_use"].get("revision")
     policy = {
         "agent_version": view.get("agent_version"), "enqueued_agent_version": data.get("agent_version"),
         "configuration": capabilities.get("version") or (view.get("continuity") or {}).get("version")
                          or (view.get("action_policy") or {}).get("version"),
-        "profile_version": view.get("profile_version"), "persona": view.get("persona_contract"),
-        **{name: digest(view.get(name)) for name in ("action_policy", "autonomy", "continuity", "contact", "exploration")},
-        "capabilities": digest(capabilities), "settings": {k: settings.get(k) for k in SETTINGS_SHOWN},
+
+        **{name: view.get(name) for name in ("action_policy", "autonomy", "continuity", "contact", "exploration")},
+        "capabilities": capabilities, "settings": {k: settings.get(k) for k in SETTINGS_SHOWN},
         "section_isolation": bool(isolation), "operational": bool(context.get("operational_only")),
-        "environment": digest(autonomy.get("execution_environment")) if autonomy else None,
-        "definitions": digest(shown.get("definitions")),
+        "environment": autonomy.get("execution_environment") if autonomy else None,
     }
     return {
         "version": MANIFEST_VERSION,
         "judgment": {"type": judgment, "lane": lane, "stimulus": data.get("stimulus")},
         "built_at": clock, "valid_until": valid_until,
-        # What frames the request is compared like policy. The digest of the context proves two
-        # requests equal and nothing more: the clock alone makes it differ from one attempt to the next.
-        "request": {**{name: profile.get(name) for name in ("system", "schema", "model", "parameters")}, "context": digest(dumps(shown))},
+        # Only actual model parameters frame this record; request words are not proof.
+        "request": {name: profile.get(name) for name in ("model", "parameters")},
         "policy": policy,
         "owner": {"latest_owner_seq": (memory or {}).get("latest_owner_seq", epoch), "owner_epoch": epoch,
                   "last_owner_message_at": (view.get("interaction_timing") or {}).get("last_owner_message_at")},
@@ -377,50 +362,36 @@ def record(jobs, provider, data, context, flags, **facts):
 
 
 def store(engine, scope, manifest):
-    """Content addressed twice over: the same manifest is one row however many attempts recorded
-    it, and each class is a row of its own that every manifest showing the same objects shares."""
-    parts = {"sources": manifest["sources"], **{"classes/" + name: value for name, value in manifest["classes"].items()}}
-    bodies = {name: dumps(value) for name, value in parts.items()}
-    keys = {name: digest([name, body]) for name, body in bodies.items()}
-    body = dumps({**manifest, "sources": keys["sources"],
-                  "classes": {name: keys["classes/" + name] for name in manifest["classes"]}})
-    key = digest(body)
+    """One attempt record, addressed by its own ID rather than content."""
+    key = "manifest_" + uuid4().hex
     at, valid = manifest["built_at"], manifest["valid_until"]
     cutoff = (timestamp(at) - timedelta(days=RETENTION_DAYS)).isoformat()
     with engine.db.connect(write=True) as conn:
         for statement in SCHEMA.strip().split(";\n"):
-            # One at a time: executescript() would commit the transaction this write belongs to.
             conn.execute(statement)
-        for name, part in bodies.items():
-            # A shared part lives as long as the newest manifest that names it.
-            conn.execute("INSERT INTO mind_appraisal_manifests VALUES(?,?,?,?,?,?,?) ON CONFLICT(digest) DO UPDATE SET built_at=excluded.built_at",
-                         (keys[name], scope, name, PART, at, valid, part))
-        conn.execute("INSERT OR IGNORE INTO mind_appraisal_manifests VALUES(?,?,?,?,?,?,?)",
-                     (key, scope, manifest["judgment"]["type"], manifest["judgment"]["lane"], at, valid, body))
-        # A manifest serves the retries of one evaluation and its audit; nothing reads one this old.
+        conn.execute("INSERT INTO mind_appraisal_manifests VALUES(?,?,?,?,?,?,?)",
+                     (key, scope, manifest["judgment"]["type"], manifest["judgment"]["lane"], at, valid, dumps(manifest)))
         conn.execute("DELETE FROM mind_appraisal_manifests WHERE scope=? AND built_at<?", (scope, cutoff))
     return key
 
 
 def load(engine, scope, key):
-    """The manifest with its parts resolved, or None when it (or any part of it) is gone."""
+    """Read by ID; legacy split records remain readable without hash checks."""
     if not key:
         return None
     with engine.db.connect() as conn:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisal_manifests'").fetchone():
             return None
-
-        def read(digest_key):
-            row = conn.execute("SELECT data FROM mind_appraisal_manifests WHERE digest=? AND scope=?", (digest_key, scope)).fetchone()
+        def read(identifier):
+            row = conn.execute("SELECT data FROM mind_appraisal_manifests WHERE digest=? AND scope=?", (identifier, scope)).fetchone()
             return json.loads(row[0]) if row else None
         manifest = read(key)
         if manifest is None:
             return None
-        manifest["sources"] = read(manifest["sources"])
-        manifest["classes"] = {name: read(part) for name, part in manifest["classes"].items()}
-    if manifest["sources"] is None or any(part is None for part in manifest["classes"].values()):
-        return None
-    return manifest
+        if isinstance(manifest.get("sources"), str):
+            manifest["sources"] = read(manifest["sources"])
+            manifest["classes"] = {name: read(part) for name, part in manifest["classes"].items()}
+        return manifest
 
 
 def expired(manifest, now):
@@ -451,6 +422,8 @@ def compare(old, new):
     """
     changes = []
     for name in sorted(set(old.get("classes", {})) | set(new.get("classes", {}))):
+        if name in {"dimensions", "desires", "concerns", "decisions", "rhythm", "assessment", "style", "traits"}:
+            continue
         before, after = old["classes"].get(name) or {}, new["classes"].get(name) or {}
         for key in sorted(set(before) | set(after)):
             a, b = before.get(key), after.get(key)
@@ -470,7 +443,11 @@ def write_set(proposal):
     written = {("dimensions", name) for name in [*(proposal.get("values") or {}), *(proposal.get("motivations") or {})]}
     written |= {("desires", u["desire_id"]) for u in proposal.get("wish_updates") or []}
     written |= {("concerns", c["concern_id"]) for c in proposal.get("concerns") or [] if c.get("concern_id")}
-    written |= {("decisions", s["exploration_id"]) for s in proposal.get("sharing") or []}
+    for decision in proposal.get("sharing") or []:
+        activity = decision.get("activity_ref") or {}
+        key = decision.get("exploration_id") or ("dream:" + activity["id"] if activity.get("kind") == "dream" else activity.get("id"))
+        if key:
+            written.add(("decisions", key))
     written |= {("plans", c["id"]) for c in proposal.get("plan_changes") or [] if c.get("id")}
     # A decision on a plan this very proposal creates names it by key: nobody else has a version of it.
     created = {c.get("key") for c in proposal.get("plan_changes") or [] if c.get("action") == "create"}
@@ -486,7 +463,7 @@ def write_set(proposal):
     written |= {("shares", d["share_id"]) for d in memory.get("disclosures") or []}
     for mapping in (memory.get("coverage") or {}).get("mappings") or []:
         written.add(("shares", mapping["share_id"]))
-        written |= {("graph", r["unit_id"]) for r in mapping.get("references") or []}
+        written |= {("graph", r["unit_id"]) for r in mapping.get("references") or [] if r.get("unit_id") and not r.get("activity_ref")}
     if proposal.get("rhythm"):
         written.add(("rhythm", "rhythm"))
     if proposal.get("habits"):
@@ -535,14 +512,6 @@ def _written(shown, state):
     return rows
 
 
-def _persona(mind):
-    from eventmem.core.persona import load_persona, persona_metadata
-    try:
-        return persona_metadata(load_persona(mind.engine, mind.scope))
-    except ValueError:
-        return "needs-review"
-
-
 def rebase(mind, manifest, before, state, proposal, *, historical):
     """Whether a proposal judged on `before` may commit on `state`, whose revision has moved.
 
@@ -550,24 +519,7 @@ def rebase(mind, manifest, before, state, proposal, *, historical):
     and concerns it updates. The read set is everything of the mind state this judgment type was
     shown, compared by the same relevance the manifests are compared by across attempts.
     """
-    if _persona(mind) != manifest["policy"].get("persona"):
-        # The prompt itself would differ now: nothing judged under the old contract is carried over.
-        return False
-    if historical:
-        return state.get("profile_version") == before.get("profile_version")
-    if manifest.get("state_revision") != before.get("revision"):
-        # The state moved between the view the model was given and this baseline: nothing is proven.
-        return False
-    if any(state.get(k) != before.get(k) for k in POLICY_STATE):
-        return False
-    written = [*proposal.values, *proposal.motivations]
-    if any((state["dimensions"].get(k) or {}).get("event_id") != (before["dimensions"].get(k) or {}).get("event_id") for k in written):
-        return False
-    if any(state["desires"].get(u.desire_id) != before["desires"].get(u.desire_id) for u in proposal.wish_updates):
-        return False
-    for concern in proposal.concerns:
-        identifier = getattr(concern, "concern_id", None)
-        if identifier and state.get("concerns", {}).get(identifier) != before.get("concerns", {}).get(identifier):
-            return False
-    judgment = manifest["judgment"]["type"]
-    return all(seen == current for name, seen, current in _written(manifest.get("classes", {}), state) if relevant(judgment, name))
+    # Subjective state may change without invalidating a subjective proposal.
+    # Existing task, source and permission checks run in the applying transaction.
+    guarded = ("agent_version", "action_policy", "autonomy", "continuity", "contact", "exploration")
+    return all(state.get(k) == before.get(k) for k in guarded)

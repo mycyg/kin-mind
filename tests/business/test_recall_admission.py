@@ -248,17 +248,17 @@ def test_candidates_past_the_pool_are_never_scored(system, monkeypatch):
     assert len(service.texts) == 1 + 2 and sum(d["reason"] == "pool" for d in row["dropped"]) == 1
 
 
-def test_an_unchanged_items_vector_is_reused_and_the_query_is_never_kept(system):
+def test_local_embedding_uses_the_current_entries_without_a_content_hash_cache(system):
     mind, memory, source, service, sources, records = system
     admission(memory, "on")
     build(mind, automatic=True)
     service.texts.clear()
     build(mind, automatic=True)
-    assert service.texts == [QUERY]  # the items' vectors were kept, the query's was not
-    assert observations(mind)[-1]["timings"]["embedded"] == 1
+    assert QUERY in service.texts and len(service.texts) == 1 + len(records)
+    assert observations(mind)[-1]["timings"]["embedded"] == 1 + len(records)
     with mind.engine.db.connect() as conn:
         kept = {row[0] for row in conn.execute("SELECT item_id FROM mind_recall_vectors")}
-    assert kept == set(records.values())
+    assert kept == set()
 
 
 # --- deep: the ranking's selection is the admission ---------------------------------------------------
@@ -404,10 +404,11 @@ def test_the_main_session_sets_a_mark_only_on_her_own_current_word(system):
     said = source("said", "猫的事以后别主动提了", owner=True)
     assert marks.change({**request, "evidence_ids": [said]}, actor="owner")["state"] == "quiet"
     assert marks.change({**request, "evidence_ids": [said]}, actor="owner")["state"] == "quiet"  # a replay
-    with pytest.raises(Conflict):
-        marks.change({**request, "evidence_ids": [said], "quiet": False}, actor="owner")  # same id, other change
+    before = marks.list()
+    assert marks.change({**request, "evidence_ids": [said], "quiet": False}, actor="owner")["state"] == "quiet"
     [mark] = marks.list()
     assert mark["item_id"] == records["cat"] and mark["actor"] == "owner"
+    assert marks.list() == before, "A reused command ID returns the prior receipt without clearing the actual mark"
     tools = {tool.name: tool for tool in asyncio.run(__import__("eventmem.core.mcp", fromlist=["create_mcp"]).create_mcp(mind.engine).list_tools())}
     assert tools["set_memory_quiet"].description == recall_admission.QUIET_TOOL_DESCRIPTION
 
@@ -440,7 +441,10 @@ def test_an_erase_takes_every_observation_and_mark_naming_what_it_erased(system)
     QuietMarks(mind).change({"command_id": "q1", "item_id": records["cat"], "quiet": True}, actor="console")
     QuietMarks(mind).change({"command_id": "q2", "item_id": records["planned"], "quiet": True}, actor="console")
     assert len(observations(mind)) == 1
-    with mind.engine.db.connect() as conn:
+    # Legacy vector rows remain erasable by their actual item ids.
+    with mind.engine.db.connect(write=True) as conn:
+        for rid in records.values():
+            conn.execute("INSERT INTO mind_recall_vectors VALUES(?,?,?,?,?)", (mind.scope.key(), "legacy:" + rid, rid, 1, b"legacy-vector"))
         assert conn.execute("SELECT 1 FROM mind_recall_vectors WHERE item_id=?", (records["cat"],)).fetchone()
     mind.engine.delete(sources["cat"])
     assert observations(mind) == []

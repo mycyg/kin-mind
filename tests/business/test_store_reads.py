@@ -160,8 +160,8 @@ def test_a_deep_recall_without_a_session_asks_no_model_and_writes_nothing(tmp_pa
     usage = [json.loads(row["data"]) for row in written if row["name"] == "structured_model_usage"]
     assert len(usage) == len(calls) and all(entry["usage"] == {"input_tokens": 1200, "output_tokens": 40} for entry in usage)
 
-    # What a recorded pack keeps is there to be read: a look uses it, and still pays for and
-    # writes nothing.
+    # Content-hash memoization is absent. A look retains originals that fit,
+    # asking and writing nothing even after a previous recorded compression.
     from eventmem.core.db import unrecorded
     from eventmem.core.read_policy import ReadPolicy
 
@@ -177,7 +177,7 @@ def test_a_deep_recall_without_a_session_asks_no_model_and_writes_nothing(tmp_pa
     with unrecorded():
         looked = contexts.pack(items, "数据库迁移", 3000, allow_model=True, policy=policy)
         refused = contexts.pack(items, "数据库迁移迁移", 3000, allow_model=True, policy=policy)
-    assert looked["state"] == "compressed" and looked["cache_hit"] and looked["text"] == kept["text"]
+    assert looked["state"] == "needs-compression" and not looked["cache_hit"] and looked["reason"] == "session-required"
     assert refused["state"] == "needs-compression" and refused["reason"] == "session-required"
     after = every_row(engine)
     assert len(calls) == paid and not {table for table in after if after[table] != before.get(table)}

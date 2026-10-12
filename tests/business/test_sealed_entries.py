@@ -317,13 +317,7 @@ def test_an_entry_erased_while_it_opens_stays_erased(setup, monkeypatch):
     monkeypatch.setattr(sealed, "_receive", erased_first)
     assert sealed.open_due(mind)["dropped"] == [letter["id"]]
     assert texts_everywhere(mind.engine, LETTER) == set() and sealed.entries(mind)["items"] == []
-    # A receipt writes its bytes before its transaction: the blob it left is nobody's, and the next
-    # sweep takes it once it is a minute old, as it takes any receipt's that a delete beat.
-    import os
-    import time
-    [orphan] = files_holding(mind.engine, LETTER)
-    os.utime(orphan, (time.time() - 120, time.time() - 120))
-    mind.engine.gc_blobs()
+    # Receipt dependencies and tombstones are checked before blob bytes are written.
     assert files_holding(mind.engine, LETTER) == []
 
 
@@ -354,8 +348,7 @@ def test_a_letter_opens_from_tomorrow_to_a_year_ahead_and_one_command_writes_it_
     assert sealed.seal_letter(mind, "x", last.isoformat(), "last")["unlock_at"] == last.isoformat()
     again = sealed.seal_letter(mind, "x", first.isoformat(), "same")
     assert sealed.seal_letter(mind, "x", first.isoformat(), "same") == again
-    with pytest.raises(Conflict):
-        sealed.seal_letter(mind, "y", first.isoformat(), "same")
+    assert sealed.seal_letter(mind, "y", first.isoformat(), "same") == again
     with pytest.raises(ValueError):
         sealed.seal_letter(mind, " ", first.isoformat(), "blank")
 

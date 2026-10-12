@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from eventmem.core import Engine, read_policy, repair
-from eventmem.core.db import NAMED, digest, dumps, named_in, named_in_json
+from eventmem.core.db import NAMED, dumps, named_in, named_in_json
 
 from kin_mind import history_compaction
 from kin_mind.deploy_checks import persona_approval
@@ -84,9 +84,9 @@ def test_a_maintenance_note_the_state_names_right_against_chinese_words_stays_ac
     assert plan["kept_because_cited"] == (1 if named else 0)
 
 
-def test_a_restore_refuses_an_unreadable_archived_row_that_names_erased_material_right_against_chinese_words(system, monkeypatch):
-    """Nothing can be taken out of an archived row that will not parse, so a restore refuses one that
-    names what was deleted since -- beside Chinese words too; one that names nothing deleted goes on."""
+def test_a_restore_refuses_every_unreadable_archived_row_without_restoring_erased_material(system, monkeypatch):
+    """Malformed JSON cannot be restored, whether an erased ID is adjacent to Chinese or another
+    word. This checks storage format, without using the legacy body checksum as an integrity gate."""
     mind, memory, source, clock = system
     secret = source("secret", "不该回来的话")
     rounds(mind, clock, source, 4)
@@ -96,16 +96,15 @@ def test_a_restore_refuses_an_unreadable_archived_row_that_names_erased_material
     mind.engine.delete(secret)
     with sqlite3.connect(archive) as conn:
         last = conn.execute("SELECT MAX(revision) FROM mind_events_v1").fetchone()[0]
-    for text, named in STORE_ID_BOUNDARIES:
+    for text, _named in STORE_ID_BOUNDARIES:
         broken = '{"note": "' + text.format(id=secret)
         with sqlite3.connect(archive) as conn:
-            conn.execute("UPDATE mind_events_v1 SET data=?,data_sha256=? WHERE revision=?", (broken, digest(broken.encode()), last))
-        if named:
-            with pytest.raises(Exception) as refused:
-                history_compaction.restore(mind, {}, apply=False)
-            assert getattr(refused.value, "target", None) == "archive-row-unreadable-and-names-erased-material", text
-        else:
-            assert history_compaction.restore(mind, {}, apply=False)["state"] == "dry-run", text
+            conn.execute("UPDATE mind_events_v1 SET data=?,data_sha256=? WHERE revision=?", (broken, "", last))
+        with pytest.raises(Exception) as refused:
+            history_compaction.restore(mind, {}, apply=False)
+        assert getattr(refused.value, "target", None) == "archive-row-will-not-parse", text
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT 1 FROM sources WHERE id=? AND deleted=0", (secret,)).fetchone() is None
 
 
 def test_the_approval_the_persona_contract_names_is_found_value_by_value(tmp_path):

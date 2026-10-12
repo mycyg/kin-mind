@@ -215,7 +215,7 @@ def _fragments(proposal, name, key, aliases=()):
         each("event_routes", memory.get("event_routes"),
              lambda r: key in (r.get("event_id"), r.get("thread_id"), *(r.get("member_ids") or [])), inside)
         each("mappings", (memory.get("coverage") or {}).get("mappings"),
-             lambda m: m.get("share_id") == key or any(r.get("unit_id") == key for r in m.get("references") or []), ("memory", "coverage"))
+             lambda m: m.get("share_id") == key or any(r.get("unit_id") == key and not r.get("activity_ref") for r in m.get("references") or []), ("memory", "coverage"))
         each("disclosures", memory.get("disclosures"),
              lambda d: key in (d.get("share_id"), *(d.get("about_ids") or []), *(d.get("previous_share_ids") or [])), inside)
         each("notes", memory.get("notes"), lambda n: key in (n.get("about_ids") or []), inside)

@@ -4,10 +4,7 @@
  * run of non-CJK characters (a word, a URL, a number) and a grapheme cluster
  * are atoms and are never cut. The same text and limit always give the same
  * fragments; the manifest stores them and nothing ever recomputes them. */
-import {createHash} from 'node:crypto';
 import {measureText} from './channel-contract.mjs';
-
-const sha256=value=>createHash('sha256').update(value).digest('hex');
 const segmenter=typeof Intl?.Segmenter==='function'?new Intl.Segmenter('und',{granularity:'grapheme'}):null;
 const EXTENDS=/^[\p{M}\u200d\ufe0e\ufe0f\u{1f3fb}-\u{1f3ff}\u{e0020}-\u{e007f}]$/u;
 function* graphemes(text,offset) {
@@ -83,11 +80,11 @@ function cutClass(text,atom) {
   return gap?5:6;
 }
 
-/** `{kind:'text',fragments:[{index,start,end,body_sha256}]}` or, when some atom
+/** `{kind:'text',fragments:[{index,start,end}]}` or, when some atom
  * alone exceeds the limit, `{kind:'file',reason}`: the bubble is unsplittable. */
 export function fragmentText(text,{limit,measure='utf16'}) {
   if(typeof text!=='string'||!Number.isSafeInteger(limit)||limit<1)throw Error('Fragmenting needs a text and a positive limit');
-  const size=measureText(measure),slice=(start,end)=>({start,end,body_sha256:sha256(text.slice(start,end))});
+  const size=measureText(measure),slice=(start,end)=>({start,end});
   if(size(text)<=limit)return {kind:'text',fragments:text?[{index:0,...slice(0,text.length)}]:[]};
   const atoms=textAtoms(text),total=[0];
   for(const atom of atoms) {
@@ -120,10 +117,9 @@ export function fragmentText(text,{limit,measure='utf16'}) {
   return {kind:'text',fragments};
 }
 
-/** The complete bubble as one file fragment, named from its content alone. */
+/** The complete bubble as one file fragment. Its caller owns the delivery ID. */
 export function fileFragment(text) {
-  const body=sha256(text);
-  return {index:0,start:0,end:text.length,body_sha256:body,kind:'file',name:'kin-reply-'+body.slice(0,16)+(fences(text).length?'.md':'.txt')};
+  return {index:0,start:0,end:text.length,kind:'file',name:'kin-reply'+(fences(text).length?'.md':'.txt')};
 }
 
 /** Null when the fragments are exactly the text, in order, within the limit; otherwise a static reason. */
@@ -133,7 +129,6 @@ export function verifyFragments(text,fragments,{limit,measure='utf16'}={}) {
   for(const [index,fragment] of fragments.entries()) {
     if(fragment.index!==index||fragment.start!==position||!(fragment.end>fragment.start))return 'fragments-not-contiguous';
     const body=text.slice(fragment.start,fragment.end);
-    if(sha256(body)!==fragment.body_sha256)return 'fragment-hash-mismatch';
     if(size&&fragment.kind!=='file'&&size(body)>limit)return 'fragment-exceeds-limit';
     position=fragment.end;
   }

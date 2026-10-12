@@ -11,7 +11,7 @@ import {recoverSessionStore,restoreInjection,loadCandidateSession,candidateCatal
 import {sha256} from '../../adapters/instruction-evidence.mjs';
 
 const providerBinding=profile=>({sourceProvider:profile.provider,sourceProviderKind:profile.providerKind,
- launchProvider:profile.providerKind==='gateway'?'kin_session_gateway':profile.provider,endpointSha256:profile.providerKind==='gateway'?'a'.repeat(64):null});
+ launchProvider:profile.providerKind==='gateway'?'kin_session_gateway':profile.provider,endpoint:profile.providerKind==='gateway'?'http://synthetic-gateway.invalid':null});
 const verifiedProfileReceipt=(profile,binding=providerBinding(profile))=>({verified:true,requestedProfile:structuredClone(profile),providerBinding:structuredClone(binding),
  profileEvidence:{model:'verified',modelProvider:'verified',reasoningEffort:'verified',serviceTierConfiguration:'verified'},
  actualProfile:{model:profile.model,modelProvider:binding.launchProvider,reasoningEffort:profile.reasoningEffort,serviceTier:profile.serviceTierPreference==='fast'?'fast':null}});
@@ -70,12 +70,12 @@ test('maintenance candidate configuration uses the exact verified provider and F
    {catalogFile:'/catalog.json',gateway});
  assert.deepEqual(sol.profile,{provider:'openai-15m',providerKind:'native',model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'});
  assert.deepEqual([sol.modelProvider,sol.fastMode,sol.config.model_catalog_json],['openai-15m','on','/catalog.json']);
- assert.deepEqual(sol.providerBinding,{sourceProvider:'openai-15m',sourceProviderKind:'native',launchProvider:'openai-15m',endpointSha256:null});
+ assert.deepEqual(sol.providerBinding,{sourceProvider:'openai-15m',sourceProviderKind:'native',launchProvider:'openai-15m',endpoint:null});
  assert.equal(Object.keys(sol.config).some(key=>key.startsWith('model_providers.')),false,'a native provider is never rewritten as a gateway');
  const deepseek=candidateConfigForRuntime({model:'deepseek-flash',modelProvider:'private-ds',providerOverride:true,reasoningEffort:'high',fastMode:'off'},
    {catalogFile:'/catalog.json',gateway});
  assert.equal(deepseek.profile.provider,'private-ds');assert.equal(deepseek.modelProvider,'kin_session_gateway');assert.equal(deepseek.config['model_providers.kin_session_gateway'].base_url,gateway.baseUrl);
- assert.deepEqual([deepseek.providerBinding.sourceProvider,deepseek.providerBinding.launchProvider,typeof deepseek.providerBinding.endpointSha256],['private-ds','kin_session_gateway','string']);
+ assert.deepEqual([deepseek.providerBinding.sourceProvider,deepseek.providerBinding.launchProvider,typeof deepseek.providerBinding.endpoint],['private-ds','kin_session_gateway','string']);
  assert.throws(()=>candidateConfigForRuntime({model:'gpt-5.6-sol',reasoningEffort:'medium',fastMode:'on'},{catalogFile:'/catalog.json',gateway}),/unverified/);
 });
 
@@ -279,8 +279,31 @@ test('a crash after binding commit rolls forward without creating or injecting a
 test('configuration is sourced, versioned and idempotent; it cannot disable work checks',t=>{
  const f=fixture(t),request={id:'cfg-1',sourceId:'owner-1',reason:'Compression first',expectedRevision:0,changes:{rotate:false,preparePressure:0.7}};
  const first=f.manager.configure(request);assert.deepEqual(f.manager.configure(request),first);assert.equal(first.revision,1);
+ assert.deepEqual(f.manager.configure({...request,reason:'Different retry wording',changes:{rotate:true},expectedRevision:9}),first);
+ assert.equal('hash' in first,false);assert.equal(f.manager.state.config.rotate,false);
  assert.throws(()=>f.manager.configure({...request,id:'cfg-2'}),/revision changed/);
  assert.throws(()=>f.manager.configure({...request,id:'cfg-2',expectedRevision:1,changes:{pausedTaskHandover:true}}),/Unsupported/);
+});
+
+test('session request and evidence ids replay their recorded facts without a content gate',t=>{
+ const f=fixture(t),request={id:'request-1',sourceId:'owner-1',reason:'First request'};
+ const first=f.manager.request(request);
+ assert.deepEqual(f.manager.request({...request,reason:'Reworded retry'}),first);assert.equal('hash' in first,false);
+ const evidence={id:'evidence-1',sourceId:'owner-1',revision:1,at:f.clock.now,kind:'reference-error',reason:'First observation'};
+ const recorded=f.manager.evidence(evidence);
+ assert.deepEqual(f.manager.evidence({...evidence,reason:'Reworded retry'}),recorded);
+});
+
+test('maintenance review identity follows actual references while current words can change',async t=>{
+ const f=fixture(t);
+ f.context.items=[{id:'owner-1',role:'user',at:'2026-09-24T00:00:00Z',revision:1,text:'First words'}];
+ await f.advise('keep');const id=f.manager.state.observation.id;
+ assert.match(id,/^observation:[0-9a-f-]{36}$/);
+ f.context.items[0].text='Different current words';
+ assert.equal((await f.manager.tick()).state,'keep');assert.equal(f.manager.state.observation.id,id);
+ assert.equal(f.manager.state.observation.recent[0].text,'Different current words');
+ assert.equal(f.calls.filter(c=>c==='review').length,1);
+ assert.equal(JSON.stringify(f.manager.state.events[id].reviewBasis).includes('words'),false);
 });
 test('a transient queue failure retries the same observation instead of losing it',async t=>{
  const f=fixture(t),queue=f.manager.reviewRequested;let tries=0;f.manager.reviewRequested=async event=>{if(++tries===1)throw Error('queue busy');return queue(event);};
@@ -731,7 +754,7 @@ test('under a freeze the minute tick prepares no checkpoint -- neither the rolli
   'a kept candidate\'s launch is compared without a process, and it is loaded again (no model turn) before its handover');
  // What a kept candidate is compared with is the launch a new one would get (NativeCandidate.launch), resolved without a process.
  const sol={provider:'openai-15m',providerKind:'native',model:'gpt-5.6-sol',reasoningEffort:'medium',serviceTierPreference:'default'};
- assert.deepEqual(api.manager.candidateLaunch(sol),{providerBinding:{sourceProvider:'openai-15m',sourceProviderKind:'native',launchProvider:'openai-15m',endpointSha256:null},instructionBinding:null});
+ assert.deepEqual(api.manager.candidateLaunch(sol),{providerBinding:{sourceProvider:'openai-15m',sourceProviderKind:'native',launchProvider:'openai-15m',endpoint:null},instructionBinding:null});
  assert.equal(api.manager.launchState({...sol,provider:'custom-gateway',providerKind:'gateway'}),'unavailable','a gateway launch with no gateway to reach opens nothing');
  // What a native compaction leaves for the next minute: a recovery checkpoint to prepare.
  Object.assign(api.manager.state,{restoreRequired:true,restorePending:false});

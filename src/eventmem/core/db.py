@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -272,7 +273,9 @@ class Database:
         conn.execute("UPDATE meta SET value=value+1 WHERE key='generation'")
 
     def blob(self, content: bytes) -> str:
-        key = digest(content)
+        """Store bytes under an independent blob id; source/record rows keep its reference.
+        Existing content-addressed filenames remain readable through those stored references."""
+        key = "blob_" + uuid.uuid4().hex
         path = self.blobs / key
         if not path.exists():
             # O_EXCL prevents concurrent writers from replacing an existing snapshot.

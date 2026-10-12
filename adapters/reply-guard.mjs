@@ -47,7 +47,7 @@ export class ReplyGuard {
       clock,contracts,emit,lease,role,hooks,sleep,retry,onAnswered,
       receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
       cancelShare:draftId=>this.call?.('share-cancel',{draft_id:draftId}),
-      review:requests=>this.checkGroup(requests),onOutcome});
+      review:(requests,context)=>this.checkGroup(requests,context),onOutcome});
     this.tail=new ReplyTail({manifests:this.manifests,clock,ownerEpoch,hooks:tailHooks,limits:tailLimits,
       onEvent:detail=>(onTail??onOutcome)(detail)});
   }

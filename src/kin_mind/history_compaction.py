@@ -1,80 +1,13 @@
-"""Rewriting the history already written, which is the one thing in this stage that touches data
-the store already holds.
+"""Compact existing state history using database revisions and bounded patches.
 
-Everything before this added a table or changed what the next write looks like. Nothing before this
-could lose anything: a new table can be dropped, a new format only applies to rows that did not
-exist yet, and a flag turned back off restores the previous behaviour exactly. This module rewrites
-hundreds of megabytes of documents that were written once and are the only record of what the mind
-held at each revision. So it is built the other way round from the rest: the question it asks at
-every step is not "may this proceed" but "is there anything at all to stop for", and every answer
-that is not a plain no stops it.
+The archive copies existing rows before any rewrite. Database IDs, revisions, kind and timestamps
+remain unchanged. Transactions, quiescence, a write-exclusion marker, SQLite checks, archive
+coverage and direct read-back of the copied rows protect this storage maintenance operation.
+Neither normal psychology nor compressed state carries a content hash or consistency proof.
+Legacy hash columns and manifest metadata are accepted but ignored.
 
-**The archive comes first — all of it.** A run is two phases, in the only order they may happen in.
-Phase one copies every row the run will touch — every column, verbatim — into a separate database
-file, fsyncs it, then reads each row back on a fresh connection and compares it byte for byte with
-what is still in the store. Only when the whole target set is archived and verified does the rewrite
-loop run, and the loop refuses any row that phase one did not cover, however that happened. Each
-batch is then rewritten inside a transaction that also moves the cursor and rebuilds what it just
-wrote, so there is no committed state in which a row was rewritten and either nobody wrote down that
-it had been or nobody checked that it came out right. The archive is never deleted by any code here,
-at any point, for any reason; `history-restore` reads from it and leaves it exactly where it is.
-
-What a rewrite does, precisely: `data` becomes what changed since the row before instead of the
-whole document, and **nothing else moves**. Every row stays, every column stays, and `id`, `scope`,
-`revision`, `kind` and `occurred_at` are not written at all. Four of the seven readers of this table
-want the columns and never look inside `data`; they cannot tell this ran.
-
-Some rows keep their whole document, and which ones is not a matter of taste:
-
-- the first row, which has nothing to stand on;
-- every fiftieth row, so no rebuild ever reads more than forty-nine patches;
-- every `evolution` row **and the row before it**, because a reversion restores the row before the
-  evolution, and that one rebuild must not depend on a chain of other rows holding together;
-- **the row under any row that was already a patch when this started.** The brief names one case of
-  it — the last old-format row before the first new-format one — and the general rule is what that
-  case is an instance of. A patch written by the live writer recorded how deep the chain under it
-  was at the time, and under a whole document that is nothing. Rewrite that document into a patch
-  and the row above goes on claiming a depth of one over a chain of fifty, and the writer's own
-  bound is computed from the wrong number for as long as the store lives.
-
-Two further rules are this module's own and can only ever keep more rows whole, never fewer: a patch
-that is not smaller than the document it would replace is not worth storing, because it would make
-the row bigger, which is the opposite of the point; and the chain is never allowed to reach the live
-writer's own checkpoint bound in a store where the fiftieth-row rule and rows that are already
-patches interleave. Both are counted separately in the report, so what fired is visible rather than
-inferred.
-
-Preconditions, checked on every run and none of them skippable: the store is quiet by the proof in
-`liveness.quiescence` — this is that proof's first real caller — there is a backup of the database
-that can be shown to hold *this* history, there is enough free disk for the backup, the archive and
-the working room, and `meta.history_compaction_active` is set so that the live writer refuses to
-write a revision while this owns the rows. A failed precondition is a refusal that has written
-nothing.
-
-"Shown to hold this history" is literal, and it is not counted. At the start of a run the store is
-surveyed once: one content digest folded over every row's key columns and bytes, and a per-row
-manifest — id, kind, occurred_at and the same sha256 the archive records — of every row the run may
-touch. The manifest is frozen into the run's own progress record; the backup is opened read-only,
-`quick_check`ed and compared against the manifest row by row; and what was trusted — the file's
-hash, size, permissions and name — is written down with it. A file that holds the same number of
-rows between the same endpoints but different bytes is not a backup of this store, however it came
-to be named. And a resumed run checks the backup against the frozen manifest, never against rows
-the run itself has already rewritten: those are the archive's answer, and the two proofs — that the
-fallback is of this store, and that the originals are kept — do not stand in for each other.
-
-The marker is deliberately not self-clearing. A run that stops in the middle leaves it set, and the
-store stays closed to new revisions until someone decides what to do: resume, which is the ordinary
-answer, or restore. That is the right way round for a package that can destroy the history. The cost
-of the store being closed is a stopped host; the cost of it being open is a revision written into a
-half-rewritten history that the archive does not hold.
-
-What can be claimed afterwards is narrower than it looks. A rewritten row carries a `state_hash`, so
-`history-verify` calls it verified where it used to call it unverifiable. That says the row is
-self-consistent — its bytes still hash to what it claims — and it says nothing about whether it still
-holds what it held before the rewrite, because both halves were written by the same pass. The only
-thing that says that is `history-compact-verify`, which rebuilds each revision from the store and
-compares it with the **archived original bytes**, copied before the first row moved. Those are two
-different claims, and only the second one is the reason this is allowed to run at all.
+A physical backup file hash is currently recorded only as an offline backup audit detail. It is
+not read to authorize a subjective state, history rebuild, compaction rewrite or restore.
 """
 
 from __future__ import annotations
@@ -85,8 +18,9 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
+from uuid import uuid4
 
-from eventmem.core.db import NAMED, Conflict, digest, dumps
+from eventmem.core.db import NAMED, Conflict, dumps  # NAMED remains a public compatibility alias.
 
 from . import history
 
@@ -183,10 +117,7 @@ def progress(conn, scope):
 def compacted_through(conn, scope) -> int:
     """The revision this store has been compacted through, for a reader that wants only the number.
 
-    `history-verify` reads it to say what its own verdict does not cover: at or below this line a
-    row's hash was written by the same pass that wrote its bytes, so the two agreeing is not
-    independent evidence of anything. The archive is, and `history-compact-verify` is what reads
-    it."""
+    `history-status` includes this number to identify archive coverage. No content proof is made."""
     return progress(conn, scope)["through"]
 
 
@@ -211,6 +142,7 @@ def _set_marker(db, active):
             conn.execute("DELETE FROM meta WHERE key=?", (history.COMPACTION_MARKER,))
             # What the marker alone refused goes back to its queue with it (K3-14).
             from eventmem.core.models import now
+
             from .recovery import resume_compaction_waits
             resume_compaction_waits(conn, now())
 
@@ -279,8 +211,7 @@ def _archive_batch(path, scope, rows, *, at, started_at, source, verified=None):
     the copy was taken — which would mean something other than this has been rewriting history — and
     neither is a thing to write past.
 
-    `verified`, when given, collects the proof per row: its revision to the hash of the bytes the
-    archive was just shown to hold. The rewrite loop accepts no row without one."""
+    `verified`, when given, collects the copied revisions. The rewrite loop requires archive coverage."""
     written = 0
     conn = _archive_connection(path, create=True)
     try:
@@ -291,7 +222,7 @@ def _archive_batch(path, scope, rows, *, at, started_at, source, verified=None):
             written += conn.execute(
                 "INSERT OR IGNORE INTO mind_events_v1 VALUES(?,?,?,?,?,?,?,?)",
                 (row["scope"], row["revision"], row["id"], row["kind"], row["occurred_at"],
-                 row["data"], digest(row["data"].encode()), at)).rowcount
+                 row["data"], "", at)).rowcount
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
@@ -310,10 +241,8 @@ def _archive_batch(path, scope, rows, *, at, started_at, source, verified=None):
             for column in COLUMNS:
                 if kept[column] != row[column]:
                     _refuse("archive-row-differs", revision=row["revision"], column=column)
-            if kept["data_sha256"] != digest(kept["data"].encode()):
-                _refuse("archive-digest-differs", revision=row["revision"])
             if verified is not None:
-                verified[row["revision"]] = kept["data_sha256"]
+                verified[row["revision"]] = True
     finally:
         check.close()
     return written
@@ -328,12 +257,9 @@ def _archive_target_set(db, path, scope, through, settled, *, at, batch, limit):
     never bigger than one batch; every chunk is committed, fsynced and read back before the next is
     fetched, and the phase does not return until every target row has been compared.
 
-    Every row is first checked against the manifest the run froze at its start: its columns and its
-    digest must be what was frozen, so a store that moved since — between invocations, past the
-    marker, however — is a stop here, before the archive is asked to hold a row nobody froze.
+    Every row is first checked against the stored database row references in the run manifest.
 
-    What comes back is the coverage proof the rewrite loop checks every row against: revision to
-    the hash of the bytes the archive was verified to hold. A resumed run walks the same phase
+    What comes back is the set of revisions copied into the archive. A resumed run walks the same phase
     again: `OR IGNORE` keeps the copies already there and the read-back compares them with the
     store a second time, so an interruption here costs nothing but the walk.
 
@@ -375,115 +301,46 @@ def _against_manifest(entries, row):
     for column in ("id", "kind", "occurred_at"):
         if row[column] != entry[column]:
             _refuse("row-differs-from-the-run-manifest", revision=row["revision"], column=column)
-    if digest(row["data"].encode()) != entry["data_sha256"]:
-        _refuse("row-differs-from-the-run-manifest", revision=row["revision"], column="data")
 
 
 def _covered(covered, row):
-    """The proof the rewrite loop requires of phase one: this row is in the archive, verified, and
-    its bytes have not moved since.
-
-    A row with no verified archive copy is never rewritten, whatever the reason it is missing —
-    holding the whole set back until every row is covered is the point of running the archive as a
-    phase of its own. A row whose bytes moved since its copy was verified is the same refusal the
-    write guard below would give, found one read earlier."""
+    """Require this database revision to have been copied into the archive before rewriting."""
     kept = covered.get(row["revision"])
     if kept is None:
         _refuse("row-not-in-verified-archive", revision=row["revision"])
-    if kept != digest(row["data"].encode()):
-        _refuse("row-changed-under-the-rewrite", revision=row["revision"])
 
 
 # --- the backup -----------------------------------------------------------------------------------
 
-def _fold(h, row):
-    """One row into a running digest: its place in the history, its key columns, and the digest of
-    its bytes — the same sha256 the archive records for it. Fixed-width or terminated pieces, so
-    two different rows can never fold to the same bytes."""
-    h.update(row["revision"].to_bytes(8, "big"))
-    for column in ("id", "kind", "occurred_at"):
-        h.update(str(row[column]).encode())
-        h.update(b"\0")
-    h.update(digest(row["data"].encode()).encode())
+
 
 
 def _store_identity(conn, scope, *, content=True):
-    """Which history, at which point, a copy of it is a copy of.
-
-    The history and not the database: how many rows this scope has, where they start and end, and —
-    with `content` — one digest folded over every row's key columns and bytes, so a copy that holds
-    the same number of rows between the same endpoints but holds different rows is not a copy of
-    this store. Count and endpoints alone were never enough to say that; for a while they were all
-    that was asked. The database's generation would be stricter still and would say nothing more
-    about the history: it moves every time anything at all is written, including a source arriving,
-    which changes no revision.
-
-    Without `content` this is the cheap structural answer. Rows here are only ever appended and
-    nothing deletes one, so count and endpoints still say which set of revisions a copy covers."""
-    if not content:
-        row = conn.execute(
-            "SELECT COUNT(*) AS held,COALESCE(MIN(revision),0) AS first,COALESCE(MAX(revision),0) AS head"
-            " FROM mind_events WHERE scope=?", (scope,)).fetchone()
-        return {"rows": row["held"], "first": row["first"], "head": row["head"]}
-    everything = hashlib.sha256()
-    rows, first, head = 0, 0, 0
-    for row in conn.execute(
-            "SELECT id,revision,kind,occurred_at,data FROM mind_events WHERE scope=?"
-            " ORDER BY revision", (scope,)):
-        rows += 1
-        first = first or row["revision"]
-        head = row["revision"]
-        _fold(everything, row)
-    return {"rows": rows, "first": first, "head": head,
-            "history_sha256": everything.hexdigest()}
+    """The database scope and existing revision range; no state-content identity is calculated."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS held,COALESCE(MIN(revision),0) AS first,COALESCE(MAX(revision),0) AS head"
+        " FROM mind_events WHERE scope=?", (scope,)).fetchone()
+    return {"rows": row["held"], "first": row["first"], "head": row["head"]}
 
 
 def _survey(conn, scope, through):
-    """One pass over the history that freezes both halves of a run's record: the store's content
-    identity, and the per-row manifest of the target set — every row above `through`, with each
-    column the rewrite could move and the digest of the bytes it would move them for.
-
-    The manifest is what the backup is verified against, and what the archive phase checks each row
-    against before it copies it: a store that moved since the freeze, however it moved, is a stop
-    found before the first rewrite rather than a surprise found after it."""
-    everything, target = hashlib.sha256(), hashlib.sha256()
-    rows, first, head = 0, 0, 0
+    """Existing row IDs and database revisions which this maintenance task will copy."""
     entries = {}
     for row in conn.execute(
-            "SELECT id,revision,kind,occurred_at,data FROM mind_events WHERE scope=?"
-            " ORDER BY revision", (scope,)):
-        rows += 1
-        first = first or row["revision"]
-        head = row["revision"]
-        _fold(everything, row)
-        if row["revision"] > through:
-            _fold(target, row)
-            entries[row["revision"]] = {
-                "id": row["id"], "kind": row["kind"], "occurred_at": row["occurred_at"],
-                "data_sha256": digest(row["data"].encode())}
-    return {"identity": {"rows": rows, "first": first, "head": head,
-                         "history_sha256": everything.hexdigest()},
-            "target_sha256": target.hexdigest(), "entries": entries}
+        "SELECT id,revision,kind,occurred_at FROM mind_events WHERE scope=? AND revision>? ORDER BY revision", (scope, through)
+    ):
+        entries[row["revision"]] = {"id": row["id"], "kind": row["kind"], "occurred_at": row["occurred_at"]}
+    return {"identity": _store_identity(conn, scope), "entries": entries}
 
 
 def _freeze_manifest(survey, scope, through, *, at):
-    """The maintenance object a run is, frozen before the backup is trusted and persisted before
-    the first rewrite. Every later invocation of the same run answers to it.
-
-    `run_id` names the run; `source` is the content identity of the store it started against;
-    `target` says which rows it will touch and `rows` is what each of them held, by column and by
-    digest. A resume never re-derives any of this from the store as it finds it — the store it
-    finds is half the run's own work, and comparing that against the original rows would be
-    unrecoverable by construction."""
+    """A persisted maintenance run ID and its existing database row references."""
     entries = survey["entries"]
     revisions = sorted(entries)
-    return {"run_id": digest(
-                f"history-compaction|{scope}|{through}|{at}|{survey['target_sha256']}"
-                .encode())[:16],
-            "scope": scope, "frozen_at": at, "through": through, "source": survey["identity"],
+    return {"run_id": uuid4().hex, "scope": scope, "frozen_at": at, "through": through,
+            "source": survey["identity"],
             "target": {"rows": len(entries), "first": revisions[0] if revisions else None,
-                       "head": revisions[-1] if revisions else None,
-                       "sha256": survey["target_sha256"]},
+                       "head": revisions[-1] if revisions else None},
             "rows": {str(revision): entries[revision] for revision in revisions}}
 
 
@@ -543,20 +400,12 @@ def _file_sha256(path: Path):
 
 
 def _backup_verify(scope, path: Path, manifest, *, at):
-    """The apply-time proof that the fallback is a copy of this store as the run froze it.
+    """Inspect the read-only backup's SQLite structure and the manifest's database row references.
 
-    The file is opened read-only, checked by SQLite's own `quick_check`, and its history compared
-    with the frozen manifest: the content identity first, then every target row's columns against
-    the manifest's own entries, so a disagreement names its revision and column rather than leaving
-    an operator to diff two hashes. What was then trusted is written down — the file's own hash,
-    its size, its permissions — so the basis the run stood on is reviewable afterwards.
-
-    This runs the same whether the file was just taken, was already there, or was named by the
-    operator: a copy nobody verified is a copy nobody has, whoever suggested it. It is compared
-    with the manifest and never with the store as it stands — on a resume the store is half the
-    run's own work, and the backup's job is to be what the run started against."""
+    The physical file hash is an audit detail; old per-row hashes are ignored.
+    """
     held = _backup_identity(path, scope)
-    if held != manifest["source"]:
+    if _structure(held) != _structure(manifest["source"]):
         _refuse("backup-is-not-of-this-store", backup=held, store=manifest["source"])
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -577,8 +426,6 @@ def _backup_verify(scope, path: Path, manifest, *, at):
             for column in ("id", "kind", "occurred_at"):
                 if row[column] != entry[column]:
                     _refuse("backup-row-differs", revision=row["revision"], column=column)
-            if digest(row["data"].encode()) != entry["data_sha256"]:
-                _refuse("backup-row-differs", revision=row["revision"], column="data")
             found.add(row["revision"])
         missing = sorted(int(revision) for revision in entries if int(revision) not in found)
         if missing:
@@ -621,7 +468,7 @@ def _backup_check(db, scope, path: Path, identity, *, take):
         return {**found, "ready": True, "reason": "backup-would-be-taken", "would_take": True,
                 "bytes": Path(db.path).stat().st_size}
     held = _backup_identity(path, scope)
-    if held != identity:
+    if _structure(held) != _structure(identity):
         return {**found, "ready": False, "reason": "backup-is-not-of-this-store",
                 "would_take": False, "backup": held, "store": identity}
     return {**found, "ready": True, "reason": "backup-matches-the-store", "would_take": False,
@@ -747,9 +594,6 @@ def _original(row):
     if state.get("revision") not in (None, row["revision"]):
         _refuse("row-state-belongs-to-another-revision", revision=row["revision"])
     text = history.canonical(state)
-    known = data.get("state_hash")
-    if known is not None and digest(text.encode()) != known:
-        _refuse("row-does-not-match-its-own-hash", revision=row["revision"])
     return data, state, text
 
 
@@ -761,7 +605,7 @@ def _rewrite(row, carried, planned):
     A patch that does not reproduce its row is not a patch this writes; the row keeps its whole
     document instead, which is always available and always correct."""
     data, state, text = _original(row)
-    state_hash, size = digest(text.encode()), len(text.encode())
+    size = len(text.encode())
     reasons = list(planned)
     if carried is None:
         reasons.append("no-parent")
@@ -776,16 +620,15 @@ def _rewrite(row, carried, planned):
             # interleave. The bound that has to hold afterwards is the live writer's.
             reasons.append("chain-would-reach-the-writers-bound")
     if reasons:
-        return (history.checkpoint_row(data.get("request"), state, state_hash=state_hash),
-                text, {"state": state, "hash": state_hash, "depth": 0, "since": 0,
+        return (history.checkpoint_row(data.get("request"), state),
+                text, {"state": state, "depth": 0, "since": 0,
                        "revision": row["revision"]}, "checkpoint", reasons)
     if history.canonical(history.apply(carried["state"], patch)) != text:
         _refuse("patch-does-not-rebuild-the-row", revision=row["revision"])
     depth, since = carried["depth"] + 1, carried["since"] + weight
     return (history.patch_row(data.get("request"), state, base=carried["revision"],
-                              base_hash=carried["hash"], depth=depth, since=since,
-                              patch=patch, state_hash=state_hash),
-            text, {"state": state, "hash": state_hash, "depth": depth, "since": since,
+                              depth=depth, since=since, patch=patch),
+            text, {"state": state, "depth": depth, "since": since,
                    "revision": row["revision"]}, "patch", [])
 
 
@@ -802,7 +645,7 @@ def _carry(conn, scope, revision):
     if data is None:
         _refuse("parent-row-will-not-parse", revision=revision)
     state = history.materialize(conn, scope, revision, data=data)
-    return {"state": state, "hash": data.get("state_hash") or history.row_hash(state),
+    return {"state": state,
             "depth": history.chain_depth(data), "since": history.chain_bytes(data),
             "revision": revision}
 
@@ -813,15 +656,11 @@ def _carry_past(conn, scope, row, data, carried):
     A store that ran on the new format for a while before this is a store where every row would
     otherwise be rebuilt from its own checkpoint on the way past, which is the chain read once per
     row instead of once. Where the row standing directly on what is already in hand, one step is the
-    whole of it — and the step is still checked against the hash the row recorded, so the shortcut
-    proves as much as the long way round."""
+    whole of it, with the same parent revision and patch operations as the long way round."""
     if carried is None or not history.is_patch(data) or data.get("base") != carried["revision"]:
         return _carry(conn, scope, row["revision"])
     state = history.apply(carried["state"], data["patch"])
-    known = data.get("state_hash")
-    if known is not None and history.row_hash(state) != known:
-        _refuse("passed-over-row-does-not-match-its-own-hash", revision=row["revision"])
-    return {"state": state, "hash": known or history.row_hash(state),
+    return {"state": state,
             "depth": history.chain_depth(data), "since": history.chain_bytes(data),
             "revision": row["revision"]}
 
@@ -858,8 +697,6 @@ def _verify_landed(conn, scope, landed, base, at):
             continue
         if history.canonical(state) != text:
             _refuse("rebuilt-row-differs-from-the-original", revision=revision, shape=shape)
-        if data.get("state_hash") != digest(text.encode()):
-            _refuse("rebuilt-row-hash-differs-from-the-original", revision=revision)
 
 
 # --- the command ----------------------------------------------------------------------------------------
@@ -887,17 +724,10 @@ def _archive_file(db, stored, at) -> Path:
 
 
 def _backup_file(db, identity, at, given) -> Path:
-    """Where the fallback copy lives. Named after the history it is a copy of — its endpoint, its
-    row count and the first bytes of its content digest — so a run that finds the history has moved
-    on, or that finds rows changed in place under the same shape, takes a new copy under a new name
-    rather than writing over the one that is there or, worse, taking the one that is there as its
-    own. Nothing here replaces a backup and nothing removes one."""
+    """An operator-named file, or a name based on the existing database revision range."""
     if given:
         return Path(given).expanduser()
-    digest12 = (identity.get("history_sha256") or "")[:12]
-    suffix = f"-{digest12}" if digest12 else ""
-    return archive_dir(db) / (
-        f"{BACKUP_STEM}-{_day(at)}-r{identity['head']}n{identity['rows']}{suffix}.sqlite3")
+    return archive_dir(db) / f"{BACKUP_STEM}-{_day(at)}-r{identity['head']}n{identity['rows']}.sqlite3"
 
 
 def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=None):
@@ -909,9 +739,9 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
     the decision the run will make and not a description of it.
 
     With `apply`, a failed precondition is a refusal that has written nothing. Past that the run
-    freezes its manifest — the store's content identity, and for every row it may touch the columns
-    and the digest of the bytes it starts from — proves the backup against it (opened read-only,
-    `quick_check`ed, compared row by row, its own hash and permissions recorded), and only then runs
+    freezes its manifest of existing database row IDs, kind, time and revisions. The backup is
+    opened read-only and `quick_check`ed; its physical file audit detail and permissions are recorded.
+    The operation then runs
     two phases: first the whole target set is archived, fsynced and read back byte for byte, and
     once every one of those rows is verified in the archive the rewrite loop runs, one batch at a
     time: one transaction that rewrites the rows, rebuilds what it wrote, compares each rebuild with
@@ -950,7 +780,7 @@ def compact(mind, config=None, *, apply=False, batch=BATCH, backup=None, limit=N
         elif survey:
             identity, head = survey["identity"], survey["identity"]["head"]
         else:
-            identity, head = {"rows": 0, "first": 0, "head": 0, "history_sha256": ""}, 0
+            identity, head = {"rows": 0, "first": 0, "head": 0}, 0
     path = _archive_file(db, stored, at)
     if resuming and not backup:
         # The backup the run started against, wherever the operator put it. A resumed run never
@@ -1155,11 +985,8 @@ def _run(mind, scope, at, path, shapes, settled, *, batch, limit, head):
 def compact_verify(mind, *, limit=SAMPLE, deep=False, archive=None):
     """Rebuild every revision the archive holds and compare it with the archived original bytes.
 
-    This is the check the rewrite is allowed to have happened for. `history-verify` asks whether a
-    row still hashes to what it claims, which after a compaction is two halves of one pass agreeing
-    with each other. This asks whether what the store can now rebuild is the document that was there
-    before anything was touched, and what it compares against was copied out before the first row
-    moved.
+    This storage maintenance check compares reconstructed JSON with the copied archive rows.
+    It uses no checksum fields and imposes no psychological consistency gate.
 
     Read only, against the store and the archive both. One forward pass by default, which is one
     rebuild per revision. `deep` rebuilds each revision from its own nearest whole document instead:
@@ -1188,24 +1015,41 @@ def compact_verify(mind, *, limit=SAMPLE, deep=False, archive=None):
         for row in held:
             revision = row["revision"]
             counts["checked"] += 1
-            if digest(row["data"].encode()) != row["data_sha256"]:
-                counts["archive_corrupt"] += 1
-                differs.append(revision)
-                state, previous = None, revision
-                continue
             archived = _parse(row["data"])
             want = history.snapshot_of(archived) if archived else None
+            patch = bool(archived and history.is_patch(archived)
+                         and type(archived.get("base")) is int and archived["base"] < revision
+                         and conn.execute("SELECT 1 FROM mind_events WHERE scope=? AND revision=?",
+                                          (scope, archived["base"])).fetchone())
+            if patch:
+                for op in archived["patch"]:
+                    if (not isinstance(op, list) or len(op) < 2 or op[0] not in ("set", "del")
+                            or len(op) != (2 if op[0] == "del" else 3)
+                            or not isinstance(op[1], list) or not 1 <= len(op[1]) <= history.MAX_DEPTH
+                            or not all(isinstance(key, str) for key in op[1])):
+                        patch = False
+                        break
+            corrupt = (archived is None or (want is None and not patch)
+                       or (want is not None and want.get("revision") not in (None, revision)))
             if want is not None and erased:
                 # An explicit delete since the archive was taken took words out of the store's
-                # rows and hashed them again. What the store must rebuild is the original with
+                # rows. What the store must rebuild is the original with
                 # exactly those words taken out — the same scrub, so anything else still differs.
                 want = erasure.scrub(want, erased)
             state, previous = (_materialize(conn, scope, revision), revision) if deep \
                 else _step(conn, scope, revision, state, previous)
+            if state is not None and state.get("revision") not in (None, revision):
+                state = None
+            if corrupt:
+                counts["archive_corrupt"] += 1
+                continue
             if want is None:
                 # The archived original was already a patch when it was copied, so there is no
                 # document here to compare a document with. The walk still has to pass through it.
                 counts["patch_originals"] += 1
+                if state is None:
+                    counts["unrebuildable"] += 1
+                    unrebuildable.append(revision)
                 continue
             if state is None:
                 counts["unrebuildable"] += 1
@@ -1262,14 +1106,9 @@ def restore(mind, config=None, *, apply=False, batch=BATCH, archive=None):
     and never written: if one of them has moved, something other than compaction has been here, and
     that is a thing to stop for rather than to paper over.
 
-    Two things stand between an archived row and the store. Its bytes are checked against the
-    digest taken when it was archived, and a row that does not match stops the restore before
-    anything is written. And an archive is a copy from before: it may hold words an explicit delete
-    has taken out of the store since. Those do not come back. Each archived row goes through the
-    same scrub the delete's own history rewrite uses, with every tombstone the store holds, and the
-    hashes are taken again from the scrubbed states — forward, carried from the row before, so
-    what comes back is a history that rebuilds and verifies, with the erase still in force. A row
-    with nothing erased in it goes back byte for byte.
+    An archive may hold words an explicit delete has removed since. Those do not come back.
+    Each row uses the delete workflow's scrub, then the existing revision and patch structure is
+    rebuilt with erasure still in force. Legacy checksum columns are ignored.
 
     Quiet is required here too. The marker stops the mind writing revisions, but this writes the
     same rows compaction does and must not race anything that might still be reading them.
@@ -1324,7 +1163,7 @@ def restore(mind, config=None, *, apply=False, batch=BATCH, archive=None):
                              (text, scope, row["revision"]))
                 restored += 1
     # The rows after the archive were written against the rows it replaced. Where those came
-    # back with other hashes, the chain after them is carried forward until it agrees again.
+    # back with changed parent states, later patches are carried forward using their revisions.
     carried = 0
     while last is not None:
         with db.connect(write=True) as conn:
@@ -1351,13 +1190,28 @@ def _restoring(db, scope, path, erased, batch):
     back as and whether that differs from the archived bytes.
 
     Read a batch at a time rather than all at once: an archive holds the whole pre-compaction
-    history, hundreds of megabytes of it. Every row's bytes are checked against the digest the
-    archive took before anything is made of them. The walk that scrubs them starts from the
+    history, hundreds of megabytes of it. Every row must be readable JSON history before any
+    batch is written. The walk that scrubs them starts from the
     state the store holds just before the first archived row, which a restore does not touch."""
     from . import erasure
 
     source = _archive_connection(path)
     try:
+        # Syntax and database revision shape are read prerequisites, never content consistency
+        # proof. Check the whole archive first so a later malformed row cannot leave a half restore.
+        for row in source.execute("SELECT revision,data FROM mind_events_v1 WHERE scope=? ORDER BY revision", (scope,)):
+            data = _parse(row["data"])
+            if data is None:
+                _refuse("archive-row-will-not-parse", revision=row["revision"])
+            if history.is_patch(data):
+                if type(data.get("base")) is not int or data["base"] >= row["revision"]:
+                    _refuse("archive-row-parent-is-invalid", revision=row["revision"])
+            else:
+                state = history.snapshot_of(data)
+                if state is None:
+                    _refuse("archive-row-carries-no-state", revision=row["revision"])
+                if state.get("revision") not in (None, row["revision"]):
+                    _refuse("archive-row-state-belongs-to-another-revision", revision=row["revision"])
         revisions = [row[0] for row in source.execute(
             "SELECT revision FROM mind_events_v1 WHERE scope=? ORDER BY revision", (scope,))]
         if not revisions:
@@ -1373,18 +1227,9 @@ def _restoring(db, scope, path, erased, batch):
                     "SELECT revision,id,kind,occurred_at,data,data_sha256 FROM mind_events_v1"
                     " WHERE scope=? AND revision>=? AND revision<=? ORDER BY revision",
                     (scope, revisions[start], revisions[min(start + batch, len(revisions)) - 1])):
-                if digest(row["data"].encode()) != row["data_sha256"]:
-                    _refuse("archive-row-differs-from-its-digest", revision=row["revision"])
                 data = _parse(row["data"])
                 if data is None:
-                    if erased.intersection(NAMED.findall(row["data"])):
-                        # Nothing can be taken out of a row that will not parse, and it may not
-                        # go back with erased words in it.
-                        _refuse("archive-row-unreadable-and-names-erased-material", revision=row["revision"])
-                    walk.state = walk.known = walk.orig = walk.orig_whole = None
-                    walk.previous = row["revision"]
-                    chunk.append((row, row["data"], False))
-                    continue
+                    _refuse("archive-row-will-not-parse", revision=row["revision"])
                 out, changed = walk.step(row["revision"], data)
                 chunk.append((row, history.canonical(out) if changed else row["data"], changed))
             yield chunk

@@ -42,6 +42,7 @@ from typing import Literal, NamedTuple
 from pydantic import Field
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.engine import uid
 from eventmem.core.models import Model
 
 from .state import timestamp
@@ -433,7 +434,7 @@ def mark(mind, evidence_ids, reason):
         refused += [{"id": named[sid], "source_id": sid, "code": "quota"} for sid in over]
         mark_id, expires = None, (timestamp(at) + timedelta(hours=MARK_TTL_HOURS)).isoformat()
         if taken:
-            mark_id = "mark_" + digest([scope, sorted(taken), reason, at])[:32]
+            mark_id = uid("mark")
             conn.executemany(f"INSERT OR IGNORE INTO {MARK_TABLE} VALUES(?,?,?,?,?,?,?,?,?)",
                              [(scope, mark_id, sid, "open", reason.strip(), at, expires, at, None) for sid in taken])
     return {"state": "recorded" if taken else "refused" if refused else "already-marked",

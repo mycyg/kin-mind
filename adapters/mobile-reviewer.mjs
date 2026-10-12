@@ -20,7 +20,7 @@ export const AUDIT_CODES=Object.freeze(['delivery-uncertain','session-mismatch',
 // each word of prompt and each byte of answer is paid for by ordinary chat.
 export const STOP_INTENTS=Object.freeze(['none','current_task']);
 export const FILE_SEND_CHANNELS=Object.freeze(['wechat','feishu']);
-const INTENT_RULES=" 同轮再判断：用户要求停止正在执行的任务时 stop=current_task，否则 none；明确要求收文件时填写 file_send 的 channel、完整 file_ref，只有原消息给出哈希才填 candidate_sha256；recall.owner_words 可填写至多八个用户称呼自己或你的词，没有则省略。";
+const INTENT_RULES=" 同轮再判断：用户要求停止正在执行的任务时 stop=current_task，否则 none；明确要求收文件时填写 file_send 的 channel、完整 file_ref，只有原消息给出实际产物编号才填 candidate_artifact_id；recall.owner_words 可填写至多八个用户称呼自己或你的词，没有则省略。";
 const ATTACHMENT_RULES=" attachments 是用户附件的 kind、mimeType、name、bytes。结合它理解请求，但附件本身不代表工作任务。";
 const bounded=(value,max)=>typeof value==='string'&&value.trim().length>0&&value.length<=max&&!/[\p{Cc}]/u.test(value)?value.trim():null;
 /** The bounded reading of the intent fields, for whoever stores them. Anything longer,
@@ -29,8 +29,8 @@ export function messageIntents(result) {
   const intents={},send=result?.file_send;
   if(STOP_INTENTS.includes(result?.stop))intents.stop=result.stop;
   if(send?.requested===true&&FILE_SEND_CHANNELS.includes(send.channel)) {
-    const ref=bounded(send.file_ref,120),sha=bounded(send.candidate_sha256,64);
-    if(ref)intents.fileSend={requested:true,channel:send.channel,fileRef:ref,...(/^[a-f0-9]{64}$/i.test(sha??'')?{candidateSha256:sha.toLowerCase()}:{})};
+    const ref=bounded(send.file_ref,120),artifactId=bounded(send.candidate_artifact_id,240);
+    if(ref)intents.fileSend={requested:true,channel:send.channel,fileRef:ref,...(artifactId?{candidateArtifactId:artifactId}:{})};
   }
   const words=[...new Set((Array.isArray(result?.recall?.owner_words)?result.recall.owner_words:[]).map(word=>bounded(word,24)).filter(Boolean))];
   if(words.length)intents.ownerWords=words.slice(0,8);
@@ -117,7 +117,7 @@ export function createMobileReviewer({key,fetchImpl=fetch,onUsage=()=>{},lease=n
       const files=intents&&Array.isArray(context.attachments)&&context.attachments.length>0;
       if(intents) {
         schema.properties.stop={type:'string',enum:[...STOP_INTENTS]};
-        schema.properties.file_send={type:'object',properties:{requested:{type:'boolean'},channel:{type:'string',enum:[...FILE_SEND_CHANNELS]},file_ref:{type:'string',maxLength:120},candidate_sha256:{type:'string',maxLength:64}},required:['requested','channel','file_ref'],additionalProperties:false};
+        schema.properties.file_send={type:'object',properties:{requested:{type:'boolean'},channel:{type:'string',enum:[...FILE_SEND_CHANNELS]},file_ref:{type:'string',maxLength:120},candidate_artifact_id:{type:'string',maxLength:240}},required:['requested','channel','file_ref'],additionalProperties:false};
         schema.properties.recall.properties.owner_words={type:'array',maxItems:8,items:{type:'string',maxLength:24}};
         schema.required.push('stop');
       }

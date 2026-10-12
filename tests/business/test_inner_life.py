@@ -267,13 +267,15 @@ def test_the_next_idle_reviews_see_the_latest_dream_and_only_a_wish_could_tell_i
     clock[0] += timedelta(hours=20)
     _, later = review(mind, source, lambda c: Appraisal(reason="第二天"), "later")
     assert "recent_dreams" not in later.seen[0], "a day later it is no longer shown"
-    # Read by the tool and the console: only with the switch on, and as a model may be shown it.
+    # Read by the tool and the console, including when new generation is off.
     from eventmem.core.mcp import create_mcp
     answer = asyncio.run(create_mcp(mind.engine).call_tool("read_dreams", {"scope": mind.scope.model_dump()}))
     read = answer[1] if isinstance(answer, tuple) else json.loads(answer[0].text)
     assert [d["text"] for d in read["dreams"]] == [DREAM] and not leaks(read)
     memory.configure({"dreams": False})
-    assert dreams.read(mind) == {"state": "disabled", "dreams": [], "cursor": None}
+    old = dreams.read(mind)
+    assert old["state"] == "enabled" and old["generation_enabled"] is False
+    assert [d["text"] for d in old["dreams"]] == [DREAM]
 
 
 # --- 2. Replies to the diary -----------------------------------------------------------------------
@@ -295,7 +297,8 @@ def test_the_console_reads_kin_s_diary_which_its_narrative_group_never_listed(en
     from eventmem.core.api import create_app
     client = TestClient(create_app(engine=mind.engine, token="inner-token", workers=False, mcp_enabled=False))
     page = client.get("/v1/diary", params=mind.scope.model_dump(), headers={"Authorization": "Bearer inner-token"}).json()
-    assert [e["source_id"] for e in page["entries"]] == [second, first] and page["dreams"]["state"] == "disabled"
+    assert [e["source_id"] for e in page["entries"]] == [second, first]
+    assert page["dreams"]["state"] == "enabled" and page["dreams"]["generation_enabled"] is False
 
 
 def test_a_reply_is_refused_while_the_switch_is_off(env):

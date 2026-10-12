@@ -1,7 +1,7 @@
 """Structured proposals shared by appraisal, tools and durable planning."""
 from typing import Literal
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import AliasChoices, Field, StrictInt, model_validator
 
 from eventmem.core.models import Model
 
@@ -17,6 +17,7 @@ class PlanStep(Model):
     not_after: str | None = None
     owner_request_id: str | None = None
     input_ids: list[str] = Field(default_factory=list, max_length=16)
+    activity_ref: dict | None = None
 
 
 class PlanChange(Model):
@@ -66,7 +67,8 @@ class ActionDecision(Model):
     next_review_at: str | None = None
     conditions_met: list[str] = Field(default_factory=list)
     procedure_ids: list[str] = Field(default_factory=list, max_length=8)
-    artifact_hashes: list[str] = Field(default_factory=list, max_length=24)
+    artifact_ids: list[str] = Field(default_factory=list, max_length=24,
+                                    validation_alias=AliasChoices("artifact_ids", "artifact_hashes"))
 
 
 class ProcedureCandidate(Model):

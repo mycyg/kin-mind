@@ -1,9 +1,12 @@
-"""Interaction-led rhythm projections. There is no scheduled sleep or wake time."""
+"""Kin's lasting rhythm and temporary attention, without scheduled sleep or wake times.
+
+Interaction windows are useful context. They do not decide Kin's own phase, and an arriving
+message does not overwrite the phase she last chose. Reads project attention; only a successful
+assessment changes the stored rhythm.
+"""
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-from eventmem.core.db import digest
 
 INTERACTION_SCHEMA = """
 CREATE INDEX IF NOT EXISTS mind_source_versions ON sources(namespace,source_key,scope,received_at)
@@ -34,8 +37,9 @@ def quiet_hours(contact, at):
 
 
 def at_rest(view, at):
-    """The owner's night as the host sees it: the rhythm resting, or their quiet hours."""
-    return ((view.get("rhythm") or {}).get("phase") == REST_PHASE
+    """Rest/contact timing, independent of temporary attention to an input."""
+    rhythm = view.get("rhythm") or {}
+    return ((rhythm.get("base_phase") or rhythm.get("phase")) == REST_PHASE
             or quiet_hours(view.get("contact") or {}, at))
 
 
@@ -91,16 +95,18 @@ def interaction_windows(conn, scope, at, timezone="Asia/Singapore"):
         "sample_status": "forming"
         if len(days) < 3 or len(windows) < 5
         else "observing",
-        "fingerprint": digest(windows),
     }
 
 
 def rhythm_view(entry, at, interactions, *, fresh=True):
     if not entry:
         return {
-            "mode": "interaction-led",
+            "mode": "independent",
             "status": "forming",
             "phase": "forming",
+            "base_phase": "forming",
+            "attention_for": None,
+            "return_to": None,
             "interactions": interactions,
             "needs_review": False,
         }
@@ -108,30 +114,42 @@ def rhythm_view(entry, at, interactions, *, fresh=True):
     value = entry["target"] + (entry["alertness"] - entry["target"]) * 0.5 ** (
         elapsed / (60 * entry["half_life_minutes"])
     )
-    phase = entry["phase"]
+    phase = entry.get("base_phase") or entry["phase"]
+    attention = entry.get("attention_for")
+    return_to = entry.get("return_to")
     latest = interactions.get("last_owner_at")
-    if phase in {"resting", "drowsy"} and latest and stamp(latest) > stamp(entry["at"]):
-        # 小光 wrote after she settled: a fact, not a timer.
-        since = max(0, (stamp(at) - stamp(latest)).total_seconds())
-        phase = "roused" if since < 1200 else "recovering"
+    reviewed_at = max(stamp(entry["at"]), stamp(entry.get("attention_cleared_at") or entry["at"]))
+    if latest and stamp(latest) > reviewed_at:
+        # Arrival draws attention, never proves wakefulness or a new mood. A task/urgent
+        # assessment keeps its stronger attention until another assessment clears it.
+        attention = attention if attention in {"task", "urgent"} else "owner_message"
+        return_to = return_to or phase
     # The phase Kin gave stays hers when its half-life has passed: no timer moves her into or out
     # of rest. Its end only asks her to look again (review_due; K1-04).
     review_due = elapsed >= entry["half_life_minutes"] * 60
     return {
-        "mode": "interaction-led",
-        "status": interactions["sample_status"],
+        "mode": "independent",
+        "status": "current",
         "phase": phase,
+        "base_phase": phase,
+        "attention_for": attention,
+        "attention_input_id": entry.get("attention_input_id"),
+        "attention_at": entry.get("attention_at"),
+        "return_to": return_to,
         "review_due": review_due,
         "proposed_phase": entry["phase"],
         "alertness": round(value, 3),
         "target": entry["target"],
         "half_life_minutes": entry["half_life_minutes"],
-        "reason": entry["reason"],
-        "basis": "runtime_inferred",
+        "reason": entry.get("reason", ""),
+        "note": entry.get("note"),
+        "current_activity": entry.get("current_activity"),
+        "previous": entry.get("previous"),
+        "basis": "subjective",
         "observed_at": entry["at"],
         "event_id": entry["event_id"],
         "config_version": entry["config_version"],
-        "evidence_ids": [r["record_id"] for r in entry["evidence"]],
+        "evidence_ids": [r["record_id"] for r in entry.get("evidence", [])],
         "needs_review": not fresh,
         "interactions": interactions,
     }

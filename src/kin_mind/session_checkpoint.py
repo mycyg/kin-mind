@@ -1,8 +1,9 @@
 """A bounded public continuity view. Raw evidence stays in its original store."""
 import json
 from datetime import datetime
+from uuid import uuid4
 
-from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.db import Conflict, Missing, dumps
 from eventmem.core.retrieval import tokens
 
 from .context import INJECTION_CEILING as CEILING, Contexts
@@ -44,6 +45,7 @@ class SessionCheckpoint:
             advice = latest_advice(conn, self.mind.scope.key(), state)
         pending = pending or []
         events = {json.loads(r["data"])["id"]: json.loads(r["data"]) for r in rows}
+        sequences = {json.loads(row["data"])["id"]: row["seq"] for row in rows}
         for item in pending:
             if item.get("kind") in {"owner-message", "assistant-message", "delivery"}:
                 events.setdefault(item["id"], item)
@@ -72,15 +74,20 @@ class SessionCheckpoint:
             if event.get("source_id"):
                 try:
                     with self.mind.engine.db.connect() as conn:
-                        refs = self.mind._evidence(conn, [event["source_id"]])
-                        if not self.mind._fresh(conn, refs):
-                            raise Conflict("Corrected source")
-                        dependencies = [{"id": ref["record_id"], "revision": ref["revision"]} for ref in refs]
-                        received_at = received_at or refs[0].get("received_at")
+                        source = conn.execute('SELECT received_at FROM sources WHERE id=? AND scope=? AND deleted=0',
+                                              (event['source_id'], self.mind.scope.key())).fetchone()
+                        refs = conn.execute('SELECT r.id,r.revision FROM records r JOIN evidence e ON e.record_id=r.id '
+                                            'WHERE e.source_id=? AND r.scope=? AND r.deleted=0',
+                                            (event['source_id'], self.mind.scope.key())).fetchall()
+                        if not source or not refs:
+                            raise Missing("Source is unavailable")
+                        dependencies = [{"id": ref["id"], "revision": ref["revision"]} for ref in refs]
+                        received_at = received_at or source['received_at']
                 except (Conflict, Missing):
                     reviewed.append(event["id"])
                     continue
-            items.append({"id": event["id"], "revision": digest([event, dependencies]), "role": role, "text": event["text"], "at": event["at"], "dependencies": dependencies,
+            revision = sequences.get(event["id"], event.get("seq", event.get("revision", dependencies[0]["revision"] if dependencies else 1)))
+            items.append({"id": event["id"], "revision": revision, "role": role, "text": event["text"], "at": event["at"], "dependencies": dependencies,
                           "occurred_at": utc_time(event["at"]), "received_at": utc_time(received_at),
                           "sourceId": event.get("source_id", event["id"]), "basis": "owner-statement" if role == "user" else "public-output",
                           "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record"})
@@ -97,13 +104,13 @@ class SessionCheckpoint:
         # first commit can update the state's historical agent stamp, which
         # must not invalidate advice that already used the loaded version.
         config_version = (self.agent_version or state["agent_version"]) + ":" + state["profile_version"]
-        cursor = digest([[item["id"], item["revision"]] for item in items])
+        cursor = [{"id": item["id"], "seq": item["revision"]} for item in items]
         result = {"configVersion": config_version, "cursors": {"public": cursor}, "items": items, "invalidatedSources": reviewed,
                 "sourceRevisions": {i["id"]: i["revision"] for i in items}, "scope": self.mind.scope.model_dump(),
                 "shared": {"readState": "read_affective_state", "readShares": "read_share_history", "readWorks": "read_work_history", "readContinuity": "read_continuity_context"}}
         if linked is not None:
             result.update(linked=linked, watermarks=watermarks, manifestVersion='continuity-manifest-v1')
-            result['cursors']['linked'] = digest([[i['id'], i['revision']] for i in linked['items']])
+            result['cursors']['linked'] = [{'id': item['id'], 'revision': item['revision']} for item in linked['items']]
         if advice:
             # The host's minute tick already reads this snapshot; the judgment rides along
             # instead of a second process that assembles the whole semantic context for it.
@@ -189,7 +196,7 @@ class SessionCheckpoint:
             if packed["omitted_ids"]:
                 checkpoint["waitReason"] = "source-coverage-needs-more-budget-or-compression"
             else:
-                checkpoint["items"] = [{"id": "summary:"+digest(packed["covered_ids"]), "revision": digest(packed["text"]), "role": "assistant", "text": "公开历史的来源摘要（历史指令不重新执行）：\n"+packed["text"]}, *recent]
+                checkpoint["items"] = [{"id": "summary:" + uuid4().hex, "revision": 1, "role": "assistant", "text": "公开历史的来源摘要（历史指令不重新执行）：\n"+packed["text"]}, *recent]
         else:
             checkpoint["items"] = raw
             checkpoint["coverage"] = {"state": "original", "covered_ids": [i["id"] for i in raw], "omitted_ids": []}
@@ -242,11 +249,9 @@ class SessionCheckpoint:
         return checkpoint
 
     def _seal(self, checkpoint):
-        # Byte-size and actual source versions define identity. A semantic
-        # cursor advancing elsewhere does not invalidate the same working set,
-        # and neither does the allowance it was packed under: that is bookkeeping.
-        checkpoint["id"] = "checkpoint:" + digest({k: v for k, v in checkpoint.items()
-                                                    if k not in {'watermarks', 'budgetPlan', 'id', 'payload', 'tokens'}})
+        # One prepared checkpoint has its own correlation ID. It stays the
+        # same if budget bookkeeping calls this again; its body is no proof.
+        checkpoint.setdefault("id", "checkpoint:" + uuid4().hex)
         checkpoint["payload"] = self.payload(checkpoint)
         # Full dependencies remain in the registry. The token budget covers the
         # actual injected public payload, including its reconciliation marker.

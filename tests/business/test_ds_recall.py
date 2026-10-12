@@ -284,7 +284,7 @@ def test_after_three_rounds_the_next_request_offers_the_submission_alone(setup, 
     entry = ledger(mind, job)
     assert [(c["purpose"], c["outcome"], c["usage"]) for c in entry["calls"]] == [("recall", "ok", USAGE)] * RECALL_ROUNDS + [("appraise", "ok", USAGE)]
     assert [c["detail"]["round"] for c in entry["calls"][:-1]] == list(range(1, RECALL_ROUNDS + 1))
-    assert entry["charged"] is True and entry["context_digest"] == entry["calls"][-1]["context_digest"]
+    assert entry["charged"] is True and "context_digest" not in entry and entry["calls"][-1].get("context_digest") is None
     assert queue_row(mind, job["id"])[1] == 1 and paid(mind) == RECALL_ROUNDS + 1
     receipt = queue_row(mind, job["id"])[2]["receipt"]
     assert len(receipt["tool_calls"]) == len(receipt["recall_rounds"]) == RECALL_ROUNDS
@@ -461,12 +461,12 @@ def test_the_request_profile_names_the_reads_only_where_they_are_offered(setup, 
     provider = Endpoint(mind, monkeypatch).provider
     context = {"state": mind.read(), "stimulus": None}
     plain = provider.request_profile(context)
-    assert plain["parameters"] == digest({"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT,
-                                          "tool_choice": "auto"})
+    assert plain["parameters"] == {"max_tokens": 131072, "thinking": "enabled", "effort": APPRAISAL_EFFORT,
+                                          "tool_choice": "auto"}
     provider.memory_recall = True
     offered = provider.request_profile(context)
-    assert offered["parameters"] != plain["parameters"] and offered["system"] != plain["system"]
-    assert (offered["schema"], offered["model"]) == (plain["schema"], plain["model"])
+    assert offered["parameters"] != plain["parameters"] and "system" not in offered
+    assert offered["model"] == plain["model"] and "schema" not in offered
     for stimulus in sorted(RECALL_WITHHELD):
         assert provider.request_profile({**context, "stimulus": stimulus})["parameters"] == plain["parameters"], stimulus
     native = native_provider(mind, None)

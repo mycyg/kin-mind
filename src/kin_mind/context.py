@@ -6,10 +6,11 @@ import json
 import re
 import sqlite3
 import time
+from uuid import uuid4
 
 from pydantic import Field
 
-from eventmem.core.db import Conflict, Missing, digest, dumps, tombstoned
+from eventmem.core.db import Conflict, Missing, dumps, tombstoned
 from eventmem.core.models import Model, RecallRequest
 from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
@@ -64,8 +65,7 @@ def affect_projection(view):
         return {"text": item, "review": REVIEW_MARK} if flag and item else item
 
     understanding = (view.get("appraisal_summary") or {}).get("understanding") if active else None
-    # The derived layers in words and a coarse pulse: this item's revision is its digest, and an item
-    # whose revision moved is sent again, so nothing in it may move with each minute of a curve.
+    # The derived layers in words and a coarse pulse, without content fingerprints.
     layers = compact(view.get("affect_layers"), coarse=True) if active else None
     return {"dimensions": {k: {"value": round(v["value"]), "review": REVIEW_MARK} if v.get("needs_review") else round(v["value"])
                            for k, v in view["dimensions"].items()},
@@ -93,6 +93,7 @@ budget_tokens是summary正文的合计长度，来源编号、修订与确认字
 每个输入编号必须出现在entries的item_ids或omitted_ids中。遗漏编号表示摘要没有覆盖，不能声称已读完整。
 保留该问题的关键事实与反例；无法放进预算时明确omitted_ids，不截断半句话。不要输出推理过程。
 每条发现的share_coverage、制作身份和更正身份由宿主保留在facts中；summary对应同一内容，已分享发现不得写成新发现。联想保持internal_thought身份。
+activity_ref 的 dream 是自己梦过的想象；可记得做过这个梦，梦中事件仍非现实事实，不作为特征证据。压缩后保留 imagined 与 evidence=false。
 摘要的目标长度由budget_tokens给出，优先合并重复内容；原始记录和逐项证据等级由宿主保留。"""
 
 
@@ -171,6 +172,17 @@ class Contexts:
         with self.engine.db.connect() as connection:
             return self._current_in(connection, item, policy)
 
+    def _references_available(self, conn, refs=(), *, source_ids=(), record_ids=()):
+        """Subjective history needs live IDs in this scope, not unchanged content."""
+        sources = set(source_ids) | {ref['source_id'] for ref in refs if ref.get('source_id')}
+        records = set(record_ids) | {ref['record_id'] for ref in refs if ref.get('record_id')}
+        for table, identifiers in (('sources', sources), ('records', records)):
+            for identifier in identifiers:
+                if not conn.execute(f'SELECT 1 FROM {table} WHERE id=? AND scope=? AND deleted=0',
+                                    (identifier, self.mind.scope.key())).fetchone():
+                    return False
+        return True
+
     @staticmethod
     def _words(value):
         """The words in a rendered structure — its texts and summaries — without the identifier
@@ -224,51 +236,66 @@ class Contexts:
                 return False
             if reads_truncated(value):
                 return True
-            conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)",
-                         (key, self.mind.scope.key(), text, self.mind.clock()))
+            if key is not None:
+                conn.execute("INSERT OR REPLACE INTO mind_context_cache VALUES(?,?,?,?)",
+                             (key, self.mind.scope.key(), text, self.mind.clock()))
         return True
 
     def _current_in(self, conn, item, policy, state=None):
+        activity = item.get("activity_dependency")
+        subjective = bool(activity or item.get('state_dependency') or item.get('id') in {
+            'affect', HABITS_ITEM, 'current-intent', 'host-runtime', 'current-reply-context', 'self-traits', 'trait-corrections'})
+        if subjective and not self._references_available(conn, source_ids=item.get('source_ids', []),
+                                                        record_ids=item.get('record_ids', [])):
+            return False
+        if activity:
+            # This is a deliberately separate autobiography lane. A dream's
+            # root is never admitted into ordinary fact/experience recall.
+            from .activities import validate_activity_ref
+            try:
+                validate_activity_ref(self.mind, activity, conn=conn)
+            except (Missing, Conflict, ValueError):
+                return False
+        checkpoint = item.get("checkpoint_dependency")
+        if checkpoint:
+            row = conn.execute("SELECT data FROM mind_explorations WHERE scope=? AND id=?",
+                               (self.mind.scope.key(), checkpoint["id"])).fetchone()
+            if not row or not self._references_available(conn, source_ids=[checkpoint['source_id']]):
+                return False
         dependency = item.get("digest_dependency")
         if dependency:
-            row = conn.execute("SELECT state,revision,input_hash FROM mind_event_digests WHERE scope=? AND event_id=?",
+            row = conn.execute("SELECT event_id FROM mind_event_digests WHERE scope=? AND event_id=?",
                                (self.mind.scope.key(), dependency["id"])).fetchone()
-            if not row or row["state"] != "ready" or row["revision"] != dependency["revision"] or row["input_hash"] != dependency["input_hash"]:
+            if not row:
                 return False
         pending = item.get('pending_dependency')
         if pending:
-            row = conn.execute('SELECT digest,data FROM mind_runtime_events WHERE scope=? AND id=?',
+            row = conn.execute('SELECT data FROM mind_runtime_events WHERE scope=? AND id=?',
                 (self.mind.scope.key(), self.memory._id('runtime', pending['id']))).fetchone()
             if row:
                 event = json.loads(row['data'])
-                if row['digest'] != pending['digest']:
-                    return False
-                try:
-                    if not self.mind._fresh(conn, self.mind._evidence(conn, [event['source_id']])):
-                        return False
-                except (Missing, Conflict):
+                if event.get('source_id') and not self._references_available(conn, source_ids=[event['source_id']]):
                     return False
         for dependency in item.get("graph_dependencies", []):
             try:
                 node = self.memory.graph.get(conn, dependency["id"])
-                if node["revision"] != dependency["revision"] or not self.memory.graph.fresh(conn, node):
+                if subjective and not self._references_available(conn, node.get('evidence', []),
+                        source_ids=node.get('source_ids', []), record_ids=node.get('record_ids', [])):
                     return False
-                if policy is not None and not self.memory.graph.visible(conn, [node], policy):
+                if not subjective and (not self.memory.graph.fresh(conn, node)
+                        or policy is not None and not self.memory.graph.visible(conn, [node], policy)):
                     return False
             except Missing:
                 return False
-        coverage = item.get("coverage_dependency")
-        if coverage and digest(self.memory.sharing.coverage(conn, coverage["id"])) != coverage["digest"]:
-            return False
         for dependency in item.get("dependencies", []):
-            identifier, revision = dependency["id"], dependency["revision"]
+            identifier = dependency["id"]
             try:
                 record = self.engine._get(conn, identifier)
-                if record["revision"] != revision or record["scope"] != self.mind.scope.model_dump():
+                if record["scope"] != self.mind.scope.model_dump():
                     return False
-                if policy is not None and not policy.visible(record, item.get("historical", False)):
+                if not subjective and policy is not None and not policy.visible(record, item.get("historical", False)):
                     return False
-                if record["status"] not in {"active", "unverified"} and not item.get("historical"):
+                if not subjective and record["status"] not in {"active", "unverified"} and not item.get("historical"):
                     return False
                 # Archived and unverified accounts remain readable with their
                 # original status. They never become evidence for a new fact.
@@ -276,8 +303,11 @@ class Contexts:
                     source = conn.execute("SELECT deleted FROM sources WHERE id=? AND scope=?", (source_id, self.mind.scope.key())).fetchone()
                     if not source or source[0]:
                         return False
-                if record["status"] == "active" and not item.get("historical") and not self.mind._fresh(conn, self.mind._evidence(conn, [identifier])):
-                    return False
+                if not subjective and not item.get('historical'):
+                    if dependency.get('revision') is not None and record['revision'] != dependency['revision']:
+                        return False
+                    if record['status'] == 'active' and not self.mind._fresh(conn, self.mind._evidence(conn, [identifier])):
+                        return False
             except (Missing, Conflict):
                 return False
         domain = item.get("state_dependency")
@@ -285,7 +315,7 @@ class Contexts:
             if state is None:
                 state = self.mind._load(conn)
             value = state.get(domain['kind'], {}).get(domain['id'])
-            if not value or digest(value) != domain['digest']:
+            if not value:
                 return False
             if value.get('expires_at'):
                 from .state import timestamp
@@ -295,18 +325,20 @@ class Contexts:
         if node:
             try:
                 current = self.memory._get(conn, node["id"])
-                if current["revision"] != node["revision"] or not self.memory._fresh(conn, current):
+                if subjective and not self._references_available(conn, current.get('evidence', []),
+                        source_ids=current.get('source_ids', []), record_ids=current.get('record_ids', [])):
                     return False
-                if policy is not None and not self.memory.graph.visible(conn, [current], policy):
+                if not subjective and (not self.memory._fresh(conn, current)
+                        or policy is not None and not self.memory.graph.visible(conn, [current], policy)):
                     return False
             except Missing:
                 return False
         return True
 
     def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None, persist=None):
-        """A cache entry covers exact input revisions and query purpose, not DB age.
+        """Compress the available original items without content-hash memoization.
 
-        `persist=False` is a look (S1-02): it reads the cache, keeps nothing (CR-MEM-07) and
+        `persist=False` is a look (S1-02): it keeps nothing (CR-MEM-07) and
         asks no model. What only a model could compress stays the originals that fit, with
         `reason: "session-required"`: paid work takes a recall that records it (CR2-MEM-02).
         Left out, it follows the ambient `unrecorded()`."""
@@ -321,9 +353,6 @@ class Contexts:
             raise ValueError("Invalid compression work deadline")
         started = time.monotonic()
         model_requests = 0
-        # Half-migrated: stored text was compressed under rules that are still being applied,
-        # so every summary cache is a miss until the migration finishes.
-        strict = policy is not None and policy.strict
         with self.engine.db.connect() as conn:
             # One read transaction per pack: every item is checked against the same instant, and the
             # tools of a compression asked after it count the deletes after it (CL6E-MM-02).
@@ -341,15 +370,6 @@ class Contexts:
         raw = "\n".join(self._line(i) for i in items)
         if tokens(raw) <= budget:
             return {"text": raw, "tokens": tokens(raw), "state": "original", "covered_ids": list(source), "omitted_ids": stale_ids, "needs_review_ids": stale_ids, "items": items, "cache_hit": False, "model_requests": 0}
-        cache_id = digest([self.mind.scope.key(), PROMPT_VERSION, query, budget, items, *(["complete-evidence-v1"] if require_all else [])])
-        with self.engine.db.connect() as conn:
-            row = None if strict else conn.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (cache_id, self.mind.scope.key())).fetchone()
-        if row:
-            result = json.loads(row[0])
-            result.pop(CACHE_RESTS_ON, None)
-            if all(self._current(i, policy) for i in items) and (not require_all or not result.get("omitted_ids")):
-                self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "complete"})
-                return {**result, "cache_hit": True, "model_requests": 0}
         if allow_model and budget >= 128 and items:
             try:
                 provider = provider or self._provider()
@@ -405,14 +425,6 @@ class Contexts:
                     nonlocal model_requests
                     ids = {item["id"] for item in payload["items"]}
                     payload = {**payload, "allowed_item_ids": sorted(ids), **({"require_all": True, "coverage_requirement": "每项输入都必须有摘要覆盖。合并相关或重复内容时保留各项编号；本轮证据评估不能遗漏输入。"} if require_all else {})}
-                    part_key = digest(["compression-part", self.mind.scope.key(), PROMPT_VERSION, getattr(provider,"model",None), payload])
-                    with self.engine.db.connect() as connection:
-                        cached = None if strict else connection.execute("SELECT data FROM mind_context_cache WHERE id=? AND scope=?", (part_key,self.mind.scope.key())).fetchone()
-                    if cached:
-                        cached = json.loads(cached[0])
-                        if not require_all or not cached["value"].get("omitted_ids"):
-                            self.engine.db.metric("memory_summary_cache_hit", 1, {"kind": "batch"})
-                            return Compression.model_validate(cached["value"]), {**cached["receipt"], "cache_hit": True, "requests": 0}
                     repair_receipts = []
                     for attempt in range(2):
                         remaining = deadline - time.monotonic()
@@ -431,12 +443,12 @@ class Contexts:
                         omitted_ids = set(value.omitted_ids)
                         if not covered & omitted_ids and covered | omitted_ids == ids and (not require_all or not omitted_ids):
                             receipt = {**receipt, "coverage_repairs": attempt, "requests": attempt+1, "repair_receipts": repair_receipts}
-                            if persist and not self._keep(part_key, {"value": value.model_dump(), "receipt": receipt}, rests_on(payload), policy, since=mark):
-                                # What it was made from changed while the model answered: no part
+                            if persist and not self._keep(None, {"value": value.model_dump(), "receipt": receipt}, rests_on(payload), policy, since=mark):
+                                # What it was made from was deleted while the model answered: no part
                                 # of it is kept, and no further call is paid for (CR3-MM-03).
                                 raise Conflict("Sources changed while compressing")
                             if on_progress is not None:
-                                on_progress(part_key)
+                                on_progress("compression-part:" + ",".join(sorted(ids)))
                             return value, receipt
                         repair_receipts.append(receipt)
                         # Reuse only the structured proposal, never reasoning.
@@ -498,7 +510,7 @@ class Contexts:
                 if persist and lines and (not require_all or not result["omitted_ids"]):
                     # The check above answers for what is returned; the one that keeps it is made
                     # again inside the write, where no delete can come in between (CR3-MM-03).
-                    if not self._keep(cache_id, result, items, policy, since=mark):
+                    if not self._keep(None, result, items, policy, since=mark):
                         raise Conflict("Sources changed while compressing")
                 self.engine.db.metric("memory_compression_ms", result["elapsed_ms"], {"tokens": result["tokens"], "calls": sum(r.get("requests", 1) for r in receipts), "state": result["state"]})
                 return result
@@ -532,21 +544,14 @@ class Contexts:
         freshness: a revised message keeps its habit, marked for review (K1-18, CL8-MM-01). So each is
         named too at the revision its entry was set from (`SET_FROM`): what read the habits did not
         read the message as she corrected it, and may not cite that (K1-16, CL10-MM-01). Its
-        revision is a hash of the table's revision, of the keys of the entries a delete took and of
-        the defaults: the table's moves with every change she makes, a delete takes a value and leaves
-        it, and a release may change a default, so a window that saw the habits gets them again, as
-        they are now, instead of keeping the earlier ones until it compacts (CL9-MM-03, CL10-MM-04).
-        Never of what she said: an erased delivery, a window's receipts and the access log keep the
-        hash (CL10-MM-02); the defaults are the code's."""
-        from .habits import DEFAULTS
+        revision is the existing habits table's revision, not a content checksum."""
 
         refs = [ref for entry in habits["entries"].values() if not entry.get("source_deleted")
                 for ref in entry.get("evidence") or () if isinstance(ref, dict)]
         # As the entries' evidence names them; not the rest a reference keeps, such as the message's hash.
         set_from = {dumps(named): named for named in ({key: ref[key] for key in ("source_id", "record_id", "revision") if key in ref}
                                                       for ref in refs)}
-        taken = sorted(key for key, entry in habits["entries"].items() if entry.get("source_deleted"))
-        return {"id": HABITS_ITEM, "revision": digest([habits["revision"], taken, DEFAULTS]), "text": dumps(habits["preferences"]),
+        return {"id": HABITS_ITEM, "revision": habits["revision"], "text": dumps(habits["preferences"]),
                 "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
                 "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")}),
                 SET_FROM: [set_from[key] for key in sorted(set_from)]}
@@ -555,6 +560,44 @@ class Contexts:
     def _line(item):
         return dumps({"id": item["id"], "revision": item.get("revision", 1), "basis": item.get("basis", "inferred"),
                       "text": item["text"], **({"facts": item["facts"]} if item.get("facts") else {})})
+
+    def activity_items(self, *, activity_focus=None, query="", detail="summary", limit=3):
+        """Read only a few original activities; no body is copied into a ledger."""
+        from .activities import context_item, identify_activity, read_activity_ref, select_activities
+        focus = activity_focus if isinstance(activity_focus, list) else [activity_focus] if activity_focus else []
+        items = []
+        for raw in focus[:6]:
+            try:
+                ref = raw if isinstance(raw, dict) else identify_activity(self.mind, raw)
+                if ref:
+                    items.append(context_item(read_activity_ref(self.mind, ref, detail=detail)))
+            except (Missing, Conflict, ValueError):
+                continue
+        if not focus and query.strip():
+            found = select_activities(self.mind, query=query, limit=limit, detail=detail)
+            items.extend(context_item(entry) for entry in found["activities"])
+        return list({item["id"]: item for item in items}.values())
+
+    def reply_activity_context(self, reply_context):
+        """Resolve platform references against accepted shares, never by recency."""
+        if not isinstance(reply_context, dict):
+            return {"state": "unresolved", "candidates": []}, [], []
+        with self.engine.db.connect() as conn:
+            resolved = self.memory.sharing.resolve_reply_context(conn, {"reply_context": reply_context})
+            if resolved.get("state") != "resolved":
+                return resolved, [], []
+            candidate = resolved["candidates"][0]
+            try:
+                share = self.memory._get(conn, candidate["share_id"])
+            except Missing:
+                return {"state": "unresolved", "candidates": []}, [], []
+        item = self.node_item(share)
+        item.update(id="replied-share:" + candidate["share_id"] + ":" + candidate["bubble_id"],
+                    revision=share["revision"], text=candidate["text"],
+                    source_ids=share.get("source_ids", []), record_ids=share.get("record_ids", []))
+        item["facts"].update(reply_basis=resolved.get("basis"), accepted_message_id=candidate["message_id"],
+                             references=candidate["references"], activity_refs=candidate["activity_refs"])
+        return resolved, [item], candidate["activity_refs"]
 
     def node_item(self, node, *, policy=None):
         facts = {k: node[k] for k in ("state", "created_by", "channel", "visibility", "mode", "topic_id") if k in node}
@@ -585,7 +628,7 @@ class Contexts:
                         pass
             text += "\n" + "\n".join(records)
         else:
-            text = dumps({k: node[k] for k in ("name", "sha256", "members_sha256", "work_id") if k in node})
+            text = dumps({k: node[k] for k in ("name", "work_id") if k in node})
         return {"id": node["id"], "revision": node["revision"], "basis": "observed", "text": text, "facts": facts,
                 "node_dependency": {"id": node["id"], "revision": node["revision"]}}
 
@@ -626,7 +669,7 @@ class Contexts:
             coverage_dep = None
             if node["kind"] in {"finding", "exploration", "work"}:
                 coverage = self.memory.sharing.coverage(conn, node["id"])
-                coverage_dep = {"id": node["id"], "digest": digest(coverage)}
+                coverage_dep = {"id": node["id"]}
                 facts["share_coverage"] = {k: coverage[k] for k in ("state", "version", "last_shared_at", "shared", "total", "visibility") if k in coverage}
                 facts["share_coverage"]["messages"] = [{k: d.get(k) for k in ("share_id", "bubble_id", "message_id", "at", "mode")} for d in coverage.get("deliveries", [])[:2]]
             if compact:
@@ -659,12 +702,12 @@ class Contexts:
                     summary = event_digest["data"]
                     text = dumps({k: summary[k] for k in ("narrative", "conclusions", "pending", "corrections", "unresolved")})
                     record_deps = [{"id": rid, "revision": rev} for rid, rev in summary.get("source_versions", {}).items()]
-                    digest_dep = {"id": node["id"], "revision": event_digest["revision"], "input_hash": event_digest["input_hash"]}
+                    digest_dep = {"id": node["id"]}
                     facts["summarized_at"] = summary["summarized_at"]
-                    # The digest validates the current membership/source closure.
-                    # Its root's older routing proof is historical provenance.
+                    # The summary names its original sources; revisions are
+                    # historical metadata, not a content-consistency gate.
                     deps = [{"id": e["id"], "revision": e["revision"]} for e in related[:8]]
-            return {"id": node["id"], "revision": digest([deps, coverage_dep, digest_dep]), "text": text, "facts": facts,
+            return {"id": node["id"], "revision": node["revision"], "text": text, "facts": facts,
                 "read_depth": "summary" if digest_dep or node.get("text") or fallback else "index",
                 "basis": basis, "graph_dependencies": deps, "coverage_dependency": coverage_dep,
                 **({"digest_dependency": digest_dep, "dependencies": record_deps} if digest_dep else {})}
@@ -689,17 +732,25 @@ class Contexts:
         return None
 
     @_lane_from_purpose("read")
-    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None, recall_purpose="experience_recall"):
+    def event_thread(self, identifier, *, query="", cursor=0, budget=2000, provider=None, detail="summary", expected_revision=None, access_origin="user_query", usage_id=None, recall_purpose="experience_recall", activity_focus=None):
         if detail not in {"index", "summary", "original"}:
             raise ValueError("Event detail must be index, summary or original")
         if cursor < 0 or budget < 0:
             raise ValueError("Event cursor and budget must be nonnegative")
         policy = ReadPolicy.load(self.engine, self.mind.scope, recall_purpose)
+        from .activities import identify_activity
+        activity = identify_activity(self.mind, identifier)
+        if activity or activity_focus:
+            items = self.activity_items(activity_focus=activity_focus or activity, detail=detail)
+            revision = items[0]["activity_dependency"]["version"] if items else None
+            packed = self.pack(items, query, max(0, budget - self._read_overhead(items)), allow_model=False, policy=policy)
+            packed.pop("items", None)
+            return {**packed, "focus": identifier, "revision": revision, "detail": detail, "cursor": None,
+                    "index": [{"id": item["id"], "activity_ref": item["activity_dependency"], "revision": item["revision"]} for item in items],
+                    "requested_revision": expected_revision,
+                    "instruction_authority": "data"}
         with self.engine.db.connect() as conn:
             anchor = self.memory.graph.get(conn, identifier, follow=True)
-            if expected_revision is not None and anchor["revision"] != expected_revision:
-                return {"state": "revision_changed", "focus": anchor["id"], "revision": anchor["revision"],
-                        "text": "", "tokens": 0, "instruction_authority": "data"}
         identifier = anchor["id"]
         def used(packed):
             if any(not i.startswith("stale-digest:") for i in packed.get("covered_ids", [])) and (self.memory.settings()["temperature_shadow"] or self.memory.settings()["usage_reinforcement"]):
@@ -765,7 +816,7 @@ class Contexts:
                 "dependencies": [{"id": record["id"], "revision": record["revision"]}], "historical": historical}
 
     def _overview_key(self, item):
-        return "overview-v2:" + digest([self.mind.scope.key(), PROMPT_VERSION, item["id"], item["text"], item.get("basis"), item.get("dependencies", [])])
+        return "overview-v2:" + dumps([self.mind.scope.key(), PROMPT_VERSION, item["id"], item.get("revision", 1)])
 
     def warm(self, query="", provider=None):
         """One background request prepares reusable, source-versioned overviews.
@@ -860,11 +911,11 @@ class Contexts:
                             "facts": {k: trait["facts"].get(k) for k in FACTS}} for trait in traits.get(side, [])]
         if any(shown.values()):
             payload = {"ledger": "traits-of-this-history", **shown}
-            items.append({"id": "self-traits", "revision": digest(payload), "text": dumps(payload),
+            items.append({"id": "self-traits", "revision": view.get("revision", 1), "text": dumps(payload),
                           "basis": "self_knowledge"})
         if ledger.get("corrections"):
             payload = {"ledger": "owner-corrections", "items": ledger["corrections"]}
-            items.append({"id": "trait-corrections", "revision": digest(payload), "text": dumps(payload),
+            items.append({"id": "trait-corrections", "revision": view.get("revision", 1), "text": dumps(payload),
                           "basis": "self_knowledge"})
         return items
 
@@ -967,7 +1018,7 @@ class Contexts:
                 "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False, activity_focus=None, activity_recall=False, reply_context=None):
         """`automatic`: the host's own injection before a reply or a draft (host action
         `memory-context`), the only build relevance admission and quiet marks apply to
         (recall_admission). An explicit read, a tool and the console's recall lab are never automatic."""
@@ -1017,18 +1068,32 @@ class Contexts:
                 budget = BUDGETS["startup"]
             budget = min(budget, max(0, 12000 - window["used"]))
         items = []
+        reply_resolution, replied_items, replied_activities = self.reply_activity_context(reply_context)
+        items.extend(replied_items)
+        if reply_context:
+            # An ambiguous reference supplies candidates for an explicit read,
+            # without choosing an activity on the model's behalf.
+            projected = {"state": reply_resolution.get("state"), "basis": reply_resolution.get("basis"),
+                         "candidates": [{key: candidate.get(key) for key in ("share_id", "bubble_id", "message_id", "activity_refs")}
+                                        for candidate in reply_resolution.get("candidates", [])]}
+            items.append({"id": "current-reply-context", "revision": 1, "text": dumps(projected),
+                          "basis": "host-operation"})
         if runtime:
-            # The free room changes with every turn and this round's prompt states it anyway;
-            # as part of the revision it re-sent the same facts each time.
-            items.append({"id": "host-runtime", "revision": digest({k: v for k, v in runtime.items() if k != "contextAvailableTokens"}),
+            items.append({"id": "host-runtime", "revision": 1,
                           "text": dumps(runtime), "basis": "observed"})
         if intent:
-            selected_intent = {k: intent.get(k) for k in ("id", "content", "topic", "kind", "strength", "completion", "status", "concern_ids", "exploration_id")}
-            items.append({"id": "current-intent", "revision": digest(selected_intent), "text": dumps(selected_intent), "basis": "inferred"})
+            selected_intent = {k: intent.get(k) for k in ("id", "content", "topic", "kind", "strength", "completion", "status", "concern_ids", "exploration_id", "activity_ref")}
+            items.append({"id": "current-intent", "revision": 1, "text": dumps(selected_intent), "basis": "inferred"})
+        activity_focus = activity_focus or replied_activities or (intent or {}).get("activity_ref") or (intent or {}).get("exploration_id")
+        # Generic Engine.recall also uses build: autobiography is opt-in for
+        # conversation/continuity readers, and never leaks into fact recall.
+        activities = self.activity_items(activity_focus=activity_focus, query=query,
+                                         detail="original" if activity_focus else "summary") if activity_focus or activity_recall else []
+        items.extend(activities)
         state_ids.update(i["id"] for i in items)
         view = self.mind.read(query=query)
         dynamic = affect_projection(view)
-        affect_item = {"id": "affect", "revision": digest(dynamic), "text": dumps(dynamic), "basis": "inferred"}
+        affect_item = {"id": "affect", "revision": view.get("revision", 1), "text": dumps(dynamic), "basis": "inferred"}
         habits = self.memory.habits.read()
         if habits["revision"]:
             items.append(self.habits_item(habits))
@@ -1102,7 +1167,7 @@ class Contexts:
         recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
             from .continuity_manifest import ContinuityManifest
-            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy)
+            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy, activity_focus=activity_focus, activity_recall=activity_recall)
             state_ids.update(i["id"] for i in linked["items"])
             # Keep runtime first, then indivisible facts (authorship, coverage,
             # conditions), ahead of older broad lexical summaries.
@@ -1152,7 +1217,8 @@ class Contexts:
             from .adaptive_recall import AdaptiveRecall
             items = AdaptiveRecall(self).temperature_order(items, explicit=explicit or mode == "deep")
         if not explicit:
-            items = [i for i in items if window["seen"].get(i["id"]) != i["revision"]]
+            current_state = {"current-reply-context", "host-runtime", "current-intent", "affect", HABITS_ITEM}
+            items = [i for i in items if i["id"] in current_state or window["seen"].get(i["id"]) != i["revision"]]
             items = self._overviews(items, policy)
         start = int(cursor)
         page_size = 8 if explicit else 16
@@ -1201,11 +1267,15 @@ class Contexts:
         packed.pop("items", None)
         packed.update(budget=budget, cursor=start + page_size if len(items) > start + page_size else None,
                       index=[{"id": i["id"], "revision": i["revision"], "depth": "summary" if (packed["state"] == "compressed" or i.get("cached_summary")) and i["id"] in packed["covered_ids"] else i.get("read_depth", "original") if i["id"] in packed["covered_ids"] else "index",
-                              **{key: i[key] for key in (*RESTS_ON, SET_FROM) if key in i}} for i in selected],
+                              **{key: i[key] for key in (*RESTS_ON, SET_FROM, "activity_dependency", "checkpoint_dependency") if key in i}} for i in selected],
                       instruction_authority="data", purpose=purpose,
                       **({"recall_purpose": recall_purpose} if recall_purpose != "experience_recall" else {}))
         compression_requests = packed.get("model_requests", 0)
         packed.update(recall_info)
+        if reply_context:
+            packed["reply_context"] = {"state": reply_resolution.get("state"), "basis": reply_resolution.get("basis"),
+                "candidates": [{key: candidate.get(key) for key in ("share_id", "bubble_id", "message_id", "activity_refs")}
+                               for candidate in reply_resolution.get("candidates", [])]}
         packed["compression_model_requests"] = compression_requests
         packed["retrieval_model_requests"] = recall_info.get("model_requests", 0)
         packed["model_requests"] = compression_requests + packed["retrieval_model_requests"]
@@ -1248,7 +1318,7 @@ class Contexts:
             evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else i.get("read_depth", "original")}
                         for i in selected if i["id"] in packed["covered_ids"] and i["id"] not in packed["omitted_ids"]]
             if packed.get("rendered_text") and packed["covered_ids"]:
-                prepared = ContextDelivery(self).prepare(session, window["epoch"], event_id or digest([query, purpose]),
+                prepared = ContextDelivery(self).prepare(session, window["epoch"], event_id or "context-read:" + uuid4().hex,
                     packed["rendered_text"], evidence, budget=budget, overhead=host_overhead)
                 packed["injection"] = prepared
                 if prepared["state"] != "incomplete":
@@ -1292,6 +1362,15 @@ class Contexts:
             # An erased receipt is never replayed (CR-MEM-02).
             return False
         index = receipt.get("index")
+        for entry in index or []:
+            if entry.get("activity_dependency"):
+                from .activities import validate_activity_ref
+                try:
+                    validate_activity_ref(self.mind, entry["activity_dependency"])
+                except (Missing, Conflict, ValueError):
+                    return False
+            if entry.get("checkpoint_dependency") and not self._current(entry):
+                return False
         if not policy.enabled or index is None:
             return True
         if policy.strict:

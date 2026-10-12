@@ -1,4 +1,3 @@
-import {createHash} from 'node:crypto';
 import {splitChatText} from './chat-bubbles.mjs';
 import {CHANNEL_CONTRACTS,channelContract,classifyReceipt,normalizeReceipt} from './channel-contract.mjs';
 import {fragmentText,fileFragment} from './text-fragments.mjs';
@@ -68,7 +67,6 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
   preflight=async request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))}),
   verifyFile=async()=>{throw Error('File delivery is not configured');},begin=async()=>{},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
   const active=new Map();
-  const digest=value=>createHash('sha256').update(value).digest('hex');
   // Proactive contact leaves through the Feishu bridge; a channel with no
   // published contract is measured by that one, with injected corrections.
   const textLimit=channel=>channelContract(CHANNEL_CONTRACTS[channel]?channel:'feishu',contracts[channel]).text;
@@ -79,8 +77,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     const plan=fragmentText(item.text,limit);
     if(plan.kind!=='text')return [{...item,oversize:{reason:plan.reason,name:fileFragment(item.text).name}}];
     if(plan.fragments.length<2)return [item];
-    return plan.fragments.map(part=>({...item,id:transportId(item.id,part.index,part.body_sha256),text:item.text.slice(part.start,part.end),
-      references:part.index?[]:item.references,part:{of:item.id,index:part.index,count:plan.fragments.length,body_sha256:part.body_sha256}}));
+    return plan.fragments.map(part=>({...item,id:transportId(item.id,part.index),text:item.text.slice(part.start,part.end),
+      references:part.index?[]:item.references,sourceReferences:item.sourceReferences??item.references,part:{of:item.id,index:part.index,count:plan.fragments.length}}));
   }
   /** Freeze the reviewed bodies and references, then cut what the channel
    * cannot carry. A group that has already begun is never cut again. */
@@ -91,6 +89,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(index<0){items.push(item);continue;}
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
+      item.sourceReferences=item.references;
       items.push(...(begun?[item]:cut(item,limit)));
     }
     batch.items=items;batch.review={at:now(),...(verdict.review_id?{id:verdict.review_id}:{})};
@@ -140,21 +139,17 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='pending';batch.reason=reason==='frozen'?'dispatch-frozen':reason;batch.heldAtGate=true;
     await write(id,batch);return result(batch);
   }
-  async function run({id,text,bubbles,files=[],references=[],channel,guard=()=>true,superseded=false,gate=null}) {
+  async function run({id,text,bubbles,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
-    const contentDigest=parts?digest(JSON.stringify(files.length?{parts,files}:parts)):null;
-    if(batch) {
-      if(parts&&batch.digest!==contentDigest)throw Error('contact-batch-content-conflict');
-      if(references.length&&batch.referenceDigest&&batch.referenceDigest!==digest(JSON.stringify(references)))throw Error('contact-batch-reference-conflict');
-    } else {
+    if(!batch) {
       if(!Array.isArray(parts)||!parts.length||parts.some(x=>typeof x!=='string'||!x.trim()))throw Error('contact-batch-empty');
       if(!Array.isArray(files)||files.length>24)throw Error('contact-batch-invalid-files');
-      batch={id,channel,referenceDigest:digest(JSON.stringify(references)),digest:contentDigest,state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
-        const itemId='kin-bubble-'+digest(id+'\0'+index).slice(0,48);
+      batch={id,channel,...(conversationId?{conversationId}:{}),state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
+        const itemId='kin-bubble-'+id+'-'+index;
         return{id:itemId,draftId:itemId,bubbleIndex:index,text,references:references[index]??[],state:'unsent'};
       })};
-      batch.items.push(...files.map((file,index)=>{const itemId='kin-file-'+digest(id+'\0'+index+'\0'+file.sha256).slice(0,48);return{id:itemId,draftId:itemId,file,state:'unsent'};}));
+      batch.items.push(...files.map((file,index)=>{const itemId='kin-file-'+id+'-'+index;return{id:itemId,draftId:itemId,file,state:'unsent'};}));
       await write(id,batch);
     }
     const transportIds=batch.items.map(item=>item?.id);
@@ -170,7 +165,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(item.state==='unsent'&&superseded){Object.assign(item,{state:'canceled',reason:'superseded-before-send',submission:'never-started'});await write(id,batch);continue;}
       if(item.state!=='unsent') {
         const known=await receipt(item.id,batch.channel),outcome=classifyReceipt(known);
-        if(outcome==='accepted')Object.assign(item,{state:'accepted',messageId:normalizeReceipt(known).messageId});
+        if(outcome==='accepted')Object.assign(item,{state:'accepted',messageId:normalizeReceipt(known).messageId,...(known.conversationId?{conversationId:known.conversationId}:{})});
         // A receipt that proves nothing was submitted: this pass sends the same
         // frozen ID again, under the verdict the group already has. A bubble that
         // never starts is not free of the host's time, so it is offered the same
@@ -236,6 +231,20 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(item.state==='unsent') {
         // A new owner input can arrive while the semantic review is running.
         if(!await eligible(within(batch))||!await guard(within(batch))){batch.state='pending';await write(id,batch);return result(batch);}
+        // A freeze or an earlier accepted part does not make its original
+        // activity immutable. Preview its sources before every new send;
+        // unknown/accepted receipts were already reconciled above.
+        const sourceReferences=item.sourceReferences??(item.references?.length?item.references:
+          batch.items.find(prior=>item.part?.of&&(prior.id===item.part.of||prior.part?.of===item.part.of)&&prior.references?.length)?.references)??[];
+        if(sourceReferences.length) {
+          const entry={draft_id:item.draftId,text:item.text,references:sourceReferences,bubble_index:item.bubbleIndex};
+          let verdict;
+          try {verdict=await preflight({batch_id:batch.id,draft_id:batch.id,channel:batch.channel,dry_run:true,source_only:true,
+            entries:[entry],text:item.text,batch_text:item.text,references:sourceReferences});}
+          catch {return needsReview(batch,id,reviewFailure({}, {category:'source-changed',stage:'contact-review-source',code:'contact-source-preview-failed',retry_condition:'source-change'}));}
+          if(verdict?.state!=='ready'||!checkedContract([item],verdict)||verdict.checked[0].text!==item.text)
+            return needsReview(batch,id,reviewFailure(verdict??{}, {category:'source-changed',stage:'contact-review-source',code:'contact-source-changed',retry_condition:'source-change'}),verdict?.reason);
+        }
         // In flight with the router from before the bubble is marked begun until its send
         // returns, so a freeze can never report idle between the two (CR2-INT-01).
         const activity=await admit(gate,item,batch);
@@ -249,13 +258,13 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
           if(!batch.deliveryStarted)await begin({id:batch.id,channel:batch.channel});
           item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
           try {
-            const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,
+            const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,conversationId:batch.conversationId,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,
               // Unsplittable: the whole body as one file, with no words of the host's own.
               // A sender that understands `media` delivers the file INSTEAD of the text, never both;
               // `text` rides along only so that a sender that does not still has a body.
               ...(item.oversize?{media:{type:'file',name:item.oversize.name,data:Buffer.from(item.text,'utf8')}}:{})});
             if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
-            Object.assign(item,{state:'accepted',messageId:sent.messageId});
+            Object.assign(item,{state:'accepted',messageId:sent.messageId,...(sent.conversationId?{conversationId:sent.conversationId}:{})});
           } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}
         } finally {activity.release();}
       }

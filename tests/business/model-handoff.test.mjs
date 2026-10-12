@@ -18,7 +18,7 @@ function history(t,items=[],id='source'){
 const profiles={gpt:{provider:'native',providerKind:'native',model:'gpt-6.1-sol',reasoningEffort:'medium',serviceTierPreference:'default'},
  kimi:{provider:'kimi',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},
  ds:{provider:'deepseek',providerKind:'gateway',model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}};
-const bind=p=>({sourceProvider:p.provider,sourceProviderKind:p.providerKind,launchProvider:p.providerKind==='gateway'?'kin_session_gateway':p.provider,endpointSha256:p.providerKind==='gateway'?'a'.repeat(64):null});
+const bind=p=>({sourceProvider:p.provider,sourceProviderKind:p.providerKind,launchProvider:p.providerKind==='gateway'?'kin_session_gateway':p.provider,endpoint:p.providerKind==='gateway'?'http://synthetic-gateway.invalid':null});
 const proof=p=>({verified:true,requestedProfile:p,providerBinding:bind(p),profileEvidence:{model:'verified',modelProvider:'verified',reasoningEffort:'verified',serviceTierConfiguration:'verified'}});
 const cp={id:'cp',conversationId:'logical',generation:1,configVersion:'v',cursors:{public:1},items:[{id:'own-summary',role:'assistant',revision:'1',text:'自有压缩摘要：保留约定与否定。'}],coverage:{state:'compressed',covered_ids:['older-1'],omitted_ids:[]},sourceRevisions:{'older-1':'1'},complete:true,payload:{kind:'internal-continuity-checkpoint',checkpointId:'cp',publicHistory:[]}};
 

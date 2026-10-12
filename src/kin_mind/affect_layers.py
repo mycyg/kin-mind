@@ -25,8 +25,6 @@ The tables below are this version's (VERSION); a view names the version it was d
 import math
 from zoneinfo import ZoneInfo
 
-from eventmem.core.db import digest
-
 from .profile import DIMENSIONS
 from .rhythm import stamp
 
@@ -79,20 +77,20 @@ ECHOES = {
     "mood": ("刚才那阵好心情还在", "刚才那点低落还没缓过来"),
     "expressive_energy": ("聊兴还在兴头上", "兴致落下来了，还没提起来"),
     "security": ("刚落下的那份安心还在", "那点不踏实还悬着"),
-    "anticipation": ("那份期待还在心里跳", "期待的事有了着落"),
+    "anticipation": ("那份期待还在心里跳", "期待的心情淡了一些"),
     "worry": ("那份担心还挂着", "担心卸下来了，松了口气"),
-    "frustration": ("受挫的闷气还没散", "卡住的地方顺了，舒了口气"),
-    "grievance": ("刚才那点委屈还没散", "委屈被接住了，释然了些"),
+    "frustration": ("那点闷气还没散", "受挫的心情缓了一些"),
+    "grievance": ("刚才那点委屈还没散", "委屈淡了一些"),
     "closeness": ("刚才那阵亲近还暖暖的", "刚才那点疏远感还没散"),
-    "longing": ("想念被勾起来了，还挂在心上", "想念被接住了，心里松快了些"),
+    "longing": ("想念还挂在心上", "想念的心情淡了一些"),
     "possessiveness": ("想多占对方一会儿的小心思还在", "想独占的小心思放下了"),
     "playfulness": ("玩心还没收住", "玩闹的心思先收起来了"),
     "flirtation": ("刚才的心动还没平复", "暧昧的心思先收了收"),
-    "care": ("还惦记着对方刚才说的事", "惦记的事有了着落"),
-    "reassurance": ("还有点想撒娇", "被哄好了，心里甜甜的"),
-    "curiosity": ("想弄明白的劲头还在", "想查的事有了答案，踏实了"),
+    "care": ("还惦记着对方", "惦记的心思缓了缓"),
+    "reassurance": ("还有点想撒娇", "想被哄的心情淡了一些"),
+    "curiosity": ("想弄明白的劲头还在", "想查的劲头先缓一缓"),
     "creativity": ("冒出来的灵感还在转", "创作的念头先放下了"),
-    "sharing": ("还有话想说给对方听", "想说的都说出来了，很舒坦"),
+    "sharing": ("还有话想说给对方听", "想说话的心情缓了一些"),
     "initiative": ("想主动做点什么的劲还在", "主动的念头先放一放"),
     "focus": ("专注的劲头还没退", "注意力从手头的事上松开了"),
     "solitude": ("还想自己待一会儿，理理思绪", "想和对方说说话了"),
@@ -103,7 +101,7 @@ ECHOES = {
     "protectiveness": ("想护着对方的劲还在", "紧着的那根弦松了"),
     "jealousy": ("那点小醋意还没散", "醋意消了，心里放下了"),
     "fear": ("刚才那阵害怕还没完全平复", "害怕过去了，心慢慢落地"),
-    "wonder": ("被勾起的好奇还没消", "好奇心得到满足了"),
+    "wonder": ("好奇的心情还没消", "好奇的心情淡了一些"),
 }
 
 # 心跳/呼吸: beats per point a dimension stands above its baseline (arousal raises the pulse; contentment
@@ -139,6 +137,7 @@ def curve(entry):
     motive = entry.get("motivation")
     return {"score": entry["score"], "target": entry["target"], "half_life_hours": entry["half_life_hours"],
             "at": entry["at"], "baseline": entry.get("baseline", entry["target"]),
+            "event_id": entry.get("event_id"),
             "motivation": {k: motive.get(k) for k in ("expires_at", "base_half_life_hours")} if motive else None}
 
 
@@ -148,14 +147,9 @@ def curves(state):
     return {key: curve(entry) for key, entry in (state.get("dimensions") or {}).items()}
 
 
-def fingerprint(entry):
-    """Which instant curve this is: the numbers and times `project` draws it from, digested."""
-    from .state import motivation_expiry
-    shape = curve(entry)
-    until = motivation_expiry(shape)
-    pace = (shape["motivation"].get("base_half_life_hours") or shape["half_life_hours"]) if until else None
-    return digest([shape["score"], shape["target"], shape["half_life_hours"], shape["at"],
-                   shape["baseline"] if until else None, until, pace])[:16]
+def segment(entry):
+    """The existing event and time at which this numerical curve segment started."""
+    return [entry.get("event_id"), entry["at"]]
 
 
 def _pieces(entry):
@@ -221,7 +215,7 @@ def undertone(entry, anchor, at, instant=None):
         from .state import project
         return (project(entry, at) if instant is None else instant), "forming"
     since, now = _hours(anchor["at"]), _hours(at)
-    if anchor.get("fp") == fingerprint(entry):
+    if anchor.get("segment") == segment(entry):
         return _clamp(_follow(anchor["m"], since, _pieces(entry), now)), "tracking"
     begin = max(since, _hours(entry["at"]))
     drifted = _relax(anchor["m"], anchor["x"], anchor["x"], 0.0, min(begin, now) - since)
@@ -230,7 +224,7 @@ def undertone(entry, anchor, at, instant=None):
 
 def anchor_at(entry, level, at):
     from .state import project
-    return {"m": round(level, 6), "x": round(project(entry, at), 6), "at": at, "fp": fingerprint(entry)}
+    return {"m": round(level, 6), "x": round(project(entry, at), 6), "at": at, "segment": segment(entry)}
 
 
 def anchor_of(state, key):
@@ -263,12 +257,12 @@ def reanchor(state, before, at):
     moved = []
     for key, entry in dimensions.items():
         anchor = anchor_of(state, key)
-        if isinstance(anchor, dict) and anchor.get("fp") == fingerprint(entry):
+        old = (before or {}).get(key)
+        if isinstance(anchor, dict) and anchor.get("segment") == segment(entry) and old == curve(entry):
             continue
         if isinstance(anchor, dict):
             # The replaced curve when it is known, else the estimate a read of it shows (`undertone`).
-            old = (before or {}).get(key)
-            known = old if old is not None and fingerprint(old) == anchor.get("fp") else entry
+            known = old if old is not None and segment(old) == anchor.get("segment") else entry
             level = undertone(known, anchor, at)[0]
         else:
             level = project(entry, at)

@@ -54,6 +54,20 @@ export const DEFERRAL_PLAN_RETRY_MS=Object.freeze([60000,5*60000,15*60000,360000
 export const CLOSED_LOOKUP_MAX_GAP_MS=3600000,CLOSED_LOOKUP_MAX_MS=24*3600000;
 /** The channels an input may arrive on, kept as its receipt fact (CR-LIFE-17). */
 const INPUT_CHANNELS=new Set(['feishu','wechat','desktop-handoff','cli']);
+// Platform references remain pointers, including while classification waits or is retried.
+// They never choose a task, grant permission, or turn quoted content into instructions.
+export function inputReferences(input) {
+  const result={};
+  for(const key of ['platform_message_id','conversation_id','reply_to_message_id','thread_id','root_message_id'])
+    if(typeof input[key]==='string'&&input[key].length<=1000)result[key]=input[key];
+  if(input.reply_context&&typeof input.reply_context==='object'&&!Array.isArray(input.reply_context)) {
+    const context={};
+    for(const key of ['channel','conversation_id','platform_message_id','reply_to_message_id','thread_id','root_message_id'])
+      if(typeof input.reply_context[key]==='string'&&input.reply_context[key].length<=1000)context[key]=input.reply_context[key];
+    if(Object.keys(context).length)result.reply_context=context;
+  }
+  return result;
+}
 /** An input's kind as the journal may name it (owner, handoff, work-result, the mind's own…). */
 const INPUT_KIND=/^[a-z][a-z-]{0,39}$/;
 /** How far an input had got when the owner's stop settled it as hers, as the journal keeps it
@@ -922,12 +936,12 @@ export class MobileRouter {
       const firstReceivedAt=Math.min(receiptTime(input.receivedAt,now),Number.isFinite(intake?.firstReceivedAt)?intake.firstReceivedAt:Infinity);
       // How often it went back to its inbox is the input's own, counted across every stage:
       // routing never starts it again, and it is kept apart from this attempt's evidence (CR3-FLOW-10).
-      const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt,
+      const base={id:input.id,hash,kind:input.kind??'owner',at:now,firstReceivedAt,...inputReferences(input),
         ...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),conversationId:this.state.conversationId,generation:this.state.generation,nativeThreadId:this.sessionId,...(tail?{tail}:{}),
         ...(intake?.retry?{retry:clone(intake.retry)}:{}),...(requeuesOf(intake)?{requeues:requeuesOf(intake)}:{})};
       if(semanticFailure) {
         const current=this.currentTask(),runtime=first.classify.runtime;
-        this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,
+        this.state.semanticPending[input.id]={id:input.id,hash,kind:input.kind??'owner',text:input.text,...inputReferences(input),
           attachments:intents?attachmentMetadata(input.attachments):[],occurredAt:input.occurredAt??null,receivedAt:input.receivedAt??null,
           conversationId:this.state.conversationId??null,generation:this.state.generation??null,
           taskId:current?.id??null,inputVersion:current?.inputVersion??null,taskVersions:first.classify.taskVersions,
@@ -1022,7 +1036,7 @@ export class MobileRouter {
   }
   rememberOwner(input) {
     this.wakeNotices();
-    this.state.recent.push({role:'user',text:input.text,at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
+    this.state.recent.push({id:input.id,role:'user',text:input.text,...inputReferences(input),...(INPUT_CHANNELS.has(input.channel)?{channel:input.channel}:{}),at:input.occurredAt??input.at??this.now(),receivedAt:input.receivedAt??this.now()});
     this.state.recent=this.state.recent.slice(-16);
   }
   /** Record that nothing of this input reached the native session, with that

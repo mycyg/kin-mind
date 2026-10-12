@@ -39,7 +39,7 @@ export class CreationVerifier {
   const checks=[];
   for(const artifact of result.artifacts.filter(a=>path.extname(a.path).toLowerCase()==='.html').slice(0,2)){
    if(signal?.aborted)break;
-   if(!this.capabilities().static_html_render){checks.push({state:'unavailable',source_sha256:artifact.sha256,reason:'static-browser-unavailable'});continue;}
+   if(!this.capabilities().static_html_render){checks.push({state:'unavailable',source_artifact_id:artifact.artifact_id,reason:'static-browser-unavailable'});continue;}
    const check=await this.render(result.receipt.workspace,artifact,signal,env);
    if(['renderer-start-failed','browser-launch-failed'].includes(check.reason))this.environmentFailure=check.reason;
    checks.push(check);
@@ -51,13 +51,13 @@ export class CreationVerifier {
   const child=this.spawnImpl(this.node,[fileURLToPath(new URL('./creation-render-worker.mjs',import.meta.url)),this.playwrightModule,this.executablePath??''],
    {stdio:['pipe','pipe','pipe'],env:{...Object.fromEntries(['PATH','HOME','TMPDIR','LANG'].filter(k=>process.env[k]).map(k=>[k,process.env[k]])),...marked},detached:true});
   let output='',settled=false,timer;
-  const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',cancel);resolve({...value,source_sha256:artifact.sha256});};
+  const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',cancel);resolve({...value,source_artifact_id:artifact.artifact_id});};
   const cancel=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{child.kill('SIGKILL');}finish({state:'unavailable',reason:signal?.aborted?'interrupted':'render-timeout'});};
   timer=setTimeout(cancel,this.timeoutMs);signal?.addEventListener('abort',cancel,{once:true});
   child.stdout.on('data',chunk=>{output+=chunk;if(output.length>250000)cancel();});child.stderr.on('data',()=>{});
   child.once('error',()=>finish({state:'unavailable',reason:'renderer-start-failed'}));
   child.once('close',code=>{if(code!==0)return finish({state:'failed',reason:'renderer-exit',exit_code:code});
    try{const value=JSON.parse(output);finish(value);}catch{finish({state:'failed',reason:'invalid-render-receipt'});}});
-  child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify({workspace,path:artifact.path,sha256:artifact.sha256}));
+  child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify({workspace,path:artifact.path,artifact_id:artifact.artifact_id}));
  });}
 }

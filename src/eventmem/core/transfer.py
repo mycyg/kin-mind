@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import tarfile
@@ -20,6 +21,7 @@ from .persona import approve_canon
 STORE_FILES = ("persona-policy.json", "kin-self-knowledge.json")
 STORE_FOLDERS = ("configuration-versions", "persona-versions", "archive")
 CHUNK = 1024 * 1024
+BLOB_KEY = re.compile(r"(?:blob_[0-9a-f]{32}|[0-9a-f]{64})")
 
 
 def file_digest(path):
@@ -65,11 +67,10 @@ def _referenced_blobs(conn):
     }
     if any(
         not isinstance(key, str)
-        or len(key) != 64
-        or any(c not in "0123456789abcdef" for c in key)
+        or not BLOB_KEY.fullmatch(key)
         for key in blobs
     ):
-        raise ValueError("Stored attachment has an invalid digest")
+        raise ValueError("Stored attachment has an invalid blob reference")
     return blobs
 
 
@@ -108,8 +109,6 @@ def backup(engine, output: Path):
             for p in snapshot.rglob("*")
             if p.is_file()
         }
-        if any(manifest["blobs/" + key] != key for key in blobs):
-            raise ValueError("Stored attachment checksum mismatch")
         (snapshot / "manifest.json").write_text(
             dumps({"format": "memorypalace-1", "files": manifest})
         )
@@ -180,8 +179,7 @@ def restore(archive_path: Path, target: Path, *, persona_approval=None):
                     or (
                         len(relative.parts) == 2
                         and relative.parts[0] == "blobs"
-                        and len(relative.parts[1]) == 64
-                        and all(c in "0123456789abcdef" for c in relative.parts[1])
+                        and BLOB_KEY.fullmatch(relative.parts[1])
                     )
                 )
             ):
@@ -222,7 +220,7 @@ def restore(archive_path: Path, target: Path, *, persona_approval=None):
                 raise ValueError("Unsupported backup database schema")
             referenced = _referenced_blobs(conn)
             for key in referenced:
-                if manifest["files"].get("blobs/" + key) != key:
+                if "blobs/" + key not in manifest["files"]:
                     raise ValueError(f"Backup is missing attachment {key}")
         # Old valid backups may contain orphan blobs; leave the archive intact.
         for name in manifest["files"]:

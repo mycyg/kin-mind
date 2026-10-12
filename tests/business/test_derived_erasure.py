@@ -1,3 +1,9 @@
+from kin_mind.memory import observe_file
+
+
+def fingerprint_file(path):
+    return observe_file(path, artifact_id="synthetic-artifact:" + str(path))
+
 """What is written from a source keeps none of its words once the source is deleted, however the
 delete and the write interleave -- an appraisal, a reflection, a creation, an exploration, a daily
 review (CR5-MM-01, CR5-MM-02, CR5-MM-09) -- and an attempt that ends before its model call is not
@@ -8,17 +14,17 @@ and then reads every table of the store for the words."""
 import json
 from datetime import datetime, timezone
 
+from test_erasure import settle, texts_everywhere
+
 from eventmem.core.db import Conflict
 from eventmem.core.models import SourceInput
-
 from kin_mind import attempts
 from kin_mind.appraisal import Appraisal, Appraisals, DailyReview
 from kin_mind.continuity import Understanding
 from kin_mind.creation import accept_result
 from kin_mind.erasure import ERASED
 from kin_mind.exploration_decisions import SharingDecision
-from kin_mind.memory import MemoryContinuity, fingerprint_file
-from test_erasure import settle, texts_everywhere
+from kin_mind.memory import MemoryContinuity
 
 pytest_plugins = ('test_kin_mind', 'test_autonomous_plans')
 
@@ -96,7 +102,7 @@ def test_a_deferred_share_keeps_no_words_of_its_deleted_result(setup):
     with engine.db.connect(write=True) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS mind_explorations(id TEXT PRIMARY KEY,scope TEXT NOT NULL,state TEXT NOT NULL,"
                      "created_at TEXT NOT NULL,data TEXT NOT NULL)")
-    result = engine.receive(SourceInput(namespace="test", key="derived-exploration", scope=mind.scope,
+    result = engine.receive(SourceInput(namespace="kin-exploration", key=TARGET, scope=mind.scope,
                                         text=f"探索结果：{MARKER} 的来历", authority="model", occurred_at=clock[0].isoformat(),
                                         metadata={"host_event": "exploration-result", "exploration_id": TARGET}))["id"]
     with engine.db.connect(write=True) as conn:
@@ -322,7 +328,7 @@ class Review:
     def structured(self, name, schema, system, context, **kwargs):
         self.meanwhile()
         return schema.model_validate({"complete": True, "reason": f"{MARKER} 的钟做好了",
-                                      "artifact_hashes": [context["verified_artifacts"][0]["sha256"]]}), \
+                                      "artifact_ids": [context["verified_artifacts"][0]["artifact_id"]]}), \
             {"provider": "deepseek", "reasoning": "high"}
 
 
@@ -336,7 +342,7 @@ def artifact_kept(mind):
 def withheld_artifact(artifact, made):
     """What a creation's artifact keeps once its words were withheld: which file and which bytes,
     and what the host found of it -- not the excerpt it read from it (CL6-MM-05)."""
-    assert {key: artifact[key] for key in ("path", "name", "sha256", "bytes")} == {key: made[key] for key in ("path", "name", "sha256", "bytes")}
+    assert {key: artifact[key] for key in ("path", "name", "artifact_id", "bytes")} == {key: made[key] for key in ("path", "name", "artifact_id", "bytes")}
     assert artifact["inspection"]["format"] == ".json" and artifact["inspection"]["content_verified"] is True
     assert artifact["inspection"]["excerpt"] == ERASED
 
@@ -373,8 +379,9 @@ def test_a_created_result_goes_with_the_evidence_it_was_written_from(env, tmp_pa
 def claim_with_brief(env, tmp_path):
     """A creation step claimed the way the host claims it: through `plan-claim`, which hands the
     creator its brief."""
-    from kin_mind import host
     from test_autonomous_plans import create, decide
+
+    from kin_mind import host
 
     mind = env[0]
     decide(env, create(env))
@@ -416,8 +423,9 @@ def test_a_creation_keeps_no_words_of_a_message_its_brief_showed_that_was_delete
 
 def explore(env, tmp_path, meanwhile=lambda brief: None):
     """One exploration of a planned wish, whose report names the marker."""
-    from kin_mind.exploration import Explorations
     from test_autonomous_plans import create, decide
+
+    from kin_mind.exploration import Explorations
 
     mind, plans, _, _, initial = env
     decide(env, create(env, actor="explore"))
@@ -464,8 +472,12 @@ def test_an_exploration_report_goes_with_the_evidence_of_its_wish(env, tmp_path)
 
 def prospective_check(mind, source, clock):
     """The behavioural check a daily review needs before it asks the model anything."""
-    from eventmem.core.self_knowledge import AssessmentInput, ClaimInput, PredictionInput, SelfKnowledge
-
+    from eventmem.core.self_knowledge import (
+        AssessmentInput,
+        ClaimInput,
+        PredictionInput,
+        SelfKnowledge,
+    )
     from kin_mind.compat import stamp as compatibility
 
     knowledge = SelfKnowledge(mind.engine, mind.scope)
@@ -988,8 +1000,9 @@ def test_a_creation_keeps_no_words_once_its_plans_own_evidence_is_deleted_during
     other evidence. The creator's brief showed the plan's words, and the message is deleted while
     the review is out. The artifact and the run stay facts, nothing the summary or the review
     wrote is stored (CL6-MM-03)."""
-    from kin_mind import host
     from test_autonomous_plans import create, decide
+
+    from kin_mind import host
 
     mind = env[0]
     basis = mind.engine.receive(SourceInput(namespace="planning-test", key="plan-basis", text=f"她想要一个 {MARKER} 的钟",
@@ -1120,9 +1133,9 @@ def test_a_withheld_artifact_keeps_neither_its_excerpt_nor_the_text_a_render_sho
     page = tmp_path / "poster.html"
     page.write_text(f"<p>{MARKER}</p>")
     made = fingerprint_file(page)
-    image = {"path": str(tmp_path / "poster-390.png"), "sha256": "0" * 64, "bytes": 10}
+    image = {"path": str(tmp_path / "poster-390.png"), "artifact_id": "0" * 64, "bytes": 10}
     artifact = {**made, "inspection": {"format": ".html", "content_verified": True, "excerpt": f"<p>{MARKER}</p>", "excerpt_complete": True,
-                                       "rendering": {"state": "verified", "method": "host-static-browser-v1", "source_sha256": made["sha256"],
+                                       "rendering": {"state": "verified", "method": "host-static-browser-v1", "source_artifact_id": made["artifact_id"],
                                                      "checks": [{"viewport_width": 390, "text": MARKER, "image": image}]}}}
     stored = memory.ingest({"id": "poster:artifact:0", "kind": "artifact-created", "at": clock[0].isoformat(), "task_id": "poster",
                             "actor": "Kin", "artifact": artifact, "text": f"做好了 {MARKER} 的海报", "input_source_ids": [gone]})
@@ -1131,12 +1144,12 @@ def test_a_withheld_artifact_keeps_neither_its_excerpt_nor_the_text_a_render_sho
     [event] = artifact_kept(mind)
     assert event["inputs_withheld"] == "derived-from-deleted" and event["source_id"] == stored["source_id"]
     kept = event["artifact"]
-    assert (kept["sha256"], kept["bytes"], kept["path"]) == (made["sha256"], made["bytes"], made["path"])
+    assert (kept["artifact_id"], kept["bytes"], kept["path"]) == (made["artifact_id"], made["bytes"], made["path"])
     assert kept["inspection"]["excerpt"] == ERASED and kept["inspection"]["rendering"]["checks"][0]["text"] == ERASED
     assert kept["inspection"]["rendering"]["checks"][0]["image"] == image
     with mind.engine.db.connect() as conn:
         node = json.loads(conn.execute("SELECT data FROM mind_memory_nodes WHERE kind='artifact'").fetchone()[0])
-    assert node["sha256"] == made["sha256"] and node["inspection"]["excerpt"] == ERASED
+    assert node["artifact_id"] == made["artifact_id"] and node["inspection"]["excerpt"] == ERASED
 
 
 def test_what_the_fork_only_read_takes_no_words_from_the_wish_and_the_plan_its_appraisal_committed(setup):

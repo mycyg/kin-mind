@@ -9,15 +9,16 @@ import {ERASED,withoutWords} from './without-words.mjs';
 const schema={type:'object',properties:{summary:{type:'string'},artifacts:{type:'array',minItems:1,maxItems:24,items:{type:'string'}},verification:{type:'array',items:{type:'string'}},remaining:{type:'array',items:{type:'string'}}},required:['summary','artifacts','verification','remaining'],additionalProperties:false};
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 
-export function artifactManifest(directory,artifacts){
+export function artifactManifest(directory,artifacts,runId){
+  if(typeof runId!=='string'||!runId)throw Error('Artifact receipt needs its creator run id');
   const root=fs.realpathSync(directory),seen=new Set();let total=0;
-  return artifacts.map(relative=>{
+  return artifacts.map((relative,index)=>{
     if(typeof relative!=='string'||path.isAbsolute(relative))throw Error('Artifact paths must be workspace relative');
     const candidate=fs.realpathSync(path.resolve(root,relative));
     if(!candidate.startsWith(root+path.sep)||seen.has(candidate))throw Error('Artifact escaped workspace or was duplicated');
     seen.add(candidate);const stat=fs.statSync(candidate);total+=stat.size;
     if(!stat.isFile()||stat.size===0||total>128*1024*1024)throw Error('Artifact missing, empty or over budget');
-    return {path:candidate,relative:path.relative(root,candidate),bytes:stat.size,sha256:hash(fs.readFileSync(candidate))};
+    return {artifact_id:runId+':artifact:'+index,path:candidate,relative:path.relative(root,candidate),bytes:stat.size};
   });
 }
 
@@ -139,8 +140,8 @@ export class AutonomousCreator {
       if(exitCode!==0||!turnCompleted||!fs.existsSync(lastFile))return {state:'failed',receipt,reason:'native-run-incomplete'};
       let output;try{output=JSON.parse(fs.readFileSync(lastFile,'utf8'));}catch{return {state:'failed',receipt,reason:'invalid-final-result'};}
       if(!Array.isArray(output.artifacts)||!output.artifacts.length||output.artifacts.length>24||!Array.isArray(output.remaining)||typeof output.summary!=='string')return {state:'failed',receipt,reason:'invalid-result-shape'};
-      const artifacts=artifactManifest(directory,output.artifacts);
-      // DS reviews completion against the goal after this host verifies bytes.
+      const artifacts=artifactManifest(directory,output.artifacts,run.id);
+      // DS reviews completion against the goal using the run's artifact references.
       const produced={state:'produced',produced_at:new Date().toISOString(),receipt,artifacts,summary:output.summary,verification:output.verification,remaining:output.remaining};
       // The render worker, and the browser it starts, carry the step's mark as well.
       return this.verifier?await this.verifier.verify(produced,{signal,env:marked}):produced;

@@ -1,5 +1,4 @@
 """Prepared context is not a delivery. Only a host-verified native item counts."""
-import hashlib
 import json
 
 from eventmem.core.db import Conflict, Missing, digest, dumps, tombstoned
@@ -17,10 +16,6 @@ CREATE INDEX IF NOT EXISTS mind_context_delivery_pending ON mind_context_deliver
 # A prepared context not begun within this long never will be: the host prepares and begins in
 # one pass, and one it deferred is prepared again under its next event.
 ABANDONED_SECONDS = 86400
-
-
-def text_hash(text):
-    return hashlib.sha256(text.encode()).hexdigest()
 
 
 class ContextDelivery:
@@ -51,18 +46,17 @@ class ContextDelivery:
         if not session or not event_id or not text or not 0 <= overhead <= 500:
             raise ValueError('Context preparation needs identity and public text')
         # The text a native item carries is what a model is shown: never a source's metadata, and
-        # its references as their trace (model_view), before it is named and hashed, so the host's
-        # receipt of the injected text matches.
+        # its references as their trace (model_view), before it is carried by its stable delivery marker.
         from .model_view import for_model
         text = for_model(text)
-        identifier = 'context:' + digest([self.scope, session, epoch, event_id, text, kind])
+        identifier = 'context:' + digest([self.scope, session, epoch, event_id, kind])
         marker = 'kin-context:' + identifier
         body = marker + '\n' + text
         count = tokens(body) + overhead
         if count > budget:
             return {'state': 'incomplete', 'reason': 'context-envelope-budget', 'tokens': count}
         value = {'id': identifier, 'session': session, 'epoch': epoch, 'event_id': event_id,
-                 'state': 'prepared', 'kind': kind, 'marker': marker, 'text': body, 'text_hash': text_hash(body),
+                 'state': 'prepared', 'kind': kind, 'marker': marker, 'text': body,
                  'tokens': count, 'content_tokens': tokens(body), 'overhead': overhead, 'items': items,
                  'manifest_id': manifest_id, 'prepared_at': self.ctx.mind.clock()}
         with self.db.connect(write=True) as conn:
@@ -151,17 +145,17 @@ class ContextDelivery:
                                     (self.scope, session, epoch, str(after), limit)).fetchall()
         return [self.view(json.loads(row[0])) for row in rows]
 
-    def acknowledge(self, session, epoch, id, *, actual_session, marker, text_hash, verified=False, native_at=None):
+    def acknowledge(self, session, epoch, id, *, actual_session, marker, text_hash=None, verified=False, native_at=None, native_item_id=None):
         with self.db.connect(write=True) as conn:
             value = self._get(conn, session, epoch, id)
-            if not verified or actual_session != session or marker != value['marker'] or text_hash != value['text_hash']:
+            if not verified or actual_session != session or marker != value['marker']:
                 raise Conflict('A matching persisted native message is required')
             if value['state'] == 'accepted':
                 return self.view(value)
             # Sources can change after a real injection. Count the bytes that did
             # arrive, but only current evidence participates in future de-dup.
             policy = self._policy()
-            # An erased delivery still settles by its marker and hash, but nothing it named counts
+            # An erased delivery still settles by its stable marker and native receipt, but nothing it named counts
             # as read or seen (CR-MEM-02).
             current = [] if value.get('erased_at') else [i for i in value['items'] if self.ctx._current(i, policy)]
             window = self.ctx.window(session, conn)
@@ -176,7 +170,7 @@ class ContextDelivery:
                 self.ctx._save_window(conn, session, window)
             value.update(state='accepted', accepted_at=self.ctx.mind.clock(), native_at=native_at,
                          historical=historical, needs_review=len(current) != len(value['items']),
-                         evidence={'kind': 'native-message-hash', 'marker': marker, 'text_hash': text_hash})
+                         evidence={'kind': 'native-message-receipt', 'marker': marker, 'native_item_id': native_item_id})
             self._put(conn, value)
             # Access records and receipt are committed together. An index isn't
             # upgraded to original just because it was selected or summarized.
@@ -189,4 +183,4 @@ class ContextDelivery:
         with self.db.connect() as conn:
             rows = conn.execute('SELECT state,COUNT(*) AS n FROM mind_context_deliveries WHERE scope=? AND session=? GROUP BY state', (self.scope, session)).fetchall()
         return {'states': {r['state']: r['n'] for r in rows}, 'window': self.ctx.window(session)['used'],
-                'model_requests': 0, 'receipt_basis': 'native-message-hash'}
+                'model_requests': 0, 'receipt_basis': 'native-message-receipt'}

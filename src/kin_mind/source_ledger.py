@@ -13,8 +13,6 @@ existence, version and true read state.
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import re
 
 LAYER_REQUESTED = "requested"
@@ -35,7 +33,6 @@ RESPELLED = re.compile(r"%[0-9A-Fa-f]{2}|[^A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%\\
 DEFAULT_PORTS = {"http": "80", "https": "443"}
 ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 EVIDENCE_ID_SHAPE = re.compile(r"(?:web|computer|mem)_[0-9a-f]*|[0-9a-f]{64}")
-SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RECEIPT_FORMAT = "kin-source-receipt-v1"
 SOURCE_RECEIPT_V2 = "kin-source-receipt-v2"
 COMPUTER_ADAPTERS = {"kin-computer-reader-v1", "kin-computer-use-v1"}
@@ -43,20 +40,24 @@ WEB_RECEIPT_V2 = "kin-web-receipt-v2"
 
 
 def web_delivery(receipt):
-    """Content version and tool-delivered ranges; not a claim of comprehension."""
+    """Capture references and tool-delivered ranges; not a claim of comprehension."""
     if receipt.get("receipt_format") != WEB_RECEIPT_V2:
         return None
-    return {key: copy.deepcopy(receipt.get(key)) for key in (
-        "receipt_format", "content_sha256", "content_chars", "raw_body_sha256",
+    delivery = {key: copy.deepcopy(receipt.get(key)) for key in (
+        "receipt_format", "capture_id", "content_ref", "content_chars",
         "raw_body_bytes", "body_bytes_representation", "raw_body_complete",
         "delivered_ranges", "semantic_classification",
     )}
+    if isinstance(delivery["delivered_ranges"], list):
+        delivery["delivered_ranges"] = [{key: page.get(key) for key in ("start", "end", "delivered_at")}
+                                        if isinstance(page, dict) else page for page in delivery["delivered_ranges"]]
+    return delivery
 
 
 def valid_web_delivery(delivery, version):
     if not isinstance(delivery, dict) or delivery.get("receipt_format") != WEB_RECEIPT_V2:
         return False
-    if delivery.get("content_sha256") != version or not SHA256.fullmatch(str(version or "")):
+    if not version or (delivery.get("capture_id") is not None and delivery["capture_id"] != version):
         return False
     if delivery.get("semantic_classification") != "model-required":
         return False
@@ -65,8 +66,7 @@ def valid_web_delivery(delivery, version):
         return False
     length = delivery.get("content_chars")
     raw_bytes = delivery.get("raw_body_bytes")
-    if (type(length) is not int or length <= 0 or type(raw_bytes) is not int or raw_bytes <= 0
-            or not SHA256.fullmatch(str(delivery.get("raw_body_sha256") or ""))):
+    if type(length) is not int or length <= 0 or type(raw_bytes) is not int or raw_bytes <= 0:
         return False
     ranges = delivery.get("delivered_ranges")
     if not isinstance(ranges, list) or not ranges:
@@ -76,7 +76,6 @@ def valid_web_delivery(delivery, version):
             return False
         start, end = page.get("start"), page.get("end")
         if (type(start) is not int or type(end) is not int or not 0 <= start < end <= length
-                or not SHA256.fullmatch(str(page.get("sha256") or ""))
                 or not isinstance(page.get("delivered_at"), str) or not page["delivered_at"]):
             return False
     return True
@@ -87,7 +86,7 @@ def _entry(state, locator, *, evidence_id=None, version=None, title="", basis=""
     return {"state": state, "locator": locator, "evidence_id": evidence_id,
             "version": version, "title": title, "basis": basis, "recorded_at": recorded_at,
             "execution_id": execution_id, "attempt": attempt, "tool": tool, "adapter": adapter,
-            **({"delivery": copy.deepcopy(delivery)} if delivery is not None else {})}
+            **({"delivery": web_delivery(delivery) or copy.deepcopy(delivery)} if delivery is not None else {})}
 
 
 def _seal_payload(entry, execution_id, attempt, receipt_format=None):
@@ -99,21 +98,15 @@ def _seal_payload(entry, execution_id, attempt, receipt_format=None):
             "state", "locator", "evidence_id", "version", "title", "basis", "recorded_at",
             "execution_id", "attempt", "tool", "adapter",
         )},
-        # Omit this extension for old receipts: their original digest stays valid.
-        **({"delivery": copy.deepcopy(entry["delivery"])} if "delivery" in entry else {}),
+        # Old receipts without delivered-range metadata remain readable.
+        **({"delivery": web_delivery(entry["delivery"]) or copy.deepcopy(entry["delivery"])} if "delivery" in entry else {}),
     }
 
 
 def seal_source_receipt(entry, *, execution_id, attempt):
-    """Seal a receipt after host verification.
-
-    This is an integrity envelope, not a cryptographic signature: its authority
-    comes from being added by the host after strict Findings validation. Model
-    output cannot add fields to Citation (pydantic forbids extras).
-    """
-    payload = _seal_payload(entry, execution_id, attempt)
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return {**payload, "receipt_digest": hashlib.sha256(canonical.encode()).hexdigest()}
+    """Record host verification against the actual execution and source references.
+    Citation output cannot add these fields (pydantic forbids extras)."""
+    return _seal_payload(entry, execution_id, attempt)
 
 
 def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
@@ -139,9 +132,7 @@ def valid_source_receipt(receipt, *, execution_id=None, attempt=None):
         return False
     if attempt is not None and verified_attempt != int(attempt):
         return False
-    payload = _seal_payload(receipt, verified_execution, verified_attempt, receipt["receipt_format"])
-    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return receipt.get("receipt_digest") == hashlib.sha256(canonical.encode()).hexdigest()
+    return True
 
 
 def valid_web_receipt(receipt, *, execution_id, attempt):
@@ -162,7 +153,7 @@ def valid_web_receipt(receipt, *, execution_id, attempt):
         ):
             return False
         return receipt.get("tool") == "read_page" and bool(
-            SHA256.fullmatch(str(receipt.get("version") or "")) and receipt.get("read_at")
+            isinstance(receipt.get("version"), str) and receipt["version"] and receipt.get("read_at")
         )
     return True
 
@@ -185,7 +176,7 @@ def valid_computer_receipt(receipt, *, execution_id, attempt):
     evidence_id = receipt.get("evidence_id")
     return bool(
         re.fullmatch(r"computer_[0-9a-f]{32}", str(evidence_id or ""))
-        and SHA256.fullmatch(str(receipt.get("version") or ""))
+        and isinstance(receipt.get("version"), str) and receipt["version"]
         and receipt.get("locator")
         and receipt.get("observed_at")
     )

@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import Field, FiniteFloat, StrictBool, StrictInt, model_validator
 
-from eventmem.core.db import Conflict, Missing, digest
+from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import Model
 
 from .affect_layers import build_view
@@ -40,10 +40,16 @@ class Understanding(Model):
 
 class RhythmProposal(Model):
     phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"]
+    base_phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] | None = None
+    attention_for: Literal["owner_message", "task", "urgent"] | None = None
+    return_to: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] | None = None
+    current_activity: str | None = Field(default=None, max_length=600)
+    note: str | None = Field(default=None, max_length=1200)
     alertness: StrictInt = Field(ge=0, le=100)
     target: StrictInt = Field(ge=0, le=100)
     half_life_minutes: Literal[20, 60, 180]
-    reason: str = Field(min_length=1)
+    # Legacy callers may still say why. The host never requires or invents a cause for a phase.
+    reason: str = Field(default="", max_length=1200)
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
@@ -71,7 +77,7 @@ class ConcernBase(Model):
     basis: Literal["explicit", "inferred", "internal_thought"] | None = None
     confidence: FiniteFloat | None = Field(default=None, ge=0, le=1)
     evidence_ids: list[str] = Field(default_factory=list, max_length=50)
-    reason: str = Field(min_length=1)
+    reason: str = Field(default="")
     owner_request: OwnerRequest | None = None
 
     @model_validator(mode="after")
@@ -175,7 +181,7 @@ class ConcernChange(ConcernBase):
     command_id: str = Field(min_length=1, max_length=200)
     agent_version: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
-    evidence_ids: list[str] = Field(min_length=1, max_length=50)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ContinuityConfig(ContinuityCommand):
@@ -187,8 +193,15 @@ class ContinuityConfig(ContinuityCommand):
 
 
 def evidence_key(ref):
-    # Derived summaries keep the original source ID; record IDs never add weight.
-    return digest([ref["source_id"], ref["hash"]])
+    # These are ordinary database references, not proof of what the cited text should contain.
+    return dumps([ref["source_id"], ref["record_id"], ref["revision"]])
+
+
+def subjective_concern(change, current=None):
+    """Kin's own attitude, apart from a shared plan or actual owner participation."""
+    return ((getattr(change, "basis", None) or (current or {}).get("basis")) == "internal_thought"
+            and (getattr(change, "kind", None) or (current or {}).get("kind")) != "shared_plan"
+            and not getattr(change, "owner_request", None) and not (current or {}).get("owner_request"))
 
 
 def low_confidence(value):
@@ -324,6 +337,8 @@ class Continuity:
             lambda conn, state, event_id: self._apply_concern(
                 conn, state, request, event_id, request.agent_version
             ),
+            rebase=lambda conn, state: subjective_concern(
+                request, state.get("concerns", {}).get(request.concern_id)),
         )
 
     def _proposal_refs(self, conn, ids, fallback, allowed=None):
@@ -335,6 +350,148 @@ class Continuity:
         }:
             raise Conflict("Proposal cites evidence outside this appraisal")
         return refs
+
+    def _subjective_refs(self, conn, ids, allowed=None):
+        """A subjective state needs no cause. Explicit citations still have to be real and shown.
+
+        In particular, the current appraisal's triggering source is not automatically made into
+        evidence of *why* Kin feels or chooses something.
+        """
+        return self._proposal_refs(conn, ids, [], allowed) if ids else []
+
+    def _concern_fresh(self, conn, entry):
+        return (self._subjective_available(conn, entry["evidence"])
+                if subjective_concern(None, entry) else self._fresh(conn, entry["evidence"]))
+
+    def _attention_event(self, conn, input_id, source_id=None):
+        """The existing real input envelope, never a new event or an inferred experience."""
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_runtime_events'").fetchone():
+            return None
+        row = conn.execute(
+            "SELECT e.id,e.data FROM mind_runtime_events e JOIN mind_reply_inputs i "
+            "ON i.scope=e.scope AND i.id=json_extract(e.data,'$.id') "
+            "AND i.source_id=json_extract(e.data,'$.source_id') "
+            "WHERE e.scope=? AND i.id=? AND e.kind='owner-message' "
+            "AND COALESCE(json_extract(e.data,'$.historical'),0)=0",
+            (self.scope.key(), input_id)).fetchone()
+        if not row:
+            return None
+        data = json.loads(row["data"])
+        if source_id is not None and data.get("source_id") != source_id:
+            return None
+        return row["id"], data
+
+    def _mark_attention(self, conn, input_id, source_id, attention_for, event_id):
+        """Host classification after routing, outside the original observation/digest.
+
+        Routing can occur after ingestion, and must work while the independent rhythm is off or
+        forming. Only this computed metadata changes; the original source, text, occurrence time,
+        immutable digest and receipt are preserved.
+        """
+        found = self._attention_event(conn, input_id, source_id)
+        if not found:
+            # The initial ingest invokes _attend before its runtime envelope has been inserted.
+            return False
+        identifier, data = found
+        current = data.get("attention_marker") or {}
+        if current.get("state") == "active":
+            priority = {"owner_message": 1, "task": 2, "urgent": 3}
+            old = current.get("attention_for")
+            if priority.get(old, 0) >= priority[attention_for]:
+                return False
+        data["attention_marker"] = {"attention_for": attention_for, "state": "active",
+                                    "at": self.clock(), "event_id": event_id}
+        conn.execute("UPDATE mind_runtime_events SET data=? WHERE scope=? AND id=?",
+                     (dumps(data), self.scope.key(), identifier))
+        return True
+
+    def _finish_attention_marker(self, conn, input_id, event_id):
+        found = self._attention_event(conn, input_id)
+        if not found:
+            return False
+        identifier, data = found
+        marker = data.get("attention_marker")
+        if isinstance(marker, dict):
+            if marker.get("state") != "active":
+                return False
+        elif data.get("attention_for") in {"task", "urgent"}:
+            marker = {"attention_for": data["attention_for"]}
+        else:
+            return False
+        data["attention_marker"] = {**marker, "state": "finished", "finished_at": self.clock(),
+                                    "finished_event_id": event_id}
+        conn.execute("UPDATE mind_runtime_events SET data=? WHERE scope=? AND id=?",
+                     (dumps(data), self.scope.key(), identifier))
+        return True
+
+    def _attend(self, conn, state, input_id, attention_for, event_id):
+        """Host seam inside an existing input transaction. No emotion or base phase is reset.
+
+        The input must already have been received for this scope. Calling this is an attention
+        marker, not permission to run a task, send a message, or settle an actual commitment.
+        Returns whether the computed marker or rhythm changed; the caller records its transaction.
+        """
+        if attention_for not in {"owner_message", "task", "urgent"}:
+            raise ValueError("Attention must name owner_message, task or urgent")
+        row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?",
+                           (self.scope.key(), input_id)).fetchone()
+        if not row:
+            raise Missing("Attention must refer to a received owner input")
+        refs = self._evidence(conn, [row[0]])
+        if (not self._fresh(conn, refs) or not refs or any(
+                ref["authority"] != "explicit" or ref.get("metadata", {}).get("role") != "user"
+                for ref in refs)):
+            raise Conflict("Attention requires a current received owner input")
+        marker_changed = self._mark_attention(conn, input_id, row[0], attention_for, event_id)
+        entry = state.get("rhythm")
+        if not entry or not self._continuity_flags(conn, state)["rhythm"]:
+            return marker_changed
+        current = entry.get("attention_for")
+        priority = {None: 0, "owner_message": 1, "task": 2, "urgent": 3}
+        if priority[current] > priority[attention_for]:
+            return marker_changed
+        if current == attention_for and entry.get("attention_input_id") == input_id:
+            return marker_changed
+        phase = entry.get("base_phase") or entry["phase"]
+        entry.update(base_phase=phase, phase=phase, attention_for=attention_for,
+                     return_to=entry.get("return_to") or phase, attention_input_id=input_id,
+                     attention_at=self.clock(), attention_event_id=event_id)
+        return True
+
+    def attend(self, input_id, attention_for="owner_message"):
+        """Persist temporary input attention, including explicit task/urgent host input markers."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            event_id = "mind_" + digest([self.scope.key(), "attention", input_id, attention_for,
+                                        state["revision"] + 1])[:32]
+            changed = self._attend(conn, state, input_id, attention_for, event_id)
+            if changed:
+                state.update(revision=state["revision"] + 1, updated_at=self.clock())
+                self._save(conn, state)
+                self._history(conn, event_id, state, "attention", {"input_id": input_id, "attention_for": attention_for})
+            return {"changed": changed, "rhythm": deepcopy(state.get("rhythm"))}
+
+    def finish_attention(self, input_id):
+        """Release this input's computed marker and only its current rhythm attention.
+
+        The original base phase and activity remain available for the next independent review.
+        Task completion and transport receipts are handled by their existing contracts.
+        """
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            entry = state.get("rhythm") or {}
+            event_id = "mind_" + digest([self.scope.key(), "attention-finished", input_id, state["revision"] + 1])[:32]
+            marker_changed = self._finish_attention_marker(conn, input_id, event_id)
+            rhythm_changed = entry.get("attention_input_id") == input_id and bool(entry.get("attention_for"))
+            if rhythm_changed:
+                entry.update(attention_for=None, return_to=None, attention_input_id=None,
+                             attention_cleared_at=self.clock())
+            changed = marker_changed or rhythm_changed
+            if changed:
+                state.update(revision=state["revision"] + 1, updated_at=self.clock())
+                self._save(conn, state)
+                self._history(conn, event_id, state, "attention-finished", {"input_id": input_id})
+            return {"changed": changed, "rhythm": deepcopy(state.get("rhythm"))}
 
     def _continuity_sources(self, conn, state, refs):
         allowed = {evidence_key(r): r for r in refs}
@@ -363,21 +520,18 @@ class Continuity:
     ):
         if not self._continuity_flags(conn, state)["concerns"]:
             raise Conflict("Concern feature is disabled")
+        concerns = state.setdefault("concerns", {})
+        cid = (("concern_" + digest([self.scope.key(), change.key])[:32])
+               if change.action == "create" else change.concern_id)
+        current = concerns.get(cid)
+        subjective = subjective_concern(change, current)
         refs = list(
             {
                 evidence_key(r): r
-                for r in self._proposal_refs(
-                    conn, change.evidence_ids, fallback or [], allowed
-                )
+                for r in (self._subjective_refs(conn, change.evidence_ids, allowed) if subjective
+                          else self._proposal_refs(conn, change.evidence_ids, fallback or [], allowed))
             }.values()
         )
-        concerns = state.setdefault("concerns", {})
-        cid = (
-            ("concern_" + digest([self.scope.key(), change.key])[:32])
-            if change.action == "create"
-            else change.concern_id
-        )
-        current = concerns.get(cid)
         if change.action != "create" and not current:
             raise Missing("Concern belongs to another scope or is missing")
         new_refs = [
@@ -398,7 +552,7 @@ class Continuity:
         # only moves its window needs no new source (`timed_concerns`).
         retimed = change.action == "update" and bool(current) and any(current.get(k) != v for k, v in timing.items())
         settles = {"ease": "easing", "archive": "archived"}.get(change.action)
-        if current and not new_refs and not retimed and (not settles or current["status"] == settles):
+        if current and not subjective and not new_refs and not retimed and (not settles or current["status"] == settles):
             # Easing or archiving is Kin's own judgment about a concern and needs no new source
             # (K3-18); it is a replay only when the concern already stands that way.
             return {
@@ -412,14 +566,14 @@ class Continuity:
             and change.action != "reopen"
         ):
             raise Conflict(
-                "A closed concern requires an explicit reopen with new evidence"
+                "A closed concern requires an explicit reopen"
             )
         if change.action == "reopen" and current["status"] not in {
             "resolved",
             "archived",
         }:
             raise Conflict("Only a closed concern can reopen")
-        if change.action == "resolve" and not new_refs:
+        if change.action == "resolve" and not new_refs and not subjective:
             raise Conflict("Resolution requires a new outcome or correction source")
         if change.owner_request:
             request = change.owner_request
@@ -516,7 +670,7 @@ class Continuity:
             entry = concerns.get(cid)
             if not entry:
                 raise Missing("Linked concern is missing from this scope")
-            if not self._fresh(conn, entry["evidence"]) or low_confidence(entry):
+            if not self._concern_fresh(conn, entry) or low_confidence(entry):
                 raise Conflict("Linked concern requires review")
             links[cid] = entry["revision"]
         return links
@@ -533,7 +687,7 @@ class Continuity:
                 not concern
                 or concern["revision"] != revision
                 or low_confidence(concern)
-                or not self._fresh(conn, concern["evidence"])
+                or not self._concern_fresh(conn, concern)
             ):
                 return False
         return True
@@ -566,7 +720,9 @@ class Continuity:
         }
         if flags["interpretation"] and request.understanding:
             proposal = request.understanding
-            evidence = self._proposal_refs(conn, proposal.evidence_ids, refs, allowed)
+            evidence = (self._subjective_refs(conn, proposal.evidence_ids, allowed)
+                        if proposal.basis == "internal_thought"
+                        else self._proposal_refs(conn, proposal.evidence_ids, refs, allowed))
             if proposal.basis == "explicit" and not any(
                 r["authority"] == "explicit" for r in evidence
             ):
@@ -583,9 +739,19 @@ class Continuity:
             state["last_assessment"] = summary
         if flags["rhythm"] and request.rhythm:
             proposal = request.rhythm
-            evidence = self._proposal_refs(conn, proposal.evidence_ids, refs, allowed)
+            evidence = self._subjective_refs(conn, proposal.evidence_ids, allowed)
+            old = state.get("rhythm") or {}
+            phase = proposal.base_phase or proposal.phase
             state["rhythm"] = {
                 **proposal.model_dump(exclude={"evidence_ids"}),
+                "phase": phase,
+                "base_phase": phase,
+                "return_to": (proposal.return_to or phase) if proposal.attention_for else None,
+                "current_activity": (proposal.current_activity if proposal.current_activity is not None
+                                     else old.get("current_activity")),
+                "previous": {key: old.get(key) for key in
+                             ("base_phase", "phase", "attention_for", "return_to", "current_activity", "at", "event_id", "note")}
+                            if old else None,
                 "evidence": evidence,
                 "at": self.clock(),
                 "event_id": event_id,
@@ -605,9 +771,7 @@ class Continuity:
         if flags["concerns"]:
             for entry in state.get("concerns", {}).values():
                 view = concern_projection(entry, at)
-                view["needs_review"] = low_confidence(entry) or not self._fresh(
-                    conn, entry["evidence"]
-                )
+                view["needs_review"] = low_confidence(entry) or not self._concern_fresh(conn, entry)
                 view["evidence_ids"] = [r["record_id"] for r in entry["evidence"]]
                 view.pop("evidence", None)
                 view.pop("resolution_evidence", None)
@@ -617,12 +781,11 @@ class Continuity:
             assessment = deepcopy(assessment)
             refs = assessment.pop("evidence")
             assessment["evidence_ids"] = [r["record_id"] for r in refs]
-            assessment["needs_review"] = not self._fresh(conn, refs)
+            assessment["needs_review"] = not self._subjective_available(conn, refs)
             if assessment.get("understanding"):
                 inner = assessment["understanding"]
-                inner["needs_review"] = low_confidence(inner) or not self._fresh(
-                    conn, inner["evidence"]
-                )
+                available = (self._subjective_available if inner.get("basis") == "internal_thought" else self._fresh)
+                inner["needs_review"] = low_confidence(inner) or not available(conn, inner["evidence"])
                 inner["evidence_ids"] = [r["record_id"] for r in inner.pop("evidence")]
         result["appraisal_summary"] = assessment
         topic = query or ((assessment or {}).get("understanding") or {}).get(
@@ -651,10 +814,10 @@ class Continuity:
                 entry,
                 at,
                 interactions,
-                fresh=not entry or self._fresh(conn, entry["evidence"]),
+                fresh=not entry or self._subjective_available(conn, entry["evidence"]),
             )
         else:
-            result["rhythm"] = {"status": "disabled", "mode": "interaction-led"}
+            result["rhythm"] = {"status": "disabled", "mode": "independent"}
         # 心境、心绪、余韵、心跳呼吸: derived here from the scores and the rhythm, shown beside the
         # expression and never fed into it -- compile_expression below reads the scores alone.
         result["affect_layers"] = build_view(state, result["dimensions"], result["rhythm"], at,
@@ -670,9 +833,6 @@ class Continuity:
             result["expression"]["concern_ids"] = [
                 c["id"] for c in result["selected_concerns"]
             ]
-            result["expression"]["fingerprint"] = digest(
-                [result["expression"], result["selected_concerns"]]
-            )
         else:
             result["expression"] = None
         for desire in result["desires"]:

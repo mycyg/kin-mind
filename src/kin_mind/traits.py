@@ -16,6 +16,9 @@ It never judges the trait itself: that sentence is Kin's own.
 - **Fading** is a semantic decision from the same appraisal that interprets the evidence. The
   host exposes support recency on the existing decay curve, but elapsed time never changes a
   trait's status by itself.
+- A **self preference** states Kin's present interests, aesthetics, humour or expression habits.
+  It may drift, fade or return without a cause or a new episode. Its history records when it changed;
+  it is not a verified external fact, an owner instruction, or automatic personality evolution.
 """
 
 from __future__ import annotations
@@ -25,7 +28,12 @@ import math
 from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
-from eventmem.core.persona import load_persona, mutable_trait, trait_categories, validate_trait_changes
+from eventmem.core.persona import (
+    load_persona,
+    mutable_trait,
+    trait_categories,
+    validate_trait_changes,
+)
 from eventmem.core.read_policy import ReadPolicy
 
 from . import appraisal, evidence_refs
@@ -80,6 +88,9 @@ CATEGORY_ALIASES = {"兴趣": "interests", "审美": "aesthetics", "幽默": "hu
 SHOWN_TRAITS = 12
 SHOWN_OBSERVATIONS = 4
 SHOWN_CORRECTIONS = 6
+# Kin may state her own tastes without an observed episode. These remain subjective preferences,
+# inside the persona's allowed categories; they are never user instructions or verified behaviour.
+SELF_PREFERENCE_CATEGORIES = {"interests", "aesthetics", "humor", "expression_habits"}
 
 
 def installed(conn):
@@ -251,9 +262,8 @@ class Traits:
             if origin:
                 return (*origin, [])
         window = self._window(conn, first["occurred_at"], cache)
-        # Two ingestions of one utterance are one origin, whatever namespaces carried them.
-        root = (root_key(text=self.engine._get(conn, first["record_id"])["content"], window=window)
-                if found == "owner_statement" and window else root_key(source_id=first["source_id"]))
+        # A real source owns the observation; its wording is never a content identity proof.
+        root = root_key(source_id=first["source_id"])
         return (episode_key(window=window) if window else episode_key(root=root)), root, []
 
     def _diary_origin(self, conn, ref, cache):
@@ -341,7 +351,8 @@ class Traits:
         named = self._lookup(conn, decision.observation_refs, trait, cache)
         identity = None
         if trait is None:
-            trait, identity = self._target(conn, named)
+            trait, identity = (self._preference_target(conn, decision) if decision.basis == "self_preference"
+                               and not named else self._target(conn, named))
         if trait and trait.get("command_id") == command:
             return trait
         if trait and trait["status"] != "revoked" and trait["revision"] != (decision.expected_revision or 0):
@@ -349,7 +360,12 @@ class Traits:
             # decision taken against a revision that has moved is not a decision about this trait.
             raise Conflict("Trait changed during evaluation", kind="runtime", code="trait-revision-changed",
                            target=trait["id"], expected=decision.expected_revision, actual=trait["revision"])
-        owner = self._owner_words(conn, decision, refs, policy)
+        if decision.basis == "self_preference" and trait:
+            self._self_preference(trait, decision)
+        if decision.basis == "self_preference" and decision.action == "revoke":
+            raise Conflict("A self preference is not an owner instruction or correction",
+                           code="trait-preference-authority")
+        owner = [] if decision.basis == "self_preference" else self._owner_words(conn, decision, refs, policy)
         if trait and trait["status"] == "revoked":
             # What an owner correction ended is over until the owner says something newer than it.
             newer = [r for r in owner if timestamp(r["occurred_at"]) > timestamp(trait["tombstone"]["at"])]
@@ -363,10 +379,12 @@ class Traits:
                 raise Missing("Trait is missing or outside this scope", code="trait-unknown")
             trait = {**identity, "status": "candidate", "revision": 0, "created_at": at, "facts": None}
         self._allowed_category(trait["category"], decision.text)
+        if decision.basis == "self_preference":
+            self._self_preference(trait, decision)
         support = [o for o in self.observations(conn, trait["id"]) if o["polarity"] == "support"]
         if decision.action == "establish":
             self._established(conn, trait, decision, support, cache)
-        if decision.action == "restore" and not support:
+        if decision.action == "restore" and not support and decision.basis != "self_preference":
             raise Conflict("A faded trait needs valid support before it stands again",
                            code="trait-needs-support", target=trait["id"])
         if decision.basis in {"owner_instruction", "owner_correction"} and not owner:
@@ -382,6 +400,7 @@ class Traits:
                      receipt=receipt, event_id=event_id, agent_version=self.mind._load(conn)["agent_version"],
                      observation_refs=[o["id"] for o in named], episodes=[e.model_dump() for e in decision.episodes],
                      owner_sources=[r["source_id"] for r in owner], action=decision.action)
+        trait["subjective"] = decision.basis == "self_preference"
         trait.pop("invalidation", None)
         # The tombstone belongs to the revision it ended; the history keeps it, this row does not.
         trait.pop("tombstone", None)
@@ -428,11 +447,37 @@ class Traits:
         identity = {"id": first["trait_id"], "key": first["key"], "category": first["category"], "slug": first["slug"]}
         return self._find(conn, first["trait_id"]), identity
 
+    def _preference_target(self, conn, decision):
+        """A stable identity for a self-stated taste; no invented observation is inserted."""
+        if not decision.category or not decision.slug or not decision.slug.strip():
+            raise Conflict("A new self preference needs category and a stable slug",
+                           code="trait-preference-identity")
+        category = self._allowed_category(decision.category, decision.text)
+        slug = decision.slug.strip()
+        identifier = "trait_" + digest([self.scope, category, slug])[:32]
+        identity = {"id": identifier, "key": decision.key or decision.text[:80],
+                    "category": category, "slug": slug}
+        return self._find(conn, identifier), identity
+
+    def _self_preference(self, trait, decision):
+        """Subjective drift cannot overwrite an owner instruction or expand persona permissions."""
+        if canonical(trait["category"]) not in SELF_PREFERENCE_CATEGORIES:
+            raise Conflict("Self preferences apply only to tastes and expression",
+                           code="trait-preference-category", target=trait["id"])
+        if decision.quote or decision.action == "revoke":
+            raise Conflict("A self preference is not an owner instruction or correction",
+                           code="trait-preference-authority", target=trait["id"])
+        if trait.get("basis") in {"owner_instruction", "owner_correction"}:
+            raise Conflict("A self preference cannot replace an owner's recorded instruction",
+                           code="trait-preference-authority", target=trait["id"])
+
     def _established(self, conn, trait, decision, support, cache):
-        """Repeated copies are one episode; distinct reflections can support growth. Only the
-        owner's own words, checked against the record, stand on one time; every other basis,
-        counter_evidence included, needs two separate episodes (K1-14)."""
-        if decision.basis in {"owner_instruction", "owner_correction"}:
+        """Inference about a lasting pattern needs separate episodes; subjective tastes do not.
+
+        Repeated copies are one episode. Owner instructions retain their literal-source check;
+        self preferences remain subjective even when Kin chooses to keep them as established.
+        """
+        if decision.basis in {"owner_instruction", "owner_correction", "self_preference"}:
             return
         episodes = [o["episode_key"] for o in
                     self._lookup(conn, [entry.ref for entry in decision.episodes], trait, cache)]
@@ -444,6 +489,8 @@ class Traits:
     def _owner_words(self, conn, decision, refs, policy):
         """The cited evidence that really is the owner speaking, with the quote checked literally
         against the record it came from. The host reads the words, never their meaning."""
+        if decision.basis in {"owner_instruction", "owner_correction"} and not (decision.quote or "").strip():
+            return []
         found = []
         for ref in refs:
             record = self.engine._get(conn, ref["record_id"])
@@ -462,7 +509,7 @@ class Traits:
             raise Missing("Trait is missing or outside this scope", code="trait-unknown")
         if trait["status"] == "revoked":
             return trait
-        if not owner:
+        if not owner or decision.basis not in {"owner_instruction", "owner_correction"}:
             raise Conflict("An owner instruction or correction must quote the owner's own words",
                            code="trait-quote-unverified", target=trait["id"])
         return self._tombstone(conn, trait, command, at, reason=decision.reason, basis=decision.basis,
@@ -522,6 +569,7 @@ class Traits:
                 "text": trait.get("text", ""), "revision": trait["revision"], "basis": trait.get("basis"),
                 "status": trait["status"],
                 "stored_status": trait["status"], "reason": trait.get("reason", ""),
+                "subjective": trait.get("subjective", False),
                 "updated_at": trait["updated_at"], "established_at": trait.get("established_at"),
                 "needs_review": trait["status"] == "needs_review", "facts": facts,
                 "observations": [{k: o[k] for k in ("id", "class", "polarity", "episode_key", "day")}

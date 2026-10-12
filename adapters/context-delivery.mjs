@@ -20,14 +20,15 @@ export class NativeContextDelivery {
   reader(runtime){return this.find?null:(this.window?.(runtime)??nativeWindowFor(runtime.rolloutPath));}
   async lookup(runtime,context) {
     const window=this.reader(runtime);
-    if(!window)return (this.find??checkpointMarker)(runtime.rolloutPath,context.marker,{textHash:context.text_hash,role:'assistant'});
+    if(!window)return (this.find??checkpointMarker)(runtime.rolloutPath,context.marker,{role:'assistant'});
     await window.poll();
-    const hit=window.receipts.find({marker:context.marker,textHash:context.text_hash,role:'assistant'});
-    return hit?{found:true,at:hit.at,offset:hit.o}:{found:false,state:'unconfirmed'};
+    const hit=window.receipts.find({marker:context.marker,role:'assistant'});
+    return hit?{found:true,at:hit.at,offset:hit.o,native_item_id:hit.native_item_id??null}:{found:false,state:'unconfirmed'};
   }
   async acknowledge(context,runtime,proof) {
     return this.call('context-delivery-ack',{session:context.session,epoch:context.epoch,id:context.id,
-      actual_session:runtime.threadId,marker:context.marker,text_hash:context.text_hash,verified:true,native_at:proof.at});
+      actual_session:runtime.threadId,marker:context.marker,verified:true,native_at:proof.at,
+      ...(proof.native_item_id?{native_item_id:proof.native_item_id}:{})});
   }
   async reconcile(context,runtime) {
     const proof=await this.lookup(runtime,context);
@@ -55,8 +56,8 @@ export class NativeContextDelivery {
       const result=await reconcileLegacyInjections(window,contexts.map(c=>c.marker),{maxBytes:this.legacyScanBytes,complete});
       if(!complete){window.state.receipts.legacy.after=after;window.save();}
       for(const context of contexts) {
-        const hit=window.receipts.find({marker:context.marker,textHash:context.text_hash,role:'assistant'});
-        if(hit)try{await this.acknowledge(context,runtime,{at:hit.at});}catch{/* The next delivery reconciles it again. */}
+        const hit=window.receipts.find({marker:context.marker,role:'assistant'});
+        if(hit)try{await this.acknowledge(context,runtime,{at:hit.at,native_item_id:hit.native_item_id});}catch{/* The next delivery reconciles it again. */}
       }
       return result;
     })().finally(()=>{this.migrating=null;});

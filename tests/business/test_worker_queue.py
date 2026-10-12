@@ -305,7 +305,7 @@ def test_a_result_whose_lease_lapsed_unclaimed_is_committed_not_paid_for_again(e
     assert len(metrics(engine, "model_cost")) == 1
 
 
-def test_a_result_taken_over_is_kept_for_the_run_that_took_the_job(engine, monkeypatch):
+def test_a_result_taken_over_leaves_its_cost_without_a_content_hash_cache(engine, monkeypatch):
     def taken(engine):
         # Another run claimed the job while this one waited for its answer.
         with engine.db.connect(write=True) as conn:
@@ -320,10 +320,10 @@ def test_a_result_taken_over_is_kept_for_the_run_that_took_the_job(engine, monke
     with engine.db.connect() as conn:
         kept = conn.execute("SELECT id,result FROM commands WHERE id LIKE 'job-answer:%'").fetchall()
         assert not conn.execute("SELECT 1 FROM records WHERE json_extract(data,'$.generated')=1").fetchone()
-    assert model.calls == 1 and len(kept) == 1 and sid in kept[0]["result"]
-    assert metrics(engine, "job_result_discarded")[0]["answers_kept"] == 1
+    assert model.calls == 1 and len(kept) == 0
+    assert metrics(engine, "job_result_discarded")[0]["answers_kept"] == 0
     # The run that took it over lets its lease lapse in turn; this worker claims the job again and
-    # is answered by what was already paid for, since it asks exactly the same.
+    # asks the model for the current run instead of reusing a content-hash answer.
     model.during = None
     with engine.db.connect(write=True) as conn:
         conn.execute("UPDATE jobs SET lease_until=? WHERE kind='extract'", (time.time() - 5,))
@@ -333,11 +333,11 @@ def test_a_result_taken_over_is_kept_for_the_run_that_took_the_job(engine, monke
         extracted = conn.execute("SELECT COUNT(*) FROM records WHERE json_extract(data,'$.generated')=1").fetchone()[0]
         left = conn.execute("SELECT COUNT(*) FROM commands WHERE id LIKE 'job-answer:%'").fetchone()[0]
         state = conn.execute("SELECT model FROM sources WHERE id=?", (sid,)).fetchone()[0]
-    assert model.calls == 1 and extracted == 1 and state == "complete" and left == 0
-    assert len(metrics(engine, "model_answer_reused")) == 1 and len(metrics(engine, "model_cost")) == 1
+    assert model.calls == 2 and extracted == 1 and state == "complete" and left == 0
+    assert not metrics(engine, "model_answer_reused") and len(metrics(engine, "model_cost")) == 2
 
 
-def test_a_kept_answer_is_used_only_for_the_very_same_request(engine, monkeypatch):
+def test_a_new_job_run_uses_the_model_currently_configured(engine, monkeypatch):
     def taken(engine):
         with engine.db.connect(write=True) as conn:
             conn.execute("UPDATE jobs SET owner='another-run',fence=fence+1,lease_until=? WHERE id=?",
@@ -348,8 +348,7 @@ def test_a_kept_answer_is_used_only_for_the_very_same_request(engine, monkeypatc
     worker = Worker(engine)
     while worker.run_once():
         pass
-    # What the job asks has changed since (here, the model the role names): the kept answer
-    # does not stand for the new request, which is asked and paid for.
+    # A model configuration change is used by the new run, which is asked and paid for.
     model.during = None
     engine.settings("models", {"extraction": {**engine.settings("models")["extraction"], "model": "synthetic-model-2"}})
     with engine.db.connect(write=True) as conn:

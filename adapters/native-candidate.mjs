@@ -93,8 +93,8 @@ export class NativeCandidate {
     const launch=this.configForModel(value),profile=launch?.profile,binding=launch?.providerBinding;
     if(!profile?.provider||!['gateway','native'].includes(profile.providerKind)||!profile.model||!profile.reasoningEffort||!['default','fast'].includes(profile.serviceTierPreference)||
       !binding||binding.sourceProvider!==profile.provider||binding.sourceProviderKind!==profile.providerKind||binding.launchProvider!==launch.modelProvider||
-      (profile.providerKind==='native'&&(launch.modelProvider!==profile.provider||binding.endpointSha256!==null))||
-      (profile.providerKind==='gateway'&&(launch.modelProvider===profile.provider||typeof binding.endpointSha256!=='string'||!binding.endpointSha256))||
+      (profile.providerKind==='native'&&(launch.modelProvider!==profile.provider||binding.endpoint!==null))||
+      (profile.providerKind==='gateway'&&(launch.modelProvider===profile.provider||typeof binding.endpoint!=='string'||!binding.endpoint))||
       !instructionBindingVerified(launch.instructionBinding)||
       (launch.instructionBinding!==null&&launch.instructionBinding!==undefined&&
         (typeof launch.config?.model_instructions_file!=='string'||typeof launch.developerInstructions!=='string')))
