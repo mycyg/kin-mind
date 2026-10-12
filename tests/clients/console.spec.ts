@@ -343,18 +343,25 @@ test('a letter to Kin is sealed until its day: only its date shows, and it can b
   expect(errors).toEqual([]);
 });
 
-test('Kin\'s own diary entries are read in their group, with no reply box while replies are off',async({page})=>{
+test('Kin\'s diary and old dreams remain readable with replies and dream generation off',async({page})=>{
   // Kin's entries are kin-reflection sources whose records are episodes: the narrative list never held one.
   const headers={Authorization:'Bearer test-console-local'};
   const thought='合成日记 '+Date.now();
+  const dream='合成旧梦：蓝门后是一片海 '+Date.now();
   expect((await page.request.post('/v1/sources',{headers,data:{namespace:'kin-reflection',key:thought,authority:'model',
     text:'Kin 自己的想法（日记与感想，不是主人的原话或已确认事实）：\n'+thought,metadata:{role:'assistant',host_event:'diary',topic:'合成'}}})).ok()).toBe(true);
+  expect((await page.request.post('/v1/sources',{headers,data:{namespace:'kin-dream',key:dream,authority:'model',
+    text:'Kin 的梦（想象出来的，不是发生过的事）：\n'+dream,metadata:{role:'assistant',host_event:'dream',topic:'合成'}}})).ok()).toBe(true);
+  const diary=await (await page.request.get('/v1/diary',{headers})).json();
+  expect(diary.replies).toBe('disabled');
+  expect(diary.dreams.generation_enabled).toBe(false);
+  expect(diary.dreams.dreams.some((entry:any)=>entry.text.includes(dream))).toBe(true);
   await page.locator('nav').getByRole('button',{name:'日记与自述',exact:true}).click();
   const panel=page.getByRole('region',{name:'Kin 的日记'});
   await expect(panel).toContainText(thought);
   await expect(panel).not.toContainText('Kin 自己的想法（');
   await expect(panel.getByLabel('回复这篇日记')).toHaveCount(0);
-  await expect(page.getByRole('region',{name:'Kin 的梦'})).toHaveCount(0);
+  await expect(page.getByRole('region',{name:'Kin 的梦'})).toContainText(dream);
 });
 
 test('a reply to a diary entry goes out once, with its words and its entry, and shows under it',async({page})=>{
