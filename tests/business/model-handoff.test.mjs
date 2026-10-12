@@ -6,7 +6,7 @@ import path from 'node:path';
 import {portableHistory,handoffCheckpoint} from '../../adapters/portable-history.mjs';
 import {ModelHandoff,needsModelHandoff} from '../../adapters/model-handoff.mjs';
 import {SessionManager} from '../../adapters/session-manager.mjs';
-import {NativeCandidate} from '../../adapters/native-candidate.mjs';
+import {NativeCandidate,candidateMcpIsolation,candidateStartupDiagnostic} from '../../adapters/native-candidate.mjs';
 import {recoverSessionStore} from '../../adapters/mobile-session-host.mjs';
 const message=(role,text)=>({type:'message',role,content:[{type:role==='user'?'input_text':'output_text',text}]});
 const row=payload=>({type:'response_item',payload});
@@ -184,4 +184,30 @@ test('new delivery during preparation keeps the original binding and releases na
  f.handoff.inspect=async()=>({...await inspect(),pendingDeliveries:++reads>1?1:0});
  await assert.rejects(f.handoff.switchProfile(profiles.ds),e=>e.beforeMutation&&/changed/.test(e.message));
  assert.equal(f.manager.fence().threadId,'source');assert.equal(closed,1);assert.equal(f.manager.running,false);
+});
+
+
+test('candidate MCP isolation targets effective servers without creating absent legacy entries',()=>{
+ const result=candidateMcpIsolation({mcp_servers:{memorypalace:{command:'memory'},'computer-use':{command:'computer'}}});
+ assert.deepEqual(result,{'mcp_servers.memorypalace.enabled':false,'mcp_servers.computer-use.enabled':false});
+ assert(!Object.keys(result).some(k=>k.includes('node_repl')));
+ assert.throws(()=>candidateMcpIsolation(undefined),/unavailable/);
+ assert.throws(()=>candidateMcpIsolation({mcp_servers:[]}),/unavailable/);
+});
+
+test('startup failure retains only bounded categories and reports the failed stage',async t=>{
+ const f=fixture(t),secret='private-dialogue-and-secret';
+ const diagnostic=candidateStartupDiagnostic('Error: invalid transport\nin `mcp_servers.node_repl`\n'+secret,1,null);
+ f.native.create=async()=>{throw Object.assign(Error(secret),{nativeDiagnostic:{...diagnostic,untrusted:secret}});};
+ await assert.rejects(f.handoff.switchProfile(profiles.kimi),e=>e.code==='HANDOFF_NOT_COMMITTED'&&e.beforeMutation&&e.message.includes('MCP')&&!e.message.includes(secret));
+ assert.deepEqual(f.manager.state.candidate.failure,{stage:'startup',category:'mcp-invalid-transport',exitCode:1});
+ assert.equal(f.manager.fence().threadId,'source');assert(!JSON.stringify(f.manager.state.candidate).includes(secret));
+});
+
+test('candidate startup process stderr is classified without retaining its body',async t=>{
+ const f=history(t),script=path.join(f.dir,'broken.mjs');
+ fs.writeFileSync(script,"process.stderr.write('Error: invalid transport\\nin `mcp_servers.node_repl`\\ncredential=private-value');process.exitCode=1;");
+ const native=new NativeCandidate({command:process.execPath,args:[script],cwd:f.dir,env:{PATH:'/usr/bin:/bin',HOME:f.dir},inheritEnv:false,timeoutMs:1000});
+ await assert.rejects(native.start(),e=>e.nativeDiagnostic?.category==='mcp-invalid-transport'&&e.nativeDiagnostic.exitCode===1&&!JSON.stringify(e).includes('private-value'));
+ await native.close();
 });

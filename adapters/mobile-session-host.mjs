@@ -147,7 +147,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
     const written=observation&&digest(observation);
     if(written&&written!==writtenObservation){atomicJson(observationFile,observation);writtenObservation=written;}
   };
-  const native=new NativeCandidate({command:config.codex_command,args:(config.candidate_disabled_mcp_servers??[]).flatMap(name=>['-c','mcp_servers.'+name+'.enabled=false']),cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
+  const native=new NativeCandidate({command:config.codex_command,cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
     configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:candidateCatalogFile(config),gateway:routing.gateway,companionInstructions}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{

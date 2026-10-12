@@ -36,6 +36,24 @@ const responseReceipt=(actual,launch)=>({
     serviceTier:Object.hasOwn(actual??{},'serviceTier')?actual.serviceTier:undefined},
 });
 
+/** Keep categories only: stderr may contain credentials or private context. */
+export function candidateStartupDiagnostic(stderr='',exitCode=null,signal=null) {
+  const category=/invalid transport/i.test(stderr)?'mcp-invalid-transport':
+    /error (?:loading|parsing) config|failed to (?:load|parse).*config/i.test(stderr)?'config-invalid':'process-exited';
+  return {stage:'startup',category,exitCode:Number.isInteger(exitCode)?exitCode:null,
+    signal:['SIGTERM','SIGKILL','SIGABRT','SIGSEGV'].includes(signal)?signal:null};
+}
+
+export function candidateMcpIsolation(config) {
+  if(!config||typeof config!=='object'||Array.isArray(config))throw Error('Candidate effective config unavailable');
+  const servers=config.mcp_servers??{};
+  if(!servers||typeof servers!=='object'||Array.isArray(servers))throw Error('Candidate MCP config unavailable');
+  return Object.fromEntries(Object.keys(servers).map(name=>{
+    if(!/^[A-Za-z0-9_-]{1,120}$/.test(name))throw Error('Candidate MCP name invalid');
+    return ['mcp_servers.'+name+'.enabled',false];
+  }));
+}
+
 /** A mobile-only, read-only app-server instance. It never owns a channel or an
  * MCP credential. Native API responses are the authority for its thread IDs. */
 export class NativeCandidate {
@@ -45,7 +63,8 @@ export class NativeCandidate {
   async start(){
     if(this.child)return;
     const child=spawn(this.command,[...this.args,'app-server','--stdio'],{cwd:this.cwd,env:this.inheritEnv?{...process.env,...this.env}:{...this.env},stdio:['pipe','pipe','pipe']});this.child=child;
-    child.stderr.on('data',()=>{});
+    let stderr='';
+    child.stderr.on('data',chunk=>{stderr=(stderr+String(chunk)).slice(-8192);});
     createInterface({input:child.stdout}).on('line',line=>{let message;try{message=JSON.parse(line);}catch{return;}
       if(this.pending.has(message.id)){const p=this.pending.get(message.id);this.pending.delete(message.id);message.error?p.reject(Error(message.error.message)):p.resolve(message.result);}
       else if(message.method){
@@ -54,11 +73,16 @@ export class NativeCandidate {
         if(message.id!==undefined)child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:message.id,error:{code:-32601,message:'Candidate verification has no tool or approval access'}})+'\n');
       }
     });
-    child.on('error',()=>this.rejectPending());child.on('exit',()=>{this.rejectPending();if(this.child===child){this.child=null;this.loaded.clear();}});
+    child.on('error',()=>this.rejectPending({stage:'startup',category:'spawn-failed',exitCode:null,signal:null}));
+    child.on('exit',(code,signal)=>{this.rejectPending({...candidateStartupDiagnostic(stderr,code,signal),stage:this.mcpIsolation?'operation':'startup'});if(this.child===child){this.child=null;this.loaded.clear();this.mcpIsolation=null;}});
     await this.request('initialize',{clientInfo:{name:'kin_continuity',version:'1'},capabilities:{experimentalApi:true}});
     child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'initialized'})+'\n');
+    // Read effective Home/project configuration before creating any thread.
+    // Never invent a partial MCP table for a server that is not configured.
+    const effective=await this.request('config/read',{cwd:this.cwd,includeLayers:false});
+    this.mcpIsolation=candidateMcpIsolation(effective?.config);
   }
-  rejectPending(){for(const p of this.pending.values())p.reject(Error('Native candidate connection closed'));this.pending.clear();}
+  rejectPending(diagnostic){for(const p of this.pending.values())p.reject(Object.assign(Error('Native candidate connection closed'),{nativeDiagnostic:diagnostic}));this.pending.clear();}
   request(method,params){return new Promise((resolve,reject)=>{
     const id=++this.serial,timer=setTimeout(()=>{this.pending.delete(id);reject(Error('Native operation receipt unconfirmed'));},this.timeoutMs);
     this.pending.set(id,{resolve:v=>{clearTimeout(timer);resolve(v);},reject:e=>{clearTimeout(timer);reject(e);}});
@@ -77,7 +101,7 @@ export class NativeCandidate {
       throw Error('Candidate profile is incomplete');
     return launch;
   }
-  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,'mcp_servers':{},'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
+  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,...this.mcpIsolation,'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
   params(profile){return this.requestParams(this.launch(profile));}
   async create({id,model,profile,name}){
     const launch=this.launch(profile??{model});await this.start();const value=await this.request('thread/start',this.requestParams(launch));

@@ -25,7 +25,7 @@ export class ModelHandoff {
     if(unresolved&&['committing','unconfirmed'].includes(unresolved.state)&&unresolved.native?.threadId===m.fence().threadId)
       throw Error('Committed handoff is awaiting recovery');
     m.running=true;
-    let candidate,committed=false;
+    let candidate,committed=false,stage='preparation';
     const checkCancel=()=>{if(signal?.aborted)throw canceled();};
     try{
       checkCancel();const previous=structuredClone(m.fence()),before=await this.inspect();
@@ -45,11 +45,11 @@ export class ModelHandoff {
       candidate={id,kind:'model-handoff',state:'creating',generation:previous.generation,previousBinding:previous,
         sourceProfile:runtimeProfile(before),profile:structuredClone(profile),checkpoint,at:m.now()};
       m.state.candidate=candidate;m.save('model-handoff-creating');
-      candidate.native=await this.native.create({id,profile,name:'Kin continuity'});candidate.state='created';m.save('model-handoff-created');checkCancel();
+      stage='creation';candidate.native=await this.native.create({id,profile,name:'Kin continuity'});candidate.state='created';m.save('model-handoff-created');checkCancel();
       candidate.injectionId=id;candidate.state='injecting';m.save('model-handoff-injecting');
-      candidate.injection=await this.native.inject({...candidate.native,checkpoint,operationId:id});
+      stage='injection';candidate.injection=await this.native.inject({...candidate.native,checkpoint,operationId:id});
       if(!candidate.injection?.verified)throw unchanged('Context injection unconfirmed');
-      candidate.verification=await this.native.verifyHandoff({...candidate.native,checkpoint,operationId:id});
+      stage='verification';candidate.verification=await this.native.verifyHandoff({...candidate.native,checkpoint,operationId:id});
       if(!candidateVerificationReady(candidate.verification,candidate))throw unchanged('Candidate context or profile is unverified');
       candidate.state='ready';m.save('model-handoff-ready');checkCancel();
       const current=await this.inspect(),latest=await this.collect();
@@ -63,7 +63,7 @@ export class ModelHandoff {
       checkCancel();
       const next={conversationId:previous.conversationId,generation:previous.generation+1,
         threadId:candidate.native.threadId,nativeSessionId:candidate.native.nativeSessionId};
-      candidate.state='committing';m.state.binding=next;m.state.segments.at(-1).state='retired';
+      stage='commit';candidate.state='committing';m.state.binding=next;m.state.segments.at(-1).state='retired';
       m.state.segments.push({...next,state:'active',activatedAt:m.now(),checkpointId:checkpoint.id,
         sourceThreadId:previous.threadId,handoffId:id,profile:structuredClone(profile)});
       m.state.handoffs??=[];
@@ -78,15 +78,23 @@ export class ModelHandoff {
       // A failed save may have completed its atomic rename. Treat this boundary
       // as indeterminate and use promotion recovery, never claim no mutation.
       committed=true;m.save('binding-committed',{handoffId:id});
-      const receipt=await m.promote({previous,binding:next,candidate});
+      stage='promotion';const receipt=await m.promote({previous,binding:next,candidate});
       if(!receipt?.verified||receipt.threadId!==next.threadId)throw Error('Promotion unconfirmed');
       candidate.state='retired';candidate.promotion=receipt;m.state.sessionAdvice=null;m.save('model-handoff-complete');
       const actual=await this.inspect();
       return {...actual,contextHandoff:{id,sourceThreadId:previous.threadId,checkpointId:checkpoint.id,
         coverage:history.coverage,checkpointCoverage:checkpoint.coverage,sourceRetained:true}};
     }catch(error){
-      if(candidate){candidate.state=committed?'unconfirmed':signal?.aborted?'canceled':'failed';candidate.error=error.code??error.name;m.save('model-handoff-ended');}
-      if(!committed&&!error.beforeMutation)throw unchanged('Context handoff failed; source session retained');
+      const diagnostic=error.nativeDiagnostic;
+      const category=['mcp-invalid-transport','config-invalid','process-exited','spawn-failed'].includes(diagnostic?.category)?diagnostic.category:null;
+      const failure={stage:category&&diagnostic.stage==='startup'?'startup':stage,category:category??'operation-failed',
+        exitCode:Number.isInteger(diagnostic?.exitCode)?diagnostic.exitCode:null};
+      if(candidate){candidate.state=committed?'unconfirmed':signal?.aborted?'canceled':'failed';candidate.error=error.code??error.name;candidate.failure=failure;m.save('model-handoff-ended');}
+      if(!committed&&!error.beforeMutation){
+        const detail=category==='mcp-invalid-transport'?'候选启动时 MCP 配置无效':category==='config-invalid'?'候选启动配置无效':
+          category&&diagnostic.stage==='startup'?'候选进程启动失败':({preparation:'上下文准备失败',creation:'候选会话创建失败',injection:'上下文注入失败',verification:'候选会话核验失败',commit:'交接提交失败'}[stage]??'候选交接失败');
+        throw unchanged('上下文交接未完成（'+detail+'）；原会话已保留。');
+      }
       throw error;
     }finally{await this.native.close().catch(()=>{});m.running=false;}
   }
