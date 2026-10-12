@@ -23,6 +23,23 @@ export function instructionTextEvidence(value) {
   return {present:true,sha256:sha256(bytes),utf8Bytes:bytes.length};
 }
 
+/** Newer native clients carry the base as a developer input item. Normalize
+ * only the exact configured bytes into the existing gateway wire shape. An
+ * explicit instructions field always wins, including an invalid one. */
+export function normalizeNativeInstructions(body,required) {
+  if(Object.hasOwn(body,'instructions')||!required||!Array.isArray(body.input))
+    return {body,incomingInstructions:instructionTextEvidence(body.instructions)};
+  for(const [index,item] of body.input.entries()) {
+    if(item?.role!=='developer'||!Array.isArray(item.content)||item.content.length!==1)continue;
+    const text=item.content[0]?.text;
+    if(typeof text!=='string'||Buffer.byteLength(text)!==required.utf8Bytes)continue;
+    const incomingInstructions=instructionTextEvidence(text);
+    if(incomingInstructions.sha256!==required.sha256)continue;
+    return {body:{...body,instructions:text,input:body.input.filter((_,i)=>i!==index)},incomingInstructions};
+  }
+  return {body,incomingInstructions:instructionTextEvidence(undefined)};
+}
+
 /** Codex 0.155 native HTTP contract, observed on start, resume and restart.
  * These fields come from the authenticated native HTTP request, not model
  * text or the router's guess about the current turn. Unknown versions/shapes

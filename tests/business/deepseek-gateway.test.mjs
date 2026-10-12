@@ -160,3 +160,27 @@ test('Kimi compaction is refused locally before lease or upstream; request conte
  const body=await response.json();assert.equal(response.status,409);assert.equal(body.error.code,'KIMI_HISTORY_INCOMPATIBLE');assert.match(body.error.message,/压缩历史/);assert.equal(JSON.stringify(body).includes('synthetic'),false);assert.equal(calls,0);assert.equal(leases,0);assert.equal(input.length,2);
  }finally{await gateway.close();}
 });
+
+test('native developer-base format passes the existing exact instruction check for Kimi and DeepSeek',async t=>{
+ const {instructionTextEvidence}=await import('../../adapters/instruction-evidence.mjs');
+ const base='Synthetic approved base',required=instructionTextEvidence(base),sent=[],evidence=[];
+ const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic',requiredIncomingInstructions:required,onRequestEvidence:e=>evidence.push(e),
+  fetchImpl:async(_,init)=>{sent.push(JSON.parse(init.body));return new Response(JSON.stringify({id:'synthetic',status:'completed',output:[]}),{headers:{'content-type':'application/json'}});}});
+ t.after(()=>gateway.close());
+ const developer=text=>({type:'message',role:'developer',content:[{type:'input_text',text}]});
+ const request=body=>fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify(body)});
+ for(const model of ['k3','deepseek-flash'])for(const legacy of [false,true]){
+  const input=[developer('Synthetic persona'),...(legacy?[]:[developer(base)]),user('Synthetic owner input')];
+  assert.equal((await request({model,input,...(legacy?{instructions:base}:{})})).status,200);
+  assert(sent.at(-1).instructions.startsWith(base+'\n\n'));
+  assert.equal(sent.at(-1).input.filter(i=>i.role===(model==='k3'?'developer':'system')).length,1,'the base is moved once; persona retained');
+  assert.equal(evidence.findLast(e=>e.stage==='terminal').incomingInstructions.sha256,required.sha256);
+ }
+ const before=sent.length;
+ for(const body of [
+  {input:[developer('wrong base'),user(base)]},
+  {instructions:'wrong base',input:[developer(base)]},
+  {input:[user(base)]},
+ ])assert.equal((await request({model:'k3',...body})).status,400);
+ assert.equal(sent.length,before,'invalid instructions never reach a provider');
+});

@@ -4,7 +4,7 @@ import {privateReplyBoundary} from './chat-bubbles.mjs';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {usageRow} from './model-lease.mjs';
 import {contactDraftInstructions} from './contact-draft.mjs';
-import {emitInstructionEvidence,instructionTextEvidence,nativeInstructionRequestIdentity,developerInstructionEvidence,sha256,MAX_COMPANION_INSTRUCTION_BYTES} from './instruction-evidence.mjs';
+import {emitInstructionEvidence,instructionTextEvidence,normalizeNativeInstructions,nativeInstructionRequestIdentity,developerInstructionEvidence,sha256,MAX_COMPANION_INSTRUCTION_BYTES} from './instruction-evidence.mjs';
 
 // A native turn is attributed per session, because the two kinds are not the same
 // spend: a chat turn is what the owner is waiting for, while contact drafts,
@@ -282,7 +282,7 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         parts.push(chunk);
       }
       const raw = Buffer.concat(parts).toString('utf8');
-      const parsed=JSON.parse(raw);
+      const {body:parsed,incomingInstructions}=normalizeNativeInstructions(JSON.parse(raw),requiredIncomingInstructions);
       const identity=nativeInstructionRequestIdentity(req.headers,parsed);
       // The callback is trusted host state. A request never self-declares its
       // purpose; dynamic contact drafts receive their structured contract from
@@ -300,7 +300,6 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         throw Error('kimi-main-conversation-unavailable');
       upstreamProvider = kimi ? 'kimi' : 'deepseek';
       const body = kimi ? kimiRequest(parsed, requestProfile, contracts) : deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
-      const incomingInstructions=instructionTextEvidence(parsed.instructions);
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:upstreamProvider,lane:attributed.lane,
         purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,
         requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:identity,
