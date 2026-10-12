@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from eventmem.core.db import Conflict, Missing, dumps
+from eventmem.core.engine import root_id
 from eventmem.core.retrieval import tokens
 
 from .context import INJECTION_CEILING as CEILING, Contexts
@@ -76,9 +77,10 @@ class SessionCheckpoint:
                     with self.mind.engine.db.connect() as conn:
                         source = conn.execute('SELECT received_at FROM sources WHERE id=? AND scope=? AND deleted=0',
                                               (event['source_id'], self.mind.scope.key())).fetchone()
-                        refs = conn.execute('SELECT r.id,r.revision FROM records r JOIN evidence e ON e.record_id=r.id '
-                                            'WHERE e.source_id=? AND r.scope=? AND r.deleted=0',
-                                            (event['source_id'], self.mind.scope.key())).fetchall()
+                        # This dialogue carries the original message, not every later
+                        # interpretation that cites it. Selected memories keep their own dependencies.
+                        refs = conn.execute('SELECT id,revision FROM records WHERE id=? AND scope=? AND deleted=0',
+                                            (root_id(event['source_id']), self.mind.scope.key())).fetchall()
                         if not source or not refs:
                             raise Missing("Source is unavailable")
                         dependencies = [{"id": ref["id"], "revision": ref["revision"]} for ref in refs]

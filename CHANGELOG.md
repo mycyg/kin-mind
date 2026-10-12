@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.34 — 2026-10-12
+
+- Bind public dialogue checkpoints to the original messages. Later self-knowledge or other interpretations citing those messages no longer block model handoff; selected semantic memories retain their own dependencies.
+- Keep original-message deletion, read-purpose restrictions and selected-memory corrections effective during checkpoint validation.
+
 ## 0.1.33 — 2026-10-12
 
 - Recall exploration and dream originals by stable source references, topic and time. Turning dream generation off preserves access to earlier dreams; explicit source deletion remains effective.

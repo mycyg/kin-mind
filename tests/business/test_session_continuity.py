@@ -4,8 +4,80 @@ from kin_mind.context import INJECTION_CEILING, Contexts
 from kin_mind.memory import MemoryContinuity
 from kin_mind.session_advice import latest, submit
 from kin_mind.session_checkpoint import SessionCheckpoint
+import pytest
+from eventmem.core.engine import root_id
+from eventmem.core.models import RecordInput, RevisionInput
+from eventmem.core.read_policy import ReadPolicy
 
 pytest_plugins = ('test_kin_mind',)
+
+
+def public_message(mind, kind='owner-message'):
+    memory = MemoryContinuity(mind)
+    memory.configure({'records': True, 'manifests': True, 'recall_purpose_policy': True})
+    event = {'id': 'synthetic-public-root', 'kind': kind, 'at': mind.clock(), 'text': 'We agreed to visit the synthetic lighthouse.'}
+    if kind == 'delivery':
+        event.update(state='accepted', channel='synthetic', message_id='synthetic-receipt')
+    receipt = memory.ingest(event)
+    return root_id(receipt['source_id']), receipt['source_id']
+
+
+@pytest.mark.parametrize('kind', ['owner-message', 'assistant-message', 'delivery'])
+def test_public_message_checkpoint_does_not_depend_on_self_knowledge_derived_from_it(setup, kind):
+    mind, _, _ = setup
+    original, source_id = public_message(mind, kind)
+    derived = mind.engine.add_record(RecordInput(kind='fact', scope=mind.scope, source_ids=[source_id], valid_from=mind.clock(),
+        content='A synthetic self-description derived from the same message.', attributes={'self_knowledge': True}),
+        'synthetic-derived-self-description')
+    policy = ReadPolicy.load(mind.engine, mind.scope, 'experience_recall')
+    assert policy.refusal(mind.engine.get(derived['id'])) == 'self_knowledge_requires_versioned_view'
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    assert snapshot['items'][0]['dependencies'] == [{'id': original, 'revision': 1}]
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, budget=4000, allow_model=False)
+    assert built['complete'] and checkpoints.validate(built)['valid']
+
+
+def test_public_checkpoint_still_checks_an_original_message_that_becomes_unavailable(setup):
+    mind, _, _ = setup
+    original, _ = public_message(mind)
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    built = checkpoints.build(checkpoints.snapshot(), {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    assert checkpoints.validate(built)['valid']
+    mind.engine.delete(original)
+    assert not checkpoints.validate(built)['valid']
+    snapshot = checkpoints.snapshot()
+    assert not snapshot['items'] and 'synthetic-public-root' in snapshot['invalidatedSources']
+
+
+def test_public_checkpoint_still_refuses_an_original_message_outside_the_read_purpose(setup):
+    mind, _, _ = setup
+    original, _ = public_message(mind)
+    mind.engine.revise(original, RevisionInput(command_id='synthetic-original-classification', expected_revision=1,
+        action='correct', attributes={'self_knowledge': True}))
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    assert snapshot['items'][0]['dependencies'] == [{'id': original, 'revision': 2}]
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    assert not checkpoints.validate(built)['valid']
+
+
+def test_selected_semantic_memory_keeps_its_own_dependency_and_rejects_a_correction(setup):
+    mind, _, _ = setup
+    _, source_id = public_message(mind)
+    semantic = mind.engine.add_record(RecordInput(kind='fact', scope=mind.scope, source_ids=[source_id], valid_from=mind.clock(),
+        content='The synthetic lighthouse visit is still planned.'), 'synthetic-selected-memory')
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    dependency = {'id': semantic['id'], 'revision': 1}
+    snapshot['linked'] = {'items': [{'id': 'synthetic-selected-memory', 'revision': 1, 'text': semantic['content'],
+        'basis': 'explicit', 'priority': 0, 'dependencies': [dependency]}], 'critical_ids': ['synthetic-selected-memory']}
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, budget=4000, allow_model=False)
+    selected = next(i for i in built['contextDependencies'] if i['id'] == 'synthetic-selected-memory')
+    assert selected['dependencies'] == [dependency] and checkpoints.validate(built)['valid']
+    mind.engine.revise(semantic['id'], RevisionInput(command_id='synthetic-memory-correction', expected_revision=1,
+        action='correct', content='The synthetic lighthouse visit was cancelled.'))
+    assert not checkpoints.validate(built)['valid']
 
 
 def record(event, snapshot='observation-1', action='keep'):
