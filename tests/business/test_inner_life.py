@@ -216,6 +216,23 @@ def test_a_rhythm_review_can_remember_a_recent_dream_without_automatic_sharing(e
     assert not [wish for wish in mind.read()["desires"] if wish.get("activity_ref")], "remembering does not request a send"
 
 
+def test_received_owner_attention_preserves_the_chosen_settling_transition(env):
+    mind, memory, source, entry, _ = env
+    memory.configure({"dreams": True})
+    asleep(mind, source)
+    mind.record(AffectiveEvent(command_id="settling-attention", agent_version="inner-v1",
+        expected_revision=mind.read()["revision"], evidence_ids=[source("settling-attention")], reason="Relaxing",
+        rhythm=RhythmProposal(phase="settling", base_phase="awake", alertness=35, target=20,
+                              half_life_minutes=180, reason="Relaxing")))
+    entry("material-attention", "今天折了一只纸船。")
+    memory.ingest({"id":"synthetic-arrival","kind":"owner-message","text":"回来啦","at":mind.clock()})
+    view=mind.read()
+    assert view["rhythm"]["attention_for"] == "owner_message"
+    assert view["rhythm"]["proposed_phase"] == "settling"
+    with mind.engine.db.connect() as conn:
+        assert dreams.offer(conn,mind,view,{"stimulus":"idle-review"},at=mind.clock())
+
+
 def test_a_dream_out_of_bounds_costs_the_dream_and_never_the_review(env):
     mind, memory, source, entry, _ = env
     memory.configure({"dreams": True})
