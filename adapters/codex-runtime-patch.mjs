@@ -8,7 +8,7 @@ const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
-const assessmentMarker = '// KIN_ASSESS_V8';
+const assessmentMarker = '// KIN_ASSESS_V9';
 const retriesMarker = '// KIN_GATEWAY_RETRIES_V1';
 const utf8Marker = '// KIN_UTF8_READER_V1';
 const inputStatusMarker = '// KIN_INPUT_STATUS_V2';
@@ -672,7 +672,7 @@ function kinToolResultIds(item, turn) {
       const config = await kinWithin(this.codexAcpClient.createSessionConfig(state.cwd, state.additionalDirectories ?? [], []), deadline, "timeout");
       const servers = await kinWithin(this.codexAcpClient.getConfigMcpServerNames(state.cwd), deadline, "timeout");
       for (const name of servers) if (name !== "memorypalace") config[\`mcp_servers.\${name}.enabled\`] = false;
-      if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": "approve" });
+      if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": "writes" });
       Object.assign(config, KIN_FORK_CLOSED);
       if (selectedModel.model === "k3") Object.assign(config, { service_tier: "default", "features.fast_mode": false, model_reasoning_effort: "high" });
       const forkPromise = api.threadFork({ threadId: params.sessionId, lastTurnId, ephemeral: true, excludeTurns: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: "read-only", config });

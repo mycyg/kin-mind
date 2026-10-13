@@ -1,8 +1,8 @@
 """Kin's dreams (2026-10-01, after Serein's dream engine, at 小光's request).
 
-**When.** Only an idle review, only while the rhythm is in its resting phase, at most once a night,
+**When.** An idle or rhythm review while resting, settling or drowsy, at most once a night,
 and only while the `dreams` setting is on. The host offers the section then and only then; whether
-a dream comes at all is Kin's: the review may leave it empty, and most nights it should. A night is
+a dream comes at all is Kin's: the review may leave it empty. A night is
 the local day from noon to noon (Asia/Singapore), so 23:00 and 03:00 are the same night.
 
 **From what.** What the last 48 hours left behind (`material`): the newest events the appraisals

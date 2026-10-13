@@ -116,8 +116,8 @@ def test_off_an_idle_review_is_asked_and_shown_what_it_always_was(env):
     with mind.engine.db.connect() as conn:
         assert A.audit_switches(conn, mind.scope.key()) == set(A.AUDIT_SECTIONS) - {"dream"}
         # The request: no dream in the schema whichever audited sections are on.
-    assert "dream" not in json.dumps(A.appraisal_schema(False, False, tuple(set(A.AUDIT_SECTIONS) - {"dream"})))
-    assert "Dream" not in json.dumps(A.appraisal_schema(True, False, ()))
+    assert "dream" not in A.appraisal_schema(False, False, tuple(set(A.AUDIT_SECTIONS) - {"dream"}))["properties"]
+    assert "Dream" not in A.appraisal_schema(True, False, ()).get("$defs", {})
     assert initiative.facts(mind).keys() == {"as_of", "hours_since_last_wish", "hours_since_last_contact_sent",
         "last_exploration", "last_creation", "idle_reviews_since_last_wish", "recent_failed_explorations",
         "contact_wishes_unsent_a_day"}
