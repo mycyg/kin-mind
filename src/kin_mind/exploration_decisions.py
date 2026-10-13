@@ -140,7 +140,7 @@ def require_activity_share(mind, conn, state, activity_ref):
 def require_share(mind, conn, state, exploration_id):
     decision = state.get("exploration_decisions", {}).get(exploration_id)
     if decision is None:
-        # One that moved still answers: a result already shared refuses a second intent as before.
+        # One that moved still supplies the activity's current sharing choice.
         from .exploration_decision_archive import archived
         decision = archived(conn, mind.scope.key(), exploration_id)
     if not decision or decision["decision"] != "share" or not _decision_fresh(mind, conn, decision):

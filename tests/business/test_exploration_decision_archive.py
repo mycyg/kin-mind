@@ -460,22 +460,27 @@ def test_an_archived_result_can_be_reconsidered_without_a_new_event_or_cause(set
     assert "explore_x" not in rows(mind) and decisions.STATE_KEY not in state
 
 
-def test_a_result_already_shared_refuses_a_second_intent_after_it_moved(setup):
+@pytest.mark.parametrize("finished", ["complete", "abandon"])
+def test_a_shared_result_allows_a_new_wish_before_and_after_its_decision_moves(setup, finished):
     mind, source, clock = setup
     result, _ = decided(mind, clock, "explore_shared", "share")
     intent = wish(mind, clock, "first-intent", [result], exploration_id="explore_shared")
-    settle_wish(mind, clock, intent, [result])
-    with pytest.raises(Conflict) as before_move:
-        wish(mind, clock, "second-intent-before", [result], exploration_id="explore_shared")
+    settle_wish(mind, clock, intent, [result], action=finished)
+    second = wish(mind, clock, "second-intent-before", [result], exploration_id="explore_shared")
+    with pytest.raises(Conflict, match="already has a contact intent"):
+        wish(mind, clock, "duplicate-live-before", [result], exploration_id="explore_shared")
+    settle_wish(mind, clock, second, [result], action=finished)
     for index in range(VIEW):
         decided(mind, clock, f"explore_newer{index:02d}")
     clock[0] += timedelta(days=10)
     switch(mind)
     assert "explore_shared" in decisions.archive(mind, apply=True)["moved"]
-    with pytest.raises(Conflict) as after_move:
-        wish(mind, clock, "second-intent-after", [result], exploration_id="explore_shared")
-    assert str(after_move.value) == str(before_move.value) == "This sharing decision already has a contact intent"
-    assert [d["id"] for d in document(mind)["desires"].values() if d.get("exploration_id") == "explore_shared"] == [intent]
+    third = wish(mind, clock, "new-intent-after", [result], exploration_id="explore_shared")
+    with pytest.raises(Conflict, match="already has a contact intent"):
+        wish(mind, clock, "duplicate-live-after", [result], exploration_id="explore_shared")
+    saved = document(mind)["desires"]
+    assert saved[intent]["status"] == saved[second]["status"] == ("completed" if finished == "complete" else "abandoned")
+    assert saved[third]["status"] == "wanted"
 
 
 def test_a_wish_that_comes_to_rest_on_a_moved_decision_brings_it_back(setup):
@@ -497,11 +502,11 @@ def test_a_wish_that_comes_to_rest_on_a_moved_decision_brings_it_back(setup):
     assert rows(mind) == {} and decisions.STATE_KEY not in state
 
 
-def test_an_appraisal_naming_a_moved_shared_result_makes_no_second_wish(setup):
+def test_an_appraisal_can_create_a_new_wish_for_a_moved_shared_result(setup):
     mind, source, clock = setup
     result, _ = decided(mind, clock, "explore_told", "share")
     intent = wish(mind, clock, "told", [result], exploration_id="explore_told")
-    settle_wish(mind, clock, intent, [result])
+    settle_wish(mind, clock, intent, [result], action="complete")
     for index in range(VIEW):
         decided(mind, clock, f"explore_newer{index:02d}")
     clock[0] += timedelta(days=10)
@@ -525,7 +530,11 @@ def test_an_appraisal_naming_a_moved_shared_result_makes_no_second_wish(setup):
     data = json.loads(row["data"])
     assert row["state"] == "complete", data.get("error")
     assert not (data.get("rejected_sections") or []), data.get("rejected_sections")
-    assert set(document(mind)["desires"]) == desires, "the intent this result had stands for it"
+    saved = document(mind)["desires"]
+    added = set(saved) - desires
+    assert len(added) == 1
+    assert saved[intent]["status"] == "completed"
+    assert saved[added.pop()]["status"] == "wanted"
 
 
 def test_an_appraisal_shown_a_decision_that_moved_since_is_not_refused_for_it(setup):
