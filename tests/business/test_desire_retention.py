@@ -221,7 +221,7 @@ def test_a_wish_an_open_execution_holds_stays_until_it_ends_and_takes_no_newer_w
 
 # --- let go, and what each still blocks --------------------------------------------------------
 
-def test_a_let_go_sharing_intent_may_be_raised_again_and_a_finished_one_still_blocks(setup):
+def test_let_go_and_finished_sharing_intents_allow_a_new_present_wish(setup):
     mind, source, clock = setup
     allow(mind, desire_retention_keep=1)
     for decision in ("exp-1", "exp-2", "exp-3"):
@@ -240,13 +240,14 @@ def test_a_let_go_sharing_intent_may_be_raised_again_and_a_finished_one_still_bl
         assert not desire_archive.intent(conn, mind.scope.key(), "exp-1", 1)
         assert desire_archive.intent(conn, mind.scope.key(), "exp-2", 1)
         assert desire_archive.intent(conn, mind.scope.key(), "exp-3", 1)
-    # The unsent intent is Kin's to raise again; a finished one -- completed or abandoned -- is still
-    # this decision's.
+    # Old intents retain their history; only a duplicate live intent blocks.
     again = make(mind, source, "share-1-again", exploration_id="exp-1")
     assert again in state_of(mind)["desires"]
     for decision in ("exp-2", "exp-3"):
+        raised = make(mind, source, "again-" + decision, exploration_id=decision)
+        assert raised in state_of(mind)["desires"]
         with pytest.raises(Conflict, match="already has a contact intent"):
-            make(mind, source, "again-" + decision, exploration_id=decision)
+            make(mind, source, "duplicate-" + decision, exploration_id=decision)
 
 
 def test_what_a_bootstrap_made_still_blocks_when_finished_and_not_when_let_go(setup):

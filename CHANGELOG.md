@@ -8,6 +8,8 @@
 - Companion integration fixes DeepSeek's rejection of nullable array types in contact drafts and records failed native drafts with their actual outcome. Empty wish arrays retain their existing meaning of all offered wishes.
 - Assessment forks can read dream originals with their imagination labels. The scoped read-only memory server advertises its actual read-only tools, so native `writes` approval mode permits those reads under `never` without granting writes or other servers.
 - A contact can finish its remaining bubbles after an accepted prefix. Source-only previews continue checking the original activity; transport receipts still govern reconciliation and repeat sends.
+- Contact drafts receive each wish's current status and distinguish its desired completion condition from an actual delivery or owner response.
+- Finished or abandoned activity contact wishes remain historical without blocking a new present sharing intent; duplicate live intents still coalesce.
 
 ## 0.1.34 — 2026-10-12
 

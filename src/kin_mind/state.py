@@ -1357,13 +1357,11 @@ class Mind(Continuity):
     def _activity_intent(self, conn, state, activity, revision, *, exclude=None):
         def matches(desire):
             linked = desire.get("activity_ref") or {"kind": "exploration", "id": desire.get("exploration_id")}
-            return (desire.get("id") != exclude and linked.get("kind") == activity["kind"]
+            return (desire.get("status") in {"wanted", "waiting", "in_progress"}
+                    and desire.get("id") != exclude and linked.get("kind") == activity["kind"]
                     and linked.get("id") == activity["id"] and desire.get("sharing_revision") == revision)
         if any(matches(d) for d in state["desires"].values()):
             return True
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_desire_archive'").fetchone():
-            return any(matches(json.loads(row[0])) for row in conn.execute(
-                "SELECT data FROM mind_desire_archive WHERE scope=? AND status IN ('completed','abandoned')", (self.scope.key(),)))
         return False
 
     def _evolve(self, conn, state, request, refs, event_id):

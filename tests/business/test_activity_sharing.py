@@ -302,6 +302,23 @@ def test_source_preview_allows_the_unsent_remainder_after_an_accepted_prefix(sys
         memory.sharing.preview({**remainder, "source_only": True})
 
 
+@pytest.mark.parametrize("kind", ["dream", "exploration"])
+@pytest.mark.parametrize("finished", ["complete", "abandon"])
+def test_a_finished_activity_wish_does_not_block_a_new_present_intent(system, kind, finished):
+    mind, _, _, _ = system
+    ref = activity(system, kind)
+    decide(system, ref, "share", "same-share-choice")
+    first = wish(system, ref, "first-contact")["desire_id"]
+    wish(system, ref, "finish-first", action=finished, desire_id=first)
+    second = wish(system, ref, "new-contact")["desire_id"]
+    assert second != first
+    saved = {d["id"]: d for d in mind.read()["desires"]}
+    assert saved[first]["status"] in {"completed", "abandoned"}
+    assert saved[second]["status"] == "wanted"
+    with pytest.raises(Conflict, match="already has a contact intent"):
+        wish(system, ref, "duplicate-live-contact")
+
+
 def test_coverage_cannot_attach_an_unseen_dream_to_an_unrelated_accepted_bubble(system):
     mind, memory, _, _ = system
     ref = activity(system)

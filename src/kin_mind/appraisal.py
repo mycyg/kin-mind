@@ -262,7 +262,7 @@ class Wish(Model):
     kind: Literal["contact", "explore", "create"]
     strength: StrictInt = Field(ge=0, le=100)
     ttl_hours: StrictInt = Field(ge=1, le=168)
-    completion: str = Field(min_length=1)
+    completion: str = Field(min_length=1, description="希望达到的完成条件，仍是目标，不是已发生或已投递的事实。")
     concern_ids: list[str] = Field(default_factory=list, max_length=10)
     exploration_target: Literal["knowledge", "computer"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
@@ -3450,7 +3450,6 @@ class Appraisals:
                                   {"habits": lambda wish: wish.kind == "explore", "concerns": lambda wish: bool(wish.concern_ids)})
 
                     from .desire_archive import contents as archived_contents
-                    from .desire_archive import intent as archived_intent
                     from .exploration_decision_archive import revision_of as decision_revision
                     # Read once, and only where it is read at all: the content check reaches
                     # finished wishes on a bootstrap and nowhere else.
@@ -3460,16 +3459,15 @@ class Appraisals:
                     def apply_wish(index, wish):
                         if wish.kind == "contact" and not wish.activity_ref and not wish.exploration_id and primary_result and self.exploration_capabilities.get("decisions"):
                             wish = wish.model_copy(update={"exploration_id": primary_result})
-                        # Both of these read the finished wishes as well as the live ones, so
-                        # both ask the archive: an intent that moved is still this decision's
-                        # intent, and a wish a bootstrap already made is still made.
+                        # A live intent already offers this activity. Finished intents stay
+                        # in history without preventing a new present wish. Bootstrap still
+                        # recognizes the content it already migrated, including the archive.
                         # The decision's revision is read wherever it lives: one that moved to its
                         # archive still has the intent it had (exploration_decision_archive).
                         if wish.exploration_id and (any(d.get("exploration_id") == wish.exploration_id
+                            and d.get("status") in {"wanted", "waiting", "in_progress"}
                             and d.get("sharing_revision") == decision_revision(state, wish.exploration_id)
-                            for d in state["desires"].values())
-                            or archived_intent(conn, self.mind.scope.key(), wish.exploration_id,
-                                               decision_revision(state, wish.exploration_id))):
+                            for d in state["desires"].values())):
                             return
                         if any(
                             d["content"] == wish.content
