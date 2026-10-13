@@ -7,6 +7,7 @@
 - Clarify that activity pointers refer to existing dreams or explorations; a new research wish names its source in the brief.
 - Companion integration fixes DeepSeek's rejection of nullable array types in contact drafts and records failed native drafts with their actual outcome. Empty wish arrays retain their existing meaning of all offered wishes.
 - Assessment forks can read dream originals with their imagination labels. The scoped read-only memory server advertises its actual read-only tools, so native `writes` approval mode permits those reads under `never` without granting writes or other servers.
+- A contact can finish its remaining bubbles after an accepted prefix. Source-only previews continue checking the original activity; transport receipts still govern reconciliation and repeat sends.
 
 ## 0.1.34 — 2026-10-12
 

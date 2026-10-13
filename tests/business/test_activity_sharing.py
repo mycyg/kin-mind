@@ -282,6 +282,26 @@ def test_batch_reservation_tracks_real_bubble_ids_and_preview_does_not_reserve(s
     assert memory.sharing.preview({"draft_id": "another", "references": [{"activity_ref": ref}]})["state"] == "ready"
 
 
+def test_source_preview_allows_the_unsent_remainder_after_an_accepted_prefix(system):
+    _, memory, _, _ = system
+    ref = activity(system)
+    request = {"batch_id": "two-bubble-contact", "entries": [
+        {"draft_id": "first-bubble", "text": "蓝门", "references": [{"activity_ref": ref}]},
+        {"draft_id": "second-bubble", "text": "门后的海", "references": [{"activity_ref": ref}]}]}
+    memory.sharing.prepare(request)
+    deliver(system, ref, "accepted", "first-receipt", draft_id="first-bubble", message_id="actual-first-id")
+    remainder = {**request, "entries": request["entries"][1:]}
+    with pytest.raises(Conflict, match="reconciled"):
+        memory.sharing.preview(remainder)
+    assert memory.sharing.preview({**remainder, "source_only": True})["state"] == "ready"
+    with pytest.raises(Conflict, match="accepted receipt"):
+        memory.sharing.prepare({"draft_id": "first-bubble", "references": [{"activity_ref": ref}]})
+    with memory.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE sources SET deleted=1 WHERE id=?", (ref["source_id"],))
+    with pytest.raises((Conflict, Missing, ValueError)):
+        memory.sharing.preview({**remainder, "source_only": True})
+
+
 def test_coverage_cannot_attach_an_unseen_dream_to_an_unrelated_accepted_bubble(system):
     mind, memory, _, _ = system
     ref = activity(system)

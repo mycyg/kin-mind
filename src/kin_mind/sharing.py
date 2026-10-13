@@ -419,8 +419,12 @@ class ShareLedger:
             raise ValueError("Send preparation needs original draft identities")
         with self.engine.db.connect() as conn:
             checked = [self._checked_entry(conn, entry) for entry in entries]
-            for row in conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=?", (self.scope.key(),)):
-                self._check_draft(self._reservation_data(row), group)
+            # Between bubbles the transport journal already reconciled every
+            # begun send. Recheck only the originals before the next unsent
+            # bubble: the group's own accepted prefix can leave it pending.
+            if request.get("source_only") is not True:
+                for row in conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=?", (self.scope.key(),)):
+                    self._check_draft(self._reservation_data(row), group)
             return {"state": "ready", "draft_id": group, "checked": checked}
 
     def resolve_reply_context(self, conn, event):
