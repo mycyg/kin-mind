@@ -52,7 +52,7 @@ TITLE = "Kin 的梦"
 # The prefix every stored dream starts with: whatever shows its raw text says what it is.
 DREAM_PREFIX = "Kin 的梦（想象出来的，不是发生过的事）：\n"
 # The section's paragraph, appended only to a request that offers it.
-DREAM_PROMPT = ("dream 只在休息相位的空闲评估里出现：今晚要不要做梦由你决定，不必每晚都有，大多数夜里留空就好。"
+DREAM_PROMPT = ("dream 在休息或逐渐放松时的空闲、节奏评估里可选：今晚要不要做梦由你决定，不必每晚都有，也可以留空。"
                 "想做时，只从 dream_material 里取材料（最近 48 小时的经历、记忆和日记片段），写 text：80 到 220 个字，"
                 "第一人称、现在时，像刚醒时还记得的那一段；可以不合逻辑、场景跳转、人和事错位。"
                 "不给建议，不解释象征，不写成日记或总结。梦中事件不是发生过的事，不能当作现实事实或特征的证据。"
@@ -163,10 +163,15 @@ def material(conn, mind, at):
 
 
 def offer(conn, mind, view, data, *, at):
-    """The material a dream may be written from, when this attempt may offer one: an idle review, in
-    the resting phase, with no dream yet tonight and something to dream of. Otherwise None."""
+    """Offer an optional dream during a quiet/rhythm review in rest or settling.
+
+    The proposed phase expresses Kin's transition. Its awake base must not hide
+    settling from this offer; the assessment still chooses whether to dream.
+    """
     stimuli = set(data.get("stimuli") or [data.get("stimulus")])
-    if ("idle-review" not in stimuli or (view.get("rhythm") or {}).get("phase") != REST_PHASE
+    rhythm = view.get("rhythm") or {}
+    phase = rhythm.get("proposed_phase") or rhythm.get("phase")
+    if (not stimuli.intersection({"idle-review", "rhythm-review"}) or phase not in {REST_PHASE, "settling", "drowsy"}
             or not enabled(conn, mind.scope.key(), SWITCH) or dreamt_tonight(conn, mind.scope.key(), at)):
         return None
     shown, refs = material(conn, mind, at)

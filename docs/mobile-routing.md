@@ -427,6 +427,13 @@ The reviewer calls DeepSeek's [Anthropic-compatible endpoint](https://api-docs.d
 with high-effort thinking and one structured tool result. The conversation gateway
 uses the [Responses endpoint](https://api-docs.deepseek.com/guides/responses_api/).
 
+DeepSeek rejects nullable array type lists such as `type: ["array", "null"]`.
+The companion's contact schema uses an array for `desire_ids`; an empty array
+already means all offered wishes. Provider failures keep their failed terminal
+outcome. Redacted server validation messages and request attempt IDs remain in
+the owner's private provider error journal; public usage and ACP output retain
+only machine error fields.
+
 ## Validation
 
 Every verified profile change creates one durable owner notification, including

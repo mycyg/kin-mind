@@ -180,6 +180,42 @@ def test_no_dream_is_offered_awake_off_or_outside_an_idle_review(env):
     assert not dreams_of(mind)
 
 
+@pytest.mark.parametrize("stimulus", ["idle-review", "rhythm-review"])
+def test_settling_with_an_awake_base_offers_material_without_forcing_a_dream(env, stimulus):
+    mind, memory, source, entry, _ = env
+    memory.configure({"dreams": True})
+    asleep(mind, source)
+    mind.record(AffectiveEvent(command_id="settling", agent_version="inner-v1",
+        expected_revision=mind.read()["revision"], evidence_ids=[source("settling")], reason="Relaxing",
+        rhythm=RhythmProposal(phase="settling", base_phase="awake", alertness=35, target=20,
+                              half_life_minutes=180, reason="Relaxing")))
+    view = mind.read()["rhythm"]
+    assert view["phase"] == "awake" and view["proposed_phase"] == "settling"
+    entry("settling-material", "今天折了一只纸船。")
+    result, reader = review(mind, source, lambda c: Appraisal(reason="只想安静放松"), "quiet-choice", stimulus=stimulus)
+    assert result["state"] == "complete", result
+    assert reader.seen[0]["dream_material"] and "dream" in reader.offered[0]
+    assert not dreams_of(mind), "offered material is an option, not a generated dream"
+    result, reader = review(mind, source, lambda c: Appraisal(reason="想做个梦", dream=Dream(text=DREAM)),
+                            "dream-choice", stimulus=stimulus)
+    assert result["state"] == "complete", result
+    assert len(dreams_of(mind)) == 1
+
+
+def test_a_rhythm_review_can_remember_a_recent_dream_without_automatic_sharing(env):
+    mind, memory, source, entry, clock = env
+    memory.configure({"dreams": True})
+    asleep(mind, source)
+    entry("material", "今天折了一只纸船。")
+    review(mind, source, lambda c: Appraisal(reason="梦", dream=Dream(text=DREAM)), "dream")
+    clock[0] += timedelta(hours=20)
+    result, reader = review(mind, source, lambda c: Appraisal(reason="先留在心里"), "rhythm-recall", stimulus="rhythm-review")
+    assert result["state"] == "complete", result
+    assert reader.seen[0]["recent_dreams"][0]["basis"] == "imagined"
+    assert reader.seen[0]["recent_dreams"][0]["text"] == DREAM
+    assert not [wish for wish in mind.read()["desires"] if wish.get("activity_ref")], "remembering does not request a send"
+
+
 def test_a_dream_out_of_bounds_costs_the_dream_and_never_the_review(env):
     mind, memory, source, entry, _ = env
     memory.configure({"dreams": True})

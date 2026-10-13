@@ -453,7 +453,7 @@ class Continuity:
         if current == attention_for and entry.get("attention_input_id") == input_id:
             return marker_changed
         phase = entry.get("base_phase") or entry["phase"]
-        entry.update(base_phase=phase, phase=phase, attention_for=attention_for,
+        entry.update(base_phase=phase, attention_for=attention_for,
                      return_to=entry.get("return_to") or phase, attention_input_id=input_id,
                      attention_at=self.clock(), attention_event_id=event_id)
         return True
@@ -744,7 +744,7 @@ class Continuity:
             phase = proposal.base_phase or proposal.phase
             state["rhythm"] = {
                 **proposal.model_dump(exclude={"evidence_ids"}),
-                "phase": phase,
+                "phase": proposal.phase,
                 "base_phase": phase,
                 "return_to": (proposal.return_to or phase) if proposal.attention_for else None,
                 "current_activity": (proposal.current_activity if proposal.current_activity is not None

@@ -19,12 +19,14 @@ test('Kimi Code request preserves public tool history, image input and caller ou
  for(const key of ['service_tier','previous_response_id','conversation'])assert.equal(value[key],undefined);
 });
 
-test('provider message diagnostics classify only fixed known parameter names and never retain arbitrary prose',()=>{
+test('private provider diagnostics keep the actual reason, redact credentials and bound prose',()=>{
  assert.equal(providerMessageDiagnostic('Unsupported parameter: include').parameter,'include');
- for(const text of ['Unsupported parameter: private_code','Unsupported parameter: include; private dialogue','secret code and conversation']){
-  const result=providerMessageDiagnostic(text);assert.deepEqual(Object.keys(result),['messageSha256','messageUtf8Bytes']);
-  assert.equal(result.messageSha256.length,64);assert.equal(result.messageUtf8Bytes,Buffer.byteLength(text));
- }
+ const message='Invalid json schema: field `type`: unknown variant `array` (request_id: synthetic-id)';
+ assert.equal(providerMessageDiagnostic(message).message,message);
+ const redacted=providerMessageDiagnostic('credential-a Bearer unknown-token credential-b',['credential-a','credential-b']);
+ assert.equal(redacted.message,'[redacted] Bearer [redacted] [redacted]');
+ const long=providerMessageDiagnostic('x'.repeat(5000));
+ assert.equal(long.message.length,4096);assert.equal(long.messageTruncated,true);assert.equal(long.messageUtf8Bytes,5000);
 });
 
 test('the public gateway names no particular owner; the host supplies the name', () => {
@@ -145,7 +147,7 @@ test('provider message goes only to a private sink with known credentials remove
  try{
   const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model:'k3',input:[user('private input')],reasoning:{effort:'high'}})});
   const value=await response.json();assert.equal(response.status,400);assert.equal(privateRows.length,1);
-  assert.equal(typeof privateRows[0].messageSha256,'string');assert.equal(privateRows[0].message,undefined);
+  assert.match(privateRows[0].message,/Unsupported parameter include/);
   assert.doesNotMatch(JSON.stringify(privateRows),/synthetic-.*-secret|unknown-secret|private input|not retained/);
   assert.equal(privateRows[0].requestShape.reasoningEffort,'high');assert.equal(privateRows[0].provider,'kimi');
   assert.doesNotMatch(JSON.stringify([value,usage]),/Unsupported parameter|redacted|private input/);

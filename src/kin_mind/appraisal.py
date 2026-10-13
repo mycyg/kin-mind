@@ -266,7 +266,7 @@ class Wish(Model):
     concern_ids: list[str] = Field(default_factory=list, max_length=10)
     exploration_target: Literal["knowledge", "computer"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
-    activity_ref: dict | None = None
+    activity_ref: dict | None = Field(default=None, description="Only an existing dream or exploration activity pointer: kind is dream or exploration. A new explore/create wish normally leaves this null; a dataset/file/source ID belongs in the brief or evidence, not a new activity kind.")
 
     @field_validator("kind")
     @classmethod
@@ -2824,9 +2824,9 @@ class Appraisals:
                     # Kin's latest diaries: a reflection reaches what Kin plans and who Kin becomes only
                     # through an assessment that sees it, and cites it as the evidence below allows.
                     model_context["recent_reflections"] = self.memory.recent_reflections()
-                    if settings.get("dreams") is True and "idle-review" in set(data.get("stimuli") or [data.get("stimulus")]):
+                    if settings.get("dreams") is True and {"idle-review", "rhythm-review"}.intersection(data.get("stimuli") or [data.get("stimulus")]):
                         # The latest dream, never as evidence: whether 小光 hears of it is a contact wish
-                        # this review may make (dreams.py). Shown, so the queue row names it below.
+                        # this quiet/rhythm review may make (dreams.py). Shown, so the queue row names it below.
                         dreamt = dreams.recent(self.mind)
                         if dreamt:
                             model_context["recent_dreams"] = dreamt
@@ -2903,7 +2903,7 @@ class Appraisals:
                     audited = audit_switches(conn, self.mind.scope.key()) if isolation else set()
                     data.pop("dream_material", None)
                     if "dream" in audited:
-                        # Offered to an idle review in the resting phase only, once a night, with something
+                        # Optional during quiet/rhythm reviews in rest or settling, once a night, with something
                         # to dream of; the references it would rest on stay with the row (dreams.py).
                         offer = dreams.offer(conn, self.mind, view, data, at=self.mind.clock())
                         if offer:

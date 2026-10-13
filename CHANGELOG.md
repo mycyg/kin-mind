@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.35 — 2026-10-13
+
+- Preserve a chosen settling phase beside its awake base and when owner input takes attention. Quiet and rhythm reviews can offer optional dream material during rest, settling or drowsiness; a rhythm review can also remember a recent dream.
+- Keep redacted provider validation reasons in the owner's private diagnostics, separate from public usage and ACP output.
+- Clarify that activity pointers refer to existing dreams or explorations; a new research wish names its source in the brief.
+- Companion integration fixes DeepSeek's rejection of nullable array types in contact drafts and records failed native drafts with their actual outcome. Empty wish arrays retain their existing meaning of all offered wishes.
+
 ## 0.1.34 — 2026-10-12
 
 - Bind public dialogue checkpoints to the original messages. Later self-knowledge or other interpretations citing those messages no longer block model handoff; selected semantic memories retain their own dependencies.
