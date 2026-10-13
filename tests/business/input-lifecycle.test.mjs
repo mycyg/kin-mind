@@ -513,11 +513,13 @@ test('a reply settles the inputs it was formed for, never a later one steered in
   const f=fixture(t);
   await chat(f,'a','在吗');
   await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['a']});
-  await f.router.dispatch({id:'b',kind:'owner',text:'还有个事'},async()=> 'steered');
+  const turn=f.router.state.turn;
+  const injected=async id=>{await f.router.observe('input-steered',{inputId:id,turn});return 'steered';};
+  await f.router.dispatch({id:'b',kind:'owner',text:'还有个事'},async()=>injected('b'));
   assert.equal(f.router.state.inputs.b.turnStartedAt,f.router.state.inputs.a.turnStartedAt,'one native turn');
   assert.deepEqual(await f.router.observe('reply-complete',{inputId:'a'}),['a']);
   assert.equal(f.router.state.inputs.b.answer,undefined,'A\'s reply formed before B came: B is still owed');
-  await f.router.dispatch({id:'c',kind:'owner',text:'再补一句'},async()=> 'steered');
+  await f.router.dispatch({id:'c',kind:'owner',text:'再补一句'},async()=>injected('c'));
   assert.deepEqual(await f.router.observe('reply-complete',{inputId:'b',answeredInputIds:['b','c','a']}),['b','c'],'what the reply group names, and only what is still open');
   assert.deepEqual([f.router.state.inputs.c.answer.state,f.router.state.inputs.c.answer.basis],['covered','answered-input-ids']);
   // Merged into one prompt is not settled by the start time either: only what the group names.

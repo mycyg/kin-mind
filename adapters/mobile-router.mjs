@@ -1297,7 +1297,6 @@ export class MobileRouter {
         this.save('input-queued',{id:input.id});return {route,model:target,queued:true};
       }
       record.state='accepted';record.acceptedAt??=this.now();
-      if(route==='steered'&&this.state.turn&&!this.state.turn.inputIds.includes(record.id)){record.turnStartedAt=this.state.turn.startedAt;this.state.turn.inputIds.push(record.id);}
       this.save('input-accepted',{id:input.id,route});
       return{route,model:target};
     });
@@ -1997,6 +1996,7 @@ export class MobileRouter {
   }
   turnEnded(data) {
     const turn=this.state.turn,at=this.now();if(!turn)return false;
+    turn.endedAt=at;turn.stopReason=data.stopReason??null;
     for(const id of turn.inputIds) {
       const record=this.state.inputs[id];if(!record?.turnStartedAt||record.turnEndedAt>=record.turnStartedAt)continue;
       record.turnEndedAt=at;record.stopReason=data.stopReason??null;
@@ -2023,9 +2023,21 @@ export class MobileRouter {
     const record=typeof data.sourceInputId==='string'?this.state.inputs[data.sourceInputId]:null;
     if(!record)return false;
     this.progress.set(record.id,this.now());
-    if(data.state==='accepted'&&data.messageId){record.delivered=(record.delivered??0)+1;record.lastDeliveredAt=this.now();return true;}
+    let uncertaintyChanged=false;
+    if(typeof data.id==='string'&&data.id) {
+      const unknown=new Set(record.uncertainDeliveries??[]);
+      if(['sending','unconfirmed'].includes(data.state)&&!record.deliveredBubbleIds?.includes(data.id)){uncertaintyChanged=!unknown.has(data.id);unknown.add(data.id);}
+      else if(['accepted','rejected','undeliverable','canceled','not-submitted'].includes(data.state))uncertaintyChanged=unknown.delete(data.id);
+      if(unknown.size)record.uncertainDeliveries=[...unknown];else delete record.uncertainDeliveries;
+    }
+    if(data.state==='accepted'&&data.messageId){
+      // Manifest side effects are at least once. Re-observing an original
+      // bubble receipt adds no second logical bubble or new platform send.
+      if(data.id){if(record.deliveredBubbleIds?.includes(data.id))return uncertaintyChanged;record.deliveredBubbleIds=[...(record.deliveredBubbleIds??[]),data.id];}
+      record.delivered=(record.delivered??0)+1;record.lastDeliveredAt=this.now();return true;
+    }
     if(['rejected','undeliverable'].includes(data.state)){record.undelivered=(record.undelivered??0)+1;return true;}
-    return false;
+    return uncertaintyChanged;
   }
   /** The whole reply to an owner input reached the platform, or Kin chose not to
    * reply. It settles the input its reply group belongs to and the inputs the group
@@ -2049,6 +2061,28 @@ export class MobileRouter {
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
+      if(kind==='input-steered') {
+        const record=this.state.inputs[data.inputId],turn=data.turn;
+        // The host has verified an injected receipt for this captured turn.
+        // Its original start/end facts survive an acknowledgement that arrives
+        // after it ended; the current turn may already belong to another input.
+        if(!turn?.startedAt||!record||!['submitting','accepted'].includes(record.state)||
+          record.executionEpoch!==this.state.executionEpoch||turn.turnFence!==record.executionEpoch)return;
+        record.state='accepted';record.acceptedAt??=this.now();record.turnStartedAt=turn.startedAt;
+        if(turn.endedAt){record.turnEndedAt=turn.endedAt;record.stopReason=turn.stopReason;}
+        if(this.state.turn===turn&&!turn.inputIds.includes(record.id))turn.inputIds.push(record.id);
+        this.progress.set(record.id,turn.endedAt??turn.startedAt);
+        this.save('input-steered',{id:record.id});return;
+      }
+      if(kind==='native-failure') {
+        const record=this.state.inputs[data.inputId];
+        // The completion callback reports a known failed native turn, including
+        // each input steered into it. It says nothing about an uncertain send.
+        if(!record?.turnStartedAt||!['accepted','submitting'].includes(record.state)||
+          record.executionEpoch!==this.state.executionEpoch||data.turnFence!==record.executionEpoch)return;
+        record.nativeFailure??={code:'native-turn-failed',at:this.now()};
+        this.save('input-native-failed',{id:record.id,code:record.nativeFailure.code});return;
+      }
       let dirty=false;
       if(kind==='prompt-start') {
         const refused=this.refusedPrompt(data);
@@ -2056,7 +2090,13 @@ export class MobileRouter {
         dirty=this.turnStarted(data)||dirty;
       }
       if(kind==='prompt-end')dirty=this.turnEnded(data)||dirty;
-      if(kind==='delivery'&&data.sourceInputId)dirty=this.inputDelivery(data)||dirty;
+      if(kind==='delivery'&&data.sourceInputId) {
+        dirty=this.inputDelivery(data)||dirty;
+        // A previous write may have failed after changing memory. The manifest
+        // can acknowledge even a duplicate observation only after this save
+        // succeeds; counting the same bubble remains idempotent.
+        if(this.state.inputs[data.sourceInputId])dirty=true;
+      }
       if(kind==='reply-complete'||kind==='reply-choice'){const settled=this.inputAnswered(kind,data);if(settled)this.save(kind,{inputId:data.inputId,...(settled.length>1?{covered:settled.slice(1)}:{})});return settled;}
       if(kind==='input-dropped') {
         // The session let a queued prompt go before it began: provably never submitted.
@@ -2493,6 +2533,7 @@ export class MobileRouter {
           if(reconciliation)verdict='unknown';
         } else if(record.state==='accepted') {
           if(record.operationFailed)verdict='stopped';
+          else if(record.nativeFailure)verdict=record.uncertainDeliveries?.length?'unknown':(record.delivered??0)>0?'partial':'stopped';
           else if(record.route==='control') {
             // A control is answered by its own reply; while that reply is still being made or
             // sent nothing is owed, and once it failed or went unconfirmed the owner is told.

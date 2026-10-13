@@ -2,10 +2,54 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import {deepseekRequest,kimiRequest,providerMessageDiagnostic,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway} from '../../adapters/deepseek-gateway.mjs';
+import {deepseekRequest,kimiRequest,providerMessageDiagnostic,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway,nativeTurnPurpose,gatewayTransportFailure} from '../../adapters/deepseek-gateway.mjs';
 
 const source = fs.readFileSync(new URL('../../adapters/deepseek-gateway.mjs', import.meta.url), 'utf8');
 const user = text => ({type: 'message', role: 'user', content: [{type: 'input_text', text}]});
+
+test('bound main creation is user work and cannot be starved by foreground classification',async t=>{
+  assert.deepEqual(nativeTurnPurpose('creation',{mainConversation:true}),{lane:'user-work',purpose:'native-creation'});
+  for(const kind of ['creation','assessment','contact-draft','exploration'])assert.equal(nativeTurnPurpose(kind).lane,'background');
+  const lanes=[],usage=[];
+  const gateway=await startDeepSeekGateway({key:'synthetic-ds',kimiKey:'synthetic-kimi',
+    purposeFor:()=>({...nativeTurnPurpose('creation',{mainConversation:true}),mainConversation:true}),onUsage:r=>usage.push(r),
+    lease:{acquire:async({lane})=>{lanes.push(lane);return {proceed:lane!=='background',retryAfterSeconds:30,
+      detail:()=>({lane,leaseState:lane==='background'?'wait':'admitted'}),release:async()=>{}};}},
+    fetchImpl:async()=>({ok:true,headers:{get:()=> 'application/json'},json:async()=>({id:'synthetic',status:'completed',output:[],usage:{}})})});
+  t.after(()=>gateway.close());
+  const r=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model:'k3',input:[user('synthetic work')]})});
+  assert.equal(r.status,200);await r.text();assert.deepEqual(lanes,['user-work']);assert.equal(usage[0].outcome,'completed');
+});
+
+test('existing transport failures keep a useful reason without retaining private prose',async t=>{
+  const marker='synthetic-private-credential-and-message';
+  assert.deepEqual(gatewayTransportFailure(Object.assign(Error(marker),{cause:{code:'ECONNRESET'}})),{reason:'network-error',code:'ECONNRESET'});
+  assert.equal(JSON.stringify(gatewayTransportFailure(Error(marker))).includes(marker),false);
+  const stream=frames=>({ok:true,headers:{get:()=> 'text/event-stream'},body:(async function*(){for(const frame of frames)yield Buffer.from(frame);})()});
+  const cases=[
+    ['missing-terminal-event',async()=>stream(['data: {"type":"response.created","response":{"id":"synthetic"}}\n\n'])],
+    ['malformed-stream-frame',async()=>stream(['data: {"private":"'+marker+'"\n\n'])],
+    ['malformed-response-json',async()=>({ok:true,headers:{get:()=> 'application/json'},json:async()=>{throw new SyntaxError(marker);}})],
+    ['network-error',async()=>{throw Object.assign(Error(marker),{cause:{code:'ECONNRESET'}});}],
+    ['timeout',async(_url,{signal})=>new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(new DOMException(marker,'AbortError')),{once:true}))]
+  ];
+  for(const [reason,fetchImpl] of cases){
+    const rows=[];const gateway=await startDeepSeekGateway({key:'synthetic',onUsage:r=>rows.push(r),fetchImpl,timeoutMs:reason==='timeout'?30:5000});
+    try{
+      const r=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model:'deepseek-flash',input:[user('synthetic')]})});
+      const body=await r.text();assert.equal(rows.length,1,reason);assert.equal(rows[0].transportFailure.reason,reason);
+      assert.equal(rows[0].usageStatus,'unknown');assert.equal(JSON.stringify(rows).includes(marker),false);assert.equal(body.includes(marker),false);
+    }finally{await gateway.close();}
+  }
+});
+
+test('a lane refusal gives the native retry its actual wait interval and makes no provider call',async t=>{
+  const gateway=await startDeepSeekGateway({key:'synthetic',purposeFor:()=>nativeTurnPurpose('assessment'),
+    lease:{acquire:async()=>({proceed:false,retryAfterSeconds:30,detail:()=>({leaseState:'wait'}),release:async()=>{}})},
+    fetchImpl:async()=>assert.fail('refused admission is not a provider request')});t.after(()=>gateway.close());
+  const r=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model:'deepseek-flash',input:[user('synthetic')]})});
+  assert.equal(r.status,503);assert.equal(r.headers.get('retry-after'),'30');await r.text();
+});
 
 test('Kimi Code request preserves public tool history, image input and caller output budget',()=>{
  const input=[user('synthetic'),{type:'message',role:'developer',content:[{type:'input_text',text:'synthetic contract'}]},

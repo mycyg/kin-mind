@@ -21,6 +21,56 @@ function fixture(t,options={}) {
   return {root,clock,runtime,args,router:new MobileRouter(args)};
 }
 
+test('a known failed native turn reports stopped or partial, while unknown submission stays unknown',async t=>{
+  const f=fixture(t);
+  for(const id of ['original','steered'])await f.router.dispatch({id,text:'synthetic chat'},async()=> 'new-turn');
+  await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['original','steered']});
+  await f.router.observe('prompt-end',{taskId:null,inputVersion:null,turnFence:0,stopReason:'end_turn'});
+  await f.router.observe('delivery',{taskId:null,sourceInputId:'steered',state:'accepted',messageId:'synthetic-part'});
+  for(const inputId of ['original','steered'])await f.router.observe('native-failure',{inputId,turnFence:0});
+  const notices=[];
+  await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'synthetic-notice'};}});
+  assert.deepEqual(notices,[['stopped','original']],'explicit failure is not reported as a pending lookup');
+  f.clock.now+=11*60000;
+  await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'synthetic-notice-2'};}});
+  assert.deepEqual(notices.at(-1),['partial','steered'],'a delivered prefix remains delivered');
+  let submitted=0;
+  await f.router.dispatch({id:'original',text:'synthetic chat'},async()=>{submitted++;return 'new-turn';});
+  assert.equal(submitted,0,'a known failed turn is not authority to repeat its input');
+  await f.router.observe('reply-complete',{inputId:'original'});
+  assert.equal(inputSummary(f.router.state.inputs.original),'answered','an eventual reply still outranks the notice');
+
+  const g=fixture(t);await g.router.dispatch({id:'uncertain',text:'synthetic chat'},async()=> 'new-turn');
+  g.router.state.inputs.uncertain.state='unconfirmed';
+  await g.router.observe('native-failure',{inputId:'uncertain',turnFence:0});
+  assert.equal(g.router.state.inputs.uncertain.nativeFailure,undefined,'no begun native turn is proven');
+  await g.router.watch({reconcileInput:async()=>({state:'unknown'})});
+  const seen=[];await g.router.watch({notifyOwner:async(kind,id)=>{seen.push([kind,id]);return {state:'accepted',messageId:'n'};}});
+  assert.deepEqual(seen,[['unknown','uncertain']]);
+});
+
+test('a completion from an older execution does not mark the new native turn failed',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'first',text:'synthetic chat'},async()=> 'new-turn');
+  await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['first']});
+  f.router.state.executionEpoch=1;
+  await f.router.observe('native-failure',{inputId:'first',turnFence:0});
+  assert.equal(f.router.state.inputs.first.nativeFailure,undefined);
+});
+
+test('a failed native turn does not turn an uncertain platform send into a definite failure',async t=>{
+  const f=fixture(t);await f.router.dispatch({id:'owner',text:'synthetic'},async()=> 'new-turn');
+  await f.router.observe('prompt-start',{taskId:null,inputVersion:null,turnFence:0,inputIds:['owner']});
+  await f.router.observe('delivery',{taskId:null,id:'original-send-id',sourceInputId:'owner',state:'unconfirmed'});
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.args.file)).inputs.owner.uncertainDeliveries,['original-send-id'],'unknown send identity is durable before anything else happens');
+  await f.router.observe('prompt-end',{taskId:null,inputVersion:null,turnFence:0,stopReason:'end_turn'});
+  await f.router.observe('native-failure',{inputId:'owner',turnFence:0});
+  const notices=[];await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'n'};}});
+  assert.deepEqual(notices,[['unknown','owner']]);
+  await f.router.observe('delivery',{taskId:null,id:'original-send-id',sourceInputId:'owner',state:'accepted',messageId:'original-receipt'});
+  assert.equal(f.router.state.inputs.owner.uncertainDeliveries,undefined);
+  await f.router.observe('reply-complete',{inputId:'owner'});assert.equal(inputSummary(f.router.state.inputs.owner),'answered');
+});
+
 test('the eight summary states are a view over the facts, which are all kept',()=>{
   const cases=[
     [{state:'semantic-pending'},'classifying'],[{state:'selected'},'queued'],[{state:'preparing'},'queued'],[{state:'queued'},'queued'],

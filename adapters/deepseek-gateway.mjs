@@ -10,9 +10,26 @@ import {emitInstructionEvidence,instructionTextEvidence,normalizeNativeInstructi
 // spend: a chat turn is what the owner is waiting for, while contact drafts,
 // creation and exploration are the host's own sessions and yield to the owner.
 export const BACKGROUND_TURN_KINDS = new Set(['contact-draft', 'creation', 'exploration', 'assessment']);
-export const nativeTurnPurpose = (kind = 'chat') => BACKGROUND_TURN_KINDS.has(kind)
+export const nativeTurnPurpose = (kind = 'chat', {mainConversation = false} = {}) => kind === 'creation' && mainConversation
+  ? {lane: 'user-work', purpose: 'native-creation'}
+  : BACKGROUND_TURN_KINDS.has(kind)
   ? {lane: 'background', purpose: 'native-' + kind}
   : {lane: 'foreground', purpose: 'native-chat-turn'};
+
+/** Classify an existing failure without retaining its message, body or stack. */
+export function gatewayTransportFailure(error, {phase = 'connect', abortReason = null, held = null} = {}) {
+  if(held?.lost)return {reason:'lease-lost'};
+  if(held?.expired)return {reason:'lease-expired-unconfirmed'};
+  if(abortReason)return {reason:abortReason};
+  if(error?.message==='missing-terminal-event')return {reason:'missing-terminal-event'};
+  if(error?.message==='stream-frame-too-large')return {reason:'stream-frame-too-large'};
+  if(error instanceof SyntaxError)return {reason:phase==='response-stream'?'malformed-stream-frame':'malformed-response-json'};
+  const code=error?.cause?.code??error?.code;
+  if(['ECONNRESET','ECONNREFUSED','EPIPE','ETIMEDOUT','ENOTFOUND','EAI_AGAIN','UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','UND_ERR_SOCKET'].includes(code))return {reason:'network-error',code};
+  if(error?.name==='AbortError')return {reason:'aborted'};
+  return {reason:'transport-error',phase};
+}
 
 export const continuityContract = "这是宿主请求的内部连续性核验。根据提供的历史，返回最后一个内部事件要求的结构化结果。不调用工具、不发送消息，只提交可核验结论，不输出内部推理。";
 // The owner's name is host configuration (the private host passes mind-config
@@ -259,8 +276,9 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       res.writeHead(404).end(); return;
     }
     const abort = new AbortController(); controllers.add(abort);
-    const timer = setTimeout(() => abort.abort(), timeoutMs);
-    res.on('close', () => { if (!res.writableEnded) abort.abort(); });
+    let abortReason=null,phase='request';
+    const timer = setTimeout(() => {abortReason??='timeout';abort.abort();}, timeoutMs);
+    res.on('close', () => { if (!res.writableEnded) {abortReason??='client-disconnected';abort.abort();} });
     // One usage row per turn that actually reached the provider, on every exit.
     // A request that never got that far is not a call and is not billed as one.
     let upstreamProvider = 'deepseek';
@@ -323,16 +341,17 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         if (!held.proceed) {
           // Background turns yield; the owner's chat turn never reaches here.
           report({usage: null, usageStatus: 'skipped', outcome: 'lane-skipped'});
-          res.writeHead(503, {'Content-Type': 'application/json'});
+          res.writeHead(503, {'Content-Type': 'application/json','Retry-After':String(held.retryAfterSeconds??30)});
           res.end(JSON.stringify({error: {message: 'Model lane unavailable', type: 'provider_error'}})); return;
         }
-        held.signal?.addEventListener('abort', () => abort.abort(), {once: true});
+        held.signal?.addEventListener('abort', () => {abortReason??='lease-aborted';abort.abort();}, {once: true});
       }
       attempted = true;
       requestEvidence={...instructionContext,requestAttemptId:(kimi?'kimi-':'ds-')+randomBytes(16).toString('hex'),
         requestAttempt:1,attempted:true};
       emitInstructionEvidence(onRequestEvidence,{...requestEvidence,stage:'forward-attempted',outcome:null,
         providerResponseId:null,recordedAt:new Date().toISOString()});
+      phase='connect';
       const upstream = await fetchImpl(kimi ? 'https://api.kimi.com/coding/v1/responses' : 'https://api.deepseek.com/responses', {
         method: 'POST', redirect: 'error', signal: abort.signal,
         headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + (kimi ? kimiKey : key)},
@@ -353,6 +372,7 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       }
       const normalize = responseNormalizer(reverseTools);
       if (!(upstream.headers.get('content-type') ?? '').includes('text/event-stream')) {
+        phase='response-json';
         const value = await upstream.json();
         value.output = (value.output ?? []).filter(item => !isPrivateOutput(item))
           .map(item => unflattenItem(item, reverseTools));
@@ -362,6 +382,7 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         res.writeHead(200, {'Content-Type': 'application/json'}).end(JSON.stringify(value)); return;
       }
       res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'});
+      phase='response-stream';
       const decoder = new TextDecoder(); let pending = '',terminal = false;
       const emit = frame => {
         const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
@@ -397,7 +418,8 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       // ever reported. That is unknown, not zero, and not nothing.
       if (attempted) {
         const outcome=held?.lost ? 'lease-lost' : held?.expired ? 'lease-expired-unconfirmed' : 'transport-incomplete';
-        finishEvidence(outcome);report({usage: null, usageStatus: 'unknown', outcome});
+        finishEvidence(outcome);report({usage: null, usageStatus: 'unknown', outcome,
+          transportFailure:gatewayTransportFailure(error,{phase,abortReason,held})});
       }
       // Never return provider bodies, credentials, or raw conversation data in errors.
       if (!res.headersSent) {
