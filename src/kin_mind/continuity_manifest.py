@@ -24,7 +24,7 @@ class ContinuityManifest:
             contexts = Contexts(mind)
         self.ctx, self.mind, self.memory = contexts, mind, contexts.memory
 
-    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None, activity_focus=None, activity_recall=False):
+    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None, activity_focus=None, activity_recall=False, activity_items=None):
         """Bounded candidate expansion, with open matters independent of recency."""
         if policy is None:
             from eventmem.core.read_policy import ReadPolicy
@@ -37,7 +37,8 @@ class ContinuityManifest:
         focus_ids = list(dict.fromkeys([r.get('unit_id') for e in pending for r in e.get('references', []) if r.get('unit_id')]
                                      + [x for x in ((intent or {}).get('exploration_id'), (intent or {}).get('work_id')) if x]))
         activity_focus = activity_focus or (intent or {}).get('activity_ref') or (intent or {}).get('exploration_id')
-        activity_items = self.ctx.activity_items(activity_focus=activity_focus, query=query, detail='summary') if activity_focus or activity_recall else []
+        if activity_items is None:
+            activity_items = self.ctx.activity_items(activity_focus=activity_focus, query=query, detail='summary') if activity_focus or activity_recall else []
         items.extend({**item, 'priority': 0 if activity_focus else 2} for item in activity_items)
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)

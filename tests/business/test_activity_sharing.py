@@ -79,7 +79,7 @@ def test_private_and_defer_can_change_without_new_facts_or_reason(system, kind):
     before = read_activity_ref(mind, ref)["text"]
     decide(system, ref, "share", "now-share")
     did = wish(system, ref, "contact")["desire_id"]
-    decide(system, ref, "share", "same-choice")
+    decide(system, ref, "share", "same-choice", reason="Same choice, restated")
     with mind.engine.db.connect() as conn:
         same = mind._load(conn)
         assert same["desires"][did]["sharing_revision"] == 2
@@ -226,7 +226,7 @@ def test_reply_to_an_old_message_uses_channel_chat_and_original_activity(system)
     user = [d for d in recent_dialogue(mind) if d["role"] == "user"][-1]
     assert user["reply_share_id"] == delivered["share_id"]
     assert user["activity_refs"] == [ref]
-    assert user["conversation_id"] == "chat-a"
+    assert "conversation_id" not in user and "platform_message_id" not in user
 
 
 def test_legacy_finding_references_and_subjective_state_remain_compatible(system):

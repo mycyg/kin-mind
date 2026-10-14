@@ -436,7 +436,7 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     assert HABITS_ITEM in first["covered_ids"] and all(word in first["text"] for word in WORDS)
     seen = contexts.window("thread-1")["seen"][HABITS_ITEM]
     assert seen == memory.habits.read()["revision"], "existing table revision, not a content hash"
-    assert HABITS_ITEM in read("turn-2")["covered_ids"], "current preferences stay visible without content fingerprints"
+    assert HABITS_ITEM not in read("turn-2")["covered_ids"], "unchanged preferences use their existing revision"
 
     before = memory.habits.read()
     engine.delete(directions)
@@ -446,8 +446,8 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     again = read("turn-3")
     assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
     assert not any(word in again["text"] for word in WORDS) and "autonomous" in again["text"]
-    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == seen
-    assert HABITS_ITEM in read("turn-4")["covered_ids"]
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == Contexts.habits_item(memory.habits.read())["revision"]
+    assert HABITS_ITEM not in read("turn-4")["covered_ids"]
     assert her_words(engine) == {}
 
     assert not hasattr(context, "digest")
@@ -528,12 +528,14 @@ def test_current_defaults_are_visible_without_computing_a_content_revision(syste
     def read(turn):
         return contexts.build("", purpose="chat", session="thread-1", event_id=turn)
 
-    assert HABITS_ITEM in read("turn-1")["covered_ids"] and HABITS_ITEM in read("turn-2")["covered_ids"]
+    assert HABITS_ITEM in read("turn-1")["covered_ids"] and HABITS_ITEM not in read("turn-2")["covered_ids"]
     seen, revision = contexts.window("thread-1")["seen"][HABITS_ITEM], memory.habits.read()["revision"]
     monkeypatch.setattr(habit_rules, "DEFAULTS", {**habit_rules.DEFAULTS, "exploration_min_interval_minutes": 45})
     assert memory.habits.read()["revision"] == revision
+    sid = said(memory, clock, "defaults-updated", "Synthetic preference: every 45 minutes")
+    memory.habits.update({"command_id":"defaults-updated","expected_revision":revision,"evidence_ids":[sid],"reason":"Synthetic preference update","preferences":{"exploration_min_interval_minutes":45}})
     again = read("turn-3")
     assert HABITS_ITEM in again["covered_ids"], "sent again, as they are now"
     lines = [json.loads(line) for line in again["text"].splitlines() if line.startswith("{")]
     assert json.loads(next(line for line in lines if line["id"] == HABITS_ITEM)["text"])["exploration_min_interval_minutes"] == 45
-    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == seen
+    assert contexts.window("thread-1")["seen"][HABITS_ITEM] == Contexts.habits_item(memory.habits.read())["revision"]

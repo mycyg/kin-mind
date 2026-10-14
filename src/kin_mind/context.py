@@ -551,7 +551,7 @@ class Contexts:
         # As the entries' evidence names them; not the rest a reference keeps, such as the message's hash.
         set_from = {dumps(named): named for named in ({key: ref[key] for key in ("source_id", "record_id", "revision") if key in ref}
                                                       for ref in refs)}
-        return {"id": HABITS_ITEM, "revision": habits["revision"], "text": dumps(habits["preferences"]),
+        return {"id": HABITS_ITEM, "revision": (str(habits["revision"]) + ":deleted:" + ",".join(sorted(k for k,v in habits["entries"].items() if v.get("source_deleted")))) if any(v.get("source_deleted") for v in habits["entries"].values()) else habits["revision"], "text": dumps(habits["preferences"]),
                 "basis": "explicit", "source_ids": sorted({ref["source_id"] for ref in refs if ref.get("source_id")}),
                 "record_ids": sorted({ref["record_id"] for ref in refs if ref.get("record_id")}),
                 SET_FROM: [set_from[key] for key in sorted(set_from)]}
@@ -707,7 +707,7 @@ class Contexts:
                     # The summary names its original sources; revisions are
                     # historical metadata, not a content-consistency gate.
                     deps = [{"id": e["id"], "revision": e["revision"]} for e in related[:8]]
-            return {"id": node["id"], "revision": node["revision"], "text": text, "facts": facts,
+            return {"id": node["id"], "revision": f"{node['revision']}:{facts.get('digest_revision', 0)}:{facts.get('digest_state', '')}:{facts.get('share_coverage', {}).get('version', '')}:{facts.get('share_coverage', {}).get('state', '')}", "text": text, "facts": facts,
                 "read_depth": "summary" if digest_dep or node.get("text") or fallback else "index",
                 "basis": basis, "graph_dependencies": deps, "coverage_dependency": coverage_dep,
                 **({"digest_dependency": digest_dep, "dependencies": record_deps} if digest_dep else {})}
@@ -1167,7 +1167,7 @@ class Contexts:
         recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
             from .continuity_manifest import ContinuityManifest
-            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy, activity_focus=activity_focus, activity_recall=activity_recall)
+            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy, activity_focus=activity_focus, activity_recall=activity_recall, activity_items=activities)
             state_ids.update(i["id"] for i in linked["items"])
             # Keep runtime first, then indivisible facts (authorship, coverage,
             # conditions), ahead of older broad lexical summaries.
@@ -1188,7 +1188,10 @@ class Contexts:
                 items = [*[i for i in items if i["id"] in lead], *archived, *[i for i in items if i["id"] not in lead]]
         unique = {}
         for item in items:
-            unique.setdefault(item["id"], item)
+            if item.get("read_depth") == "original":
+                unique[item["id"]] = item
+            else:
+                unique.setdefault(item["id"], item)
         items = list(unique.values())
         quiet_ids = set()
         if automatic and settings["recall_quiet_marks"]:
@@ -1217,7 +1220,7 @@ class Contexts:
             from .adaptive_recall import AdaptiveRecall
             items = AdaptiveRecall(self).temperature_order(items, explicit=explicit or mode == "deep")
         if not explicit:
-            current_state = {"current-reply-context", "host-runtime", "current-intent", "affect", HABITS_ITEM}
+            current_state = {"current-reply-context", "host-runtime", "current-intent", "affect"}
             items = [i for i in items if i["id"] in current_state or window["seen"].get(i["id"]) != i["revision"]]
             items = self._overviews(items, policy)
         start = int(cursor)

@@ -75,7 +75,7 @@ def apply_decisions(mind, conn, state, proposals, event, receipt, stimulus):
             revive(mind, conn, state, exploration_id)
         decisions[key] = {
             **proposal.model_dump(), "exploration_id": exploration_id, "activity_ref": activity, "source_ids": [activity["source_id"]],
-            "revision": (previous or {}).get("revision", 0) + 1,
+            "revision": (previous or {}).get("revision", 0) + int(not previous or any(previous.get(k) != getattr(proposal, k) for k in ("decision", "reconsider_when"))),
             "updated_at": mind.clock(), "event_id": event.command_id,
             "agent_version": event.agent_version, "evidence": provenance, "runtime": receipt,
         }

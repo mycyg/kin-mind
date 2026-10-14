@@ -538,8 +538,8 @@ class Continuity:
             r
             for r in refs
             if not conn.execute(
-                "SELECT 1 FROM mind_concern_evidence WHERE scope=? AND concern_id=? AND evidence_key=?",
-                (self.scope.key(), cid, evidence_key(r)),
+                "SELECT 1 FROM mind_concern_evidence WHERE scope=? AND concern_id=? AND source_id=?",
+                (self.scope.key(), cid, r["source_id"]),
             ).fetchone()
         ]
         timing = {}
@@ -552,7 +552,7 @@ class Continuity:
         # only moves its window needs no new source (`timed_concerns`).
         retimed = change.action == "update" and bool(current) and any(current.get(k) != v for k, v in timing.items())
         settles = {"ease": "easing", "archive": "archived"}.get(change.action)
-        if current and not subjective and not new_refs and not retimed and (not settles or current["status"] == settles):
+        if current and not subjective and not new_refs and not retimed and not change.owner_request and (not settles or current["status"] == settles):
             # Easing or archiving is Kin's own judgment about a concern and needs no new source
             # (K3-18); it is a replay only when the concern already stands that way.
             return {
@@ -756,6 +756,7 @@ class Continuity:
                 "at": self.clock(),
                 "event_id": event_id,
                 "config_version": state["continuity"]["version"],
+                **({k: old[k] for k in ("attention_for", "attention_input_id", "attention_at", "attention_event_id", "return_to") if k in old} if not proposal.attention_for else {}),
             }
 
     def _continuity_view(self, conn, state, result, at, query=""):

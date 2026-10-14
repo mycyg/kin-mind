@@ -515,3 +515,14 @@ def test_revised_source_does_not_hide_psychology_while_factual_authorization_and
             expected_revision=mind.read()["revision"], evidence_ids=[origin], features={"rhythm": False}, reason="A factual setting"))
     mind.engine.delete(origin)
     assert mind.read()["dimensions"]["joy"]["needs_review"], "Actual deletion keeps its privacy boundary"
+
+def test_legacy_concern_evidence_is_not_new_owner_participation(flexible):
+    mind, _, source, _ = flexible
+    sid = source('same-owner-response')
+    mind.configure_continuity(ContinuityConfig(command_id='concerns-enabled',agent_version='flexible-v1',expected_revision=mind.read()['revision'],evidence_ids=[sid],features={'concerns':True},reason='Synthetic configuration'))
+    created = mind.manage_concern(ConcernChange(command_id='legacy-concern',agent_version='flexible-v1',expected_revision=mind.read()['revision'],action='create',key='legacy',kind='care',content='Synthetic concern',topic='Synthetic',intensity=50,evidence_ids=[sid],basis='explicit',confidence=1))
+    cid = created['concern_id']
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_concern_evidence SET evidence_key='legacy-key' WHERE scope=? AND concern_id=?",(mind.scope.key(),cid))
+    with pytest.raises(Conflict,match='new explicit owner response'):
+        mind.manage_concern(ConcernChange(command_id='legacy-replay',agent_version='flexible-v1',expected_revision=mind.read()['revision'],action='update',concern_id=cid,evidence_ids=[sid],owner_request=OwnerRequest(kind='help',action='Synthetic action',reason='Synthetic reason',completion='Done',status='completed')))

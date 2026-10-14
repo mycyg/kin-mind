@@ -192,3 +192,23 @@ def test_deferred_reply_is_atomic_durable_and_resumes_through_contact(system):
     assert mind.reconsider_contacts(owner_epoch="synthetic")["resumed"] == []
     with pytest.raises(Conflict):
         memory.habits.choose_reply({**request,"retry_after_seconds":1200})
+
+
+def test_graph_context_revision_tracks_summary_and_coverage(system, monkeypatch):
+    from kin_mind.lifecycle import EventLifecycle
+    mind, memory, source, _ = system
+    units = findings(system)
+    contexts = Contexts(mind)
+    before = contexts.graph_item(units[0])
+    send(system, units[0])
+    assert contexts.graph_item(units[0])["revision"] != before["revision"]
+    memory.configure({"event_lifecycle": True})
+    sid = source('summary-source')
+    with mind.engine.db.connect(write=True) as conn:
+        refs = memory.graph.proof(conn, [sid])
+        node = memory.graph._put(conn, {"id":"summary-revision-node","kind":"event","title":"Synthetic event","text":"Synthetic text","source_ids":[refs[0]["source_id"]],"evidence":refs,"basis":"documented"})
+    revision = [1]
+    monkeypatch.setattr(EventLifecycle, 'read', lambda *args, **kwargs: {"state":"ready","revision":revision[0],"data":{"narrative":"Synthetic summary","conclusions":[],"pending":[],"corrections":[],"unresolved":[],"summarized_at":mind.clock(),"source_versions":{}}})
+    first = contexts.graph_item(node)["revision"]
+    revision[0] += 1
+    assert contexts.graph_item(node)["revision"] != first

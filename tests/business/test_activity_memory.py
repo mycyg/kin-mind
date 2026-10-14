@@ -141,10 +141,12 @@ def test_actual_context_build_event_thread_and_manifest_expand_activity_focus(en
     mind, _, source = env
     sid = source("old-dream", dreams.DREAM_PREFIX + DREAM)
     ref = canonical_activity_ref(mind, "dream", sid)
+    MemoryContinuity(mind).configure({"manifests":True})
     contexts = Contexts(mind)
     built = contexts.build(query="后来那个门呢", activity_focus=ref, purpose="read", budget=12000, mode="light")
     assert DREAM in built["text"] and '"basis":"imagined"' in built["text"]
     assert built["model_requests"] == 0
+    assert next(i for i in built["index"] if i["id"].startswith("activity:"))["depth"] == "original"
     event = contexts.event_thread(sid, detail="original", budget=12000, expected_revision=999)
     assert DREAM in event["text"] and event["index"][0]["activity_ref"] == ref
     assert event["requested_revision"] == 999, "historical document metadata does not block a read"
