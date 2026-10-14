@@ -18,7 +18,7 @@ export function artifactManifest(directory,artifacts,runId){
     if(!candidate.startsWith(root+path.sep)||seen.has(candidate))throw Error('Artifact escaped workspace or was duplicated');
     seen.add(candidate);const stat=fs.statSync(candidate);total+=stat.size;
     if(!stat.isFile()||stat.size===0||total>128*1024*1024)throw Error('Artifact missing, empty or over budget');
-    return {artifact_id:runId+':artifact:'+index,path:candidate,relative:path.relative(root,candidate),bytes:stat.size};
+    return {artifact_id:runId+':artifact:'+index,path:candidate,relative:path.relative(root,candidate),bytes:stat.size,sha256:hash(fs.readFileSync(candidate))};
   });
 }
 

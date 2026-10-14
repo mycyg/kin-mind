@@ -58,6 +58,6 @@ export class CreationVerifier {
   child.once('error',()=>finish({state:'unavailable',reason:'renderer-start-failed'}));
   child.once('close',code=>{if(code!==0)return finish({state:'failed',reason:'renderer-exit',exit_code:code});
    try{const value=JSON.parse(output);finish(value);}catch{finish({state:'failed',reason:'invalid-render-receipt'});}});
-  child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify({workspace,path:artifact.path,artifact_id:artifact.artifact_id}));
+  child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify({workspace,path:artifact.path,artifact_id:artifact.artifact_id,sha256:artifact.sha256,bytes:artifact.bytes}));
  });}
 }

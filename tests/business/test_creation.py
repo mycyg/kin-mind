@@ -1,8 +1,8 @@
-from kin_mind.memory import observe_file
+from kin_mind.memory import fingerprint_file as verified_file
 
 
 def fingerprint_file(path):
-    return observe_file(path, artifact_id="synthetic-artifact:" + str(path))
+    return verified_file(path, artifact_id="synthetic-artifact:" + str(path))
 
 import json
 
@@ -90,17 +90,16 @@ def test_required_verification_gap_is_resumable_and_visible_in_compact_plan(env,
     assert receipt['resume_action']=='inspect-checkpoint-and-run-missing-checks'
     assert receipt['checkpoint']==result['receipt']['workspace']
 
-def test_artifact_identity_does_not_require_a_content_hash_during_review(env,tmp_path):
+def test_artifact_changed_during_review_keeps_step_running(env,tmp_path):
     mind,plans,run,result,config=ready(env,tmp_path)
     class Change(Review):
         def structured(self,*args,**kwargs):
             decision,receipt=super().structured(*args,**kwargs)
             Path(result['artifacts'][0]['path']).write_text('{"total":999}')
             return decision,receipt
-    settled=accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Change())
-    assert settled['state']=='completed'
-    assert settled['result']['artifacts'][0]['artifact_id']==result['artifacts'][0]['artifact_id']
-    assert 'sha256' not in settled['result']['artifacts'][0]
+    with pytest.raises(Conflict,match='changed during review'):
+        accept_result(mind,config,{'run_id':run['id'],'owner':'worker','fence':1,'result':result},Change())
+    assert plans.read(identifier=run['plan_id'])['plans'][0]['steps'][0]['state']=='running'
 
 def test_retry_after_artifact_ingestion_reuses_original_observation(env,tmp_path,monkeypatch):
     from kin_mind.memory import MemoryContinuity

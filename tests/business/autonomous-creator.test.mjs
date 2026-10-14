@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
@@ -23,7 +24,7 @@ test('manifest rejects traversal, symlink escape and duplicate artifact paths',(
  assert.throws(()=>artifactManifest(path.join(root,'inside'),['../file.txt'],'run-1'),/escaped/);
  assert.throws(()=>artifactManifest(path.join(root,'inside'),['escape'],'run-1'),/escaped/);
  assert.throws(()=>artifactManifest(root,['file.txt','file.txt'],'run-1'),/duplicated/);
- assert.deepEqual(artifactManifest(root,['file.txt'],'run-1')[0],{artifact_id:'run-1:artifact:0',path:fs.realpathSync(path.join(root,'file.txt')),relative:'file.txt',bytes:13});
+ assert.deepEqual(artifactManifest(root,['file.txt'],'run-1')[0],{artifact_id:'run-1:artifact:0',path:fs.realpathSync(path.join(root,'file.txt')),relative:'file.txt',bytes:13,sha256:createHash('sha256').update('actual output').digest('hex')});
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 test('isolated worker uses configured model and returns native and artifact receipts without phone tools',async()=>{
@@ -34,7 +35,7 @@ test('isolated worker uses configured model and returns native and artifact rece
  try{const creator=new AutonomousCreator({command:'codex',root,spawnImpl,env:{PATH:'/usr/bin',HOME:root,FEISHU_APP_SECRET:'must-not-pass'},executions:records()});
  const result=await creator.run({plan:{id:'p',goal:'Create a text'},step:{id:'s'},run:{id:'r'},brief:{known_evidence:[]}});
  assert.equal(result.state,'produced');assert.equal(result.receipt.thread_id,'isolated-only');assert.equal(result.artifacts.length,1);
- assert.equal(result.artifacts[0].artifact_id,'r:artifact:0');assert.equal('sha256' in result.artifacts[0],false);
+ assert.equal(result.artifacts[0].artifact_id,'r:artifact:0');assert.match(result.artifacts[0].sha256,/^[a-f0-9]{64}$/);
  assert.equal(captured.options.env.FEISHU_APP_SECRET,undefined);assert.ok(captured.args.includes('--ignore-user-config'));assert.ok(captured.args.includes('features.apps=false'));assert.ok(captured.args.includes('sandbox_workspace_write.network_access=false'));assert.ok(!captured.args.includes('resume'));
  assert.equal(captured.args[captured.args.indexOf('--model')+1],'gpt-6-sol');assert.ok(captured.args.includes('model_reasoning_effort="medium"'));
  assert.equal(captured.args.includes('service_tier="fast"'),false,'the default creator never opts into paid Fast');

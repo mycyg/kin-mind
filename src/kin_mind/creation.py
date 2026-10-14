@@ -23,7 +23,7 @@ class CompletionReview(Model):
 def accept_result(mind, config, request, provider=None):
     from . import judgment_cache
     from .appraisal import DeepSeek
-    from .memory import MemoryContinuity, observe_file
+    from .memory import MemoryContinuity, fingerprint_file
     from .model_lanes import ModelAdmissionWait
     from .plans import AutonomousPlans
     plans, memory = AutonomousPlans(mind), MemoryContinuity(mind)
@@ -34,6 +34,9 @@ def accept_result(mind, config, request, provider=None):
             raise Conflict("Unknown creator run", code="creation-run-unknown")
         run = json.loads(row[0])
         if row["state"] != "running":
+            saved = {a["artifact_id"]: a for a in run.get("result", {}).get("artifacts", [])}
+            if any(a.get("artifact_id") in saved and any(a.get(k) != saved[a["artifact_id"]].get(k) for k in ("sha256", "bytes")) for a in result.get("artifacts", [])):
+                raise Conflict("Creation retry changed its output", code="creation-output-changed")
             return run
         plan = plans.get(conn, run["plan_id"])
         step = next(s for s in plan["steps"] if s["id"] == run["step_id"])
@@ -58,7 +61,13 @@ def accept_result(mind, config, request, provider=None):
         path = Path(artifact["path"]).resolve(strict=True)
         if not path.is_relative_to(workspace):
             raise Conflict("Artifact is outside its creation workspace", code="creation-artifact-outside")
-        actual = observe_file(path, artifact_id=artifact.get("artifact_id") or f"{run_id}:artifact:{index}")
+        actual = fingerprint_file(path, artifact_id=artifact.get("artifact_id") or f"{run_id}:artifact:{index}")
+        with mind.engine.db.connect() as conn:
+            prior = conn.execute("SELECT data FROM mind_runtime_events WHERE scope=? AND id=?", (mind.scope.key(), memory._id("runtime", run_id + ":artifact:" + str(index)))).fetchone()
+        if prior and any(json.loads(prior[0])["artifact"].get(k) != actual[k] for k in ("sha256", "bytes")):
+            raise Conflict("Creation retry changed its observed output", code="creation-output-changed")
+        if any(actual[k] != artifact.get(k) for k in ("sha256", "bytes")):
+            raise Conflict("Creation output differs from its receipt", code="creation-output-changed")
         if not actual["bytes"]:
             raise Conflict("Creation output is empty", code="creation-artifact-invalid")
         inspection = {"format": path.suffix.lower(), "content_verified": False}
@@ -96,9 +105,9 @@ def accept_result(mind, config, request, provider=None):
             path = Path(image["path"]).resolve(strict=True)
             if not path.is_relative_to(workspace / ".host-verification"):
                 raise Conflict("Rendered image is outside the verification workspace", code="creation-render-outside")
-            actual = observe_file(path, artifact_id=image.get("artifact_id") or source["artifact_id"] + ":render:" + str(len(artifacts)))
+            actual = fingerprint_file(path, artifact_id=image.get("artifact_id") or source["artifact_id"] + ":render:" + str(len(artifacts)))
             header = path.read_bytes()[:24]
-            if header[:8] != b"\x89PNG\r\n\x1a\n":
+            if any(actual[k] != image.get(k) for k in ("sha256", "bytes")) or header[:8] != b"\x89PNG\r\n\x1a\n":
                 raise Conflict("Rendered image does not match its receipt", code="creation-render-mismatch")
             import struct
             width, height = struct.unpack(">II", header[16:24])
@@ -160,6 +169,11 @@ def accept_result(mind, config, request, provider=None):
     finally:
         done.set()
         worker.join(timeout=2)
+    for artifact in artifacts:
+        fresh = fingerprint_file(artifact["path"], artifact_id=artifact["artifact_id"])
+        if any(fresh[k] != artifact[k] for k in ("sha256", "bytes")):
+            judgment_cache.reject(mind.engine, review_receipt)
+            raise Conflict("Creation output changed during review", code="creation-output-changed")
     current = plans.renew(run_id, owner, fence)
     gaps = list(dict.fromkeys([*decision.step_remaining, *decision.remaining]))
     complete = decision.complete and not gaps and bool(decision.artifact_ids) and not invalid and current["state"] == "renewed"

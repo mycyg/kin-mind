@@ -1,8 +1,8 @@
-from kin_mind.memory import observe_file
+from kin_mind.memory import fingerprint_file as verified_file
 
 
 def fingerprint_file(path):
-    return observe_file(path, artifact_id="synthetic-artifact:" + str(path))
+    return verified_file(path, artifact_id="synthetic-artifact:" + str(path))
 
 """What is written from a source keeps none of its words once the source is deleted, however the
 delete and the write interleave -- an appraisal, a reflection, a creation, an exploration, a daily

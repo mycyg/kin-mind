@@ -1,6 +1,8 @@
 /** Trusted host process. Input pages get an opaque, network-free origin, no
  * scripts, downloads, service workers, external assets or local file URLs. */
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
+const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 let input='';for await(const chunk of process.stdin)input+=chunk;
@@ -13,7 +15,7 @@ catch{console.log(JSON.stringify({state:'unavailable',reason:'browser-launch-fai
 try{
  const root=fs.realpathSync(request.workspace),source=fs.realpathSync(request.path);
  if(!source.startsWith(root+path.sep))throw Error('outside-workspace');
- const html=fs.readFileSync(source);if(html.length>2*1024*1024)throw Error('source-over-budget');
+ const html=fs.readFileSync(source);if(html.length!==request.bytes||hash(html)!==request.sha256)throw Error('source-changed');if(html.length>2*1024*1024)throw Error('source-over-budget');
  if(typeof request.artifact_id!=='string'||!request.artifact_id)throw Error('missing-artifact-reference');
  const output=path.join(root,'.host-verification');fs.mkdirSync(output,{recursive:true,mode:0o700});
  if(fs.realpathSync(output)!==output)throw Error('verification-directory-symlink');
@@ -33,7 +35,7 @@ try{
   await page.screenshot({path:file,fullPage:true,timeout:10000});
   const bytes=fs.readFileSync(file);
   checks.push({viewport_width:width,layout_width:layout.width,layout_height:layout.height,horizontal_overflow:layout.width>width,
-   blocked_resources:blocked.length,text:layout.text.slice(0,18000),image:{artifact_id:request.artifact_id+':render:'+width,path:file,bytes:bytes.length}});
+   blocked_resources:blocked.length,text:layout.text.slice(0,18000),image:{artifact_id:request.artifact_id+':render:'+width,path:file,bytes:bytes.length,sha256:hash(bytes)}});
   await context.close();
  }
  console.log(JSON.stringify({state:'verified',method:'host-static-browser-v1',source_artifact_id:request.artifact_id,browser:browser.version(),

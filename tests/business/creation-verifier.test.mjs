@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {createHash} from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
@@ -20,7 +21,7 @@ function renderer(answer){
 }
 function produced(t,files){
   const workspace=fs.mkdtempSync(path.join(os.tmpdir(),'kin-creation-'));t.after(()=>fs.rmSync(workspace,{recursive:true,force:true}));
-  const artifacts=Object.entries(files).map(([name,text],index)=>{const file=path.join(workspace,name);fs.writeFileSync(file,text);return {artifact_id:'run:artifact:'+index,path:file,bytes:Buffer.byteLength(text)};});
+  const artifacts=Object.entries(files).map(([name,text],index)=>{const file=path.join(workspace,name);fs.writeFileSync(file,text);return {artifact_id:'run:artifact:'+index,path:file,bytes:Buffer.byteLength(text),sha256:createHash('sha256').update(text).digest('hex')};});
   return {state:'produced',artifacts,receipt:{workspace}};
 }
 
@@ -86,10 +87,10 @@ test('the actual render worker emits artifact references with a synthetic browse
   const [check]=(await verifier.verify(result)).host_verification;
   assert.equal(check.state,'verified');assert.equal(check.source_artifact_id,'run:artifact:0');
   assert.deepEqual(check.checks.map(c=>c.image.artifact_id),['run:artifact:0:render:390','run:artifact:0:render:1024']);
-  assert.ok(check.checks.every(c=>!('sha256' in c.image)&&fs.existsSync(c.image.path)));
+  assert.ok(check.checks.every(c=>typeof c.image.sha256==='string'&&fs.existsSync(c.image.path)));
   fs.writeFileSync(result.artifacts[0].path,'<p>Updated words under the same artifact id</p>');
   const [updated]=(await verifier.verify(result)).host_verification;
-  assert.equal(updated.state,'verified');assert.ok(updated.checks.every(c=>c.text.includes('Updated words')));
+  assert.equal(updated.state,'failed');
 });
 
 // The real worker in a real headless browser, when this checkout has Playwright (the console's).
@@ -106,6 +107,5 @@ test('the real renderer draws the current page with scripts and network off usin
   assert.ok(check.checks.every(c=>fs.existsSync(c.image.path)&&c.image.path.startsWith(fs.realpathSync(result.receipt.workspace))));
   fs.writeFileSync(result.artifacts[0].path,page+'<!-- changed -->');
   const refreshed=(await verifier.verify(result)).host_verification[0];
-  assert.equal(refreshed.state,'verified');assert.equal(refreshed.source_artifact_id,result.artifacts[0].artifact_id);
-  assert.ok(refreshed.checks.every(c=>c.image.artifact_id===result.artifacts[0].artifact_id+':render:'+c.viewport_width&&!('sha256' in c.image)));
+  assert.equal(refreshed.state,'failed');assert.equal(refreshed.source_artifact_id,result.artifacts[0].artifact_id);
 });

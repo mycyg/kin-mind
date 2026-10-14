@@ -286,8 +286,11 @@ def observe_file(path, *, artifact_id=None):
     return result
 
 
-# Old callers remain source compatible; this performs no fingerprinting.
-fingerprint_file = observe_file
+def fingerprint_file(path, *, artifact_id=None):
+    import hashlib
+    result = observe_file(path, artifact_id=artifact_id)
+    data = Path(result["path"]).read_bytes()
+    return {**result, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 # Set in `meta` once the memory index shares its rowids with `mind_memory_nodes` (see graph.py).
@@ -524,6 +527,8 @@ class MemoryContinuity:
         if artifact.get("path"):
             observed = observe_file(artifact["path"])
             artifact = {**artifact, **observed, **({"name": artifact["name"]} if artifact.get("name") else {})}
+        if kind == "artifact-created" and event.get("artifact", {}).get("sha256"):
+            artifact["sha256"] = event["artifact"]["sha256"]
         if artifact:
             artifact["artifact_id"] = artifact.get("artifact_id") or event_id + ":artifact"
         if event.get("state") == "accepted" and not event.get("message_id"):
