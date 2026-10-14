@@ -358,12 +358,12 @@ test('an input proven never submitted is retried by its own id, then reported; o
   const notices=[];let answer={state:'unconfirmed'};
   const notifyOwner=async(kind,id)=>{notices.push([kind,id]);return answer;};
   await f.router.watch({requeue,notifyOwner});
-  assert.deepEqual(notices,[['pending-input','owner-2']]);
+  assert.deepEqual(notices,[['stopped','owner-2']]);
   assert.equal(inputSummary(f.router.state.inputs['owner-2']),'received','an unconfirmed notice does not settle the input');
   f.clock.now+=120000;answer={state:'accepted',messageId:'notice-1'};
   await f.router.watch({requeue,notifyOwner});
-  assert.deepEqual(notices.at(-1),['pending-input','owner-2'],'the same notice, by the same input id');
-  assert.equal(f.router.state.inputs['owner-2'].ownerNotice.id,'kin-input-notice-'+createHash('sha256').update(JSON.stringify(['owner-2','pending-input'])).digest('hex').slice(0,32),
+  assert.deepEqual(notices.at(-1),['stopped','owner-2'],'the same notice, by the same input id');
+  assert.equal(f.router.state.inputs['owner-2'].ownerNotice.id,'kin-input-notice-'+createHash('sha256').update(JSON.stringify(['owner-2','stopped'])).digest('hex').slice(0,32),
     'the ledger names the notice by the identity its sender uses');
   assert.equal(inputSummary(f.router.state.inputs['owner-2']),'failed-notified');
   assert.equal(f.router.unsettledInputs().some(i=>i.id==='owner-2'),false);

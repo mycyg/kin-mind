@@ -1653,7 +1653,7 @@ export class MobileRouter {
     if(request.notify)this.queueNotice(request.sourceInputId??request.commandId,'mode-failed',{requestId:request.commandId,subscriberIds:request.notificationSubscribers??[request.commandId],text});
   }
   async applyModeRequest(request,runtime) {
-    if(!request||request.state!=='pending')return {runtime};
+    if(!request||request.state!=='pending'||request.retryAt>this.now())return {runtime};
     let target=request.mode==='manual'?request.profile:request.mode==='work'?this.profiles.work:
       this.openWork().length?this.profiles.work:this.automaticIdleProfile();
     if(request.mode==='auto'&&request.force){
@@ -1719,7 +1719,8 @@ export class MobileRouter {
       }
       if(['HANDOFF_NOT_COMMITTED','HANDOFF_CANCELED'].includes(error.code)){
         if(this.state.transition){this.finishTransition(runtime);this.state.transition.state='failed-before-switch';}
-        request.waitingReason=error.code;request.failedAt=this.now();this.pendingModeNotice(request);
+        request.waitingReason=error.code;request.failedAt=this.now();request.handoffAttempts=(request.handoffAttempts??0)+1;
+        request.retryAt=request.failedAt+SUBMIT_RETRY_MS[Math.min(request.handoffAttempts-1,SUBMIT_RETRY_MS.length-1)];this.pendingModeNotice(request);
         this.save('mode-handoff-pending',{commandId:request.commandId,reason:error.code});return {runtime};
       }
       request.failedAt=this.now();request.waitingReason='switch-unconfirmed';
@@ -1730,6 +1731,7 @@ export class MobileRouter {
     }
   }
   applyModeState(request,actual,target) {
+    delete request.retryAt;delete request.handoffAttempts;
     const applied=runtimeProfile({...actual,serviceTierPreference:target.serviceTierPreference??actual.serviceTierPreference});
     if(request.mode==='manual') {this.state.mode='manual';this.state.manualProfile=applied;delete this.state.autoReturnProfile;}
     else if(request.mode==='work') {this.state.mode='work';delete this.state.manualProfile;}
@@ -2525,7 +2527,7 @@ export class MobileRouter {
           // (CR-LIFE-03, CR2-LIFE-05); a dispatch that has not let go is not requeued.
           if(inflight){if(idle)verdict='pending-input';}
           else if(retry&&!retry.exhausted&&requeue&&requeuesOf(record)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())handOutRequeue(record);}
-          else {if(retry&&!retry.exhausted){retry.exhausted=true;retry.requeue??='budget';changed=true;}verdict='pending-input';}
+          else {if(retry&&!retry.exhausted){retry.exhausted=true;retry.requeue??='budget';changed=true;}verdict='stopped';}
         } else if(record.state==='queued') {
           // Only the host's in-memory queue held it. With the session idle and its prompt
           // never begun it provably never arrived; behind a busy or hung turn it may still

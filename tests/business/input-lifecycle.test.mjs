@@ -89,7 +89,7 @@ test('a submission reconciled as not received is retried under its own id, and r
   for(let i=0;i<REQUEUE_BUDGET+2;i++){await g.router.watch({requeue:async()=>{requeues++;return {state:'requeued'};},notifyOwner:async()=>({state:'accepted',messageId:'n'})});g.clock.now+=HOUR;}
   assert.equal(requeues,REQUEUE_BUDGET);
   assert.equal(g.router.state.inputs.refused.retry.exhausted,true);
-  assert.deepEqual([g.router.state.inputs.refused.ownerNotice.kind,inputSummary(g.router.state.inputs.refused)],['pending-input','failed-notified']);
+  assert.deepEqual([g.router.state.inputs.refused.ownerNotice.kind,inputSummary(g.router.state.inputs.refused)],['stopped','failed-notified']);
 });
 
 test('a busy or hung session never holds back one notice, and a wait for acceptance has a limit (CR-LIFE-04)',async t=>{

@@ -661,10 +661,18 @@ test('classifier recent conversation projects only model-visible dialogue fields
 });
 test('temporary handoff failures remain pending with Chinese notice',async t=>{
  const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
- f.router.switchModel=async()=>{throw Object.assign(Error('Source session is not idle'),{code:'HANDOFF_NOT_COMMITTED',beforeMutation:true});};
+ let now=1000,attempts=0;f.router.now=()=>now;const switchModel=f.router.switchModel;
+ f.router.switchModel=async()=>{attempts++;throw Object.assign(Error('Source session is not idle'),{code:'HANDOFF_NOT_COMMITTED',beforeMutation:true});};
  await f.router.dispatch({id:'temporary-handoff',text:'切到Kimi'},()=>assert.fail('no prompt'));
  const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
  assert.equal(request.state,'pending');assert.equal(request.waitingReason,'HANDOFF_NOT_COMMITTED');
  const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return {state:'accepted',messageId:'synthetic'};},lookup:async()=>null});
  assert(notices.some(s=>s.includes('切换正在处理')));assert(!notices.some(s=>s.includes('Source session')));
+ for(const delay of [30000,120000,600000,600000]){
+   assert.equal(request.retryAt-now,delay);await f.router.applyPendingMode();const before=attempts;
+   now=request.retryAt-1;await f.router.applyPendingMode();assert.equal(attempts,before);
+   now++;await f.router.applyPendingMode();assert.equal(attempts,before+1);
+ }
+ now=request.retryAt;f.router.switchModel=switchModel;await f.router.applyPendingMode();
+ assert.equal(request.state,'applied');assert.equal(request.retryAt,undefined);assert.equal(request.handoffAttempts,undefined);
 });

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.39
+- Preserve unread desktop messages and concurrent cursor updates; reject ambiguous file-name grants.
+- Back off temporary model handoff failures and distinguish exhausted input retries in notices.
+
 ## 0.1.38
 - Protect deleted history across model handoffs and retry temporary switch failures.
 - Verify authorized file bytes and creator outputs; preserve activity originals and sharing revisions.
