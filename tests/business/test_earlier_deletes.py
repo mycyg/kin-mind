@@ -1,8 +1,8 @@
-from kin_mind.memory import observe_file
+from kin_mind.memory import fingerprint_file as verified_file
 
 
 def fingerprint_file(path):
-    return observe_file(path, artifact_id="synthetic-artifact:" + str(path))
+    return verified_file(path, artifact_id="synthetic-artifact:" + str(path))
 
 """A delete made before a model began is none of its business (CL6E-MM-02), and a commit refused
 for a delete made while it answered costs the row nothing (CL6E-MM-03).

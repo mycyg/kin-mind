@@ -89,7 +89,7 @@ test('a submission reconciled as not received is retried under its own id, and r
   for(let i=0;i<REQUEUE_BUDGET+2;i++){await g.router.watch({requeue:async()=>{requeues++;return {state:'requeued'};},notifyOwner:async()=>({state:'accepted',messageId:'n'})});g.clock.now+=HOUR;}
   assert.equal(requeues,REQUEUE_BUDGET);
   assert.equal(g.router.state.inputs.refused.retry.exhausted,true);
-  assert.deepEqual([g.router.state.inputs.refused.ownerNotice.kind,inputSummary(g.router.state.inputs.refused)],['stopped','failed-notified']);
+  assert.deepEqual([g.router.state.inputs.refused.ownerNotice.kind,inputSummary(g.router.state.inputs.refused)],['pending-input','failed-notified']);
 });
 
 test('a busy or hung session never holds back one notice, and a wait for acceptance has a limit (CR-LIFE-04)',async t=>{
@@ -500,7 +500,7 @@ test('a live dispatch is judged for stalls, and one whose preparation hangs past
   const told=[];const watch=()=>f.router.watch({notifyOwner:async(kind,id)=>{told.push([kind,id]);return {state:'accepted',messageId:'n'};},
     requeue:async()=>assert.fail('a live dispatch is never requeued')});
   f.clock.now+=11*MINUTE;await watch();
-  assert.deepEqual(told,[['stopped','slow']],'past the stall limit she is told, though it is still in flight');
+  assert.deepEqual(told,[['pending-input','slow']],'past the stall limit she is told, though it is still in flight');
   assert.equal(f.router.state.inputs.slow.state,'preparing','before its deadline it may still go');
   f.clock.now+=10*MINUTE;await watch();
   assert.deepEqual([f.router.state.inputs.slow.state,f.router.state.inputs.slow.withdrawn?.reason],['failed-before-submit','dispatch-wait-exceeded'],'past its deadline it is withdrawn');

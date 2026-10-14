@@ -66,7 +66,7 @@ test('an input whose preparation keeps failing is told to the owner as the syste
   const record=f.router.state.inputs['in-2'];
   assert.equal(record.retry.exhausted,true);
   await f.router.watch({requeue:async()=>assert.fail('no retry is left'),notifyOwner});
-  assert.deepEqual(told,[['stopped','in-2',true]]);
+  assert.deepEqual(told,[['pending-input','in-2',true]]);
   assert.equal(inputSummary(f.router.state.inputs['in-2']),'failed-notified');
 });
 
