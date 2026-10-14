@@ -181,11 +181,11 @@ def select_activities(mind, *, kind=None, identifier=None, query="", since=None,
             source_identity = isinstance(identifier, str) and identifier.startswith("src_") and len(identifier) == 36
             where.append("s.id=?" if source_identity else "(s.id=? OR s.source_key=?)")
             args.extend([identifier] if source_identity else [identifier, identifier])
-        from .state import timestamp
+        from .plans import local_time
         for value, operator in ((since, ">="), (until, "<=")):
             if value:
                 where.append("julianday(s.occurred_at)" + operator + "julianday(?)")
-                args.append(timestamp(value).isoformat())
+                args.append(local_time(value))
         if query.strip():
             from .graph import query_terms
             terms = list(dict.fromkeys([query.strip().casefold(), *(term for term in query_terms(query) if len(term) > 1)]))[:24]

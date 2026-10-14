@@ -75,12 +75,13 @@ export class NativeCandidate {
     });
     child.on('error',()=>this.rejectPending({stage:'startup',category:'spawn-failed',exitCode:null,signal:null}));
     child.on('exit',(code,signal)=>{this.rejectPending({...candidateStartupDiagnostic(stderr,code,signal),stage:this.mcpIsolation?'operation':'startup'});if(this.child===child){this.child=null;this.loaded.clear();this.mcpIsolation=null;}});
-    await this.request('initialize',{clientInfo:{name:'kin_continuity',version:'1'},capabilities:{experimentalApi:true}});
+    try{await this.request('initialize',{clientInfo:{name:'kin_continuity',version:'1'},capabilities:{experimentalApi:true}});
     child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'initialized'})+'\n');
     // Read effective Home/project configuration before creating any thread.
     // Never invent a partial MCP table for a server that is not configured.
     const effective=await this.request('config/read',{cwd:this.cwd,includeLayers:false});
     this.mcpIsolation=candidateMcpIsolation(effective?.config);
+    }catch(error){child.kill();if(this.child===child)this.child=null;this.loaded.clear();this.mcpIsolation=null;throw error;}
   }
   rejectPending(diagnostic){for(const p of this.pending.values())p.reject(Object.assign(Error('Native candidate connection closed'),{nativeDiagnostic:diagnostic}));this.pending.clear();}
   request(method,params){return new Promise((resolve,reject)=>{
@@ -101,7 +102,7 @@ export class NativeCandidate {
       throw Error('Candidate profile is incomplete');
     return launch;
   }
-  requestParams(launch){return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,...this.mcpIsolation,'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
+  requestParams(launch){if(!this.mcpIsolation)throw Error('Candidate MCP isolation unavailable');return {cwd:this.cwd,model:launch.profile.model,modelProvider:launch.modelProvider,config:{...launch.config,...this.mcpIsolation,'features.apps':false,'features.hooks':false,'features.multi_agent':false,model_reasoning_effort:launch.reasoningEffort},sandbox:'read-only',approvalPolicy:'never',developerInstructions:launch.developerInstructions??this.personaInstructions,serviceTier:requestedServiceTier(launch)};}
   params(profile){return this.requestParams(this.launch(profile));}
   async create({id,model,profile,name}){
     const launch=this.launch(profile??{model});await this.start();const value=await this.request('thread/start',this.requestParams(launch));

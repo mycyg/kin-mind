@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.38
+- Protect deleted history across model handoffs and retry temporary switch failures.
+- Verify authorized file bytes and creator outputs; preserve activity originals and sharing revisions.
+- Deduplicate unchanged habits and refresh graph context after summary or coverage changes.
+
+## 0.1.37
+- Support authorized desktop Markdown conversations through the native session.
+
+## 0.1.36
+- Fix main turn admission and durable failure receipts.
+
 ## 0.1.35 — 2026-10-13
 
 - Preserve a chosen settling phase beside its awake base and when owner input takes attention. Quiet and rhythm reviews can offer optional dream material during rest, settling or drowsiness; a rhythm review can also remember a recent dream.

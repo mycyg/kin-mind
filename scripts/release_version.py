@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # What goes into the wheel and the sdist, and what pins what they run with.
-PACKAGE = ("src/eventmem", "src/kin_mind", "pyproject.toml", "uv.lock")
+PACKAGE = ("adapters", "src/eventmem", "src/kin_mind", "pyproject.toml", "uv.lock")
 LINE = re.compile(r'^version = "(\d+)\.(\d+)\.(\d+)"$', re.M)
 # The project's own entry in uv.lock carries the same version; a lock left behind would no
 # longer match its pyproject.toml.

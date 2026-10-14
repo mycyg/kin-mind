@@ -1116,7 +1116,7 @@ def _appraisal_context(context):
     for dimension in state["dimensions"].values():
         reason = dimension.get("reason")
         if reason and reasons.count(reason) > 1:
-            key = reason
+            key = next((k for k,v in shared.items() if v == reason), "r" + str(len(shared) + 1))
             shared[key] = dimension.pop("reason")
             dimension["reason_ref"] = key
     if shared:

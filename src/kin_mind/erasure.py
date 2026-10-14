@@ -1304,7 +1304,7 @@ class Walk:
         if request is not None:
             out["request"] = scrub(request, self.ids) if isinstance(request, (dict, list)) else request
         self.previous = revision
-        changed = history.canonical(out) != history.canonical(data)
+        changed = history.canonical({k:v for k,v in out.items() if k not in {"state_hash", "base_hash"}}) != history.canonical({k:v for k,v in data.items() if k not in {"state_hash", "base_hash"}})
         return (out if changed else data), changed
 
 
