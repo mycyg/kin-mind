@@ -181,7 +181,7 @@ export const noticeMayStart=notice=>!notice.lastReceipt||['not-submitted','no-po
   notice.lastReceipt==='rejected'&&(notice.rejections??0)<=NOTICE_REJECT_RETRY_MS.length;
 export function recentConversation(items) {
   const counts={user:0,assistant:0};
-  return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse();
+  return items.slice().reverse().filter(item=>Object.hasOwn(counts,item.role)&&++counts[item.role]<=8).reverse().map(({role,text,at})=>({role,text,at}));
 }
 /** The classifier's own answer, told apart from the host's literal commands. */
 export const CLASSIFIER_DECISION='deepseek-input-classification';
@@ -1671,7 +1671,7 @@ export class MobileRouter {
     }
     try {await this.preflightProfile?.(target,runtime);} catch(error) {
       if(!isHistoryRefusal(error))throw error;
-      this.failModeRequest(request,error.code,error.message);this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
+      this.failModeRequest(request,error.code,'没有切换：当前会话历史未通过兼容性核验，原会话已保留。');this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
     }
     // A prior owner force can suppress the current epoch before a newer mode
     // choice supersedes it. Settle that interruption, never its old mode choice.
@@ -1715,7 +1715,12 @@ export class MobileRouter {
     } catch(error) {
       if(isHistoryRefusal(error)){
         if(this.state.transition){this.finishTransition(runtime);this.state.transition.state='failed-before-switch';}
-        this.failModeRequest(request,error.code,error.message);this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
+        this.failModeRequest(request,error.code,'没有切换：当前会话历史未通过兼容性核验，原会话已保留。');this.save('mode-history-refused',{commandId:request.commandId,reason:error.code});return {runtime};
+      }
+      if(['HANDOFF_NOT_COMMITTED','HANDOFF_CANCELED'].includes(error.code)){
+        if(this.state.transition){this.finishTransition(runtime);this.state.transition.state='failed-before-switch';}
+        request.waitingReason=error.code;request.failedAt=this.now();this.pendingModeNotice(request);
+        this.save('mode-handoff-pending',{commandId:request.commandId,reason:error.code});return {runtime};
       }
       request.failedAt=this.now();request.waitingReason='switch-unconfirmed';
       if(this.state.transition)this.state.transition.state='unconfirmed';
@@ -2511,16 +2516,16 @@ export class MobileRouter {
         if(['semantic-pending','selected','preparing'].includes(record.state)) {
           // Still waiting before submission — for a classification, the coordinator, a switch
           // or its own preparation. Past the stall limit she is told it has not gone through.
-          if(idle)verdict='stopped';
+          if(idle)verdict='pending-input';
         } else if(record.state==='submitting') {
           if(idle)verdict='unknown';
         } else if(record.state==='failed-before-submit') {
           const retry=record.retry;
           // Back to the inbox only on evidence, and only so many times across every attempt
           // (CR-LIFE-03, CR2-LIFE-05); a dispatch that has not let go is not requeued.
-          if(inflight){if(idle)verdict='stopped';}
+          if(inflight){if(idle)verdict='pending-input';}
           else if(retry&&!retry.exhausted&&requeue&&requeuesOf(record)<REQUEUE_BUDGET){if(retry.nextAt<=now&&!this.frozen())handOutRequeue(record);}
-          else {if(retry&&!retry.exhausted){retry.exhausted=true;retry.requeue??='budget';changed=true;}verdict='stopped';}
+          else {if(retry&&!retry.exhausted){retry.exhausted=true;retry.requeue??='budget';changed=true;}verdict='pending-input';}
         } else if(record.state==='queued') {
           // Only the host's in-memory queue held it. With the session idle and its prompt
           // never begun it provably never arrived; behind a busy or hung turn it may still

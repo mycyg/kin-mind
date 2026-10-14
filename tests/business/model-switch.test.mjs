@@ -645,7 +645,7 @@ test('incompatible Kimi history fails explicitly before force interruption and p
  const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_INCOMPATIBLE');
  assert.notEqual(f.router.state.transition?.state,'unconfirmed');
  const persisted=JSON.parse(fs.readFileSync(f.router.file));assert.equal(persisted.requests[request.commandId].state,'failed');
- const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return{state:'accepted',messageId:'synthetic'};},lookup:async()=>null});assert.ok(notices.some(s=>s.includes('压缩历史')&&s.includes('原会话')));
+ const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return{state:'accepted',messageId:'synthetic'};},lookup:async()=>null});assert.ok(notices.some(s=>s.includes('历史')&&s.includes('原会话')));
 });
 test('a history refusal at the final switch boundary settles the transition without changing the prior profile',async t=>{
  const {historyError}=await import('../../adapters/provider-history.mjs');const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
@@ -654,4 +654,17 @@ test('a history refusal at the final switch boundary settles the transition with
  const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
  assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_UNVERIFIED');assert.equal(f.router.state.transition.state,'failed-before-switch');assert.deepEqual(f.runtime,before);
  const restarted=new MobileRouter(f.args);assert.equal(restarted.state.requests[request.commandId].state,'failed');assert.notEqual(restarted.state.transition.state,'unconfirmed');
+});
+
+test('classifier recent conversation projects only model-visible dialogue fields',()=>{
+ assert.deepEqual(recentConversation([{role:'user',text:'synthetic',at:1,conversation_id:'private-index',platform_message_id:'private-message'}]),[{role:'user',text:'synthetic',at:1}]);
+});
+test('temporary handoff failures remain pending with Chinese notice',async t=>{
+ const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
+ f.router.switchModel=async()=>{throw Object.assign(Error('Source session is not idle'),{code:'HANDOFF_NOT_COMMITTED',beforeMutation:true});};
+ await f.router.dispatch({id:'temporary-handoff',text:'切到Kimi'},()=>assert.fail('no prompt'));
+ const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
+ assert.equal(request.state,'pending');assert.equal(request.waitingReason,'HANDOFF_NOT_COMMITTED');
+ const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return {state:'accepted',messageId:'synthetic'};},lookup:async()=>null});
+ assert(notices.some(s=>s.includes('切换正在处理')));assert(!notices.some(s=>s.includes('Source session')));
 });

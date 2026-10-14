@@ -83,7 +83,7 @@ for(const name of ['kimi','ds'])test(`${name}: safe handoff then return keeps so
  assert.equal(first.model,profiles[name].model);assert.equal(f.manager.fence().generation,2);assert.deepEqual(f.events,['create','inject','verify','promote']);
  fs.appendFileSync(f.runtime.rolloutPath,JSON.stringify(row(message('user','new after switch')))+'\n');
  const returned=await f.handoff.switchProfile(profiles.gpt);assert.equal(returned.model,profiles.gpt.model);assert.equal(f.manager.fence().generation,3);
- assert(JSON.stringify(f.manager.state.candidate.checkpoint.payload).includes('new after switch'));
+ assert(fs.readFileSync(f.runtime.rolloutPath,'utf8').includes('new after switch'));
  assert.deepEqual(fs.readFileSync(f.f.file),original);assert.equal(f.manager.state.segments.length,3);assert.equal(f.manager.state.restorePending,false);assert.equal(f.manager.state.restoreCheckpoint,undefined);
  assert.equal(f.manager.state.handoffs.length,2);assert.equal(f.manager.state.handoffs[0].previousBinding.threadId,'source');
 });
@@ -210,4 +210,19 @@ test('candidate startup process stderr is classified without retaining its body'
  const native=new NativeCandidate({command:process.execPath,args:[script],cwd:f.dir,env:{PATH:'/usr/bin:/bin',HOME:f.dir},inheritEnv:false,timeoutMs:1000});
  await assert.rejects(native.start(),e=>e.nativeDiagnostic?.category==='mcp-invalid-transport'&&e.nativeDiagnostic.exitCode===1&&!JSON.stringify(e).includes('private-value'));
  await native.close();
+});
+
+test('deleted sources never enter handoff payload or registry; retired candidates keep only counts',async t=>{
+ const f=fixture(t);f.context.lastDeletionAt='2099-01-01T00:00:00Z';
+ await f.handoff.switchProfile(profiles.ds);
+ assert(!JSON.stringify(f.manager.state).includes('source dialogue'));
+ assert(!fs.readFileSync(f.manager.file,'utf8').includes('source dialogue'));
+ const {retiredCandidate}=await import('../../adapters/session-manager.mjs');
+ const prior=retiredCandidate({checkpoint:{payload:{continuity:{portableHistory:{items:[message('user','deleted words')],coverage:{lossless:false}}}}}});
+ assert(!JSON.stringify(prior).includes('deleted words'));assert.equal(prior.checkpoint.payload.continuity.portableHistory.count,1);
+});
+test('confirmed force boundary permits residual queue counts',async t=>{
+ const f=fixture(t);f.runtime.queued=2;f.runtime.active=true;
+ await f.handoff.switchProfile(profiles.ds,{forceBoundary:{receipt:{state:'interrupted'}}});
+ assert.equal(f.manager.fence().generation,2);
 });

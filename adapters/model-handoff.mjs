@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {portableHistory,handoffCheckpoint} from './portable-history.mjs';
-import {candidateVerificationReady} from './session-manager.mjs';
+import {candidateVerificationReady,retiredCandidate} from './session-manager.mjs';
 import {runtimeProfile} from './codex-models.mjs';
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
 export function needsModelHandoff(target,runtime) {
@@ -29,18 +29,20 @@ export class ModelHandoff {
     const checkCancel=()=>{if(signal?.aborted)throw canceled();};
     try{
       checkCancel();const previous=structuredClone(m.fence()),before=await this.inspect();
+      const confirmedForce=['interrupted','idle'].includes(forceBoundary?.receipt?.state);
+      const busy=value=>!confirmedForce&&(value.active||value.backgroundTasks||value.handoffTasks||value.pendingDeliveries||value.queued);
       const stopped=value=>value.nativeStatus==='idle'||value.nativeStatus==='systemError'&&['interrupted','idle'].includes(forceBoundary?.receipt?.state);
-      if(!stopped(before)||!before.known||before.threadId!==previous.threadId||before.active||before.backgroundTasks||before.handoffTasks||before.pendingDeliveries||before.queued)
+      if(!stopped(before)||!before.known||before.threadId!==previous.threadId||busy(before))
         throw unchanged('Source session is not idle');
       const context=await this.collect();
       const cp=await this.checkpoint(context,previous);
-      const history=await portableHistory(before);
+      const history=await portableHistory(before,{deletedAt:context.lastDeletionAt});
       const id='model-handoff:'+randomUUID();
       const checkpoint=handoffCheckpoint(cp,history,{id,profile});
       if(!await this.validate(checkpoint))throw unchanged('Checkpoint sources changed');
       checkCancel();
       if(unresolved&&!['retired','failed','stale','canceled'].includes(unresolved.state)){
-        unresolved.state='stale';unresolved.staleReason='explicit-model-handoff';m.state.retiredCandidates??=[];m.state.retiredCandidates.push(structuredClone(unresolved));
+        unresolved.state='stale';unresolved.staleReason='explicit-model-handoff';m.state.retiredCandidates??=[];m.state.retiredCandidates.push(retiredCandidate(unresolved));
       }
       candidate={id,kind:'model-handoff',state:'creating',generation:previous.generation,previousBinding:previous,
         sourceProfile:runtimeProfile(before),profile:structuredClone(profile),checkpoint,at:m.now()};
@@ -53,13 +55,13 @@ export class ModelHandoff {
       if(!candidateVerificationReady(candidate.verification,candidate))throw unchanged('Candidate context or profile is unverified');
       candidate.state='ready';m.save('model-handoff-ready');checkCancel();
       const current=await this.inspect(),latest=await this.collect();
-      if(!stopped(current)||!same(m.fence(),previous)||current.threadId!==previous.threadId||current.active||current.backgroundTasks||current.handoffTasks||current.pendingDeliveries||current.queued||m.frozen())
+      if(!stopped(current)||!same(m.fence(),previous)||current.threadId!==previous.threadId||busy(current)||m.frozen())
         throw unchanged('Source session changed during handoff');
       if(!same(context.cursors,latest.cursors)||context.configVersion!==latest.configVersion||!await this.validate(checkpoint))
         throw unchanged('Continuity sources changed during handoff');
       // The immutable source fingerprint includes appends after the first read.
-      const fresh=await portableHistory(current);
-      if(fresh.source.sha256!==history.source.sha256)throw unchanged('Source history changed during handoff');
+      const fresh=await portableHistory(current,{deletedAt:latest.lastDeletionAt});
+      if(fresh.source.sha256!==history.source.sha256||fresh.coverage.suppressed!==history.coverage.suppressed)throw unchanged('Source history changed during handoff');
       checkCancel();
       const next={conversationId:previous.conversationId,generation:previous.generation+1,
         threadId:candidate.native.threadId,nativeSessionId:candidate.native.nativeSessionId};

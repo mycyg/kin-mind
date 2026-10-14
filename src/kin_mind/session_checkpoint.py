@@ -44,6 +44,7 @@ class SessionCheckpoint:
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
             advice = latest_advice(conn, self.mind.scope.key(), state)
+            deleted_at = conn.execute("SELECT MAX(deleted_at) FROM tombstones").fetchone()[0]
         pending = pending or []
         events = {json.loads(r["data"])["id"]: json.loads(r["data"]) for r in rows}
         sequences = {json.loads(row["data"])["id"]: row["seq"] for row in rows}
@@ -107,7 +108,7 @@ class SessionCheckpoint:
         # must not invalidate advice that already used the loaded version.
         config_version = (self.agent_version or state["agent_version"]) + ":" + state["profile_version"]
         cursor = [{"id": item["id"], "seq": item["revision"]} for item in items]
-        result = {"configVersion": config_version, "cursors": {"public": cursor}, "items": items, "invalidatedSources": reviewed,
+        result = {"lastDeletionAt": deleted_at, "configVersion": config_version, "cursors": {"public": cursor}, "items": items, "invalidatedSources": reviewed,
                 "sourceRevisions": {i["id"]: i["revision"] for i in items}, "scope": self.mind.scope.model_dump(),
                 "shared": {"readState": "read_affective_state", "readShares": "read_share_history", "readWorks": "read_work_history", "readContinuity": "read_continuity_context"}}
         if linked is not None:

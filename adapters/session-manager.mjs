@@ -7,6 +7,11 @@ import {SESSION_DEFAULTS,windowPressure,rotationEligibility,safeBoundary,validat
 import {runtimeProfile} from './codex-models.mjs';
 import {sameInstructionBinding} from './instruction-evidence.mjs';
 const copy=v=>structuredClone(v);
+export function retiredCandidate(candidate) {
+  const value=copy(candidate),history=value.checkpoint?.payload?.continuity?.portableHistory;
+  if(history)value.checkpoint.payload.continuity.portableHistory={count:history.items?.length??history.count??0,coverage:history.coverage};
+  return value;
+}
 const BINDING_FIELDS=['conversationId','generation','threadId','nativeSessionId'];
 const bindingFacts=binding=>Object.fromEntries(BINDING_FIELDS.map(key=>[key,binding?.[key]??null]));
 const taskFacts=tasks=>(tasks??[]).map(task=>({id:task.id,inputVersion:task.inputVersion??null,status:task.status??null}));
@@ -65,7 +70,7 @@ const frozenWait=()=>({state:'waiting',reason:'dispatch-frozen'});
 const retireLegacyCandidate=state=>{
   const candidate=state.candidate;
   if(!candidate||!['created','injected','ready','waiting'].includes(candidate.state)||candidateHasProfileAuthority(candidate))return false;
-  candidate.state='stale';candidate.staleReason='legacy-profile-evidence-missing';state.retiredCandidates??=[];state.retiredCandidates.push(copy(candidate));return true;
+  candidate.state='stale';candidate.staleReason='legacy-profile-evidence-missing';state.retiredCandidates??=[];state.retiredCandidates.push(retiredCandidate(candidate));return true;
 };
 
 /** One durable binding, used by every channel. Acquiring this lease is a host
@@ -101,6 +106,8 @@ export class SessionManager {
   body(){const {revision,...content}=this.state;return JSON.stringify(content);}
   /** Written only when something in it changed: a minute that changed nothing writes nothing. */
   save(kind,details={}) {
+    if(this.state.candidate?.state==='retired')this.state.candidate=retiredCandidate(this.state.candidate);
+    if(this.state.retiredCandidates)this.state.retiredCandidates=this.state.retiredCandidates.map(retiredCandidate);
     const body=this.body();if(body===this.saved)return false;
     this.state.revision++;
     atomicJson(this.file,this.state,{previous:true});this.saved=body;
@@ -138,6 +145,7 @@ export class SessionManager {
       if(Number.isFinite(at))state.nativeFloor={generation:state.binding.generation,at:Math.max(at,state.nativeFloor?.generation===state.binding.generation?state.nativeFloor.at:0)};
       state.compactions=state.compactions.filter(c=>!drop.has(c));
     }
+    if(state.retiredCandidates)state.retiredCandidates=state.retiredCandidates.map(retiredCandidate);
     if(state.retiredCandidates?.length>RETENTION.candidates)state.retiredCandidates=state.retiredCandidates.slice(-RETENTION.candidates);
     for(const [id,request] of Object.entries(state.requests))if(request.state!=='pending'&&old(request.reviewedAt??request.at))delete state.requests[id];
   }
@@ -240,7 +248,7 @@ export class SessionManager {
     if(candidate){
       // A handover prepared for the old runtime goes with it; its record is kept.
       if(!['retired','failed','stale'].includes(candidate.state))Object.assign(candidate,{state:'stale',staleReason:'kin-home-migration'});
-      this.state.retiredCandidates=[...(this.state.retiredCandidates??[]).filter(c=>c.id!==candidate.id),copy(candidate)];this.state.candidate=null;
+      this.state.retiredCandidates=[...(this.state.retiredCandidates??[]).filter(c=>c.id!==candidate.id),retiredCandidate(candidate)];this.state.candidate=null;
     }
     const now=this.now(),next={conversationId:fence.conversationId,generation:fence.generation+1,threadId:native.threadId,nativeSessionId:native.nativeSessionId};
     this.state.binding=next;Object.assign(this.state.segments.at(-1),{state:'retired',retiredAt:now});
@@ -663,7 +671,7 @@ export class SessionManager {
   }
   async retireCandidate(candidate,reason) {
     Object.assign(candidate,{state:'stale',staleReason:reason});
-    this.state.retiredCandidates=[...(this.state.retiredCandidates??[]),copy(candidate)].slice(-RETENTION.candidates);
+    this.state.retiredCandidates=[...(this.state.retiredCandidates??[]),retiredCandidate(candidate)].slice(-RETENTION.candidates);
     this.save('candidate-replaced',{id:candidate.id,reason});
     await this.closeCandidate?.(candidate);
   }

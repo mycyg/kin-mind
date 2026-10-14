@@ -264,3 +264,12 @@ def test_the_tasks_a_migration_puts_into_its_snapshot_reach_the_restore_payload(
     built = checkpoints.build(snapshot, binding, budget=4000, allow_model=False, adaptive_budget=True)
     assert built['complete']
     assert built['payload']['tasks'] == [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张'}]
+
+def test_recent_dialogue_excludes_platform_metadata(setup):
+    from kin_mind.dialogue import recent_dialogue
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'records':True})
+    MemoryContinuity(mind).ingest({'id':'metadata-projection','kind':'owner-message','at':mind.clock(),'text':'Synthetic message',
+        'conversation_id':'external-conversation','platform_message_id':'external-message','reply_context':{'text':'platform-context'}})
+    items = recent_dialogue(mind)
+    assert items and not any(k in item for item in items for k in ('conversation_id','platform_message_id','reply_context','reply_resolution'))

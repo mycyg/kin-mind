@@ -129,7 +129,7 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
             item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "state", "message_id", "input_id", "bubble_id",
-                                          "conversation_id", "platform_message_id", "reply_to_message_id", "root_message_id", "thread_id", "reply_context", "reply_resolution") if k in event}
+                                          "reply_share_id", "reply_bubble_id", "activity_refs") if k in event}
             resolution = event.get("reply_resolution") or {}
             if resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:
                 candidate = resolution["candidates"][0]
