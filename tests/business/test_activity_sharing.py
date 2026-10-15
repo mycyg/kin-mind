@@ -474,3 +474,48 @@ def test_saved_exploration_recall_survives_nonshare_restart_and_canceled_deliver
         assert memory.sharing.coverage(conn, ref)['state'] == 'unconfirmed'
     with pytest.raises(Conflict):
         wish(system, ref, 'not-authorized-to-contact')
+
+
+@pytest.mark.parametrize('kind', ['dream', 'exploration'])
+def test_activity_view_tracks_successful_ranges_without_authorizing_a_push(system, kind):
+    from kin_mind.activities import context_item, select_activities
+    from kin_mind.context import Contexts
+    from kin_mind.model_view import for_model
+    mind, memory, _, _ = system
+    ref = activity(system, kind)
+    deliver(system, ref, 'canceled', 'failed-range')
+    empty = read_activity_ref(mind, ref)['share_coverage']
+    assert empty['state'] == 'untracked' and 'not-proof-never-shared' in empty['absence_means']
+    deliver(system, ref, 'accepted', 'said-one-part', message_id='actual-synthetic-receipt')
+    shown = read_activity_ref(mind, ref)
+    for coverage in (shown['share_coverage'], for_model(json.loads(Contexts._line(context_item(shown))))['facts']['share_coverage']):
+        assert coverage['state'] == 'partial' and coverage['coverage_scope'] == 'registered-content'
+        assert coverage['unsolicited_share_default'] == 'avoid_registered_content'
+        assert coverage['messages'][0]['message_id'] == 'actual-synthetic-receipt'
+        assert coverage['last_shared_at'] == mind.clock()
+    with mind.engine.db.connect() as conn:
+        before = conn.execute('SELECT COUNT(*) FROM mind_share_coverage').fetchone()[0]
+    # Explicit retrieval remains available and itself neither sends nor creates a contact wish.
+    assert select_activities(mind, kind=kind, identifier=ref['source_id'])['activities']
+    with mind.engine.db.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM mind_share_coverage').fetchone()[0] == before
+        assert not mind._load(conn)['desires']
+
+
+def test_finding_only_success_marks_just_that_range_in_activity_view(system):
+    mind, memory, _, _ = system
+    units = findings(system)
+    ref = activity(system, 'exploration', 'explore-fixture')
+    memory.ingest({'id': 'natural-reply-success', 'kind': 'delivery', 'at': mind.clock(), 'origin': 'reply',
+        'channel': 'feishu', 'delivery_id': 'natural-reply', 'bubble_id': 'one-finding',
+        'text': units[0]['text'], 'state': 'accepted', 'message_id': 'reply-receipt',
+        'references': [{'unit_id': units[0]['id'], 'version': 1}]})
+    with mind.engine.db.connect() as conn:
+        first = memory.sharing.coverage(conn, units[0]['id'])
+        rest = memory.sharing.coverage(conn, units[1]['id'])
+    assert first['unsolicited_share_eligible'] is False
+    assert rest['state'] == 'unshared' and 'unsolicited_share_eligible' not in rest
+    coverage = read_activity_ref(mind, ref)['share_coverage']
+    assert coverage['state'] == 'partial'
+    assert [m['unit_id'] for m in coverage['messages']] == [units[0]['id']]
+    assert coverage['messages'][0]['message_id'] == 'reply-receipt'

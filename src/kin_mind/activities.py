@@ -148,6 +148,8 @@ def read_activity_ref(mind, activity_ref, *, conn=None, detail="full", historica
                     if isinstance(checkpoint, dict) and data.get("source_id") == ref["source_id"]:
                         entry["checkpoint"] = checkpoint
                         entry["checkpoint_dependency"] = {"id": ref["id"], "source_id": ref["source_id"]}
+        from .sharing import activity_share_history
+        entry["share_coverage"] = activity_share_history(connection, mind.scope.key(), ref)
         entry["detail"] = "original" if detail == "full" else detail
         return entry
 
@@ -220,7 +222,7 @@ def context_item(entry):
     ref = entry["activity_ref"]
     facts = {"kind": "activity", "activity_ref": ref, "content_class": ref["content_class"],
              "occurred_at": ref["occurred_at"], "superseded": entry["superseded"],
-             **{key: entry[key] for key in ("local_time", "timezone", "historical", "time_basis")}}
+             **{key: entry[key] for key in ("local_time", "timezone", "historical", "time_basis", "share_coverage")}}
     if ref["kind"] == "dream":
         facts.update(evidence=False, use_as_current_fact=False, autobiography="dreamed-imagination")
     else:

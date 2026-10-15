@@ -680,7 +680,7 @@ class Contexts:
             if node["kind"] in {"finding", "exploration", "work"}:
                 coverage = self.memory.sharing.coverage(conn, node["id"])
                 coverage_dep = {"id": node["id"]}
-                facts["share_coverage"] = {k: coverage[k] for k in ("state", "version", "last_shared_at", "shared", "total", "visibility") if k in coverage}
+                facts["share_coverage"] = {k: coverage[k] for k in ("state", "version", "last_shared_at", "shared", "total", "visibility", "coverage_scope", "absence_means", "unsolicited_share_eligible", "unsolicited_share_default") if k in coverage}
                 facts["share_coverage"]["messages"] = [{k: d.get(k) for k in ("share_id", "bubble_id", "message_id", "at", "mode")} for d in coverage.get("deliveries", [])[:2]]
             if compact:
                 # The graph detail tool retains full relation reasons and

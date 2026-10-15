@@ -278,7 +278,7 @@ def read(mind, *, cursor=0, limit=20, identifier=None, query="", since=None, unt
               "dreams": [], "cursor": found["cursor"], "instruction_authority": "data"}
     omitted = []
     for entry in found["activities"]:
-        shown = {key: entry[key] for key in ("source_id", "at", "local_time", "timezone", "historical", "time_basis", "use_as_current_fact",
+        shown = {key: entry[key] for key in ("source_id", "at", "local_time", "timezone", "historical", "time_basis", "use_as_current_fact", "share_coverage",
                                                 "text", "activity_ref", "basis", "evidence", "superseded", "detail")}
         candidate = {**result, "dreams": [*result["dreams"], shown]}
         if budget is None or tokens(dumps(candidate)) + 80 <= budget:

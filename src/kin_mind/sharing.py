@@ -58,6 +58,37 @@ class CoverageAssessment(Model):
     mappings: list[CoverageMapping] = Field(default_factory=list, max_length=24)
 
 
+def activity_share_history(conn, scope, activity):
+    """Read accepted content ranges, without initializing a ledger or treating a part as the whole."""
+    empty = {"state": "untracked", "coverage_scope": "registered-content", "messages": [],
+             "absence_means": "no-tracked-success-not-proof-never-shared"}
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_share_coverage'").fetchone():
+        return empty
+    units = ["activity:" + activity["kind"] + ":" + activity["id"]]
+    if activity["kind"] == "exploration" and conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_graph_nodes'").fetchone():
+        units += [r[0] for r in conn.execute(
+            "SELECT id FROM mind_graph_nodes WHERE scope=? AND kind='finding' AND state='active' AND json_extract(data,'$.owner_id')=?",
+            (scope, activity["id"]))]
+    rows = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient='owner' AND state='accepted' "
+        "AND unit_id IN (" + ",".join("?" for _ in units) + ") ORDER BY at DESC,bubble_id", (scope, *units))
+    messages = []
+    for row in rows:
+        d = json.loads(row[0])
+        if (not d.get("message_id") or d.get("mapping_state") == "retracted"
+                or d.get("basis") == "semantic-mapping" and d.get("confidence", 0) < 0.8):
+            continue
+        if d.get("activity_ref") and d["activity_ref"].get("source_id") != activity["source_id"]:
+            continue
+        messages.append({k: d.get(k) for k in ("unit_id", "version", "share_id", "bubble_id", "message_id", "at", "mode", "reason")})
+        if len(messages) == 12:
+            break
+    if not messages:
+        return empty
+    return {**empty, "state": "partial", "last_shared_at": messages[0]["at"], "messages": messages,
+            "unsolicited_share_default": "avoid_registered_content",
+            "scope_note": "Only the registered bubble contents or finding units were shared; the whole activity is not marked complete."}
+
+
 class ShareLedger:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
@@ -183,6 +214,9 @@ class ShareLedger:
         return {"id": identifier, "version": unit.get("content_version", 1), "state": state,
                 "last_shared_at": accepted["at"] if accepted else None, "deliveries": deliveries,
                 "delivery_count": total, "visibility": "unverified",
+                "absence_means": "no-tracked-success-not-proof-never-shared",
+                **({"unsolicited_share_eligible": False} if accepted and unit["kind"] == "finding" else {}),
+                **({"unsolicited_share_default": "avoid_registered_content"} if accepted and unit["kind"] == "activity" else {}),
                 **({"activity_ref": unit["activity_ref"], "coverage_scope": "registered-content"} if unit.get("activity_ref") else {})}
 
     def _save_coverage(self, conn, data):
