@@ -400,11 +400,33 @@ def test_real_host_javascript_parameters_reach_python_memory_context(env):
     result = subprocess.run(["/Users/apple/.local/node22/bin/node", "--input-type=module", "-e", '''
 import {memoryContextReferences} from %s;
 console.log(JSON.stringify({query:'昨晚梦到什么，还有晚饭',mode:'light',purpose:'chat',budget:12000,
- ...memoryContextReferences({channel:'feishu',chatId:'synthetic-chat',messageId:'synthetic-input'},
- {activity_query:{kind:'dream',query:'',period:'any'}})}));
+ ...memoryContextReferences({channel:'feishu',chatId:'synthetic-chat',messageId:'synthetic-input',occurredAt:'2026-08-01T15:59:00Z'},
+ {activity_query:{kind:'dream',query:'',period:'last_night'},activity_query_at:'2099-01-01T00:00:00Z'})}));
 ''' % json.dumps(helper.as_uri())], check=True, capture_output=True, text=True)
     request = json.loads(result.stdout)
+    assert request["activity_query_at"] == "2026-08-01T15:59:00Z"
     config = {"root":str(mind.engine.db.root), "scope":mind.scope.model_dump(), "agent_version":"synthetic-activity-v1"}
     answer = dispatch(config, "memory-context", request)
     assert DREAM in answer["text"] and sid in answer["text"]
     assert answer["state"] != "disabled"
+
+
+@pytest.mark.parametrize("period,occurred,handled", [
+    ("last_night", "2026-10-15T15:59:00Z", "2026-10-15T16:01:00Z"),
+    ("tonight", "2026-10-15T03:59:00Z", "2026-10-15T04:01:00Z"),
+])
+def test_delayed_activity_query_keeps_original_message_date(env, period, occurred, handled):
+    from kin_mind.context import activity_query_filters
+    mind, _, source = env
+    mind.clock = lambda: handled
+    original = source("original-night", dreams.DREAM_PREFIX + DREAM, at="2026-10-14T17:02:00Z")
+    source("next-night", dreams.DREAM_PREFIX + "下一夜的梦", at="2026-10-15T17:02:00Z")
+    intent = {"kind": "dream", "query": "", "period": period}
+    assert activity_query_filters(intent, occurred) != activity_query_filters(intent, handled)
+    result = Contexts(mind).build(query="今晚/昨晚的梦", mode="light", budget=12000,
+        activity_query=intent, activity_query_at=occurred)
+    assert DREAM in result["text"] and original in result["text"] and "下一夜的梦" not in result["text"]
+    assert mind.clock() == handled
+    for bad in ("2026-10-15T23:59:00", "yesterday", "", 123):
+        with pytest.raises(ValueError):
+            activity_query_filters(intent, handled, reference_at=bad)

@@ -561,7 +561,7 @@ class Contexts:
         return dumps({"id": item["id"], "revision": item.get("revision", 1), "basis": item.get("basis", "inferred"),
                       "text": item["text"], **({"facts": item["facts"]} if item.get("facts") else {})})
 
-    def activity_items(self, *, activity_focus=None, query="", detail="summary", limit=3, activity_query=None):
+    def activity_items(self, *, activity_focus=None, query="", detail="summary", limit=3, activity_query=None, activity_query_at=None):
         """Read only a few original activities; no body is copied into a ledger."""
         from .activities import context_item, identify_activity, read_activity_ref, select_activities
         focus = activity_focus if isinstance(activity_focus, list) else [activity_focus] if activity_focus else []
@@ -576,7 +576,7 @@ class Contexts:
         if not focus and (activity_query is not None or query.strip()):
             filters = {}
             if activity_query is not None:
-                filters = activity_query_filters(activity_query, self.mind.clock())
+                filters = activity_query_filters(activity_query, self.mind.clock(), reference_at=activity_query_at)
                 query = filters.pop("query")
                 detail = "original"
             found = select_activities(self.mind, query=query, limit=limit, detail=detail, **filters)
@@ -1027,7 +1027,7 @@ class Contexts:
                 "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False, activity_focus=None, activity_recall=False, reply_context=None, activity_query=None):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False, activity_focus=None, activity_recall=False, reply_context=None, activity_query=None, activity_query_at=None):
         """`automatic`: the host's own injection before a reply or a draft (host action
         `memory-context`), the only build relevance admission and quiet marks apply to
         (recall_admission). An explicit read, a tool and the console's recall lab are never automatic."""
@@ -1097,7 +1097,7 @@ class Contexts:
         # Generic Engine.recall also uses build: autobiography is opt-in for
         # conversation/continuity readers, and never leaks into fact recall.
         activities = self.activity_items(activity_focus=activity_focus, query=query,
-                                         detail="original" if activity_focus else "summary", activity_query=activity_query) if activity_focus or activity_recall or activity_query is not None else []
+                                         detail="original" if activity_focus else "summary", activity_query=activity_query, activity_query_at=activity_query_at) if activity_focus or activity_recall or activity_query is not None else []
         items.extend(activities)
         state_ids.update(i["id"] for i in items)
         view = self.mind.read(query=query)
@@ -1444,11 +1444,16 @@ class Contexts:
             return receipt
 
 
-def activity_query_filters(value, at):
+def activity_query_filters(value, at, *, reference_at=None):
     """Interpret the classifier's structured activity intent, never the owner's keywords."""
     from datetime import timedelta
     from .dreams import night_start
     from .state import timestamp
+    if reference_at is not None:
+        from .dialogue import utc_time
+        if not isinstance(reference_at, str) or not reference_at:
+            raise ValueError("Activity query reference time requires an ISO timestamp")
+        at = utc_time(reference_at)  # timezone required; never changes the live host clock
     if not isinstance(value, dict) or value.get("kind") not in {"dream", "exploration"}:
         raise ValueError("Invalid activity query kind")
     query, period = value.get("query", ""), value.get("period", "any")
