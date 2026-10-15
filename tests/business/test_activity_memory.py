@@ -354,3 +354,57 @@ def test_subjective_history_survives_source_correction_while_fact_reads_use_curr
     mind.engine.delete(sid)
     assert not contexts._current(subjective)
     assert not any(item['id'] == 'synthetic-curiosity' for item in ContinuityManifest(mind, contexts=contexts).select('纸鹤')['items'])
+
+
+def test_structured_activity_query_reads_last_night_original_without_mixed_chat(env):
+    mind, memory, source = env
+    # At local 20:00, last night's window is yesterday noon to today noon.
+    sid = source("last-night", dreams.DREAM_PREFIX + DREAM, at="2026-10-11T17:02:00Z")
+    source("older", dreams.DREAM_PREFIX + "旧梦", at="2026-10-10T17:00:00Z")
+    report(source, at="2026-10-12T11:00:00Z")
+    intent = {"kind": "dream", "query": "", "period": "last_night"}
+    result = Contexts(mind).build(query="昨晚梦到什么，晚饭吃了什么，纸鹤的折法", activity_query=intent,
+                                  activity_recall=True, mode="light", budget=12000)
+    assert DREAM in result["text"] and sid in result["text"]
+    assert "旧梦" not in result["text"]
+    selected = Contexts(mind).activity_items(query="纸鹤的折法 晚饭", activity_query=intent)
+    assert len(selected) == 1 and "沿对角线折叠" not in dumps(selected)
+    assert '"basis":"imagined"' in result["text"] and '"evidence":false' in result["text"]
+    assert next(i for i in result["index"] if i["id"].startswith("activity:"))["depth"] == "original"
+    empty = Contexts(mind).activity_items(query="纸鹤", activity_query={**intent, "query": "不存在"})
+    assert len(empty) == 1 and '"state":"not-found"' in empty[0]["text"]
+    # No result does not substitute an exploration report, even if the broad query matches it.
+    assert "沿对角线折叠" not in dumps(empty)
+
+
+def test_activity_time_windows_and_explicit_ranges():
+    from kin_mind.context import activity_query_filters
+    intent = {"kind": "dream", "query": "", "period": "last_night"}
+    evening = activity_query_filters(intent, "2026-10-15T13:00:00Z")
+    morning = activity_query_filters(intent, "2026-10-15T01:00:00Z")
+    assert evening == morning
+    assert evening["since"] == "2026-10-14T12:00:00+08:00"
+    assert evening["until"] == "2026-10-15T11:59:59.999999+08:00"
+    for bad in ({"kind":"fact"}, {**intent,"period":"range"}, {**intent,"period":"range","since":"yesterday"}):
+        with pytest.raises(ValueError):
+            activity_query_filters(bad, "2026-10-15T13:00:00Z")
+
+
+def test_real_host_javascript_parameters_reach_python_memory_context(env):
+    import subprocess
+    from pathlib import Path
+    from kin_mind.host import dispatch
+    mind, _, source = env
+    sid = source("contract-dream", dreams.DREAM_PREFIX + DREAM)
+    helper = Path(__file__).resolve().parents[3] / "host" / "input-references.mjs"
+    result = subprocess.run(["/Users/apple/.local/node22/bin/node", "--input-type=module", "-e", '''
+import {memoryContextReferences} from %s;
+console.log(JSON.stringify({query:'昨晚梦到什么，还有晚饭',mode:'light',purpose:'chat',budget:12000,
+ ...memoryContextReferences({channel:'feishu',chatId:'synthetic-chat',messageId:'synthetic-input'},
+ {activity_query:{kind:'dream',query:'',period:'any'}})}));
+''' % json.dumps(helper.as_uri())], check=True, capture_output=True, text=True)
+    request = json.loads(result.stdout)
+    config = {"root":str(mind.engine.db.root), "scope":mind.scope.model_dump(), "agent_version":"synthetic-activity-v1"}
+    answer = dispatch(config, "memory-context", request)
+    assert DREAM in answer["text"] and sid in answer["text"]
+    assert answer["state"] != "disabled"

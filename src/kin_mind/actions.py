@@ -142,6 +142,20 @@ class ActionEvents:
                 queued.append(self.emit(conn, "wish-review", [desire["id"], "trait", sorted(desire["trait_revisions"].items())], {
                     "desire_id": desire["id"], "reason": "A trait this wish rested on was revised",
                     "evidence_ids": [r["record_id"] for r in desire.get("evidence", [])], "agent_version": state["agent_version"]}))
+        # Changed concerns use the existing review lane for contact AND exploration.
+        # A repeated tick asks once for this dependency revision set; it never resumes a wish.
+        for desire in state["desires"].values():
+            if (desire["status"] != "wanted" or not desire.get("concern_revisions")
+                    or timestamp(desire["expires_at"]) <= timestamp(now)
+                    or self.mind._concern_links_fresh(conn, state, desire)):
+                continue
+            current = [(cid, state.get("concerns", {}).get(cid, {}).get("revision"))
+                       for cid in sorted(desire["concern_revisions"])]
+            queued.append(self.emit(conn, "wish-review", [desire["id"], "concern", current], {
+                "desire_id": desire["id"], "kind": desire["kind"],
+                "reason": "A concern this wish rested on changed; resume/link to confirm it, or wait/abandon",
+                "evidence_ids": [r["record_id"] for r in desire.get("evidence", [])],
+                "agent_version": state["agent_version"]}))
         # A contact wish -- a share among them -- still unsent a day after it was made is put to Kin
         # again, once a day while it stands, instead of running out unseen: a decided share sat for six
         # days and expired without a word (2026-09-20 to 26). Her own wait until a later time stands,

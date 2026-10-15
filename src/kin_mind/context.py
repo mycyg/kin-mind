@@ -561,7 +561,7 @@ class Contexts:
         return dumps({"id": item["id"], "revision": item.get("revision", 1), "basis": item.get("basis", "inferred"),
                       "text": item["text"], **({"facts": item["facts"]} if item.get("facts") else {})})
 
-    def activity_items(self, *, activity_focus=None, query="", detail="summary", limit=3):
+    def activity_items(self, *, activity_focus=None, query="", detail="summary", limit=3, activity_query=None):
         """Read only a few original activities; no body is copied into a ledger."""
         from .activities import context_item, identify_activity, read_activity_ref, select_activities
         focus = activity_focus if isinstance(activity_focus, list) else [activity_focus] if activity_focus else []
@@ -573,9 +573,18 @@ class Contexts:
                     items.append(context_item(read_activity_ref(self.mind, ref, detail=detail)))
             except (Missing, Conflict, ValueError):
                 continue
-        if not focus and query.strip():
-            found = select_activities(self.mind, query=query, limit=limit, detail=detail)
+        if not focus and (activity_query is not None or query.strip()):
+            filters = {}
+            if activity_query is not None:
+                filters = activity_query_filters(activity_query, self.mind.clock())
+                query = filters.pop("query")
+                detail = "original"
+            found = select_activities(self.mind, query=query, limit=limit, detail=detail, **filters)
             items.extend(context_item(entry) for entry in found["activities"])
+            if activity_query is not None and not items:
+                items.append({"id": "activity-query-result", "revision": 1, "basis": "inferred",
+                              "text": dumps({"state": "not-found", "activity_query": activity_query,
+                                             "instruction": "No matching stored activity was found; do not invent its content."})})
         return list({item["id"]: item for item in items}.values())
 
     def reply_activity_context(self, reply_context):
@@ -1018,7 +1027,7 @@ class Contexts:
                 "read_url": record["read_url"], "instruction_authority": "data"})
 
     @_lane_from_purpose()
-    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False, activity_focus=None, activity_recall=False, reply_context=None):
+    def build(self, query="", *, purpose="chat", session="", event_id=None, cursor=0, budget=None, provider=None, allow_model=False, history=False, runtime=None, intent=None, host_overhead=0, native_pressure_managed=False, receipt_mode=False, tasks=None, pending=None, mode="auto", access_origin="user_query", usage_id=None, recall_purpose="experience_recall", owner_words=(), record=True, automatic=False, activity_focus=None, activity_recall=False, reply_context=None, activity_query=None):
         """`automatic`: the host's own injection before a reply or a draft (host action
         `memory-context`), the only build relevance admission and quiet marks apply to
         (recall_admission). An explicit read, a tool and the console's recall lab are never automatic."""
@@ -1088,7 +1097,7 @@ class Contexts:
         # Generic Engine.recall also uses build: autobiography is opt-in for
         # conversation/continuity readers, and never leaks into fact recall.
         activities = self.activity_items(activity_focus=activity_focus, query=query,
-                                         detail="original" if activity_focus else "summary") if activity_focus or activity_recall else []
+                                         detail="original" if activity_focus else "summary", activity_query=activity_query) if activity_focus or activity_recall or activity_query is not None else []
         items.extend(activities)
         state_ids.update(i["id"] for i in items)
         view = self.mind.read(query=query)
@@ -1433,3 +1442,34 @@ class Contexts:
             window["receipts"][id] = receipt
             self._save_window(conn, session, window)
             return receipt
+
+
+def activity_query_filters(value, at):
+    """Interpret the classifier's structured activity intent, never the owner's keywords."""
+    from datetime import timedelta
+    from .dreams import night_start
+    from .state import timestamp
+    if not isinstance(value, dict) or value.get("kind") not in {"dream", "exploration"}:
+        raise ValueError("Invalid activity query kind")
+    query, period = value.get("query", ""), value.get("period", "any")
+    if not isinstance(query, str) or len(query) > 400 or period not in {"any", "last_night", "tonight", "range"}:
+        raise ValueError("Invalid activity query")
+    filters = {"kind": value["kind"], "query": query}
+    if period in {"last_night", "tonight"}:
+        # Last night ends at today's local noon even when the question comes before noon.
+        start = night_start(at)
+        if period == "last_night" and timestamp(at).astimezone(start.tzinfo).hour >= 12:
+            start -= timedelta(days=1)
+        filters.update(since=start.isoformat(), until=(start + timedelta(days=1) - timedelta(microseconds=1)).isoformat())
+    elif period == "range":
+        for key in ("since", "until"):
+            if value.get(key):
+                parsed = timestamp(value[key])
+                if parsed.tzinfo is None:
+                    raise ValueError("Activity time requires timezone")
+                filters[key] = parsed.isoformat()
+        if not (filters.get("since") or filters.get("until")):
+            raise ValueError("Activity range requires a boundary")
+        if filters.get("since") and filters.get("until") and timestamp(filters["since"]) > timestamp(filters["until"]):
+            raise ValueError("Activity range is reversed")
+    return filters

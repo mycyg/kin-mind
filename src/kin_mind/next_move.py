@@ -160,6 +160,10 @@ def _binding(conn, mind, state, value, committed, event_id, at):
         if not mine and not standing:
             raise Conflict("This move does not match what this appraisal committed",
                            code="next-move-inconsistent", target=value.wish_ref)
+        if value.move == "reply" and desire.get("kind") == "contact" and not mind._desire_ready(conn, desire, at, state=state):
+            stale = not mind._concern_links_fresh(conn, state, desire)
+            raise Conflict("Selected contact wish requires resume/link review" if stale else "Selected contact wish is not ready",
+                           code="next-move-concern-needs-review" if stale else "next-move-wish-not-ready", target=value.wish_ref)
         bound["wish"] = {"id": value.wish_ref, "kind": desire.get("kind"), "status": desire["status"],
                          "committed": mine}
     if value.step_ref:
