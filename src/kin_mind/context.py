@@ -71,7 +71,8 @@ def affect_projection(view):
                            for k, v in view["dimensions"].items()},
             "understanding": marked(understanding, pending or (isinstance(understanding, dict) and understanding.get("needs_review"))),
             "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:INTERACTION_LIMITS["guidance"]]] if active else [],
-            "concerns": [marked({k: c.get(k) for k in ("id", "content", "status", "basis")}, pending or bool(c.get("needs_review")))
+            "concerns": [marked({k: c.get(k) for k in ("id", "content", "status", "basis", "created_at", "updated_at", "assessed_at",
+                          "created_local_time", "updated_local_time", "timezone", "latest_evidence_time", "temporal_note") if c.get(k) is not None}, pending or bool(c.get("needs_review")))
                          for c in view.get("selected_concerns", [])[:INTERACTION_LIMITS["concerns"]]] if active else [],
             **({"affect_layers": layers} if layers else {})}
 # What a chat read is shown of a trait's counted facts: how many separate times, how many

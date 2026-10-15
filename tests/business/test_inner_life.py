@@ -310,6 +310,8 @@ def test_the_next_idle_reviews_see_the_latest_dream_and_only_a_wish_could_tell_i
     review(mind, source, lambda c: Appraisal(reason="睡着了", dream=Dream(text=DREAM)), "night")
     clock[0] += timedelta(hours=6)
     _, morning = review(mind, source, lambda c: Appraisal(reason="早上"), "morning")
+    from kin_mind.dialogue import STATE_TIME_GUIDANCE
+    assert morning.seen[0]["clock"]["state_inference_guidance"] == STATE_TIME_GUIDANCE
     (shown,) = morning.seen[0]["recent_dreams"]
     assert shown["text"] == DREAM and morning.said[0] == dreams.RECENT_DREAMS_PROMPT
     _, message = review(mind, source, lambda c: Appraisal(reason="小光来了"), "message", stimulus=None)

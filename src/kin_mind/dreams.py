@@ -235,8 +235,10 @@ def _entry(engine, row):
     except (Missing, OSError):
         return None
     from .activities import _ref
+    from .dialogue import historical_time_context
     return {"source_id": row["id"], "at": row["occurred_at"], "text": text.removeprefix(DREAM_PREFIX),
-            "activity_ref": _ref("dream", row), "basis": "imagined", "evidence": False}
+            "activity_ref": _ref("dream", row), "basis": "imagined", "evidence": False,
+            "use_as_current_fact": False, **historical_time_context(row["occurred_at"])}
 
 
 def recent(mind, at=None):
@@ -276,7 +278,8 @@ def read(mind, *, cursor=0, limit=20, identifier=None, query="", since=None, unt
               "dreams": [], "cursor": found["cursor"], "instruction_authority": "data"}
     omitted = []
     for entry in found["activities"]:
-        shown = {key: entry[key] for key in ("source_id", "at", "text", "activity_ref", "basis", "evidence", "superseded", "detail")}
+        shown = {key: entry[key] for key in ("source_id", "at", "local_time", "timezone", "historical", "time_basis", "use_as_current_fact",
+                                                "text", "activity_ref", "basis", "evidence", "superseded", "detail")}
         candidate = {**result, "dreams": [*result["dreams"], shown]}
         if budget is None or tokens(dumps(candidate)) + 80 <= budget:
             result["dreams"].append(shown)

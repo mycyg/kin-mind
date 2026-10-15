@@ -14,6 +14,7 @@ from eventmem.core.read_policy import HOST_PREFIXES, envelope_prefixes, host_env
 
 TIMEZONE = "Asia/Singapore"
 RECENT_EXCHANGES = 4
+STATE_TIME_GUIDANCE = "结合当前时间、原消息/记录时间、经过时长和后续更新判断活动状态。过去说正在做的事，不等于现在仍在做；也不因时间过去就断言已经结束。用户新明确陈述优先。区分已确认事实与此刻推测；缺少更新时可保持未知，用自然、带余地的话回应，不必每句追问确认。推测不冒充用户确认的事实，保留其推断身份，不能成为后续确认的来源。历史日期按本轮时区理解。"
 
 
 def is_public_dialogue(event, prefixes=HOST_PREFIXES):
@@ -51,7 +52,15 @@ def contact_timezone(mind):
 def clock_context(now, zone=TIMEZONE):
     stamp = datetime.fromisoformat(utc_time(now))
     return {"current_time": stamp.isoformat(), "local_time": stamp.astimezone(ZoneInfo(zone)).isoformat(),
-            "timezone": zone, "authority": "host-clock", "historical_times_are_not_now": True}
+            "timezone": zone, "authority": "host-clock", "historical_times_are_not_now": True,
+            "state_inference_guidance": STATE_TIME_GUIDANCE}
+
+
+def historical_time_context(at, zone=TIMEZONE):
+    """Display an event's local time without relabeling its original timestamp as now."""
+    stamp = datetime.fromisoformat(utc_time(at))
+    return {"local_time": stamp.astimezone(ZoneInfo(zone)).isoformat(), "timezone": zone,
+            "historical": True, "time_basis": "recorded-event"}
 
 
 def split_recent(items, exchanges=RECENT_EXCHANGES):

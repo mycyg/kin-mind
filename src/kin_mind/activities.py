@@ -10,6 +10,8 @@ from contextlib import nullcontext
 
 from eventmem.core.db import Conflict, Missing, dumps
 
+from .dialogue import historical_time_context
+
 KINDS = {"exploration": "kin-exploration", "dream": "kin-dream"}
 CLASSES = {"exploration": "knowledge_report", "dream": "dream_imagination"}
 
@@ -117,7 +119,7 @@ def read_activity_ref(mind, activity_ref, *, conn=None, detail="full", historica
                  "source_ids": [ref["source_id"]], "record_ids": [root_id],
                  "dependencies": [{"id": root_id, "revision": root["revision"]}],
                  "activity_dependency": ref, "superseded": bool(newer), "instruction_authority": "data",
-                 "historical": True}
+                 **historical_time_context(ref["occurred_at"])}
         if ref["kind"] == "dream":
             from .dreams import DREAM_PREFIX
             text = raw.removeprefix(DREAM_PREFIX)
@@ -217,7 +219,8 @@ def context_item(entry):
     """Dedicated autobiography lane, with no observed graph projection."""
     ref = entry["activity_ref"]
     facts = {"kind": "activity", "activity_ref": ref, "content_class": ref["content_class"],
-             "occurred_at": ref["occurred_at"], "superseded": entry["superseded"]}
+             "occurred_at": ref["occurred_at"], "superseded": entry["superseded"],
+             **{key: entry[key] for key in ("local_time", "timezone", "historical", "time_basis")}}
     if ref["kind"] == "dream":
         facts.update(evidence=False, use_as_current_fact=False, autobiography="dreamed-imagination")
     else:

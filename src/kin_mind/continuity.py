@@ -283,6 +283,9 @@ def select_concerns(concerns, query="", limit=3, intent=None, entering=()):
                 "basis",
                 "confidence",
                 "evidence_ids",
+                "created_at", "updated_at", "assessed_at",
+                "created_local_time", "updated_local_time", "timezone",
+                "latest_evidence_time", "temporal_note",
                 "owner_request",
             )
         }
@@ -774,6 +777,18 @@ class Continuity:
                 view = concern_projection(entry, at)
                 view["needs_review"] = low_confidence(entry) or not self._concern_fresh(conn, entry)
                 view["evidence_ids"] = [r["record_id"] for r in entry["evidence"]]
+                from .dialogue import historical_time_context, TIMEZONE
+                view["timezone"] = TIMEZONE
+                for field in ("created", "updated"):
+                    if entry.get(field + "_at"):
+                        view[field + "_local_time"] = historical_time_context(entry[field + "_at"])["local_time"]
+                timed = [ref for ref in entry["evidence"] if ref.get("occurred_at")]
+                if timed:
+                    latest = max(timed, key=lambda ref: stamp(ref["occurred_at"]))
+                    view["latest_evidence_time"] = {
+                        "source_id": latest["source_id"], "occurred_at": latest["occurred_at"],
+                        "local_time": historical_time_context(latest["occurred_at"])["local_time"], "timezone": TIMEZONE}
+                view["temporal_note"] = "这是当时形成的心事；active/easing不证明用户此刻仍在进行所述活动。latest_evidence_time只是最近来源的发生时间，不是正文活动的时间。"
                 view.pop("evidence", None)
                 view.pop("resolution_evidence", None)
                 result["concerns"].append(view)

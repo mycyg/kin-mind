@@ -151,3 +151,50 @@ def test_the_bounds_are_the_render_s_own():
     assert answer.returncode == 0, answer.stderr[-2000:]
     limits = json.loads(answer.stdout)
     assert {key: INTERACTION_LIMITS[key] for key in limits} == limits
+
+
+def test_concern_time_survives_selection_memory_and_real_host_projection(setup):
+    from datetime import datetime, timedelta, timezone
+    from kin_mind.context import affect_projection
+    from kin_mind.continuity import ConcernProposal
+    from test_companion_continuity import concerns_on, create, propose
+    mind, source, clock = setup
+    clock[0] = datetime(2030, 10, 14, 17, 2, 0, 123456, tzinfo=timezone.utc)
+    concerns_on(mind, source)
+    cid, _ = create(mind, source, clock, 'synthetic-activity')
+    clock[0] += timedelta(minutes=5)
+    evidence = source('later-source', 'synthetic observation')
+    clock[0] += timedelta(minutes=2)
+    propose(mind, 'new-assessment', ConcernProposal(action='update', concern_id=cid, reason='synthetic assessment',
+        intensity=65, evidence_ids=[evidence]), evidence)
+    clock[0] += timedelta(hours=3)
+    view = mind.read()
+    concern = next(c for c in view['selected_concerns'] if c['id'] == cid)
+    assert concern['created_at'] == '2030-10-14T17:03:00.123456+00:00'
+    assert concern['created_local_time'] == '2030-10-15T01:03:00.123456+08:00'
+    assert concern['updated_at'] == concern['assessed_at'] == '2030-10-14T17:10:00.123456+00:00'
+    assert concern['updated_local_time'] == '2030-10-15T01:10:00.123456+08:00'
+    assert concern['latest_evidence_time'] == {'source_id':evidence, 'occurred_at':'2030-10-14T17:08:00.123456+00:00',
+        'local_time':'2030-10-15T01:08:00.123456+08:00', 'timezone':'Asia/Singapore'}
+    memory = affect_projection(view)['concerns'][0]
+    whole, projected = rendered(view, interaction_projection(view))
+    for shown in (memory, whole['concerns'][0], projected['concerns'][0]):
+        for field in ('created_at','updated_at','assessed_at','created_local_time','updated_local_time','timezone','latest_evidence_time','temporal_note'):
+            assert shown[field] == concern[field]
+        assert '不证明用户此刻仍在进行' in shown['temporal_note']
+    # Presentation only: no guessed end state or display fields are persisted into the concern.
+    with mind.engine.db.connect() as conn:
+        stored = mind._load(conn)['concerns'][cid]
+        assert stored['status'] == 'active' and 'temporal_note' not in stored and 'latest_evidence_time' not in stored
+
+
+def test_background_clock_and_conversation_clock_share_state_time_guidance():
+    from kin_mind.dialogue import clock_context
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("needs node")
+    module = ADAPTER.parent / "conversation-time.mjs"
+    script = "import {conversationClock} from " + json.dumps(module.as_uri()) + ";console.log(JSON.stringify(conversationClock({},'2026-10-15T14:00:00Z')));"
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, check=True)
+    host = json.loads(result.stdout)
+    assert host["state_inference_guidance"] == clock_context("2026-10-15T14:00:00Z")["state_inference_guidance"]

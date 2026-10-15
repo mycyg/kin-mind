@@ -430,3 +430,40 @@ def test_delayed_activity_query_keeps_original_message_date(env, period, occurre
     for bad in ("2026-10-15T23:59:00", "yesterday", "", 123):
         with pytest.raises(ValueError):
             activity_query_filters(intent, handled, reference_at=bad)
+
+
+@pytest.mark.parametrize('kind', ['dream', 'exploration'])
+def test_activity_model_views_keep_original_time_and_show_local_historical_time(env, kind):
+    from kin_mind.model_view import for_model
+    mind, _, source = env
+    occurred = '2026-10-14T17:02:00.000000+00:00'
+    sid = (source('dated-dream', dreams.DREAM_PREFIX + DREAM, at=occurred) if kind == 'dream'
+           else report(source, 'dated-report', at=occurred))
+    ref = canonical_activity_ref(mind, kind, sid)
+    entry = for_model(read_activity_ref(mind, ref))
+    assert entry['at'] == occurred and entry['activity_ref']['occurred_at'] == occurred
+    assert entry['local_time'] == '2026-10-15T01:02:00+08:00'
+    assert entry['timezone'] == 'Asia/Singapore' and entry['historical'] is True
+    # _line is the actual original-context serialization, not just its in-memory item.
+    line = for_model(json.loads(Contexts._line(context_item(entry))))
+    facts = line['facts']
+    assert facts['occurred_at'] == occurred and facts['local_time'] == entry['local_time']
+    assert facts['historical'] is True and facts['time_basis'] == 'recorded-event'
+    if kind == 'dream':
+        assert facts['evidence'] is False and facts['use_as_current_fact'] is False
+    else:
+        assert facts['state'] == 'complete', 'the original report state is retained as historical'
+
+
+def test_dream_tool_and_idle_view_preserve_historical_local_time(env):
+    from eventmem.core.mcp import create_mcp
+    mind, _, source = env
+    occurred = '2026-10-14T17:02:00.000000+00:00'
+    source('dated-tool-dream', dreams.DREAM_PREFIX + DREAM, at=occurred)
+    mind.clock = lambda: '2026-10-15T01:30:00+00:00'
+    answer = asyncio.run(create_mcp(mind.engine).call_tool('read_dreams', {'scope': mind.scope.model_dump()}))
+    result = answer[1] if isinstance(answer, tuple) else json.loads(answer[0].text)
+    for shown in (result['dreams'][0], dreams.recent(mind)[0]):
+        assert shown['at'] == occurred and shown['local_time'] == '2026-10-15T01:02:00+08:00'
+        assert shown['timezone'] == 'Asia/Singapore' and shown['historical'] is True
+        assert shown['evidence'] is False and shown['use_as_current_fact'] is False
