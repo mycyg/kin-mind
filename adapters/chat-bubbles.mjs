@@ -35,7 +35,7 @@ export function privateReplyBoundary(text) {
   return null;
 }
 
-export const chatVoice = '普通聊天和主动分享按自己的话意选择一个或多个完整气泡；停顿、情绪转折或新的念头可以分开发，不为了形式机械拆句。深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
+export const chatVoice = '回复前先结合眼前话题、时间和后续更新，考虑小光可能在做什么、这轮值得说什么；不确定的状态保留余地，只输出自然回应，不展示分析过程。普通聊天和主动分享默认简短自然，优先一个完整气泡；确有独立内容时再按话意选择一个或多个完整气泡。同一话题的接话、关心和追问尽量合成一个自然段。空行会拆成气泡，不为排版或每句话机械留空行，不重复关心、追问或凑收尾。深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
 
 /** The internal draft protocol's control envelope, recognised on a normal chat
  * turn's reply body. This shape is how internal draft turns (proactive contact)
