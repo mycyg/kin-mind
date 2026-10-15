@@ -455,22 +455,22 @@ def test_late_real_receipt_closes_original_unknown_delivery_without_restoring_co
 
 
 @pytest.mark.parametrize('choice', ['defer', 'keep', 'private', 'abandon'])
-def test_saved_exploration_recall_survives_nonshare_restart_and_failed_delivery(system, choice):
+def test_saved_exploration_recall_survives_nonshare_restart_and_canceled_delivery(system, choice):
     from eventmem.core import Engine
     from kin_mind.activities import select_activities
     from kin_mind.state import Mind
     mind, memory, source, clock = system
     ref = activity(system, 'exploration', 'saved-unshared-report')
     original = read_activity_ref(mind, ref)['text']
-    # A prepared delivery was canceled before sending; its original report stays saved.
-    memory.sharing.prepare({'draft_id': 'failed-share', 'references': [{'activity_ref': ref}]})
-    memory.sharing.cancel('failed-share')
+    # Exercise the delivery-result settlement path with a synthetic sending termination.
+    # This is not a real external platform failure.
+    deliver(system, ref, 'canceled', 'failed')
     decide(system, ref, choice, 'nonshare-choice')
     for reader in (mind, Mind(Engine(mind.engine.db.root), mind.scope, clock=mind.clock)):
         assert read_activity_ref(reader, ref)['text'] == original
         assert select_activities(reader, kind='exploration', query='合成海图')['activities'][0]['activity_ref'] == ref
         assert select_activities(reader, kind='exploration', identifier=ref['source_id'], detail='original')['activities'][0]['text'] == original
     with mind.engine.db.connect() as conn:
-        assert memory.sharing.coverage(conn, ref)['state'] == 'unshared'
+        assert memory.sharing.coverage(conn, ref)['state'] == 'unconfirmed'
     with pytest.raises(Conflict):
         wish(system, ref, 'not-authorized-to-contact')
