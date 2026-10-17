@@ -26,9 +26,9 @@ MAX_TEXT = 4000
 class PrivateNotes:
     def __init__(self, mind):
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope.key()
-        ensure_schema(self.engine, 'private-notes-v1', SCHEMA)
 
     def save(self, request):
+        ensure_schema(self.engine, 'private-notes-v1', SCHEMA)
         identifier, group = request.get('id'), request.get('group_id')
         text = request.get('text')
         if not isinstance(identifier, str) or not identifier or not isinstance(group, str) or not group:
@@ -71,7 +71,8 @@ class PrivateNotes:
                 where.append('julianday(at)'+op+'julianday(?)'); args.append(timestamp(value).isoformat())
         with self.engine.db.connect() as conn:
             # Queries stay local. A bounded semantic rerank is optional and never a paid chat call.
-            rows = conn.execute('SELECT * FROM mind_private_notes WHERE '+' AND '.join(where)+' ORDER BY at DESC,id DESC', args).fetchall()
+            exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_private_notes'").fetchone()
+            rows = conn.execute('SELECT * FROM mind_private_notes WHERE '+' AND '.join(where)+' ORDER BY at DESC,id DESC', args).fetchall() if exists else []
         entries = [{**json.loads(r['data']), 'id': r['id'], 'at': r['at'], 'input_id': r['input_id'], 'group_id': r['group_id']} for r in rows]
         state = 'not-needed'
         if query:
