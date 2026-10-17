@@ -1,0 +1,16 @@
+{
+  "query": "昨晚梦到什么，还有晚饭",
+  "mode": "light",
+  "purpose": "chat",
+  "budget": 12000,
+  "reply_context": {
+    "channel": "feishu",
+    "conversation_id": "synthetic-chat",
+    "platform_message_id": "synthetic-input",
+    "reply_to_message_id": null,
+    "thread_id": null,
+    "root_message_id": null
+  },
+  "activity_query": {"kind": "dream", "query": "", "period": "last_night"},
+  "activity_query_at": "2026-08-01T15:59:00Z"
+}

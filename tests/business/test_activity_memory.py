@@ -390,20 +390,15 @@ def test_activity_time_windows_and_explicit_ranges():
             activity_query_filters(bad, "2026-10-15T13:00:00Z")
 
 
-def test_real_host_javascript_parameters_reach_python_memory_context(env):
-    import subprocess
+def test_host_request_contract_reaches_python_memory_context(env):
     from pathlib import Path
     from kin_mind.host import dispatch
     mind, _, source = env
     sid = source("contract-dream", dreams.DREAM_PREFIX + DREAM)
-    helper = Path(__file__).resolve().parents[3] / "host" / "input-references.mjs"
-    result = subprocess.run(["/Users/apple/.local/node22/bin/node", "--input-type=module", "-e", '''
-import {memoryContextReferences} from %s;
-console.log(JSON.stringify({query:'昨晚梦到什么，还有晚饭',mode:'light',purpose:'chat',budget:12000,
- ...memoryContextReferences({channel:'feishu',chatId:'synthetic-chat',messageId:'synthetic-input',occurredAt:'2026-08-01T15:59:00Z'},
- {activity_query:{kind:'dream',query:'',period:'last_night'},activity_query_at:'2099-01-01T00:00:00Z'})}));
-''' % json.dumps(helper.as_uri())], check=True, capture_output=True, text=True)
-    request = json.loads(result.stdout)
+    # The core checkout owns its wire contract. The host's integration test
+    # checks that its real JavaScript produces this exact request; core CI
+    # must not depend on a sibling private checkout or a Mac-only executable.
+    request = json.loads((Path(__file__).with_name("fixtures") / "host-memory-context.json").read_text())
     assert request["activity_query_at"] == "2026-08-01T15:59:00Z"
     config = {"root":str(mind.engine.db.root), "scope":mind.scope.model_dump(), "agent_version":"synthetic-activity-v1"}
     answer = dispatch(config, "memory-context", request)
