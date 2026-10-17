@@ -76,6 +76,14 @@ def _dispatch(config, action, request):
     if config.get("contact_policy_file"):
         # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
         mind.register_contact_policy(config["contact_policy_file"])
+    if action in {"private-note-save", "private-notes"}:
+        from .private_notes import PrivateNotes
+        notes = PrivateNotes(mind)
+        if action == "private-note-save":
+            return notes.save(request)
+        if request.pop("recent", False):
+            return notes.recent()
+        return notes.read(**request)
     if action == "liveness-facts":
         # The host's contact pause and fault watch: the store's liveness facts, read-only, with no
         # model, executor or embedding service asked (operational_status.liveness_read).
@@ -748,6 +756,7 @@ UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 # no long executor. Exploration, creation's completion review, memory preparation and every
 # request that may take a native review keep their own process, executor and lease.
 RESIDENT_ACTIONS = frozenset({
+    "private-note-save", "private-notes",
     "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
     "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",

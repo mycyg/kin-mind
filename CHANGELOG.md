@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.44
+- Keep a private role note before every owner-facing reply; send only public bubbles across chat and work.
+- Recall notes by message, time, and local semantic search, separate from public diary and factual memory.
+- Preserve delivery uncertainty, restart recall, and source erasure for private notes.
+
 ## 0.1.39
 - Preserve unread desktop messages and concurrent cursor updates; reject ambiguous file-name grants.
 - Back off temporary model handoff failures and distinguish exhausted input retries in notices.

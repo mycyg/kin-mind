@@ -99,6 +99,12 @@ def register_mind_tools(server, engine):
         return read(Mind(engine, scope), identifier, kind=kind)
 
     @server.tool()
+    def read_private_notes(scope: Scope, query: str = "", identifier: str | None = None, input_id: str | None = None, group_id: str | None = None, since: str | None = None, until: str | None = None, cursor: int = 0, limit: int = 5) -> dict:
+        """回忆自己在某次回复前留下的私密心情札记。可用相关话题、消息/回复组编号或时间范围；语义检索只用本地嵌入，不可用时退回词语检索。它是当时感受和猜测，不是小光的事实；小光问当时怎么想时可自然回答，平常不主动公开。旧猜测服从后来的纠正。"""
+        from .private_notes import PrivateNotes
+        return PrivateNotes(Mind(engine, scope)).read(query=query, identifier=identifier, input_id=input_id, group_id=group_id, since=since, until=until, cursor=cursor, limit=limit)
+
+    @server.tool()
     def read_dreams(scope: Scope, cursor: int = 0, limit: int = 10, identifier: str | None = None, query: str = "", since: str | None = None, until: str | None = None, detail: str = "original", budget: int | None = None) -> dict:
         """按 ID、主题或时间读取自己做过的梦，最新的在前。可选 index、summary 或 original，budget 控制本地读取大小。关闭新梦生成后旧梦仍可读；可以记得梦过什么，梦中事件仍非现实事实和特征证据。要不要讲由你决定，读取本身不发送消息。"""
         from .dreams import read

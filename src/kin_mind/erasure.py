@@ -109,7 +109,7 @@ SPECIAL = frozenset({"mind_events", "mind_graph_nodes", "mind_graph_edges", "min
                      # A deferred event route goes whole with what it names (event_deferrals).
                      "mind_event_deferrals", "mind_sealed_entries",
                      # Handled whole in _recall_rows: a mark goes with its item and with the message it cites.
-                     "mind_recall_observations", "mind_recall_quiet"})
+                     "mind_recall_observations", "mind_recall_quiet", "mind_private_notes"})
 # What was, or was about to be, put into a native window: a delivery (its body `text` and its
 # `items`, which name what they rest on as `id`, `dependencies[].id` and the like) and a window's
 # stored receipts (`text`, `rendered_text`, `index[].id`). Handled by name below (CR-MEM-02).
@@ -807,6 +807,10 @@ def _recall_rows(conn, erased, doomed, *, write=True):
     habit's preference goes with what it was said in: all go whole. Counts, as (observations, marks,
     vectors)."""
     observations = marks = vectors = 0
+    if doomed and _table(conn, "mind_private_notes"):
+        rows = [r["key"] for r in mentions(conn, "mind_private_notes", doomed, "rowid AS key")]
+        for key in rows if write else ():
+            conn.execute("DELETE FROM mind_private_notes WHERE rowid=?", (key,))
     if doomed and _table(conn, RECALL_OBSERVATIONS):
         rows = [row["key"] for row in mentions(conn, RECALL_OBSERVATIONS, doomed, "rowid AS key")]
         for key in rows if write else ():
