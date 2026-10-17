@@ -646,7 +646,8 @@ def _dispatch(config, action, request):
         capabilities = exploration_capabilities(config, computer_override=resolved_computer)
         web = None
         if capabilities["capabilities"]["search"]["available"]:
-            web = {**(config.get("exploration_web") or {}), "enabled": True}
+            web = {**(config.get("exploration_web") or {}), "enabled": True,
+                   "backend": "deepseek", "credentials_file": config.get("credentials_file")}
         budget = min(int(request.get("budget_seconds") or prepared["budget_seconds"]),
                      prepared["budget_seconds"])
         return explorer.run(

@@ -42,7 +42,7 @@ from .source_ledger import (
     verify_citations,
 )
 from .source_ledger import summary as ledger_summary
-from .web_read import DEFAULT_SEARCH_ENDPOINT
+from .web_service import SEARCH_ENDPOINT as DEFAULT_SEARCH_ENDPOINT
 
 # The codex-cli version this executor was built and verified against. Older CLIs
 # pause the exploration instead of failing in unpredictable flag handling.
@@ -842,6 +842,8 @@ def run_codex(
         web_ledger = directory / "web-observations.json"
         web_config = {"execution_id": directory.name, "attempt": attempt,
                       "ledger": str(web_ledger),
+                      "backend": web.get("backend", "direct"),
+                      "credentials_file": web.get("credentials_file"),
                       "search_endpoint": web.get("search_endpoint") or DEFAULT_SEARCH_ENDPOINT,
                       "public_transport": web.get("public_transport"),
                       "allow_hosts": list(web.get("allow_hosts", []))}

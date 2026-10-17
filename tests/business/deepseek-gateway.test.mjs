@@ -230,3 +230,17 @@ test('native developer-base format passes the existing exact instruction check f
  ])assert.equal((await request({model:'k3',...body})).status,400);
  assert.equal(sent.length,before,'invalid instructions never reach a provider');
 });
+
+test('chat host web functions round-trip namespaces for DeepSeek and Kimi without built-in search', async t => {
+  for (const model of ['deepseek-flash','k3']) {
+    let upstream;
+    const gateway=await startDeepSeekGateway({key:'synthetic-ds',kimiKey:'synthetic-kimi',
+      fetchImpl:async(_url,init)=>{upstream=JSON.parse(init.body);return {ok:true,headers:{get:()=> 'application/json'},json:async()=>({id:'synthetic',status:'completed',output:[{type:'function_call',call_id:'call-public',name:'mcp__memorypalace__read_page',arguments:'{"url":"https://example.com"}'}],usage:{}})};}});
+    t.after(()=>gateway.close());
+    const r=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model,input:[user('Read public example.com')],tools:[{type:'web_search'},{type:'namespace',name:'mcp__memorypalace',tools:[{type:'function',name:'read_page',parameters:{type:'object',properties:{url:{type:'string'}},required:['url']}}]}]})});
+    assert.equal(r.status,200);const result=await r.json();
+    assert.equal(upstream.tools.length,1);assert.equal(upstream.tools[0].name,'mcp__memorypalace__read_page');
+    assert.equal(result.output[0].namespace,'mcp__memorypalace');assert.equal(result.output[0].name,'read_page');
+    assert.equal(result.output[0].call_id,'call-public');
+  }
+});

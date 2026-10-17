@@ -78,10 +78,11 @@ const EXPLORATION_MCP_NAMESPACES = new Set(['mcp__kin_web', 'mcp__kin_computer',
 /** DeepSeek Responses accepts ordinary function tools, not Codex namespace
  * wrappers. Flatten only the three host-owned exploration namespaces and retain
  * a reverse map for responses. Collaboration/user-input/write tools stay absent. */
-export function flattenExplorationTools(body) {
+export function flattenExplorationTools(body, {chat = false} = {}) {
   const reverse = new Map(), tools = [];
+  const namespaces = chat ? new Set([...EXPLORATION_MCP_NAMESPACES, 'mcp__memorypalace', 'memorypalace']) : EXPLORATION_MCP_NAMESPACES;
   for (const tool of body.tools ?? []) {
-    if (tool?.type === 'namespace' && EXPLORATION_MCP_NAMESPACES.has(tool.name)) {
+    if (tool?.type === 'namespace' && namespaces.has(tool.name)) {
       for (const member of tool.tools ?? []) {
         if (member?.type !== 'function') continue;
         const name = tool.name + '__' + member.name;
@@ -90,11 +91,11 @@ export function flattenExplorationTools(body) {
       }
       continue;
     }
-    if (tool?.type === 'function' && tool.name !== 'request_user_input') tools.push(tool);
+    if (chat ? tool?.type !== 'web_search' && tool?.type !== 'web_search_preview' : tool?.type === 'function' && tool.name !== 'request_user_input') tools.push(tool);
   }
   body.tools = tools;
   body.input = (body.input ?? []).map(item => {
-    if (item?.type !== 'function_call' || !EXPLORATION_MCP_NAMESPACES.has(item.namespace)) return item;
+    if (item?.type !== 'function_call' || !namespaces.has(item.namespace)) return item;
     const name = item.namespace + '__' + item.name;
     if (!reverse.has(name)) reverse.set(name, {namespace: item.namespace, name: item.name});
     const value = {...item, name}; delete value.namespace; return value;
@@ -335,7 +336,9 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         res.writeHead(400, {'Content-Type':'application/json'});
         res.end(JSON.stringify({error:{message:'Instruction requirement mismatch',type:'configuration_error',code:'instruction_requirement_mismatch'}}));return;
       }
-      const reverseTools = profile === 'exploration' ? flattenExplorationTools(body) : new Map();
+      // Host web tools are ordinary functions for both providers. Preserve their
+      // native namespace in returned calls so ACP can execute and track them.
+      const reverseTools = flattenExplorationTools(body, {chat: profile !== 'exploration'});
       if (lease) {
         held = await lease.acquire({lane: attributed.lane, purpose: attributed.purpose});
         if (!held.proceed) {
