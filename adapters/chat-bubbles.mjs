@@ -98,13 +98,14 @@ export function chatEnvelope(text) {
   if(!('bubbles' in value)&&!PROTOCOL_ACTIONS.has(value.action))return null;
   const keys=Object.keys(value);
   const referenced=bubble=>bubble&&typeof bubble==='object'&&!Array.isArray(bubble)&&
-    Object.keys(bubble).every(key=>['text','references','bubble_id'].includes(key))&&
+    Object.keys(bubble).every(key=>['text','references','bubble_id','presentation'].includes(key))&&
     typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
     (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
   if(value.action==='send'&&keys.every(k=>['action','bubbles','presentation'].includes(k))&&Array.isArray(value.bubbles)&&value.bubbles.length
     &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)))
     return {state:'send',...(value.presentation?{presentation:replyPresentation(value.presentation)}:{}),bubbles:value.bubbles.map(bubble=>(typeof bubble==='string'?bubble:bubble.text).trim()),
       ...(value.bubbles.some(bubble=>typeof bubble==='object')?{
+        ...(value.bubbles.some(bubble=>bubble?.presentation)?{presentations:value.bubbles.map(bubble=>bubble?.presentation?replyPresentation(bubble.presentation):null)}:{}),
         references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references:undefined),
         reference_bubble_ids:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.bubble_id??null:null)}:{})};
   return {state:'invalid',reason:'chat-envelope-incomplete'};

@@ -57,12 +57,13 @@ function decide(result) {
       if(!Array.isArray(result.bubbles))return null;
       // A bubble is a string, or {text, references} when it cites what it shares.
       const items=result.bubbles.map(x=>typeof x==='string'?{text:x}:x&&typeof x==='object'&&typeof x.text==='string'
-        &&(x.references===undefined||x.references===null||Array.isArray(x.references))?{text:x.text,references:x.references??[]}:null);
+        &&(x.references===undefined||x.references===null||Array.isArray(x.references))?{text:x.text,references:x.references??[],...(x.presentation?{presentation:replyPresentation(x.presentation)}:{})}:null);
       if(items.some(x=>x===null))return null;
       const kept=items.filter(x=>x.text.trim());
       if(kept.length||typeof result.text!=='string') {
         const bubbles=kept.map(x=>x.text.trim());
         return {action:'send',...(result.presentation?{presentation:replyPresentation(result.presentation)}:{}),...(result.private_note!==undefined?{private_note:result.private_note}:{}),text:bubbles.join('\n\n'),bubbles,
+          ...(kept.some(x=>x.presentation)?{presentations:kept.map(x=>x.presentation??null)}:{}),
           ...(kept.some(x=>x.references)?{references:kept.map(x=>x.references??[])}:{}),...chosen};
       }
     }

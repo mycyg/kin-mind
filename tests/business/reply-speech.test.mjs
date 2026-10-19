@@ -70,3 +70,27 @@ test('Wechat speech delivery is explicitly a file attachment',async()=>{
 });
 
 test('a failed audio copy does not claim the accepted text was unsent',()=>{const p=bubblePieces({text:'你好。',fragments:[{kind:'text',state:'accepted',start:0,end:3},{kind:'speech',state:'failed',start:0,end:3}]});assert.deepEqual(p.sent,['你好。']);assert.match(p.unsent[0],/语音部分/);});
+
+const mixedReply=JSON.stringify({private_note:'私密札记',action:'send',presentation:{mode:'text',style:''},bubbles:[
+ {text:'https://example.com/help',references:[],presentation:null},
+ {text:'晚安。',references:[],presentation:{mode:'voice',style:''}},
+]});
+test('different public bubbles retain their own forms without repeating their content',async t=>{
+ const p=parsePrivateReply(mixedReply);assert.equal(p.state,'send');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kin-mixed-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const m=new TransportManifests({directory:dir,receipt:()=>null,sleep:async()=>{}}),sent=[];
+ const entries=p.bubbles.map((text,i)=>({request:{draft_id:'d'+i,reply_id:'input',text},delivery:{id:'b'+i,text,presentation:p.presentations[i]??p.presentation}}));
+ const draft=m.createDraft({entries,ownerEpoch:1});
+ const result=await m.run(draft.group_id,{transport:{receipt:()=>null,send:async d=>{sent.push(d);return {state:'accepted',messageId:d.id};}}});
+ assert.equal(result.manifest.state,'accepted');assert.equal(sent.length,2);
+ assert.equal(sent[0].text,'https://example.com/help');assert.equal(sent[0].speech,undefined);
+ assert.equal(sent[1].text,'晚安。');assert.ok(sent[1].speech);
+ assert.ok(!JSON.stringify(sent).includes('私密札记'));
+});
+test('proactive mixed forms survive parsing, freezing, and journal resume',async()=>{
+ const d=parseContactDraft(mixedReply),store=new Map(),sent=[];
+ const batch=createContactBatch({read:id=>store.get(id),write:(id,v)=>store.set(id,structuredClone(v)),send:async x=>{sent.push(x);return {state:'accepted',messageId:x.id};}});
+ const r=await batch({id:'mixed-contact',...d,channel:'feishu'});assert.equal(r.state,'accepted');
+ assert.equal(sent.length,2);assert.equal(sent[0].speech,undefined);assert.ok(sent[1].speech);
+ await batch({id:'mixed-contact'});assert.equal(sent.length,2);
+});

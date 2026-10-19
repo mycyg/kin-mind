@@ -91,11 +91,11 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
       item.sourceReferences=item.references;
-      const mode=batch.presentation?.mode??'text';
+      const presentation=item.presentation??batch.presentation,mode=presentation?.mode??'text';
       if(begun||mode==='text')items.push(...(begun?[item]:cut(item,limit)));
       else {
         if(mode==='both')items.push(...cut(item,limit));
-        items.push({...item,id:mode==='both'?item.id+'-speech':item.id,speech:{style:batch.presentation?.style??''}});
+        items.push({...item,id:mode==='both'?item.id+'-speech':item.id,speech:{style:presentation?.style??''}});
       }
     }
     batch.items=items;batch.review={at:now(),...(verdict.review_id?{id:verdict.review_id}:{})};
@@ -145,7 +145,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='pending';batch.reason=reason==='frozen'?'dispatch-frozen':reason;batch.heldAtGate=true;
     await write(id,batch);return result(batch);
   }
-  async function run({id,text,bubbles,presentation,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
+  async function run({id,text,bubbles,presentation,presentations,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
     if(!batch) {
@@ -153,7 +153,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(!Array.isArray(files)||files.length>24)throw Error('contact-batch-invalid-files');
       batch={id,channel,...(presentation?{presentation:replyPresentation(presentation)}:{}),...(conversationId?{conversationId}:{}),state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
         const itemId='kin-bubble-'+id+'-'+index;
-        return{id:itemId,draftId:itemId,bubbleIndex:index,text,references:references[index]??[],state:'unsent'};
+        return{id:itemId,draftId:itemId,bubbleIndex:index,text,...(presentations?.[index]?{presentation:replyPresentation(presentations[index])}:{}),references:references[index]??[],state:'unsent'};
       })};
       batch.items.push(...files.map((file,index)=>{const itemId='kin-file-'+id+'-'+index;return{id:itemId,draftId:itemId,file,state:'unsent'};}));
       await write(id,batch);

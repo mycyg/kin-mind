@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.54
+
+- Anchor the local voice to an owner-selected synthetic recording using the existing Qwen3-TTS Base model.
+- Let Kin choose text or voice without repeating the same content; both remains available when explicitly requested.
+- Carry optional per-bubble forms through existing reply and proactive contact delivery.
+
 ## 0.1.53
 
 - Add local Qwen3-TTS public replies in text, voice, or both, with a fixed configurable voice and style instructions.

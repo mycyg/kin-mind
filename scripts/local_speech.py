@@ -1,4 +1,4 @@
-"""Offline Qwen3 CustomVoice worker. stdin contains public text only; EOF exits."""
+"""Offline Qwen3 speech worker. stdin contains public text only; EOF exits."""
 import contextlib
 import json
 import os
@@ -11,6 +11,7 @@ import time
 def main():
     model_path, ffmpeg = sys.argv[1:3]
     model = None
+    reference = None
     for line in sys.stdin:
         started = time.monotonic()
         stage = "load"
@@ -20,6 +21,7 @@ def main():
             # MLX/transformers diagnostics must not become protocol responses.
             with contextlib.redirect_stdout(sys.stderr):
                 import numpy as np
+                import mlx.core as mx
                 import soundfile as sf
                 from mlx_audio.tts.utils import load_model
 
@@ -30,11 +32,25 @@ def main():
                 load_ms = round((time.monotonic() - load_started) * 1000)
                 stage = "synthesis"
                 generation_started = time.monotonic()
-                results = list(model.generate_custom_voice(
-                    text=request["text"], speaker=request["voice"], language="Chinese",
-                    instruct=request.get("style") or "自然口语，像和熟悉的人聊天。",
-                    verbose=False,
-                ))
+                if request.get("referenceAudio") and request.get("referenceText"):
+                    # The selected synthetic recording anchors identity. Base ICL
+                    # has no instruct control: expression follows text/punctuation.
+                    if reference is None:
+                        data = subprocess.check_output([
+                            ffmpeg, "-nostdin", "-v", "error", "-i", request["referenceAudio"],
+                            "-f", "f32le", "-ac", "1", "-ar", str(model.sample_rate), "pipe:1"],
+                            stderr=subprocess.DEVNULL)
+                        reference = mx.array(np.frombuffer(data, dtype=np.float32).copy())
+                    results = list(model.generate(
+                        text=request["text"], ref_audio=reference, ref_text=request["referenceText"],
+                        lang_code="Chinese", temperature=0.3, top_p=0.9, verbose=False,
+                    ))
+                else:
+                    results = list(model.generate_custom_voice(
+                        text=request["text"], speaker=request["voice"], language="Chinese",
+                        instruct=request.get("style") or "自然口语，像和熟悉的人聊天。",
+                        verbose=False,
+                    ))
                 audio = np.concatenate([np.asarray(result.audio).reshape(-1) for result in results])
                 rate = results[0].sample_rate
                 if not audio.size:
