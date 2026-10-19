@@ -408,7 +408,10 @@ class Traits:
                      owner_sources=[r["source_id"] for r in owner], action=decision.action)
         trait["subjective"] = decision.basis == "self_preference"
         # The private input remains private; its source roots only govern erasure.
-        trait["text_evidence_ids"] = sorted(set(trait.get("text_evidence_ids", [])) | set(receipt.get("private_note_evidence_ids", [])))
+        if decision.basis == "self_preference":
+            for field in ("text", "key", "slug", "reason", "quote"):
+                lineage = field + "_evidence_ids"
+                trait[lineage] = sorted(set(trait.get(lineage, [])) | set(receipt.get("private_note_evidence_ids", [])))
         trait.pop("invalidation", None)
         # The tombstone belongs to the revision it ended; the history keeps it, this row does not.
         trait.pop("tombstone", None)

@@ -545,7 +545,7 @@ def test_private_preference_loses_derived_text_when_its_source_is_erased(flexibl
     mind, _, source, _ = flexible
     origin = source('private-note-origin')
     decision = TraitDecision(action='propose', basis='self_preference', category='expression',
-        slug='private-derived', key='表达偏好', text='一个来自私密札记的独有想法。')
+        slug='private-derived', key='私密札记独有标题', reason='私密札记独有缘由', text='一个来自私密札记的独有想法。')
     with mind.engine.db.connect(write=True) as conn:
         trait = Traits(mind).decide(conn, [decision], 'private-derived',
             {'private_note_evidence_ids':[origin]}, None, 'private-derived')[0]
@@ -553,4 +553,5 @@ def test_private_preference_loses_derived_text_when_its_source_is_erased(flexibl
     mind.engine.delete(origin)
     with mind.engine.db.connect() as conn:
         rows = conn.execute('SELECT data FROM mind_traits').fetchall()
-        assert all('一个来自私密札记的独有想法' not in row[0] for row in rows)
+        assert all(word not in row[0] for row in rows for word in ('一个来自私密札记的独有想法','私密札记独有标题','私密札记独有缘由'))
+        assert all('独有' not in item['text'] for item in Traits(mind).projection(conn, mind.clock())['candidate'])
