@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.55
+
+- Choose text or voice before composing each public bubble in the same model response.
+- Write spoken replies as natural speech without emoji, kaomoji, parenthetical actions, or stage directions; keep natural text chat and the selected synthetic voice.
+
 ## 0.1.54
 
 - Anchor the local voice to an owner-selected synthetic recording using the existing Qwen3-TTS Base model.
