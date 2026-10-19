@@ -2467,13 +2467,13 @@ export class MobileRouter {
    * notice gap at the moment it starts, and only a send that started uses the gap
    * (CR-LIFE-08, CR-LIFE-16); a lookup needs neither. A notice whose round used its
    * attempts rests and is taken up again (CR-LIFE-05). */
-  async watch({notifyOwner=null,reconcileInput=null,requeue=null,sessionBusy=false}={}) {
+  async watch({notifyOwner=null,reconcileInput=null,requeue=null,sessionBusy=false,replyOutcomes=[]}={}) {
     if(this.watching)return [];
     this.watching=true;
-    try {return await this.watchOnce({notifyOwner,reconcileInput,requeue,sessionBusy});}
+    try {return await this.watchOnce({notifyOwner,reconcileInput,requeue,sessionBusy,replyOutcomes});}
     finally {this.watching=false;}
   }
-  async watchOnce({notifyOwner,reconcileInput,requeue,sessionBusy}) {
+  async watchOnce({notifyOwner,reconcileInput,requeue,sessionBusy,replyOutcomes=[]}) {
     const now=this.now(),stuckMs=(this.state.config.inputStuckMinutes??10)*60000,gapMs=(this.state.config.noticeGapMinutes??10)*60000;
     const actions=await this.locked(async()=>{
       this.expireUnsubmittedInputs();
@@ -2541,6 +2541,7 @@ export class MobileRouter {
         } else if(record.state==='accepted') {
           if(record.operationFailed)verdict='stopped';
           else if(record.nativeFailure)verdict=record.uncertainDeliveries?.length?'unknown':(record.delivered??0)>0?'partial':'stopped';
+          else if(idle&&replyOutcomes.some(f=>f.inputIds.includes(record.id)&&['format-failed','send-failed'].includes(f.state)))verdict=(record.delivered??0)>0?'partial':'stopped';
           else if(record.route==='control') {
             // A control is answered by its own reply; while that reply is still being made or
             // sent nothing is owed, and once it failed or went unconfirmed the owner is told.
@@ -2618,7 +2619,11 @@ export class MobileRouter {
         notice.attempts=(notice.attempts??0)+1;notice.updatedAt=this.now();notice.lastReceipt=kind;
         // Only a send that started uses the gap, from when it started (CR-LIFE-16).
         if(action.mayStart&&['accepted','rejected','unknown'].includes(kind))this.state.lastOwnerNoticeAt=startedAt;
-        if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();}
+        if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();
+          const group=replyOutcomes.find(f=>f.groupId&&f.inputIds.includes(record.id));
+          for(const id of group?.inputIds??[]) {const other=this.state.inputs[id];
+            if(other&&other!==record&&!other.answer&&!other.ownerNotice){other.ownerNotice={...notice};other.settledAt=this.now();}}
+        }
         else if(kind==='rejected'&&action.mayStart) {
           // Refused outright, so nothing reached her: the same notice goes again after a
           // bounded rest; once the rests are spent it is only looked up (CR2-LIFE-06).

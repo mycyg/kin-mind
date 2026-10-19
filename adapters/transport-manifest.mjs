@@ -119,7 +119,7 @@ export function owedRemainder(manifest,now) {
 /** Status without any message text: safe for health output and logs. */
 export function manifestSummary(manifest) {
   const intent=manifest.tail_intent,owed=manifest.tail_owed;
-  return {group_id:manifest.group_id,state:manifest.state,reason:manifest.reason??null,reply_id:manifest.reply_id,channel:manifest.channel,
+  return {group_id:manifest.group_id,state:manifest.state,reason:manifest.reason??null,reply_id:manifest.reply_id,answered_input_ids:manifest.answered_input_ids??[],channel:manifest.channel,
     created_at:manifest.created_at,updated_at:manifest.updated_at,retryAt:manifest.retryAt,revision:manifest.revision,leaseGeneration:manifest.leaseGeneration,
     ...(manifest.continues_reply_id?{continues_reply_id:manifest.continues_reply_id}:{}),
     ...(intent?{tail_intent:{id:intent.id,state:intent.state,...(intent.decision?{decision:intent.decision,carrier:intent.carrier??null,linked_group:intent.linked_group??null}:{})}}:{}),

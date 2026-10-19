@@ -84,6 +84,12 @@ function kinRememberMessage(state, event) {
   reply.last = text;
   if (event.item?.phase === "final_answer") reply.final = text;
 }
+function kinCompletedReply(state, turn) {
+  const reply = state.kinReply;
+  if (turn?.status !== "completed" || reply?.turnId !== turn.id) return undefined;
+  const text = reply.final ?? reply.last;
+  return typeof text === "string" ? { turnId: turn.id, text } : undefined;
+}
 function kinRememberInput(state, event) {
   if (!kinOwnThread(state, event.threadId)) return;
   const reply = kinReplyTurn(state, event.turnId);
@@ -188,6 +194,10 @@ export function patchCodexRuntime(source) {
     '      case "turn/started":\n        this.sessionState.currentTurnId = notification.params.turn.id;\n        kinTurnStarted(this.sessionState, notification.params);', 'ACP turn start');
   source = replaceOnce(source, '      case "turn/completed":\n        await this.flushPendingPlanUpdates();\n        this.clearPlanTurnState();\n        this.sessionState.currentTurnId = null;',
     '      case "turn/completed":\n        await this.flushPendingPlanUpdates();\n        this.clearPlanTurnState();\n        this.sessionState.currentTurnId = null;\n        kinFinishTurn(this.sessionState, notification.params);', 'ACP turn completion');
+  // Bind the authoritative completed message to this prompt response. Streaming
+  // deltas may include an unfinished message discarded when owner input steers it.
+  source = replaceOnce(source, '        _meta: this.buildQuotaMeta(sessionState)\n      };\n    } catch (err) {',
+    '        _meta: { ...this.buildQuotaMeta(sessionState), kinCompletedReply: kinCompletedReply(sessionState, turnCompleted.turn) }\n      };\n    } catch (err) {', 'ACP prompt completed text');
   return mark(mark(source, lastReplyMarker), marker);
 }
 

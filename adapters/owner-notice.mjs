@@ -8,10 +8,10 @@ import {createHash} from 'node:crypto';
 
 export const OWNER_NOTICE_KINDS=Object.freeze(['stopped','unknown','partial','pending-input']);
 export const OWNER_NOTICE_TEXTS=Object.freeze({
-  'pending-input':'刚才那条暂时没处理成功，消息还留着。我会先核对，不用重复发。',
-  stopped:'刚才这条回复没能完成。我会先核对记录，不会自动重复执行。',
-  unknown:'刚才那条的结果还没确认，我正在按原编号核对，先别重复发。',
-  partial:'刚才只送达了一部分，我会核对剩余内容；已送达的不会重发。'});
+  'pending-input':'刚才那条暂时没处理成功，消息还留着，不用重复发。',
+  stopped:'刚才这条回复没能完成，原消息还在，不用重复发。',
+  unknown:'刚才那条的结果还没确认，先别重复发。',
+  partial:'刚才只送达了一部分，已送达的不会重发。'});
 /** The system's own label, so the owner can always tell these from Kin. */
 export const SYSTEM_NOTICE_LABEL='【系统提示】';
 const SCOPES=Object.freeze(['input','reply']);

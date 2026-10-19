@@ -10,9 +10,9 @@ export const SUMMARY_STATES=Object.freeze(['received','classifying','queued','su
  * The host speaks as the system, never as Kin. */
 export const NOTICE_KINDS=Object.freeze(['stopped','unknown','partial']);
 export const NOTICE_TEXTS=Object.freeze({
-  stopped:'刚才那条暂时没处理成功，消息还留着。我会先核对，不用重复发。',
-  unknown:'刚才那条的结果还没确认，我正在按原编号核对，先别重复发。',
-  partial:'刚才只送达了一部分，我会核对剩余内容；已送达的不会重发。'});
+  stopped:'刚才那条暂时没处理成功，消息还留着，不用重复发。',
+  unknown:'刚才那条的结果还没确认，先别重复发。',
+  partial:'刚才只送达了一部分，已送达的不会重发。'});
 /** Before native submission: a retry of the same id is safe only on this evidence. */
 export const RETRY_EVIDENCE=Object.freeze(['not-submitted','platform-rejected','reconciled-not-received']);
 /** Backoff for an input proven never submitted: the same id, then a notice. */
