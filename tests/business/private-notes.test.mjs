@@ -12,3 +12,15 @@ test('missing, truncated and mixed envelopes never yield public text',()=>{
   assert.equal(parsePrivateReply(raw).state,'invalid');assert.equal(publicReplyText(raw),'');
  }
 });
+
+test('whole JSON fence is transport wrapping; surrounding prose still cannot leak',()=>{
+ const body=JSON.stringify({private_note:'只留在札记。',action:'send',bubbles:['公开回复。']});
+ for(const lang of ['', 'json']) {
+  const wrapped='```'+lang+'\n'+body+'\n```';
+  assert.equal(publicReplyText(wrapped),'公开回复。');
+  assert.equal(parsePrivateReply(wrapped).private_note,'只留在札记。');
+  assert.equal(publicReplyText('前言\n'+wrapped),'');
+  assert.equal(publicReplyText(wrapped+'\n后记'),'');
+ }
+ assert.equal(publicReplyText('```json\n'+body),'');
+});

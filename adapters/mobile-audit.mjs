@@ -1,9 +1,6 @@
 import fs from 'node:fs';
-import {createHash} from 'node:crypto';
 import {atomicJson} from './mobile-router.mjs';
 import {REVIEWER_LANES,REVIEWER_PURPOSES,AUDIT_CODES} from './mobile-reviewer.mjs';
-
-const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export function appraisalProgress(operations, mind={}) {
   const running=operations?.queues?.find(q=>q.lane==='action'&&q.state==='running'&&q.count>0);
@@ -184,13 +181,13 @@ export class MobileAudit {
       for(const incident of incidents)if(incident.state==='open'){incident.state='cleared';incident.clearedAt=at;}
       return null;
     }
-    const codes=[...new Set(result.findings.map(f=>AUDIT_CODES.includes(f.code)?f.code:'other'))].sort(),fingerprint=digest(codes);
-    const same=incidents.filter(i=>i.fingerprint===fingerprint).sort((a,b)=>b.lastSeenAt-a.lastSeenAt)[0];
+    const codes=[...new Set(result.findings.map(f=>AUDIT_CODES.includes(f.code)?f.code:'other'))].sort();
+    const same=incidents.filter(i=>JSON.stringify(i.codes)===JSON.stringify(codes)).sort((a,b)=>b.lastSeenAt-a.lastSeenAt)[0];
     if(same&&(same.state==='open'||at-(same.clearedAt??0)<INCIDENT_REOPEN_MS)) {
       Object.assign(same,{state:'open',findings:result.findings,lastSeenAt:at,seen:(same.seen??1)+1});delete same.clearedAt;
       return same;
     }
-    const incident={id,state:'open',fingerprint,codes,findings:result.findings,firstSeenAt:at,lastSeenAt:at,seen:1};
+    const incident={id,state:'open',codes,findings:result.findings,firstSeenAt:at,lastSeenAt:at,seen:1};
     this.state.incidents[id]=incident;
     const keep=Object.values(this.state.incidents).sort((a,b)=>b.lastSeenAt-a.lastSeenAt).slice(0,32).map(i=>i.id);
     for(const key of Object.keys(this.state.incidents))if(!keep.includes(key))delete this.state.incidents[key];

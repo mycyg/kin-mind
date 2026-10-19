@@ -5,8 +5,9 @@ export const privateNoteInstructions = `每次给小光的文字回复（闲聊�
 /** Host purpose selects this contract, never a keyword in the model's prose. */
 export function parsePrivateReply(text) {
   if(typeof text!=='string')return {state:'invalid',reason:'private-note-envelope-invalid'};
+  const body=text.trim(),fenced=/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(body);
   let value;
-  try {value=JSON.parse(text.trim());}catch{return {state:'invalid',reason:'private-note-envelope-incomplete'};}
+  try {value=JSON.parse(fenced?fenced[1]:body);}catch{return {state:'invalid',reason:'private-note-envelope-incomplete'};}
   if(!value||Array.isArray(value)||typeof value!=='object'||Object.keys(value).some(k=>!['private_note','action','bubbles'].includes(k)))
     return {state:'invalid',reason:'private-note-envelope-invalid'};
   if(typeof value.private_note!=='string'||!value.private_note.trim()||Array.from(value.private_note).length>4000)
