@@ -4,7 +4,7 @@ import {splitChatText,chatEnvelope,chatVoice} from '../../adapters/chat-bubbles.
 
 test('voice leaves the number of complete bubbles to the speaker',()=>{
   assert.match(chatVoice,/选择一个或多个完整气泡/);
-  assert.match(chatVoice,/深度讨论、工作、分析与交付按内容展开/);
+  assert.match(chatVoice,/明确要求详述、工作、分析与交付按内容展开/);
   assert.doesNotMatch(chatVoice,/20字|1[—-]4|1-4/);
   // Multiple intentional paragraphs remain supported; this preference is not
   // a lossy splitter or a hard one-bubble protocol constraint.
