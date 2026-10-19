@@ -555,3 +555,16 @@ def test_private_preference_loses_derived_text_when_its_source_is_erased(flexibl
         rows = conn.execute('SELECT data FROM mind_traits').fetchall()
         assert all(word not in row[0] for row in rows for word in ('一个来自私密札记的独有想法','私密札记独有标题','私密札记独有缘由'))
         assert all('独有' not in item['text'] for item in Traits(mind).projection(conn, mind.clock())['candidate'])
+
+
+def test_unknown_optional_topic_link_does_not_discard_subjective_stance(flexible):
+    mind, *_ = flexible
+    with mind.engine.db.connect(write=True) as conn:
+        commit_intent(SimpleNamespace(mind=mind, conn=conn, state=mind._load(conn), sources=[],
+            value=ExpressionIntent(stance="想主动回应她", continue_topics=[
+                {"topic": "今晚约会怎么过", "concern_id": "not-a-stored-concern"}]),
+            event_id="intent-topic", job_id="synthetic-job", receipt={}, version="flexible-v1", stimulus="idle-review"))
+    with mind.engine.db.connect() as conn:
+        intent = current(conn, mind, mind.clock(), persona=None)
+    assert intent["stance"] == "想主动回应她"
+    assert intent["continue_topics"] == [{"topic": "今晚约会怎么过", "concern_id": None}]

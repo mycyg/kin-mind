@@ -99,15 +99,12 @@ def _cited(conn, mind, ids):
 
 
 def _topics(state, topics):
-    """A topic may point at a concern this scope is actually carrying, and at nothing else."""
+    """Keep subjective topics; only attach concern links this scope actually carries."""
     found = []
     for topic in topics:
-        if topic.concern_id is not None:
-            concern = (state.get("concerns") or {}).get(topic.concern_id)
-            if not concern or concern["status"] not in OPEN:
-                raise Missing("An intent topic names a concern this scope does not carry",
-                              code="intent-concern-unknown", target=topic.concern_id)
-        found.append({"topic": topic.topic, "concern_id": topic.concern_id})
+        concern = (state.get("concerns") or {}).get(topic.concern_id)
+        concern_id = topic.concern_id if concern and concern["status"] in OPEN else None
+        found.append({"topic": topic.topic, "concern_id": concern_id})
     return found
 
 
