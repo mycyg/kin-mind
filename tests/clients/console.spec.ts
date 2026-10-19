@@ -402,7 +402,7 @@ test('automatic context: admitted titles, drop reasons and the quiet toggle',asy
  await expect(row).toContainText('一次成功的数据库迁移');await expect(row).toContainText('相关度不足 1');
  await expect(page.locator('.admission-panel')).toContainText('影子记录');
  await row.getByRole('button',{name:'不主动提起',exact:true}).click();
- await expect(page.getByRole('status')).toContainText('已设为不主动提起');
+ await expect(page.getByRole('status').filter({hasText:'已设为不主动提起'})).toBeVisible();
  const quiet=page.locator('.quiet-list');await expect(quiet).toContainText('一次成功的数据库迁移');
  await quiet.getByRole('button',{name:'恢复自动带入',exact:true}).click();
  await expect(page.locator('.quiet-list')).toHaveCount(0);
