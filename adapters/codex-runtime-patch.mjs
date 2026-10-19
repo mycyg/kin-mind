@@ -4,7 +4,7 @@
  * change stops the build for review instead of patching the wrong place. */
 const marker = '// KIN_MODEL_ROUTING_V3';
 const lastReplyMarker = '// KIN_LAST_REPLY_CACHE_V1';
-const compactionMarker = '// KIN_MEMORY_COMPACTION_V1';
+const compactionMarker = '// KIN_MEMORY_COMPACTION_V2';
 const compactionReceiptMarker = '// KIN_COMPACTION_RECEIPT_V1';
 const sessionMarker = '// KIN_SESSION_CONTINUITY_V1';
 const inputIdentityMarker = '// KIN_INPUT_IDENTITY_V2';
@@ -228,6 +228,9 @@ export function patchMemoryRuntime(source) {
     };
     let release = () => {};
     try {
+      // Native compact/start has no model override. ACP model preferences must
+      // reach the native thread even when no user turn followed a model change.
+      await kinWithin(this.codexAcpClient.setCollaborationMode(sessionId, state.collaborationMode, state.currentModelId), deadline, "KIN_COMPACTION_TIMEOUT");
       const failed = new Promise((_, reject) => {
         release = this.codexAcpClient.appServerClient.captureTurnCompletions(sessionId, (event) => {
           if (event.turn?.status && event.turn.status !== "completed") reject(new Error("KIN_COMPACTION_FAILED"));

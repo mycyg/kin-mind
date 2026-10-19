@@ -313,13 +313,18 @@ export async function produceMobileRuntimeProof({bundleDir,descriptorPath,inputP
 
     // Compact the isolated thread, then prove the same identity survives an
     // ACP process restart and the next provider request retains both layers.
+    // Change the ACP preference without a user turn: compaction must synchronize
+    // it to the native thread, whose previous model is deliberately different.
+    await client.request('session/set_config_option',{sessionId:id,configId:'model',value:'k3'});
+    await client.request('session/set_config_option',{sessionId:id,configId:'reasoning_effort',value:'high'});
     const compactStart=server.captures.length;
     const compact=await client.request('_kin/compact',{sessionId:id,operationId:'compat-'+randomUUID()});requireFact(compact.completed===true,'Native isolated compaction did not complete');
     const compactRequests=server.captures.slice(compactStart),compactWire=compactRequests.find(item=>item.raw.includes(Buffer.from(baseConfig.compact_prompt)));
     requireFact(compactWire,'Native compaction did not use the candidate compact_prompt');
+    requireFact(compactWire.body.model==='k3'&&compactWire.body.reasoning?.effort==='high','Native compaction did not follow the ACP model/effort preference');
     p=current(profiles.find(x=>x.scenario_id==='isolated_compaction_resume'));await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);
     add('isolated_compaction_resume',[requestEvidence(capture,records,'thread/resume',descriptor),requestEvidence(capture,records,'turn/start',descriptor)],records,
-      {compaction:{raw_request_sha256:sha(compactWire.raw),compact_prompt_sha256:sha(baseConfig.compact_prompt),provider_requests:compactRequests.length}});
+      {compaction:{raw_request_sha256:sha(compactWire.raw),compact_prompt_sha256:sha(baseConfig.compact_prompt),provider_requests:compactRequests.length,model:compactWire.body.model,reasoning_effort:compactWire.body.reasoning?.effort}});
     // A process restart is proved by its own restart, not by the compaction's.
     p=current(profiles.find(x=>x.scenario_id==='process_restart'));await launch(p);await sessionLoad(id);capture=await prompt(id);records=trace(traceFile);
     add('process_restart',[requestEvidence(capture,records,'thread/resume',descriptor)]);
