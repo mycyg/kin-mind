@@ -203,7 +203,7 @@ export class MindLoop {
       possibleSend=true;
       const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
       // The batch asks about this contact itself (`within`): its own attempt is not a contact before it.
-      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,references:decision.references,files,
+      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,presentation:decision.presentation,references:decision.references,files,
         guard:within=>!this.closed&&!this.isBusy()&&this.eligibility(within).eligible&&epoch===this.ownerEpoch()});
       // The owner's contact rules said no at the send itself (the Feishu contact answers `skipped`, with
       // their reason): it returned before its batch was written, so nothing went out under this id. It is
@@ -231,7 +231,7 @@ export class MindLoop {
       if(receipt.state==='pending')return {state:'pending',attempt_id:attempt.id,reason:receipt.reason??'Share review remains pending',...(receipt.failure?{failure:receipt.failure}:{})};
       const state=receipt.state==='accepted'&&receipt.messageId?'accepted':'unconfirmed';
       const settled=await this.call('settle',{attempt_id:attempt.id,state,message_id:receipt.messageId,message_ids:receipt.messageIds,
-                                      partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles,
+                                      partial:receipt.partial,canceled_bubbles:receipt.canceledBubbles,...(receipt.failure?{failure:receipt.failure}:{}),
                                       reason:state==='accepted'?'Platform accepted; phone read unverified':'Receipt requires reconciliation'});
       if(state==='accepted')void this.review();
       return settled;

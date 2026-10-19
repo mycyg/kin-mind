@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.53
+
+- Add local Qwen3-TTS public replies in text, voice, or both, with a fixed configurable voice and style instructions.
+- Carry speech through existing reply/contact receipts; retain partial text and expose synthesis failures.
+- Support Feishu native audio and ordinary WeChat audio file attachments; keep current channel routing.
+- Favor short natural chat exchanges while allowing detailed work replies.
+
 ## 0.1.44
 - Keep a private role note before every owner-facing reply; send only public bubbles across chat and work.
 - Recall notes by message, time, and local semantic search, separate from public diary and factual memory.

@@ -1,3 +1,4 @@
+import {replyPresentation} from './reply-presentation.mjs';
 import {splitChatText} from './chat-bubbles.mjs';
 import {CHANNEL_CONTRACTS,channelContract,classifyReceipt,normalizeReceipt} from './channel-contract.mjs';
 import {fragmentText,fileFragment} from './text-fragments.mjs';
@@ -90,7 +91,12 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
       item.sourceReferences=item.references;
-      items.push(...(begun?[item]:cut(item,limit)));
+      const mode=batch.presentation?.mode??'text';
+      if(begun||mode==='text')items.push(...(begun?[item]:cut(item,limit)));
+      else {
+        if(mode==='both')items.push(...cut(item,limit));
+        items.push({...item,id:mode==='both'?item.id+'-speech':item.id,speech:{style:batch.presentation?.style??''}});
+      }
     }
     batch.items=items;batch.review={at:now(),...(verdict.review_id?{id:verdict.review_id}:{})};
     delete batch.reason;delete batch.failure;delete batch.reviewNotBefore;
@@ -139,13 +145,13 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='pending';batch.reason=reason==='frozen'?'dispatch-frozen':reason;batch.heldAtGate=true;
     await write(id,batch);return result(batch);
   }
-  async function run({id,text,bubbles,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
+  async function run({id,text,bubbles,presentation,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
     if(!batch) {
       if(!Array.isArray(parts)||!parts.length||parts.some(x=>typeof x!=='string'||!x.trim()))throw Error('contact-batch-empty');
       if(!Array.isArray(files)||files.length>24)throw Error('contact-batch-invalid-files');
-      batch={id,channel,...(conversationId?{conversationId}:{}),state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
+      batch={id,channel,...(presentation?{presentation:replyPresentation(presentation)}:{}),...(conversationId?{conversationId}:{}),state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
         const itemId='kin-bubble-'+id+'-'+index;
         return{id:itemId,draftId:itemId,bubbleIndex:index,text,references:references[index]??[],state:'unsent'};
       })};
@@ -258,11 +264,19 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
           if(!batch.deliveryStarted)await begin({id:batch.id,channel:batch.channel});
           item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
           try {
-            const sent=await send({id:item.id,text:item.text,file:item.file,channel:batch.channel,conversationId:batch.conversationId,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,
+            const sent=await send({id:item.id,text:item.text,...(item.speech?{speech:item.speech}:{}),file:item.file,channel:batch.channel,conversationId:batch.conversationId,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,canSend:async()=>await eligible(within(batch))&&await guard(within(batch)),
               // Unsplittable: the whole body as one file, with no words of the host's own.
               // A sender that understands `media` delivers the file INSTEAD of the text, never both;
               // `text` rides along only so that a sender that does not still has a body.
               ...(item.oversize?{media:{type:'file',name:item.oversize.name,data:Buffer.from(item.text,'utf8')}}:{})});
+            if(sent?.state==='not-submitted'&&sent.reason==='contact-paused') {item.state='unsent';return heldAtGate(batch,id,item,'contact-paused');}
+            if(sent?.reason==='tts-failed') {
+              Object.assign(item,{state:'canceled',reason:'tts-failed',submission:'never-started'});
+              batch.state=batch.items.some(x=>x.state==='accepted')?'accepted':'needs-review';batch.reason='tts-failed';
+              batch.failure=reviewFailure({}, {category:'unknown',stage:'contact-speech',code:'tts-failed',retry_condition:'deepseek-decision'});
+              for(const rest of batch.items)if(rest.state==='unsent')Object.assign(rest,{state:'canceled',reason:'tts-failed',submission:'never-started'});
+              batch.safeToRelease=true;await write(id,batch);return result(batch);
+            }
             if(sent?.state!=='accepted'||!sent.messageId)throw Error('receipt-unconfirmed');
             Object.assign(item,{state:'accepted',messageId:sent.messageId,...(sent.conversationId?{conversationId:sent.conversationId}:{})});
           } catch {item.state='unconfirmed';batch.state='unconfirmed';await write(id,batch);return result(batch);}

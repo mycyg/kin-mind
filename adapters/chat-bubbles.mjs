@@ -1,3 +1,4 @@
+import {replyPresentation} from './reply-presentation.mjs';
 import {fences} from './text-fragments.mjs';
 
 /** Line starts with whether each line lies inside a code fence (CommonMark,
@@ -35,7 +36,7 @@ export function privateReplyBoundary(text) {
   return null;
 }
 
-export const chatVoice = '按小光最新确认的聊天节奏偏好，不沿用旧的优先单气泡倾向。回复前结合眼前话题、时间和后续更新，考虑这轮值得说什么；不确定的状态保留余地，只输出自然回应，不展示分析过程。日常轻聊避免连续几个冗长段落、重复关心和追问，不凑收尾。按情绪和内容选择一个或多个完整气泡，短句连发、兴奋时刷屏都可以；空行会拆成气泡，分段要有自然节奏或内容推进，不机械逐句留空行。分享探索或梦、讲故事可以较长或多段；深度讨论、工作、分析与交付按内容展开，不设单气泡或字数硬限制，不机械合段或截断。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
+export const chatVoice = '按小光最新确认的聊天节奏偏好，不沿用旧的优先单气泡倾向。回复前结合眼前话题、时间和后续更新，考虑这轮值得说什么；不确定的状态保留余地，只输出自然回应，不展示分析过程。日常轻聊用短句自然来回，留出对方接话的空间；避免连续大段、重复关心和追问，不凑收尾。按情绪和内容选择一个或多个完整气泡，短句连发、兴奋时刷屏都可以；空行会拆成气泡，分段要有自然节奏或内容推进，不机械逐句留空行。分享探索或梦先说最想分享的一点，再随对方回应展开；明确要求详述、工作、分析与交付按内容展开，不设单气泡或字数硬限制，不机械合段或截断。用有情绪的完整口语句子，词语写全；语气词、网络梗和颜文字随语境使用。代码、链接、文件名和工作成稿保持完整。闲扯、撒娇、怪念头都可以聊，不需要先交研究作业。';
 
 /** The internal draft protocol's control envelope, recognised on a normal chat
  * turn's reply body. This shape is how internal draft turns (proactive contact)
@@ -100,9 +101,9 @@ export function chatEnvelope(text) {
     Object.keys(bubble).every(key=>['text','references','bubble_id'].includes(key))&&
     typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
     (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
-  if(value.action==='send'&&keys.length===2&&Array.isArray(value.bubbles)&&value.bubbles.length
+  if(value.action==='send'&&keys.every(k=>['action','bubbles','presentation'].includes(k))&&Array.isArray(value.bubbles)&&value.bubbles.length
     &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)))
-    return {state:'send',bubbles:value.bubbles.map(bubble=>(typeof bubble==='string'?bubble:bubble.text).trim()),
+    return {state:'send',...(value.presentation?{presentation:replyPresentation(value.presentation)}:{}),bubbles:value.bubbles.map(bubble=>(typeof bubble==='string'?bubble:bubble.text).trim()),
       ...(value.bubbles.some(bubble=>typeof bubble==='object')?{
         references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references:undefined),
         reference_bubble_ids:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.bubble_id??null:null)}:{})};

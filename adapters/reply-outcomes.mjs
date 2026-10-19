@@ -11,7 +11,7 @@ export function replyOutcomeFacts(inputs={},groups={}, {now=Date.now(),limit=8}=
     const state=unknown?'send-unknown':format?'format-failed':failed?'send-failed':null;
     if(!state)continue;
     facts.push({groupId:g.group_id,inputIds:[...new Set([g.reply_id,...(g.answered_input_ids??[])].filter(Boolean))],at:g.updated_at??g.created_at,
-      state,sentBubbles:sent,unknownFragments:unknown});
+      state,sentBubbles:sent,unknownFragments:unknown,...(bubbles.some(b=>b.reason==='tts-failed')?{reason:'tts-failed',sentTextFragments:fragments.filter(f=>f.kind==='text'&&f.state==='accepted').length}:{})});
   }
   for(const input of Object.values(inputs))if(input.nativeFailure&&!input.answer&&!facts.some(f=>f.inputIds.includes(input.id)))
     facts.push({inputIds:[input.id],at:input.nativeFailure.at,state:'generation-failed',sentBubbles:input.delivered??0,unknownFragments:input.uncertainDeliveries?.length??0});

@@ -41,7 +41,9 @@ export function bubblePieces(bubble) {
   let last=null;
   for(const fragment of [...bubble.fragments].sort((a,b)=>a.start-b.start)) {
     const kind=fragment.state==='accepted'?'sent':['unknown','submitting'].includes(fragment.state)?'unknown':'unsent';
-    const text=bubble.text.slice(fragment.start,fragment.end);
+    const body=bubble.text.slice(fragment.start,fragment.end);
+    const text=fragment.kind==='speech'?'（语音部分，文字发送情况另列）'+body:body;
+    if(fragment.kind==='speech')last=null;
     if(!text)continue;
     if(last===kind)pieces[kind][pieces[kind].length-1]+=text;else pieces[kind].push(text);
     last=kind;

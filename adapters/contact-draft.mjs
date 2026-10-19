@@ -1,3 +1,4 @@
+import {replyPresentation} from './reply-presentation.mjs';
 import {privateNoteInstructions} from './private-notes.mjs';
 import {chatVoice} from './chat-bubbles.mjs';
 
@@ -61,11 +62,11 @@ function decide(result) {
       const kept=items.filter(x=>x.text.trim());
       if(kept.length||typeof result.text!=='string') {
         const bubbles=kept.map(x=>x.text.trim());
-        return {action:'send',...(result.private_note!==undefined?{private_note:result.private_note}:{}),text:bubbles.join('\n\n'),bubbles,
+        return {action:'send',...(result.presentation?{presentation:replyPresentation(result.presentation)}:{}),...(result.private_note!==undefined?{private_note:result.private_note}:{}),text:bubbles.join('\n\n'),bubbles,
           ...(kept.some(x=>x.references)?{references:kept.map(x=>x.references??[])}:{}),...chosen};
       }
     }
-    return {action:'send',...(result.private_note!==undefined?{private_note:result.private_note}:{}),text:typeof result.text==='string'?result.text.trim():'',...chosen};
+    return {action:'send',...(result.presentation?{presentation:replyPresentation(result.presentation)}:{}),...(result.private_note!==undefined?{private_note:result.private_note}:{}),text:typeof result.text==='string'?result.text.trim():'',...chosen};
   }
   if(!['wait','abandon'].includes(result.action))return null;
   if(result.reason!==undefined&&result.reason!==null&&typeof result.reason!=='string')return null;
