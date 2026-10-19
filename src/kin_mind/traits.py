@@ -82,7 +82,11 @@ SUPPORT_HALF_LIFE_DAYS = 30
 # What the persona contract calls the same category. The contract itself decides which of them a
 # trait may use; this only spells one category one way before asking it.
 CATEGORY_ALIASES = {"兴趣": "interests", "审美": "aesthetics", "幽默": "humor",
-                    "表达习惯": "expression_habits", "习惯": "habits", "价值": "values"}
+                    "表达习惯": "expression_habits", "习惯": "habits", "价值": "values",
+                    "interest": "interests", "expression": "expression_habits",
+                    "表达": "expression_habits", "语气": "relationship_style",
+                    "自我叙述": "self_description", "探索倾向": "exploration_preferences",
+                    "分享倾向": "sharing_preferences", "作息偏好": "rhythm_preferences"}
 # How much of the ledger one appraisal is shown. The projection is structured state and is never
 # compressed, so it stays small by counting rather than by retelling.
 SHOWN_TRAITS = 12
@@ -90,7 +94,9 @@ SHOWN_OBSERVATIONS = 4
 SHOWN_CORRECTIONS = 6
 # Kin may state her own tastes without an observed episode. These remain subjective preferences,
 # inside the persona's allowed categories; they are never user instructions or verified behaviour.
-SELF_PREFERENCE_CATEGORIES = {"interests", "aesthetics", "humor", "expression_habits"}
+SELF_PREFERENCE_CATEGORIES = {"interests", "aesthetics", "humor", "expression_habits",
+                              "relationship_style", "self_description", "exploration_preferences",
+                              "sharing_preferences", "rhythm_preferences", "creative_preferences"}
 
 
 def installed(conn):
@@ -401,6 +407,8 @@ class Traits:
                      observation_refs=[o["id"] for o in named], episodes=[e.model_dump() for e in decision.episodes],
                      owner_sources=[r["source_id"] for r in owner], action=decision.action)
         trait["subjective"] = decision.basis == "self_preference"
+        # The private input remains private; its source roots only govern erasure.
+        trait["text_evidence_ids"] = sorted(set(trait.get("text_evidence_ids", [])) | set(receipt.get("private_note_evidence_ids", [])))
         trait.pop("invalidation", None)
         # The tombstone belongs to the revision it ended; the history keeps it, this row does not.
         trait.pop("tombstone", None)
@@ -588,6 +596,7 @@ class Traits:
                 # The types the owner's contract lets change, so a category is chosen from them
                 # rather than refused after the fact (the gate itself is _allowed_category's).
                 "categories": self._categories(),
+                "self_preference_categories": sorted(SELF_PREFERENCE_CATEGORIES),
                 # Only what this projection owns: why the host refused an observation or a decision.
                 "last_refusal": {k: v for k, v in refused.items() if k in SECTIONS},
                 "window": {"included": len(shown), "total": len(rows)}}

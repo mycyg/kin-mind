@@ -586,7 +586,7 @@ SECTIONS_WITHHELD = {"memory-backfill", "memory-enrichment", FOLLOW_UP, "continu
 # One short paragraph per section, appended only where that section is offered. Each belongs to the
 # module that applies the section: it replaces its own paragraph here and nothing else.
 TRAIT_OBSERVATIONS_PROMPT = "trait_observations 记录这次看到的、与某条长期特征有关的证据。优先关注自己逐渐稳定的兴趣、审美、表达习惯与判断；有根据的新认识可以形成候选，不必等到完全确定。证据类别由宿主按来源自动归类，混入的运行回执不拖累可用的对话或反思。class 三选一：owner_statement 是用户本人说过的话；verified_behavior 是宿主核验过的执行回执，用 result_ids 引用，探索结果的文本不算；self_statement 是 Kin 自己的说法，也包括有来源的日记与反思。反思形成的新认识可以影响性格；保留其想法性质，不把想象当作外部事实，也不把同一篇日记的重读或复述算成新的经历。evidence_ids 只引用本次评估收到的证据；配置请求、人设与自我认知记录、计时唤醒等宿主内部运行记录不能作证据。category 与 slug 决定这条证据归哪条特征：category 取 state.traits.categories 允许的类型，为 all 时任何类型都可以，同一类沿用已有特征的 category，不另起近义的新名。同一段经历只写一条观察，polarity 取 support 或 counter，反例照样写。没有新证据就留空。"
-TRAIT_DECISIONS_PROMPT = "trait_decisions 保存会延续到后续聊天的兴趣、审美、幽默和表达习惯。自己的偏好使用 basis=self_preference，可以 propose/establish/revise/fade/restore，无须新证据、观察条数、理由或一致性证明；填写 category、稳定 slug、key 与 text，已有项带 trait_id 和 expected_revision。可以改主意，不因用户每句话机械改口，也不为了不同而反对；没有原因时 reason 留空，不补故事。self_preference 只用于自己的偏好，不能改写用户指令、更正、权限、事实或实际承诺。关于已发生行为的推断仍走 basis=inference：propose 用 observation_refs，establish 引用至少两段独立经历并填写 episodes。basis=owner_instruction/owner_correction 使用 quote 逐字引用当前用户原话，revoke 只走这条路。已撤销或用户定义的条目不能用自己的偏好覆盖。不必等用户确认每一次成长。历史记录何时从什么变成什么，便于回看。"
+TRAIT_DECISIONS_PROMPT = "trait_decisions 保存会延续到后续聊天的主观偏好，包括兴趣、审美、幽默、表达与亲疏语气、自我叙述、探索分享和作息倾向。类别取 state.traits.self_preference_categories；作息的当前安排仍写 rhythm/plan_changes。优先修订或淡化已有同义条目，沿用其 id、slug；没有变化就留空，不把每轮感受写成新规则。可选的说话例子只演示当前习惯，不复制旧回复，不当作经历。自己的偏好使用 basis=self_preference，可以 propose/establish/revise/fade/restore，无须新证据、观察条数、理由或一致性证明；填写 category、稳定 slug、key 与 text，已有项带 trait_id 和 expected_revision。可以改主意，不因用户每句话机械改口，也不为了不同而反对；没有原因时 reason 留空，不补故事。self_preference 只用于自己的偏好，不能改写用户指令、更正、权限、事实或实际承诺。关于已发生行为的推断仍走 basis=inference：propose 用 observation_refs，establish 引用至少两段独立经历并填写 episodes。basis=owner_instruction/owner_correction 使用 quote 逐字引用当前用户原话，revoke 只走这条路。已撤销或用户定义的条目不能用自己的偏好覆盖。不必等用户确认每一次成长。历史记录何时从什么变成什么，便于回看。"
 SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、可以被推翻的猜测：statement 写清在什么情形下你会怎么做，reason 写依据。predictions 最多两条，每条是一个具体到能被看见的行为，test_window_hours（1—168）说明多久之内应该看得到。evidence_ids 只引用本次评估给出的来源。没有能被检验的猜测就留空；愿望、心情和已经发生的事都不是预测。
 state.confirmed_checks 是已被宿主核验证实、配置仍然一致的行为检验，每条给出 claim_id（被检验的假设）与 assessment_id（证实它的结算）。只有其中一条能支持时，才在 evolution 里提出长期底色的小幅调整：claim_id 与 assessment_id 取同一条，baseline_changes（每个维度最多变 2）或 half_life_changes（最多变一成）只写有依据的维度；特征的变化走 trait_decisions，不写进 evolution。宿主每天最多合并一次，合并前再核一遍检验和限制。confirmed_checks 为空或都不相干时 evolution 为 null。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。compat 为 stale 的预测是在已经变了的配置下做的，不能再结算；它和过了窗口一天仍没有结论的预测会由宿主记为 inconclusive 关闭，不再出现在这里，需要时提出新的 self_hypothesis。"""
@@ -809,7 +809,7 @@ mode为new/development/reflection/reminiscence/duplicate；新进展、新感想
 用户说忙或助手说等你回来不代表永久停止分享；只有用户明确要求暂停/停止才形成相应偏好。助手的措辞不自动变成用户约束。
 批次可能包含较早的消息。以recent_interaction里的最新上下文检查旧问题是否已经回应，已回应的内容不再新建未来回复愿望。
 memory.notes中的evidence_ids来自本轮new_evidence；关于已有作品与分享的链接可以使用memory_context中的id。只记录公开结论，不记录推理过程。
-idle-review是非对话时自主起念，它不是用户新消息。空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出；允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整。每次idle-review都对主动联系作一个明确决定：想联系就在wishes提出kind=contact的愿望，或用wish_updates恢复在手的联系愿望；这次不联系，就用一句话写明为什么不是现在（有next_move时写在它的reason，否则写进reason）。
+idle-review是非对话时自主起念，它不是用户新消息。空闲评估本身就是自主起念的机会，想联系、探索或创作都可以直接提出；允许根据已有兴趣和情绪重新评估initiative和curiosity的values与target，当前值低也可以调整。每次idle-review都对主动联系作一个明确决定：想联系就在wishes提出kind=contact的愿望，或用wish_updates恢复在手的联系愿望；这次不联系，可以选择 quiet/rest，reason 可空；有具体安排才记，不为安静编理由。
 next_review_minutes由你在10到1440之间选择（十分钟到一天），决定下一次安静时重新想一想的时间，不是发消息时刻。新事件仍会更早唤醒你，实际取两者中较早的。
 delivery仅结算回执；发送状态由宿主保存，memory.disclosures可以整理已发内容，不能靠回执创造新话题。
 memory-backfill只整理旧记录的memory.notes/links/disclosures，不更新情绪、不新建或恢复愿望；它不是新经历。
@@ -2824,6 +2824,8 @@ class Appraisals:
                     # Kin's latest diaries: a reflection reaches what Kin plans and who Kin becomes only
                     # through an assessment that sees it, and cites it as the evidence below allows.
                     model_context["recent_reflections"] = self.memory.recent_reflections()
+                    from .private_notes import PrivateNotes
+                    model_context["private_role_notes"] = PrivateNotes(self.mind).appraisal_context()
                     if settings.get("dreams") is True and {"idle-review", "rhythm-review"}.intersection(data.get("stimuli") or [data.get("stimulus")]):
                         # The latest dream, never as evidence: whether 小光 hears of it is a contact wish
                         # this quiet/rhythm review may make (dreams.py). Shown, so the queue row names it below.
@@ -3108,6 +3110,7 @@ class Appraisals:
                     read = erasure.tool_read_ids(conn, receipt, since=data["tombstone_mark"])
                 # Save the structured result even when required-decision
                 # validation rejects it. No provider thinking blocks are stored.
+                receipt = {**receipt, "private_note_evidence_ids": sorted({sid for note in model_context.get("private_role_notes", {}).get("notes", []) for sid in note.get("evidence_ids", [])})}
                 data.update(proposed_result=proposal_record(proposal), receipt=receipt,
                             evaluated_sources=list(semantic_refs.values()),
                             # A stored proposal was written from what its own attempt was shown as well.

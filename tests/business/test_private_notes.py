@@ -108,3 +108,20 @@ def test_real_outputs_survive_restart(tmp_path):
     for model in ['k3','deepseek-flash','gpt-6.1-sol']:
         original=json.loads((Path(fixtures)/('note-'+model)/'answer.txt').read_text())
         assert restarted.read(identifier=model)['notes'][0]['text']==original['private_note']
+
+
+def test_appraisal_sees_only_private_role_material_and_erasure_roots(tmp_path):
+    mind, source = setup(tmp_path)
+    notes = PrivateNotes(mind)
+    notes.save({'id':'n','group_id':'g','input_id':'input-1','text':'我想安静一会儿。','reply_text':'公开答复'})
+    context = notes.appraisal_context()
+    note = context['notes'][0]
+    assert note['basis'] == 'role_note' and note['visibility'] == 'kin_only'
+    assert note['evidence_ids'] == [source['id']]
+    assert 'reply_text' not in note and 'delivery' not in note and 'later_notes' not in note
+    from kin_mind.erasure import shown_ids, _recall_rows
+    with mind.engine.db.connect() as conn:
+        assert source['id'] in shown_ids(conn, context)
+    with mind.engine.db.connect(write=True) as conn:
+        _recall_rows(conn, {source['id']}, {source['id']})
+    assert notes.appraisal_context()['notes'] == []

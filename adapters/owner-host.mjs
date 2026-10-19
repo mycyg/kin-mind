@@ -299,7 +299,7 @@ export function interactionView(state) {
     exploration_decisions:(state.exploration_decisions??[]).slice(0,4),
     concerns:active?(state.selected_concerns??[]).slice(0,INTERACTION_LIMITS.concerns).map(c=>note(marked(c))):[],
     understanding:summary?note(marked(summary)):undefined,
-    rhythm:rhythm?note(marked({mode:rhythm.mode,status:rhythm.status,phase:rhythm.phase,alertness:rhythm.alertness,needs_review:rhythm.needs_review,observed_at:rhythm.observed_at})):undefined,
+    rhythm:rhythm?note(marked({mode:rhythm.mode,status:rhythm.status,phase:rhythm.phase,alertness:rhythm.alertness,current_activity:rhythm.current_activity,needs_review:rhythm.needs_review,observed_at:rhythm.observed_at})):undefined,
     affect_layers:layers?affectLayers(layers):undefined,
   };
 }

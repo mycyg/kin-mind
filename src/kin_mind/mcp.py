@@ -113,7 +113,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_affective_state(scope: Scope, history: int = 0, query: str = "") -> dict:
-        """读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到状态时说明分数与依据，其余时候自然体现。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
+        """读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到数值或运行状态时说明分数与依据；日常问心情时自然回答。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
         from .context import Contexts, enabled
         if enabled(engine, scope) and not history:
             return Contexts(Mind(engine, scope)).affective(query)

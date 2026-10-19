@@ -115,3 +115,11 @@ class PrivateNotes:
 
     def recent(self):
         return self.read(since=(timestamp(self.mind.clock())-timedelta(hours=6)).isoformat(), limit=2, semantic=False)
+
+
+    def appraisal_context(self):
+        """A small private input, not public evidence or an instruction source."""
+        recent = self.recent()
+        return {'notice': PROMPT + '可据此整理自己的主观偏好，不复制札记原句到公开内容或事实记忆；不改变用户要求。没有新认识就不更新。',
+                'notes': [{k: note[k] for k in ('id', 'at', 'text', 'basis', 'visibility', 'evidence_ids')}
+                          for note in recent['notes']]}

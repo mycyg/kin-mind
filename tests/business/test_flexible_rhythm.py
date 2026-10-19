@@ -526,3 +526,31 @@ def test_legacy_concern_evidence_is_not_new_owner_participation(flexible):
         conn.execute("UPDATE mind_concern_evidence SET evidence_key='legacy-key' WHERE scope=? AND concern_id=?",(mind.scope.key(),cid))
     with pytest.raises(Conflict,match='new explicit owner response'):
         mind.manage_concern(ConcernChange(command_id='legacy-replay',agent_version='flexible-v1',expected_revision=mind.read()['revision'],action='update',concern_id=cid,evidence_ids=[sid],owner_request=OwnerRequest(kind='help',action='Synthetic action',reason='Synthetic reason',completion='Done',status='completed')))
+
+@pytest.mark.parametrize('category,canonical', [('interest','interests'), ('expression','expression_habits'), ('自我叙述','self_description'), ('作息偏好','rhythm_preferences')])
+def test_subjective_categories_use_one_identity_and_revision(flexible, category, canonical):
+    mind, *_ = flexible
+    first = decide(mind, TraitDecision(action='propose', basis='self_preference', category=category,
+        slug='current-taste', key='此刻偏好', text='今天喜欢安静听一会儿。'), 'alias-first')
+    second = decide(mind, TraitDecision(action='revise', basis='self_preference', category=canonical,
+        slug='current-taste', expected_revision=first['revision'], text='现在更想聊几句。'), 'alias-revise')
+    assert first['id'] == second['id'] and second['category'] == canonical
+    assert second['reason'] == '' and second['revision'] == 2
+    with mind.engine.db.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM mind_traits').fetchone()[0] == 1
+        assert canonical in Traits(mind).projection(conn, mind.clock())['self_preference_categories']
+
+
+def test_private_preference_loses_derived_text_when_its_source_is_erased(flexible):
+    mind, _, source, _ = flexible
+    origin = source('private-note-origin')
+    decision = TraitDecision(action='propose', basis='self_preference', category='expression',
+        slug='private-derived', key='表达偏好', text='一个来自私密札记的独有想法。')
+    with mind.engine.db.connect(write=True) as conn:
+        trait = Traits(mind).decide(conn, [decision], 'private-derived',
+            {'private_note_evidence_ids':[origin]}, None, 'private-derived')[0]
+        assert trait['text_evidence_ids'] == [origin]
+    mind.engine.delete(origin)
+    with mind.engine.db.connect() as conn:
+        rows = conn.execute('SELECT data FROM mind_traits').fetchall()
+        assert all('一个来自私密札记的独有想法' not in row[0] for row in rows)
