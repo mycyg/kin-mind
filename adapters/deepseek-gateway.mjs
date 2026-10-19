@@ -117,6 +117,22 @@ export const DEEPSEEK_EFFORTS = Object.freeze(['none', 'low', 'high', 'max']);
 export const KIN_DEEPSEEK_EFFORT = 'high';
 export const forwardedEffort = () => KIN_DEEPSEEK_EFFORT;
 
+/** Codex marks compaction separately even on the same /responses endpoint.
+ * Only a bound ordinary main turn gets the public reply JSON format; tool
+ * continuations retain it, while explicit schemas and internal work stay intact. */
+export function applyMainReplyFormat(body, {headers, identity, attributed, profile} = {}) {
+  if (body.model !== 'deepseek-flash' || !identity || identity === 'unknown') return;
+  const mainReply = profile === 'chat' || attributed?.mainConversation === true &&
+    ['native-chat-turn', 'native-creation'].includes(attributed.purpose);
+  if (!mainReply || profile && profile !== 'chat') return;
+  let metadata;
+  try { metadata = JSON.parse(headers?.['x-codex-turn-metadata']); } catch { return; }
+  if (metadata?.request_kind !== 'turn' || metadata.thread_id !== identity.threadId ||
+    metadata.turn_id !== identity.turnId) return;
+  if (body.text?.format && body.text.format.type !== 'text') return;
+  body.text = {...body.text, format: {type: 'json_object'}};
+}
+
 // DeepSeek treats developer messages as user input. Map trusted developer
 // instructions to its supported system role; leave user data and receipts alone.
 export function deepseekRequest(body, reasoningEffort = 'high', profile = null, contracts = gatewayContracts()) {
@@ -323,6 +339,7 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
         throw Error('kimi-main-conversation-unavailable');
       upstreamProvider = kimi ? 'kimi' : 'deepseek';
       const body = kimi ? kimiRequest(parsed, requestProfile, contracts) : deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
+      applyMainReplyFormat(body, {headers:req.headers, identity, attributed, profile:requestProfile});
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:upstreamProvider,lane:attributed.lane,
         purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,
         requestedReasoningEffort:typeof parsed.reasoning?.effort==='string'?parsed.reasoning.effort:null,nativeRequestIdentity:identity,
