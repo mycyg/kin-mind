@@ -434,6 +434,26 @@ outcome. Redacted server validation messages and request attempt IDs remain in
 the owner's private provider error journal; public usage and ACP output retain
 only machine error fields.
 
+### Main-reply JSON and terminal format failures
+
+Bound ordinary main turns request JSON output, including tool continuations.
+DeepSeek uses `text.format.type=json_object`; K3 uses the documented
+`text.format={type:"json_schema",name:"kin_reply",schema:{type:"object"}}`.
+[Kimi Code documents the coding Responses endpoint and `k3` model](https://www.kimi.com/code/docs/),
+and [Kimi Responses documents the JSON Schema format](https://platform.kimi.com/docs/api/responses#body-text-format).
+This constrains object syntax; the existing private-reply parser still validates
+the complete envelope and separates the private note from public bubbles.
+Compaction, internal work and explicitly supplied formats are left intact.
+Malformed or incomplete JSON is never repaired or sent as public text.
+
+A recorded terminal format failure is eligible for the next watchdog pass,
+without the input-stall timeout or session-idle wait. Format failures with no
+known or uncertain delivery get a fixed system format-error notice. Confirmed
+partial delivery and uncertain delivery retain their respective notices. The
+existing freeze gate, notice gap, receipt lookup and per-input deduplication
+still apply; platform-send failures retain their existing stall timing, and a
+failure never authorizes replaying the input.
+
 ## Validation
 
 Every verified profile change creates one durable owner notification, including

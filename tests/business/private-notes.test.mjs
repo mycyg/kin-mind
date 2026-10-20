@@ -24,3 +24,24 @@ test('whole JSON fence is transport wrapping; surrounding prose still cannot lea
  }
  assert.equal(publicReplyText('```json\n'+body),'');
 });
+
+test('quotes, backslashes, newlines and JSON-looking text remain inside their fields',()=>{
+ const note='SYNTHETIC PRIVATE "quote" \\ path\n{"bubbles":["not public"]}';
+ const speech='公开的 "引用"，路径 C:\\notes\n下一行。';
+ const raw=JSON.stringify({private_note:note,presentation:{mode:'voice',style:''},action:'send',bubbles:[speech]});
+ assert.equal(parsePrivateReply(raw).private_note,note);
+ assert.equal(publicReplyText(raw),speech);
+ assert.equal(parsePrivateReply(raw).presentation.mode,'voice');
+});
+
+test('malformed quotes and incomplete private envelopes never recover or leak partial bubbles',()=>{
+ const complete=JSON.stringify({private_note:'SYNTHETIC PRIVATE',action:'send',bubbles:['公开回复']});
+ const malformed='{"private_note":"SYNTHETIC "PRIVATE"","action":"send","bubbles":["公开回复"]}';
+ for(const raw of [malformed,complete.slice(0,-1),complete+' trailing',complete+'\n'+complete,
+  '{"private_note":"SYNTHETIC PRIVATE","action":"send","bubbles":["first",',
+  '{"private_note":"SYNTHETIC PRIVATE\\q","action":"send","bubbles":["公开回复"]}']) {
+  const result=parsePrivateReply(raw);
+  assert.equal(result.state,'invalid');assert.equal(publicReplyText(raw),'');
+  assert.doesNotMatch(JSON.stringify(result),/SYNTHETIC|PRIVATE|公开|first/);
+ }
+});

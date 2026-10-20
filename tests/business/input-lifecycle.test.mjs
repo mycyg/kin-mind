@@ -9,6 +9,9 @@ import {WorkLockReview} from '../../adapters/work-lock-review.mjs';
 import {MobileAudit} from '../../adapters/mobile-audit.mjs';
 import {createMobileReviewer} from '../../adapters/mobile-reviewer.mjs';
 import {createLeaseClient} from '../../adapters/model-lease.mjs';
+import {parsePrivateReply} from '../../adapters/private-notes.mjs';
+import {replyOutcomeFacts} from '../../adapters/reply-outcomes.mjs';
+import {ownerNotice} from '../../adapters/owner-notice.mjs';
 import {safeBoundary} from '../../adapters/session-policy.mjs';
 
 const MINUTE=60000,HOUR=3600000;
@@ -982,4 +985,66 @@ test('an unknown submission the owner\'s stop settled holds the session no more,
     ['unconfirmed','stop','native-session','synthetic',false,'canceled-by-owner']);
   await router.watch({reconcileInput:async id=>{assert.equal(id,'stop','nothing she stopped is looked up');return {state:'found'};}});
   assert.deepEqual(boundary(router),{safe:true});
+});
+
+test('a terminal format failure is reported on the next watch, once, without waiting for native idle',async t=>{
+ const f=fixture(t);await chat(f,'format');await chat(f,'steered');
+ f.clock.now+=9000;
+ const calls=[],replyOutcomes=[{groupId:'synthetic-group',inputIds:['format','steered'],state:'format-failed',sentBubbles:0,unknownFragments:0}];
+ const notifyOwner=async(kind,id,options)=>{calls.push({kind,id,...options});return {state:'accepted',messageId:'notice'};};
+ await f.router.watch({notifyOwner,sessionBusy:true,replyOutcomes});
+ assert.deepEqual(calls,[{kind:'format-failed',id:'format',mayStart:true}]);
+ assert.equal(inputSummary(f.router.state.inputs.format),'failed-notified');
+ assert.equal(inputSummary(f.router.state.inputs.steered),'failed-notified','one group notice covers its inputs');
+ const restarted=new MobileRouter(f.args);
+ f.clock.now+=11*MINUTE;
+ await restarted.watch({notifyOwner,replyOutcomes});assert.equal(calls.length,1,'receipt survives restart');
+ await restarted.dispatch({id:'format',kind:'owner',text:'hi'},()=>assert.fail('a format failure never authorizes replay'));
+});
+
+test('known reply failure uses delivery facts; uncertainty and partial delivery are not called unsent',async t=>{
+ for(const [outcomes,kind] of [
+  [[{state:'send-failed',sentBubbles:0,unknownFragments:0}],'stopped'],
+  [[{state:'format-failed',sentBubbles:1,unknownFragments:0}],'partial'],
+  [[{state:'format-failed',sentBubbles:0},{state:'send-unknown',unknownFragments:1}],'unknown']
+ ]) {
+  const f=fixture(t);await chat(f,'reply');const calls=[];
+  const watch={replyOutcomes:outcomes.map(x=>({...x,inputIds:['reply']})),
+   notifyOwner:async(k,id)=>{calls.push([k,id]);return {state:'accepted',messageId:'notice'};}};
+  await f.router.watch(watch);
+  if(outcomes[0].state==='send-failed') {
+   assert.deepEqual(calls,[],'platform-send failures retain their existing stall timing');
+   f.clock.now+=11*MINUTE;await f.router.watch(watch);
+  }
+  assert.deepEqual(calls,[[kind,'reply']]);
+ }
+});
+
+test('fresh format failures obey freeze and notice gap, and successful or still-running replies get no false notice',async t=>{
+ const f=fixture(t);for(const id of ['failed','ok','running'])await chat(f,id);
+ await f.router.observe('reply-complete',{inputId:'ok'});
+ const replyOutcomes=[{inputIds:['failed','ok'],state:'format-failed',sentBubbles:0,unknownFragments:0}],calls=[];
+ const notifyOwner=async(kind,id)=>{calls.push([kind,id]);return {state:'accepted',messageId:'notice'};};
+ await f.router.freezeDispatch('test');await f.router.watch({notifyOwner,replyOutcomes});assert.deepEqual(calls,[]);
+ await f.router.thawDispatch('test');f.router.state.lastOwnerNoticeAt=f.clock.now;
+ f.clock.now+=MINUTE;await f.router.watch({notifyOwner,replyOutcomes});assert.deepEqual(calls,[]);
+ f.clock.now+=9*MINUTE;f.router.progress.set('running',f.clock.now);
+ await f.router.watch({notifyOwner,replyOutcomes});assert.deepEqual(calls,[['format-failed','failed']]);
+ assert.equal(f.router.state.inputs.ok.ownerNotice,undefined);assert.equal(f.router.state.inputs.running.ownerNotice,undefined);
+});
+
+
+test('only a terminal manifest format result produces a notice, never unfinished stream text or private content',async t=>{
+ const f=fixture(t);await chat(f,'synthetic-format');
+ const raw='{"private_note":"SYNTHETIC "SECRET"","action":"send","bubbles":["public"]}';
+ const group={group_id:'synthetic-group',reply_id:'synthetic-format',updated_at:f.clock.now,
+  bubbles:[{state:'pending',text:raw,fragments:[]}]};
+ const notices=[],notifyOwner=async(kind,id)=>{notices.push(ownerNotice(kind,id));return {state:'accepted',messageId:'notice'};};
+ const watch=()=>f.router.watch({notifyOwner,sessionBusy:true,replyOutcomes:replyOutcomeFacts(f.router.state.inputs,{group},{now:f.clock.now})});
+ await watch();assert.deepEqual(notices,[],'an unfinished stream has no terminal failure fact');
+ const parsed=parsePrivateReply(raw);assert.equal(parsed.state,'invalid');
+ group.reason=parsed.reason;group.bubbles[0].state='canceled';f.clock.now+=1000;
+ await watch();assert.equal(notices.length,1);assert.equal(notices[0].kind,'format-failed');
+ assert.doesNotMatch(JSON.stringify(notices),/SYNTHETIC|SECRET|private_note|public/);
+ assert.deepEqual(group.bubbles[0].fragments,[],'no failed envelope is submitted to a transport');
 });

@@ -437,13 +437,13 @@ test('a slow model catalog cannot leave the classification clock without a liste
   assert.deepEqual(unhandled,[]);assert.equal(f.router.state.inputs.slow.state,'accepted');
 });
 
-test('format failure uses a stopped notice and one receipt covers the same failed steered group',async t=>{
+test('format failure uses its specific notice and one receipt covers the same failed steered group',async t=>{
   const f=fixture(t);f.clock.now=700000;
   for(const id of ['owner','steered'])f.router.state.inputs[id]={id,kind:'owner',state:'accepted',at:1,acceptedAt:1,turnStartedAt:1,turnEndedAt:2,stopReason:'end_turn'};
   const replyOutcomes=[{groupId:'failed-group',inputIds:['owner','steered'],state:'format-failed',sentBubbles:0}];
   const notices=[];const notifyOwner=async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'system-receipt'};};
   await f.router.watch({notifyOwner,replyOutcomes});
-  assert.deepEqual(notices,[['stopped','owner']]);assert.equal(f.router.state.inputs.steered.ownerNotice.messageId,'system-receipt');
+  assert.deepEqual(notices,[['format-failed','owner']]);assert.equal(f.router.state.inputs.steered.ownerNotice.messageId,'system-receipt');
   f.clock.now+=700000;await f.router.watch({notifyOwner,replyOutcomes});assert.equal(notices.length,1);
   assert.equal(f.router.state.inputs.owner.answer,undefined,'notice is not a delivered Kin reply');
 });

@@ -121,7 +121,7 @@ export const forwardedEffort = () => KIN_DEEPSEEK_EFFORT;
  * Only a bound ordinary main turn gets the public reply JSON format; tool
  * continuations retain it, while explicit schemas and internal work stay intact. */
 export function applyMainReplyFormat(body, {headers, identity, attributed, profile} = {}) {
-  if (body.model !== 'deepseek-flash' || !identity || identity === 'unknown') return;
+  if (!['deepseek-flash', 'k3'].includes(body.model) || !identity || identity === 'unknown') return;
   const mainReply = profile === 'chat' || attributed?.mainConversation === true &&
     ['native-chat-turn', 'native-creation'].includes(attributed.purpose);
   if (!mainReply || profile && profile !== 'chat') return;
@@ -130,7 +130,14 @@ export function applyMainReplyFormat(body, {headers, identity, attributed, profi
   if (metadata?.request_kind !== 'turn' || metadata.thread_id !== identity.threadId ||
     metadata.turn_id !== identity.turnId) return;
   if (body.text?.format && body.text.format.type !== 'text') return;
-  body.text = {...body.text, format: {type: 'json_object'}};
+  // Kimi Responses documents json_schema, not DeepSeek's json_object mode.
+  // Constrain JSON syntax only; the existing private-reply parser still owns
+  // envelope validation, public bubbles and reference/presentation semantics.
+  // https://platform.kimi.com/docs/api/responses#body-text-format
+  const format = body.model === 'k3'
+    ? {type: 'json_schema', name: 'kin_reply', schema: {type: 'object'}}
+    : {type: 'json_object'};
+  body.text = {...body.text, format};
 }
 
 // DeepSeek treats developer messages as user input. Map trusted developer
