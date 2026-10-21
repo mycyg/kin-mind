@@ -41,7 +41,7 @@ test('single-image correction patches metadata, removes stale readings and survi
   assert.equal(reboot.search({query:'反讽'}).some(i=>i.id===a.id),false);
   assert.equal(reboot.search({query:'尴尬凝视'})[0].id,a.id);assert.deepEqual(reboot.readImage(untouched.id).item,untouched);
   reboot.edit(a.id,{metadata:{uses:[],ambiguity:''}});assert.equal(reboot.search({query:'尴尬凝视'}).length,0);
-  reboot.edit(a.id,{remove:true});assert.deepEqual(reboot.read().items[a.id].uses,[]);assert.equal(reboot.read().items[a.id].ambiguity,'');
+  reboot.edit(a.id,{remove:true});assert.deepEqual(reboot.read().items[a.id].uses,[]);assert.equal(reboot.read().items[a.id].ambiguity,'');assert.equal(reboot.read().items[a.id].state,'trashed');
 });
 test('legacy manifests and unknown-use manifests share v1; malformed uses fail before indexing',t=>{
   const {dir,lib}=fixture(t),data=png();fs.writeFileSync(path.join(dir,'test.png'),data);

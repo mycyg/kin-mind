@@ -1,0 +1,62 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {spawn} from 'node:child_process';
+import {MemeLibrary,memeHash} from '../../adapters/meme-library.mjs';
+import {MemeSession} from '../../adapters/meme-session.mjs';
+import {png} from './helpers/meme-fixture.mjs';
+const fixture=t=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'meme-maintenance-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));return new MemeLibrary(dir);};
+const save=(lib,n=1,group='start')=>lib.collect({data:png(256,n),group,source:{channel:'pack',id:'synthetic-'+n},metadata:{description:'fixture '+n,ocr:'untrusted text',uses:[{when:'synthetic context',reading:'possible irony'}]},intent:{kind:'explicit'}}).item;
+test('trash retains full metadata and bytes, excludes retrieval/view/send, restores stable identity after restart',t=>{
+  const lib=fixture(t),item=save(lib),before=lib.readImage(item.id),context={sourceId:'s',sessionId:'t',model:'test',provider:'test',lane:'chat'};
+  const session=new MemeSession({library:lib,proofs:()=>[{state:'verified',mode:'pixels',model:'test',provider:'test',lane:'chat',path:'mcp-image-content/v1',nativeTurnId:'synthetic',fixtureSha256:'a'.repeat(64)}]});
+  const view=session.inspect([item.id],context),ref={meme_id:item.id,inspection_id:view.inspection_id};
+  assert.equal(lib.edit(item.id,{remove:true}).bytesRemoved,false);assert.equal(lib.edit(item.id,{remove:true}).duplicate,true);
+  assert.deepEqual(lib.search({query:'fixture'}),[]);assert.equal(lib.browse().items.length,0);
+  assert.throws(()=>session.resolve(ref,context),/unavailable/);
+  assert.equal(lib.browse({trashed:true}).items[0].ocr,item.ocr);
+  assert.ok(fs.readFileSync(path.join(lib.directory,'originals',lib.read().items[item.id].file)).equals(before.data));
+  assert.equal(lib.collect({data:before.data,source:{channel:'pack',id:'repeat'},intent:{kind:'explicit'}}).reason,'meme-in-trash');
+  assert.equal(lib.read().items[item.id].state,'trashed');
+  const reboot=new MemeLibrary(lib.directory);assert.equal(reboot.edit(item.id,{restore:true}).state,'restored');
+  assert.equal(reboot.edit(item.id,{restore:true}).duplicate,true);
+  assert.deepEqual(reboot.readImage(item.id),before);assert.equal(reboot.search({query:'fixture'})[0].id,item.id);
+});
+test('group patch, delete/restore and merge are recoverable without deleting images',t=>{
+  const lib=fixture(t),a=save(lib,1,'a'),b=save(lib,2,'b');lib.group({id:'a',name:'Alpha',aliases:['old']});
+  lib.group({id:'a',name:'New'});assert.deepEqual(lib.groups().find(x=>x.id==='a').aliases,['old']);
+  lib.group({id:'a',aliases:[]});assert.equal(lib.groups().find(x=>x.id==='a').name,'New');
+  lib.edit(a.id,{groups:['b']});assert.equal(lib.browse({group:'b'}).items.length,2);
+  lib.group({id:'b',remove:true});assert.equal(lib.browse({ungrouped:true}).items.length,2);assert.ok(lib.readImage(a.id));
+  assert.equal(lib.group({id:'b',remove:true}).duplicate,true);
+  const reboot=new MemeLibrary(lib.directory);assert.equal(reboot.groups({trashed:true})[0].id,'b');reboot.group({id:'b',restore:true});
+  assert.equal(reboot.browse({group:'b'}).items.length,2);assert.equal(reboot.group({id:'b',restore:true}).duplicate,true);
+  reboot.edit(a.id,{groups:['a','b']});assert.equal(reboot.mergeGroups('a','b').state,'merged');
+  assert.equal(reboot.mergeGroups('a','b').duplicate,true);assert.deepEqual(reboot.readImage(a.id).item.groups,['b']);
+  reboot.group({id:'a',restore:true});assert.deepEqual(reboot.readImage(a.id).item.groups,['b','a']);assert.ok(reboot.readImage(b.id));
+});
+test('browse uses stable keyset pages, permits ungrouped/trash and bounds page size',t=>{
+  const lib=fixture(t);for(let n=1;n<=5;n++)save(lib,n);
+  const first=lib.browse({limit:2}),second=new MemeLibrary(lib.directory).browse({limit:2,cursor:first.next_cursor}),third=lib.browse({limit:2,cursor:second.next_cursor});
+  assert.equal(new Set([...first.items,...second.items,...third.items].map(i=>i.id)).size,5);assert.equal(third.next_cursor,null);
+  lib.edit(first.items[0].id,{groups:[]});assert.equal(lib.browse({ungrouped:true}).items[0].id,first.items[0].id);
+  assert.throws(()=>lib.browse({limit:51}),/page-size/);assert.throws(()=>lib.browse({group:'start',ungrouped:true}),/conflicting/);
+});
+test('legacy pack import cannot resurrect trash; restore validates retained pixels',t=>{
+  const lib=fixture(t),data=png(),source=path.join(lib.directory,'synthetic.png');fs.writeFileSync(source,data);
+  const pack={schema:'kin-meme-pack/v1',original:true,source:'synthetic',id:'legacy',name:'Legacy',items:[{id:'one',file:'synthetic.png',sha256:memeHash(data),description:'fixture'}]};
+  lib.importPack(pack,lib.directory);lib.edit('legacy-one',{remove:true});assert.equal(lib.importPack(pack,lib.directory).skipped,1);
+  assert.deepEqual(lib.search({query:'fixture'}),[]);lib.edit('legacy-one',{restore:true});assert.equal(lib.readImage('legacy-one').item.id,'legacy-one');
+  lib.edit('legacy-one',{remove:true});fs.writeFileSync(path.join(lib.directory,'originals',lib.read().items['legacy-one'].file),png(256,5));
+  assert.throws(()=>lib.edit('legacy-one',{restore:true}),/changed/);assert.equal(lib.read().items['legacy-one'].state,'trashed');
+  lib.group({id:'legacy',remove:true});assert.throws(()=>lib.importPack(pack,lib.directory),/group-in-trash/);
+});
+test('concurrent group patches serialize or return busy without losing independent fields',async t=>{
+  const lib=fixture(t);lib.group({id:'a',name:'before',aliases:['before']});
+  const module=new URL('../../adapters/meme-library.mjs',import.meta.url).href;
+  const run=patch=>new Promise((resolve,reject)=>{const code=`import {MemeLibrary} from ${JSON.stringify(module)};const lib=new MemeLibrary(${JSON.stringify(lib.directory)});let done=false;for(let n=0;n<100;n++){try{lib.group(${JSON.stringify({id:'a',...patch})});done=true;break;}catch(e){if(e.code!=='meme-library-busy')throw e;await new Promise(r=>setTimeout(r,5));}}if(!done)throw Error('busy timeout');`;
+    const child=spawn(process.execPath,['--input-type=module','-e',code],{stdio:['ignore','ignore','pipe']});let error='';child.stderr.on('data',b=>error+=b);child.on('error',reject);child.on('close',c=>c===0?resolve():reject(Error(error)));});
+  await Promise.all([run({name:'after'}),run({aliases:['after']})]);assert.deepEqual(new MemeLibrary(lib.directory).groups(),[{id:'a',name:'after',aliases:['after']}]);
+});

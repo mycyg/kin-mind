@@ -22,15 +22,15 @@ test('recognition is not collection: default/negative choice writes no index; ch
   assert.equal(collect(lib,data,{intent:{kind:'interesting',visual:true,isMeme:true,worthKeeping:false}}).state,'saved');
   const ordinary=collect(lib,png(256,100),{intent:{kind:'explicit'},source:{channel:'feishu',id:'explicit-photo'}});assert.equal(ordinary.state,'saved');
 });
-test('restart, precise dedup, sources, pack search, edits and retirement are consistent',t=>{
+test('restart, precise dedup, sources, pack search, edits and recoverable trash are consistent',t=>{
   const {lib,data}=fixture(t);const a=collect(lib,data).item;
   lib.group({id:'cats',name:'猫咪',aliases:['猫猫']});
   const b=collect(lib,data,{source:{channel:'wechat',id:'owner-image-2'},group:'cats'});assert.equal(b.duplicate,true);assert.equal(a.id,b.item.id);assert.equal(b.item.sources.length,2);
   const restarted=new MemeLibrary(lib.directory);assert.equal(restarted.search({query:'扶额',group:'cats'})[0].id,a.id);
   assert.equal(restarted.search({query:'无奈'})[0].id,a.id);assert.deepEqual(restarted.search({query:'不相干xyz'}),[]);
   restarted.edit(a.id,{metadata:{description:'新描述',contexts:['庆祝'],aliases:['太棒了']}});assert.equal(restarted.search({query:'太棒了'}).length,1);
-  restarted.edit(a.id,{remove:true});assert.equal(restarted.search({query:'太棒了'}).length,0);assert.throws(()=>restarted.readImage(a.id),/unavailable/);assert.equal(fs.existsSync(path.join(lib.directory,'originals',a.hash+'.png')),false);
-  assert.equal(collect(restarted,data).item.id,a.id);assert.equal(restarted.search({query:'无奈'}).length,1);
+  restarted.edit(a.id,{remove:true});assert.equal(restarted.search({query:'太棒了'}).length,0);assert.throws(()=>restarted.readImage(a.id),/unavailable/);assert.equal(fs.existsSync(path.join(lib.directory,'originals',a.hash+'.png')),true);
+  assert.equal(collect(restarted,data).reason,'meme-in-trash');restarted.edit(a.id,{restore:true});assert.equal(restarted.readImage(a.id).item.id,a.id);assert.equal(restarted.search({query:'太棒了'}).length,1);
 });
 test('missing/corrupt index and modified bytes fail closed',t=>{const {lib,data}=fixture(t);const a=collect(lib,data).item;fs.writeFileSync(path.join(lib.directory,'originals',a.hash+'.png'),png(256,4));assert.throws(()=>lib.readImage(a.id),/changed/);fs.writeFileSync(lib.file,'{');assert.throws(()=>lib.search({query:'猫'}),/unavailable/);});
 test('PNG CRC, dimensions, corruption and non-PNG rejected',()=>{assert.equal(inspectMemeImage(png()).width,256);const corrupt=png();corrupt[40]^=1;assert.throws(()=>inspectMemeImage(corrupt),/corrupt/);assert.throws(()=>inspectMemeImage(Buffer.from('GIF89a')),/image-required/);});

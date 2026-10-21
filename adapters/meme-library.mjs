@@ -77,11 +77,40 @@ export class MemeLibrary {
     const lockFile=path.join(this.directory,'index.lock'),lock=claimPidLock(lockFile);if(lock.state!=='held')throw err('meme-library-busy');
     try {const state=this.read(),value=fn(state);writeJsonAtomic(this.file,state,{previous:false});return afterCommit?afterCommit(state,value):value;}finally{releasePidLock(lockFile,lock.claim);}
   }
-  groups(){return Object.values(this.read().packs).map(p=>({...p}));}
-  group({id,name,aliases=[],remove=false}) {
-    requireId(id);return this.transaction(s=>{if(remove){delete s.packs[id];for(const item of Object.values(s.items))item.groups=item.groups.filter(g=>g!==id);return {state:'removed'};}
-      if(!s.packs[id]&&Object.keys(s.packs).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');
-      return s.packs[id]={id,name:str(name,100)||id,aliases:tags(aliases)};});
+  groups({trashed=false}={}){return Object.values(trashed?this.read().trashPacks??{}:this.read().packs).map(p=>structuredClone(p));}
+  group({id,name,aliases,remove=false,restore=false}) {
+    requireId(id);if(remove&&restore)throw err('meme-conflicting-operation');
+    return this.transaction(s=>{
+      s.trashPacks??={};
+      if(remove){if(s.trashPacks[id])return {state:'trashed',id,duplicate:true};if(!s.packs[id])throw err('meme-unknown-group');
+        s.trashPacks[id]={...s.packs[id],trashedAt:this.clock(),members:Object.values(s.items).filter(i=>i.groups.includes(id)).map(i=>i.id)};
+        delete s.packs[id];for(const item of Object.values(s.items))item.groups=item.groups.filter(g=>g!==id);return {state:'trashed',id};}
+      if(restore){if(s.packs[id])return {state:'restored',id,duplicate:true};const old=s.trashPacks[id];if(!old)throw err('meme-unknown-group');
+        s.packs[id]={id,name:old.name,aliases:old.aliases};
+        for(const itemId of old.members){const i=s.items[itemId];if(i&&i.state!=='retired'&&!i.groups.includes(id)){if(i.groups.length>=16)throw err('meme-group-budget');i.groups.push(id);}}
+        delete s.trashPacks[id];return {state:'restored',id};}
+      if(s.trashPacks[id])throw err('meme-group-in-trash');
+      if(!s.packs[id]&&Object.keys(s.packs).length+Object.keys(s.trashPacks).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');
+      const old=s.packs[id];return s.packs[id]={id,name:name==null?old?.name??id:str(name,100)||id,aliases:aliases==null?old?.aliases??[]:tags(aliases)};
+    });
+  }
+  mergeGroups(id,target) {
+    requireId(id);requireId(target);if(id===target)throw err('meme-same-group');
+    return this.transaction(s=>{s.trashPacks??={};if(!s.packs[target])throw err('meme-unknown-group');
+      if(s.trashPacks[id]?.mergedInto===target)return {state:'merged',id,target,duplicate:true};
+      if(!s.packs[id])throw err('meme-unknown-group');
+      const members=Object.values(s.items).filter(i=>i.groups.includes(id));
+      s.trashPacks[id]={...s.packs[id],trashedAt:this.clock(),members:members.map(i=>i.id),mergedInto:target};
+      for(const i of members)i.groups=[...new Set(i.groups.map(g=>g===id?target:g))];delete s.packs[id];
+      return {state:'merged',id,target,count:members.length};});
+  }
+  browse({group=null,ungrouped=false,trashed=false,cursor=null,limit=20}={}) {
+    if(group!==null)requireId(group);if(cursor!==null)requireId(cursor);
+    if(group!==null&&ungrouped)throw err('meme-conflicting-filter');
+    if(!Number.isInteger(limit)||limit<1||limit>50)throw err('meme-invalid-page-size');
+    const s=this.read(),items=Object.values(s.items).filter(i=>i.state===(trashed?'trashed':'ready')&&(!group||i.groups.includes(group))&&(!ungrouped||!i.groups.length))
+      .sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0).filter(i=>!cursor||i.id>cursor);
+    const page=items.slice(0,limit);return {items:page.map(publicItem),next_cursor:items.length>limit?page.at(-1).id:null};
   }
   collect({data,source,metadata={},group='collected',intent}) {
     // Classification alone never collects, never writes an index or invokes a model.
@@ -94,10 +123,13 @@ export class MemeLibrary {
     return this.transaction(s=>this.insert(s,{data,source:{channel:source.channel,id:source.id},hash,info,meta,group}));
   }
   insert(s,{data,source,hash,info,meta,group,preferredId}) {
-    if(!s.packs[group]){if(Object.keys(s.packs).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[group]={id:group,name:group,aliases:[]};}
+    if(s.trashPacks?.[group])throw err('meme-group-in-trash');
+    if(!s.packs[group]){if(Object.keys(s.packs).length+Object.keys(s.trashPacks??{}).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[group]={id:group,name:group,aliases:[]};}
     let item=Object.values(s.items).find(i=>i.hash===hash);
+    // Repeated receipt/import must not silently undo a deliberate deletion.
+    if(item?.state==='trashed')return {state:'skipped',reason:'meme-in-trash',duplicate:true,item:publicItem(item)};
     if(item?.state==='ready'){if(!item.sources.some(x=>x.channel===source.channel&&x.id===source.id))item.sources.push(source);if(item.sources.length>100)item.sources.splice(0,item.sources.length-100);if(!item.groups.includes(group))item.groups.push(group);return {state:'saved',duplicate:true,item:publicItem(item)};}
-    if(Object.values(s.items).filter(i=>i.state==='ready').length>=MEME_LIMITS.items)throw err('meme-item-budget');
+    if(Object.values(s.items).filter(i=>i.state==='ready'||i.state==='trashed').length>=MEME_LIMITS.items)throw err('meme-item-budget');
     if(!s.packs[group]){if(Object.keys(s.packs).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[group]={id:group,name:group,aliases:[]};}
     const id=item?.id??preferredId??'meme-'+randomUUID();requireId(id);if(s.items[id]&&s.items[id]!==item)throw err('meme-id-conflict');
     const file=hash+'.'+info.extension,target=path.join(this.directory,'originals',file);
@@ -116,16 +148,17 @@ export class MemeLibrary {
       const score=relevance(corpus,query)+relevance(corpus,context)+(matched_uses[0]?.score??0);
       return {...publicItem(i),matched_uses,score};}).filter(i=>i.score>0).sort((a,b)=>b.score-a.score||(a.lastUsedAt??0)-(b.lastUsedAt??0)||a.id.localeCompare(b.id)).slice(0,Math.max(1,Math.min(MEME_LIMITS.candidates,Number.isSafeInteger(limit)?limit:3)));
   }
-  readImage(id){requireId(id);const item=this.read().items[id];if(!item||item.state!=='ready')throw err('meme-unavailable');const target=path.join(this.directory,'originals',item.file),real=fs.realpathSync(target),root=fs.realpathSync(path.join(this.directory,'originals'));if(!real.startsWith(root+path.sep))throw err('meme-path-outside-library');const data=fs.readFileSync(real);if(memeHash(data)!==item.hash)throw err('meme-content-changed');inspectMemeImage(data);return {item:publicItem(item),data};}
-  edit(id,{metadata,groups,remove=false}={}) {
-    requireId(id);return this.transaction(s=>{const i=s.items[id];if(!i||i.state!=='ready')throw err('meme-unavailable');
-      if(remove){i.state='retired';Object.assign(i,memeMetadata());i.groups=[];i.sources=[];return {state:'retired',id};}
+  imageBytes(item){const target=path.join(this.directory,'originals',item.file),real=fs.realpathSync(target),root=fs.realpathSync(path.join(this.directory,'originals'));if(!real.startsWith(root+path.sep))throw err('meme-path-outside-library');const data=fs.readFileSync(real);if(memeHash(data)!==item.hash)throw err('meme-content-changed');inspectMemeImage(data);return data;}
+  readImage(id){requireId(id);const item=this.read().items[id];if(!item||item.state!=='ready')throw err('meme-unavailable');return {item:publicItem(item),data:this.imageBytes(item)};}
+  edit(id,{metadata,groups,remove=false,restore=false}={}) {
+    requireId(id);if(remove&&restore)throw err('meme-conflicting-operation');
+    return this.transaction(s=>{const i=s.items[id];if(!i||i.state==='retired')throw err('meme-unavailable');
+      if(remove){const duplicate=i.state==='trashed';if(!duplicate){i.state='trashed';i.trashedAt=this.clock();}return {state:'trashed',id,duplicate,bytesRemoved:false};}
+      if(restore){if(i.state==='ready')return {state:'restored',id,duplicate:true};if(i.state!=='trashed')throw err('meme-unavailable');
+        this.imageBytes(i);i.state='ready';delete i.trashedAt;return {state:'restored',id};}
+      if(i.state!=='ready')throw err('meme-unavailable');
       // Partial corrections replace only supplied metadata fields. []/'' explicitly clear them.
-      if(metadata)Object.assign(i,memeMetadata({...i,...metadata}));if(groups){if(!Array.isArray(groups)||groups.length>16||groups.some(g=>!s.packs[g]))throw err('meme-unknown-group');i.groups=[...new Set(groups)];}return publicItem(i);},(s,result)=>{if(!remove)return result;const item=s.items[id];
-      // Remove content only after the durable tombstone, under the same short index lock.
-      // Existing delivery journals remain evidence; they are not collection/search entries.
-      try {if(!Object.values(s.items).some(i=>i.state==='ready'&&i.hash===item.hash))fs.rmSync(path.join(this.directory,'originals',path.basename(item.file)),{force:true});return {...result,bytesRemoved:true};}
-      catch{return {...result,bytesRemoved:false};}});
+      if(metadata)Object.assign(i,memeMetadata({...i,...metadata}));if(groups){if(!Array.isArray(groups)||groups.length>16||groups.some(g=>!s.packs[g]))throw err('meme-unknown-group');i.groups=[...new Set(groups)];}return publicItem(i);});
   }
   recordUse(id,receipt) {
     if(receipt?.state!=='accepted'||!receipt.messageId||!receipt.id)return {state:'not-recorded'};
@@ -145,6 +178,6 @@ export class MemeLibrary {
       const meta=memeMetadata(x);if(!meta.description)throw err('meme-pack-index-required');
       return {data,info,hash:x.sha256,meta,source:{channel:'pack',id:pack.id+':'+x.id},group:pack.id,preferredId:pack.id+'-'+x.id};});
     if(dryRun)return {state:'valid',pack:pack.id,count:prepared.length};
-    return this.transaction(s=>{if(!s.packs[pack.id]&&Object.keys(s.packs).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[pack.id]=pack;const items=prepared.map(p=>this.insert(s,p));return {state:'imported',pack:pack.id,count:items.length,items:items.map(x=>x.item.id)};});
+    return this.transaction(s=>{if(s.trashPacks?.[pack.id])throw err('meme-group-in-trash');if(!s.packs[pack.id]&&Object.keys(s.packs).length+Object.keys(s.trashPacks??{}).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[pack.id]=pack;const items=prepared.map(p=>this.insert(s,p));return {state:'imported',pack:pack.id,count:items.length,skipped:items.filter(x=>x.state==='skipped').length,items:items.map(x=>x.item.id)};});
   }
 }
