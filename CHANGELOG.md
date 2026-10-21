@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.61
+
+- Keep the main conversation responsive while one owned task worker continues, with event-backed progress, revision/cancellation fences, and separately acknowledged public items and final results.
+- Allow optional public text, voice, and inspected MEME expressions through the existing transport queue; preserve private-note boundaries.
+- Reduce repeated automatic note context while preserving original records, provenance, correction links, and full retrieval.
+
 ## 0.1.55
 
 - Choose text or voice before composing each public bubble in the same model response.
