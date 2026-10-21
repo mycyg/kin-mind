@@ -102,7 +102,13 @@ export class ReplyGuard {
     try {
       const imported=this.manifests.importLegacy(this.directory).imported.length;
       await this.tail.recover().catch(()=>{});
-      const result=await this.manifests.resumeDue({guard,transport:send,limit,run:id=>this.run(id,{guard,send})});
+      const result=await this.manifests.resumeDue({guard,transport:send,limit,run:id=>{
+        const manifest=this.manifests.load(id);
+        // Parallel expressions have their own version/expiry queue. The generic
+        // tail may reconcile and flush receipts, but never synthesize or resume media.
+        return ['progress','task-final'].includes(manifest?.kind)
+          ?this.manifests.run(id,{transport:{receipt:this.manifests.receipt}}):this.run(id,{guard,send});
+      }});
       return {...result,imported};
     }finally{this.resuming=false;}
   }

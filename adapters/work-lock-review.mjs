@@ -50,6 +50,7 @@ export class WorkLockReview {
   }
   /** Why no summary is due now, or null. */
   waiting(task,runtime) {
+    if(task.parallel)return 'task-worker-snapshot-owned';
     // A declaration whose report is still unproven past the report wait goes back to Kin
     // as facts; the lock stays until the report is proven or she declares otherwise
     // (CR-LIFE-11, CR-MIND-02).

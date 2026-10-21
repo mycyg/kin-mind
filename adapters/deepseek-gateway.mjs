@@ -10,7 +10,9 @@ import {emitInstructionEvidence,instructionTextEvidence,normalizeNativeInstructi
 // spend: a chat turn is what the owner is waiting for, while contact drafts,
 // creation and exploration are the host's own sessions and yield to the owner.
 export const BACKGROUND_TURN_KINDS = new Set(['contact-draft', 'creation', 'exploration', 'assessment']);
-export const nativeTurnPurpose = (kind = 'chat', {mainConversation = false} = {}) => kind === 'creation' && mainConversation
+export const nativeTurnPurpose = (kind = 'chat', {mainConversation = false} = {}) => kind === 'task-worker'
+  ? {lane:'user-work',purpose:'native-task-worker'}
+  : kind === 'creation' && mainConversation
   ? {lane: 'user-work', purpose: 'native-creation'}
   : BACKGROUND_TURN_KINDS.has(kind)
   ? {lane: 'background', purpose: 'native-' + kind}

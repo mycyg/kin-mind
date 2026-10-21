@@ -403,6 +403,8 @@ export class MobileRouter {
     // still scheduled: it stays until that is done (CR2-LIFE-11).
     const closed=Object.values(this.state.tasks).filter(t=>!open(t)&&!deferralOwed(t));
     for(const task of closed.slice(0,Math.max(0,closed.length-limits.tasks))){move('task',task.id,task);delete this.state.tasks[task.id];}
+    for(const item of Object.values(this.state.visibleItems??{}))if(['accepted','failed','dropped'].includes(item.state)&&
+      (item.taskId?!this.state.tasks[item.taskId]:this.archivedIds.has(item.sourceInputId))) {move('visible-item',item.id,item);delete this.state.visibleItems[item.id];}
     const settledNotice=n=>['accepted','rejected','failed','superseded','suppressed','unresolved'].includes(n.state);
     const kept=new Set([...Object.values(this.state.tasks).flatMap(t=>[t.handoff?.id,t.completion?.commandId,t.acceptedBy]),
       ...Object.values(this.state.notices).filter(n=>!settledNotice(n)).map(n=>n.requestId),...Object.values(this.state.reclassifications??{}).map(r=>r.requestId)].filter(Boolean));
@@ -741,7 +743,8 @@ export class MobileRouter {
    * names is canceled, and the inputs that turn was answering are canceled by her. */
   settleOwnerStop(record) {
     const at=this.now();
-    for(const task of this.tasks())if(task.cancelRequested&&task.cancelSourceInputId===record.id)this.cancelTask(task,at);
+    for(const task of this.tasks())if(task.cancelRequested&&task.cancelSourceInputId===record.id&&
+      (!task.parallel||['completed','failed','canceled','blocked'].includes(task.parallel.state)))this.cancelTask(task,at);
     for(const id of record.interrupt?.turnInputIds??[]) {
       const other=this.state.inputs[id];
       if(other&&ownerInput(other)&&other.state==='accepted'&&!answered(other))this.cancelSettled(other,record.id,at);
@@ -1508,6 +1511,7 @@ export class MobileRouter {
       if(request.expectedRevision!==undefined&&request.expectedRevision!==this.state.configRevision)throw Error('Router configuration revision changed; read current state');
       if(request.completedTaskId&&(!this.state.tasks[request.completedTaskId]||!open(this.state.tasks[request.completedTaskId])))throw Error('Task is not open');
       if(request.completedTaskId&&request.completedInputVersion!==this.state.tasks[request.completedTaskId].inputVersion)throw Error('Task input version changed; read current runtime');
+      if(request.completedTaskId&&this.state.tasks[request.completedTaskId]?.parallel&&!['completed','failed','canceled','blocked'].includes(this.state.tasks[request.completedTaskId].parallel.state))throw Error('Task worker is still executing; read its progress or cancel it first');
       if(taskOutcome==='declined'){
         const task=this.state.tasks[request.completedTaskId];
         if(this.currentTask()?.id!==task.id||!task.turnStartedAt||task.turnEndedAt||task.executionEpoch!==this.state.executionEpoch)throw Error('Decline must belong to the current native task turn');
@@ -2377,6 +2381,8 @@ export class MobileRouter {
       }
       if(this.lapseProposals())changed=true;
       for(const task of this.tasks()) {
+        // Independent worker lifecycle and delivery are settled by ParallelTasks.
+        if(task.parallel)continue;
         if(task.cancelRequested){this.cancelTask(task);changed=true;continue;}
         // Kin's declared outcome closes the task once the host's facts are in (N1).
         if(task.completion?.outcome&&task.completion.state!=='historical-proposal') {
