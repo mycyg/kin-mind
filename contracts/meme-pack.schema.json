@@ -47,8 +47,7 @@
           "id",
           "file",
           "sha256",
-          "description",
-          "contexts"
+          "description"
         ],
         "properties": {
           "id": {
@@ -81,8 +80,25 @@
             "items": {
               "type": "string"
             },
-            "maxItems": 24,
-            "minItems": 1
+            "maxItems": 24
+          },
+          "ambiguity": {
+            "type": "string",
+            "maxLength": 600,
+            "description": "Optional uncertainty; no interpretation is required."
+          },
+          "uses": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "required": ["when", "reading"],
+              "additionalProperties": false,
+              "properties": {
+                "when": {"type": "string", "minLength": 1, "maxLength": 300},
+                "reading": {"type": "string", "minLength": 1, "maxLength": 300}
+              }
+            }
           },
           "emotions": {
             "type": "array",

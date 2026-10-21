@@ -32,7 +32,7 @@ export class MemeSession {
     // host limits the source to the authenticated current owner turn.
     const explicit=args.basis==='explicit';
     if(!explicit&&!verifiedMemeVision({...context,visionPath:'owner-image-input/v1'},this.proofs()))return fail('vision-unverified');
-    return this.library.collect({data:image.data,source:image.source,metadata:args.metadata??{},group:args.group??'collected',intent:explicit?{kind:'explicit'}:{kind:'interesting',visual:true,isMeme:args.is_meme===true,worthKeeping:args.worth_keeping===true}});
+    return this.library.collect({data:image.data,source:image.source,metadata:args.metadata??{},group:args.group??'collected',intent:explicit?{kind:'explicit'}:{kind:'interesting',visual:true,isMeme:args.is_meme===true}});
   }
   inspect(ids,context) {
     this.prune();if(!verifiedMemeVision(context,this.proofs()))return fail('vision-unverified');

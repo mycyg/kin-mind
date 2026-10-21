@@ -1,5 +1,5 @@
 /** Private, owner-scoped MEME library. No network, model calls, timers or persona writes.
- * Only explicit collection or a visual turn's positive reuse choice creates an index.
+ * Only explicit collection or a visual turn's interesting-image choice creates an index.
  * Single index transaction + immutable content files; a crash may leave an unreferenced
  * content file, never a ready index pointing at half-written bytes. */
 import fs from 'node:fs';
@@ -16,8 +16,18 @@ const requireId=id=>{if(typeof id!=='string'||!ID.test(id))throw err('meme-inval
 const str=(x,max=1200)=>{if(typeof x!=='string'||x.length>max||/[\u0000-\u0008]/u.test(x))throw err('meme-invalid-text');return x.trim();};
 const tags=x=>{if(!Array.isArray(x)||x.length>24)throw err('meme-invalid-tags');return [...new Set(x.map(t=>str(t,100)).filter(Boolean))];};
 export function memeMetadata(value={}) {
-  return {description:str(value.description??''),ocr:str(value.ocr??'',2400),tags:tags(value.tags??[]),contexts:tags(value.contexts??[]),aliases:tags(value.aliases??[]),emotions:tags(value.emotions??[])};
+  const uses=value.uses??[];
+  if(!Array.isArray(uses)||uses.length>8)throw err('meme-invalid-uses');
+  return {description:str(value.description??''),ocr:str(value.ocr??'',2400),tags:tags(value.tags??[]),contexts:tags(value.contexts??[]),aliases:tags(value.aliases??[]),emotions:tags(value.emotions??[]),
+    ambiguity:str(value.ambiguity??'',600),uses:uses.map(u=>{
+      if(!u||typeof u!=='object')throw err('meme-invalid-use');
+      const when=str(u.when??'',300),reading=str(u.reading??'',300);
+      if(!when||!reading)throw err('meme-invalid-use');return {when,reading};
+    })};
 }
+const normalize=text=>text.normalize('NFKC').toLowerCase();
+const terms=text=>[...new Set((text.match(/[a-z0-9]+|[\p{Script=Han}]+/gu)??[]).flatMap(t=>/^[\p{Script=Han}]+$/u.test(t)&&t.length>1?Array.from({length:t.length-1},(_,i)=>t.slice(i,i+2)):[t]))];
+const relevance=(corpus,text)=>text?terms(text).reduce((n,t)=>n+(corpus.includes(t)?1:0),0)+(corpus.includes(text)?3:0):0;
 const crc32=b=>{let c=0xffffffff;for(const x of b){c^=x;for(let j=0;j<8;j++)c=(c>>>1)^((c&1)?0xedb88320:0);}return (c^0xffffffff)>>>0;};
 /** First version accepts static PNGs and structurally checked JPEGs. Animation and unvalidated formats are
  * deliberately unsupported; callers preserve ordinary input handling independently. */
@@ -76,7 +86,9 @@ export class MemeLibrary {
   collect({data,source,metadata={},group='collected',intent}) {
     // Classification alone never collects, never writes an index or invokes a model.
     if(!intent||!['explicit','interesting'].includes(intent.kind))return {state:'skipped',reason:'not-chosen'};
-    if(intent.kind==='interesting'&&(intent.visual!==true||intent.isMeme!==true||intent.worthKeeping!==true))return {state:'skipped',reason:'not-chosen'};
+    // Choosing this basis already expresses interest. Utility is not an admission gate;
+    // legacy worthKeeping is accepted but ignored. Unknown meaning can still be a MEME.
+    if(intent.kind==='interesting'&&(intent.visual!==true||intent.isMeme!==true))return {state:'skipped',reason:'not-chosen'};
     if(!source||!['wechat','feishu','pack'].includes(source.channel)||typeof source.id!=='string'||!source.id||source.id.length>300)throw err('meme-source-required');
     const info=inspectMemeImage(data),hash=memeHash(data),meta=memeMetadata(metadata);requireId(group);
     return this.transaction(s=>this.insert(s,{data,source:{channel:source.channel,id:source.id},hash,info,meta,group}));
@@ -93,20 +105,23 @@ export class MemeLibrary {
     item={id,hash,file,...info,...meta,groups:[group],sources:[source],state:'ready',createdAt:item?.createdAt??this.clock(),lastUsedAt:item?.lastUsedAt??null,useCount:item?.useCount??0};s.items[id]=item;
     return {state:'saved',duplicate:false,item:publicItem(item)};
   }
-  search({query='',group=null,limit=3,exclude=[]}={}) {
-    query=str(query,400).normalize('NFKC').toLowerCase();if(!query)return [];
+  search({query='',context='',group=null,limit=3,exclude=[]}={}) {
+    query=normalize(str(query,400));context=normalize(str(context,1200));if(!query&&!context)return [];
     if(group!==null)requireId(group);if(!Array.isArray(exclude)||exclude.length>100)throw err('meme-invalid-exclude');
-    const tokens=[...new Set((query.match(/[a-z0-9]+|[\p{Script=Han}]+/gu)??[]).flatMap(t=>/^[\p{Script=Han}]+$/u.test(t)&&t.length>1?Array.from({length:t.length-1},(_,i)=>t.slice(i,i+2)):[t]))];
     const state=this.read();return Object.values(state.items).filter(i=>i.state==='ready'&&(!group||i.groups.includes(group))&&!exclude.includes(i.id)).map(i=>{
-      const corpus=[i.description,i.ocr,...i.tags,...i.contexts,...i.aliases,...i.emotions].join(' ').normalize('NFKC').toLowerCase();
-      const score=tokens.reduce((n,t)=>n+(corpus.includes(t)?1:0),0)+(corpus.includes(query)?3:0);
-      return {...publicItem(i),score};}).filter(i=>i.score>0).sort((a,b)=>b.score-a.score||(a.lastUsedAt??0)-(b.lastUsedAt??0)||a.id.localeCompare(b.id)).slice(0,Math.max(1,Math.min(MEME_LIMITS.candidates,Number.isSafeInteger(limit)?limit:3)));
+      const corpus=normalize([i.description,i.ocr,...i.tags,...i.contexts,...i.aliases,...i.emotions,i.ambiguity??''].join(' '));
+      // Uses are contextual possibilities, never intrinsic facts or evidence of owner emotion.
+      // Rank each alternative independently: accumulating contradictory readings adds no bonus.
+      const matched_uses=(i.uses??[]).map(u=>({...u,score:relevance(normalize(u.when+' '+u.reading),query)+relevance(normalize(u.when+' '+u.reading),context)})).filter(u=>u.score>0).sort((a,b)=>b.score-a.score).slice(0,3);
+      const score=relevance(corpus,query)+relevance(corpus,context)+(matched_uses[0]?.score??0);
+      return {...publicItem(i),matched_uses,score};}).filter(i=>i.score>0).sort((a,b)=>b.score-a.score||(a.lastUsedAt??0)-(b.lastUsedAt??0)||a.id.localeCompare(b.id)).slice(0,Math.max(1,Math.min(MEME_LIMITS.candidates,Number.isSafeInteger(limit)?limit:3)));
   }
   readImage(id){requireId(id);const item=this.read().items[id];if(!item||item.state!=='ready')throw err('meme-unavailable');const target=path.join(this.directory,'originals',item.file),real=fs.realpathSync(target),root=fs.realpathSync(path.join(this.directory,'originals'));if(!real.startsWith(root+path.sep))throw err('meme-path-outside-library');const data=fs.readFileSync(real);if(memeHash(data)!==item.hash)throw err('meme-content-changed');inspectMemeImage(data);return {item:publicItem(item),data};}
   edit(id,{metadata,groups,remove=false}={}) {
     requireId(id);return this.transaction(s=>{const i=s.items[id];if(!i||i.state!=='ready')throw err('meme-unavailable');
-      if(remove){i.state='retired';i.description='';i.ocr='';i.tags=[];i.contexts=[];i.aliases=[];i.emotions=[];i.groups=[];i.sources=[];return {state:'retired',id};}
-      if(metadata)Object.assign(i,memeMetadata(metadata));if(groups){if(!Array.isArray(groups)||groups.length>16||groups.some(g=>!s.packs[g]))throw err('meme-unknown-group');i.groups=[...new Set(groups)];}return publicItem(i);},(s,result)=>{if(!remove)return result;const item=s.items[id];
+      if(remove){i.state='retired';Object.assign(i,memeMetadata());i.groups=[];i.sources=[];return {state:'retired',id};}
+      // Partial corrections replace only supplied metadata fields. []/'' explicitly clear them.
+      if(metadata)Object.assign(i,memeMetadata({...i,...metadata}));if(groups){if(!Array.isArray(groups)||groups.length>16||groups.some(g=>!s.packs[g]))throw err('meme-unknown-group');i.groups=[...new Set(groups)];}return publicItem(i);},(s,result)=>{if(!remove)return result;const item=s.items[id];
       // Remove content only after the durable tombstone, under the same short index lock.
       // Existing delivery journals remain evidence; they are not collection/search entries.
       try {if(!Object.values(s.items).some(i=>i.state==='ready'&&i.hash===item.hash))fs.rmSync(path.join(this.directory,'originals',path.basename(item.file)),{force:true});return {...result,bytesRemoved:true};}
@@ -127,7 +142,7 @@ export class MemeLibrary {
       if(typeof x.file!=='string'||path.isAbsolute(x.file)||x.file.split(/[\\/]/).includes('..'))throw err('meme-pack-path');
       const real=fs.realpathSync(path.join(base,x.file));if(!real.startsWith(base+path.sep)||!fs.statSync(real).isFile())throw err('meme-pack-path');
       const data=fs.readFileSync(real),info=inspectMemeImage(data);if(info.mime!=='image/png'||info.width<256||info.height<256||info.width!==info.height||memeHash(data)!==x.sha256)throw err('meme-pack-image');
-      const meta=memeMetadata(x);if(!meta.description||!meta.contexts.length)throw err('meme-pack-index-required');
+      const meta=memeMetadata(x);if(!meta.description)throw err('meme-pack-index-required');
       return {data,info,hash:x.sha256,meta,source:{channel:'pack',id:pack.id+':'+x.id},group:pack.id,preferredId:pack.id+'-'+x.id};});
     if(dryRun)return {state:'valid',pack:pack.id,count:prepared.length};
     return this.transaction(s=>{if(!s.packs[pack.id]&&Object.keys(s.packs).length>=MEME_LIMITS.packs)throw err('meme-pack-budget');s.packs[pack.id]=pack;const items=prepared.map(p=>this.insert(s,p));return {state:'imported',pack:pack.id,count:items.length,items:items.map(x=>x.item.id)};});

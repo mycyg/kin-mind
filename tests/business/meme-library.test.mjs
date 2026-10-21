@@ -18,8 +18,8 @@ const context={sourceId:'input-1',sessionId:'session-1',model:'test-vision',prov
 const proof={...context,path:'mcp-image-content/v1',state:'verified',mode:'pixels',nativeTurnId:'synthetic-native-proof',fixtureSha256:'a'.repeat(64)};
 
 test('recognition is not collection: default/negative choice writes no index; chosen and explicit are distinct',t=>{
-  const {lib,data}=fixture(t);assert.equal(collect(lib,data,{intent:{kind:'interesting',visual:true,isMeme:true,worthKeeping:false}}).state,'skipped');assert.equal(fs.existsSync(lib.file),false);
-  assert.equal(collect(lib,data,{intent:{kind:'interesting',visual:true,isMeme:true,worthKeeping:true}}).state,'saved');
+  const {lib,data}=fixture(t);assert.equal(collect(lib,data,{intent:null}).state,'skipped');assert.equal(fs.existsSync(lib.file),false);
+  assert.equal(collect(lib,data,{intent:{kind:'interesting',visual:true,isMeme:true,worthKeeping:false}}).state,'saved');
   const ordinary=collect(lib,png(256,100),{intent:{kind:'explicit'},source:{channel:'feishu',id:'explicit-photo'}});assert.equal(ordinary.state,'saved');
 });
 test('restart, precise dedup, sources, pack search, edits and retirement are consistent',t=>{

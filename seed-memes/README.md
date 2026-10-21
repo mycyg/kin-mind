@@ -10,7 +10,13 @@ Keep text away from slice edges and visually verify each exported tile and OCR.
 Manifest format is `kin-meme-pack/v1`, with `id`, `name`, `original:true`, `source` (authorship
 and rights/provenance), optional `aliases`, and `items`. Each item has a stable `id`, relative
 `file`, actual file `sha256`, `description`, `ocr`, `tags`, `contexts`, `emotions`, `aliases`.
-`description` and nonempty `contexts` are required. No remote URL, parent path, symlink
+`description` describes visible content and is required; `contexts` may be empty or omitted.
+Optional `uses` contains up to 8 `{when, reading}` pairs (each string at most 300 characters):
+context-dependent possibilities, not intrinsic meanings. Optional `ambiguity` (600 characters)
+preserves uncertainty. Leave uses empty when unclear. There is no fixed emotion list.
+Legacy manifests remain valid. Partial metadata edits replace only supplied fields, so a
+user explanation can correct one image without changing its visible description or identity.
+These notes never become user personality memory. No remote URL, parent path, symlink
 escape, missing image, false hash, animated/corrupt image or unindexed entry is accepted.
 Image minimum 256×256, square; recommended 512, at most 5 MiB and 16 Mpixels.
 
