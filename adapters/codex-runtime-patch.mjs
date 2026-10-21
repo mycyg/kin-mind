@@ -647,7 +647,7 @@ function kinToolResultIds(item, turn) {
   async kinAssess(params) {
     const started = Date.now();
     const requestId = typeof params?.requestId === "string" ? params.requestId : "";
-    const result = { requestId, forkThreadId: null, turnId: null, model: null, reasoningEffort: null, usage: null, output: null, rawText: "", toolCalls: [] };
+    const result = { requestId, forkThreadId: null, turnId: null, model: null, modelProvider: null, reasoningEffort: null, usage: null, output: null, rawText: "", toolCalls: [] };
     // How far it got (CR2-INT-06): no turn asked for, a turn asked for but unconfirmed, a turn begun.
     let stage = "not-started";
     const end = (state, extra = {}) => ({ ...result, state, stage, ...extra, durationMs: Date.now() - started });
@@ -693,6 +693,7 @@ function kinToolResultIds(item, turn) {
       const fork = await kinWithin(forkPromise, deadline, "timeout");
       result.forkThreadId = fork.thread.id;
       result.model = fork.model ?? modelId.model;
+      result.modelProvider = typeof fork.modelProvider === "string" ? fork.modelProvider : null;
       result.reasoningEffort = modelId.effort;
       api.onServerNotification(result.forkThreadId, (notification) => {
         if (notification.method === "thread/tokenUsage/updated") usage = notification.params.tokenUsage;
