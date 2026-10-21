@@ -37,6 +37,7 @@ const actionOf=answer=>typeof answer==='string'?answer:answer?.action;
  * did not. Adjacent parts of one kind are one piece. */
 export function bubblePieces(bubble) {
   const pieces={sent:[],unsent:[],unknown:[]};
+  if(bubble.memeFailure){pieces.unsent.push('（表情图片未发送：'+bubble.memeFailure+'；没有上传或发送成功回执。若仍要发，请重新查看图片后提交。）');return pieces;}
   if(!bubble.fragments?.length){if(bubble.text)pieces.unsent.push(bubble.text);return pieces;}
   let last=null;
   for(const fragment of [...bubble.fragments].sort((a,b)=>a.start-b.start)) {

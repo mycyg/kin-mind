@@ -246,7 +246,7 @@ export class TransportManifests {
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:'draft',reason:null,leaseGeneration:0,revision:0,review:null,
       created_at:now,updated_at:now,retryAt:0,failures:0,
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
-        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.meme?{meme:entry.delivery.meme}:{}),...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
+        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.memeFailure?{memeFailure:entry.delivery.memeFailure}:{}),...(entry.delivery.meme?{meme:entry.delivery.meme}:{}),...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
     const loaded=this.load(id);
     if(loaded) {
       if(routingBasis(loaded)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
@@ -268,6 +268,12 @@ export class TransportManifests {
       const checked=review.checked[index]??{},text=checked.text??bubble.request.text??bubble.text;
       Object.assign(bubble,{text,references:checked.references??bubble.references??[]});
       if(!text.trim()){Object.assign(bubble,{state:'undeliverable',reason:'empty-body',fragments:[]});continue;}
+      if(bubble.memeFailure) {
+        Object.assign(bubble,{state:'undeliverable',reason:bubble.memeFailure,
+          fragments:[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'image',state:'failed',
+            receipt:{state:'not-submitted',submissionStarted:false,reason:bubble.memeFailure}}]});
+        continue;
+      }
       if(bubble.meme) {
         frozenMemeMedia(bubble.meme);
         bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'image',state:'unsent',receipt:null}];
