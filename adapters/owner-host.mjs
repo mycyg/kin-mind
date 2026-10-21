@@ -203,7 +203,7 @@ export class MindLoop {
       possibleSend=true;
       const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
       // The batch asks about this contact itself (`within`): its own attempt is not a contact before it.
-      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,presentation:decision.presentation,presentations:decision.presentations,references:decision.references,files,
+      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,memes:decision.memes,presentation:decision.presentation,presentations:decision.presentations,references:decision.references,files,
         guard:within=>!this.closed&&!this.isBusy()&&this.eligibility(within).eligible&&epoch===this.ownerEpoch()});
       // The owner's contact rules said no at the send itself (the Feishu contact answers `skipped`, with
       // their reason): it returned before its batch was written, so nothing went out under this id. It is

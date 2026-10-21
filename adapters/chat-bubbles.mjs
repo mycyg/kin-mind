@@ -1,3 +1,4 @@
+import {memeBubble} from './meme-session.mjs';
 import {replyPresentation} from './reply-presentation.mjs';
 import {fences} from './text-fragments.mjs';
 
@@ -102,8 +103,9 @@ export function chatEnvelope(text) {
     typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
     (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
   if(value.action==='send'&&keys.every(k=>['action','bubbles','presentation'].includes(k))&&Array.isArray(value.bubbles)&&value.bubbles.length
-    &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)))
-    return {state:'send',...(value.presentation?{presentation:replyPresentation(value.presentation)}:{}),bubbles:value.bubbles.map(bubble=>(typeof bubble==='string'?bubble:bubble.text).trim()),
+    &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)||memeBubble(bubble)))
+    return {state:'send',...(value.presentation?{presentation:replyPresentation(value.presentation)}:{}),bubbles:value.bubbles.map(bubble=>memeBubble(bubble)?'[表情图片]':(typeof bubble==='string'?bubble:bubble.text).trim()),
+      ...(value.bubbles.some(memeBubble)?{meme_refs:value.bubbles.map(b=>memeBubble(b)?b:null)}:{}),
       ...(value.bubbles.some(bubble=>typeof bubble==='object')?{
         ...(value.bubbles.some(bubble=>bubble?.presentation)?{presentations:value.bubbles.map(bubble=>bubble?.presentation?replyPresentation(bubble.presentation):null)}:{}),
         references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references:undefined),

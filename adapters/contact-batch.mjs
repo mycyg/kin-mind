@@ -66,7 +66,7 @@ const within=batch=>({contact:batch.id,started:batch.deliveryStarted===true||bat
  * send has been admitted and before it begins. */
 export function createContactBatch({read,write,send,receipt=()=>null,eligible=()=>true,
   preflight=async request=>({state:'ready',checked:request.entries.map(entry=>({state:'ready',draft_id:entry.draft_id,text:entry.text,references:entry.references??[]}))}),
-  verifyFile=async()=>{throw Error('File delivery is not configured');},begin=async()=>{},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
+  onMemeAccepted=()=>{},verifyMeme=async()=>false,verifyFile=async()=>{throw Error('File delivery is not configured');},begin=async()=>{},contracts={},maxReviewFailures=6,maxFailures=6,now=()=>Date.now()}) {
   const active=new Map();
   // Proactive contact leaves through the Feishu bridge; a channel with no
   // published contract is measured by that one, with injected corrections.
@@ -87,7 +87,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     const limit=textLimit(batch.channel),begun=batch.items.some(x=>BEGUN.includes(x.state)),items=[];
     for(const item of batch.items) {
       const index=reviewed.indexOf(item);
-      if(index<0){items.push(item);continue;}
+      if(index<0||item.meme){items.push(item);continue;}
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
       item.sourceReferences=item.references;
@@ -145,7 +145,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='pending';batch.reason=reason==='frozen'?'dispatch-frozen':reason;batch.heldAtGate=true;
     await write(id,batch);return result(batch);
   }
-  async function run({id,text,bubbles,presentation,presentations,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
+  async function run({id,text,bubbles,memes=[],presentation,presentations,files=[],references=[],channel,conversationId,guard=()=>true,superseded=false,gate=null}) {
     let batch=await read(id);
     const parts=bubbles??(text===undefined?null:splitChatText(text));
     if(!batch) {
@@ -153,11 +153,12 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       if(!Array.isArray(files)||files.length>24)throw Error('contact-batch-invalid-files');
       batch={id,channel,...(presentation?{presentation:replyPresentation(presentation)}:{}),...(conversationId?{conversationId}:{}),state:'pending',identity:{version:2,groupId:id,legacyGroupDraftIds:false},items:parts.map((text,index)=>{
         const itemId='kin-bubble-'+id+'-'+index;
-        return{id:itemId,draftId:itemId,bubbleIndex:index,text,...(presentations?.[index]?{presentation:replyPresentation(presentations[index])}:{}),references:references[index]??[],state:'unsent'};
+        return{id:itemId,draftId:itemId,bubbleIndex:index,text,...(memes[index]?{meme:memes[index]}:{}),...(presentations?.[index]?{presentation:replyPresentation(presentations[index])}:{}),references:references[index]??[],state:'unsent'};
       })};
       batch.items.push(...files.map((file,index)=>{const itemId='kin-file-'+id+'-'+index;return{id:itemId,draftId:itemId,file,state:'unsent'};}));
       await write(id,batch);
     }
+    for(const item of batch.items)if(item.meme&&item.state==='unsent'){let valid=false;try{valid=await verifyMeme(item.meme);}catch{}if(!valid){item.state='canceled';item.reason='meme-unavailable';await write(id,batch);}}
     const transportIds=batch.items.map(item=>item?.id);
     if(transportIds.some(value=>typeof value!=='string'||!value)||new Set(transportIds).size!==transportIds.length)
       return needsReview(batch,id,reviewFailure({},
@@ -264,11 +265,12 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
           if(!batch.deliveryStarted)await begin({id:batch.id,channel:batch.channel});
           item.state='pending';delete item.submission;batch.deliveryStarted=true;await write(id,batch);
           try {
-            const sent=await send({id:item.id,text:item.text,...(item.speech?{speech:item.speech}:{}),file:item.file,channel:batch.channel,conversationId:batch.conversationId,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,canSend:async()=>await eligible(within(batch))&&await guard(within(batch)),
+            const sent=await send({id:item.id,text:item.text,...(item.speech?{speech:item.speech}:{}),file:item.file,meme:item.meme,channel:batch.channel,conversationId:batch.conversationId,memoryBatchId:batch.id,expectedBubbles:batch.items.length,references:item.references,draftId:item.draftId,canSend:async()=>await eligible(within(batch))&&await guard(within(batch)),
               // Unsplittable: the whole body as one file, with no words of the host's own.
               // A sender that understands `media` delivers the file INSTEAD of the text, never both;
               // `text` rides along only so that a sender that does not still has a body.
               ...(item.oversize?{media:{type:'file',name:item.oversize.name,data:Buffer.from(item.text,'utf8')}}:{})});
+            if(item.meme&&sent?.state==='not-submitted'&&sent.submissionStarted===false&&sent.reason==='meme-unavailable'){Object.assign(item,{state:'canceled',reason:'meme-unavailable',submission:'never-started'});await write(id,batch);continue;}
             if(sent?.state==='not-submitted'&&sent.reason==='contact-paused') {item.state='unsent';return heldAtGate(batch,id,item,'contact-paused');}
             if(sent?.reason==='tts-failed') {
               Object.assign(item,{state:'canceled',reason:'tts-failed',submission:'never-started'});
@@ -308,7 +310,8 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
     batch.state='needs-review';batch.safeToRelease=true;delete batch.reviewNotBefore;
     await write(id,batch);return result(batch);
   }
-  function result(batch){const ids=batch.items.filter(x=>x.state==='accepted').map(x=>x.messageId);return {
+  function result(batch){
+    for(const item of batch.items)if(item.meme&&item.state==='accepted')try{onMemeAccepted(item.meme,{id:item.id,state:'accepted',messageId:item.messageId});}catch{}const ids=batch.items.filter(x=>x.state==='accepted').map(x=>x.messageId);return {
     id:batch.id,state:batch.state,reason:batch.reason,channel:batch.channel,messageId:batch.state==='accepted'?ids[0]:undefined,
     messageIds:ids,acceptedBubbles:ids.length,totalBubbles:batch.items.length,
     canceledBubbles:batch.items.filter(x=>x.state==='canceled').length,

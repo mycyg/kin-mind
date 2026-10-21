@@ -1,3 +1,4 @@
+import {frozenMemeMedia} from './meme-session.mjs';
 import {replyPresentation} from './reply-presentation.mjs';
 /** The durable delivery record of one phone reply group: which bubbles it has,
  * how each frozen bubble is cut into transport fragments, and what is known
@@ -245,7 +246,7 @@ export class TransportManifests {
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:'draft',reason:null,leaseGeneration:0,revision:0,review:null,
       created_at:now,updated_at:now,retryAt:0,failures:0,
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
-        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
+        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.meme?{meme:entry.delivery.meme}:{}),...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
     const loaded=this.load(id);
     if(loaded) {
       if(routingBasis(loaded)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
@@ -267,6 +268,11 @@ export class TransportManifests {
       const checked=review.checked[index]??{},text=checked.text??bubble.request.text??bubble.text;
       Object.assign(bubble,{text,references:checked.references??bubble.references??[]});
       if(!text.trim()){Object.assign(bubble,{state:'undeliverable',reason:'empty-body',fragments:[]});continue;}
+      if(bubble.meme) {
+        frozenMemeMedia(bubble.meme);
+        bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'image',state:'unsent',receipt:null}];
+        continue;
+      }
       const presentation=replyPresentation(bubble.presentation);
       if(presentation.mode==='voice') {
         bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'speech',state:'unsent',receipt:null}];
@@ -281,7 +287,7 @@ export class TransportManifests {
         if(Buffer.byteLength(text,'utf8')>contract.file.maxBytes)Object.assign(bubble,{state:'undeliverable',reason:'file-exceeds-channel-limit'});
       }
     }
-    for(const bubble of manifest.bubbles)if(bubble.presentation?.mode==='both'&&!started(bubble)&&open(bubble)) {
+    for(const bubble of manifest.bubbles)if(!bubble.meme&&bubble.presentation?.mode==='both'&&!started(bubble)&&open(bubble)) {
       const index=bubble.fragments.length;
       bubble.fragments.push({transport_id:transportId(bubble.bubble_id,index),index,start:0,end:bubble.text.length,kind:'speech',state:'unsent',receipt:null});
     }
@@ -447,6 +453,7 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{}),
       // Python hears about bubbles from this layer; the transport stays silent.
       memory:false,bubbleId:bubble.bubble_id,fragment:{index:fragment.index,count:bubble.fragments.length,start:fragment.start,end:fragment.end}};
+    if(fragment.kind==='image')return {...base,meme:bubble.meme,media:frozenMemeMedia(bubble.meme)};
     if(fragment.kind==='speech')return {...base,text:body,speech:{style:bubble.presentation?.style??''}};
     return fragment.kind==='file'?{...base,media:{type:'file',name:fragment.name,data:Buffer.from(body,'utf8')}}:{...base,text:body};
   }
@@ -492,6 +499,10 @@ export class TransportManifests {
         catch(error){refused=RECONCILE_FIRST_CODES.includes(error?.code);/* Otherwise the durable receipt decides. */}
         // CR-LIFE-08: dispatch is frozen and the gate let nothing out. The fragment is as it
         // was before this attempt, no failure is counted, and the group looks again later.
+        if(fragment.kind==='image'&&returned?.state==='not-submitted'&&returned.submissionStarted!==true&&['meme-unavailable','meme-channel-unavailable'].includes(returned.reason)) {
+          Object.assign(fragment,{state:'canceled',receipt:returned});Object.assign(bubble,{state:'canceled',reason:returned.reason,state_at:iso(this.clock())});
+          await this.touch(manifest,context);await this.flush(manifest,context);return 'sent';
+        }
         if(returned?.reason==='tts-failed') {
           Object.assign(fragment,{state:'unsent',receipt:returned});
           Object.assign(bubble,{state:'undeliverable',reason:'tts-failed',state_at:iso(this.clock())});
@@ -561,6 +572,7 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
       references:bubble.references,draftId:bubble.draft_id,replyInputId:manifest.reply_id,referenceBubbleId:bubble.request.reference_bubble_id,replyBubbleIndex:bubble.request.reply_bubble_index,state:kind==='canceled'?'not-submitted':kind,acceptedAt:at,checkedAt:at,
       ...(kind==='accepted'?{messageId:receipts[0]?.messageId,conversationId:receipts[0]?.conversationId}:{})},{channel:manifest.channel});
+    if(bubble.meme)event.meme_id=bubble.meme.meme_id;
     return kind==='accepted'&&receipts.length>1?{...event,message_ids:receipts.map(r=>r.messageId)}:event;
   }
   /** Bubble-level side effects, at least once and in order: release a dead
