@@ -3,7 +3,7 @@
 export function privateNoteContext(recent) {
   if(!recent||!Array.isArray(recent.notes))return recent;
   return {...recent,notes:recent.notes.map(note=>({
-    ...Object.fromEntries(['id','at','text','basis','visibility','evidence_ids','input_id','group_id','corrects','delivery_state'].filter(k=>k in note).map(k=>[k,note[k]])),
+    ...Object.fromEntries(['id','at','text','basis','visibility','evidence_ids','input_id','group_id','corrects','delivery_state','model','provider','session','turn_id'].filter(k=>k in note).map(k=>[k,note[k]])),
     ...(Array.isArray(note.delivery)?{delivery:note.delivery.map(d=>({state:d.state,channel:d.channel}))}:{}),
     ...(Array.isArray(note.later_notes)?{later_note_ids:note.later_notes.map(n=>n.id).filter(Boolean)}:{}),
   }))};
