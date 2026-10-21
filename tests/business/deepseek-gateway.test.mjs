@@ -200,6 +200,12 @@ test('K3 main replies and bound task deliveries use Kimi high, while assessments
   assert.equal(usage[2].lane,'background','the delivery keeps its existing scheduling and usage attribution');
   purpose={lane:'background',purpose:'native-assessment',mainConversation:true};
   assert.equal((await request('k3')).status,502);assert.equal(calls.length,3);
+  purpose=nativeTurnPurpose('task-worker');
+  assert.equal((await request('k3')).status,200);assert.equal(calls.length,4);
+  assert.equal(usage[3].lane,'user-work');assert.equal(usage[3].purpose,'native-task-worker');
+  assert.equal(calls[3].body.reasoning.effort,'high');
+  purpose={lane:'background',purpose:'native-task-worker'};
+  assert.equal((await request('k3')).status,502);assert.equal(calls.length,4,'purpose alone does not grant the owner task lane');
 });
 
 test('provider HTTP errors retain bounded machine diagnostics without private text or a retry',async t=>{

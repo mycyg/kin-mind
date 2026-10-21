@@ -49,7 +49,7 @@ export async function kinTaskWorker(params) {
     api.onServerNotification(run.threadId,n=>{
       if(!['item/started','item/completed'].includes(n.method))return;
       const item=n.params?.item;if(!item)return;
-      if(item.type==='agentMessage'&&n.method==='item/completed'&&item.phase==='final_answer')finalText=item.text??'';
+      if(item.type==='agentMessage'&&n.method==='item/completed'&&(!item.phase||item.phase==='final_answer'))finalText=item.text??'';
       if(!['commandExecution','mcpToolCall','webSearch','fileChange','dynamicToolCall'].includes(item.type))return;
       run.events.push({seq:++run.seq,type:'tool',id:item.id,name:item.tool??item.type,
         status:n.method==='item/started'?'running':item.status??'completed',at:Date.now()});
@@ -62,7 +62,9 @@ export async function kinTaskWorker(params) {
       run.turnId=id;if(run.cancelRequested)void api.turnInterrupt({threadId:run.threadId,turnId:id}).catch(()=>{});
     }).then(result=>{
       run.turnId=result.turn.id;run.state=result.turn.status==='completed'?'completed':result.turn.status==='interrupted'?'interrupted':'failed';
-      const message=(result.turn.items??[]).findLast(i=>i.type==='agentMessage'&&i.phase==='final_answer');
+      // K3 can omit phase. Only a completed native turn is eligible, and the
+      // host still requires the private-note/public JSON envelope before send.
+      const message=(result.turn.items??[]).findLast(i=>i.type==='agentMessage'&&(!i.phase||i.phase==='final_answer'));
       if(run.state==='completed')run.text=message?.text??finalText;
     }).catch(()=>{run.state='failed';run.reason='native-turn-failed';}).finally(()=>api.clearThreadHandlers(run.threadId));
     return view(run);

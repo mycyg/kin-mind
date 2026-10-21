@@ -337,7 +337,10 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       // scheduling lane. It is still her selected companion replying; only the
       // host's verified native thread identity can admit that delivery here.
       const mainDelivery = attributed.mainConversation === true && attributed.purpose === 'native-creation';
-      if (kimi && (!kimiKey || !(mainDelivery || attributed.lane === 'foreground' && attributed.purpose === 'native-chat-turn')))
+      // The host registers the owner's single task thread before it starts;
+      // request text cannot assign itself this lane or purpose.
+      const ownerTask = attributed.lane === 'user-work' && attributed.purpose === 'native-task-worker';
+      if (kimi && (!kimiKey || !(mainDelivery || ownerTask || attributed.lane === 'foreground' && attributed.purpose === 'native-chat-turn')))
         throw Error('kimi-main-conversation-unavailable');
       upstreamProvider = kimi ? 'kimi' : 'deepseek';
       const body = kimi ? kimiRequest(parsed, requestProfile, contracts) : deepseekRequest(parsed, reasoningEffort, requestProfile, contracts);
