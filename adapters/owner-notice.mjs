@@ -6,9 +6,10 @@
  * this notice itself a receipt; whoever keeps the ledger reads that receipt. */
 import {createHash} from 'node:crypto';
 
-export const OWNER_NOTICE_KINDS=Object.freeze(['stopped','unknown','partial','pending-input']);
+export const OWNER_NOTICE_KINDS=Object.freeze(['stopped','unknown','partial','pending-input','format-failed']);
 export const OWNER_NOTICE_TEXTS=Object.freeze({
   'pending-input':'刚才那条暂时没处理成功，消息还留着，不用重复发。',
+  'format-failed':'刚才这条回复格式处理失败，未能发出。原消息还在，不用重复发。',
   stopped:'刚才这条回复没能完成，原消息还在，不用重复发。',
   unknown:'刚才那条的结果还没确认，先别重复发。',
   partial:'刚才只送达了一部分，已送达的不会重发。'});

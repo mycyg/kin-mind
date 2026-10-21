@@ -2541,7 +2541,14 @@ export class MobileRouter {
         } else if(record.state==='accepted') {
           if(record.operationFailed)verdict='stopped';
           else if(record.nativeFailure)verdict=record.uncertainDeliveries?.length?'unknown':(record.delivered??0)>0?'partial':'stopped';
-          else if(idle&&replyOutcomes.some(f=>f.inputIds.includes(record.id)&&['format-failed','send-failed'].includes(f.state)))verdict=(record.delivered??0)>0?'partial':'stopped';
+          else if(replyOutcomes.some(f=>f.inputIds.includes(record.id)&&(f.state==='format-failed'||idle&&f.state==='send-failed'))) {
+            // A terminal format failure is already evidence, not a stalled turn.
+            // Keep the normal notice gap/freeze gates and the input's one notice.
+            const outcomes=replyOutcomes.filter(f=>f.inputIds.includes(record.id));
+            verdict=record.uncertainDeliveries?.length||outcomes.some(f=>f.state==='send-unknown'||f.unknownFragments>0)?'unknown':
+              (record.delivered??0)>0||outcomes.some(f=>f.sentBubbles>0)?'partial':
+              outcomes.some(f=>f.state==='format-failed')?'format-failed':'stopped';
+          }
           else if(record.route==='control') {
             // A control is answered by its own reply; while that reply is still being made or
             // sent nothing is owed, and once it failed or went unconfirmed the owner is told.

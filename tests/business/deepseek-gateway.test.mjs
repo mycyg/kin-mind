@@ -7,19 +7,19 @@ import {deepseekRequest,kimiRequest,applyMainReplyFormat,providerMessageDiagnost
 const source = fs.readFileSync(new URL('../../adapters/deepseek-gateway.mjs', import.meta.url), 'utf8');
 const user = text => ({type: 'message', role: 'user', content: [{type: 'input_text', text}]});
 
-test('JSON mode is DeepSeek main reply only; compaction, schemas and other providers retain their format',()=>{
+test('JSON format applies only to bound main replies; compaction, schemas and other providers retain their format',()=>{
  const identity={threadId:'synthetic-thread',turnId:'synthetic-turn'};
  const context={identity,attributed:{mainConversation:true,purpose:'native-chat-turn'},
   headers:{'x-codex-turn-metadata':JSON.stringify({thread_id:identity.threadId,turn_id:identity.turnId,request_kind:'turn'})}};
- for(const purpose of ['native-chat-turn','native-creation']){
-  const body={model:'deepseek-flash',text:{verbosity:'low'},tools:[{type:'function',name:'read_file'}],input:[user('synthetic'),{type:'function_call_output',call_id:'synthetic',output:'synthetic'}]};
+ for(const model of ['deepseek-flash','k3'])for(const purpose of ['native-chat-turn','native-creation']){
+  const body={model,text:{verbosity:'low'},tools:[{type:'function',name:'read_file'}],input:[user('synthetic'),{type:'function_call_output',call_id:'synthetic',output:'synthetic'}]};
   const original=structuredClone(body);
   applyMainReplyFormat(body,{...context,attributed:{mainConversation:true,purpose}});
-  assert.deepEqual(body.text,{verbosity:'low',format:{type:'json_object'}});
+  assert.deepEqual(body.text,{verbosity:'low',format:model==='k3'?{type:'json_schema',name:'kin_reply',schema:{type:'object'}}:{type:'json_object'}});
   assert.deepEqual(body.tools,original.tools);assert.deepEqual(body.input,original.input);
  }
  const cases=[
-  [{model:'k3'},{}],[{model:'gpt-6.1-sol'},{}],
+  [{model:'gpt-6.1-sol'},{}],
   [{model:'deepseek-flash',text:{format:{type:'json_schema',name:'existing',schema:{type:'object'}}}},{}],
   [{model:'deepseek-flash'},{headers:{'x-codex-turn-metadata':JSON.stringify({thread_id:identity.threadId,turn_id:identity.turnId,request_kind:'compaction'})}}],
   [{model:'deepseek-flash'},{headers:{}}],[{model:'deepseek-flash'},{identity:'unknown'}],
@@ -27,17 +27,24 @@ test('JSON mode is DeepSeek main reply only; compaction, schemas and other provi
   [{model:'deepseek-flash'},{attributed:{mainConversation:false,purpose:'native-creation'}}],
   [{model:'deepseek-flash'},{profile:'exploration'}],
  ];
- for(const [body,extra]of cases){const before=structuredClone(body);applyMainReplyFormat(body,{...context,...extra});assert.deepEqual(body,before);}
+ for(const [example,extra]of cases)for(const model of (example.model==='deepseek-flash'?['deepseek-flash','k3']:[example.model])) {
+  const body={...structuredClone(example),model},before=structuredClone(body);
+  applyMainReplyFormat(body,{...context,...extra});assert.deepEqual(body,before);
+ }
+ for(const model of ['deepseek-flash','k3'])for(const field of ['thread_id','turn_id']) {
+  const body={model},metadata={thread_id:identity.threadId,turn_id:identity.turnId,request_kind:'turn',[field]:'different'};
+  applyMainReplyFormat(body,{...context,headers:{'x-codex-turn-metadata':JSON.stringify(metadata)}});assert.deepEqual(body,{model});
+ }
 });
 
-test('authenticated native HTTP forwards main reply JSON mode without changing the parser contract',async t=>{
- let sent;const gateway=await startDeepSeekGateway({key:'synthetic',purposeFor:()=>({lane:'foreground',purpose:'native-chat-turn',mainConversation:true}),
+for(const model of ['deepseek-flash','k3'])test(`authenticated native HTTP forwards ${model} main reply format without changing the parser contract`,async t=>{
+ let sent;const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic-kimi',purposeFor:()=>({lane:'foreground',purpose:'native-chat-turn',mainConversation:true}),
   fetchImpl:async(_,init)=>{sent=JSON.parse(init.body);return new Response(JSON.stringify({status:'completed',output:[]}));}});t.after(()=>gateway.close());
  const id='synthetic-thread',turn='synthetic-turn';
  const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token,'session-id':id,'thread-id':id,'x-client-request-id':id,
-  'x-codex-turn-metadata':JSON.stringify({thread_id:id,turn_id:turn,request_kind:'turn'})},body:JSON.stringify({model:'deepseek-flash',input:[user('synthetic')],prompt_cache_key:id,
+  'x-codex-turn-metadata':JSON.stringify({thread_id:id,turn_id:turn,request_kind:'turn'})},body:JSON.stringify({model,input:[user('synthetic')],prompt_cache_key:id,
    client_metadata:{session_id:id,thread_id:id,turn_id:turn,root_turn_id:turn}})});
- assert.equal(response.status,200);await response.text();assert.equal(sent.text.format.type,'json_object');
+ assert.equal(response.status,200);await response.text();assert.deepEqual(sent.text.format,model==='k3'?{type:'json_schema',name:'kin_reply',schema:{type:'object'}}:{type:'json_object'});
 });
 
 test('bound main creation is user work and cannot be starved by foreground classification',async t=>{
