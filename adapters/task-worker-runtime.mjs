@@ -31,12 +31,25 @@ export async function kinTaskWorker(params) {
   if(runs.size>32)for(const [id,r] of runs)if(r!==run&&['completed','failed','interrupted'].includes(r.state)){runs.delete(id);if(runs.size<=32)break;}
   try {
     const config=await this.codexAcpClient.createSessionConfig(parent.cwd,parent.additionalDirectories??[],[]);
-    const servers=await this.codexAcpClient.getConfigMcpServerNames(parent.cwd);
-    for(const name of servers)if(name!=='memorypalace')config[`mcp_servers.${name}.enabled`]=false;
-    Object.assign(config,{'mcp_servers.memorypalace.env.KIN_MCP_MODE':'task-worker',
-      'mcp_servers.memorypalace.env.KIN_TASK_CAPABILITY':params.capability,'features.multi_agent':false});
-    if(params.workerMark)Object.assign(config,{'mcp_servers.memorypalace.env.KIN_WORKER_MARK':params.workerMark,
-      'shell_environment_policy.set':{KIN_WORKER_MARK:params.workerMark}});
+    // A root mcp_servers table and dotted descendants are overlapping native
+    // config overrides: their application order can erase worker identity.
+    // Materialize one detached table so the parent stays unchanged and the
+    // worker's mode/capability survives every native map iteration order.
+    const loaded=await api.configRead({cwd:parent.cwd,includeLayers:false});
+    const servers=structuredClone(loaded?.config?.mcp_servers??{});
+    for(const [name,value] of Object.entries(config.mcp_servers??{}))
+      servers[name]={...servers[name],...structuredClone(value),env:{...servers[name]?.env,...value.env}};
+    for(const key of Object.keys(config).filter(k=>k.startsWith('mcp_servers.'))) {
+      const parts=key.slice('mcp_servers.'.length).split('.');let cursor=servers;
+      for(const part of parts.slice(0,-1))cursor=cursor[part]??={};
+      cursor[parts.at(-1)]=structuredClone(config[key]);delete config[key];
+    }
+    for(const [name,server] of Object.entries(servers))if(name!=='memorypalace')server.enabled=false;
+    if(!servers.memorypalace)throw Error('Task memory server is unavailable');
+    servers.memorypalace.env={...servers.memorypalace.env,KIN_MCP_MODE:'task-worker',KIN_TASK_CAPABILITY:params.capability,
+      ...(params.workerMark?{KIN_WORKER_MARK:params.workerMark}:{})};
+    config.mcp_servers=servers;config['features.multi_agent']=false;
+    if(params.workerMark)config['shell_environment_policy.set']={KIN_WORKER_MARK:params.workerMark};
     const modelId=ModelId.fromString(parent.currentModelId);
     const common={cwd:parent.cwd,model:modelId.model,modelProvider:await this.codexAcpClient.getResumeModelProvider(),
       approvalPolicy:'never',sandbox:parent.agentMode.sandboxMode,config};
