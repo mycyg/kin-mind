@@ -1069,7 +1069,7 @@ wheels = [
 
 [[package]]
 name = "kin-mind"
-version = "0.1.56"
+version = "0.1.60"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
