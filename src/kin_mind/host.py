@@ -688,7 +688,7 @@ def _dispatch(config, action, request):
             prepared={"state":"ready", "executable":None, "budget_seconds":1200, "model":profile["model"],
                 "runner":lambda executable,topic,directory,**kwargs:run_codex(executable,topic,directory,
                     reasoning=profile["reasoningEffort"],provider={"id":"native-main","base_url":"http://127.0.0.1","wire_api":"responses"},
-                    cli_version="native-main",native_exchange=lambda request,servers:native_exploration_exchange({**request,"profile":profile},servers),**kwargs)}
+                    cli_version="native-main",native_exchange=lambda request,servers,on_started=None:native_exploration_exchange({**request,"profile":profile},servers,on_started=on_started),**kwargs)}
             prepared["runner"].reports_start = True
         if prepared is None:
             prepared = prepare_codex_exploration(config, repair=repair_final)

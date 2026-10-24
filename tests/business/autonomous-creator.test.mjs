@@ -270,3 +270,19 @@ test('shared creator uses main receipt, real artifact hashes and verifier withou
   assert.equal(interrupted.state,'interrupted');assert.equal(interrupted.checkpoint,result.receipt.workspace);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+
+test('native creator records a real start while running, once across duplicate ACK and final receipt, and ignores late callbacks',async()=>{
+ const root=temporary(),log=[];let late;
+ try {
+  const creator=new AutonomousCreator({command:'native-main',root,executions:records(log),nativeRun:async(_request,{onStarted})=>{
+   late=onStarted;assert.equal(log.includes('started'),false);await onStarted();await onStarted();
+   assert.equal(log.filter(x=>x==='started').length,1,'active before the native promise resolves');
+   return {state:'waiting',model_invoked:false,reason:'deepseek-foreground-priority',receipt:{native_turn_id:'t',fork_thread_id:'f'}};
+  }});
+  const input={plan:{id:'p'},step:{id:'s'},run:{id:'r'},brief:{}};
+  await creator.run(input,{onStarted:()=>log.push('started')});await late();assert.equal(log.filter(x=>x==='started').length,1);
+  let noStart;creator.nativeRun=async(_request,{onStarted})=>{noStart=onStarted;return {state:'waiting',stage:'unknown',receipt:{}};};
+  await creator.run({...input,run:{id:'unknown'}},{onStarted:()=>assert.fail('unknown is not a native start')});await noStart();
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

@@ -661,7 +661,7 @@ function kinToolResultIds(item, turn) {
     const execution = params.execution && ["creation", "exploration"].includes(params.execution.kind) && typeof params.execution.capability === "string" ? params.execution : null;
     const deadline = started + Math.min(Math.max(Number(params.timeoutMs) || 120000, 1000), 900000);
     const api = this.codexAcpClient.appServerClient;
-    let turnId = null, turnDone = false, usage = null, stopped = false;
+    let turnId = null, turnDone = false, usage = null, stopped = false, startNotice = null;
     const seen = [];
     const interrupt = async (threadId, id) => {
       api.markTurnStale(threadId, id);
@@ -743,6 +743,12 @@ function kinToolResultIds(item, turn) {
         turnId = id;
         stage = "started";
         if (stopped) void interrupt(forkThreadId, id);
+        else if (execution) startNotice = this.connection.notify(methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: { sessionUpdate: "session_info_update", _meta: { kinExecutionStarted: {
+            requestId, capability: execution.capability, forkThreadId, turnId: id
+          } } }
+        }).catch(() => {});
       }), deadline, "timeout");
       turnDone = true;
       // What the turn did, as this ACP saw each item complete. The completed turn itself lists its
@@ -769,6 +775,7 @@ function kinToolResultIds(item, turn) {
       const message = String(error?.message ?? error).slice(0, 300);
       return end(message === "timeout" ? "timeout" : "failed", { error: message });
     } finally {
+      if (startNotice) await startNotice;
       if (result.forkThreadId) await release(result.forkThreadId);
     }
   }

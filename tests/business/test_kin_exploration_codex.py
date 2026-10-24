@@ -825,7 +825,7 @@ def test_main_session_execution_reuses_source_validation_and_checkpoint(tmp_path
     import subprocess
     monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('no model CLI may start'))
     seen=[]
-    def exchange(request, servers):
+    def exchange(request, servers, on_started=None):
         seen.append(request)
         assert servers == {} and request['kind'] == 'exploration'
         result = dict(FINDINGS)
@@ -850,11 +850,26 @@ def test_start_receipt_only_follows_actual_cli_spawn_or_native_turn(tmp_path, mo
     with pytest.raises(CodexUnavailable):
         run_codex(tmp_path/"missing",TOPIC,tmp_path/"not-started",on_started=lambda:started.append("missing"),**codex_kwargs())
     assert started==["cli"]
-    def exchange(request,servers):
+    def exchange(request,servers,on_started=None):
         return {"state":"complete","result":FINDINGS,"receipt":{"native_session_id":"same-main","native_turn_id":"turn-energy","model":"deepseek-flash"}}
     report=run_codex(None,TOPIC,tmp_path/"native-energy",native_exchange=exchange,cli_version="native-main",
         on_started=lambda:started.append("native"),**codex_kwargs())
     assert report["state"]=="complete" and started==["cli","native"]
-    report=run_codex(None,TOPIC,tmp_path/"native-no-turn",native_exchange=lambda *args:{"state":"waiting","receipt":{}},
+    report=run_codex(None,TOPIC,tmp_path/"native-no-turn",native_exchange=lambda *args,**kwargs:{"state":"waiting","receipt":{}},
         cli_version="native-main",on_started=lambda:started.append("missing-turn"),**codex_kwargs())
     assert report["state"]=="failed" and started==["cli","native"]
+
+
+def test_native_start_callback_precedes_result_and_terminal_receipt_does_not_repeat_it(tmp_path):
+    started=[]
+    def exchange(request, servers, on_started=None):
+        assert started == []
+        on_started()
+        assert started == ["start"], "work must already be active while native execution is running"
+        on_started()
+        assert started == ["start"]
+        return {"state":"waiting","model_invoked":False,"reason":"deepseek-foreground-priority",
+                "receipt":{"native_session_id":"same-main","fork_thread_id":"fork","native_turn_id":"turn"}}
+    report=run_codex(None,TOPIC,tmp_path/"native-live",native_exchange=exchange,cli_version="native-main",
+        on_started=lambda:started.append("start"),**codex_kwargs())
+    assert report["state"] == "failed" and started == ["start"]

@@ -951,6 +951,13 @@ def run_codex(
         native_receipt = None
         exit_code = None
         if native_exchange:
+            start_reported = False
+            def report_native_start():
+                nonlocal start_reported
+                if not start_reported:
+                    start_reported = True
+                    if on_started:
+                        on_started()
             # The existing main session executes; only tools run as worker-owned processes.
             # All source ledgers and final-result validation below are the original path.
             state, reason = "failed", None
@@ -962,10 +969,10 @@ def run_codex(
                     "system": prompt, "schema": findings_schema(),
                     "context": {"actor": "agent:kin", "started_at": started_at,
                                 "execution_id": directory.name, "attempt": attempt}},
-                    {name: spec for name, spec in {"kin_computer": computer_mcp, "kin_web": web_mcp, "kin_ui": ui_mcp}.items() if spec})
+                    {name: spec for name, spec in {"kin_computer": computer_mcp, "kin_web": web_mcp, "kin_ui": ui_mcp}.items() if spec}, on_started=report_native_start)
                 native_receipt = answer.get("receipt") or {}
-                if on_started and native_receipt.get("native_turn_id"):
-                    on_started()
+                if native_receipt.get("native_turn_id"):
+                    report_native_start()
                 thread_id = native_receipt.get("fork_thread_id") or native_receipt.get("native_session_id")
                 turn_completed = (answer.get("state") == "complete" and bool(thread_id)
                     and bool(native_receipt.get("native_turn_id")) and native_receipt.get("model") == model)

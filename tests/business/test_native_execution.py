@@ -19,13 +19,17 @@ def increment() -> dict:
  return {'value':counter}
 s.run(transport='stdio')
 ''')
-    frames=[{'native_tool':{'id':str(i),'server':'synthetic','name':'increment','arguments':{}}} for i in [1,2]]
+    frames=[{'native_started':{'id':'test-exec','fork_thread_id':'fork','native_turn_id':'turn'}},
+            {'native_started':{'id':'test-exec','fork_thread_id':'fork','native_turn_id':'turn'}}]
+    frames += [{'native_tool':{'id':str(i),'server':'synthetic','name':'increment','arguments':{}}} for i in [1,2]]
     frames+=[{'native_tool':{'id':'3','server':'synthetic','name':'unadvertised','arguments':{}}},
              {'id':'test-exec','state':'complete','result':{},'receipt':{'native_session_id':'same-main'}}]
     incoming=io.StringIO(''.join(json.dumps(f)+'\n' for f in frames));out=io.StringIO()
     monkeypatch.setattr(sys,'stdin',incoming);monkeypatch.setattr(sys,'stdout',out)
+    starts=[]
     answer=native_exploration_exchange({'id':'test-exec','system':'Synthetic','profile':{'model':'synthetic'}},
-        {'synthetic':{'command':sys.executable,'args':[str(server)],'env':dict(os.environ)}})
+        {'synthetic':{'command':sys.executable,'args':[str(server)],'env':dict(os.environ)}}, on_started=lambda:starts.append('started'))
+    assert starts == ['started']
     assert answer['receipt']['native_session_id']=='same-main'
     observed=[json.loads(line) for line in out.getvalue().splitlines()]
     assert observed[0]['native_review']['execution_tools'][0]['name']=='increment'

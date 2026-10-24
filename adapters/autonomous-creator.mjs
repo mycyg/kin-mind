@@ -160,7 +160,8 @@ export class AutonomousCreator {
     const directory=creationWorkspace(this.root,plan,step),started=Date.now();
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
     const lastFile=path.join(directory,'.result-'+run.id+'.json'),controller=new AbortController();
-    let finish,heartbeatBusy=false;
+    let finish,heartbeatBusy=false,startRecorded,startClosed=false;
+    const recordStarted=()=>startClosed?Promise.resolve():startRecorded??=Promise.resolve().then(onStarted).catch(()=>{});
     const done=new Promise(resolve=>{finish=resolve;});
     const cancel=()=>controller.abort();this.current={interrupt:cancel,done};
     signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
@@ -171,11 +172,10 @@ export class AutonomousCreator {
       const answer=await this.nativeRun({id:'creation:'+run.id,kind:'creation',timeout_ms:timeoutMs,schema,
         system:'这是 KIN 沿主会话上下文在隔离执行回合继续自己的创作步骤。使用已有工具，在给定 workspace 制作和核验产物，只完成本步。保留已有检查点、复用未变文件。不要发送消息、改人设、扩大权限或读取渠道凭据。需要外部新证据时记录缺口交给探索。最终返回 schema JSON，artifacts 用相对 workspace 路径。产物核验与完成评估由原宿主继续。',
         context:{actor:'agent:kin',workspace:directory,plan:{id:plan.id,goal:plan.goal,motivation:plan.motivation},step,brief,
-          host_verification_capabilities:this.verifier?.capabilities()??{static_html_render:false}}},{signal:controller.signal});
+          host_verification_capabilities:this.verifier?.capabilities()??{static_html_render:false}}},{signal:controller.signal,onStarted:recordStarted});
       const native=answer.receipt??{};
-      // This interface returns its native start receipt only when the turn ends.
-      // Charge that proven work even after failure, never a queued/unknown turn.
-      if(answer.model_invoked!==false&&(native.native_turn_id||answer.started===true))await onStarted();
+      // A terminal ACK backs up the live callback; both share one start receipt.
+      if(native.native_turn_id||answer.stage==='started')await recordStarted();
       const receipt={executor:native.channel==='fork'?'native-isolated-session':'native-main-session',native_receipt:native,model:native.model,reasoning:native.reasoning,
         thread_id:native.fork_thread_id??native.native_session_id,native_turn_id:native.native_turn_id,run_id:run.id,workspace:directory,
         elapsed_ms:Date.now()-started,usage:native.usage??null,usage_status:native.usage?'reported':'unknown'};
@@ -189,6 +189,8 @@ export class AutonomousCreator {
       return this.verifier?await this.verifier.verify(produced,{signal:controller.signal,env:{[MARK_ENV]:execution.mark}}):produced;
     }finally{
       clearTimeout(timer);clearInterval(heartbeat);signal?.removeEventListener('abort',cancel);
+      startClosed=true;
+      if(startRecorded)await startRecorded;
       await execution.settle();this.current=null;finish();
     }
   }
