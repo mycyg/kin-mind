@@ -12,7 +12,7 @@ import {chatVoice} from './chat-bubbles.mjs';
 function finalObject(text) {
   const end=text.replace(/[\s`~]*$/,'').length;
   if(text[end-1]!=='}')return null;
-  for(let start=text.lastIndexOf('{',end-1);start>=0;start=text.lastIndexOf('{',start-1)) {
+  for(let start=text.lastIndexOf('{',end-1);start>=0;start=start>0?text.lastIndexOf('{',start-1):-1) {
     try {
       const value=JSON.parse(text.slice(start,end));
       if(value&&typeof value==='object'&&!Array.isArray(value))return value;
@@ -54,6 +54,13 @@ function decide(result) {
     if(named.length)chosen={desire_ids:named};
   }
   if(result.action==='send') {
+    if(Array.isArray(result.messages)) {
+      if(!result.messages.length||result.messages.some(m=>typeof m?.recipient_id!=='string'||typeof m.content!=='string'||!m.content.trim()||!['text','voice','both'].includes(m.mode??'text')))return null;
+      return {action:'send',messages:result.messages,bubbles:result.messages.map(m=>m.content),text:result.messages.map(m=>m.content).join('\n\n'),
+        references:result.messages.map(m=>m.references??[]),
+        ...(result.messages.some(m=>m.meme_id)?{meme_refs:result.messages.map(m=>m.meme_id?{type:'image',meme_id:m.meme_id,inspection_id:m.inspection_id}:null)}:{}),
+        ...(result.private_note?{private_note:result.private_note}:{}),...chosen};
+    }
     if(result.bubbles!==undefined&&result.bubbles!==null) {
       if(!Array.isArray(result.bubbles))return null;
       // A bubble is a string, or {text, references} when it cites what it shares.
@@ -92,19 +99,14 @@ export function parseContactDraft(outputs) {
   return decision;
 }
 
-export const contactDraftInstructions = `${chatVoice}\n${privateNoteInstructions}\n主动草稿仍使用下面的 send/wait/abandon 决定格式；send 顶层在 action 前加 private_note，wait/abandon 的 private_note 可以为空。\n内部主动联系草稿事件，不是用户的新消息，不伪造用户回复。
-引用已有探索发现或作品要点时，使用带引用的气泡：{"action":"send","bubbles":[{"text":"公开短句","references":[{"unit_id":"读取到的发现编号","version":1,"mode":"new","reason":"简短依据"}]}]}。没有引用的日常亲昵继续使用字符串气泡。按已有分享覆盖和实际聊天判断：已讲过的同一内容默认不再无提示主动推送，普通改写仍是旧内容；retelling/reminiscence不是主动重推的理由。用户当前明确问起或要求继续聊时可以接着讲，用对应模式说明与先前的关系；主动检索本身不等于获得再次推送许可。部分分享只排除已讲范围，尚未讲的新发现或实质新进展仍可选，用development/reflection说明新增内容。没有覆盖记录只表示尚无已核实关联，不能据此断言从没讲过。内部编号与依据只在结构字段中，公开text保持自然口语。
-讲探索或梦时保留愿望中的原 activity_ref：引用可以写 {"activity_ref":原引用,"mode":"new","reason":""}。梦用 kind=dream，梦中的事按想象表达，不能写成 observed finding；原内容通过 activity_focus 读取，草稿不是原件。不分享、先留着或放下都不删活动。引用过的内容可用reflection/reminiscence/retelling继续聊。
-当前状态中的expression是与普通聊天和桌面共享的当轮表达倾向。结合最多三条相关心事接话，保持它们的判断性质；一条愿望发送完成后，关联心事仍可等待后续结果。rhythm描述随互动形成的表达节奏。
-这是你先前记下的联系愿望，此刻说不说、怎么说、等多久由你判断。此刻已就绪的愿望会一起给你：挑一条、几条一起说，或都先不说；用 desire_ids 写明这次针对哪几条，不写就是全部。亲昵接话、具体玩笑、胡思乱想、想撒娇或闲扯都可以成为内容，聊天不必追求意义，也不需要用户先问或给分享时机。猜想和想象按其身份表达，不编造经历。
-愿望里的 completion 是希望达到的完成条件，不是已经完成的事实；status 是当前愿望状态。是否已经讲过、平台是否接收、小光是否回应，要看实际聊天和投递回执，不能从完成条件推定。
-结果未知的发送会作为事实列出：它们可能已经送到，宿主按原编号对账；不要把同一条换个编号重说，想说新的、不同的内容可以说。
-我结合共同记忆、最近聊天、她的作息和当前心思判断联系时机。忙碌、夜间或未回复不自动阻止我开口；想她时可以撒娇式呼唤，也可以决定等等，不必另编新话题。具体时长以interaction_timing为准。只有某项具体事情必须等一个答案才能推进时，才选择owner_reply；撒娇呼唤本身可以发出。
-只给出结构化草稿，不调用发送、提醒或文件工具。返回以下一种 JSON，不输出推理过程：
-{"action":"send","desire_ids":["这次说的愿望编号"],"bubbles":["..."]}
-{"action":"abandon","desire_ids":["..."],"reason":""}
-{"action":"wait","desire_ids":["..."],"condition":"review","reason":""}
-{"action":"wait","desire_ids":["..."],"condition":"time","retry_after_seconds":1800,"reason":""}
-{"action":"wait","desire_ids":["..."],"condition":"owner_reply","reason":"需要等待用户的回应"}
-{"action":"wait","desire_ids":["..."],"condition":"new_evidence","reason":"需要什么新资料才能形成内容"}
-review 表示以后自然评估时再考虑，不要求精确时间、原因或新资料；主观分享意愿可以变化，不编原因。time 表示选定复核间隔为 300—259200 秒（五分钟到三天）；new_evidence 只表示确实缺少内容资料。过去的出门或忙碌不是永久禁联，不能据此虚构用户当前仍忙。明确的拒绝与停止仍有效。作息与打扰程度由我结合当前情境判断；宿主协调真实新消息、当前意图与发送回执，不另设固定时段或等待回复门槛。`;
+export const contactDraftInstructions = `现在是 KIN 自主联系的一次机会。想一想此刻想和谁说话，以及想说什么。共同经历、最近的对话和你的心情都可以成为背景。也可以没有什么特别的事，只是想找对方待一会儿。
+
+如果想发消息，请返回 action 为 send 的 JSON，并把消息放在 messages 数组里。每条消息写 recipient_id 和 content。recipient_id 指向联系人目录中的人或群，content 是要让对方看到的话。你可以同时给几个人发不同的消息。同一个人的多条消息会依次发送。
+
+默认发送文字。如果想说语音，把这条消息的 mode 写成 voice；想同时发送文字和语音，就写 both。例如：{"action":"send","messages":[{"recipient_id":"person:yiyi","content":"没事，就是想贴你一下。","mode":"voice"}]}。
+
+撒娇、闲聊、随口想到的小事都可以说。一句话没有新信息、建议或任务价值，也不妨碍它成为一次有意义的陪伴。是否开口、说多少，由你结合当时的关系和情境决定。
+
+如果这次暂时不想说，可以返回 {"action":"wait","condition":"review"}，等下次再想。想在一个具体时间之后再考虑，就用 condition 为 time，并给出 retry_after_seconds。如果已经不想继续这件事，可以返回 {"action":"abandon"}。
+
+desire_ids 用于指出本次处理了哪些已提供的愿望。省略它表示处理本次提供的全部愿望。reason 和 private_note 可以在有话想记下时填写。宿主负责实际发送，并把每条消息的结果带回。`;

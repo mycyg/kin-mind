@@ -13,7 +13,7 @@ export function assertKimiInputCompatible(input){
  * an earlier one: later readable items do not prove that all its context survived.
  * Incomplete, changing or oversized logs fail closed. No content leaves this reader. */
 export async function checkModelHistory(profile,runtime){
-  if(profile?.model!=='k3')return;
+  if(!["kimi-for-coding","kimi-for-coding-highspeed","k3","k3-256k","k3.1-pro","k3.1-pro-highspeed"].includes(profile?.model))return;
   if(!runtime?.known||!runtime.rolloutPath||!runtime.threadId||runtime.threadId!==runtime.sessionId)throw historyError(true);
   let handle;
   try{

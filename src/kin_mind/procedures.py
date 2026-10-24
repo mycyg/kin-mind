@@ -231,8 +231,6 @@ def prepare_replay(engine, payload, provider=None):
                            expected=p["revision"], actual=current["revision"])
         # A review transition can change status without changing method content.
         # Reject any verdict prepared before that transition.
-        from . import judgment_cache
-        judgment_cache.accept(engine, receipt, conn=conn)
         for c in verdict.cases:
             methods._record_trial(conn, identifier=p["id"], revision=p["revision"], trial_id=digest([p["id"], p["revision"], c.result_id]),
                 result_id=c.result_id, passed=c.passed, environment=p["environment"],

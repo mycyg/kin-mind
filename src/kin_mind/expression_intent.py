@@ -28,6 +28,7 @@ from datetime import timedelta
 from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.persona import load_persona, persona_metadata
 
+from . import recipient
 from . import appraisal, evidence_refs, trait_refs
 from .autonomy_schema import optimized
 from .evidence_classes import never_evidence
@@ -37,6 +38,7 @@ from .traits import EFFECTIVE, Traits, installed
 SECTION = SWITCH = "expression_intent"
 # One current intent per scope, and every accepted one kept readable beside it.
 SCHEMA = (
+    ("CREATE TABLE IF NOT EXISTS mind_expression_recipients(scope TEXT NOT NULL,person TEXT NOT NULL,id TEXT NOT NULL, PRIMARY KEY(scope,person))"),
     ("CREATE TABLE IF NOT EXISTS mind_expression_intents("
     " scope TEXT PRIMARY KEY,id TEXT NOT NULL,at TEXT NOT NULL,valid_until TEXT NOT NULL,"
     " data TEXT NOT NULL)"),
@@ -117,23 +119,28 @@ def commit_intent(commit):
     topics = _topics(commit.state, value.continue_topics)
     _ensure(conn)
     identifier = "intent_" + digest([commit.event_id, SECTION])[:32]
-    intent = {"id": identifier, "stance": value.stance, "continue_topics": topics,
+    intent = {"recipient_person_id":recipient.current(), "id": identifier, "stance": value.stance, "continue_topics": topics,
               "avoid": list(value.avoid), "valid_minutes": value.valid_minutes,
               "valid_until": (timestamp(at) + timedelta(minutes=value.valid_minutes)).isoformat(),
               "at": at, "evidence": refs, "evidence_ids": sorted({r["record_id"] for r in refs}),
               "trait_refs": traits, "persona": identity(persona_metadata(load_persona(mind.engine, mind.scope))),
               "event_id": commit.event_id, "job_id": commit.job_id, "receipt": commit.receipt,
               "agent_version": commit.version, "stimulus": commit.stimulus}
-    conn.execute("INSERT INTO mind_expression_intents VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
-                 "id=excluded.id,at=excluded.at,valid_until=excluded.valid_until,data=excluded.data",
-                 (mind.scope.key(), identifier, at, intent["valid_until"],
-                  dumps(evidence_refs.as_stored(conn, mind.scope.key(), "mind_expression_intents", intent))))
+    previous = stored(conn,mind.scope.key())
+    if recipient.current() == recipient.XIAOGUANG:
+        conn.execute("INSERT INTO mind_expression_intents VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
+                     "id=excluded.id,at=excluded.at,valid_until=excluded.valid_until,data=excluded.data",
+                     (mind.scope.key(), identifier, at, intent["valid_until"],
+                      dumps(evidence_refs.as_stored(conn, mind.scope.key(), "mind_expression_intents", intent))))
+    conn.execute("INSERT INTO mind_expression_recipients VALUES(?,?,?) ON CONFLICT(scope,person) DO UPDATE SET id=excluded.id", (mind.scope.key(),recipient.current(),identifier))
     conn.execute("INSERT OR REPLACE INTO mind_expression_intent_log VALUES(?,?,?,?)",
                  (identifier, mind.scope.key(), at, dumps(evidence_refs.as_stored(conn, mind.scope.key(), "mind_expression_intent_log", intent))))
     # The intent already re-reads the ledger for itself before every reply; this is so that one
     # place answers the other question — what did this trait hold up, once it moves. One intent is
     # in force at a time, so the one this replaces leaves no row behind.
-    trait_refs.clear_kind(conn, mind.scope.key(), "intent")
+    # Replace only this recipient's previous stance dependencies.
+    if previous and trait_refs.installed(conn):
+        conn.execute("DELETE FROM mind_trait_dependents WHERE scope=? AND kind='intent' AND dependent_id=?",(mind.scope.key(),previous['id']))
     trait_refs.record(conn, mind.scope.key(), "intent", identifier,
                       {ref["trait_id"]: ref["revision"] for ref in traits},
                       dependent_revision=intent["valid_until"], at=at)
@@ -162,7 +169,7 @@ def stale_reason(intent, at, *, evidence_fresh=True, traits_current=True,
 
 
 def _traits_current(conn, mind, refs):
-    """Every trait the intent named, still at the revision it named and still in force."""
+    """Every trait the intent named is still in force with the same meaning."""
     if not refs:
         return True
     if not installed(conn):
@@ -173,7 +180,7 @@ def _traits_current(conn, mind, refs):
             trait = ledger.get(conn, ref["trait_id"])
         except Missing:
             return False
-        if trait["revision"] != ref["revision"] or trait["status"] not in EFFECTIVE:
+        if not trait_refs.same_meaning_since(conn, trait, ref["revision"]):
             return False
     return True
 
@@ -181,7 +188,10 @@ def _traits_current(conn, mind, refs):
 def stored(conn, scope):
     """This scope's current intent, or None. A database no intent has reached holds none."""
     try:
-        row = conn.execute("SELECT data FROM mind_expression_intents WHERE scope=?", (scope,)).fetchone()
+        if recipient.current() == recipient.XIAOGUANG:
+            row = conn.execute("SELECT data FROM mind_expression_intents WHERE scope=?", (scope,)).fetchone()
+        else:
+            row = conn.execute("SELECT l.data FROM mind_expression_recipients p JOIN mind_expression_intent_log l ON l.id=p.id AND l.scope=p.scope WHERE p.scope=? AND p.person=?", (scope,recipient.current())).fetchone()
     except sqlite3.OperationalError:
         return None
     return json.loads(row[0]) if row else None

@@ -447,7 +447,8 @@ def test_the_view_and_every_projection_of_it_carry_the_layers(setup):
 
     # Shown beside the expression, never fed into it: the hints are what the scores alone give.
     bare = {k: {f: v for f, v in d.items() if f != "undertone"} for k, d in view["dimensions"].items()}
-    assert compile_expression(view["dimensions"], rhythm=view["rhythm"]) == compile_expression(bare, rhythm=view["rhythm"])
+    assert compile_expression(view["dimensions"], rhythm=view["rhythm"])["feelings"] == view["dimensions"]
+    assert compile_expression(bare, rhythm=view["rhythm"])["feelings"] == bare
     alone = compile_expression(bare, rhythm=view["rhythm"], config_version=view["continuity"]["version"],
                                persona=view["persona_contract"])
     assert view["expression"]["guidance"] == alone["guidance"] and view["expression"]["version"] == alone["version"]

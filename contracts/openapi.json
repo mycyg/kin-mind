@@ -3990,6 +3990,95 @@
         ],
         "title": "Body_upload_source"
       },
+      "CompanionDelivery": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "text",
+              "voice",
+              "both"
+            ],
+            "title": "Mode",
+            "default": "text"
+          },
+          "schema_version": {
+            "type": "integer",
+            "const": 1,
+            "title": "Schema Version",
+            "default": 1
+          },
+          "channel": {
+            "type": "string",
+            "const": "feishu",
+            "title": "Channel",
+            "default": "feishu"
+          },
+          "person_id": {
+            "type": "string",
+            "enum": [
+              "person:xiaoguang",
+              "person:yiyi"
+            ],
+            "title": "Person Id"
+          },
+          "app_id": {
+            "type": "string",
+            "pattern": "^cli_[A-Za-z0-9_-]+$",
+            "title": "App Id"
+          },
+          "open_id": {
+            "type": "string",
+            "pattern": "^ou_[A-Za-z0-9_-]+$",
+            "title": "Open Id"
+          },
+          "chat_id": {
+            "type": "string",
+            "pattern": "^oc_[A-Za-z0-9_-]+$",
+            "title": "Chat Id"
+          },
+          "conversation_key": {
+            "type": "string",
+            "title": "Conversation Key"
+          },
+          "binding_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Binding Revision"
+          },
+          "requester_person_id": {
+            "type": "string",
+            "enum": [
+              "person:xiaoguang",
+              "person:yiyi"
+            ],
+            "title": "Requester Person Id"
+          },
+          "request_conversation_key": {
+            "type": "string",
+            "title": "Request Conversation Key"
+          },
+          "source_input_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Source Input Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "person_id",
+          "app_id",
+          "open_id",
+          "chat_id",
+          "conversation_key",
+          "binding_revision",
+          "requester_person_id",
+          "request_conversation_key",
+          "source_input_id"
+        ],
+        "title": "CompanionDelivery"
+      },
       "ContactPolicy": {
         "properties": {
           "id": {
@@ -5331,6 +5420,16 @@
       },
       "ScheduleInput": {
         "properties": {
+          "companion_delivery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompanionDelivery"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "command_id": {
             "type": "string",
             "title": "Command Id"

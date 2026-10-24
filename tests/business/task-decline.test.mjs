@@ -19,10 +19,10 @@ async function fixture(t,{manual=false}={}) {
   const router=new MobileRouter(options);
   if(manual){router.state.mode='manual';router.state.manualProfile={provider:'custom-gateway',providerKind:'native',model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'};}
   await router.dispatch({id:'original-work',kind:'owner',text:'work'},async()=> 'new-turn');
+  router.recordModeRequest({mode:'work',commandId:'take-original',sourceInputId:'original-work',reason:'I take on this task'});
   const task=router.currentTask();
   await router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:router.state.executionEpoch});
-  // The classifier only proposed the work; Kin takes it on (N5).
-  await router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-'+task.id,completedTaskId:task.id,completedInputVersion:task.inputVersion,reason:'I will do it'});
+  // Work acceptance now comes from the model's explicit tool call.
   const command={mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'original-work',
     reason:'I did the initial check and do not want to do the rest',commandId:'decline-'+task.id};
   return {router,runtime,task,command,options,switches:()=>switches,now:()=>++tick};
@@ -68,6 +68,7 @@ test('native end settles a refusal while tool and delivery receipts remain separ
 test('a new work input supersedes the old declined version without canceling it',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
   await f.router.dispatch({id:'more-work',kind:'owner',text:'work'},async()=> 'new-turn');
+  f.router.recordModeRequest({mode:'work',commandId:'take-more',sourceInputId:'more-work',reason:'I take on the additional work'});
   assert.equal(f.task.inputVersion,2);assert.deepEqual(f.task.inputIds,['original-work','more-work']);
   assert.equal(f.task.completion,undefined);assert.equal(f.router.state.requests[f.command.commandId].state,'superseded');
   assert.equal(f.router.state.exitRequested,false);
@@ -138,14 +139,15 @@ test('a refusal closes without requiring a later chat reply as its receipt',asyn
   assert.equal(f.router.state.inputs['new-chat'].state,'accepted');
 });
 
-test('a later owner mode request keeps its flags when new work invalidates an old decline',async t=>{
+test('a later explicit work acceptance supersedes an earlier automatic-mode request',async t=>{
   const f=await fixture(t);await f.router.requestMode(f.command);
   await f.router.requestMode({mode:'auto',commandId:'later-auto',reason:'owner requested automatic routing'});
   assert.equal(f.router.state.requests[f.command.commandId].state,'superseded');
   await f.router.dispatch({id:'more-work',kind:'owner',text:'work'},async()=> 'new-turn');
-  assert.equal(f.router.state.requests['later-auto'].state,'pending');
-  assert.equal(f.router.state.requestedMode,'auto');
-  assert.equal(f.router.state.exitRequested,true);
+  f.router.recordModeRequest({mode:'work',commandId:'take-more',sourceInputId:'more-work',reason:'I take on the additional work'});
+  assert.equal(f.router.state.requests['later-auto'].state,'superseded');
+  assert.equal(f.router.state.requestedMode,'work');
+  assert.equal(f.router.state.exitRequested,false);
 });
 
 test('an arriving chat stays an independent input while a declined work turn waits',async t=>{
@@ -167,7 +169,7 @@ test('the idle summary never reviews a task Kin has already declared',async t=>{
   assert.equal(summaries,0);assert.equal(f.task.status,'running');
 });
 
-test('Kin may decline a proposal she never took on, and the decline is reported, not faked as done',async t=>{
+test('a persisted legacy proposal can be declined with its actual receipt',async t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-task-proposal-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   let tick=1000;
   const runtime={known:true,profileReady:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
@@ -176,7 +178,8 @@ test('Kin may decline a proposal she never took on, and the decline is reported,
   const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++tick,inspect:async()=>({...runtime}),
     classify:async()=>({route:'work',reason:'synthetic'}),switchModel:async()=>({...runtime}),waitForIdle:async()=>assert.fail('unexpected wait')});
   await router.dispatch({id:'ask',kind:'owner',text:'please do it'},async()=> 'new-turn');
-  const task=router.currentTask();assert.equal(task.status,'proposed');
+  const task=router.addTask({id:'ask',kind:'owner',text:'please do it'},{proposal:true});router.state.inputs.ask.taskId=task.id;
+  assert.equal(task.status,'proposed');
   await router.observe('prompt-start',{taskId:task.id,inputVersion:1,turnFence:0});
   await router.requestMode({mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:1,sourceInputId:'ask',reason:'not now, and not this way',commandId:'decline-proposal'});
   await router.observe('delivery',{taskId:task.id,inputVersion:1,turnFence:0,sourceInputId:'ask',id:'why',state:'accepted',messageId:'told'});
@@ -195,7 +198,7 @@ test('an undeclared proposal lapses when its own turn ends and releases the lock
   const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++tick,inspect:async()=>({...runtime}),
     classify:async()=>({route:'work',reason:'synthetic'}),switchModel:async()=>({...runtime}),waitForIdle:async()=>assert.fail('unexpected wait')});
   await router.dispatch({id:'ask',kind:'owner',text:'quick question labelled as work'},async()=> 'new-turn');
-  const task=router.currentTask();
+  const task=router.addTask({id:'ask',kind:'owner',text:'old persisted proposal'},{proposal:true});router.state.inputs.ask.taskId=task.id;
   await router.observe('prompt-start',{taskId:task.id,inputVersion:1,turnFence:0,inputIds:['ask']});
   assert.equal(router.tasks().length,1,'the proposal keeps its own turn on the work profile');
   await router.observe('prompt-end',{taskId:task.id,inputVersion:1,turnFence:0,stopReason:'end_turn'});

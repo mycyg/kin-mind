@@ -83,3 +83,38 @@ def test_guard_blocks_only_protected_roots(tmp_path):
     assert "hermetic: 11 blocked operation(s)" in run.stderr
     assert sorted(os.listdir(root / "protected")) == ["memory.sqlite3"]
 
+
+def test_wrapped_os_functions_keep_builtin_call_shape(tmp_path):
+    """Pathlib on Python 3.9 stores these functions as accessor class attributes."""
+    (tmp_path / "protected").mkdir()
+    env = {"PATH": os.environ["PATH"], "PYTHONPATH": str(GUARD),
+           "PYTHONDONTWRITEBYTECODE": "1", "HERMETIC_ROOT": str(tmp_path),
+           "KIN_PROTECTED_ROOTS": str(tmp_path / "protected")}
+    script = r'''
+import os, json
+from pathlib import Path
+class Accessor:
+    open = os.open
+    mkdir = os.mkdir
+    unlink = os.unlink
+a = Accessor()
+root = Path(os.environ['HERMETIC_ROOT'])
+a.mkdir(root / 'free')
+fd = a.open(root / 'free' / 'a', os.O_WRONLY | os.O_CREAT, 0o600)
+os.write(fd, b'actual bytes'); os.close(fd)
+assert (root / 'free' / 'a').read_text() == 'actual bytes'
+a.unlink(root / 'free' / 'a')
+blocked = []
+for name, call in [('open', lambda: a.open(root / 'protected' / 'b', os.O_WRONLY | os.O_CREAT, 0o600)),
+                   ('mkdir', lambda: a.mkdir(root / 'protected' / 'dir'))]:
+    try: call()
+    except PermissionError as error:
+        assert 'hermetic: blocked' in str(error)
+        blocked.append(name)
+print(json.dumps(blocked))
+'''
+    run = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+    assert json.loads(run.stdout) == ["open", "mkdir"], run.stderr
+    assert run.returncode == 3
+    assert list((tmp_path / "protected").iterdir()) == []
+

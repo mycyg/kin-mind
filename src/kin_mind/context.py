@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
-from eventmem.core.db import Conflict, Missing, dumps, tombstoned
+from eventmem.core.db import Conflict, Missing, digest, dumps, tombstoned
 from eventmem.core.models import Model, RecallRequest
 from eventmem.core.read_policy import ReadPolicy, label_facts
 from eventmem.core.retrieval import candidates, tokens, valid
@@ -155,6 +155,8 @@ class Contexts:
     def __init__(self, mind):
         self.mind, self.engine = mind, mind.engine
         self.memory = MemoryContinuity(mind)
+        from .companion_view import ACTIVE_VIEW
+        self.companion_view=ACTIVE_VIEW.get()
         with self.engine.db.connect() as conn:
             conn.executescript(SCHEMA)
 
@@ -336,7 +338,72 @@ class Contexts:
                 return False
         return True
 
-    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None, persist=None):
+    def pack_incremental(self, items, query, budget, *, namespace, **options):
+        """Reuse complete, versioned checkpoint segments in the existing context cache.
+
+        A correction, erase, changed audience or source set invalidates its segment.
+        Only uncovered source items reach the existing compressor; budget pressure can
+        require rebuilding the combined summary. No extra timer or summary model lane.
+        """
+        started = time.monotonic()
+        if self.companion_view:
+            items = self.companion_view.filter(items)
+        audience = (self.companion_view.person, self.companion_view.conversation) if self.companion_view else None
+        prefix = "checkpoint-segment:" + digest([self.mind.scope.key(), namespace, query, audience]) + ":"
+        policy = options.get("policy")
+        source = {i["id"]: i for i in items}
+        covered, reused = set(), []
+        with self.engine.db.connect() as conn:
+            rows = conn.execute("SELECT data FROM mind_context_cache WHERE scope=? AND id LIKE ? ORDER BY created_at DESC",
+                                (self.mind.scope.key(), prefix + "%")).fetchall()
+            for row in rows:
+                cached = json.loads(row[0])
+                deps = cached.get("segment_sources", [])
+                ids = {i["id"] for i in deps}
+                if not ids or ids & covered or not ids <= source.keys():
+                    continue
+                # Same source identity/revision is necessary, but not enough for pending
+                # events: their delivery facts may have settled without a record revision.
+                if any(source[i["id"]] != i for i in deps) or not self._still(conn, deps, policy, cached.get("text", "")):
+                    continue
+                reused.append(cached); covered.update(ids)
+        text = "\n".join(c["text"] for c in reused)
+        remaining = [i for i in items if i["id"] not in covered]
+        if tokens(text) >= budget and remaining or tokens(text) > budget:
+            reused, covered, text, remaining = [], set(), "", items
+        packed = self.pack(remaining, query, max(0, budget-tokens(text)-(1 if text else 0)), **options, _projected=True) if remaining else {
+            "text": "", "state": "compressed", "covered_ids": [], "omitted_ids": [], "model_requests": 0}
+        if remaining and not packed["omitted_ids"] and packed.get("state") == "compressed" and options.get("allow_model", True):
+            from eventmem.core.db import recording
+            if options.get("persist", recording()):
+                key = prefix + digest([(i["id"], i.get("revision")) for i in remaining])
+                self._keep(key, {**packed, "segment_sources": remaining}, remaining, policy)
+        if reused and packed["omitted_ids"] and options.get("allow_model", True):
+            seconds = options.get("work_seconds", 150) - (time.monotonic() - started)
+            if seconds >= 1:
+                # The current budget can shrink. Rebuild once rather than pinning an
+                # oversized old summary forever; all paid requests remain accounted.
+                rebuilt = self.pack(items, query, budget, **{**options, "work_seconds": seconds}, _projected=True)
+                rebuilt["model_requests"] += packed.get("model_requests", 0)
+                rebuilt["prior_receipts"] = packed.get("receipt", [])
+                if not rebuilt["omitted_ids"] and rebuilt.get("state") == "compressed":
+                    from eventmem.core.db import recording
+                    if options.get("persist", recording()):
+                        self._keep(prefix + digest([(i["id"], i.get("revision")) for i in items]),
+                                   {**rebuilt, "segment_sources": items}, items, policy)
+                return rebuilt
+        with self.engine.db.connect() as conn:
+            if not self._still(conn, items, policy, text, packed["text"]):
+                raise Conflict("Checkpoint sources changed while composing cached segments")
+        combined = "\n".join(x for x in (text, packed["text"]) if x)
+        return {**packed, "text": combined, "tokens": tokens(combined),
+                "state": "compressed" if reused and not packed["omitted_ids"] else packed["state"],
+                "covered_ids": [i["id"] for i in items if i["id"] in covered or i["id"] in packed["covered_ids"]],
+                "cache_hit": bool(reused), "reused_segments": len(reused)}
+
+    def pack(self, items, query, budget, *, provider=None, allow_model=True, work_seconds=150, require_all=False, policy=None, on_progress=None, persist=None, _projected=False):
+        if self.companion_view and not _projected:
+            items = self.companion_view.filter(items)
         """Compress the available original items without content-hash memoization.
 
         `persist=False` is a look (S1-02): it keeps nothing (CR-MEM-07) and
@@ -1090,7 +1157,8 @@ class Contexts:
                           "basis": "host-operation"})
         if runtime:
             items.append({"id": "host-runtime", "revision": 1,
-                          "text": dumps(runtime), "basis": "observed"})
+                          "text": dumps(runtime), "basis": "observed",
+                          **({"person_id": self.companion_view.person} if self.companion_view else {})})
         if intent:
             selected_intent = {k: intent.get(k) for k in ("id", "content", "topic", "kind", "strength", "completion", "status", "concern_ids", "exploration_id", "activity_ref")}
             items.append({"id": "current-intent", "revision": 1, "text": dumps(selected_intent), "basis": "inferred"})
@@ -1326,6 +1394,8 @@ class Contexts:
             from .reinforcement import strengths
             with self.engine.db.connect() as conn:
                 packed["usage_strength"] = strengths(conn, self.mind.scope.key(), packed["covered_ids"], self.mind.clock())
+        if self.companion_view:
+            packed['companion_person_id']=self.companion_view.person
         if session and not explicit and receipt_mode:
             from .context_delivery import ContextDelivery
             evidence = [{**i, "depth": "summary" if packed["state"] == "compressed" or i.get("cached_summary") else i.get("read_depth", "original")}
@@ -1375,6 +1445,11 @@ class Contexts:
             # An erased receipt is never replayed (CR-MEM-02).
             return False
         index = receipt.get("index")
+        if self.companion_view:
+            # Receipts from before per-person projection cannot silently become a new audience's context.
+            if receipt.get('companion_person_id')!=self.companion_view.person:return False
+            with self.engine.db.connect() as conn:
+                if any(self.companion_view.visible_id(i.get('id',''),conn) is False for i in index or []):return False
         for entry in index or []:
             if entry.get("activity_dependency"):
                 from .activities import validate_activity_ref

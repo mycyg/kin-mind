@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from eventmem.core import Engine
-from eventmem.core.db import digest
+from eventmem.core.db import digest, dumps
 from eventmem.core.integrity import enforce_source_root, warn_interpreter
 from eventmem.core.models import Scope, SourceInput
 from eventmem.paths import atomic_write
@@ -72,7 +72,30 @@ def _dispatch(config, action, request):
     # `recover` is the host's start-up call: there the configured capacity replaces what meta
     # holds. Any other action only fills a missing value.
     sync_capacity(engine, config, startup=action == "recover")
+    if action.startswith("companion-"):
+        from .companion_host import dispatch_companion
+        return dispatch_companion(engine, config, action, request)
     mind = Mind(engine, Scope.model_validate(config["scope"]))
+    mind.unified_targets = request.get("unified_targets") or {}
+    def review_provider():
+        if config.get("main_session_review") or config.get("companion", {}).get("shared_session"):
+            from .appraisal import NativeReview
+            import sys
+            def exchange(payload):
+                print(json.dumps({"native_review": payload}, ensure_ascii=False), flush=True)
+                response = json.loads(sys.stdin.readline())
+                if response.get("id") != payload["id"]:
+                    raise RuntimeError("native-review-response-mismatch")
+                return response
+            if not request.get("native_review_profile"):
+                raise RuntimeError("main-session-required")
+            provider=NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange,
+                                            used_tokens=request.get("native_review_used_tokens") or 0)
+            provider.native_attempt=(request.get("run_id") or action, "host")
+            return provider
+        else:
+            return DeepSeek.from_engine(engine)
+
     if config.get("contact_policy_file"):
         # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
         mind.register_contact_policy(config["contact_policy_file"])
@@ -116,7 +139,7 @@ def _dispatch(config, action, request):
                 result={"checkpoint_retained": True, "reason": reason})
         if action == "plan-result":
             from .creation import accept_result
-            return accept_result(mind, config, request)
+            return accept_result(mind, config, request, provider=review_provider() if config.get("companion", {}).get("shared_session") else None)
         if action == "plan-claim":
             from .decision_context import execution_brief
             from .erasure import tombstone_mark
@@ -192,15 +215,20 @@ def _dispatch(config, action, request):
             if memory.settings()["event_lifecycle"] and isinstance(request.get("foreground"), bool):
                 from .lifecycle import foreground_lease
                 foreground_lease(engine, mind.scope.key(), "host:" + config["session_id"], active=request["foreground"], seconds=120)
-            return checkpoints.snapshot(request.get("pending"), tasks=request.get("tasks"), intent=request.get("intent"))
+            return checkpoints.snapshot(request.get("pending"), tasks=request.get("tasks"), intent=request.get("intent"), include_business=config.get("companion",{}).get("shared_session") is True)
         snapshot = dict(request['snapshot'])
         if not request.get('shadow') and not memory.settings().get('manifest_restore'):
             snapshot.pop('manifestVersion', None)
             snapshot.pop('linked', None)
         # The checkpoint carries the user's session across a rotation, so somebody is waiting
         # for it unless the host says this one is maintenance.
+        # Background maintenance may summarize missing historical coverage through
+        # the existing compressor. Dispatch and rolling snapshots explicitly pass
+        # allow_model=False: they must never wait for another model inside a turn.
+        # A shared conversational session does not turn a bounded text transform
+        # into a second appraisal/personality session.
         with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
-            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine), allow_model=request.get("allow_model", True), adaptive_budget=True)
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine) if request.get("allow_model", True) else None, allow_model=request.get("allow_model", True), adaptive_budget=True, restore_capacity=request.get('restore_capacity'))
     if action.startswith("context-delivery-"):
         from .context_delivery import ContextDelivery
         deliveries = ContextDelivery(Contexts(mind))
@@ -334,13 +362,13 @@ def _dispatch(config, action, request):
         if not request.get("apply"):
             return archive_memory.status(mind)
         retried = archive_memory.retry_failed(mind) if request.get("retry_failed") else 0
-        return {**archive_memory.run(mind, DeepSeek.from_engine(engine), limit=request.get("limit", archive_memory.BATCH)),
+        return {**archive_memory.run(mind, review_provider(), limit=request.get("limit", archive_memory.BATCH)),
                 **({"retried": retried} if retried else {})}
     if action == "window-notes":
         # Operator action. Without `--apply` it only reads the queue's counts and failure codes;
         # `--apply` writes the newest due note now, one paid DeepSeek call at most.
         from . import window_notes
-        return window_notes.run(mind, DeepSeek.from_engine(engine)) if request.get("apply") else window_notes.status(mind)
+        return window_notes.run(mind, review_provider()) if request.get("apply") else window_notes.status(mind)
     if action == "configure-memory":
         return memory.configure(request)
     if action == "recall-admission-calibrate":
@@ -349,6 +377,11 @@ def _dispatch(config, action, request):
         from .recall_admission import calibrate
         return calibrate(mind, thresholds=request.get("thresholds"), quota=request.get("quota"))
     if action == "runtime-event":
+        from .companion_view import ACTIVE_VIEW, CompanionView, companion_scope
+        person=request.get("recipient_person_id")
+        if person in {"person:xiaoguang","person:yiyi","group:family"} and ACTIVE_VIEW.get() is None:
+            with companion_scope(CompanionView(engine,mind.scope,person,request.get("conversation_key") or config["session_id"])):
+                return _dispatch(config,action,request)
         result = memory.ingest(request)
         if result.get("source_id") and memory.settings()["semantic"] and not request.get("historical"):
             result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
@@ -516,30 +549,13 @@ def _dispatch(config, action, request):
             # checkpoint carries it only once it is written.
             from . import window_notes
             if window_notes.due(mind):
-                return window_notes.run(mind, DeepSeek.from_engine(engine))
+                return window_notes.run(mind, (review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)))
             # The background lane also writes the memories of archived records (archive_memory):
             # when it has no job of its own to run, or when they have waited an hour for it.
             from . import archive_memory
             if archive_memory.due(mind, waited=0 if not jobs.runnable("enrichment") else archive_memory.STARVED_SECONDS):
-                return archive_memory.run(mind, DeepSeek.from_engine(engine))
-        return jobs.run_one(DeepSeek.from_engine(engine), lane="enrichment", job_id=request.get("job_id"))
-    def review_provider():
-        if config.get("main_session_review"):
-            from .appraisal import NativeReview
-            import sys
-            def exchange(payload):
-                print(json.dumps({"native_review": payload}, ensure_ascii=False), flush=True)
-                response = json.loads(sys.stdin.readline())
-                if response.get("id") != payload["id"]:
-                    raise RuntimeError("native-review-response-mismatch")
-                return response
-            if not request.get("native_review_profile"):
-                raise RuntimeError("main-session-required")
-            return NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange,
-                                            used_tokens=request.get("native_review_used_tokens") or 0)
-        else:
-            return DeepSeek.from_engine(engine)
-
+                return archive_memory.run(mind, (review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)))
+        return jobs.run_one((review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)), lane="enrichment", job_id=request.get("job_id"))
     def review_pause():
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
@@ -552,14 +568,22 @@ def _dispatch(config, action, request):
     def review_minute(run=None):
         """The minute's review: queue what is due, run one appraisal when `run` is given, then
         settle the wishes it decided. No extra model call is used for the clock."""
-        actions.crossings()
+        from . import recipient
+        unified = config.get("companion", {}).get("shared_session") is True
+        secondary = unified and recipient.current() != recipient.XIAOGUANG
+        if not secondary:actions.crossings()
         from .plans import AutonomousPlans
         plans = AutonomousPlans(mind)
         plans.tick(actions)
-        memory.queue_idle(actions)
+        if not secondary:memory.queue_idle(actions)
         actions.review_unselected()
         actions.drain(jobs)
-        if memory.settings()["semantic"]:
+        if secondary:
+            # Retire only unmixed legacy idle wakes, after draining their local events.
+            with engine.db.connect(write=True) as conn:
+                conn.execute("UPDATE mind_appraisals SET state='superseded' WHERE scope=? AND " + recipient.predicate() + " AND state='pending' AND json_extract(data,'$.stimulus')='idle-review' AND COALESCE(json_array_length(json_extract(data,'$.batch_ids')),0)=0", (mind.scope.key(),))
+        from . import recipient
+        if recipient.current()==recipient.XIAOGUANG and memory.settings()["semantic"]:
             memory.queue_history(jobs, config["agent_version"])
             if memory.settings()["graph"]:
                 from .graph_migration import GraphMigration
@@ -582,7 +606,10 @@ def _dispatch(config, action, request):
         from .exploration_decision_archive import auto as archive_decisions
         archive_decisions(mind)
         if cadence.status()["state"] == "ready":
-            wake = Path(config["exploration_stop_file"]).parent / "mind-exploration-request.json"
+            from .recipient import current as current_recipient
+            person = current_recipient()
+            filename = "mind-exploration-request.json" if person == "person:xiaoguang" else "mind-exploration-request-" + person.replace(":", "-") + ".json"
+            wake = Path(config["exploration_stop_file"]).parent / filename
             if not wake.exists():
                 # `mind-exploration-request.tmp` was one name two reviews shared, and
                 # the host reads this file the moment it appears: a second review
@@ -647,7 +674,18 @@ def _dispatch(config, action, request):
             except Exception as error:
                 error.receipt = getattr(provider, "failure_receipt", None)
                 raise
-        prepared = prepare_codex_exploration(config, repair=repair_final)
+        prepared = None
+        if config.get("companion", {}).get("shared_session"):
+            from .native_execution import native_exploration_exchange
+            from .codex_executor import run_codex
+            profile=request.get("native_review_profile")
+            if not profile:raise RuntimeError("main-session-required")
+            prepared={"state":"ready", "executable":None, "budget_seconds":1200, "model":profile["model"],
+                "runner":lambda executable,topic,directory,**kwargs:run_codex(executable,topic,directory,
+                    reasoning=profile["reasoningEffort"],provider={"id":"native-main","base_url":"http://127.0.0.1","wire_api":"responses"},
+                    cli_version="native-main",native_exchange=lambda request,servers:native_exploration_exchange({**request,"profile":profile},servers),**kwargs)}
+        if prepared is None:
+            prepared = prepare_codex_exploration(config, repair=repair_final)
         if prepared["state"] != "ready":
             return prepared
         resolved_computer = prepared.get("computer") or config.get("computer_exploration")
@@ -663,7 +701,7 @@ def _dispatch(config, action, request):
             config["exploration_directory"],
             config["agent_version"],
             canceled=stop.exists,
-            model=prepared["model"],
+            model=request.get("native_review_profile", {}).get("model") if config.get("companion", {}).get("shared_session") else prepared["model"],
             runner=prepared["runner"],
             brief=request.get("brief"),
             desire_id=request.get("desire_id"),
@@ -682,6 +720,10 @@ def _dispatch(config, action, request):
     if action == "settle":
         return mind.settle_contact(**request)
     if action == "recover":
+        from . import settling
+        memory = MemoryContinuity(mind)
+        with engine.db.connect(write=True) as conn:
+            enrichment_rescheduled = settling.recover(conn, mind.scope.key(), settling.minutes(memory.settings(conn)))
         # CR-MIND-12: an older release kept the session judgment in the versioned state.
         mind.retire_session_advice()
         # Emotion system v2: the dimensions this release adds join a state initialized before them.
@@ -722,20 +764,34 @@ def _dispatch(config, action, request):
                     (identifier, mind.scope.key()),
                 )
             attempts = conn.execute(
-                "SELECT id FROM mind_contacts WHERE scope=? AND state='drafting'",
+                "SELECT id,data FROM mind_contacts WHERE scope=? AND state='drafting'",
                 (mind.scope.key(),),
             ).fetchall()
-        for attempt in attempts:
-            mind.settle_contact(
-                attempt_id=attempt["id"],
-                state="canceled",
-                reason="Host restarted before sending",
-            )
+        # No platform submission occurred while drafting. Resume the same intent ID;
+        # the next claim refreshes its execution epoch and the model sees current context.
+        with engine.db.connect(write=True) as conn:
+            for attempt in attempts:
+                data = json.loads(attempt["data"])
+                data["resume_draft"] = True
+                conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(data), attempt["id"]))
+            current = mind._load(conn)
+            resumed = []
+            for desire in current["desires"].values():
+                if desire["status"] == "waiting" and desire.get("contact_wait", {}).get("decided_by") == "host":
+                    desire.pop("contact_wait", None)
+                    desire.update(status="wanted", revision=desire["revision"]+1, updated_at=mind.clock())
+                    resumed.append(desire["id"])
+            if resumed:
+                current.update(revision=current["revision"]+1, updated_at=mind.clock())
+                mind._save(conn, current)
+                mind._history(conn, "mind_"+digest([mind.scope.key(), "retire-host-waits", resumed])[:32], current,
+                              "contact-recovery", {"resumed_wishes": resumed})
         # Every settled run's working directory that still has its words loses them now, the ones
         # just interrupted among them, rather than when the next exploration starts (OPS-03).
         directory = config.get("exploration_directory")
         swept = explorer.sweep_workdirs(directory) if directory else []
-        return {"state": "recovered", "canceled_drafts": len(attempts),
+        return {"state": "recovered", "canceled_drafts": 0, "resumable_drafts": len(attempts),
+                "enrichment_rescheduled": enrichment_rescheduled,
                 "interrupted_explorations": interrupted, "live_explorations": retained,
                 "swept_workdirs": len(swept)}
     raise ValueError("Unknown host action")
@@ -850,7 +906,7 @@ def main():
         if args.action == "serve":
             return serve(config)
         # An operator runs these from a terminal, with no request to pipe in.
-        raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if args.action in {"review", "daily"} and config.get("main_session_review") else sys.stdin.read())
+        raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if (args.action in {"review", "daily", "companion-host-call"} and config.get("main_session_review") or config.get("companion", {}).get("shared_session")) else sys.stdin.read())
         request = json.loads(raw) if raw.strip() else {}
         if args.action in APPLY_ACTIONS:
             if args.apply and args.dry_run:

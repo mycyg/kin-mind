@@ -18,6 +18,7 @@ further along the path still runs. The Node half is ../hermetic-preload.mjs.
 
 import os
 import sys
+from functools import partial
 
 _ENV = os.environ
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -112,7 +113,9 @@ def _wrap(owner, name, checks):
 
     guarded.__name__ = getattr(original, "__name__", name)
     guarded.__doc__ = getattr(original, "__doc__", None)
-    setattr(owner, name, guarded)
+    # Built-in functions do not bind when stored on a class. Python 3.9's
+    # pathlib accessor stores os functions that way, so keep that call shape.
+    setattr(owner, name, partial(guarded))
 
 
 def _install_files():
@@ -138,7 +141,7 @@ def _install_files():
             _check("os.open", path, dir_fd=kwargs.get("dir_fd"))
         return real_os_open(path, flags, *args, **kwargs)
 
-    os.open = os_open
+    os.open = partial(os_open)
     for name in ("mkdir", "makedirs"):
         _wrap(os, name, [(0, "path" if name == "mkdir" else "name", True, "dir_fd")])
     for name in ("remove", "unlink", "rmdir"):

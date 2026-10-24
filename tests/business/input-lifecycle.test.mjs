@@ -33,6 +33,7 @@ test('the owner\'s literal stop cuts the running turn, keeps the result on the s
   const calls=[];
   const f=fixture(t,{interruptTurn:async request=>{calls.push(request);Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted',cancel:{cancelledTurn:true}};}});
   await f.router.dispatch({id:'ask',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-ask',mode:'work',sourceInputId:'ask',reason:'KIN takes this work on'});
   const task=f.router.currentTask();
   await f.router.requestMode({commandId:'take-on',mode:'work',reason:'on it',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['ask']});
@@ -50,6 +51,7 @@ test('the owner\'s literal stop cuts the running turn, keeps the result on the s
 test('an unconfirmed interruption keeps the stop\'s result open and is settled once the session is seen idle (CR-LIFE-01)',async t=>{
   const f=fixture(t,{interruptTurn:async()=>({state:'unconfirmed',reason:'native-cancel-unconfirmed'})});
   await f.router.dispatch({id:'ask',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-ask',mode:'work',sourceInputId:'ask',reason:'KIN takes this work on'});
   const task=f.router.currentTask();
   await f.router.requestMode({commandId:'take-on',mode:'work',reason:'on it',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   Object.assign(f.runtime,{active:true,nativeStatus:'running'});
@@ -199,7 +201,7 @@ test('the notice gap is checked when a send starts and runs from when it started
 
 test('a control is answered by its own reply, maintenance by its command; neither just by its route (CR-LIFE-07)',async t=>{
   const f=fixture(t,{classify:async()=>({route:'control',control:'status',reason:'status'})});
-  await f.router.dispatch({id:'status',kind:'owner',text:'/mode status'},async()=>assert.fail('a control is not a prompt'));
+  await f.router.dispatch({id:'status',kind:'owner',text:'/mode work'},async()=>assert.fail('a control is not a prompt'));
   const control=f.router.state.inputs.status;
   assert.equal(inputSummary(control),'submitted','accepted, not yet answered');
   await f.router.flushNotices({send:async()=>({state:'rejected'}),lookup:async()=>({state:'rejected'})});
@@ -208,7 +210,7 @@ test('a control is answered by its own reply, maintenance by its command; neithe
   const told=[];await f.router.watch({notifyOwner:async(kind,id)=>{told.push([kind,id]);return {state:'accepted',messageId:'n'};}});
   assert.deepEqual(told,[['stopped','status']],'the owner is told her control got no reply');
   const g=fixture(t,{classify:async()=>({route:'control',control:'status',reason:'status'})});
-  await g.router.dispatch({id:'status',kind:'owner',text:'/mode status'},async()=>assert.fail('a control is not a prompt'));
+  await g.router.dispatch({id:'status',kind:'owner',text:'/mode work'},async()=>assert.fail('a control is not a prompt'));
   await g.router.flushNotices({send:async()=>({state:'accepted',messageId:'m-status'}),lookup:async()=>null});
   assert.deepEqual([g.router.state.inputs.status.answer.basis,g.router.state.inputs.status.answer.messageId],['control-reply','m-status']);
   // Maintenance: a completed command answers it; a failed one is reported at once.
@@ -220,10 +222,10 @@ test('a control is answered by its own reply, maintenance by its command; neithe
   assert.deepEqual(said,[['stopped','compact']]);
 });
 
-test('a proposal only hints at routing: no lock, no delivery duty, and it lapses without a turn (CR-LIFE-10)',async t=>{
+test('a restored legacy proposal holds no lock and lapses, unless KIN explicitly accepts it (CR-LIFE-10)',async t=>{
   const f=fixture(t);
   await f.router.dispatch({id:'maybe-work',kind:'owner',text:'写个东西'},async()=>{throw Error('catalog unavailable');}).catch(()=>{});
-  const task=f.router.tasks()[0];
+  const task=f.router.addTask({id:'maybe-work',kind:'owner',text:'old proposed work'},{proposal:true});
   assert.deepEqual([task.status,task.requiresDelivery,f.router.openWork().length],['proposed',false,0]);
   assert.equal(f.router.internalHeld(f.runtime,'proactive'),false,'the mind is not held by a proposal');
   const record=f.router.state.inputs['maybe-work'];
@@ -233,7 +235,7 @@ test('a proposal only hints at routing: no lock, no delivery duty, and it lapses
   // Taken on, it holds the lock and owes the report.
   const g=fixture(t);
   await g.router.dispatch({id:'w',kind:'owner',text:'写个东西'},async()=> 'new-turn');
-  const proposal=g.router.tasks()[0];
+  const proposal=g.router.addTask({id:'w',kind:'owner',text:'old proposed work'},{proposal:true});
   await g.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:proposal.id,completedInputVersion:proposal.inputVersion});
   assert.deepEqual([proposal.status,proposal.requiresDelivery,g.router.openWork().length],['running',true,1]);
 });
@@ -241,6 +243,7 @@ test('a proposal only hints at routing: no lock, no delivery duty, and it lapses
 test('work closes on Kin declaration while an unknown report is reconciled separately by its original id',async t=>{
   const f=fixture(t);
   await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-job',mode:'work',sourceInputId:'job',reason:'KIN takes this work on'});
   const task=f.router.tasks()[0];
   await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
@@ -261,6 +264,7 @@ test('work closes on Kin declaration while an unknown report is reconciled separ
   // Her other exits stay open: a partial declaration replaces the first.
   const g=fixture(t);
   await g.router.dispatch({id:'job2',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await g.router.requestMode({commandId:'take-job2',mode:'work',sourceInputId:'job2',reason:'KIN takes this work on'});
   const other=g.router.tasks()[0];
   await g.router.requestMode({commandId:'done2',mode:'auto',reason:'finished',completedTaskId:other.id,completedInputVersion:other.inputVersion});
   await g.router.requestMode({commandId:'partial2',mode:'auto',reason:'only half',taskOutcome:'partial',completedTaskId:other.id,completedInputVersion:other.inputVersion});
@@ -270,6 +274,7 @@ test('work closes on Kin declaration while an unknown report is reconciled separ
 /** A task Kin took on, declared done with these deliveries in its turn, and closed. */
 async function closedWork(f,deliveries) {
   await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-job',mode:'work',sourceInputId:'job',reason:'KIN takes this work on'});
   const task=f.router.tasks()[0],basis={taskId:task.id,inputVersion:task.inputVersion,turnFence:0};
   await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   await f.router.observe('prompt-start',{...basis,inputIds:['job']});
@@ -338,6 +343,7 @@ test('delivery lookups read the runtime only for an open declaration; a closed t
   const f=fixture(t);let inspected=0;const inspect=f.router.inspect;
   f.router.inspect=async()=>{inspected++;return inspect();};
   await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-job',mode:'work',sourceInputId:'job',reason:'KIN takes this work on'});
   const task=f.router.tasks()[0];
   await f.router.requestMode({commandId:'done',mode:'auto',reason:'finished',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   inspected=0;await f.router.reconcileDeliveries(async()=>null);
@@ -475,6 +481,7 @@ const waitFor=async(condition,what='condition')=>{for(let i=0;i<400&&!condition(
 
 test('the owner\'s stop withdraws work still being prepared: its reservation goes and a late submission is refused (CR2-LIFE-01)',async t=>{
   const f=fixture(t);
+  f.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   let release;const prepared=new Promise(resolve=>{release=resolve;});const sent=[];
   const work=f.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},
     async(decision,markSubmitted)=>{await prepared;await markSubmitted();sent.push(decision.inputId);return 'new-turn';});
@@ -493,6 +500,7 @@ test('the owner\'s stop withdraws work still being prepared: its reservation goe
 
 test('a live dispatch is judged for stalls, and one whose preparation hangs past its deadline cannot submit late (CR2-LIFE-03)',async t=>{
   const f=fixture(t);
+  f.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   let release;const prepared=new Promise(resolve=>{release=resolve;});const sent=[];
   const slow=f.router.dispatch({id:'slow',kind:'owner',text:'在吗',submissionProtocol:'host-boundary-v1'},
     async(decision,markSubmitted)=>{await prepared;await markSubmitted();sent.push(1);return 'new-turn';});
@@ -664,10 +672,11 @@ test('not-found proves an input never arrived only on its own thread, from a run
 
 // ---- Third review: CR3-FLOW ----
 
-test('a work summary, a health reading and a classification asked again each pass the activity gate where the call starts; refused, they count nothing (CR3-FLOW-01)',async t=>{
+test('work summary and health checks release their activities; ordinary input starts no classifier (CR3-FLOW-01)',async t=>{
   // A summary of open work Kin has gone quiet about.
   const f=fixture(t);
   await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-job',mode:'work',sourceInputId:'job',reason:'KIN takes this work on'});
   const task=f.router.tasks()[0];
   await f.router.requestMode({commandId:'accept',mode:'work',reason:'yes',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
   await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
@@ -710,24 +719,11 @@ test('a work summary, a health reading and a classification asked again each pas
   assert.equal((await skipped.tick()).state,'skipped');
   assert.deepEqual(f.router.activityList(),[],'a lane that refuses lets the gate go');
 
-  // A classification asked again.
-  let failing=true,classifying=null;
-  const g=fixture(t,{classify:async()=>{if(failing)throw Error('deepseek-http-503');classifying=[g.router.activityList(),g.router.busy(g.runtime)];return {route:'chat',reason:'synthetic'};}});
-  await g.router.select({id:'q',kind:'owner',text:'在吗'});
-  const entry=g.router.state.semanticPending.q;
-  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['semantic-pending',1]);
-  failing=false;
-  await g.router.freezeDispatch('release');
-  await g.router.reviewSemanticPending();
-  assert.deepEqual([entry.state,entry.attempts,classifying],['pending',1,null],'frozen: the model is not asked and no attempt is counted');
-  assert.equal(g.router.state.history.some(event=>event.kind==='semantic-retry'),false);
-  await g.router.thawDispatch('released');
-  await g.router.reviewSemanticPending();
-  assert.deepEqual([g.router.state.inputs.q.state,entry.attempts],['selected',2]);
-  assert.deepEqual(classifying[0].map(activity=>[activity.kind,activity.id]),[['classification-retry','q']],'counted while the model is asked');
-  assert.equal(classifying[1],false,'holding nothing of her conversation');
+  const g=fixture(t,{classify:async()=>assert.fail('ordinary input starts no classifier')});
+  const selected=await g.router.select({id:'q',kind:'owner',text:'在吗'});
+  assert.equal(selected.route,'chat');assert.equal(g.router.state.semanticPending.q,undefined);
   assert.deepEqual(g.router.activityList(),[]);
-  for(const kind of ['work-summary','health-review','classification-retry'])assert.ok(ACTIVITY_KINDS.includes(kind),kind);
+
 });
 
 test('the owner\'s stop takes her stopped work out of the host\'s queue by its own ids, and a prompt that would begin with it never does (CR3-FLOW-02)',async t=>{
@@ -735,7 +731,7 @@ test('the owner\'s stop takes her stopped work out of the host\'s queue by its o
   const hostQueue=()=>{const queue=[];return {queue,take:ids=>{const taken=queue.filter(id=>ids.includes(id));queue.splice(0,queue.length,...queue.filter(id=>!ids.includes(id)));return taken;},
     push:id=>async()=>{queue.push(id);return {route:'new-turn',queued:true};}};};
   const q=hostQueue();
-  const f=fixture(t,{withdrawQueued:q.take});
+  const f=fixture(t,{withdrawQueued:q.take});f.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   await f.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},q.push('w'));
   assert.equal(f.router.state.inputs.w.state,'queued','waiting behind a turn of its own, not begun');
   await f.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},q.push('stop'));
@@ -751,7 +747,7 @@ test('the owner\'s stop takes her stopped work out of the host\'s queue by its o
 
   // The queue did not hold it — it was the message about to begin — and a message sent after
   // the stop was merged into it: that prompt never begins, and the later message is not lost.
-  const g=fixture(t,{withdrawQueued:()=>[]});
+  const g=fixture(t,{withdrawQueued:()=>[]});g.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   await g.router.dispatch({id:'w',kind:'owner',text:'写一份报告'},async()=>({route:'new-turn',queued:true}));
   await g.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},async()=>({route:'new-turn',queued:true}));
   assert.deepEqual([g.router.state.inputs.w.state,g.router.state.inputs.w.withdrawn.fromQueue],['failed-before-submit',false]);
@@ -766,7 +762,7 @@ test('the owner\'s stop takes her stopped work out of the host\'s queue by its o
   assert.deepEqual(requeued,['after'],'the later message goes again under its own id; the stopped work never does');
 
   // Stopped while it was being handed over: its prompt start refuses it, and the handover keeps that.
-  const h=fixture(t,{withdrawQueued:()=>[]});
+  const h=fixture(t,{withdrawQueued:()=>[]});h.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   let begin=null;
   const handing=h.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
     await markSubmitted();
@@ -780,7 +776,7 @@ test('the owner\'s stop takes her stopped work out of the host\'s queue by its o
 
   // Handed to the queue just after the stop: taken back the moment the handover ends.
   const k=hostQueue();
-  const late=fixture(t,{withdrawQueued:k.take});
+  const late=fixture(t,{withdrawQueued:k.take});late.router.addTask({id:'w',kind:'owner',text:'already accepted work'});
   const lateWork=late.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
     await markSubmitted();
     await late.router.dispatch({id:'stop',kind:'owner',text:'停止任务'},k.push('stop'));
@@ -830,14 +826,14 @@ test('an input requeued while it was taken in keeps that count once it is routed
     f.clock.now+=HOUR;
   }
   assert.equal(requeues,REQUEUE_BUDGET,'three in all, across its intake and its routing');
-  // A classification that fails after an intake requeue keeps the count on its pending record too.
+  // Ordinary routing after intake recovery keeps its count without calling a classifier.
   const g=fixture(t,{classify:async()=>{throw Error('deepseek-http-503');}});
   await g.router.received({id:'s',kind:'owner',channel:'wechat'});
   await g.router.intakeFailed('s','attachment-unreadable');
   g.clock.now+=HOUR;await g.router.watch({requeue:async()=>({state:'requeued'}),notifyOwner});
   await g.router.received({id:'s',kind:'owner',channel:'wechat'});
   await g.router.select({id:'s',kind:'owner',text:'在吗'});
-  assert.deepEqual([g.router.state.inputs.s.state,g.router.state.inputs.s.requeues,g.router.state.inputs.s.retry.evidence],['semantic-pending',1,'not-submitted'],'the count and this attempt\'s evidence are kept apart');
+  assert.deepEqual([g.router.state.inputs.s.state,g.router.state.inputs.s.requeues,g.router.state.inputs.s.retry.evidence],['selected',1,'not-submitted'],'the count and this attempt\'s evidence are kept apart');
 });
 
 // ---- The owner's stop kept through a restore from the journal alone (§0) ----
@@ -850,10 +846,12 @@ test('a restore from the journal alone keeps the owner\'s stop: what she stopped
   const lost=async(_,started)=>{started();throw Error('lost response');};
   // A turn the stop cut: the input it answered had reached the native session.
   await f.router.dispatch({id:'running',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-running',mode:'work',sourceInputId:'running',reason:'KIN takes this work on'});
   const first=f.router.tasks()[0];
   await f.router.observe('prompt-start',{taskId:first.id,inputVersion:first.inputVersion,turnFence:0,inputIds:['running']});
   Object.assign(f.runtime,{active:true,nativeStatus:'active'});
   await f.router.dispatch({id:'stop-0',kind:'owner',text:'停止任务'},async()=> 'new-turn');
+  f.router.addTask({id:'queued-w',kind:'owner',text:'already accepted second work'});f.router.addTask({id:'prep',kind:'owner',text:'same accepted work'});
   // Stopped in the host's queue (CR3-FLOW-02), and while still being prepared (CR2-LIFE-01).
   await f.router.dispatch({id:'queued-w',kind:'owner',text:'写第二份'},async()=>{queue.push('queued-w');return {route:'new-turn',queued:true};});
   let release;const prepared=new Promise(resolve=>{release=resolve;});
@@ -862,6 +860,7 @@ test('a restore from the journal alone keeps the owner\'s stop: what she stopped
   await f.router.dispatch({id:'stop-1',kind:'owner',text:'停止任务'},async()=> 'new-turn');
   release();assert.equal((await prep).route,'canceled-by-owner');
   // Stopped while it was being handed over: refused where its prompt would have begun.
+  f.router.addTask({id:'handing',kind:'owner',text:'already accepted third work'});
   const handing=await f.router.dispatch({id:'handing',kind:'owner',text:'写第三份',submissionProtocol:'host-boundary-v1'},async(decision,markSubmitted)=>{
     await markSubmitted();
     await f.router.dispatch({id:'stop-2',kind:'owner',text:'停止任务'},async()=> 'new-turn');
@@ -906,61 +905,18 @@ test('a restore from the journal alone keeps the owner\'s stop: what she stopped
 
 // ---- Fourth review: CR4-FLOW ----
 
-test('a classification asked again holds its activity until the model call has ended: a late lease starts nothing, a request past the deadline is canceled (CR4-FLOW-01)',async t=>{
-  // The real reviewer and lane client; the ledger and the provider answer when the test says so.
-  let slowLease=null;const leaseCalls=[];
-  const lease=createLeaseClient({holder:'test',request:async route=>{
-    leaseCalls.push(route.split('/').pop());
-    if(route.endsWith('/acquire')&&slowLease)await slowLease;
-    return route.endsWith('/acquire')?{state:'admitted',lease:{renew_after_seconds:30}}:{state:'released'};
-  }});
-  let phase='fail',endRequest=null;const requests=[],usage=[];
-  const fetchImpl=async(url,init)=>{
-    requests.push(phase);
-    if(phase==='fail')return {ok:false,status:503};
-    // A slow request: like fetch it refuses a signal already fired; otherwise it ends only
-    // after it is canceled, and when the test lets it.
-    return new Promise((_,reject)=>{
-      if(init.signal.aborted)return reject(init.signal.reason);
-      init.signal.addEventListener('abort',()=>{endRequest=()=>reject(init.signal.reason??Error('aborted'));},{once:true});
-    });
-  };
-  const reviewer=createMobileReviewer({key:'synthetic-key',fetchImpl,lease,onUsage:row=>usage.push(row)});
-  const f=fixture(t,{classify:(input,options)=>reviewer.classify(input,options)});
-  f.router.state.config.classifierTimeoutMs=20;
-  await f.router.select({id:'q',kind:'owner',text:'在吗'});
-  assert.equal(f.router.state.inputs.q.state,'semantic-pending');
-  const retrying=()=>f.router.activityList().map(activity=>[activity.kind,activity.id]);
-  // 1. The lane answers after the deadline: then a freeze, and the drain.
-  let grant;slowLease=new Promise(resolve=>{grant=resolve;});phase='slow';
-  const first=f.router.reviewSemanticPending();
-  await waitFor(()=>leaseCalls.filter(call=>call==='acquire').length===2,'the lane is asked');
-  await new Promise(resolve=>setTimeout(resolve,80));
-  await f.router.freezeDispatch('release');
-  assert.deepEqual(retrying(),[['classification-retry','q']],'past the deadline the drain still counts it: its lane has not answered');
-  grant();slowLease=null;
-  await first;
-  assert.deepEqual(requests,['fail'],'the lease that came late started no request');
-  assert.equal(leaseCalls.at(-1),'release','and was let go');
-  assert.deepEqual(f.router.activityList(),[],'held until then');
-  // 2. The request is slow: at the deadline it is canceled; then a freeze, and the drain.
-  await f.router.thawDispatch('released');
-  f.clock.now+=MINUTE;
-  const second=f.router.reviewSemanticPending();
-  await waitFor(()=>endRequest!==null,'the request is canceled at the deadline');
-  await f.router.freezeDispatch('release');
-  assert.deepEqual(retrying(),[['classification-retry','q']],'canceled but not yet ended: the drain still counts it');
-  endRequest();
-  await second;
-  assert.deepEqual(f.router.activityList(),[],'let go once the request has ended and its lease is released');
-  assert.equal(leaseCalls.at(-1),'release');
-  assert.deepEqual([requests,usage.at(-1).outcome],[['fail','slow'],'caller-deadline'],'the canceled request is accounted to the caller\'s deadline');
-  assert.deepEqual([f.router.state.semanticPending.q.attempts,f.router.state.semanticPending.q.lastFailure.class],[3,'timeout']);
+test('a stalled retired classifier cannot delay an ordinary input or create a model activity',async t=>{
+  let called=0;
+  const f=fixture(t,{classify:async()=>{called++;return new Promise(()=>{});}});
+  const result=await f.router.dispatch({id:'plain',kind:'owner',text:'今天没什么事，就想找你'},async()=> 'new-turn');
+  assert.equal(result.route,'new-turn');assert.equal(called,0);assert.deepEqual(f.router.activityList(),[]);
+  assert.equal(f.router.state.inputs.plain.state,'accepted');assert.deepEqual(f.router.state.semanticPending,{});
 });
 
 test('an unknown submission the owner\'s stop settled holds the session no more, before or after a restore from the journal; its unknown evidence stays (CR4-FLOW-04)',async t=>{
   const f=fixture(t);
   const lost=async(_,started)=>{started();throw Error('lost response');};
+  f.router.addTask({id:'w',kind:'owner',text:'accepted work with uncertain submission'});
   await assert.rejects(f.router.dispatch({id:'w',kind:'owner',text:'写一份报告',submissionProtocol:'host-boundary-v1'},lost),/reconciliation/);
   const boundary=router=>safeBoundary({runtime:{...f.runtime},inputs:Object.values(router.state.inputs),tasks:router.tasks()});
   const w=()=>f.router.state.inputs.w;

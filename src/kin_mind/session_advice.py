@@ -40,16 +40,7 @@ class SessionAdvice(Model):
 
 
 SESSION_ADVICE_PROMPT = """
-session_context 是宿主会话观测，不是用户消息，也不构成情绪或关系证据。
-存在该字段时，在同一次评估中提供 session_advice：keep/recall/compact/prepare/rotate/defer。
-优先维持同一原生会话。缺少事实先 recall，窗口压力先 compact；压缩后话题与工作正常就 keep。
-只有引用 lastCompaction.id 及它之后仍有效的具体退化 evidenceIds，才能 prepare 或 rotate。
-压缩次数、历史总 token、文件大小、时间经过、普通警告或一次网络慢都不足以证明退化。
-比较压缩前后对应任务和接话；错误指代、任务遗漏、重复分享或持续窗口压力需要实际来源。
-没有足够压缩后观测时保持或等待，不能把预测写成已经发生的性能下降。
-reason 写简短判断依据，recheckCondition 写复核条件。模型只建议，宿主核验操作与安全边界。
-会话维护本身不产生联系愿望，不重放旧消息，不改变人设、联系偏好、情绪或任务身份。
-recent 中用户确实在指出错接话、遗忘任务或重复分享时，可用 findings 保存 sourceId、kind、原文 quote 与简短解释。假设、一般技术讨论和自我描述不作为故障。findings 先登记为带来源的解释，下一次评估引用 evidence 中的正式编号；不把刚提出的解释自行确认成已经验证的退化。
+存在 session_context 时提交 session_advice。根据当前观测选择 keep/recall/compact/prepare/rotate/defer；缺事实可 recall，窗口压力可 compact。prepare/rotate 引用 lastCompaction.id 与其后的退化 evidenceIds。findings 记录具体用户反馈的 sourceId、原文 quote 和解释。reason 是判断依据，recheckCondition 是下次复核条件。
 """
 
 
@@ -65,6 +56,17 @@ ADVICE_REPAIR_PROMPT = """你在修正一条被宿主拒绝的 session_advice。
 只引用 allowed_evidence 里的 id；prepare 或 rotate 必须引用 last_compaction.id，并至少引用一条 at 晚于 completedAt、未标记 needsReview 或 resolved 的观测。
 findings 的 sourceId 必须是用户原话的来源，quote 必须与原文逐字一致；无法保证时删除该条 finding。
 依据不足时改为 keep、recall、compact 或 defer，不要编造观测编号。只调用工具提交修正后的建议，不输出推理过程。"""
+
+
+def with_dialogue(context, dialogue):
+    """Use the same source set for the displayed review and its submitted findings."""
+    if not context:
+        return context
+    recent = {row["id"]: row for row in context.get("recent", [])}
+    for row in dialogue:
+        if row.get("id") and row.get("role") == "user":
+            recent.setdefault(row["id"], {k: row[k] for k in ("id", "role", "text", "at", "source_id") if k in row})
+    return {**context, "recent": list(recent.values())}
 
 
 def advice_record(proposal, context, receipt, event_id, request_id=None):
@@ -99,6 +101,7 @@ def repair_input(proposal, context, problem):
     compact = context.get("lastCompaction") or {}
     return {"problem": {"code": problem.code, "message": str(problem)},
             "allowed_evidence": [{k: entry[k] for k in ("id", "at", "needsReview", "resolved") if k in entry} for entry in context.get("evidence", [])],
+            "recent": [{k: entry[k] for k in ("id", "role", "text") if k in entry} for entry in context.get("recent", []) if entry.get("role") == "user"],
             "last_compaction": {k: compact[k] for k in ("id", "completedAt") if k in compact} or None,
             "advice": proposal.model_dump()}
 

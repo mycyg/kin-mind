@@ -126,7 +126,8 @@ export async function switchCodexModel({connection,sessionId,profile=null,model=
   const gatewayTarget=target.providerKind==='gateway'||(!target.providerKind&&target.model==='deepseek-flash');
   if(gatewayTarget) {
     if(!gateway?.baseUrl||!gateway?.token)throw Error('Gateway profile unavailable');
-    await connection.extMethod('providers/set',{providerId:'openai',apiType:'openai',baseUrl:gateway.baseUrl,headers:{Authorization:'Bearer '+gateway.token}});
+    if(before.providerOverride!==true||before.providerBaseUrl!==gateway.baseUrl)
+      await connection.extMethod('providers/set',{providerId:'openai',apiType:'openai',baseUrl:gateway.baseUrl,headers:{Authorization:'Bearer '+gateway.token}});
   } else await connection.extMethod('providers/disable',{providerId:'openai'});
   await connection.setSessionConfigOption({sessionId,configId:'model',value:target.model});
   await connection.setSessionConfigOption({sessionId,configId:'reasoning_effort',value:target.reasoningEffort});

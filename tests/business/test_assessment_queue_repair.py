@@ -486,21 +486,19 @@ def test_a_stamp_from_before_dimensions_were_added_still_holds(setup):
         state = mind._load(conn)
         current = compat.stamp(mind, conn, state)
         before = deepcopy(state)
-        for group in compat.DEFINITION_ADDITIONS:
-            for key in group:
-                before["profile"]["dimensions"].pop(key)
+        before["profile"]["dimensions"].pop("mood")
         earlier = compat.stamp(mind, conn, before)
-        assert earlier["key"] != current["key"] and current["key"] == "compat_" + digest(current["parts"])[:32]
+        assert earlier == current, "dimension descriptions do not invalidate active decisions"
         assert compat.holds(earlier, current) and compat.stale_reason(earlier, current) is None
         changed = deepcopy(before)
-        changed["profile"]["dimensions"]["mood"]["label"] += "（改）"
-        assert compat.stale_reason(compat.stamp(mind, conn, changed), current) == "compat-changed:definitions"
+        changed["profile"]["dimensions"]["mood"] = {"label": "改过的描述"}
+        assert compat.stale_reason(compat.stamp(mind, conn, changed), current) is None
         undeclared = deepcopy(state)
         undeclared["profile"]["dimensions"]["zeal"] = deepcopy(undeclared["profile"]["dimensions"]["mood"])
-        assert not compat.holds(current, compat.stamp(mind, conn, undeclared)), "an undeclared addition still moves it"
-        assert not compat.holds(current, earlier), "and so does a dimension taken away"
+        assert compat.holds(current, compat.stamp(mind, conn, undeclared))
+        assert compat.holds(current, earlier)
         other = {**earlier, "parts": {**earlier["parts"], "contract": "behavior-x"}}
-        assert compat.stale_reason(other, current) == "compat-changed:contract,definitions"
+        assert compat.stale_reason(other, current) == "compat-changed:contract"
         moved = compat.stamp(mind, conn, changed)
     # A proposal the merge marked stale for the addition is one the day's merge can use again.
     from kin_mind.behavior_chain import SCHEMA, due
@@ -514,7 +512,7 @@ def test_a_stamp_from_before_dimensions_were_added_still_holds(setup):
                           dumps({"evolution": {}, "compat": stamp, "stale_reason": "compat-changed:definitions"})))
         with mind.engine.db.connect() as conn:
             return due(conn, mind)
-    assert stale_proposal("still-moved", moved) is False, "nothing for the merge while it is still stale"
+    assert stale_proposal("still-moved", other) is False, "nothing for the merge while it is still stale"
     assert stale_proposal("held-again", earlier) is True
 
 
@@ -588,7 +586,7 @@ def test_a_prediction_nothing_can_settle_is_closed_as_inconclusive(setup):
     assert record["status"] == "archived" and (closed["outcome"], closed["reason"]) == ("inconclusive", "window-expired")
 
 
-def test_a_prediction_made_under_a_configuration_that_moved_is_closed_with_what_moved(setup):
+def test_a_prediction_made_under_a_contract_that_moved_is_closed_with_what_moved(setup, monkeypatch):
     from kin_mind.appraisal import Prediction, SelfHypothesis
     mind, source, clock = setup
     jobs = Appraisals(mind)
@@ -601,9 +599,11 @@ def test_a_prediction_made_under_a_configuration_that_moved_is_closed_with_what_
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('behavior_models',?)",
                      (json.dumps({"chat": "another-model", "chat_effort": "high"}),))
+    from kin_mind import compat
+    monkeypatch.setattr(compat, "BEHAVIOR_CONTRACT", "behavior-next")
     chain_commit(jobs, mind, source, "after-the-change")
     closed = mind.engine.get(prediction["id"])["attributes"]["self_knowledge"]["closed"]
-    assert closed["reason"] == "compat-changed:models"
+    assert closed["reason"] == "compat-changed:contract"
 
 
 # --- 6. A refusal is shown until the section commits again --------------------------------------------
@@ -641,4 +641,37 @@ def test_the_stored_review_minutes_are_validated_against_the_range_kin_chooses_f
     for wrong in ({"review_min_minutes": 9, "first_review_minutes": 10}, {"review_max_minutes": 1441}):
         with pytest.raises(ValueError, match="10..1440"):
             memory.configure(wrong)
-    assert "10到1440" in A.SYSTEM
+    assert A.Appraisal.model_json_schema()["properties"]["next_review_minutes"]["minimum"] == 10
+    assert A.Appraisal.model_json_schema()["properties"]["next_review_minutes"]["maximum"] == 1440
+
+
+def test_due_state_checks_share_one_commit_without_consuming_future_or_user_jobs(setup):
+    mind, source, _=semantic(setup)
+    jobs=Appraisals(mind,session_context={'id':'snapshot-current','binding':{'generation':1},'evidence':[],'recent':[]})
+    a=jobs.enqueue([source('idle','synthetic idle state')],'synthetic-v1',stimulus='idle-review')['id']
+    b=jobs.enqueue([source('rhythm','synthetic rhythm state')],'synthetic-v1',stimulus='rhythm-review')['id']
+    c=jobs.enqueue_maintenance('snapshot-current','synthetic-v1',request_id='current-request')['id']
+    future=jobs.enqueue([source('future','future deadline')],'synthetic-v1',stimulus='rhythm-review')['id']
+    user=jobs.enqueue([source('new-user','new user event')],'synthetic-v1')['id']
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute('UPDATE mind_appraisals SET available=? WHERE id=?',(time.time()+3600,future))
+    from kin_mind.session_advice import SessionAdvice,latest
+    reviewer=Seeing(Appraisal(reason='checked',session_advice=SessionAdvice(action='keep',reason='room remains')))
+    assert jobs.run_one(reviewer,job_id=a)['state']=='complete'
+    assert reviewer.calls==1
+    assert [row_of(mind,i)[0] for i in (a,b,c)]==['complete']*3
+    assert row_of(mind,future)[0]=='pending' and row_of(mind,user)[0]=='pending'
+    assert row_of(mind,a)[3]['session_request_id']=='current-request'
+
+    assert reviewer.contexts[0]['session_review_required']['request_id']=='current-request'
+    with mind.engine.db.connect() as conn:
+        assert latest(conn,mind.scope.key())['requestId']=='current-request'
+
+
+def test_merged_maintenance_without_answer_remains_pending_not_false_complete(setup):
+    mind,source,_=semantic(setup)
+    jobs=Appraisals(mind,session_context={'id':'snapshot','binding':{'generation':1},'evidence':[],'recent':[]})
+    a=jobs.enqueue([source('idle-state','synthetic idle')],'synthetic-v1',stimulus='idle-review')['id']
+    b=jobs.enqueue_maintenance('snapshot','synthetic-v1',request_id='need-answer')['id']
+    jobs.run_one(Seeing(),job_id=a)
+    assert row_of(mind,a)[0]!='complete' and row_of(mind,b)[0]!='complete'

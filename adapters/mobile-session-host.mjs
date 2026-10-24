@@ -6,7 +6,7 @@ import {NativeContextDelivery} from './context-delivery.mjs';
 import {NativeCandidate} from './native-candidate.mjs';
 import {ModelHandoff} from './model-handoff.mjs';
 import {atomicJson} from './mobile-router.mjs';
-import {safeReadOnlyPreparation,checkpointBudget} from './session-policy.mjs';
+import {safeReadOnlyPreparation,checkpointBudget,windowPressure} from './session-policy.mjs';
 import {holdsSession} from './input-ledger.mjs';
 import {switchCodexModel,runtimeProfile,profileMatches} from './codex-models.mjs';
 import {sameInstructionBinding,verifyCompanionInstructions} from './instruction-evidence.mjs';
@@ -127,15 +127,15 @@ export function candidateCatalogFile(config) {
 
 /** Adapter dependencies are supplied by the mobile host. No desktop paths,
  * credentials, channel IDs or shared experiences are built into this module. */
-export async function startMobileSessions({bridge,root,config,routerConfig,mindCall,recordStatus=()=>{}}) {
+export async function startMobileSessions({bridge,root,config,routerConfig,mindCall,recordStatus=()=>{},stateDirectory=path.join(root,'state')}) {
   if(!config.adaptive_sessions)return null;
   const companionInstructions=config.companion_instructions??{enabled:false};
   // This is a preflight gate. Each later candidate launch verifies the bytes
   // again so a long-running host cannot silently use a changed versioned file.
   verifyCompanionInstructions(companionInstructions);
   const routing=bridge.mobileRouting,router=routing.router;
-  const file=config.session_registry_file??path.join(root,'state/conversation-registry.json');
-  const observationFile=config.session_observation_file??path.join(root,'state/session-observation.json');
+  const file=config.session_registry_file??path.join(stateDirectory,'conversation-registry.json');
+  const observationFile=config.session_observation_file??path.join(stateDirectory,'session-observation.json');
   await routing.ensureSession('kin-host:session-management');
   await router.restoreRoutingProfile();
   const initial=await routing.inspect();
@@ -148,7 +148,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
       atomicJson(observationFile,observation);writtenObservation={id:observation.id,at:observation.at};
     }
   };
-  const native=new NativeCandidate({command:config.codex_command,cwd:path.join(root,'conversation'),env:{KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
+  const native=new NativeCandidate({command:config.codex_command,cwd:path.join(root,'conversation'),env:{...bridge.config?.agent?.env,KIN_SESSION_GATEWAY_TOKEN:routing.gateway.token},
     configForModel:profile=>candidateConfigForRuntime(profile,{catalogFile:candidateCatalogFile(config),gateway:routing.gateway,companionInstructions}),
     personaInstructions:fs.readFileSync(path.join(root,'conversation/AGENTS.md'),'utf8')});
   const collect=async()=>{
@@ -166,15 +166,22 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
   const inspect=async()=>{
     const value=await routing.inspect();
     if(value.known&&value.rolloutPath){
-      if(readerId!==value.threadId){reader=new NativeWindow({file:value.rolloutPath,threadId:value.threadId,stateFile:path.join(root,'state/native-window-'+value.threadId+'.json')});readerId=value.threadId;}
+      if(readerId!==value.threadId){reader=new NativeWindow({file:value.rolloutPath,threadId:value.threadId,stateFile:path.join(stateDirectory,'native-window-'+value.threadId+'.json')});readerId=value.threadId;}
       const state=await reader.poll();
       return nativePressureRuntime(value,state);
     }
     return value;
   };
-  // Every checkpoint has the same fixed allowance. It is read by the window after a
-  // compaction or handover, so the room left in the current one is no measure of it.
-  const buildCheckpoint=request=>mindCall('session-checkpoint',request);
+  // Checkpoint capacity follows the verified native window and restoration phase.
+  const buildCheckpoint=async request=>{
+    const runtime=await inspect(),pressure=windowPressure(runtime,manager.state.config);
+    // Before compaction this text belongs to the following window. During
+    // recovery it must fit the actual already-compacted window's free space.
+    const capacity=pressure.known?Math.floor(pressure.effectiveWindow-pressure.outputReserve-pressure.toolReserve-
+      (manager.state.restoreRequired?pressure.expectedInputTokens:0)):null;
+    if(capacity!==null&&capacity<request.budget)throw Object.assign(Error('Recovery window has insufficient headroom'),{code:'restore-native-headroom-insufficient'});
+    return mindCall('session-checkpoint',{...request,...(capacity!==null?{restore_capacity:capacity}:{})});
+  };
   const background=new NativeContextDelivery({call:mindCall,
     runtime:async()=>{const current=await routing.ensureSession('kin-host:context-status');return current.agentInfo.connection.extMethod('_kin/runtime',{sessionId:manager.fence().threadId});},
     inject:async request=>{const current=await routing.ensureSession('kin-host:context');return current.agentInfo.connection.extMethod('_kin/inject-checkpoint',request);}});
@@ -261,11 +268,18 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         // owner notifications are unconfirmed; the prepared artifacts carry the
         // annotation. Compaction, injection and promotion keep the strict boundary.
         const preparation=safeReadOnlyPreparation({...snapshot,runtime});
+        if(manager.state.restoreRequired&&!manager.state.restorePending&&!preparation.safe&&manager.state.recoveryPreparation?.reason!==preparation.reason){
+          manager.state.recoveryPreparation={at:new Date().toISOString(),reason:preparation.reason,state:'waiting'};
+          manager.save('restore-preparation-waiting',manager.state.recoveryPreparation);
+        }
         // CL6-FLOW-02: a checkpoint is maintenance -- the recovery one may ask DS -- so under a
         // freeze neither starts; the first tick after the thaw prepares them.
         if(manager.state.restoreRequired&&!manager.state.restorePending&&preparation.safe)await manager.maintained('restore-checkpoint',async()=>{
           const {checkpoint:cp}=await manager.preparedCheckpoint(snapshot,manager.fence(),router.tasks().length?4000:manager.state.config.restoreBudget);
           if(cp.complete&&JSON.stringify(snapshot.cursors)===JSON.stringify((await collect()).cursors)){manager.state.restoreCheckpoint=cp;manager.state.restorePending=true;manager.save('automatic-compaction-checkpoint-ready',{unconfirmedDeliveries:preparation.unconfirmedDeliveries??[]});}
+          else if(cp.complete){manager.state.recoveryPreparation={at:new Date().toISOString(),state:'waiting',reason:'restore-source-cursors-changed'};manager.save('restore-preparation-stale',manager.state.recoveryPreparation);}
+          else if(!cp.complete){manager.state.recoveryPreparation={at:new Date().toISOString(),reason:cp.coverage?.reason??cp.waitReason??cp.state??'coverage-incomplete',tokens:cp.tokens,
+            omitted:cp.coverage?.omitted_ids?.length??null,modelRequests:cp.metrics?.model_requests??null};manager.save('restore-preparation-incomplete',manager.state.recoveryPreparation);}
         });
         if(snapshot.manifestVersion&&preparation.safe){
           const key=JSON.stringify([manager.fence().generation,snapshot.cursors]);
@@ -279,7 +293,7 @@ export async function startMobileSessions({bridge,root,config,routerConfig,mindC
         writeObservation();
         manager.state.lastTick={...result,checkedAt:new Date().toISOString()};
         recordStatus({sessionManagement:api.view()});
-      }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.name,checkedAt:new Date().toISOString()}});}
+      }catch(error){recordStatus({sessionManagement:{state:'waiting',reason:error.code??error.name,checkedAt:new Date().toISOString()}});}
       finally{running=false;}
     },
     async restoreBeforeDispatch(contextToken){

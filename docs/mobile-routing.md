@@ -15,39 +15,9 @@ loads these public adapters from the one core checkout its static imports name
 
 `MobileRouter` persists an input ledger, work tasks, mode requests, configuration
 revisions and transition history. Input acceptance and provider replacement share
-one mutex. The classifier is asked outside it; a dispatch is planned under it,
-prepared outside it and marked submitted under it again only while nothing it was
-planned on has changed, otherwise it is planned again. A planned dispatch reserves
-the provider until it reaches the session. New work received during a DeepSeek turn
-waits for that turn to finish. DeepSeek classifies natural language using the
-current message, recent conversation, mode and task summary, including during work.
-Its result describes intent; the host independently preserves the active work
-profile unless the owner explicitly changes it. Runtime enquiries and notification
-requests do not create work or touch a declared outcome. Literal commands — the
-owner's stop, `/mode work`, `/mode auto` and `/compact` — have their own path;
-natural phrasing is not matched by a collection of regular expressions.
+one mutex. Ordinary messages go to the current conversation model without a separate classification request. Literal commands such as `/mode work`, `/mode auto`, stop and `/compact` are handled directly. Natural requests to change models or take on work are interpreted in the conversation and applied through `request_mobile_mode` with the current input identity. The router records the resulting task and mode request, then changes providers at the appropriate native turn boundary.
 
-A classification that fails decides nothing: no task is opened, no provider switch
-happens and no execution is granted. The input waits as itself in the durable
-`semantic-pending` state, with its version basis, the tasks and model at capture and
-the failure class (`timeout`, `http`, `parse` or `unavailable`), and the same input
-is asked of DeepSeek again: four attempts in all, each retry allowed twice the
-classifier timeout (at most 45 seconds), with a growing wait between them. A late
-answer routes against the state it finds. A stop it reads applies only to the tasks
-it was read against, and late work never extends a task the owner is stopping; it
-opens work of its own. An input whose session moved to a new generation meanwhile
-is read again there. When the attempts are spent the message still reaches Kin,
-unlabelled, as chat on the current profile, rather than ending unanswered.
-
-A `work` label only proposes a task. The proposal keeps its own turn on the work
-profile and lapses when that turn ends, unless Kin takes it on
-(`request_mobile_mode` with `task_outcome=accepted`, the task ID and its input
-version), declares an outcome for it or declines it; a lapsed proposal can still be
-taken on while no other task is open. Kin's own handoffs and the host's internal
-jobs are commitments from the start. An open task holds the work lock: later
-messages ride on it, new work raising its input version and clearing an earlier
-declaration, chat as context that changes neither. A mode request Kin makes takes
-effect at an idle boundary.
+A work request creates or accepts a task. When the owner has manually selected a model, accepting or completing a task preserves that exact model, effort and service preference. A new explicit model selection or literal mode command can change it. In automatic mode, work uses the configured work profile and returns to the recorded automatic profile after the task closes. Historical `semantic-pending` inputs may still be reconciled under their original identity; new ordinary inputs never enter that classification retry path.
 
 Work closes on the outcome Kin declares, never on a model's verdict: `completed`,
 `partial`, `declined` or `deferred`, requested with `mode=auto`, the task ID and its
@@ -207,46 +177,11 @@ or is answered as a status request when none is pending; it does not start a
 work-model task. A mixed message that also requests code, a document or a repair
 remains work.
 
-The owner's stop needs no model when it is the literal command: it is read before
-anything else, answers when no classifier can and applies to every open task. A stop
-read from natural language counts only when the classifier actually answered, and
-applies only to the tasks it was read against. Either way it is recorded on the stop
-input itself, cancels the tasks it names once execution has stopped, and never opens
-or extends work. What of the stopped work waits in the host's in-memory queue, its
-prompt not begun, leaves that queue at once by its original input IDs and is canceled
-by her under those IDs; it is never requeued or sent under another ID. Nothing else in
-the queue moves, whatever arrived after the stop included. The stop is read again where
-any prompt would begin, in the step that records its start: a prompt that carries
-stopped work never begins, and a message merged into it after the stop is not
-submitted and goes again under its own ID.
+The literal owner stop is handled without a model. It cancels open work after execution stops and removes queued task inputs by their original IDs. Newer unrelated inputs remain queued. Natural language intentions are read by the active conversation model; old task summaries do not become new owner instructions.
 
-In manual mode, ordinary messages retain the selected model, effort and Fast
-preference. The classifier still reads content, recall and stop/file intentions, but
-does not select a model for those messages. Only a fresh control in the current owner
-text changes the profile or routing mode; an old control in the task summary or
-recent conversation is context, not renewed authority. A manual profile comes only
-from the owner's own control or a verified reclassification, never from a model or
-maintenance request. Partial effort/tier changes retain the other current fields. An
-already verified, identical manual profile settles without canceling the native turn,
-fencing tools or notifying another switch. An uncertain prior switch still reconciles
-through its original receipt. Closing a task retains a manual profile; returning to
-automatic routing requires the owner's explicit request.
+In manual mode, ordinary messages and task acceptance retain the selected model, reasoning effort and service preference. An identical verified selection settles without interrupting the native turn. An uncertain earlier switch reconciles through its original receipt.
 
-Historical correction is a separate receipt, not a rewrite of the input record. An
-authenticated private host can call `reclassifyAcceptedControl` only for an accepted
-owner input no older than `reclassifyMaxHours`, with its semantic hash, the basis it
-read, a bounded current-classifier result and hashed acceptance/owner/source evidence
-tied to the same session, conversation and generation. The basis is the configuration
-revision and the owner inputs after the source, not every bookkeeping save. Only
-manual, auto or work control is accepted. The receipt leaves `record.route` untouched
-and authorizes one exact mode request; it never submits the source input or replays
-its task effects. An identical retry returns that receipt; a changed command ID
-conflicts, and a newer explicit control or reclassification makes the evidence stale.
-The host's maintenance entry for it, `POST /recover-owner-control`, asks the classifier
-beside her conversation like any classification asked again: a freeze refuses it before
-the model is asked, and the drain counts it until the call has ended, let go of its
-lane and the receipt is recorded. An identical retry asks no model and is answered,
-frozen or not.
+`POST /recover-owner-control` is retired and returns HTTP 410. It does not classify or replay old messages. Current model selection uses `request_mobile_mode` in the conversation. Historical switch receipts are retained only to settle effects already requested before the change.
 
 A mode request can set `notify: true`. After native model verification, the host
 creates a durable notification with a stable output ID. The owner-bound sender and
@@ -292,7 +227,6 @@ The model-side `configure_mobile_routing` tool reaches the first three.
 | `noticeGapMinutes` | 10 | 1–240 | The least time between two owner notices |
 | `dispatchWaitMinutes` | 20 | 1–120 | How long a dispatch waits for the coordinator, a switch or a classification |
 | `reportWaitMinutes` | 30 | 1–1440 | How long a declared outcome waits for its report to reach the platform |
-| `reclassifyMaxHours` | 24 | 1–168 | The oldest accepted owner message that may be reclassified as a control |
 | `handoffSourceMaxHours` | 24 | 1–168 | The oldest owner input that may authorize a desktop handoff |
 
 ## The unsent rest of an interrupted reply

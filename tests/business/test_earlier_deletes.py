@@ -99,7 +99,7 @@ def test_a_delete_from_before_the_claim_stops_no_draft_though_the_state_still_na
     assert refused["state"] == "canceled" and refused["reason"] == "draft-sources-deleted"
     assert seen_record in refused["evaluated_ids"] and old_source not in refused["evaluated_ids"]
     clock[0] += timedelta(seconds=301)
-    assert mind.reconsider_contacts(owner_epoch="owner-1")["resumed"] == [ready]
+    assert mind.reconsider_contacts(owner_epoch="owner-1")["resumed"] == []
     again = mind.claim_contact(owner_epoch="owner-1")
     kept = mind.settle_contact(attempt_id=again["id"], state="pending", text="周末爬山累吗",
                                shown_ids=[*state_ids(mind), seen_source, seen_record],

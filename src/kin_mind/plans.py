@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from eventmem.core.db import Conflict, Missing, digest, dumps
 
-from . import evidence_refs, liveness
+from . import evidence_refs, liveness, recipient
 from .autonomy_models import ActionDecision, PlanChange
 from .autonomy_schema import enabled, optimized
 from .model_runtime import verified_decision
@@ -55,7 +55,7 @@ class AutonomousPlans:
         self.mind, self.engine, self.scope = mind, mind.engine, mind.scope.key()
 
     def get(self, conn, identifier):
-        row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=?", (self.scope, identifier)).fetchone()
+        row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND id=?", (self.scope, identifier)).fetchone()
         if not row:
             raise Missing("Plan is missing or outside this scope")
         return json.loads(row[0])
@@ -89,10 +89,10 @@ class AutonomousPlans:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_runtime_events'").fetchone():
             return 0
         return conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' "
-                            "AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope,)).fetchone()[0]
+                            "AND COALESCE(json_extract(data,'$.historical'),0)=0 AND " + recipient.predicate(), (self.scope,)).fetchone()[0]
 
     def _target(self, conn, plan_id):
-        row = conn.execute("SELECT id FROM mind_plans WHERE scope=? AND (id=? OR json_extract(data,'$.key')=?)", (self.scope, plan_id, plan_id)).fetchone()
+        row = conn.execute("SELECT id FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND (id=? OR json_extract(data,'$.key')=?)", (self.scope, plan_id, plan_id)).fetchone()
         return self.get(conn, row[0] if row else plan_id)
 
     def basis(self, plan, step, epoch):
@@ -147,12 +147,18 @@ class AutonomousPlans:
     def change(self, conn, proposal, command, *, allowed=None, receipt=None):
         p = PlanChange.model_validate(proposal)
         refs = self._refs(conn, p.evidence_ids, allowed)
-        identifier = p.id or "plan_" + digest([self.scope, p.desire_id or p.key])[:32]
+        if p.desire_id:
+            linked = self.mind._load(conn)["desires"].get(p.desire_id)
+            if not linked or not recipient.belongs(linked):
+                raise Missing("Linked wish belongs to another recipient or is unavailable")
+        identifier = p.id or "plan_" + digest(recipient.key([self.scope, p.desire_id or p.key]))[:32]
         if p.action == "create":
             existing = conn.execute("SELECT data FROM mind_plans WHERE id=? AND scope=?", (identifier, self.scope)).fetchone()
             if existing:
-                return json.loads(existing[0])
-            plan = {"id": identifier, "key": p.key, "revision": 1, "status": "active", "created_at": self.mind.clock(),
+                found=json.loads(existing[0])
+                if not recipient.belongs(found):raise Missing("Plan belongs to another recipient")
+                return found
+            plan = {"recipient_person_id": recipient.current(), "id": identifier, "key": p.key, "revision": 1, "status": "active", "created_at": self.mind.clock(),
                     "desire_id": p.desire_id, "steps": [], "timezone": "Asia/Singapore"}
         else:
             plan = self.get(conn, identifier)
@@ -217,7 +223,7 @@ class AutonomousPlans:
 
     def manage(self, request):
         command = request["command_id"]
-        key = "plan_command_" + digest([self.scope, command])[:32]
+        key = "plan_command_" + digest(recipient.key([self.scope, command]))[:32]
         with self.engine.db.connect(write=True) as conn:
             prior = conn.execute("SELECT result FROM commands WHERE id=?", (key,)).fetchone()
             if prior:
@@ -261,9 +267,10 @@ class AutonomousPlans:
             # Asked again after the plan was made (the router lost its receipt): the same plan,
             # even when its time has passed in between and the change would read differently.
             made = conn.execute("SELECT data FROM mind_plans WHERE id=? AND scope=?",
-                                ("plan_" + digest([self.scope, "deferred-task:" + task_id])[:32], self.scope)).fetchone()
+                                ("plan_" + digest(recipient.key([self.scope, "deferred-task:" + task_id]))[:32], self.scope)).fetchone()
             if made:
                 plan = json.loads(made[0])
+                if not recipient.belongs(plan):raise Missing("Deferred plan belongs to another recipient")
                 return {"state": "created", "planId": plan["id"], "plan_id": plan["id"], "revision": plan["revision"]}
             inputs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_reply_inputs'").fetchone())
             for identifier in named:
@@ -470,7 +477,7 @@ class AutonomousPlans:
         version, registered = version or self.mind._load(conn)["agent_version"], []
         key = ((receipt or {}).get("compat") or compat.stamp(self.mind, conn))["key"]
         for identifier in plan_ids:
-            row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, identifier)).fetchone()
+            row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND id=? AND status='active'", (self.scope, identifier)).fetchone()
             plan = json.loads(row[0]) if row else None
             if not plan or plan.get("compat_key") == key:
                 continue
@@ -633,7 +640,7 @@ class AutonomousPlans:
         event exists and is complete. Kept under a marker no event carries, tick() finds them open and
         takes them over, which is an event of its own.
         """
-        if not conn.execute("SELECT 1 FROM mind_plans WHERE scope=? AND id=?", (self.scope, target["plan_id"])).fetchone():
+        if not conn.execute("SELECT 1 FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND id=?", (self.scope, target["plan_id"])).fetchone():
             return conn.execute("DELETE FROM mind_plan_wakeups WHERE scope=? AND plan_id=?", (self.scope, target["plan_id"])).rowcount
         return conn.execute("UPDATE mind_plan_wakeups SET event_id=? WHERE scope=? AND plan_id=? AND event_id=?",
                             (UNSHOWN + target["event_id"], self.scope, target["plan_id"], target["event_id"])).rowcount
@@ -643,11 +650,11 @@ class AutonomousPlans:
             if identifier:
                 plans = [self.get(conn, identifier)]
             else:
-                rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? " + ("AND status=? " if status else "") +
+                rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " " + ("AND status=? " if status else "") +
                                     "ORDER BY next_review,id LIMIT ? OFFSET ?", (self.scope, *([status] if status else []), min(100, max(1, limit)), max(0, cursor))).fetchall()
                 plans = [json.loads(r[0]) for r in rows]
             taken = len(plans)
-            lead = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=? AND status='active'", (self.scope, first)).fetchone() if first and not identifier else None
+            lead = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND id=? AND status='active'", (self.scope, first)).fetchone() if first and not identifier else None
             if lead:
                 # The plan a review was woken for leads its own view, however many plans are due before it.
                 # The window keeps its size, and the cursor counts only plans taken in their usual order.
@@ -713,7 +720,7 @@ class AutonomousPlans:
                 return emitted
             current = self.mind._load(conn)
             epoch, version = self.owner_epoch(conn), current["agent_version"]
-            for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall():
+            for row in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND status='active'", (self.scope,)).fetchall():
                 plan = json.loads(row[0])
                 reasons = self._wakeups(conn, plan, epoch, version, current)
                 if not reasons:
@@ -752,13 +759,13 @@ class AutonomousPlans:
             # A run whose lease has run out has no executor left: the one that held it lived in a
             # host that is gone, or lost the claim's answer. It is taken back here, on the next
             # claim, not only at a start-up that happens to come late enough (K2-01).
-            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND actor=? AND state='running' AND lease_until<=?",
+            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND actor=? AND state='running' AND lease_until<=?",
                                     (self.scope, actor, time.time())).fetchall():
                 self._reclaim(conn, row, "lease-expired")
-            active = conn.execute("SELECT id FROM mind_plan_runs WHERE scope=? AND actor=? AND state IN ('running','unconfirmed')", (self.scope, actor)).fetchone()
+            active = conn.execute("SELECT id FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND actor=? AND state IN ('running','unconfirmed')", (self.scope, actor)).fetchone()
             if active:
                 return {"state": "waiting", "reason": "executor-reserved", "run_id": active[0]}
-            rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active' ORDER BY next_review,id", (self.scope,)).fetchall()
+            rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND status='active' ORDER BY next_review,id", (self.scope,)).fetchall()
             state = self.mind._load(conn) if rows else None
             for row in rows:
                 plan = json.loads(row[0])
@@ -766,7 +773,7 @@ class AutonomousPlans:
                     if step["actor"] != actor or self.waiting_reason(conn, plan, step, state):
                         continue
                     run_id = "plan_run_" + digest([self.scope, plan["id"], step["id"], step["revision"]])[:32]
-                    attempt = {"id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
+                    attempt = {"recipient_person_id": recipient.current(), "id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
                                "step_revision": step["revision"], "actor": actor, "decision": step["decision"], "state": "running",
                                "started_at": self.mind.clock(), "owner": owner, "fence": 1}
                     conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, self.scope, plan["id"], step["id"], actor, "running", time.time() + 90, owner, 1, self._row(conn, "mind_plan_runs", attempt)))
@@ -782,7 +789,7 @@ class AutonomousPlans:
         still stands (creation.accept_result, CR5-MM-02). `mark`: the `tombstone_mark` taken before
         the claim, so its settlement counts only the deletes after it (CL6E-MM-02)."""
         with self.engine.db.connect(write=True) as conn:
-            row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND id=? AND state='running'",
+            row = conn.execute("SELECT data FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND id=? AND state='running'",
                                (self.scope, run_id)).fetchone()
             if row:
                 noted = {"shown": shown, **({"tombstone_mark": mark} if mark is not None else {})}
@@ -790,7 +797,7 @@ class AutonomousPlans:
 
     def renew(self, run_id, owner, fence):
         with self.engine.db.connect(write=True) as conn:
-            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND id=?", (self.scope, run_id)).fetchone()
+            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND id=?", (self.scope, run_id)).fetchone()
             if not row or row["owner"] != owner or row["fence"] != fence or row["state"] != "running" or row["lease_until"] <= time.time():
                 raise Conflict("Execution lease expired or was replaced")
             plan = self.get(conn, row["plan_id"])
@@ -810,7 +817,7 @@ class AutonomousPlans:
         if state not in {"completed", "interrupted", "failed", "unconfirmed"}:
             raise ValueError("Unsupported executor result")
         with self.engine.db.connect(write=True) as conn:
-            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND id=?", (self.scope, run_id)).fetchone()
+            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND id=?", (self.scope, run_id)).fetchone()
             if not row or row["owner"] != owner or row["fence"] != fence:
                 raise Conflict("Execution fence mismatch", target=run_id, expected=fence,
                                actual=row["fence"] if row else None)
@@ -863,7 +870,7 @@ class AutonomousPlans:
             raise Conflict("Recovery requires verified termination of previous executors")
         recovered, held = [], []
         with self.engine.db.connect(write=True) as conn:
-            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND state='running'", (self.scope,)).fetchall():
+            for row in conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND state='running'", (self.scope,)).fetchall():
                 if evidence and row["lease_until"] > time.time():
                     held.append({"id": row["id"], "lease_until": row["lease_until"]})
                     continue
@@ -916,8 +923,8 @@ class AutonomousPlans:
                 return created
             state = self.mind._load(conn)
             # Completed plans are read only while their last decision's wish is unsettled (K2-21).
-            rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active'", (self.scope,)).fetchall()
-            rows += conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='completed' "
+            rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND status='active'", (self.scope,)).fetchall()
+            rows += conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND status='completed' "
                                  "AND json_extract(data,'$.wish_sync')='pending'", (self.scope,)).fetchall()
             for row in rows:
                 plan = json.loads(row[0])
@@ -953,8 +960,15 @@ class AutonomousPlans:
                         continue
                     if desire and desire.get("plan_decision_id") == step["decision"]["id"]:
                         continue
-                    if desire and desire["status"] in {"in_progress", "completed", "abandoned"}:
+                    if desire and desire["status"] == "in_progress":
                         continue
+                    if desire and desire["status"] in {"completed", "abandoned"}:
+                        if not ready:
+                            continue
+                        # A new ready plan decision owns a new execution intent.
+                        # Preserve the old wish's terminal history instead of
+                        # making that history disable this plan's next step.
+                        desire = None
                     strength = step.get("strength")
                     if strength is None:
                         dimension = "initiative" if step["actor"] == "contact" else "curiosity"

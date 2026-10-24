@@ -4,6 +4,13 @@ import json
 from typing import Literal
 
 from pydantic import Field, model_validator
+from . import recipient
+from .companions import XIAOGUANG
+
+def decision_key(activity, person=None):
+    person = person or recipient.current()
+    return activity if person == XIAOGUANG else activity + "@" + person
+
 
 from eventmem.core.db import Conflict, Missing
 from eventmem.core.models import Model
@@ -14,8 +21,9 @@ VIEW = 12
 
 
 class SharingDecision(Model):
-    exploration_id: str | None = Field(default=None, min_length=1, max_length=100)
-    activity_ref: dict | None = None
+    recipient_person_id: Literal["person:xiaoguang", "person:yiyi", "group:family"] | None = None
+    exploration_id: str | None = Field(default=None, min_length=1, max_length=100, description="已存在的探索 ID，与 activity_ref 至少提供一项。")
+    activity_ref: dict | None = Field(default=None, description="已存在活动的原始引用；与 exploration_id 同时提供时须指向同一活动。")
     decision: Literal["share", "defer", "keep", "private", "abandon"]
     reason: str = ""
     reconsider_when: str | None = None
@@ -38,13 +46,18 @@ def apply_decisions(mind, conn, state, proposals, event, receipt, stimulus):
         activity = (validate_activity_ref(mind, proposal.activity_ref, conn=conn) if proposal.activity_ref
                     else canonical_activity_ref(mind, "exploration", proposal.exploration_id, conn=conn))
         exploration_id = activity["id"] if activity["kind"] == "exploration" else None
-        key = exploration_id or "dream:" + activity["id"]
+        person = proposal.recipient_person_id or recipient.current()
+        key = decision_key(exploration_id or "dream:" + activity["id"], person)
+        if person != XIAOGUANG:
+            from .companions import Companions
+            if not Companions(mind.engine, mind.scope).visible(conn, activity["source_id"], person):
+                raise Missing("Activity is not visible to this sharing recipient")
         decisions = state.setdefault("exploration_decisions" if exploration_id else "activity_decisions", {})
         row = conn.execute("SELECT data FROM mind_explorations WHERE id=? AND scope=?",
                            (exploration_id, mind.scope.key())).fetchone() if exploration_id else None
         previous = decisions.get(key)
         moved = False
-        if previous is None and exploration_id:
+        if previous is None and exploration_id and person == XIAOGUANG:
             # A decision that moved to the archive is still the decision this result has: judged
             # against it exactly as in the document, and brought back only to be written again.
             from .exploration_decision_archive import archived
@@ -74,13 +87,14 @@ def apply_decisions(mind, conn, state, proposals, event, receipt, stimulus):
             from .exploration_decision_archive import revive
             revive(mind, conn, state, exploration_id)
         decisions[key] = {
-            **proposal.model_dump(), "exploration_id": exploration_id, "activity_ref": activity, "source_ids": [activity["source_id"]],
+            **proposal.model_dump(), "recipient_person_id": person, "exploration_id": exploration_id, "activity_ref": activity, "source_ids": [activity["source_id"]],
             "revision": (previous or {}).get("revision", 0) + int(not previous or any(previous.get(k) != getattr(proposal, k) for k in ("decision", "reconsider_when"))),
             "updated_at": mind.clock(), "event_id": event.command_id,
             "agent_version": event.agent_version, "evidence": provenance, "runtime": receipt,
         }
         if proposal.decision in {"keep", "private", "abandon", "defer"}:
             for desire in state["desires"].values():
+                if desire.get("recipient_person_id", XIAOGUANG) != person:continue
                 linked = desire.get("activity_ref") or {"kind": "exploration", "id": desire.get("exploration_id")}
                 if (linked.get("kind"), linked.get("id")) != (activity["kind"], activity["id"]) or desire["status"] in {"completed", "abandoned"}:
                     continue
@@ -130,7 +144,7 @@ def require_activity_share(mind, conn, state, activity_ref):
     activity = validate_activity_ref(mind, activity_ref, conn=conn)
     if activity["kind"] == "exploration":
         return require_share(mind, conn, state, activity["id"])
-    decision = state.get("activity_decisions", {}).get("dream:" + activity["id"])
+    decision = state.get("activity_decisions", {}).get(decision_key("dream:" + activity["id"]))
     if not decision or decision["decision"] != "share" or not _decision_fresh(mind, conn, decision):
         raise Conflict("This activity has no current decision to communicate")
     validate_activity_ref(mind, decision["activity_ref"], conn=conn)
@@ -138,8 +152,8 @@ def require_activity_share(mind, conn, state, activity_ref):
 
 
 def require_share(mind, conn, state, exploration_id):
-    decision = state.get("exploration_decisions", {}).get(exploration_id)
-    if decision is None:
+    decision = state.get("exploration_decisions", {}).get(decision_key(exploration_id))
+    if decision is None and recipient.current() == XIAOGUANG:
         # One that moved still supplies the activity's current sharing choice.
         from .exploration_decision_archive import archived
         decision = archived(conn, mind.scope.key(), exploration_id)

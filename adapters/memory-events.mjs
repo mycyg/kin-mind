@@ -116,6 +116,7 @@ export function deliveryEvent(record,{channel='feishu',batchId,expectedBubbles,a
   if(!at)throw Error('Delivery observation needs the persisted receipt timestamp');
   return {id:`delivery:${channel}:${record.id}:${state}`,kind:'delivery',at,
     channel,delivery_id:batchId??record.memoryBatchId??record.id,bubble_id:record.id,
+    ...(record.route?{recipient_person_id:record.route.person_id,conversation_key:record.route.conversation_key,conversation_kind:record.route.recipient_kind==='group'?'group':'p2p',chat_id:record.route.chat_id,audience_person_ids:record.audience_person_ids??[],delivery_route:record.route,input_source_ids:record.inputSourceIds??[]}:{}),
     ...(record.conversationId??record.conversation_id?{conversation_id:record.conversationId??record.conversation_id}:{}),
     ...(expectedBubbles??record.expectedBubbles?{expected_bubbles:expectedBubbles??record.expectedBubbles}:{}),
     text:record.text||record.media?.transcript||'',state,...(record.messageId?{message_id:record.messageId}:{}),
@@ -234,7 +235,7 @@ export const ARTIFACT_OBSERVED_BYTES=512*1024*1024;
 export const ARTIFACT_PENDING_MS=30*60000;
 export const ARTIFACT_PENDING_MAX=200;
 export class ToolArtifactObserver {
-  constructor({journal,task=()=>null,clock=()=>new Date().toISOString(),now=()=>Date.now()}) {Object.assign(this,{journal,task,clock,now});this.before=new Map();}
+  constructor({journal,task=()=>null,identity=()=>({}),clock=()=>new Date().toISOString(),now=()=>Date.now()}) {Object.assign(this,{journal,task,identity,clock,now});this.before=new Map();}
   update(update) {
     if(!update.toolCallId)return;
     const id=update.toolCallId;
@@ -242,7 +243,7 @@ export class ToolArtifactObserver {
     const paths=[...(update.locations??[]).map(l=>l.path),update.rawInput?.path,update.rawInput?.file_path].filter(p=>typeof p==='string'&&path.isAbsolute(p));
     if(update.status==='failed'){this.before.delete(id);return;}
     if(update.status!=='completed') {
-      const previous=this.before.get(id)??Object.assign(new Map(),{since:this.now()});
+      const previous=this.before.get(id)??Object.assign(new Map(),{since:this.now(),identity:this.identity()});
       previous.kind=update.kind??previous.kind;
       for(const file of paths)if(!previous.has(file))previous.set(file,this.stat(file));
       this.before.set(id,previous);return;
@@ -258,7 +259,7 @@ export class ToolArtifactObserver {
       let artifact;try{artifact=this.capture(file,artifactId);}catch{continue;}
       if(!artifact)continue;
       this.journal.append({id:`tool-artifact:${id}:${index}`,kind:created?'artifact-created':'artifact-observed',
-        at:this.clock(),actor:created?'Kin':'unknown',tool_call_id:id,task_id:this.task(),artifact});
+        at:this.clock(),...(before?.identity??this.identity()),actor:created?(before?.identity?.actor??this.identity().actor??'Kin'):'unknown',tool_call_id:id,task_id:this.task(),artifact});
     }
   }
   capture(file,artifact_id=null) {
@@ -283,8 +284,8 @@ export const TOOL_ACTIVITY_PENDING_MS=30*60000,TOOL_ACTIVITY_PENDING_MAX=200;
  * it is first seen. Calls that never finish are forgotten after
  * TOOL_ACTIVITY_PENDING_MS, and at most TOOL_ACTIVITY_PENDING_MAX are kept (AD2-12). */
 export class ToolActivityObserver {
-  constructor({root,scope=null,session=()=>null,owner=()=>false,scenario='companion',now=()=>Date.now()}) {
-    Object.assign(this,{root,scope,session,owner,scenario,now});this.calls=new Map();
+  constructor({root,scope=null,session=()=>null,owner=()=>false,scenario='companion',identity=()=>({}),now=()=>Date.now()}) {
+    Object.assign(this,{root,scope,session,owner,scenario,identity,now});this.calls=new Map();
   }
   update(update) {
     if(!update?.toolCallId)return;
@@ -292,13 +293,13 @@ export class ToolActivityObserver {
     const id=update.toolCallId,known=this.calls.get(id);
     let owner=known?.owner;
     if(owner===undefined)try{owner=Boolean(this.owner());}catch{owner=false;}
-    const call={...known,id,owner,since:known?.since??this.now(),...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
+    const call={...known,id,owner,identity:known?.identity??this.identity(),since:known?.since??this.now(),...Object.fromEntries(['title','kind','rawInput','rawOutput','content','status'].filter(key=>update[key]!==undefined).map(key=>[key,update[key]]))};
     if(!['completed','failed'].includes(update.status)){this.calls.set(id,call);return;}
     this.calls.delete(id);
     if(!owner)return;
     try {
       const record=toolExperience(call,{session:this.session(),scope:this.scope,scenario:this.scenario});
-      if(record)spoolHostEvent(this.root,record);
+      if(record){Object.assign(record.payload,call.identity);spoolHostEvent(this.root,record);}
     } catch{/* Tool activity is an observation; it never decides the turn. */}
   }
   prune() {

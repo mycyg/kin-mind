@@ -19,6 +19,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
 from eventmem.core.engine import DERIVED_CONFLICTS
 from eventmem.core.models import Model, RecordInput, SourceInput
 
+from . import recipient
 from . import memory_formation, memory_items, settling
 from .autonomy_schema import optimized
 from .computer import redact
@@ -63,13 +64,17 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 # The quiet-review interval Kin may choose (N8, set by kin_mind.appraisal). The stored
 # review_min/max_minutes keys stay readable for older configurations and bound nothing now.
 REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
+
+def review_minutes(value, maximum=None):
+    return max(REVIEW_FLOOR_MINUTES, min(maximum or REVIEW_CEILING_MINUTES, value))
+
 # What `appraisal_input_budget` may be set to: enough for an ordinary request, and no more than
 # the model's window (deepseek-flash: 1,048,576 tokens).
 APPRAISAL_BUDGET_RANGE = (32000, 1048576)
 # Settings an earlier release registered and nothing reads any more. A stored configuration or a
 # caller that still carries one is not refused for it: it is left out when read, and dropped from
 # the configuration the next time it is written.
-RETIRED_SETTINGS = frozenset({"chunked_reply_review", "rest_review_window", "review_rest_max_minutes"})
+RETIRED_SETTINGS = frozenset({"legacy_drive_thresholds", "idempotency_fingerprint", "semantic_cache_v2", "chunked_reply_review", "rest_review_window", "review_rest_max_minutes"})
 # Kin's own diary (kin-reflection sources) as an assessment is shown it: the latest few, each the start
 # of what was thought. Small on purpose: structured context the compressor leaves as it is.
 REFLECTIONS_SHOWN = 5
@@ -91,16 +96,15 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # Off by default: the fixed score gates that used to decide whether to speak or explore.
             # A score is context, so only an explicit opt-in brings them back. The stored thresholds
             # are left as they are, so switching this on restores the previous behaviour exactly.
-            "legacy_drive_thresholds": False,
             # Default-on optimization: an unchanged wait is recorded without a plan revision.
             "plan_review_record_only": True,
             # Default-on: one refused proposal section no longer fails the whole appraisal.
             "appraisal_section_isolation": True,
             # Stage 2, registered once here and read through autonomy_schema.optimized():
             # each one off restores the stage-1 behavior of its work package.
-            "attempt_ledger": True, "idempotency_fingerprint": True, "manifest_rebase": True,
+            "attempt_ledger": True, "manifest_rebase": True,
             "appraisal_reuse": True, "appraisal_revalidation": True, "model_lanes": True,
-            "semantic_cache_v2": True, "memory_item_isolation": True,
+            "memory_item_isolation": True,
             # Stage 3: purpose-typed recall. Off restores `history` admitting self-knowledge, the
             # prefix-only envelope filters, relation seeds taken before validation and bare labels.
             "recall_purpose_policy": True,
@@ -219,13 +223,16 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             "memorable_marks": False}
 
 
+MEMORY_LINK_HELP = "about_ids 连接记忆：填已有 mem_/src_/graph_ ID 或本轮 note/graph 的 key；没有链接填 []。人物主体直接写入 content，person:xiaoguang 这类身份 ID 不作记忆链接。"
+
+
 class MemoryNote(Model):
     key: str = Field(min_length=1, max_length=160)
     content: str = Field(min_length=1, max_length=4000)
     title: str = Field(min_length=1, max_length=300)
     kind: Literal["episode", "knowledge", "preference", "commitment"] = "episode"
     evidence_ids: list[str] = Field(min_length=1, max_length=16)
-    about_ids: list[str] = Field(default_factory=list, max_length=12)
+    about_ids: list[str] = Field(default_factory=list, max_length=12, description=MEMORY_LINK_HELP)
 
 
 class MemoryLink(Model):
@@ -391,11 +398,11 @@ class MemoryContinuity:
         if set(values) - set(DEFAULTS):
             raise ValueError("Unknown memory setting")
         for key in ("native_window_context", "records", "semantic", "context", "idle", "operational_lanes", "sharing", "graph", "associations", "graph_recall", "manifests", "manifest_restore", "context_receipts", "continuity_overviews", "continuity_quality", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow", "temperature_ranking", "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "reinforcement_ranking", "procedure_learning", "plan_review_record_only", "appraisal_section_isolation",
-                    "attempt_ledger", "idempotency_fingerprint", "manifest_rebase", "appraisal_reuse",
-                    "appraisal_revalidation", "model_lanes", "semantic_cache_v2", "memory_item_isolation",
+                    "attempt_ledger", "manifest_rebase", "appraisal_reuse",
+                    "appraisal_revalidation", "model_lanes", "memory_item_isolation",
                     "recall_purpose_policy",
                     "trait_ledger", "behavior_chain", "expression_intent", "next_move_audit",
-                    "wish_version_review", "legacy_drive_thresholds",
+                    "wish_version_review",
                     "evidence_key_index", "history_legacy_guard", "liveness_checks",
                     "history_patches", "desire_archive", "archive_memory",
                     "exploration_decision_archive", "sealed_entries",
@@ -499,6 +506,10 @@ class MemoryContinuity:
         if not self.settings()["records"]:
             return {"state": "disabled"}
         event = dict(request)
+        if event.get("kind") in {"exploration-result","artifact-created"}:
+            event.setdefault("actor","agent:kin")
+            event.setdefault("speaker_person_id","agent:kin")
+            event.setdefault("knowledge_basis","model_report")
         # Computed route attention belongs to the host's attend transaction.
         event.pop("attention_marker", None)
         kind = event.get("kind")
@@ -555,7 +566,11 @@ class MemoryContinuity:
                     text=dumps({**observed, "artifact": artifact}) if kind != "owner-message" else observed.get("text", ""),
                     authority=authority, occurred_at=observed["at"], extract=False,
                     metadata={"host_event": kind, "role": "user" if kind == "owner-message" else "assistant",
-                              "runtime_event_id": event_id, "channel": observed.get("channel"), "internal": kind not in {"owner-message", "assistant-message"}},
+                              "runtime_event_id": event_id, "channel": observed.get("channel"), "internal": kind not in {"owner-message", "assistant-message"},
+                              **({"recipient_person_id": observed["recipient_person_id"], "conversation_key": observed.get("conversation_key"),
+                                  "conversation_kind":observed.get("conversation_kind","group" if observed["recipient_person_id"]=="group:family" else "p2p"),"chat_id":observed.get("chat_id") or observed.get("conversation_id"),"audience_person_ids":observed.get("audience_person_ids",[]),
+                                  "speaker_person_id": observed.get("speaker_person_id") if kind == "owner-message" else "agent:kin"}
+                                 if observed.get("recipient_person_id") else {})},
                 ), derived_from=derived_from, shown=shown)["id"]
             # An event that names the sources it was written from -- a creation's summary -- is a
             # derived source: they are checked where it is stored and become its dependencies, and
@@ -679,7 +694,7 @@ class MemoryContinuity:
                 elif event.get("message_id") and prior["message_id"] != event["message_id"]:
                     raise Conflict("Accepted bubble cannot change platform ID")
                 states = {b["state"] for b in share["bubbles"].values()}
-                share.update(channel=event.get("channel"), conversation_id=event.get("conversation_id", share.get("conversation_id")), delivery_id=event.get("delivery_id"), visibility="unverified",
+                share.update(recipient_person_id=event.get("recipient_person_id",share.get("recipient_person_id","owner")), channel=event.get("channel"), conversation_id=event.get("conversation_id", share.get("conversation_id")), delivery_id=event.get("delivery_id"), visibility="unverified",
                              last_at=max(share.get("last_at", event["at"]), event["at"]),
                              expected_bubbles=event.get("expected_bubbles", share.get("expected_bubbles")),
                              source_ids=list(dict.fromkeys([*share["source_ids"], source_id])), record_ids=list(dict.fromkeys([*share["record_ids"], root])))
@@ -697,7 +712,7 @@ class MemoryContinuity:
                                   (event_id, self.scope.key(), kind, event["at"], "", dumps({**event, "artifact": artifact, "source_id": source_id, "receipt": receipt})))
             if kind in settling.CONVERSATION and not event.get("historical"):
                 # The conversation moved: what waits for it to be quiet waits from here (settling).
-                settling.push(conn, self.scope.key(), settling.minutes(self.settings(conn)))
+                settling.push(conn, self.scope.key(), settling.minutes(self.settings(conn)), event.get("recipient_person_id", "person:xiaoguang"))
             return {"id": event_id, "seq": cursor.lastrowid, "state": "recorded", **receipt}
 
     def _optional_sources(self, conn, identifier):
@@ -761,10 +776,10 @@ class MemoryContinuity:
 
     def semantic_context(self, query="", event_limit=24, *, operational=False):
         with self.engine.db.connect() as conn:
-            row = conn.execute("SELECT * FROM mind_semantic_cursor WHERE scope=?", (self.scope.key(),)).fetchone()
+            row = recipient.cursor(conn,self.scope.key(),"mind_semantic_cursor")
             cursor = dict(row) if row else {"seq": 0, "next_review": self.mind.clock(), "revision": 0, "data": "{}"}
-            pending = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND COALESCE(json_extract(data,'$.historical'),0)=0 ORDER BY seq LIMIT ?", (self.scope.key(), cursor["seq"], event_limit)).fetchall()
-            latest_owner_seq = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope.key(),)).fetchone()[0]
+            pending = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND " + recipient.predicate() + " AND seq>? AND COALESCE(json_extract(data,'$.historical'),0)=0 ORDER BY seq LIMIT ?", (self.scope.key(), cursor["seq"], event_limit)).fetchall()
+            latest_owner_seq = conn.execute("SELECT COALESCE(MAX(seq),0) FROM mind_runtime_events WHERE scope=? AND " + recipient.predicate() + " AND kind='owner-message' AND COALESCE(json_extract(data,'$.historical'),0)=0", (self.scope.key(),)).fetchone()[0]
         recent = recent_dialogue(self.mind)
         if not query:
             owner_messages = [e for e in recent if e.get("kind") == "owner-message"]
@@ -959,7 +974,7 @@ class MemoryContinuity:
             note_ended(data, data["job_id"], state)
             cursor = data["through_seq"]
         with self.engine.db.connect() as conn:
-            rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND seq>? AND json_extract(data,'$.historical')=1 ORDER BY seq LIMIT 16", (self.scope.key(), cursor)).fetchall()
+            rows = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND " + recipient.predicate() + " AND seq>? AND json_extract(data,'$.historical')=1 ORDER BY seq LIMIT 16", (self.scope.key(), cursor)).fetchall()
             sources, unavailable = [], 0
             for source_id in dict.fromkeys(json.loads(r["data"])["source_id"] for r in rows):
                 # A source deleted since it was recorded is passed over; asking for it would
@@ -993,7 +1008,7 @@ class MemoryContinuity:
             return None
         with self.engine.db.connect() as conn:
             table = "mind_action_schedule" if config["operational_lanes"] else "mind_semantic_cursor"
-            row = conn.execute(f"SELECT * FROM {table} WHERE scope=?", (self.scope.key(),)).fetchone()
+            row = recipient.cursor(conn,self.scope.key(),table)
         return dict(row) if row and timestamp(row["next_review"]) <= timestamp(self.mind.clock()) else None
 
     def queue_idle(self, actions):
@@ -1015,10 +1030,9 @@ class MemoryContinuity:
 
         `next_minutes` is Kin's own choice, ten minutes to a day (N8); the stored review range
         no longer narrows it."""
-        minutes = max(REVIEW_FLOOR_MINUTES, min(max_minutes or REVIEW_CEILING_MINUTES, next_minutes))
+        minutes = review_minutes(next_minutes, max_minutes)
         next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
-        conn.execute("INSERT INTO mind_action_schedule VALUES(?,?,1,?) ON CONFLICT(scope) DO UPDATE SET next_review=excluded.next_review,revision=revision+1,data=excluded.data",
-                     (self.scope.key(), next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes, "last_success": self.mind.clock()})))
+        recipient.save_cursor(conn,self.scope.key(),"mind_action_schedule",next_at=next_at,data={"event_id":event_id,"receipt":receipt,"minutes":minutes,"last_success":self.mind.clock()})
         for ref in refs:
             conn.execute("INSERT OR IGNORE INTO mind_semantic_sources VALUES(?,?,?)", (self.scope.key(), ref["source_id"], event_id))
 
@@ -1141,10 +1155,9 @@ class MemoryContinuity:
         if schedule:
             # The cursor follows the events this evaluation was given and scored, withheld or not:
             # held back, it would hand an already scored event to a full appraisal a second time.
-            minutes = max(REVIEW_FLOOR_MINUTES, min(max_minutes or REVIEW_CEILING_MINUTES, next_minutes))
+            minutes = review_minutes(next_minutes, max_minutes)
             next_at = (timestamp(self.mind.clock()) + timedelta(minutes=minutes)).isoformat()
-            conn.execute("INSERT INTO mind_semantic_cursor(scope,seq,next_review,revision,data) VALUES(?,?,?,1,?) ON CONFLICT(scope) DO UPDATE SET seq=MAX(seq,excluded.seq),next_review=excluded.next_review,revision=revision+1,data=excluded.data",
-                         (self.scope.key(), through_seq, next_at, dumps({"event_id": event_id, "receipt": receipt, "minutes": minutes})))
+            recipient.save_cursor(conn,self.scope.key(),"mind_semantic_cursor",seq=through_seq,next_at=next_at,data={"event_id":event_id,"receipt":receipt,"minutes":minutes})
         return items.records()
 
     def _apply_items(self, conn, items, assessment, refs, event_id, receipt):
@@ -1212,8 +1225,15 @@ class MemoryContinuity:
             with items.item("note", key) as live:
                 if not live:
                     continue
-                for identifier in note.about_ids:
-                    for root in self._record_ids(conn, resolve(identifier)):
+                for index, identifier in enumerate(note.about_ids):
+                    try:
+                        roots = self._record_ids(conn, resolve(identifier))
+                    except Missing as error:
+                        error.target = identifier
+                        error.field = "memory." + key + ".about_ids[" + str(index) + "]"
+                        error.hint = MEMORY_LINK_HELP
+                        raise
+                    for root in roots:
                         if aliases[note.key] != root:
                             self.engine._relation(conn, aliases[note.key], "about", root, {"basis": "inferred", "event_id": event_id})
         for key, link in zip(memory_items.positions("links", assessment.links), assessment.links):

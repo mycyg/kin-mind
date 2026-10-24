@@ -103,6 +103,7 @@ def handle(engine, event, payload, *, receipt_only=False):
                 else "explicit",
                 metadata={
                     "host_event": event,
+                    **{k:payload[k] for k in ('speaker_person_id','recipient_person_id','conversation_key','actor') if k in payload},
                     "tool": tool,
                     "action": arguments,
                     "outcome": result,

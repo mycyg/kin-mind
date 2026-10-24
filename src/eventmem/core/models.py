@@ -244,7 +244,29 @@ class ContactPolicy(Model):
         return value
 
 
+class CompanionDelivery(Model):
+    mode: Literal["text", "voice", "both"] = "text"
+    schema_version: Literal[1] = 1
+    channel: Literal["feishu"] = "feishu"
+    person_id: Literal["person:xiaoguang", "person:yiyi"]
+    app_id: str = Field(pattern=r"^cli_[A-Za-z0-9_-]+$")
+    open_id: str = Field(pattern=r"^ou_[A-Za-z0-9_-]+$")
+    chat_id: str = Field(pattern=r"^oc_[A-Za-z0-9_-]+$")
+    conversation_key: str
+    binding_revision: int = Field(ge=1)
+    requester_person_id: Literal["person:xiaoguang", "person:yiyi"]
+    request_conversation_key: str
+    source_input_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def conversation_matches(self):
+        if self.conversation_key != f"feishu:{self.app_id}:{self.chat_id}":
+            raise ValueError("Route conversation mismatch")
+        return self
+
+
 class ScheduleInput(Model):
+    companion_delivery: CompanionDelivery | None = None
     command_id: str
     policy_id: str = "default"
     record_id: str

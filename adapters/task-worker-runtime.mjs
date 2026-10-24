@@ -71,7 +71,7 @@ export async function kinTaskWorker(params) {
     if(run.cancelRequested){run.state='interrupted';api.clearThreadHandlers(run.threadId);return view(run);}
     run.state='running';
     run.done=api.runTurn({threadId:run.threadId,input:[{type:'text',text:params.input,text_elements:[]}],cwd:parent.cwd,
-      approvalPolicy:'never',sandboxPolicy:parent.agentMode.sandboxPolicy,model:modelId.model,effort:modelId.effort,summary:'none'},id=>{
+      approvalPolicy:'never',sandboxPolicy:parent.agentMode.sandboxPolicy,model:modelId.model,effort:modelId.effort,summary:'none',collaborationMode:createCodexCollaborationMode(this.codexAcpClient.getCollaborationMode(params.sessionId),modelId.toString())},id=>{
       run.turnId=id;if(run.cancelRequested)void api.turnInterrupt({threadId:run.threadId,turnId:id}).catch(()=>{});
     }).then(result=>{
       run.turnId=result.turn.id;run.state=result.turn.status==='completed'?'completed':result.turn.status==='interrupted'?'interrupted':'failed';

@@ -44,35 +44,35 @@ def outcomes(mind):
     return liveness_read(mind, "contact", now=timestamp(mind.clock()).timestamp())["contact_failures"]["outcomes_24h"]
 
 
-def test_a_failed_draft_waits_as_the_hosts_and_never_as_her_decision(setup):
+def test_native_draft_reason_survives_contact_settlement(setup):
+    mind, source, clock = setup
+    wish(mind, source, "rain", content="Tell her about the rain")
+    attempt = mind.claim_contact(owner_epoch="owner-1")
+    failure = {"category": "model-unavailable", "stage": "contact-draft-model",
+               "code": "fork-draft-failed", "retry_condition": "backoff", "model_invoked": False,
+               "native_error": "no-completed-turn", "native_reason": "native-history-unavailable",
+               "native_stage": "not-started"}
+    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-not-started", failure=failure)
+    _, data = row(mind, attempt["id"])
+    for key, value in failure.items():
+        assert data["failure"][key] == value
+
+
+def test_a_failed_draft_records_technical_failure_without_changing_kins_wish(setup):
     mind, source, clock = setup
     wish(mind, source, "rain", content="Tell her about the rain")
     attempt = mind.claim_contact(owner_epoch="owner-1")
     did = attempt["desire_ids"][0]
+    before = raw_wish(mind, did)
     mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-failed", failure=LIMIT)
     state, data = row(mind, attempt["id"])
-    assert state == "canceled"
-    assert "decision" not in data and "decisions" not in data, "no decision of hers is made up"
-    held = {"action": "wait", "reason": "Draft generation or parsing failed", "condition": "time",
-            "retry_after_seconds": CONTACT_WAIT_MIN_SECONDS, "decided_by": "host", "cause": "draft-failed"}
-    assert data["host_wait"] == held and data["host_waits"] == {did: held}
-    assert data["failure"]["code"] == "mind-worker-output-limit"
-    # The backoff is as it was: five minutes, the failure counted on the wish.
-    stored = raw_wish(mind, did)
-    assert stored["status"] == "waiting" and stored["contact_failures"] == 1
-    wait = stored["contact_wait"]
-    assert (wait["decided_by"], wait["cause"], wait["condition"]) == ("host", "draft-failed", "time")
-    assert (timestamp(wait["retry_at"]) - timestamp(wait["since"])).total_seconds() == CONTACT_WAIT_MIN_SECONDS
-    # What Kin is shown says it was the host's: the state, and the part a contact draft reads.
-    assert shown_wish(mind, did)["contact_wait"]["decided_by"] == "host"
-    projected = interaction_projection(mind.read())
-    assert next(d for d in projected["desires"] if d["id"] == did)["contact_wait"]["decided_by"] == "host"
-    # The count of how attempts ended: the host's, not a wait of hers.
+    assert state == "canceled" and data["failure"]["code"] == "mind-worker-output-limit"
+    assert not {"decision", "decisions", "host_wait", "host_waits"} & data.keys()
+    assert raw_wish(mind, did) == before, "technical retry state belongs to the attempt, not a semantic wish"
     assert outcomes(mind) == {"sent": 0, "unconfirmed": 0, "kin_wait": 0, "kin_abandon": 0, "host": 1}
-    # Her initiative facts: a contact wish unsent a day, held by the host.
     clock[0] += timedelta(hours=25)
     unsent = initiative.facts(mind)["contact_wishes_unsent_a_day"]
-    assert [(entry["desire_id"], entry["status"], entry.get("wait_decided_by")) for entry in unsent] == [(did, "waiting", "host")]
+    assert [(entry["desire_id"], entry["status"]) for entry in unsent] == [(did, "wanted")]
 
 
 def test_her_own_wait_stays_her_decision(setup):
@@ -103,14 +103,13 @@ def test_an_older_row_is_read_by_its_words_and_its_reason_and_left_as_it_is(setu
     with mind.engine.db.connect(write=True) as conn:
         state, data = conn.execute("SELECT state,data FROM mind_contacts WHERE id=?", (attempt["id"],)).fetchone()
         data = json.loads(data)
-        held = data.pop("host_wait")
-        data.pop("host_waits")
-        old = {k: v for k, v in held.items() if k not in ("decided_by", "cause")}
+        # Load the old persisted shape explicitly; the current writer no longer creates it.
+        old = {"action": "wait", "reason": "Draft generation or parsing failed", "condition": "time", "retry_after_seconds": CONTACT_WAIT_MIN_SECONDS}
         data.update(decision=old, decisions={did: old})
         conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (json.dumps(data), attempt["id"]))
         current = mind._load(conn)
-        for key in ("decided_by", "cause"):
-            current["desires"][did]["contact_wait"].pop(key)
+        current["desires"][did]["status"] = "waiting"
+        current["desires"][did]["contact_wait"] = {**old, "since": mind.clock(), "retry_at": (timestamp(mind.clock()) + timedelta(seconds=CONTACT_WAIT_MIN_SECONDS)).isoformat()}
         mind._save(conn, current)
     assert "decided_by" not in raw_wish(mind, did)["contact_wait"]
     assert shown_wish(mind, did)["contact_wait"]["decided_by"] == "host", "known by the host's words"
@@ -131,23 +130,18 @@ def test_an_older_row_is_read_by_its_words_and_its_reason_and_left_as_it_is(setu
     assert not host_wait({"reason": "Draft generation or parsing failed", "decided_by": "kin"}) and not host_wait(None)
 
 
-def test_every_wait_the_host_makes_is_marked_and_known_by_its_words(setup):
-    """Each way an attempt ends without her decision: marked as the host's, and its words among those an
-    older row is known by (HOST_WAIT_REASONS), so the two never drift apart."""
+def test_every_technical_cancel_leaves_the_semantic_wish_unchanged(setup):
     mind, source, _clock = setup
     for reason in ("draft-failed", "draft-not-started", "contact-review-failed", "draft-source-changed",
                    "contact-source-changed", "repeats-unconfirmed-send", "draft-sources-deleted", "draft-empty"):
         wish(mind, source, "wish-" + reason, content="A wish for " + reason)
         attempt = mind.claim_contact(owner_epoch="owner-1")
+        before = {identifier: raw_wish(mind, identifier) for identifier in attempt["desire_ids"]}
         mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason=reason)
-        wait = raw_wish(mind, attempt["desire_ids"][0])["contact_wait"]
-        assert (wait["decided_by"], wait["cause"]) == ("host", reason)
-        assert wait["reason"] in HOST_WAIT_REASONS, reason
+        for identifier, value in before.items():
+            assert raw_wish(mind, identifier) == value
         _, data = row(mind, attempt["id"])
-        assert "decision" not in data and data["host_wait"]["cause"] == reason
-        # A wish set aside asks Kin to review it, and that review would hold the next claim: taken as done.
-        with mind.engine.db.connect(write=True) as conn:
-            conn.execute("DELETE FROM mind_action_events WHERE scope=?", (mind.scope.key(),))
+        assert "decision" not in data and "host_wait" not in data
     assert outcomes(mind)["host"] == 8
 
 

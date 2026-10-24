@@ -490,10 +490,12 @@ function kinSteerAccepted(state, params) {
  * read-only mode with those reads approved, and every other MCP server disabled
  * (PROBE.md). A budget bounds the fork; a late turn is interrupted.
  *
- * The fork always ends at a completed turn (CR-RT-12): the one the host names, the
+ * A nonempty thread's fork ends at a completed turn (CR-RT-12): the one the host names, the
  * newest this ACP saw complete, or else the newest the native history lists as
- * completed (a bounded read, newest first). Without one, or when the history cannot
- * be read in its documented shape, no fork is made: `no-completed-turn`, with the
+ * completed (a bounded read, newest first). A handoff with zero turns can fork its
+ * restored context; the fork must still have zero turns before its draft starts.
+ * Other histories without a completed turn, or histories that cannot be read,
+ * make no draft: `no-completed-turn`, with the
  * reason. Each tool call is reported as `{name, ok, ids, idsTruncated, idsTruncatedBy?}`
  * (CR-MIND-08, CL6E-MM-04). `ids` are the store's source and record ids (`src_`, `mem_`)
  * the call's completed result carries anywhere -- values, keys, JSON carried as text (a
@@ -530,6 +532,7 @@ export function patchKinAssessment(source) {
     for (let pages = 0; pages < 4; pages++) {
       const page = await kinWithin(api.threadTurnsList({ threadId, cursor, limit: 50, sortDirection: "desc", itemsView: "notLoaded" }), deadline, "timeout");
       if (!kinHistoryPage(page)) return { reason: "native-history-malformed" };
+      if (pages === 0 && page.data.length === 0 && page.nextCursor === null) return { empty: true };
       const turn = page.data.find((item) => item.status === "completed");
       if (turn) return { turnId: turn.id };
       cursor = page.nextCursor;
@@ -655,6 +658,7 @@ function kinToolResultIds(item, turn) {
     if (!state) return end("failed", { error: "session-not-loaded" });
     const input = typeof params.input === "string" && params.input ? [{ type: "text", text: params.input, text_elements: [] }] : Array.isArray(params.input) && params.input.length ? params.input : null;
     if (!requestId || !input || !params.outputSchema || typeof params.outputSchema !== "object" || Array.isArray(params.outputSchema)) return end("failed", { error: "invalid-request" });
+    const execution = params.execution && ["creation", "exploration"].includes(params.execution.kind) && typeof params.execution.capability === "string" ? params.execution : null;
     const deadline = started + Math.min(Math.max(Number(params.timeoutMs) || 120000, 1000), 900000);
     const api = this.codexAcpClient.appServerClient;
     let turnId = null, turnDone = false, usage = null, stopped = false;
@@ -669,29 +673,59 @@ function kinToolResultIds(item, turn) {
       api.clearThreadHandlers(threadId);
     };
     try {
-      // The fork ends at a completed turn: the one named, the newest this ACP saw
-      // complete, or the newest the native history lists as completed. Without one no
-      // fork is made; the cutoff is never left out.
+      // A restored model-handoff thread may have context but no turn yet. Only a
+      // confirmed empty history uses that context directly; unreadable history or
+      // nonempty history without a completed cutoff still cannot start a draft.
       let lastTurnId = typeof params.lastTurnId === "string" && params.lastTurnId ? params.lastTurnId : state.kinLastCompletedTurnId;
-      if (!lastTurnId) {
+      let emptyHistory = false;
+      if (!lastTurnId && params.detachedContext !== true) {
         const latest = await kinLatestCompletedTurn(api, params.sessionId, deadline);
-        if (!latest.turnId) return end("failed", { error: "no-completed-turn", reason: latest.reason });
+        if (!latest.turnId && !latest.empty) return end("failed", { error: "no-completed-turn", reason: latest.reason });
+        emptyHistory = latest.empty === true;
         lastTurnId = latest.turnId;
       }
       const selectedModel = ModelId.fromString(state.currentModelId);
-      // K3 belongs only to the main conversation. Assessment, contact and topic
-      // forks use the existing DeepSeek gateway without changing the main thread.
-      const modelId = selectedModel.model === "k3" ? { model: "deepseek-flash", effort: "high" } : selectedModel;
+      // Self-contained evaluations always use the existing DS/high profile.
+      // Drafts and executions retain their explicit model policy; main is unchanged.
+      const modelId = params.detachedContext === true || ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(selectedModel.model) && params.preserveModel !== true ? ModelId.create("deepseek-flash", "high") : selectedModel;
       const config = await kinWithin(this.codexAcpClient.createSessionConfig(state.cwd, state.additionalDirectories ?? [], []), deadline, "timeout");
       const servers = await kinWithin(this.codexAcpClient.getConfigMcpServerNames(state.cwd), deadline, "timeout");
       for (const name of servers) if (name !== "memorypalace") config[\`mcp_servers.\${name}.enabled\`] = false;
-      if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": "writes" });
-      Object.assign(config, KIN_FORK_CLOSED);
-      if (selectedModel.model === "k3") Object.assign(config, { service_tier: "default", "features.fast_mode": false, model_reasoning_effort: "high" });
-      const forkPromise = api.threadFork({ threadId: params.sessionId, lastTurnId, ephemeral: true, excludeTurns: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: "read-only", config });
+      if (servers.has("memorypalace")) Object.assign(config, { "mcp_servers.memorypalace.env.KIN_MCP_MODE": execution ? "internal-execution" : "read-only", "mcp_servers.memorypalace.default_tools_approval_mode": execution ? "approve" : "writes", ...(execution ? {"mcp_servers.memorypalace.env.KIN_EXECUTION_CAPABILITY":execution.capability} : {}) });
+      // Materialize MCP overrides once: a root table must not erase dotted capability env.
+      const loaded = await api.configRead({cwd:state.cwd,includeLayers:false});
+      const serverConfig = structuredClone(loaded?.config?.mcp_servers ?? {});
+      for (const [name,value] of Object.entries(config.mcp_servers ?? {})) serverConfig[name] = {...serverConfig[name],...structuredClone(value),env:{...serverConfig[name]?.env,...value.env}};
+      for (const key of Object.keys(config).filter(key=>key.startsWith("mcp_servers."))) {
+        const parts=key.slice("mcp_servers.".length).split(".");let cursor=serverConfig;
+        for(const part of parts.slice(0,-1))cursor=cursor[part]??={};
+        cursor[parts.at(-1)]=structuredClone(config[key]);delete config[key];
+      }
+      for(const [name,server] of Object.entries(serverConfig)){if(name!=="memorypalace")server.enabled=false;for(const key of ["startup_timeout_sec","tool_timeout_sec"])if(server[key]===null||server[key]==="")delete server[key];}
+      if(serverConfig.memorypalace){
+        serverConfig.memorypalace.env={...serverConfig.memorypalace.env,KIN_MCP_MODE:execution?"internal-execution":"read-only",...(execution?{KIN_EXECUTION_CAPABILITY:execution.capability}:{})};
+        serverConfig.memorypalace.default_tools_approval_mode=execution?"approve":"writes";
+      }
+      config.mcp_servers=serverConfig;
+      const executionShell = execution?.kind === "creation";
+      const closed = {...KIN_FORK_CLOSED};
+      if (executionShell) for (const key of ["features.shell_tool","features.unified_exec","features.view_image"]) delete closed[key];
+      Object.assign(config, closed);
+      if (modelId.model === "deepseek-flash" || ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(selectedModel.model)) Object.assign(config, { service_tier: "default", "features.fast_mode": false, model_reasoning_effort: "high" });
+      // A self-contained assessment keeps persona/config and scoped read tools, not
+      // the main conversation's private transcript. Each request supplies its full schema/state.
+      if (params.detachedContext === true && execution) return end("failed", { error: "detached-execution-not-supported" });
+      const threadOptions = { ephemeral: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: executionShell ? state.agentMode.sandboxMode : "read-only", config };
+      const forkPromise = params.detachedContext === true ? api.threadStart(threadOptions) : api.threadFork({ ...threadOptions, threadId: params.sessionId, lastTurnId, excludeTurns: true });
       void forkPromise.then((fork) => { if (stopped && result.forkThreadId === null) void release(fork.thread.id); }, () => {});
       const fork = await kinWithin(forkPromise, deadline, "timeout");
+      result.contextMode = params.detachedContext === true ? "detached" : "fork";
+      result.inputCharacters = typeof params.input === "string" ? params.input.length : null;
       result.forkThreadId = fork.thread.id;
+      // Ephemeral forks cannot expose turns. Confirm the source stayed empty
+      // through the fork, before allowing any model request from that snapshot.
+      if (emptyHistory && !(await kinLatestCompletedTurn(api, params.sessionId, deadline)).empty)
+        return end("failed", { error: "empty-thread-changed", reason: "source-history-no-longer-empty" });
       result.model = fork.model ?? modelId.model;
       result.modelProvider = typeof fork.modelProvider === "string" ? fork.modelProvider : null;
       result.reasoningEffort = modelId.effort;
@@ -701,7 +735,11 @@ function kinToolResultIds(item, turn) {
       });
       const forkThreadId = result.forkThreadId;
       stage = "unknown";
-      const outcome = await kinWithin(api.runTurn({ threadId: forkThreadId, input, cwd: state.cwd, approvalPolicy: "never", sandboxPolicy: { type: "readOnly", networkAccess: false }, summary: "none", model: modelId.model, effort: modelId.effort, outputSchema: params.outputSchema }, (id) => {
+      // K3's strict final-output grammar suppressed tool calls in the real execution replay.
+      // Keep the full contract in the final-answer instruction; the host still validates it before commit.
+      const promptedSchema = execution && ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(modelId.model);
+      const executionInput = promptedSchema ? [...input, { type: "text", text: "仅最终结果遵循下面的 JSON Schema；先完成本轮要求的工具调用，工具调用不是最终 JSON。最终只输出 JSON，宿主会验证：" + JSON.stringify(params.outputSchema), text_elements: [] }] : input;
+      const outcome = await kinWithin(api.runTurn({ threadId: forkThreadId, input: executionInput, cwd: state.cwd, approvalPolicy: "never", sandboxPolicy: executionShell ? state.agentMode.sandboxPolicy : { type: "readOnly", networkAccess: false }, summary: "none", model: modelId.model, effort: modelId.effort, collaborationMode: createCodexCollaborationMode(this.codexAcpClient.getCollaborationMode(params.sessionId), modelId.toString()), ...(promptedSchema ? {} : { outputSchema: params.outputSchema }) }, (id) => {
         turnId = id;
         stage = "started";
         if (stopped) void interrupt(forkThreadId, id);
@@ -721,7 +759,7 @@ function kinToolResultIds(item, turn) {
       result.rawText = text;
       if (turn.status === "interrupted") return end("interrupted");
       if (turn.status !== "completed") return end("failed", { error: turn.error?.message ?? turn.status ?? "failed" });
-      try { result.output = JSON.parse(text); } catch { return end("failed", { error: "invalid-output" }); }
+      try { result.output = JSON.parse(text); } catch (error) { return end("failed", { error: { code: "invalid-output", message: String(error?.message ?? error).slice(0, 1000) } }); }
       return end("completed");
     } catch (error) {
       stopped = true;
@@ -739,7 +777,7 @@ function kinToolResultIds(item, turn) {
   source = replaceOnce(source, '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);',
     '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);\n    if (method === "_kin/assess") return await this.kinAssess(params);', 'ACP assessment dispatch');
   source = replaceOnce(source, '.onRequest("_kin/runtime",',
-    '.onRequest("_kin/assess", external_exports.object({sessionId: external_exports.string(), requestId: external_exports.string(), input: external_exports.unknown(), outputSchema: external_exports.unknown(), timeoutMs: external_exports.number().optional(), lastTurnId: external_exports.string().optional()}), (ctx) => getAgent().extMethod("_kin/assess", ctx.params)).onRequest("_kin/runtime",', 'ACP assessment registration');
+    '.onRequest("_kin/assess", external_exports.object({sessionId: external_exports.string(), requestId: external_exports.string(), input: external_exports.unknown(), outputSchema: external_exports.unknown(), timeoutMs: external_exports.number().optional(), lastTurnId: external_exports.string().optional(), preserveModel: external_exports.boolean().optional(), detachedContext: external_exports.boolean().optional(), execution: external_exports.object({kind:external_exports.string(),capability:external_exports.string()}).optional()}), (ctx) => getAgent().extMethod("_kin/assess", ctx.params)).onRequest("_kin/runtime",', 'ACP assessment registration');
   if (!source.includes('async kinCompact(') || !source.includes('function kinWithin(')) throw Error('ACP assessment needs the compaction bound helper');
   return mark(source, assessmentMarker);
 }

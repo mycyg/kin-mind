@@ -160,6 +160,8 @@ def revision_of(state, identifier):
     """The revision of this exploration's decision wherever it now lives: the document's own, else
     the one the document records for it having moved, else None. Read from the document alone, so
     a commit transaction can ask it of the state it holds."""
+    from .exploration_decisions import decision_key
+    identifier = decision_key(identifier)
     live = (state.get("exploration_decisions") or {}).get(identifier)
     if live is not None:
         return live.get("revision")
@@ -178,7 +180,7 @@ def holds(conn, mind, state, at, *, days=DAYS, keep=KEEP):
     decisions = state.get("exploration_decisions") or {}
     # Compared as moments rather than as text: the stamps are written at several precisions.
     floor = timestamp(at) - timedelta(days=max(0, days))
-    ordered = [entry["exploration_id"] for entry in newest(state)]
+    ordered = [entry["exploration_id"] for entry in newest(state) if entry.get("recipient_person_id", "person:xiaoguang") == "person:xiaoguang"]
     window = set(ordered[:VIEW])
     dated = [i for i in ordered if decisions[i].get("updated_at")]
     recent = set([i for i in dated if timestamp(decisions[i]["updated_at"]) > floor][:max(0, keep)])

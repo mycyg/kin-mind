@@ -11,15 +11,16 @@ const HOUR=3600000;
 async function fixture(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-work-chat-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const clock={now:10000};let summaries=0;const told=[];
-  const runtime={known:true,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
-    model:'gpt-6.1-sol',modelProvider:'custom-gateway',reasoningEffort:'medium',serviceTierPreference:'fast',fastMode:'on',
-    providerOverride:false,active:false,queued:0,backgroundTasks:0,pendingDeliveries:0};
+  const runtime={known:true,profileReady:true,handoffTasks:0,sessionId:'synthetic',threadId:'synthetic',nativeSessionId:'synthetic',nativeStatus:'idle',
+    model:'deepseek-flash',modelProvider:'custom-gateway',reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',
+    providerOverride:true,active:false,queued:0,backgroundTasks:0,pendingDeliveries:0};
   const router=new MobileRouter({file:path.join(root,'router.json'),sessionId:'synthetic',now:()=>++clock.now,
     inspect:async()=>({...runtime}),classify:async({text})=>({route:text==='work'?'work':'chat',reason:'synthetic'}),
-    switchModel:async()=>assert.fail('chat must preserve work model'),waitForIdle:async()=>assert.fail('unexpected wait')});
+    switchModel:async(model,profile)=>{Object.assign(runtime,{model,modelProvider:profile.provider??'custom-gateway',providerOverride:profile.providerKind==='gateway',reasoningEffort:profile.reasoningEffort,serviceTierPreference:profile.serviceTierPreference,fastMode:profile.serviceTierPreference==='fast'?'on':'off'});return {...runtime};},waitForIdle:async()=>assert.fail('unexpected wait')});
   await router.dispatch({id:'original',kind:'owner',text:'work'},async()=> 'new-turn');
+  await router.requestMode({mode:'work',commandId:'accept',sourceInputId:'original',reason:'I will do it'});
+  await router.applyPendingMode();
   const task=router.currentTask();
-  await router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept',completedTaskId:task.id,completedInputVersion:1,reason:'I will do it'});
   await router.observe('prompt-start',{taskId:task.id,inputVersion:1,turnFence:0,inputIds:['original']});runtime.active=true;runtime.nativeStatus='active';
   let dispatch;
   await router.dispatch({id:'chat',kind:'owner',text:'想你啦'},async d=>{dispatch=d;return 'steered';});

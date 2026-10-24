@@ -6,9 +6,9 @@ from half a conversation, and the correction or the answer that came after becam
 own. Emotion, wishes and the contact decision are untouched by this: the action lane still runs
 every turn. Only the memory lane waits.
 
-* **When.** An enrichment job made with the setting on is available at the scope's last
+* **When.** An enrichment job made with the setting on is available at its recipient's last
   conversation activity -- an owner message, an assistant message or a delivery, by the time it
-  happened -- plus the setting's minutes. Each new conversation event moves every waiting job to
+  happened -- plus the setting's minutes. Each new conversation event moves that recipient's waiting jobs to
   the new time (`push`), from the event's own time, so the jobs of one conversation wait together.
   The latest activity being an outreach of Kin's own (a delivery of `OUTREACH_ORIGINS`) keeps the
   conversation open for its answer up to `OUTREACH_WAIT_MINUTES`.
@@ -28,6 +28,7 @@ from __future__ import annotations
 from eventmem.core.db import Missing, digest
 
 from .state import timestamp
+from . import recipient
 
 SETTING = "enrichment_settle_minutes"
 SETTLE_RANGE = (0, 1440)
@@ -50,13 +51,14 @@ def minutes(settings):
     return value if type(value) is int and value > 0 else 0
 
 
-def due(conn, scope, settle_minutes):
-    """When the scope's conversation will have been quiet `settle_minutes`, in epoch seconds, or
+def due(conn, scope, settle_minutes, person=None):
+    """When this recipient's conversation will have been quiet `settle_minutes`, in epoch seconds, or
     None when it has had none."""
     row = conn.execute(
         "SELECT kind,occurred_at,json_extract(data,'$.origin') AS origin FROM mind_runtime_events "
         "WHERE scope=? AND kind IN (?,?,?) AND COALESCE(json_extract(data,'$.historical'),0)=0 "
-        "ORDER BY julianday(occurred_at) DESC,seq DESC LIMIT 1", (scope, *CONVERSATION)).fetchone()
+        "AND COALESCE(json_extract(data,'$.recipient_person_id'),'person:xiaoguang')=? "
+        "ORDER BY julianday(occurred_at) DESC,seq DESC LIMIT 1", (scope, *CONVERSATION, person or recipient.current())).fetchone()
     if not row:
         return None
     wait = settle_minutes
@@ -72,17 +74,33 @@ def available(conn, scope, settle_minutes, now):
     return now if quiet is None else quiet
 
 
-def push(conn, scope, settle_minutes):
+def push(conn, scope, settle_minutes, person=None):
     """Every job still waiting for the conversation waits from its latest event. Inside the
     transaction that records the event."""
     if not settle_minutes or not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisals'").fetchone():
         return 0
-    quiet = due(conn, scope, settle_minutes)
+    person = person or recipient.current()
+    quiet = due(conn, scope, settle_minutes, person)
     if quiet is None:
         return 0
     return conn.execute("UPDATE mind_appraisals SET available=? WHERE scope=? AND state='pending' AND available<>? "
-                        "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.settle')=1",
-                        (quiet, scope, quiet, STIMULUS)).rowcount
+                        "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.settle')=1 "
+                        "AND COALESCE(json_extract(data,'$.recipient_person_id'),'person:xiaoguang')=?",
+                        (quiet, scope, quiet, STIMULUS, person)).rowcount
+
+
+def recover(conn, scope, settle_minutes):
+    """Normal startup corrects waiting deadlines from durable, recipient-attributed events.
+
+    Claimed jobs lose `settle`, so this cannot move retry backoff or resume quarantined work.
+    It changes no evidence, task identity, receipt or memory scope.
+    """
+    if not settle_minutes or not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisals'").fetchone():
+        return 0
+    people = conn.execute("SELECT DISTINCT COALESCE(json_extract(data,'$.recipient_person_id'),'person:xiaoguang') "
+                          "FROM mind_appraisals WHERE scope=? AND state='pending' "
+                          "AND json_extract(data,'$.stimulus')=? AND json_extract(data,'$.settle')=1", (scope, STIMULUS)).fetchall()
+    return sum(push(conn, scope, settle_minutes, row[0]) for row in people)
 
 
 def evidence_tokens(engine, conn, identifiers, cache):

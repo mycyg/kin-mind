@@ -688,7 +688,8 @@ class Continuity:
             concern = state.get("concerns", {}).get(cid)
             if (
                 not concern
-                or concern["revision"] != revision
+                or concern.get("revision") != revision
+                or concern.get("status") not in {"active", "easing"}
                 or low_confidence(concern)
                 or not self._concern_fresh(conn, concern)
             ):

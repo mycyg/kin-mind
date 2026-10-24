@@ -145,6 +145,14 @@ class Traits:
         return json.loads(row[0]) if row else None
 
     def _save(self, conn, trait, command, at):
+        previous = self._find(conn, trait["id"]) if trait.get("revision", 0) > 1 else None
+        reinforced = bool(
+            previous
+            and previous.get("status") in EFFECTIVE
+            and trait.get("status") in EFFECTIVE
+            and trait.get("action") != "revise"
+            and (previous.get("text") or "").strip() == (trait.get("text") or "").strip()
+        )
         trait["updated_at"] = at
         conn.execute("INSERT INTO mind_traits VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                      "category=excluded.category,status=excluded.status,revision=excluded.revision,"
@@ -153,12 +161,12 @@ class Traits:
         conn.execute("INSERT OR REPLACE INTO mind_trait_history VALUES(?,?,?,?,?)",
                      (trait["id"], trait["revision"], command, at, dumps(trait)))
         # The one place a trait is written, so it is the one place that has to tell what rested on
-        # it. A revision it no longer has is not this trait any more; a cached judgment that rested
-        # on it proves two requests were equal, never that the trait behind them still holds.
+        # it. A revision that changes its text or ends it invalidates dependents; a reinforcement of
+        # the exact same text keeps them valid.
         from . import trait_refs
         from .judgment_cache import invalidate
         trait_refs.trait_moved(conn, self.scope, trait["id"], trait["revision"], at,
-                               ended=trait["status"] not in EFFECTIVE)
+                               ended=trait["status"] not in EFFECTIVE, reinforced=reinforced)
         invalidate(conn, [trait["id"]])
         return trait
 

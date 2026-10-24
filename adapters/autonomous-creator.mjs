@@ -71,8 +71,8 @@ const pause=ms=>new Promise(resolve=>{setTimeout(resolve,ms);});
 const within=(promise,ms)=>{let timer;return Promise.race([promise,new Promise(resolve=>{timer=setTimeout(resolve,ms);})]).finally(()=>clearTimeout(timer));};
 const inlineTable=values=>'{'+Object.entries(values).map(([key,value])=>key+'='+JSON.stringify(value)).join(', ')+'}';
 export class AutonomousCreator {
-  constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env,executions=null,stopCapMs=9000}){
-    Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env,executions,stopCapMs});this.child=null;this.current=null;
+  constructor({command,root,model='gpt-6-sol',reasoning='medium',fast=false,modelCatalog,verifier,spawnImpl=spawn,env=process.env,executions=null,stopCapMs=9000,nativeRun=null}){
+    Object.assign(this,{command,root,model,reasoning,fast,modelCatalog,verifier,spawnImpl,env,executions,stopCapMs,nativeRun});this.child=null;this.current=null;
   }
   /** The run is settled: its final answer keeps no words (CL6-MM-07). */
   settled({plan,step,run}){
@@ -89,6 +89,7 @@ export class AutonomousCreator {
   }
   async run({plan,step,run,brief}, {signal,timeoutMs=1200000,onHeartbeat=async()=>({state:'renewed'})}={}){
     if(this.current)throw Error('Creation executor is already running');
+    if(this.nativeRun)return this.runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat});
     if(typeof this.executions?.open!=='function')throw Error('Creation needs the host\'s execution records');
     const directory=creationWorkspace(this.root,plan,step);
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
@@ -151,6 +152,39 @@ export class AutonomousCreator {
       await execution.settle();
       if(this.child===child)this.child=null;
       this.current=null;finished();
+    }
+  }
+  async runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat}){
+    const directory=creationWorkspace(this.root,plan,step),started=Date.now();
+    fs.mkdirSync(directory,{recursive:true,mode:0o700});
+    const lastFile=path.join(directory,'.result-'+run.id+'.json'),controller=new AbortController();
+    let finish,heartbeatBusy=false;
+    const done=new Promise(resolve=>{finish=resolve;});
+    const cancel=()=>controller.abort();this.current={interrupt:cancel,done};
+    signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
+    const timer=setTimeout(cancel,timeoutMs);
+    const heartbeat=setInterval(async()=>{if(heartbeatBusy)return;heartbeatBusy=true;try{if((await onHeartbeat()).state!=='renewed')cancel();}catch{cancel();}finally{heartbeatBusy=false;}},20000);
+    const execution=this.executions.open({kind:'creation-verification',action:'create'});
+    try{
+      const answer=await this.nativeRun({id:'creation:'+run.id,kind:'creation',timeout_ms:timeoutMs,schema,
+        system:'这是 KIN 沿主会话上下文在隔离执行回合继续自己的创作步骤。使用已有工具，在给定 workspace 制作和核验产物，只完成本步。保留已有检查点、复用未变文件。不要发送消息、改人设、扩大权限或读取渠道凭据。需要外部新证据时记录缺口交给探索。最终返回 schema JSON，artifacts 用相对 workspace 路径。产物核验与完成评估由原宿主继续。',
+        context:{actor:'agent:kin',workspace:directory,plan:{id:plan.id,goal:plan.goal,motivation:plan.motivation},step,brief,
+          host_verification_capabilities:this.verifier?.capabilities()??{static_html_render:false}}},{signal:controller.signal});
+      const native=answer.receipt??{};
+      const receipt={executor:native.channel==='fork'?'native-isolated-session':'native-main-session',native_receipt:native,model:native.model,reasoning:native.reasoning,
+        thread_id:native.fork_thread_id??native.native_session_id,native_turn_id:native.native_turn_id,run_id:run.id,workspace:directory,
+        elapsed_ms:Date.now()-started,usage:native.usage??null,usage_status:native.usage?'reported':'unknown'};
+      if(controller.signal.aborted||answer.reason==='owner-preempted')return {state:'interrupted',receipt,checkpoint:directory};
+      if(answer.state!=='complete'||!receipt.thread_id||!receipt.native_turn_id)return {state:'failed',receipt,reason:'native-run-incomplete',checkpoint:directory};
+      const output=answer.result;
+      if(!Array.isArray(output?.artifacts)||!output.artifacts.length||output.artifacts.length>24||!Array.isArray(output.remaining)||typeof output.summary!=='string')return {state:'failed',receipt,reason:'invalid-result-shape'};
+      writeJsonAtomic(lastFile,output,{previous:false});
+      const artifacts=artifactManifest(directory,output.artifacts,run.id);
+      const produced={state:'produced',produced_at:new Date().toISOString(),receipt,artifacts,summary:output.summary,verification:output.verification,remaining:output.remaining};
+      return this.verifier?await this.verifier.verify(produced,{signal:controller.signal,env:{[MARK_ENV]:execution.mark}}):produced;
+    }finally{
+      clearTimeout(timer);clearInterval(heartbeat);signal?.removeEventListener('abort',cancel);
+      await execution.settle();this.current=null;finish();
     }
   }
 }

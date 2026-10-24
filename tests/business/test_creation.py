@@ -165,3 +165,38 @@ def test_reruns_of_one_step_are_one_work(env,tmp_path):
         works={json.loads(r[0])['receipt'].get('work_id') for r in conn.execute("SELECT data FROM mind_runtime_events WHERE kind='artifact-created'")}
     from kin_mind.memory import MemoryContinuity
     assert works=={MemoryContinuity(mind)._id('work',['plan-step',run['plan_id'],run['step_id']])}
+
+def test_y_creation_artifact_and_completion_both_keep_trusted_recipient(env,tmp_path):
+    from kin_mind.companion_view import CompanionView,companion_scope
+    from eventmem.core.db import Missing
+    mind=env[0]
+    with companion_scope(CompanionView(mind.engine,mind.scope,'person:yiyi','synthetic:y-private')):
+        mind,plans,run,result,config=ready(env,tmp_path)
+        request={'run_id':run['id'],'owner':'worker','fence':1,'result':result}
+        assert accept_result(mind,config,request,Review())['state']=='completed'
+        with mind.engine.db.connect() as conn:
+            rows=[json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_runtime_events WHERE kind IN ('artifact-created','task-result')")]
+        assert {r['kind'] for r in rows}=={'artifact-created','task-result'}
+        assert all(r['recipient_person_id']=='person:yiyi' and r['actor']=='agent:kin' and r['conversation_key']=='synthetic:y-private' for r in rows)
+    with pytest.raises(Conflict,match='Unknown creator run'):
+        accept_result(mind,config,request,Review())
+
+@pytest.mark.parametrize('channel',['legacy','fork'])
+@pytest.mark.parametrize('case',['complete','wrong-session','missing-turn','wrong-model'])
+def test_shared_creator_requires_actual_main_receipt_and_still_verifies_artifacts(env,tmp_path,case,channel):
+    mind,plans,run,result,config=ready(env,tmp_path)
+    config['companion']={'shared_session':True}
+    result['receipt'].update(executor='native-main-session',model='k3',thread_id='same-main',native_turn_id='turn-7',
+        native_receipt={'channel':'legacy','native_session_id':'same-main','native_turn_id':'turn-7'})
+    if channel=='fork':
+        result['receipt'].update(executor='native-isolated-session',thread_id='isolated')
+        result['receipt']['native_receipt'].update(channel='fork',fork_thread_id='isolated')
+    result['receipt'].pop('exit_code')
+    request={'run_id':run['id'],'owner':'worker','fence':1,'result':result,
+             'native_review_session_id':'same-main','native_review_profile':{'model':'k3'}}
+    if case=='wrong-session':request['native_review_session_id']='someone-else'
+    if case=='missing-turn':result['receipt']['native_receipt'].pop('native_turn_id')
+    if case=='wrong-model':result['receipt']['model']='old-creator-model'
+    if case=='complete':assert accept_result(mind,config,request,Review())['state']=='completed'
+    else:
+        with pytest.raises(Conflict):accept_result(mind,config,request,Review())

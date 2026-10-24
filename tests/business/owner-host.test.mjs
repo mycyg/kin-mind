@@ -43,15 +43,17 @@ test('a pre-model source change does not count as a draft failure',async()=>{con
 test('a draft that never started only waits; one that started or cannot be placed is a drafting failure (CR2-INT-06)',async()=>{
  const settleFor=async failure=>{const error=Error('private detail');error.failure=failure;const{loop,events}=fixture({draft:async()=>{throw error;},send:async()=>assert.fail('must not send')});await loop.tick();return events.at(-1)[1];};
  // WS4 (h:abd70aa): a draft fork the ACP says never started ran no model.
- const unmade=await settleFor({category:'model-unavailable',stage:'contact-draft-model',code:'fork-draft-failed',retry_condition:'backoff',model_invoked:false});
+ const native={native_error:'no-completed-turn',native_reason:'native-history-unavailable',native_stage:'not-started'};
+ const unmade=await settleFor({category:'model-unavailable',stage:'contact-draft-model',code:'fork-draft-failed',retry_condition:'backoff',model_invoked:false,...native});
+ for(const [key,value] of Object.entries(native))assert.equal(unmade.failure[key],value);
  assert.deepEqual([unmade.state,unmade.reason,unmade.failure.model_invoked],['canceled','draft-not-started',false]);
  // No mind worker could run, or a release freeze refused the fork before it began (CR-MIND-01).
  assert.equal((await settleFor({category:'model-unavailable',stage:'mind-worker',code:'mind-worker-unavailable',retry_condition:'backoff',model_invoked:false})).reason,'draft-not-started');
  assert.equal((await settleFor({category:'source-changed',stage:'contact-draft-source',code:'dispatch-frozen',retry_condition:'source-change',model_invoked:false})).reason,'draft-not-started');
- // A fork that started, or one nobody can place (unknown: null, dropped), still counts.
+ // A fork that started, or one nobody can place (unknown: null, retained), still counts.
  assert.equal((await settleFor({category:'model-unavailable',stage:'contact-draft-model',code:'fork-draft-failed',retry_condition:'backoff',model_invoked:true})).reason,'draft-failed');
  const unknown=await settleFor({category:'model-unavailable',stage:'contact-draft-model',code:'fork-draft-timeout',retry_condition:'backoff',model_invoked:null});
- assert.deepEqual([unknown.reason,'model_invoked' in unknown.failure],['draft-failed',false]);
+ assert.deepEqual([unknown.reason,unknown.failure.model_invoked],['draft-failed',null]);
  // A source that really moved before the model is still that, and a model output fault is a failure.
  assert.equal((await settleFor({category:'source-changed',stage:'contact-draft-source',code:'contact-runtime-mismatch',retry_condition:'source-change',model_invoked:false})).reason,'draft-source-changed');
  assert.equal((await settleFor({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision',model_invoked:false})).reason,'draft-failed');
@@ -196,7 +198,7 @@ for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
   let state,epoch='owner-1',busy=false,eligible=true,first=true,sends=0,claims=0;
   const loop=new MindLoop({eligibility:()=>({eligible}),ownerEpoch:()=>epoch,isBusy:()=>busy,
    draft:async()=>({action:'send',text:'A current thought'}),send:async()=>{sends++;return{state:'accepted',messageId:'receipt'};},
-   resume:async()=>assert.fail('a proven unsent attempt must not require transport reconciliation'),
+   resume:async candidate=>{assert.equal(candidate.attempt_id,'attempt-1');sends++;return {state:'accepted',messageId:'receipt'};},
    call:async(action,request)=>{
     if(action==='candidate')return ['pending','unconfirmed'].includes(state)
      ?{eligible:false,reason:'attempt-in-progress',state,attempt_id:'attempt-'+claims}:{eligible:true};
@@ -218,10 +220,12 @@ for(const boundary of ['owner-input','busy','quiet','closed','write-error']) {
    }});
   loop.review=async()=>{};
   const result=await loop.tick();
-  assert.equal(result.state,'canceled');assert.equal(result.aborted_before_send,true);assert.equal(sends,0);
+  const retained=['busy','quiet','closed'].includes(boundary);
+  assert.equal(result.state,retained?'pending':'canceled');assert.equal(sends,0);
+  if(!retained)assert.equal(result.aborted_before_send,true);
   if(boundary==='owner-input')assert.equal(result.reason,'contact-source-changed');
   busy=false;eligible=true;loop.closed=false;
-  assert.equal((await loop.tick()).state,'accepted');assert.equal(claims,2);assert.equal(sends,1);
+  assert.equal((await loop.tick()).state,'accepted');assert.equal(claims,retained?1:2);assert.equal(sends,1);
  });
 }
 test('a new owner message does not stop background exploration (N7); closing does, and says it is a shutdown (OPS-04)',async()=>{

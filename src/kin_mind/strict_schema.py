@@ -104,8 +104,8 @@ def _map_values(node):
     return extra if isinstance(extra, dict) else {}
 
 
-def _entry(value):
-    return {"type": "object", "properties": {"key": {"type": "string"}, "value": value},
+def _entry(value, key=None):
+    return {"type": "object", "properties": {"key": key or {"type": "string"}, "value": value},
             "required": ["key", "value"], "additionalProperties": False}
 
 
@@ -132,7 +132,7 @@ def _encode(node):
                 "properties": {name: child if name in required else _with_null(child) for name, child in encoded.items()},
                 "required": list(properties), "additionalProperties": False, **_words(node)}
     if shape == "map":
-        return {"type": "array", "items": _entry(_encode(_map_values(node))), **_words(node, (_ENTRIES,))}
+        return {"type": "array", "items": _entry(_encode(_map_values(node)), _encode({"type": "string", **node.get("propertyNames", {})})), **_words(node, (_ENTRIES,))}
     if shape == "any":
         return {"type": "string", **_words(node, (_JSON_TEXT,))}
     if shape == "array":

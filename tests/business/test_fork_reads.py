@@ -73,11 +73,11 @@ def test_a_draft_back_after_what_it_read_was_deleted_keeps_no_words_in_any_table
     assert waited["state"] == "canceled" and waited["reason"] == "draft-sources-deleted"
     assert read_record in waited["evaluated_ids"] and MARKER not in json.dumps(waited, ensure_ascii=False)
     desire = stored_wish(mind, did)
-    assert desire["status"] == "waiting" and desire["contact_wait"]["condition"] == "time"
+    assert desire["status"] == "wanted" and "contact_wait" not in desire
     assert "reason_evidence_ids" not in desire and MARKER not in desire["reason"]
     # Drafted again five minutes later, from what is there then.
     clock[0] += timedelta(seconds=301)
-    assert mind.reconsider_contacts(owner_epoch="owner-1")["resumed"] == [did]
+    assert mind.reconsider_contacts(owner_epoch="owner-1")["resumed"] == []
     again = mind.claim_contact(owner_epoch="owner-1")
     mind.engine.delete(shown_source)
     held = mind.settle_contact(attempt_id=again["id"], state="pending", desire_ids=[did], text=f"还记得 {MARKER} 的灯吗",
@@ -85,7 +85,7 @@ def test_a_draft_back_after_what_it_read_was_deleted_keeps_no_words_in_any_table
     assert held["state"] == "canceled" and held["reason"] == "draft-sources-deleted"
     assert not {"text_excerpt", "text_digest", "chosen"} & set(held)
     assert {shown_source, shown_record} <= set(held["evaluated_ids"])
-    assert stored_wish(mind, did)["status"] == "waiting"
+    assert stored_wish(mind, did)["status"] == "wanted"
     settle(mind.engine)
     assert texts_everywhere(mind.engine, MARKER) == set()
     assert mind.read()["contact_unconfirmed"] == [] and mind.contact_candidate()["reason"] != "attempt-in-progress"
@@ -304,13 +304,17 @@ def test_a_host_reason_that_replaces_kins_is_no_copy_and_stays_when_her_sources_
     attempt = mind.claim_contact(owner_epoch="owner-1")
     mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-failed", desire_ids=[failed])
     assert settle_wishes(mind, apply=True)["settled"] == [moved]
-    expected = {ready: "Declared contact condition became ready: time", failed: "Draft generation or parsing failed", moved: WAITING_REASON}
+    assert stored_wish(mind, failed)["reason"] == f"因为 {MARKER}"
+    assert stored_wish(mind, failed)["reason_evidence_ids"] == [shown_record]
+    expected = {ready: "Declared contact condition became ready: time", moved: WAITING_REASON}
     for did, reason in expected.items():
         assert stored_wish(mind, did)["reason"] == reason and "reason_evidence_ids" not in stored_wish(mind, did)
     mind.engine.delete(shown_source)
     settle(mind.engine)
     for did, reason in expected.items():
         assert stored_wish(mind, did)["reason"] == reason, did
+    assert stored_wish(mind, failed)["reason"] == ERASED
+    assert texts_everywhere(mind.engine, MARKER) == set()
 
 
 class Truncated:

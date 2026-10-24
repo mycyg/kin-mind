@@ -72,8 +72,8 @@ export class ParallelTasks {
     const id='visible-'+hash([source.runId??source.sourceInputId,kind,args.commandId]);
     return this.write(()=>{
       const old=this.router.state.visibleItems[id];
-      if(old){if(old.digest!==hash(body))throw Error('Visible identity conflicts with frozen content');return {id,state:old.state,sequence:old.sequence};}
-      const item={id,...copy(source),...body,digest:hash(body),kind,state:'admitted',sequence:++this.router.state.visibleSequence,
+      if(old){if(JSON.stringify({publicText:old.publicText,presentation:old.presentation,meme:old.meme,important:old.important})!==JSON.stringify(body)||JSON.stringify(old.route??null)!==JSON.stringify(source.route??null)||JSON.stringify(old.answeredInputIds??[])!==JSON.stringify(source.answeredInputIds??[]))throw Error('Visible identity conflicts with frozen content');return {id,state:old.state,sequence:old.sequence};}
+      const item={id,commandId:args.commandId,...copy(source),...body,kind,state:'admitted',sequence:++this.router.state.visibleSequence,
         createdAt:this.now(),expiresAt:kind==='progress'&&!body.important?this.now()+60000:Number.MAX_SAFE_INTEGER};
       if(!this.current(item))throw Error('Expression source is stale');
       this.router.state.visibleItems[id]=item;

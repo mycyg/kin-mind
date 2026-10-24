@@ -62,7 +62,8 @@ from .evidence_refs import DROPPED, is_ref, trace
 SOURCE_ID = re.compile(r"src_[0-9a-f]{32}")
 RECORD_ID = re.compile(r"mem_[0-9a-f]{32}")
 # The facts of a source's metadata a prompt reads, shown under their own names beside the source.
-SOURCE_FACTS = ("host_event", "role", "exploration_id")
+SOURCE_FACTS = ("host_event", "role", "exploration_id", "speaker_person_id", "conversation_key",
+                "conversation_kind", "chat_id", "knowledge_basis", "subject_ids", "participants")
 # A string is parsed only if it names one of these: nothing else can hold what this takes out. Bare
 # words, so JSON carried as text inside JSON (a memory item's line: `"text":"{\"evidence\":...}"`)
 # is found at any depth.

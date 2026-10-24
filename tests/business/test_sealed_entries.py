@@ -400,17 +400,13 @@ def test_a_repair_of_a_proposal_that_may_seal_a_diary_is_never_cached(monkeypatc
     provider = A.DeepSeek("https://api.deepseek.com", A.APPRAISAL_MODEL, "SYNTHETIC_SEALED_KEY")
     monkeypatch.setenv("SYNTHETIC_SEALED_KEY", "synthetic")
 
-    def cache(*args):
-        raise AssertionError("cache read")
-    monkeypatch.setattr(provider, "_cache_get", cache)
+    assert not hasattr(provider, '_cache_get')
     with unrecorded():
-        with pytest.raises(AssertionError, match="cache read"):
-            provider.structured("repair_appraisal", Appraisal, "s", {"proposal": {}})
-        provider.sealing = True
-        with pytest.raises(RuntimeError, match="deepseek-session-required"):
-            provider.structured("repair_appraisal", Appraisal, "s", {"proposal": {}})
-        with pytest.raises(AssertionError, match="cache read"):
-            provider.structured("compress", Appraisal, "s", {})
+        for name in ['repair_appraisal', 'compress']:
+            for sealing in [False, True]:
+                provider.sealing = sealing
+                with pytest.raises(RuntimeError, match="deepseek-session-required"):
+                    provider.structured(name, Appraisal, "s", {"proposal": {}})
 
 
 def test_a_main_session_fork_never_seals(setup):

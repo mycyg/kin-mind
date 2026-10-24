@@ -8,11 +8,12 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from .db import Conflict, Missing, digest
-from .models import ContactPolicy, Model, ScheduleInput, Scope, SourceInput, utc
+from .models import CompanionDelivery, ContactPolicy, Model, ScheduleInput, Scope, SourceInput, utc
 from .scheduler import Scheduler, describe
 
 
 class ContactTaskInput(Model):
+    companion_delivery: CompanionDelivery | None = None
     command_id: str = Field(min_length=1, max_length=200)
     policy_id: str = Field(default="default", min_length=1, max_length=200)
     title: str = Field(min_length=1, max_length=1000)
@@ -98,6 +99,12 @@ class ContactTasks:
                 "policy_id": task.policy_id,
             }
         )
+        if task.companion_delivery:
+            route = task.companion_delivery
+            # This is the expressly addressed message body, not the entire private request.
+            attributes = {**attributes, "companion_audience": list(dict.fromkeys([route.requester_person_id, route.person_id])),
+                          "speaker_person_id": route.requester_person_id, "conversation_key": route.request_conversation_key,
+                          "recipient_person_id": route.person_id, "request_source_id": route.source_input_id}
         source_input = SourceInput(
             namespace=self.namespace,
             key=task.command_id,
@@ -132,6 +139,7 @@ class ContactTasks:
         result = self.scheduler.schedule(
             ScheduleInput(
                 command_id=task.command_id,
+                companion_delivery=task.companion_delivery,
                 policy_id=task.policy_id,
                 record_id=record_id,
                 due_at=task.due_at,

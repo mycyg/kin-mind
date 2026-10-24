@@ -32,7 +32,7 @@ def test_main_session_appraisal_commits_once_without_contact_or_diary(setup):
     assert mind.read()['desires']==[]
     assert len(calls)==1 and calls[0]['profile']==p.profile
     assert '不重复增加成长依据' in calls[0]['system']
-    assert '不调用这些提交工具' in calls[0]['system']
+    assert '最终JSON即本轮提交' in calls[0]['system']
     assert '有效的 DS 决策' not in calls[0]['system']
     with mind.engine.db.connect(write=True) as conn:
         conn.execute("UPDATE mind_appraisals SET state='running',lease=0 WHERE id=?",(job['id'],))
@@ -425,7 +425,7 @@ def test_kin_chooses_when_to_think_again_within_a_day(setup):
     from kin_mind.state import timestamp
     mind, _, _ = setup
     assert [Appraisal(reason='r', next_review_minutes=m).next_review_minutes for m in (5, 600, 3000)] == [10, 600, 1440]
-    assert '10到1440' in SYSTEM
+    assert Appraisal.model_json_schema()['properties']['next_review_minutes']['maximum'] == 1440
     memory = MemoryContinuity(mind)
     with mind.engine.db.connect(write=True) as conn:
         memory.commit_action(conn, [], 'event-n8', 600, {})
@@ -564,8 +564,8 @@ def test_an_idle_assessment_is_told_it_may_start_something(setup):
     jobs.enqueue([source('idle')], 'synthetic-v1')
     assert jobs.run_one(native_provider(mind, exchange))['state'] == 'complete'
     contract = frames[0]['contract']
-    assert '自主起念的机会' in contract and '更新复核时间即可' not in contract
-    assert '确定性公式' not in contract and '不会让想念或主动随时间自己上升' in contract
+    assert '想开口、探索、创作或安静都由你判断' in contract
+    assert '分数帮助描述状态，不决定你有没有资格行动' in contract
     policy = frames[0]['context'].get('state', {}).get('action_policy') or {}
     assert 'provider' not in policy and 'reasoning' not in policy
 
@@ -889,3 +889,85 @@ def test_a_repair_that_fails_like_an_outage_leaves_the_appraisal_that_ran_charge
         assert charged == attempt
         assert state == ('needs-repair' if attempt == MAX_CHARGED_ATTEMPTS else 'pending'), attempt
     assert data['repair_reason'].startswith('charged-attempts-exhausted')
+
+def test_local_lane_refusal_after_native_start_is_admission_not_outage(setup):
+    mind,source,_=setup
+    answer={'state':'waiting','reason':'deepseek-foreground-priority','stage':'started','admission_wait':True,'model_invoked':False,'receipt':{'usage':None}}
+    jobs=Appraisals(mind);job=jobs.enqueue([source('lane-wait')],'synthetic-v1')
+    for _ in range(10):
+        with mind.engine.db.connect(write=True) as conn:
+            conn.execute('UPDATE mind_appraisals SET available=0 WHERE id=?',(job['id'],))
+        assert jobs.run_one(native_provider(mind,lambda request:answer))['state']=='pending'
+    with mind.engine.db.connect() as conn:
+        r=conn.execute('SELECT attempts,data FROM mind_appraisals WHERE id=?',(job['id'],)).fetchone()
+    data=json.loads(r['data']);assert r['attempts']==0 and not data.get('transient_failures') and data['admission_waits']==10
+
+
+@pytest.mark.parametrize("context", [{"stimulus":"session-maintenance"}, {"session_review_required":{"required_output":"session_advice"}}])
+def test_maintenance_schema_requires_real_nonnull_session_judgment(setup, context):
+    from kin_mind.appraisal import appraisal_schema
+    from kin_mind.strict_schema import strict_schema
+    mind,_,_=setup
+    p=native_provider(mind,lambda request:{})
+    schema=strict_schema(appraisal_schema(required=p._required(context)))
+    assert 'session_advice' in schema['required']
+    assert schema['properties']['session_advice']=={'$ref':'#/$defs/SessionAdvice'}
+    assert p._required({})==()
+
+def test_detached_review_uses_ds_budget_and_preserves_explicit_recent_dialogue(setup):
+    from kin_mind.appraisal import APPRAISAL_MODEL, catalog_window
+    mind, _, _ = setup
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('models',?)",
+                     (json.dumps({'summary':{'endpoint':'https://api.deepseek.com'}}),))
+    original={'model':'k3','reasoningEffort':'high','modelContextWindow':128000,'outputReserve':16000,'toolReserve':8000,'detachedContext':True}
+    provider=NativeReview.from_engine(mind.engine,profile=original,exchange=lambda _:None,used_tokens=100000)
+    assert provider.model==APPRAISAL_MODEL
+    assert provider.input_budget==catalog_window()-24000
+    assert original['model']=='k3'
+    frames=[]
+    def native(name,schema,contract,dynamic,timeout):
+        frames.append(dynamic)
+        return {'reason':'No new action.'},{'model':APPRAISAL_MODEL,'native_turn_id':'t','usage':{}}
+    provider._native=native
+    provider._request_appraisal({'operational_only':True},json.dumps({'recent_dialogue':[{'id':'real-source','role':'user','text':'canceled'}],'new_evidence':[]}),None,30,None)
+    assert frames[0]['recent_dialogue'][0]['text']=='canceled'
+
+
+def test_terminal_plan_projection_keeps_settlement_and_refs_not_execution_history():
+    from kin_mind.decision_context import appraisal_plan, compact_plan
+    plan = {"id":"plan-1", "revision":3, "status":"completed", "goal":"finished", "evidence":[{"source_id":"src_x"}],
+            "steps":[{"id":"s1", "state":"completed", "goal":"work", "completion":"checked", "preconditions":"old conditions",
+                      "receipts":[{"id":"receipt-1", "state":"completed", "source_id":"src_result", "complete":True,
+                                   "checkpoint":{"old_prompt":"large history"}}]}]}
+    result=appraisal_plan(plan)
+    assert result["status"]=="completed" and result["evidence"]==plan["evidence"]
+    assert result["steps"][0]["receipt_refs"][0]["source_id"]=="src_result"
+    assert result["steps"][0]["receipt_refs"][0]["complete"] is True
+    assert "old_prompt" not in json.dumps(result)
+    assert "checkpoint" in plan["steps"][0]["receipts"][0]
+    active={**plan,"status":"active"}
+    assert appraisal_plan(active)==compact_plan(active)
+
+
+def test_recipient_agendas_project_terminal_history_without_crossing_audience():
+    from kin_mind.appraisal import _appraisal_context
+    import copy
+    old = {'id':'plan-old','revision':2,'status':'completed','goal':'done',
+           'steps':[{'id':'step','state':'completed','completion':'verified',
+                     'receipts':[{'source_id':'src_done','complete':True,'checkpoint':{'prompt':'old private draft'}}]}]}
+    active = {'id':'wish-active','status':'wanted','content':'new work','evidence':[{'source_id':'src_allowed','text':'needed'}]}
+    done = {'id':'wish-done','status':'abandoned','content':'canceled','recipient_person_id':'person:yiyi',
+            'delivery':{'state':'not-sent'},'decision_receipt':{'usage':123},
+            'evidence':[{'source_id':'src_cancel','record_id':'mem_cancel','revision':3,'authority':'explicit','text':'historical'}]}
+    original={'recipient_targets':{'person:xiaoguang':{'route':{'person_id':'person:xiaoguang'},'plans':[old],'wishes':[active]},
+                                  'person:yiyi':{'route':{'person_id':'person:yiyi'},'plans':[],'wishes':[done]}}}
+    saved=copy.deepcopy(original);result=_appraisal_context(original)['recipient_targets']
+    assert original==saved
+    assert result['person:xiaoguang']['wishes']==[active]
+    assert result['person:yiyi']['wishes'][0]['status']=='abandoned'
+    assert result['person:yiyi']['wishes'][0]['delivery']=={'state':'not-sent'}
+    assert result['person:yiyi']['wishes'][0]['evidence'][0]['source_id']=='src_cancel'
+    assert 'decision_receipt' not in result['person:yiyi']['wishes'][0]
+    assert 'src_cancel' not in json.dumps(result['person:xiaoguang'])
+    assert 'old private draft' not in json.dumps(result)

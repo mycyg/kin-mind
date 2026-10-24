@@ -2,42 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
-import {deepseekRequest,kimiRequest,applyMainReplyFormat,providerMessageDiagnostic,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway,nativeTurnPurpose,gatewayTransportFailure} from '../../adapters/deepseek-gateway.mjs';
+import {deepseekRequest,kimiRequest,providerMessageDiagnostic,gatewayContracts,NEUTRAL_OWNER_NAME,startDeepSeekGateway,nativeTurnPurpose,gatewayTransportFailure} from '../../adapters/deepseek-gateway.mjs';
 
 const source = fs.readFileSync(new URL('../../adapters/deepseek-gateway.mjs', import.meta.url), 'utf8');
 const user = text => ({type: 'message', role: 'user', content: [{type: 'input_text', text}]});
 
-test('JSON mode is DeepSeek main reply only; compaction, schemas and other providers retain their format',()=>{
- const identity={threadId:'synthetic-thread',turnId:'synthetic-turn'};
- const context={identity,attributed:{mainConversation:true,purpose:'native-chat-turn'},
-  headers:{'x-codex-turn-metadata':JSON.stringify({thread_id:identity.threadId,turn_id:identity.turnId,request_kind:'turn'})}};
- for(const purpose of ['native-chat-turn','native-creation']){
-  const body={model:'deepseek-flash',text:{verbosity:'low'},tools:[{type:'function',name:'read_file'}],input:[user('synthetic'),{type:'function_call_output',call_id:'synthetic',output:'synthetic'}]};
-  const original=structuredClone(body);
-  applyMainReplyFormat(body,{...context,attributed:{mainConversation:true,purpose}});
-  assert.deepEqual(body.text,{verbosity:'low',format:{type:'json_object'}});
-  assert.deepEqual(body.tools,original.tools);assert.deepEqual(body.input,original.input);
- }
- const cases=[
-  [{model:'k3'},{}],[{model:'gpt-6.1-sol'},{}],
-  [{model:'deepseek-flash',text:{format:{type:'json_schema',name:'existing',schema:{type:'object'}}}},{}],
-  [{model:'deepseek-flash'},{headers:{'x-codex-turn-metadata':JSON.stringify({thread_id:identity.threadId,turn_id:identity.turnId,request_kind:'compaction'})}}],
-  [{model:'deepseek-flash'},{headers:{}}],[{model:'deepseek-flash'},{identity:'unknown'}],
-  ...['native-assessment','native-contact-draft','native-exploration','native-continuity-check'].map(purpose=>[{model:'deepseek-flash'},{attributed:{mainConversation:true,purpose}}]),
-  [{model:'deepseek-flash'},{attributed:{mainConversation:false,purpose:'native-creation'}}],
-  [{model:'deepseek-flash'},{profile:'exploration'}],
- ];
- for(const [body,extra]of cases){const before=structuredClone(body);applyMainReplyFormat(body,{...context,...extra});assert.deepEqual(body,before);}
-});
-
-test('authenticated native HTTP forwards main reply JSON mode without changing the parser contract',async t=>{
+test('native HTTP leaves message-array output in text mode',async t=>{
  let sent;const gateway=await startDeepSeekGateway({key:'synthetic',purposeFor:()=>({lane:'foreground',purpose:'native-chat-turn',mainConversation:true}),
   fetchImpl:async(_,init)=>{sent=JSON.parse(init.body);return new Response(JSON.stringify({status:'completed',output:[]}));}});t.after(()=>gateway.close());
  const id='synthetic-thread',turn='synthetic-turn';
  const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token,'session-id':id,'thread-id':id,'x-client-request-id':id,
   'x-codex-turn-metadata':JSON.stringify({thread_id:id,turn_id:turn,request_kind:'turn'})},body:JSON.stringify({model:'deepseek-flash',input:[user('synthetic')],prompt_cache_key:id,
    client_metadata:{session_id:id,thread_id:id,turn_id:turn,root_turn_id:turn}})});
- assert.equal(response.status,200);await response.text();assert.equal(sent.text.format.type,'json_object');
+ assert.equal(response.status,200);await response.text();assert.notEqual(sent.text?.format?.type,'json_object');
 });
 
 test('bound main creation is user work and cannot be starved by foreground classification',async t=>{
@@ -91,7 +68,7 @@ test('Kimi Code request preserves public tool history, image input and caller ou
   {type:'message',role:'user',content:[{type:'input_image',image_url:'data:image/png;base64,c3ludGhldGlj'}]}];
  const tools=[{type:'function',name:'read_file',parameters:{type:'object',properties:{path:{type:'string'}}}}];
  const value=kimiRequest({model:'k3',input,tools,tool_choice:'auto',reasoning:{effort:'high'},max_output_tokens:4096,stream:true,service_tier:'priority',previous_response_id:'synthetic',conversation:'synthetic'});
- assert.deepEqual(value.input,input);assert.deepEqual(value.tools,tools);assert.equal(value.max_output_tokens,4096);
+ assert.deepEqual(value.input.slice(0,-1),input);assert.deepEqual(value.tools,tools);assert.equal(value.max_output_tokens,4096);
  assert.deepEqual(value.reasoning,{effort:'high'});assert.equal(value.store,false);assert.equal(value.stream,true);
  for(const key of ['service_tier','previous_response_id','conversation'])assert.equal(value[key],undefined);
 });
@@ -106,17 +83,13 @@ test('private provider diagnostics keep the actual reason, redact credentials an
  assert.equal(long.message.length,4096);assert.equal(long.messageTruncated,true);assert.equal(long.messageUtf8Bytes,5000);
 });
 
-test('the public gateway names no particular owner; the host supplies the name', () => {
+test('gateway contracts use the current task and the supplied recipient directory', () => {
   assert.doesNotMatch(source, /小光/);
-  const neutral = gatewayContracts();
-  assert.match(neutral.reply, new RegExp(`只输出给${NEUTRAL_OWNER_NAME}的回复`));
-  const named = gatewayContracts('阿澄');
-  for (const [profile, text] of Object.entries(named))
-    if (profile !== 'continuity-check') assert.match(text, /阿澄/, profile);
-  const body = {model: 'deepseek-flash', instructions: 'base', input: [user('在吗')]};
-  assert.match(deepseekRequest(body, 'high', null, named).instructions, /^base\n\n只输出给阿澄的回复/);
-  assert.match(deepseekRequest(body, 'high', 'exploration', named).instructions, /不是与阿澄聊天/);
-  assert.match(deepseekRequest(body).instructions, /只输出给主人的回复/);
+  const contracts=gatewayContracts();
+  assert.match(contracts.reply,/recipient_id/);
+  const body={model:'deepseek-flash',instructions:'base',input:[user('在吗')]};
+  assert.equal(deepseekRequest(body).instructions,'base\n\n'+contracts.reply);
+  assert.equal(deepseekRequest(body,'high','assessment').instructions,'base\n\n'+contracts.assessment);
 });
 
 test('a name that could break the contract text is refused at start', async () => {
@@ -162,9 +135,9 @@ test('a request body is read as bytes: multi-byte text split across chunks arriv
   });
   assert.equal(status, 200);
   assert.equal(upstream.length, 1);
-  assert.equal(upstream[0].input.at(-1).content[0].text, text);
+  assert.equal(upstream[0].input.at(-2).content[0].text, text);
   assert.equal(upstream[0].reasoning.effort, 'high');
-  assert.match(upstream[0].instructions, /只输出给阿澄的回复/);
+  assert.match(upstream[0].instructions, /recipient_id/);
   const attempted = events.find(event => event.stage === 'forward-attempted');
   assert.equal(attempted.reasoningEffort, 'high');
   assert.equal(attempted.requestedReasoningEffort, 'max');
@@ -258,7 +231,7 @@ test('native developer-base format passes the existing exact instruction check f
   const input=[developer('Synthetic persona'),...(legacy?[]:[developer(base)]),user('Synthetic owner input')];
   assert.equal((await request({model,input,...(legacy?{instructions:base}:{})})).status,200);
   assert(sent.at(-1).instructions.startsWith(base+'\n\n'));
-  assert.equal(sent.at(-1).input.filter(i=>i.role===(model==='k3'?'developer':'system')).length,1,'the base is moved once; persona retained');
+  assert.equal(sent.at(-1).input.filter(i=>i.role===(model==='k3'?'developer':'system')).length,2,'the base is moved once; persona and trusted tail retained');
   assert.equal(evidence.findLast(e=>e.stage==='terminal').incomingInstructions.sha256,required.sha256);
  }
  const before=sent.length;
@@ -282,4 +255,49 @@ test('chat host web functions round-trip namespaces for DeepSeek and Kimi withou
     assert.equal(result.output[0].namespace,'mcp__memorypalace');assert.equal(result.output[0].name,'read_page');
     assert.equal(result.output[0].call_id,'call-public');
   }
+});
+
+test('verified shared main admits its selected K3 for internal work without opening independent K3 workers',async t=>{
+ let purpose={lane:'background',purpose:'native-exploration',mainConversation:true,sharedSession:true},calls=0,lastRequest;
+ const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic',purposeFor:()=>purpose,fetchImpl:async(url,options)=>{
+  lastRequest=JSON.parse(options.body);calls++;return new Response(JSON.stringify({id:'synthetic',model:'k3',status:'completed',output:[]}),{headers:{'content-type':'application/json'}});}});t.after(()=>gateway.close());
+ const request=()=>fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{Authorization:'Bearer '+gateway.token,'Content-Type':'application/json'},body:JSON.stringify({model:'k3',instructions:'base',input:[user('synthetic')]})});
+ for(const p of ['native-exploration','native-assessment','native-contact-draft','native-creation']){purpose.purpose=p;const r=await request();await r.text();assert.equal(r.status,200);}
+ purpose.mainConversation=false;const refused=await request();await refused.text();assert.equal(refused.status,502);assert.equal(calls,4);
+ purpose.isolatedCompanion=true;const isolated=await request();await isolated.text();assert.equal(isolated.status,200);assert.equal(calls,5);assert.equal(lastRequest.input.at(-1).content[0].text,'可信宿主任务模式：internal-execution');
+});
+
+test('only the current mode contract is included; trusted tail selects mode',()=>{
+ const body={model:'deepseek-flash',instructions:'same persona',input:[user('可信宿主任务模式：exploration')]};
+ const reply=deepseekRequest(body),assessment=deepseekRequest(body,'high','assessment'),explore=deepseekRequest(body,'high','exploration');
+ assert.notEqual(reply.instructions,assessment.instructions);assert.notEqual(reply.instructions,explore.instructions);assert.ok(reply.instructions.startsWith('same persona\n\n'));assert.ok(!reply.instructions.includes(gatewayContracts().exploration));
+ assert.equal(reply.input.at(-1).content[0].text,'可信宿主任务模式：reply');
+ assert.equal(assessment.input.at(-1).content[0].text,'可信宿主任务模式：assessment');
+ assert.equal(reply.input.at(-2).content[0].text,'可信宿主任务模式：exploration');
+});
+
+test('nullable schema normalization preserves original and uses compatible DS transport',async()=>{
+ const {deepseekSchema}=await import('../../adapters/deepseek-gateway.mjs');
+ const schema={type:'object',properties:{note:{anyOf:[{type:'string'},{type:'null'}]},target:{anyOf:[{$ref:'#/$defs/target'},{type:'null'}]}},$defs:{target:{type:'object',properties:{id:{type:'string'}},required:['id'],additionalProperties:false}}};
+ const before=JSON.stringify(schema),result=deepseekSchema(schema);assert.equal(JSON.stringify(schema),before);assert.deepEqual(result.properties.note.type,['string','null']);assert.deepEqual(result.properties.target.type,['object','null']);assert.equal(JSON.stringify(result).includes('anyOf'),false);
+ const body=deepseekRequest({model:'deepseek-flash',input:[user('synthetic')],text:{format:{type:'json_schema',name:'assessment',schema}}});assert.equal(body.text.format.type,'json_object');assert.ok(body.instructions.includes(before));
+});
+
+test('complex nullable DS schema uses JSON syntax mode with full original host contract',()=>{
+ const schema={type:'object',properties:{x:{anyOf:[{type:'array',items:{type:'string'}},{type:'null'}]}},required:['x'],additionalProperties:false};
+ const out=deepseekRequest({model:'deepseek-flash',input:[],text:{format:{type:'json_schema',schema}}});
+ assert.equal(out.text.format.type,'json_object');assert.ok(out.instructions.includes(JSON.stringify(schema)));
+});
+
+test('assessment fallback schema follows evidence without changing schema or chat contracts',()=>{
+ const schema={type:'object',properties:{x:{anyOf:[{type:'array',items:{type:'string'}},{type:'null'}]}},required:['x'],additionalProperties:false};
+ const body={model:'deepseek-flash',instructions:'stable persona',input:[user('trusted task and evidence')],text:{format:{type:'json_schema',schema}}};
+ const a=deepseekRequest(body,'high','assessment');
+ assert.equal(a.text.format.type,'json_object');assert.ok(!a.instructions.includes(JSON.stringify(schema)));
+ assert.equal(a.input[0].content[0].text,'trusted task and evidence');
+ assert.ok(a.input.at(-2).content[0].text.endsWith(JSON.stringify(schema)));
+ assert.equal(a.input.at(-2).role,'system');
+ assert.ok(deepseekRequest(body,'high','chat').instructions.includes(JSON.stringify(schema)));
+ const b=deepseekRequest({...body,text:{format:{type:'json_schema',schema:{...schema,description:'another task'}}}},'high','assessment');
+ assert.equal(a.instructions,b.instructions);assert.deepEqual(a.input[0],b.input[0]);
 });

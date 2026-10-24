@@ -1,3 +1,4 @@
+import json
 """Session continuity storage: where a maintenance judgment travels, what a checkpoint
 build leaves behind, and how much one automatic injection may add to a native window."""
 from kin_mind.context import INJECTION_CEILING, Contexts
@@ -10,6 +11,83 @@ from eventmem.core.models import RecordInput, RevisionInput
 from eventmem.core.read_policy import ReadPolicy
 
 pytest_plugins = ('test_kin_mind',)
+
+
+def test_shared_session_background_checkpoint_can_compress_but_dispatch_cannot(setup, monkeypatch):
+    from kin_mind import host
+    mind, _, _ = setup
+    config = {'root': str(mind.engine.db.root), 'scope': mind.scope.model_dump(),
+              'agent_version': 'synthetic-v1', 'session_id': 'same-main',
+              'companion': {'shared_session': True}}
+    calls, providers = [], []
+    compressor = object()
+    monkeypatch.setattr(host.DeepSeek, 'from_engine', lambda engine: providers.append(engine) or compressor)
+    def build(self, snapshot, binding, **kwargs):
+        calls.append(kwargs)
+        return {'complete': True}
+    monkeypatch.setattr(SessionCheckpoint, 'build', build)
+    request = {'snapshot': {}, 'binding': {'conversationId': 'one-kin', 'generation': 5}}
+    host.dispatch(config, 'session-checkpoint', dict(request))
+    host.dispatch(config, 'session-checkpoint', {**request, 'allow_model': False})
+    host.dispatch(config, 'session-checkpoint', {**request, 'allow_model': False, 'shadow': True})
+    assert len(providers) == 1
+    assert [c['allow_model'] for c in calls] == [True, False, False]
+    assert [c['provider'] for c in calls] == [compressor, None, None]
+
+
+@pytest.mark.parametrize('metadata_heavy,capacity', [(False,None),(True,None),(True,20000)])
+def test_large_checkpoint_recovers_full_coverage_with_existing_summarizer(setup, metadata_heavy, capacity):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    snapshot['items'] = [dict(id=f'event-{i}', revision=1, role='user' if i % 2 == 0 else 'assistant',
+        text=f'合成事件{i}：小光转述一一看过灯塔。' + '这是完整保存的合成日常资料。' * (0 if metadata_heavy else 150),
+        at=f'2026-10-22T01:{i:02}:00Z', basis='explicit', speaker_person_id='person:xiaoguang',
+        conversation_kind='private', conversation_key='synthetic-x' * (300 if metadata_heavy else 1), recipient_person_id='person:xiaoguang') for i in range(16)]
+    binding = {'conversationId': 'one-kin', 'generation': 5}
+    waiting = checkpoints.build(snapshot, binding, allow_model=False, adaptive_budget=True,restore_capacity=capacity)
+    assert not waiting['complete'] and waiting['coverage']['omitted_ids']
+    calls = []
+    class Compressor:
+        def structured(self, name, schema, system, payload, **kwargs):
+            calls.append(payload)
+            return Compression(entries=[{'item_ids': payload['allowed_item_ids'],
+                'summary': '合成私聊中小光转述一一看过灯塔，并非一一直接发言；原文与原时间按来源编号保留。'}], omitted_ids=[]), {'model': 'synthetic', 'usage': {}}
+    restored = checkpoints.build(snapshot, binding, provider=Compressor(), adaptive_budget=True,restore_capacity=capacity)
+    assert calls and restored['complete'], restored.get('waitReason')
+    assert not restored['coverage']['omitted_ids'] and restored['tokens'] <= (capacity or INJECTION_CEILING)
+    if capacity:
+        assert restored['budgetPlan']['reason']=='native-window' and restored['budgetPlan']['limit']==capacity
+        assert restored['tokens'] > INJECTION_CEILING, 'large native recovery is not blocked at the legacy 8k cap'
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' in i['text'] for i in calls[0]['items'])
+    assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
+
+
+def test_checkpoint_reserves_space_for_summary_provenance(setup):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    snapshot['items'] = [dict(id=f'event-{i}-' + 'source-identity-' * 3, revision=1, role='user' if i % 2 == 0 else 'assistant',
+        text=f'合成事件{i}：小光转述一一看过灯塔。' + '这是完整保存的合成日常资料。' * 75,
+        at=f'2026-10-22T01:{i:02}:00Z', basis='explicit', speaker_person_id='person:xiaoguang',
+        conversation_kind='private', conversation_key='synthetic-x', recipient_person_id='person:xiaoguang') for i in range(64)]
+    binding = {'conversationId': 'one-kin', 'generation': 5}
+    waiting = checkpoints.build(snapshot, binding, allow_model=False, adaptive_budget=True)
+    assert not waiting['complete'] and waiting['coverage']['omitted_ids']
+    calls = []
+    class Compressor:
+        def structured(self, name, schema, system, payload, **kwargs):
+            calls.append(payload)
+            return Compression(entries=[{'item_ids': payload['allowed_item_ids'],
+                'summary': '合成私聊中小光转述一一看过灯塔，并非一一直接发言；原文与原时间按来源编号保留。'}], omitted_ids=[]), {'model': 'synthetic', 'usage': {}}
+    restored = checkpoints.build(snapshot, binding, provider=Compressor(), adaptive_budget=True)
+    assert calls and restored['complete'], restored.get('waitReason')
+    assert len(restored['items']) < len(snapshot['items']), 'old exchanges are summarized, not dropped'
+    assert not restored['coverage']['omitted_ids'] and restored['tokens'] <= INJECTION_CEILING
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' in i['text'] for i in calls[0]['items'])
+    assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
 
 
 def public_message(mind, kind='owner-message'):
@@ -273,3 +351,66 @@ def test_recent_dialogue_excludes_platform_metadata(setup):
         'conversation_id':'external-conversation','platform_message_id':'external-message','reply_context':{'text':'platform-context'}})
     items = recent_dialogue(mind)
     assert items and not any(k in item for item in items for k in ('conversation_id','platform_message_id','reply_context','reply_resolution'))
+
+def test_companion_checkpoint_keeps_direct_conversation_separate_from_shared_sources(setup):
+    from kin_mind.companion_host import dispatch_companion
+    from kin_mind.companions import XIAOGUANG as X,YIYI as Y
+    mind,_,_=setup;memory=MemoryContinuity(mind);memory.configure({'records':True,'manifests':False})
+    cfg={'root':str(mind.engine.db.root),'scope':mind.scope.model_dump(),'agent_version':'synthetic-v1','session_id':'synthetic-session'}
+    for person,chat,text in [(X,'chat:x','小光转述：一一喜欢星星'),(Y,'chat:y','一一接入后的第一句')]:
+        identity={'speaker_person_id':person,'conversation_key':chat,'source_message_id':'om_'+chat[-1],'sharing':'ordinary-shared','route':{'chat_id':chat}}
+        dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'anchor-'+chat,'text':text,'at':'2026-10-22T03:10:00Z','received_at':'2026-10-22T03:10:01Z','identity':identity})
+    result=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':'chat:y','action':'session-snapshot','request':{}})
+    assert [i['text'] for i in result['items']]==['一一接入后的第一句']
+    assert result['items'][0]['speaker_person_id']==Y
+    built=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':'chat:y','action':'session-checkpoint','request':{'snapshot':result,'binding':{'conversationId':'chat:y','generation':0},'allow_model':False}})
+    assert built['complete'] and '小光转述' not in json.dumps(built,ensure_ascii=False)
+
+def test_shared_checkpoint_preserves_people_scene_and_business_indices_without_model(setup):
+    from test_kin_mind import wish
+    from kin_mind.companion_view import CompanionView,companion_scope
+    mind,source,clock=setup
+    public_message(mind)
+    with companion_scope(CompanionView(mind.engine,mind.scope,'person:yiyi','chat:y')):
+        wish(mind,source,'y-future',content='synthetic Y wish')
+    cp=SessionCheckpoint(mind,agent_version='synthetic-v1')
+    snap=cp.snapshot(include_business=True)
+    snap['items'][0].update(speaker_person_id='person:yiyi',recipient_person_id='group:family',conversation_kind='group',conversation_key='chat:family',chat_id='oc_synthetic')
+    built=cp.build(snap,{'conversationId':'one','generation':5},allow_model=False,adaptive_budget=True)
+    assert built['complete']
+    payload=built['payload'];item=payload['publicHistory'][0]
+    assert item['speaker_person_id']=='person:yiyi' and item['conversation_kind']=='group' and item['chat_id']=='oc_synthetic'
+    assert payload['businessState']['wishes'][0]['recipient_person_id']=='person:yiyi'
+    assert payload['businessState']['affect']['mood']['value']==mind.read()['dimensions']['mood']['value']
+    assert 'synthetic Y wish' not in json.dumps(payload['businessState'])
+    assert cp.validate(built)['valid']
+
+@pytest.mark.parametrize('capacity',[0,499,True,1000])
+def test_known_insufficient_native_capacity_never_falls_back_to_8k(setup,capacity):
+    mind,_,_=setup
+    cp=SessionCheckpoint(mind,agent_version='synthetic-v1')
+    with pytest.raises(ValueError):
+        cp.build(cp.snapshot(),{'conversationId':'one','generation':1},budget=2000,restore_capacity=capacity)
+
+
+def test_checkpoint_segments_reuse_only_unchanged_sources_and_compress_new_tail(setup):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    ctx=Contexts(mind);calls=[]
+    class Compressor:
+        def structured(self,name,schema,system,payload,**kw):
+            calls.append(payload['allowed_item_ids'])
+            return Compression(entries=[{'item_ids':payload['allowed_item_ids'],'summary':'合成历史摘要，来源时间和对象保持。'}],omitted_ids=[]),{'model':'synthetic','usage':{}}
+    items=[{'id':'event-a','revision':1,'text':'原始合成历史。'*600,'basis':'explicit','facts':{}}]
+    one=ctx.pack_incremental(items,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert one['state']=='compressed' and one['model_requests']==1
+    two=ctx.pack_incremental([*items,{'id':'event-b','revision':1,'text':'新增合成历史。'*600,'basis':'explicit','facts':{}}],'history',1000,namespace='same-main',provider=Compressor(),require_all=True)
+    assert two['cache_hit'] and two['covered_ids']==['event-a','event-b']
+    assert calls[-1]==['event-b'] and two['model_requests']==1
+    same=ctx.pack_incremental(items,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert same['cache_hit'] and same['model_requests']==0
+    revised=[{**items[0],'revision':2,'text':'更正后的合成资料。'*600}]
+    changed=ctx.pack_incremental(revised,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert not changed['cache_hit'] and changed['model_requests']==1
+    empty=ctx.pack_incremental([],'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert empty['covered_ids']==[] and empty['text']==''

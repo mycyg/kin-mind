@@ -14,8 +14,8 @@ projection still reads it as current.
   of which already re-reads the ledger for itself and is recorded here so one place answers
   "what did this trait hold up".
 
-Nothing here judges. A dependent is `needs_review` when the ledger no longer carries the revision
-it was written against — that is all the host knows and all it claims. What to do about it belongs
+Nothing here judges. A dependent is `needs_review` when the ledger no longer carries the same meaning
+as the effective revision it was written against — that is all the host knows and all it claims. What to do about it belongs
 to the reader: a wish stops being ready, a step asks for a review, an intent falls back to the
 lookup, and the next appraisal is shown the trait as it now is.
 """
@@ -71,16 +71,55 @@ def clear_kind(conn, scope, kind):
     return conn.execute("DELETE FROM mind_trait_dependents WHERE scope=? AND kind=?", (scope, kind)).rowcount
 
 
-def trait_moved(conn, scope, trait_id, revision, at, *, ended):
-    """The ledger wrote this trait. Whatever rested on a revision it no longer has needs review.
+def same_meaning_since(conn, trait, revision):
+    """Whether `trait` is still EFFECTIVE and has kept the exact same text/meaning since `revision`."""
+    from .traits import EFFECTIVE
+    if trait.get("status") not in EFFECTIVE:
+        return False
+    if type(revision) is not int or revision < 1 or type(trait.get("revision")) is not int:
+        return False
+    if trait.get("revision") == revision:
+        return True
+    if trait["revision"] < revision:
+        return False
+    rows = conn.execute(
+        "SELECT revision,data FROM mind_trait_history WHERE id=? AND revision>=? AND revision<=? ORDER BY revision",
+        (trait["id"], revision, trait["revision"]),
+    ).fetchall()
+    if [row[0] for row in rows] != list(range(revision, trait["revision"] + 1)):
+        return False
+    target_text = (trait.get("text") or "").strip()
+    for rev, raw in rows:
+        snap = json.loads(raw)
+        if snap.get("id") != trait["id"] or snap.get("revision") != rev:
+            return False
+        if snap.get("status") not in EFFECTIVE:
+            return False
+        if (snap.get("text") or "").strip() != target_text:
+            return False
+        if rev > revision and snap.get("action") == "revise":
+            return False
+    return True
 
-    Called from the one place that writes a trait, so no path can move a trait without the things
-    that rested on it hearing about it."""
+
+def trait_moved(conn, scope, trait_id, revision, at, *, ended, reinforced=False):
+    """The ledger wrote this trait. Everything that rested on an earlier revision is now stale
+    unless this write merely reinforced/established the exact same trait text without revising it."""
     if not installed(conn):
         return 0
+    if reinforced and not ended:
+        conn.execute(
+            "UPDATE mind_trait_dependents SET trait_revision=?,at=? WHERE scope=? AND trait_id=? AND state=? AND trait_revision=?",
+            (revision, at, scope, trait_id, VALID, revision - 1),
+        )
+        return 0
+    if ended:
+        return conn.execute(
+            "UPDATE mind_trait_dependents SET state=?,at=? WHERE scope=? AND trait_id=? AND state=?",
+            (NEEDS_REVIEW, at, scope, trait_id, VALID)).rowcount
     return conn.execute(
-        "UPDATE mind_trait_dependents SET state=?,at=? WHERE scope=? AND trait_id=? AND state=? AND (? OR trait_revision<>?)",
-        (NEEDS_REVIEW, at, scope, trait_id, VALID, 1 if ended else 0, revision)).rowcount
+        "UPDATE mind_trait_dependents SET state=?,at=? WHERE scope=? AND trait_id=? AND trait_revision<>? AND state=?",
+        (NEEDS_REVIEW, at, scope, trait_id, revision, VALID)).rowcount
 
 
 def attach(commit, bound, grounds):
@@ -125,13 +164,11 @@ def _decision_id(conn, scope, plan_id, step_id):
 # --- reading it back ----------------------------------------------------------------------------
 
 def links_fresh(conn, mind, desire):
-    """Every trait this wish was committed on, still in force at the revision it was committed
-    against. Read from the ledger itself: the dependents table says what to look at, never what
-    the answer is."""
+    """Every trait this wish was committed on is still in force with the same meaning in the ledger."""
     refs = desire.get("trait_revisions") or {}
     if not refs:
         return True
-    from .traits import EFFECTIVE, Traits
+    from .traits import Traits
     from .traits import installed as ledger_installed
     if not ledger_installed(conn):
         return False
@@ -141,7 +178,7 @@ def links_fresh(conn, mind, desire):
             trait = ledger.get(conn, identifier)
         except Missing:
             return False
-        if trait["revision"] != revision or trait["status"] not in EFFECTIVE:
+        if not same_meaning_since(conn, trait, revision):
             return False
     return True
 

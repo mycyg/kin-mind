@@ -913,6 +913,51 @@ export interface components {
             /** File */
             file: string;
         };
+        /** CompanionDelivery */
+        CompanionDelivery: {
+            /**
+             * Mode
+             * @default text
+             * @enum {string}
+             */
+            mode?: "text" | "voice" | "both";
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version?: 1;
+            /**
+             * Channel
+             * @default feishu
+             * @constant
+             */
+            channel?: "feishu";
+            /**
+             * Person Id
+             * @enum {string}
+             */
+            person_id: "person:xiaoguang" | "person:yiyi";
+            /** App Id */
+            app_id: string;
+            /** Open Id */
+            open_id: string;
+            /** Chat Id */
+            chat_id: string;
+            /** Conversation Key */
+            conversation_key: string;
+            /** Binding Revision */
+            binding_revision: number;
+            /**
+             * Requester Person Id
+             * @enum {string}
+             */
+            requester_person_id: "person:xiaoguang" | "person:yiyi";
+            /** Request Conversation Key */
+            request_conversation_key: string;
+            /** Source Input Id */
+            source_input_id: string;
+        };
         /** ContactPolicy */
         ContactPolicy: {
             /**
@@ -1440,6 +1485,7 @@ export interface components {
         };
         /** ScheduleInput */
         ScheduleInput: {
+            companion_delivery?: components["schemas"]["CompanionDelivery"] | null;
             /** Command Id */
             command_id: string;
             /**

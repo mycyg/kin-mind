@@ -514,7 +514,7 @@ class EventGraph:
             try:
                 self.get(conn, actor_id)
             except Missing:
-                self._put(conn, {"id": actor_id, "kind": "entity", "entity_type": "person" if actor == "owner" else "agent", "title": actor,
+                self._put(conn, {"id": actor_id, "kind": "entity", "entity_type": "person" if actor == "owner" or actor.startswith("person:") else "agent", "title": actor,
                     "source_ids": [receipt["source_id"]], "evidence": refs, "basis": "observed", "identity_basis": "host-bound-actor"})
             identity = "host-actor:" + actor
             conn.execute("INSERT OR IGNORE INTO mind_graph_identity VALUES(?,?,?)", (self.scope.key(),identity,actor_id))

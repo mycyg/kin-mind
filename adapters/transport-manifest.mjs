@@ -46,6 +46,7 @@ const supersededBeforeSend=receipt=>receipt?.state==='not-submitted'&&receipt.su
  * frozen. Nothing left, and nothing failed: the fragment waits, uncounted. */
 export const heldByFreeze=receipt=>receipt?.state==='not-submitted'&&receipt.submissionStarted===false&&receipt.reason==='dispatch-frozen';
 const executionNumber=value=>Number.isSafeInteger(value)&&value>=0;
+const companionBasis=value=>value.route?{route:structuredClone(value.route),inputSourceIds:[...new Set(value.inputSourceIds??[])]}:{};
 const routingBasis=value=>JSON.stringify([
   [Object.hasOwn(value,'taskId'),value.taskId],
   [Object.hasOwn(value,'inputVersion'),value.inputVersion],
@@ -78,14 +79,29 @@ export function legacyState(manifest) {
   return {draft:'pending',held:'pending',reviewed:'prepared',sending:'prepared','blocked-unknown':'unconfirmed'}[manifest.state]??manifest.state;
 }
 
+/** Contact settlement reads the same journal as the sender, including partial sends. */
+export function contactReceipt(manifest) {
+  if(!manifest)return {state:'pending',messageIds:[],acceptedBubbles:0};
+  const bubbles=manifest.bubbles??[],fragments=bubbles.flatMap(b=>b.fragments??[]);
+  const messageIds=fragments.filter(f=>f.state==='accepted').map(f=>f.receipt?.messageId).filter(Boolean);
+  const acceptedBubbles=bubbles.filter(b=>b.state==='accepted'||b.fragments?.some(f=>f.state==='accepted')).length;
+  const canceledBubbles=bubbles.filter(b=>['canceled','rejected','undeliverable'].includes(b.state)).length;
+  const unknown=fragments.some(f=>['submitting','unknown'].includes(f.state))||bubbles.some(b=>b.state==='unconfirmed');
+  const settled=terminal(manifest);
+  const state=unknown?'unconfirmed':manifest.state==='accepted'||settled&&acceptedBubbles>0?'accepted':settled?'canceled':'pending';
+  return {state,reason:manifest.reason??undefined,channel:manifest.channel,messageId:messageIds[0],messageIds,
+    acceptedBubbles,totalBubbles:bubbles.length,canceledBubbles,partial:acceptedBubbles>0&&canceledBubbles>0,
+    safeToRelease:settled&&!unknown&&acceptedBubbles===0};
+}
+
 /** A manifest in the shape the host's guard and `deliverGroup` callers read. Carries bubble text. */
 export function manifestView(manifest) {
-  const shared={kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
+  const shared={...companionBasis(manifest),kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
     ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
     ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
     ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
     ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{})};
-  const entries=manifest.bubbles.map(b=>({request:b.request,state:b.state,delivery:{...shared,id:b.bubble_id,text:b.text,references:b.references,draftId:b.draft_id},
+  const entries=manifest.bubbles.map(b=>({request:b.request,state:b.state,delivery:{...shared,...companionBasis(b),id:b.bubble_id,text:b.text,references:b.references,draftId:b.draft_id},
     fragments:b.fragments.map(f=>({transport_id:f.transport_id,kind:f.kind,state:f.state,messageId:f.receipt?.messageId}))}));
   return {state:legacyState(manifest),groupState:manifest.state,groupId:manifest.group_id,reason:manifest.reason??undefined,ownerEpoch:manifest.ownerEpoch,retryAt:manifest.retryAt,
     createdAt:manifest.created_at,...(manifest.continued?{continuedAt:manifest.continued.at,continuedEpoch:manifest.continued.epoch}:{}),
@@ -236,7 +252,7 @@ export class TransportManifests {
     // A batch ID that already names other bubbles: keep both, under separate groups.
     if(existing&&existing.bubbles.map(b=>b.bubble_id).join('\0')!==ids.join('\0'))id='group-'+ids[0];
     else if(existing&&routingBasis(existing)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
-    const manifest={schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
+    const manifest={...companionBasis(first.delivery),schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
       ...(answeredIds(first.request)?{answered_input_ids:answeredIds(first.request)}:{}),
       kind:first.delivery.kind??'reply',work:Boolean(first.request.work),
       ...(Object.hasOwn(first.delivery,'taskId')?{taskId:first.delivery.taskId}:{}),
@@ -246,9 +262,10 @@ export class TransportManifests {
       expected_bubbles:first.delivery.expectedBubbles??entries.length,state:'draft',reason:null,leaseGeneration:0,revision:0,review:null,
       created_at:now,updated_at:now,retryAt:0,failures:0,
       bubbles:entries.map((entry,order)=>{const text=entry.delivery.text??entry.request.text;
-        return {bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.memeFailure?{memeFailure:entry.delivery.memeFailure}:{}),...(entry.delivery.meme?{meme:entry.delivery.meme}:{}),...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
+        return {...companionBasis(entry.delivery),bubble_id:entry.delivery.id,draft_id:entry.request.draft_id,order,request:entry.request,text,...(entry.delivery.file?{file:entry.delivery.file}:{}),...(entry.delivery.memeFailure?{memeFailure:entry.delivery.memeFailure}:{}),...(entry.delivery.meme?{meme:entry.delivery.meme}:{}),...(entry.delivery.presentation?{presentation:replyPresentation(entry.delivery.presentation)}:{}),references:entry.delivery.references??[],state:'unsent',fragments:[]};})};
     const loaded=this.load(id);
     if(loaded) {
+      if(loaded.bubbles.some((bubble,index)=>JSON.stringify(companionBasis(bubble.route?bubble:loaded))!==JSON.stringify(companionBasis(entries[index].delivery))))throw Error('Reply recipient conflicts with its durable manifest');
       if(routingBasis(loaded)!==routingBasis(first.delivery))throw Error('Reply routing basis conflicts with its durable manifest');
       return loaded;
     }
@@ -274,6 +291,10 @@ export class TransportManifests {
             receipt:{state:'not-submitted',submissionStarted:false,reason:bubble.memeFailure}}]});
         continue;
       }
+      if(bubble.file) {
+        bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'artifact',state:'unsent',receipt:null}];
+        continue;
+      }
       if(bubble.meme) {
         frozenMemeMedia(bubble.meme);
         bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'image',state:'unsent',receipt:null}];
@@ -293,7 +314,7 @@ export class TransportManifests {
         if(Buffer.byteLength(text,'utf8')>contract.file.maxBytes)Object.assign(bubble,{state:'undeliverable',reason:'file-exceeds-channel-limit'});
       }
     }
-    for(const bubble of manifest.bubbles)if(!bubble.meme&&bubble.presentation?.mode==='both'&&!started(bubble)&&open(bubble)) {
+    for(const bubble of manifest.bubbles)if(!bubble.file&&!bubble.meme&&bubble.presentation?.mode==='both'&&!started(bubble)&&open(bubble)) {
       const index=bubble.fragments.length;
       bubble.fragments.push({transport_id:transportId(bubble.bubble_id,index),index,start:0,end:bubble.text.length,kind:'speech',state:'unsent',receipt:null});
     }
@@ -355,11 +376,24 @@ export class TransportManifests {
     if(!manifest.review){this.finalize(manifest,verdict);await this.save(manifest,context.lease);}
     // A review reads every request of the group. Whatever it reserved for a bubble that was withdrawn before is released once more.
     for(const bubble of manifest.bubbles)if(bubble.state==='canceled'&&bubble.share_canceled)bubble.share_canceled=false;
-    for(const bubble of manifest.bubbles.filter(open)) {
-      if(!await this.permitted(manifest,context))return;
-      if(await this.sendBubble(manifest,bubble,context)!=='sent')return;
+    const lanes=new Map();
+    for(const bubble of manifest.bubbles.filter(open)){
+      const route=bubble.route??manifest.route;
+      const key=route?.chat_id??route?.person_id??'current';
+      if(!lanes.has(key))lanes.set(key,[]);
+      lanes.get(key).push(bubble);
     }
-    return this.finish(manifest,context);
+    const results=await Promise.allSettled([...lanes.values()].map(async bubbles=>{
+      for(const bubble of bubbles){
+        if(!open(bubble))continue;
+        if(!await this.permitted(manifest,context))return false;
+        if(await this.sendBubble(manifest,bubble,context)!=='sent')return false;
+      }
+      return true;
+    }));
+    const failed=results.find(result=>result.status==='rejected');
+    if(failed)throw failed.reason;
+    if(results.every(result=>result.value))return this.finish(manifest,context);
   }
   async touch(manifest,context){context.worked=true;await this.save(manifest,context.lease);}
 
@@ -451,7 +485,7 @@ export class TransportManifests {
 
   delivery(manifest,bubble,fragment) {
     const body=bubble.text.slice(fragment.start,fragment.end);
-    const base={id:fragment.transport_id,kind:manifest.kind,draftId:bubble.draft_id,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
+    const base={...companionBasis(bubble.route?bubble:manifest),id:fragment.transport_id,kind:manifest.kind,draftId:bubble.draft_id,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
       references:bubble.references,
       ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
       ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
@@ -459,6 +493,7 @@ export class TransportManifests {
       ...(Object.hasOwn(manifest,'sessionFence')?{sessionFence:manifest.sessionFence}:{}),
       // Python hears about bubbles from this layer; the transport stays silent.
       memory:false,bubbleId:bubble.bubble_id,fragment:{index:fragment.index,count:bubble.fragments.length,start:fragment.start,end:fragment.end}};
+    if(fragment.kind==='artifact')return {...base,file:bubble.file};
     if(fragment.kind==='image')return {...base,meme:bubble.meme,media:frozenMemeMedia(bubble.meme)};
     if(fragment.kind==='speech')return {...base,text:body,speech:{style:bubble.presentation?.style??''}};
     return fragment.kind==='file'?{...base,media:{type:'file',name:fragment.name,data:Buffer.from(body,'utf8')}}:{...base,text:body};
@@ -487,8 +522,9 @@ export class TransportManifests {
       let receipt=await context.receipt(fragment.transport_id),kind=classifyReceipt(receipt);
       if(supersededBeforeSend(receipt)){await this.cancelSuperseded(manifest,bubble,fragment,receipt,context);return 'stop';}
       if(kind==='absent'||kind==='never-started') {
-        const gap=contract.maxSendsPerSecond?Math.ceil(1000/contract.maxSendsPerSecond):0,wait=this.lastSubmitAt===null?0:this.lastSubmitAt+gap-this.clock();
-        if(wait>0)await this.sleep(wait);
+        const gap=contract.maxSendsPerSecond?Math.ceil(1000/contract.maxSendsPerSecond):0;
+        const slot=Math.max(this.clock(),this.lastSubmitAt===null?0:this.lastSubmitAt+gap);this.lastSubmitAt=slot;
+        const wait=slot-this.clock();if(wait>0)await this.sleep(wait);
         // Reconcile first, then revalidate before any new fragment is submitted.
         // This preview also covers a begun bubble and keeps its frozen identity.
         if(bubble.references?.length&&context.review) {
@@ -496,7 +532,7 @@ export class TransportManifests {
           const verdict=await context.review([request],{frozen:true,source_only:true,pending:[0],groupId:manifest.group_id,sent:this.sentEvidence(manifest)});
           if(verdict.state!=='ready'){await this.refused(manifest,context,verdict);return 'stop';}
         }
-        const now=this.lastSubmitAt=this.clock(),before={firstSubmitAt:fragment.firstSubmitAt,attempts:fragment.attempts};
+        const now=this.clock(),before={firstSubmitAt:fragment.firstSubmitAt,attempts:fragment.attempts};
         Object.assign(fragment,{state:'submitting',firstSubmitAt:fragment.firstSubmitAt??now,attempts:(fragment.attempts??0)+1});
         Object.assign(manifest,{state:'sending',reason:null,retryAt:0});this.refresh(manifest);
         await this.touch(manifest,context);          // refused ⇒ nothing is sent
@@ -572,7 +608,13 @@ export class TransportManifests {
 
   bubbleEvent(manifest,bubble,kind) {
     const receipts=bubble.fragments.filter(f=>f.state==='accepted').map(f=>f.receipt??{}),at=bubble.event_at[kind];
-    const event=deliveryEvent({id:bubble.bubble_id,text:bubble.text,kind:manifest.kind,memoryBatchId:manifest.delivery_id,expectedBubbles:manifest.expected_bubbles,
+    // Transport retry identity belongs to the whole batch. Memory disclosure belongs
+    // to one recipient; a multi-person batch must not overwrite that person's ledger.
+    const person=b=>(b.route??manifest.route)?.person_id??'owner';
+    const separate=new Set(manifest.bubbles.map(person)).size>1;
+    const memoryBatchId=separate?manifest.delivery_id+':'+person(bubble):manifest.delivery_id;
+    const expectedBubbles=separate?manifest.bubbles.filter(b=>person(b)===person(bubble)).length:manifest.expected_bubbles;
+    const event=deliveryEvent({...companionBasis(bubble.route?bubble:manifest),id:bubble.bubble_id,text:bubble.text,kind:manifest.kind,memoryBatchId,expectedBubbles,
       ...(Object.hasOwn(manifest,'taskId')?{taskId:manifest.taskId}:{}),
       ...(Object.hasOwn(manifest,'inputVersion')?{inputVersion:manifest.inputVersion}:{}),
       ...(Object.hasOwn(manifest,'turnFence')?{turnFence:manifest.turnFence}:{}),
@@ -585,6 +627,11 @@ export class TransportManifests {
    * bubble's reservation, then tell Python. Both are idempotent on the other
    * side; each is tried a bounded number of times. */
   async flush(manifest,context) {
+    const work=(context.flushTail??Promise.resolve()).then(()=>this.flushEffects(manifest,context));
+    context.flushTail=work.catch(()=>{});
+    return work;
+  }
+  async flushEffects(manifest,context) {
     let changed=false;
     for(const bubble of manifest.bubbles) {
       const kind=EVENT_FOR[bubble.state];
@@ -607,7 +654,8 @@ export class TransportManifests {
     // and it is told again under the same group, on a backoff, never given up.
     const answer=this.answerDue(manifest);
     if(answer&&!context.failedEffects.has(manifest.group_id)&&!(manifest.answer_retry_at>this.clock())) {
-      try{await this.onAnswered(answer);manifest.answered={state:answer.state,at:this.clock()};delete manifest.answer_retry_at;}
+      try{await this.onAnswered(answer);if(answer.itemSettlement)manifest.settled_input_ids=[...new Set([...(manifest.settled_input_ids??[]),...answer.answeredInputIds])];
+        else manifest.answered={state:answer.state,at:this.clock()};delete manifest.answer_retry_at;}
       catch{
         const failures=manifest.answer_failures=(manifest.answer_failures??0)+1;
         manifest.answer_retry_at=this.clock()+Math.min(this.retry.baseMs*2**Math.min(failures-1,16),this.retry.maxMs);
@@ -624,10 +672,28 @@ export class TransportManifests {
    * (CR2-LIFE-07). A group from before CR2-LIFE-04 answers only its own input. */
   answerDue(manifest) {
     if(!this.onAnswered||manifest.answered||manifest.kind!=='reply'||!manifest.reply_id)return null;
-    const state=manifest.state==='accepted'?'accepted':manifest.state==='retired'&&OWN_CHOICES.includes(manifest.reason)?manifest.reason:null;
+    if(manifest.bubbles.some(b=>Array.isArray(b.request?.item_input_ids))) {
+      const settled=new Set(manifest.settled_input_ids??[]);
+      const ids=[...new Set(manifest.bubbles.flatMap(b=>b.request?.item_input_ids??[]))];
+      const ready=ids.filter(id=>!settled.has(id)&&manifest.bubbles.filter(b=>b.request?.item_input_ids?.includes(id)).every(b=>b.state==='accepted'));
+      if(ready.length)return {groupId:manifest.group_id,inputId:ready[0],answeredInputIds:ready,state:manifest.bubbles.every(b=>b.request?.input_scope==='turn')?'processed':'accepted',itemSettlement:true};
+      if(ids.every(id=>settled.has(id)))return null;
+    }
+    // An owner interruption transfers never-submitted words to the next accepted
+    // native input. Settle that handoff in the input ledger too, without claiming
+    // those words reached the platform. Failed/uncertain sends still need their
+    // original reconciliation or failure notice; merely retiring them is no answer.
+    const handed=manifest.state==='retired'&&!manifest.work&&manifest.reason==='new-owner-input'&&
+      !manifest.tail_owed&&manifest.tail_handed?.reason==='new-owner-input'&&
+      typeof manifest.tail_handed.input_id==='string'&&manifest.tail_handed.input_id&&manifest.tail_handed.input_id!==manifest.reply_id&&
+      !(manifest.answered_input_ids??[]).includes(manifest.tail_handed.input_id)&&
+      manifest.tail_handed.items?.length>0&&manifest.bubbles.every(b=>
+        b.state==='accepted'||b.state==='canceled'&&b.fragments.every(f=>
+          f.state==='accepted'||f.state==='unsent'&&!f.attempts&&!f.receipt));
+    const state=manifest.state==='accepted'?'accepted':handed?'merged':manifest.state==='retired'&&OWN_CHOICES.includes(manifest.reason)?manifest.reason:null;
     if(!state)return null;
     return {groupId:manifest.group_id,inputId:manifest.reply_id,answeredInputIds:manifest.answered_input_ids??[manifest.reply_id],state,
-      ...(state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
+      ...(handed?{mergedInto:manifest.tail_handed.input_id}:state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
   }
   /** Side effects that are still due and still worth trying: each bubble's, and the group's answer. */
   owes(manifest) {

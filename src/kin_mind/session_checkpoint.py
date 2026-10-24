@@ -39,7 +39,7 @@ class SessionCheckpoint:
         self.memory = MemoryContinuity(mind)
         self.agent_version = agent_version
 
-    def snapshot(self, pending=None, *, tasks=None, intent=None):
+    def snapshot(self, pending=None, *, tasks=None, intent=None, include_business=False):
         rows = dialogue_rows(self.mind, exchanges=8)
         with self.mind.engine.db.connect() as conn:
             state = self.mind._load(conn)
@@ -93,7 +93,8 @@ class SessionCheckpoint:
             items.append({"id": event["id"], "revision": revision, "role": role, "text": event["text"], "at": event["at"], "dependencies": dependencies,
                           "occurred_at": utc_time(event["at"]), "received_at": utc_time(received_at),
                           "sourceId": event.get("source_id", event["id"]), "basis": "owner-statement" if role == "user" else "public-output",
-                          "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record"})
+                          "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record",
+                          **{k:event[k] for k in ("speaker_person_id","recipient_person_id","conversation_key","conversation_kind","chat_id","actor") if k in event}})
         items.reverse()
         items, _ = split_recent(items, exchanges=8)
         linked, watermarks = None, None
@@ -111,6 +112,17 @@ class SessionCheckpoint:
         result = {"lastDeletionAt": deleted_at, "configVersion": config_version, "cursors": {"public": cursor}, "items": items, "invalidatedSources": reviewed,
                 "sourceRevisions": {i["id"]: i["revision"] for i in items}, "scope": self.mind.scope.model_dump(),
                 "shared": {"readState": "read_affective_state", "readShares": "read_share_history", "readWorks": "read_work_history", "readContinuity": "read_continuity_context"}}
+        if include_business:
+            with self.mind.engine.db.connect() as conn:
+                plans=[json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plans WHERE scope=? AND status='active' ORDER BY next_review LIMIT 20",(self.mind.scope.key(),))]
+            result['businessState']={'at':self.mind.clock(),'stateRevision':state['revision'],
+                'affect':{name:{k:v[k] for k in ('value','target') if k in v} for name,v in self.mind.read()['dimensions'].items()},
+                'wishes':[{k:d[k] for k in ('id','revision','kind','status','recipient_person_id','expires_at','activity_ref','exploration_id') if k in d}
+                          for d in state['desires'].values() if d['status'] in {'wanted','waiting','in_progress'}][:20],
+                'plans':[{**{k:p[k] for k in ('id','revision','status','recipient_person_id','next_review_at') if k in p},
+                          'steps':[{k:v[k] for k in ('id','state','actor','not_before','not_after','run_id') if k in v} for v in p.get('steps',[]) if v.get('state') not in {'completed','abandoned'}]}
+                         for p in plans],
+                'readCurrent':'read_affective_state / read_autonomous_plans / read_share_history; IDs are a snapshot, not new execution permission'}
         if linked is not None:
             result.update(linked=linked, watermarks=watermarks, manifestVersion='continuity-manifest-v1')
             result['cursors']['linked'] = [{'id': item['id'], 'revision': item['revision']} for item in linked['items']]
@@ -120,14 +132,21 @@ class SessionCheckpoint:
             result['sessionAdvice'] = advice
         return result
 
-    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True, adaptive_budget=False):
-        if not isinstance(budget, int) or not 500 <= budget <= CEILING:
+    def build(self, snapshot, binding, *, budget=2000, provider=None, allow_model=True, adaptive_budget=False, restore_capacity=None):
+        # A verified native window supplies the recovery capacity. The old 8k
+        # bound remains only for callers without runtime evidence, not a fixed
+        # limit that can permanently block a large but valid native restoration.
+        if restore_capacity is not None and (type(restore_capacity) is not int or restore_capacity < 500):
+            raise ValueError("Insufficient verified restoration capacity")
+        ceiling = restore_capacity if restore_capacity is not None else CEILING
+        if not isinstance(budget, int) or not 500 <= budget <= ceiling:
             raise ValueError("Invalid continuity budget")
         requested_budget = budget
         settings = self.memory.settings()
         checkpoint = {"conversationId": binding["conversationId"], "generation": binding["generation"],
                       **{k: snapshot[k] for k in ("configVersion", "cursors", "scope", "shared", "sourceRevisions")},
                       "tasks": snapshot.get("tasks", []), "inputStates": snapshot.get("inputStates", []), "items": [], "pendingQuestions": [], "coverage": {}, "complete": False}
+        if snapshot.get('businessState'):checkpoint['businessState']=snapshot['businessState']
         checkpoint['sourceRevisions'] = dict(checkpoint['sourceRevisions'])
         if 'manifestVersion' in snapshot:
             budget -= 95  # Reserve the common native-injection marker envelope.
@@ -155,7 +174,13 @@ class SessionCheckpoint:
         recent, older = split_recent(raw)
         envelope = 95 if 'manifestVersion' in snapshot else 0
         for exchanges in range(RECENT_EXCHANGES - 1, 0, -1) if adaptive_budget else ():
-            if tokens(dumps(self.payload({**checkpoint, 'items': recent}))) + 180 <= CEILING - envelope:
+            # The older summary also needs its exact evidence references. Keeping
+            # four verbose exchanges can leave less room than those references
+            # alone require, so even an available compressor cannot make progress.
+            # Move whole earlier exchanges into the summary; never drop sources.
+            summary_room = (sum(tokens(dumps({'id': i['id'], 'revision': i.get('revision'),
+                'basis': i.get('basis', 'inferred')})) for i in older) + 20 + 512 + 160) if older else 0
+            if tokens(dumps(self.payload({**checkpoint, 'items': recent}))) + 180 + summary_room <= ceiling - envelope:
                 break
             recent, older = split_recent(raw, exchanges)
         checkpoint["items"] = recent
@@ -167,9 +192,9 @@ class SessionCheckpoint:
             # Provenance IDs also occupy space: when this bounded history fits, keeping
             # it verbatim avoids a summary budget smaller than its mandatory references.
             needed = tokens(dumps(self.payload({**checkpoint, 'items':raw}))) + tokens("\n".join(dumps(o) for o in overviews)) + 180
-            budget = max(budget, min(CEILING - envelope, needed))
-            checkpoint['budgetPlan'] = {'reason':'recent-dialogue', 'requested':requested_budget,
-                                        'effective':budget + envelope, 'limit':CEILING}
+            budget = max(budget, min(ceiling - envelope, needed))
+            checkpoint['budgetPlan'] = {'reason':'native-window' if restore_capacity is not None else 'recent-dialogue', 'requested':requested_budget,
+                                        'effective':budget + envelope, 'limit':ceiling}
         # Optional associations use spare room after the complete conversation;
         # they do not force an otherwise unnecessary compression request.
         base = checkpoint if critical_ids else {**checkpoint, 'items': raw}
@@ -190,11 +215,22 @@ class SessionCheckpoint:
                 if item['id'] not in memory_pack['covered_ids']:
                     checkpoint['sourceRevisions'].pop(item['id'], None)
         remaining = budget - tokens(dumps(self.payload(checkpoint))) - 180
-        if older and tokens(dumps([{k: i[k] for k in ('id', 'role', 'text', 'at')} for i in older])) > remaining:
-            items = [{"id": i["id"], "revision": i["revision"], "text": dumps({k: i[k] for k in ("role", "text", "at", "delivery")}), "basis": i["basis"], "facts": {}, "dependencies": i.get("dependencies", [])} for i in older]
+        # Decide against the actual restored payload, including identities,
+        # routing and business state. Measuring only old dialogue text can choose
+        # the original-history branch even when that full payload exceeds 8k.
+        if older and (restore_capacity is not None or tokens(dumps(self.payload({**checkpoint, 'items': raw}))) + 180 > budget):
+            items = [{"id": i["id"], "revision": i["revision"], "text": dumps({k: i[k] for k in ("role", "text", "at", "delivery", "speaker_person_id", "recipient_person_id", "conversation_key", "conversation_kind", "chat_id", "sourceId") if k in i}), "basis": i["basis"], "facts": {}, "dependencies": i.get("dependencies", [])} for i in older]
             instruction = TEXTURE_INSTRUCTION if settings.get('checkpoint_texture') is True else FACTS_INSTRUCTION
-            packed = Contexts(self.mind).pack(items, instruction, max(0, remaining - 160), provider=provider, allow_model=allow_model, require_all=True)
-            checkpoint["coverage"] = {k: packed.get(k) for k in ("state", "covered_ids", "omitted_ids", "receipt")}
+            # Native headroom permits carrying essential state and recent turns;
+            # it is not a request to fill that room with all old dialogue. Give
+            # the older semantic summary its source cost plus the desired prose
+            # budget, bounded by actual remaining room.
+            summary_budget = max(0, remaining - 160)
+            if restore_capacity is not None:
+                refs = sum(tokens(dumps({'id': i['id'], 'revision': i.get('revision'), 'basis': i.get('basis', 'inferred')})) for i in items) + 20
+                summary_budget = min(summary_budget, refs + requested_budget)
+            packed = Contexts(self.mind).pack_incremental(items, instruction, summary_budget, namespace=binding.get("conversationId"), provider=provider, allow_model=allow_model, require_all=True)
+            checkpoint["coverage"] = {k: packed.get(k) for k in ("state", "covered_ids", "omitted_ids", "receipt", "reason")}
             history_requests = packed.get('model_requests', 0)
             if packed["omitted_ids"]:
                 checkpoint["waitReason"] = "source-coverage-needs-more-budget-or-compression"
@@ -213,7 +249,7 @@ class SessionCheckpoint:
             note = carried(self.mind, binding.get("conversationId"))
         without_note = (budget, checkpoint.get('budgetPlan'))
         if note:
-            room = CEILING - envelope if adaptive_budget else budget
+            room = ceiling - envelope if adaptive_budget else budget
             with_note = tokens(dumps(self.payload({**checkpoint, **note}))) + 180
             if with_note <= max(budget, room):
                 checkpoint.update(note)
@@ -267,9 +303,10 @@ class SessionCheckpoint:
         return {'kind': 'internal-continuity-checkpoint', 'marker': 'kin-checkpoint:restore:' + 'f' * 64,
                 'checkpointId': checkpoint.get('id', 'checkpoint:' + 'f' * 64),
                 'conversationId': checkpoint['conversationId'], 'generation': checkpoint['generation'], 'configVersion': checkpoint['configVersion'],
-                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at', 'occurred_at', 'received_at') if k in item} for item in checkpoint['items']],
+                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at', 'occurred_at', 'received_at', 'speaker_person_id', 'recipient_person_id', 'conversation_key', 'conversation_kind', 'chat_id', 'sourceId', 'delivery') if k in item} for item in checkpoint['items']],
                 'tasks': [{k: task[k] for k in ('id', 'inputVersion', 'status', 'goal', 'summary', 'acceptance', 'remaining', 'result') if k in task} for task in checkpoint.get('tasks', [])],
                 'inputStates': [{k: item[k] for k in ('id', 'state', 'taskId') if k in item} for item in selected.values()],
+                **({'businessState':checkpoint['businessState']} if checkpoint.get('businessState') else {}),
                 'readSources': 'read_conversation_checkpoint', 'shared': checkpoint['shared'],
                 **({'memoryContext': checkpoint['memoryContext'], 'memoryRead': 'read_continuity_context', 'memoryRemaining': len(checkpoint['memoryIndex'])} if 'memoryContext' in checkpoint else {}),
                 # 这一段的我们: plain text, its source named for tracing (window_notes).

@@ -126,7 +126,7 @@ def test_task_and_urgent_attention_persist_return_and_cannot_be_lost_to_chitchat
     with pytest.raises(Conflict, match="Task or urgent"):
         memory.habits.choose_reply({"input_id": "task", "action": "silent"})
     assert mind.read()["rhythm"]["base_phase"] == "resting"
-    assert "完整处理" in compile_expression({}, rhythm=mind.read()["rhythm"])["guidance"][-1]["text"]
+    assert compile_expression({}, rhythm=mind.read()["rhythm"])["guidance"] == [], "attention is state, not a scripted conversational posture"
     received(memory, clock, "urgent", "Urgent, help now")
     mind.attend("urgent", "urgent")
     received(memory, clock, "chat")
@@ -221,12 +221,13 @@ def test_self_preference_cannot_change_core_authority_categories(flexible, categ
     assert refused.value.code == "trait-preference-category"
 
 
-def test_self_preference_still_obeys_persona_permissions(flexible, monkeypatch):
+def test_self_preference_can_change_beyond_legacy_persona_key_lists(flexible, monkeypatch):
     mind, *_ = flexible
     monkeypatch.setattr("kin_mind.traits.load_persona", lambda *_: {"mutable_trait_keys": ["interests"]})
-    with pytest.raises(ValueError, match="owner approval"):
-        decide(mind, TraitDecision(action="propose", basis="self_preference", category="aesthetics",
-                                  slug="forbidden", text="A new aesthetic preference"), "forbidden")
+    result = decide(mind, TraitDecision(action="propose", basis="self_preference", category="aesthetics",
+                                      slug="new-preference", text="A new aesthetic preference"), "new-preference")
+    assert result["id"]
+    assert result["category"] == "aesthetics"
 
 
 def test_subjective_drift_cannot_overwrite_owner_instruction_or_invent_a_quote(flexible):

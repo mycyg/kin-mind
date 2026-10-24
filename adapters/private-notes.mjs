@@ -9,12 +9,19 @@ export function parsePrivateReply(text) {
   const body=text.trim(),fenced=/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(body);
   let value;
   try {value=JSON.parse(fenced?fenced[1]:body);}catch{return {state:'invalid',reason:'private-note-envelope-incomplete'};}
-  if(!value||Array.isArray(value)||typeof value!=='object'||Object.keys(value).some(k=>!['private_note','action','bubbles','presentation'].includes(k)))
+  if(!value||Array.isArray(value)||typeof value!=='object'||Object.keys(value).some(k=>!['private_note','action','bubbles','presentation','input_ids','silent_input_ids'].includes(k)))
     return {state:'invalid',reason:'private-note-envelope-invalid'};
   if(typeof value.private_note!=='string'||!value.private_note.trim()||Array.from(value.private_note).length>4000)
     return {state:'invalid',reason:'private-note-missing'};
+  if(value.input_ids!==undefined&&(!Array.isArray(value.input_ids)||!value.input_ids.length||value.input_ids.some(id=>typeof id!=='string'||!id)||new Set(value.input_ids).size!==value.input_ids.length))
+    return {state:'invalid',reason:'reply-inputs-invalid'};
+  if(value.silent_input_ids!==undefined&&(!Array.isArray(value.silent_input_ids)||value.silent_input_ids.some(id=>typeof id!=='string'||!id)||new Set(value.silent_input_ids).size!==value.silent_input_ids.length||value.silent_input_ids.some(id=>value.input_ids?.includes(id))))
+    return {state:'invalid',reason:'reply-inputs-invalid'};
+  const ownership={...(value.input_ids?{input_ids:value.input_ids}:{}),...(value.silent_input_ids?{silent_input_ids:value.silent_input_ids}:{})};
+  if(value.action==='silent'&&Array.isArray(value.bubbles)&&value.bubbles.length===0)
+    return {state:'silent',private_note:value.private_note.trim(),...ownership};
   const envelope=chatEnvelope(JSON.stringify({action:value.action,bubbles:value.bubbles}));
-  return envelope?.state==='send'?{...envelope,private_note:value.private_note.trim(),...(value.presentation?{presentation:replyPresentation(value.presentation)}:{})}:{state:'invalid',reason:'private-note-bubbles-invalid'};
+  return envelope?.state==='send'?{...envelope,...ownership,private_note:value.private_note.trim(),...(value.presentation?{presentation:replyPresentation(value.presentation)}:{})}:{state:'invalid',reason:'private-note-bubbles-invalid'};
 }
 
 export function publicReplyText(text) {

@@ -350,6 +350,7 @@ export class SessionManager {
       previousBasis?.config!==basis.config));
     this.state.observation={...content,reviewBasis:basis,id,at:changed?now:previous.at};
     if(changed)this.save('observation',{id});
+    if(this.state.config.compact&&pressure.known&&pressure.ratio>=this.state.config.compactPressure)return;
     const urgent=['elevated','critical'].includes(window.level)||evidence.length>0||requested.length>0;
     await this.review(id,{entered:previous?.id!==id,worth:urgent||semantic,spaced:!urgent&&semantic});
   }
@@ -394,6 +395,25 @@ export class SessionManager {
       // new maintenance goes through `maintained` and waits for the thaw.
       const recovery=await this.recoverPromotion();if(recovery)return recovery;
       const runtime=observed??await this.inspect(),context=collected??await this.collect();await this.observe(runtime,context);
+      // Capacity recovery is deterministic: a full window cannot be asked to
+      // decide whether to make room. Reuse the checkpoint/receipt transaction.
+      const pressure=windowPressure(runtime,this.state.config);
+      if(this.state.config.compact&&pressure.known&&pressure.ratio>=this.state.config.compactPressure){
+        const advice={action:'compact',snapshotId:this.state.observation.id,generation:this.state.binding.generation,
+          reason:runtime.contextWindowExceeded?'context-window-exceeded':'capacity-threshold',capacityRecovery:true};
+        return await this.runCompaction(advice,context);
+      }
+      if(this.state.config.prepare&&pressure.known&&pressure.ratio>=this.state.config.preparePressure&&
+          safeBoundary({...context,runtime}).safe&&!this.frozen()&&
+          (context.sessionAdvice??this.state.sessionAdvice)?.action!=='compact'&&
+          !this.checkpointReadyOrWaiting(context,this.state.binding,Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0))){
+        await this.maintained('checkpoint-prepare:'+this.state.observation.id.slice(0,24),async()=>{
+          const prepared=await this.preparedCheckpoint(context,this.state.binding,Math.max(this.state.config.restoreBudget,context.tasks?.length?4000:0));
+          this.state.checkpointPreparation={id:prepared.checkpoint?.id??null,complete:prepared.checkpoint?.complete===true,
+            generation:this.state.binding.generation,retryAt:prepared.retryAt??null};
+          this.save('checkpoint-prepared');
+        });
+      }
       if(context.sessionAdvice)this.receive(context.sessionAdvice,runtime);
       const advice=this.state.sessionAdvice,event=this.state.events[this.state.observation?.id];
       if(!this.state.config.observe||!advice||advice.snapshotId!==this.state.observation?.id||advice.generation!==this.state.binding.generation)
@@ -409,6 +429,12 @@ export class SessionManager {
   }
   /** Reuse an actual checkpoint for its recorded conversation, cursors and budget. An
    * incomplete build retains the existing growing wait. No payload memo key is computed. */
+  checkpointReadyOrWaiting(context,binding,budget){
+    const memo=this.checkpointMemo;
+    return Boolean(memo?.checkpoint&&memo.budget===budget&&isDeepStrictEqual(memo.binding,bindingFacts(binding))&&
+      memo.configVersion===context.configVersion&&isDeepStrictEqual(memo.cursors,context.cursors)&&
+      (memo.checkpoint.complete||this.now()<memo.retryAt));
+  }
   async preparedCheckpoint(context,binding,budget) {
     const memo=this.checkpointMemo,now=this.now(),prior=memo?.checkpoint;
     const matches=prior&&memo.budget===budget&&isDeepStrictEqual(memo.binding,bindingFacts(binding))&&
@@ -425,7 +451,7 @@ export class SessionManager {
     if(pending&&await this.settleCompaction(pending)!=='settled')return {state:'waiting',reason:'compaction-receipt-unconfirmed',operationId:pending.id};
     const last=this.state.compactions.findLast(c=>c.state==='complete');
     // A cooldown says when the next compaction may run. It is not a judgment that none is needed.
-    if(last&&this.now()-last.completedAt<this.state.config.compactCooldownMs)return {state:'waiting',reason:'observe-after-compaction',nextAt:last.completedAt+this.state.config.compactCooldownMs};
+    if(!advice.capacityRecovery&&last&&this.now()-last.completedAt<this.state.config.compactCooldownMs)return {state:'waiting',reason:'observe-after-compaction',nextAt:last.completedAt+this.state.config.compactCooldownMs};
     return this.maintained('compaction:'+advice.snapshotId.slice(0,24),()=>this.startCompaction(advice,context));
   }
   async startCompaction(advice,context) {

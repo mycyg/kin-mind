@@ -37,7 +37,7 @@ class PrivateNotes:
             raise ValueError('private-note-text-invalid')
         at = timestamp(request.get('at') or self.mind.clock()).isoformat()
         input_id = request.get('input_id')
-        data = {k: request[k] for k in ('turn_id', 'model', 'provider', 'session', 'reply_text', 'corrects') if k in request}
+        data = {k: request[k] for k in ('turn_id', 'model', 'provider', 'session', 'reply_text', 'corrects', 'person_id', 'conversation_key') if k in request}
         if isinstance(data.get('reply_text'), str):
             data['reply_text'] = data['reply_text'][:2000]
         data.update(text=text.strip(), basis='role_note', visibility='kin_only', evidence_ids=[])
