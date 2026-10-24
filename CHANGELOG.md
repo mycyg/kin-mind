@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.101
+
+- Accept a missing outer array closer only after native reply completion confirms intact message objects; keep intermediate stream parsing strict.
+
 ## 0.1.100
 
 - Accept omitted optional reply metadata and settle handed-off inputs against actual delivery receipts, with accurate partial and delayed-failure notices.
