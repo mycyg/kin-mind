@@ -132,7 +132,7 @@ class ShareLedger:
         units = self.units(conn, identifier, result["findings"], [data["source_id"]], at=data.get("completed_at"))
         from .activities import canonical_activity_ref
         activity = canonical_activity_ref(self.mind, "exploration", identifier, conn=conn)
-        return [self.graph._put(conn, {**unit, "activity_ref": activity}) for unit in units]
+        return [self.graph._put(conn, {**unit, "activity_ref": activity,"topic_tags":result.get("topic_tags",[]),"knowledge_basis":"model_report","perspective":result.get("perspective","mixed")}) for unit in units]
 
     @staticmethod
     def activity_id(activity):
@@ -179,7 +179,10 @@ class ShareLedger:
                 sources.add(ref.activity_ref["source_id"])
         return sorted(sources)
 
-    def coverage(self, conn, identifier, *, recipient="owner"):
+    def coverage(self, conn, identifier, *, recipient=None):
+        from .companion_view import ACTIVE_VIEW
+        view=ACTIVE_VIEW.get()
+        recipient=recipient or (view.person if view else "owner")
         if isinstance(identifier, dict):
             ref, unit = self.valid_reference(conn, {"activity_ref": identifier}, historical=True)
             identifier = ref.unit_id
@@ -196,8 +199,9 @@ class ShareLedger:
             states = [c["state"] for c in children]
             state = "shared" if states and all(s == "shared" for s in states) else "partial" if "shared" in states or "partial" in states else "unconfirmed" if "unconfirmed" in states else "unshared"
             return {"id": identifier, "state": state, "units": children, "total": len(children), "shared": states.count("shared"), "visibility": "unverified"}
-        args = (self.scope.key(), recipient, identifier, unit.get("content_version", 1))
-        where = "scope=? AND recipient=? AND unit_id=? AND version=?"
+        recipients=[recipient,"owner"] if recipient=="person:xiaoguang" else [recipient]
+        args = (self.scope.key(), *recipients, identifier, unit.get("content_version", 1))
+        where = "scope=? AND recipient IN ("+",".join("?" for _ in recipients)+") AND unit_id=? AND version=?"
         total = conn.execute(f"SELECT COUNT(*) FROM mind_share_coverage WHERE {where}", args).fetchone()[0]
         def checked(raw):
             value = json.loads(raw)
@@ -220,7 +224,7 @@ class ShareLedger:
                 **({"activity_ref": unit["activity_ref"], "coverage_scope": "registered-content"} if unit.get("activity_ref") else {})}
 
     def _save_coverage(self, conn, data):
-        keys = (self.scope.key(), "owner", data["unit_id"], data["version"], data["bubble_id"])
+        keys = (self.scope.key(), data.get("recipient", "owner"), data["unit_id"], data["version"], data["bubble_id"])
         prior = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient=? AND unit_id=? AND version=? AND bubble_id=?", keys).fetchone()
         old = json.loads(prior[0]) if prior else {}
         compare = lambda value: {k:v for k,v in value.items() if k != "revision"}
@@ -238,6 +242,7 @@ class ShareLedger:
 
     def settle(self, conn, share, *, mappings=None):
         """Only persisted, host-observed bubbles can change delivery coverage."""
+        recipient=share.get("recipient_person_id", "owner")
         supplied = {m.bubble_id: m for m in mappings or []}
         for bid, bubble in share.get("bubbles", {}).items():
             mapping = supplied.get(bid)
@@ -248,10 +253,10 @@ class ShareLedger:
                 except (Missing, Conflict, ValueError):
                     self._settle_unavailable_reference(conn, share, bid, bubble, raw, mapping=mapping)
                     continue
-                prior = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient=? AND unit_id=? AND version=? AND bubble_id=?", (self.scope.key(), "owner", ref.unit_id, ref.version, bid)).fetchone()
+                prior = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient=? AND unit_id=? AND version=? AND bubble_id=?", (self.scope.key(), recipient, ref.unit_id, ref.version, bid)).fetchone()
                 if prior and json.loads(prior[0])["state"] == "accepted" and not mapping:
                     continue
-                data = {"unit_id": ref.unit_id, "version": ref.version, "bubble_id": bid, "share_id": share["id"],
+                data = {"recipient":recipient,"unit_id": ref.unit_id, "version": ref.version, "bubble_id": bid, "share_id": share["id"],
                     "state": bubble["state"], "message_id": bubble.get("message_id"), "channel": share.get("channel"),
                     "conversation_id": bubble.get("conversation_id") or share.get("conversation_id"),
                     "at": bubble["at"], "mode": ref.mode, "reason": mapping.reason if mapping else ref.reason,
@@ -269,7 +274,7 @@ class ShareLedger:
                     edge = self.graph.link(conn, ref.unit_id, "shares", share["id"], refs, role=bid, basis="inferred" if mapping else "observed", reason=data["reason"] or "Registered content reference and delivery receipt")
                     data.update(relation_id=edge["id"], relation_revision=edge["revision"])
                 self._save_coverage(conn, data)
-                reservation = conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=? AND recipient='owner' AND unit_id=? AND version=?", (self.scope.key(), ref.unit_id, ref.version)).fetchone()
+                reservation = conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=? AND recipient=? AND unit_id=? AND version=?", (self.scope.key(), recipient, ref.unit_id, ref.version)).fetchone()
                 draft = bubble.get("draft_id") or share.get("delivery_id")
                 if reservation and draft in {reservation["draft_id"], *json.loads(reservation["data"]).get("draft_ids", [])}:
                     reserved = json.loads(reservation["data"])
@@ -278,7 +283,7 @@ class ShareLedger:
                     for group, members in reserved.get("batch_drafts", {}).items():
                         states[group] = self._aggregate_states([states.get(member, "prepared") for member in members])
                     reservation_state = self._aggregate_states(list(states.values()))
-                    conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND recipient='owner' AND unit_id=? AND version=?", (reservation_state, dumps(reserved), self.scope.key(), ref.unit_id, ref.version))
+                    conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND recipient=? AND unit_id=? AND version=?", (reservation_state, dumps(reserved), self.scope.key(), recipient, ref.unit_id, ref.version))
             if not mapping and bubble.get("state") == "accepted" and bubble.get("message_id"):
                 self._settle_unavailable_reference(conn, share, bid, bubble, None)
 
@@ -294,8 +299,8 @@ class ShareLedger:
                     "channel": share.get("channel"), "conversation_id": bubble.get("conversation_id") or share.get("conversation_id"),
                     "needs_review": True, "content_state": "unavailable-or-changed"}
             self._save_coverage(conn, data)
-            keys = (self.scope.key(), previous["unit_id"], previous["version"])
-            row = conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=? AND recipient='owner' AND unit_id=? AND version=?", keys).fetchone()
+            keys = (self.scope.key(), previous.get("recipient","owner"), previous["unit_id"], previous["version"])
+            row = conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=? AND recipient=? AND unit_id=? AND version=?", keys).fetchone()
             draft = bubble.get("draft_id") or share.get("delivery_id")
             if row:
                 reserved = self._reservation_data(row)
@@ -304,7 +309,7 @@ class ShareLedger:
                     states[draft] = "accepted"
                     for group, members in reserved.get("batch_drafts", {}).items():
                         states[group] = self._aggregate_states([states.get(member, "prepared") for member in members])
-                    conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND recipient='owner' AND unit_id=? AND version=?",
+                    conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND recipient=? AND unit_id=? AND version=?",
                         (self._aggregate_states(list(states.values())), dumps(reserved), *keys))
 
     def _registered(self, conn, bubble):
@@ -358,22 +363,30 @@ class ShareLedger:
                 self.settle(conn, share, mappings=[mapping])
 
     def register(self, request):
+        from .companion_view import ACTIVE_VIEW
+        view=ACTIVE_VIEW.get()
+        if view:request={**request,"recipient":view.person}
         reply_id = request.get("reply_id")
         bubbles = request.get("bubbles")
         if not reply_id or not isinstance(bubbles, list) or not 1 <= len(bubbles) <= 64:
             raise ValueError("A reference registration needs a reply ID and public bubbles")
         with self.engine.db.connect(write=True) as conn:
+            if view:
+                prior=conn.execute("SELECT data FROM mind_reply_references WHERE scope=? AND reply_id=?",(self.scope.key(),reply_id)).fetchone()
+                if prior and json.loads(prior[0]).get("recipient_person_id","person:xiaoguang")!=view.person:raise Conflict("Reply belongs to another recipient")
             checked = []
             for index, item in enumerate(bubbles):
                 if not isinstance(item.get("text"), str) or not item["text"].strip():
                     raise ValueError("Reference text cannot be empty")
                 refs = [self.valid_reference(conn, r)[0].model_dump(exclude_none=True) for r in item.get("references", [])]
+                if view and any(not view.memory.visible(conn,sid,view.person) for sid in self.reference_sources(conn,refs)):raise Missing("Sharing source protected")
                 checked.append({"text": item["text"], "bubble_id": item.get("bubble_id") or item.get("id") or f"{reply_id}:bubble:{index}",
                                 "bubble_index": index, "references": refs,
                                 "source_ids": self.reference_sources(conn, refs)})
-            data = {"reply_id": reply_id, "bubbles": checked, "state": "registered", "at": self.mind.clock()}
+            data = {"reply_id": reply_id, "bubbles": checked, "state": "registered", "at": self.mind.clock(),
+                    **({"recipient_person_id":view.person,"conversation_key":view.conversation} if view else {})}
             if request.get("draft_id"):
-                self.reserve(conn, [r for b in checked for r in b["references"]], request["draft_id"])
+                self.reserve(conn, [r for b in checked for r in b["references"]], request["draft_id"], recipient=request.get("recipient","owner"))
             # The empty legacy column is schema compatibility only. Reply and bubble IDs
             # carry the relationship; words can be revised without an integrity test.
             conn.execute("INSERT OR REPLACE INTO mind_reply_references VALUES(?,?,?,?)", (self.scope.key(), reply_id, "", dumps(data)))
@@ -404,13 +417,14 @@ class ShareLedger:
             return "pending"
         return "canceled" if states and all(state == "canceled" for state in states) else "prepared"
 
-    def reserve(self, conn, references, draft_id):
+    def reserve(self, conn, references, draft_id, *, recipient="owner"):
+        if recipient not in {"owner","person:xiaoguang","person:yiyi","group:family"}: raise ValueError("Unknown recipient")
         """Coordinate a real draft ID. Sharing an activity again is a free choice."""
         for row in conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=?", (self.scope.key(),)):
             self._check_draft(self._reservation_data(row), draft_id)
         for raw in references:
             ref, _ = self.valid_reference(conn, raw)
-            keys = (self.scope.key(), "owner", ref.unit_id, ref.version)
+            keys = (self.scope.key(), recipient, ref.unit_id, ref.version)
             prior = conn.execute("SELECT draft_id,state,data FROM mind_share_reservations WHERE scope=? AND recipient=? AND unit_id=? AND version=?", keys).fetchone()
             data = self._reservation_data(prior)
             self._check_draft(data, draft_id)
@@ -426,11 +440,11 @@ class ShareLedger:
         if not group or any(not entry.get("draft_id") for entry in entries):
             raise ValueError("Send preparation needs original draft identities")
         with self.engine.db.connect(write=True) as conn:
-            self.reserve(conn, [ref for entry in entries for ref in entry.get("references", [])], group)
+            self.reserve(conn, [ref for entry in entries for ref in entry.get("references", [])], group, recipient=request.get("recipient","owner"))
             for entry in entries:
                 for raw in entry.get("references", []):
                     ref, _ = self.valid_reference(conn, raw)
-                    args = (self.scope.key(), "owner", ref.unit_id, ref.version)
+                    args = (self.scope.key(), request.get("recipient","owner"), ref.unit_id, ref.version)
                     row = conn.execute("SELECT data FROM mind_share_reservations WHERE scope=? AND recipient=? AND unit_id=? AND version=?", args).fetchone()
                     data = json.loads(row[0])
                     data["draft_ids"] = sorted({*data.get("draft_ids", []), entry["draft_id"]})

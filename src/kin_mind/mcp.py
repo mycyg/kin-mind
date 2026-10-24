@@ -112,8 +112,15 @@ def register_mind_tools(server, engine):
                     query=query, since=since, until=until, detail=detail, budget=budget)
 
     @server.tool()
-    def read_affective_state(scope: Scope, history: int = 0, query: str = "") -> dict:
-        """读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到数值或运行状态时说明分数与依据；日常问心情时自然回答。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
+    def read_affective_state(scope: Scope, history: int = 0, query: str = "", wish_id: str | None = None, trait_id: str | None = None) -> dict:
+        """trait_id读取一条性格倾向及依据；wish_id 按稳定ID读取一条当前或归档心愿及来源，不返回整个状态；refs用read_memory读取。省略时读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到数值或运行状态时说明分数与依据；日常问心情时自然回答。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
+        if wish_id is not None and trait_id is not None:
+            raise ValueError("Read one wish or trait at a time")
+        if trait_id is not None:
+            from kin_mind.traits import Traits
+            return Traits(Mind(engine,scope)).read(trait_id, history=bool(history))
+        if wish_id is not None:
+            return Mind(engine, scope).read_wish(wish_id)
         from .context import Contexts, enabled
         if enabled(engine, scope) and not history:
             return Contexts(Mind(engine, scope)).affective(query)

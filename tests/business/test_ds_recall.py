@@ -448,7 +448,11 @@ def test_lanes_that_read_nothing_and_a_provider_without_a_store_send_the_request
         jobs.run_one(ds.provider)
     [sent] = ds.sent
     assert [tool["name"] for tool in sent["tools"]] == SUBMIT and len(sent["messages"]) == 1
-    assert RECALL_PROMPT not in sent["system"] and sent["system"].endswith(PLAIN_END)
+    assert RECALL_PROMPT not in sent["system"]
+    if lane == "session-maintenance":
+        assert "session_advice" in sent["system"]
+    else:
+        assert sent["system"].endswith(PLAIN_END)
     assert ds.raw[0] == as_before(sent)
 
 

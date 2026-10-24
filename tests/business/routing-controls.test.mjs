@@ -3,11 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
 import {MobileRouter,HANDOFF_SOURCE_MAX_HOURS} from '../../adapters/mobile-router.mjs';
 import {runtimeReply,displayName} from '../../adapters/mobile-controls.mjs';
 
-const sha=value=>createHash('sha256').update(String(value)).digest('hex');
 function fixture(t,{profiles=null,classify=null}={}) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-routing-controls-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   const clock={now:1000};
@@ -30,78 +28,6 @@ test('a mode request is credited only to the source its caller names (H1-04)',as
   assert.equal(notices.length,0);
 });
 
-test('a manual profile comes only from the owner or a verified reclassification (H1-04)',async t=>{
-  const f=fixture(t);
-  await f.router.dispatch({id:'owner-said-hi',kind:'owner',text:'hi'},async()=> 'new-turn');
-  assert.throws(()=>f.router.recordModeRequest({commandId:'pin-manual',mode:'manual',reason:'model asked',profile:{model:'gpt-6-sol',reasoningEffort:'high'}}),/only from the owner/);
-  assert.throws(()=>f.router.recordModeRequest({commandId:'pin-manual-2',mode:'manual',reason:'model asked',sourceInputId:'owner-said-hi',profile:{model:'gpt-6-sol',reasoningEffort:'high'}}),/only from the owner/,
-    'naming an owner message is not the owner asking');
-  assert.equal(f.router.state.requests['pin-manual'],undefined);assert.equal(f.router.state.configRevision,0,'a refused request changes nothing');
-  // The owner's own words still pin a profile.
-  const g=fixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'high',serviceTierPreference:'fast'},force:false,reason:'owner choice'})});
-  await g.router.dispatch({id:'owner-manual',kind:'owner',text:'用 sol high'},async()=>assert.fail('a control is not a prompt'));
-  assert.equal(g.router.state.requests['owner-mode:owner-manual'].mode,'manual');
-});
-
-test('a reclassification is fenced on configuration and later owner inputs, not on bookkeeping (H1-07)',async t=>{
-  const f=fixture(t);
-  await f.router.dispatch({id:'switch-please',kind:'owner',text:'切到 sol high'},async()=> 'new-turn');
-  const source=f.router.state.inputs['switch-please'];
-  const basis=f.router.reclassificationBasis('switch-please');
-  // Tool and delivery bookkeeping save the state; they do not move the basis.
-  await f.router.observe('tool',{id:'bookkeeping',status:'completed'});
-  await f.router.observe('delivery',{id:'reply',state:'accepted',messageId:'m1',sourceInputId:'switch-please'});
-  assert.equal(f.router.reclassificationBasis('switch-please'),basis);
-  const evidence={id:'evidence',version:1,sourceSha256:sha('source'),acceptanceSha256:sha('acceptance'),ownerBindingSha256:sha('binding'),
-    actualSessionId:'synthetic',conversationId:'conversation',generation:1};
-  const decision={route:'control',control:'work',force:false,reason:'the owner asked for the work profile'};
-  const result=await f.router.reclassifyAcceptedControl({commandId:'recover-1',sourceInputId:'switch-please',sourceHash:source.hash,expectedRevision:basis,evidence,decision});
-  assert.equal(result.receipt.state,'recorded');assert.equal(result.request.mode,'work');
-  // A later owner message moves the basis for another source.
-  const g=fixture(t);
-  await g.router.dispatch({id:'switch-please',kind:'owner',text:'切到 sol high'},async()=> 'new-turn');
-  const before=g.router.reclassificationBasis('switch-please');
-  await g.router.dispatch({id:'never-mind',kind:'owner',text:'算了不用换'},async()=> 'new-turn');
-  assert.notEqual(g.router.reclassificationBasis('switch-please'),before);
-  await assert.rejects(g.router.reclassifyAcceptedControl({commandId:'recover-2',sourceInputId:'switch-please',sourceHash:g.router.state.inputs['switch-please'].hash,
-    expectedRevision:before,evidence,decision}),/revision changed/);
-});
-
-test('an old owner message cannot be reclassified into a control (H1-07)',async t=>{
-  const f=fixture(t);
-  await f.router.dispatch({id:'old-switch',kind:'owner',text:'切到 sol high'},async()=> 'new-turn');
-  f.clock.now+=25*3600000;
-  assert.throws(()=>f.router.assertReclassifiable(f.router.state.inputs['old-switch']),/too old/);
-  const evidence={id:'evidence',version:1,sourceSha256:sha('source'),acceptanceSha256:sha('acceptance'),ownerBindingSha256:sha('binding'),
-    actualSessionId:'synthetic',conversationId:'conversation',generation:1};
-  await assert.rejects(f.router.reclassifyAcceptedControl({commandId:'recover-old',sourceInputId:'old-switch',sourceHash:f.router.state.inputs['old-switch'].hash,
-    expectedRevision:f.router.reclassificationBasis('old-switch'),evidence,decision:{route:'control',control:'work',force:false,reason:'late'}}),/too old/);
-});
-
-test('the host\'s configured profiles route work and chat; display names come from the catalog (AD1-15)',async t=>{
-  const profiles={work:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},chat:{model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}};
-  const f=fixture(t,{profiles,classify:async()=>({route:'work',reason:'a real request'})});
-  await f.router.dispatch({id:'do-work',kind:'owner',text:'please write the report'},async()=> 'new-turn');
-  assert.deepEqual(f.switches,['gpt-6-astra']);
-  assert.deepEqual((await f.router.readRuntime()).defaults.work,profiles.work);
-  f.router.rememberModelNames([{id:'gpt-6-astra',aliases:['Astra (catalog)']}]);
-  assert.equal(runtimeReply({actual:{model:'gpt-6-astra',reasoningEffort:'high',verified:true},tasks:[],mode:'auto'},{names:f.router.modelNames}).includes('Astra (catalog)'),true);
-  assert.equal(displayName('unknown-model'),'unknown-model');
-});
-
-test('a failed force leaves no force in progress, so nothing keeps its epoch suppressed (H1-01)',async t=>{
-  let inProgress=null;
-  const f=fixture(t,{classify:async()=>({route:'control',control:'work',force:true,reason:'owner forces the work profile'})});
-  f.args.forceSwitch=null;
-  const router=new MobileRouter({...f.args,forceSwitch:async()=>{inProgress=router.forceInProgress();return {state:'failed',reason:'native-cancel-request-failed'};}});
-  Object.assign(f.runtime,{active:true,nativeStatus:'active'});
-  await router.dispatch({id:'force-now',kind:'owner',text:'立刻切到工作模式'},async()=>assert.fail('a control is not a prompt'));
-  assert.equal(inProgress,true,'while the host is interrupting, the force is in progress');
-  assert.equal(router.state.requests['owner-mode:force-now'].state,'failed');
-  assert.equal(router.forceInProgress(),false);
-  assert.equal(router.state.executionEpoch,0,'the epoch never advanced');
-});
-
 test('a desktop hand-off is authorized by an accepted owner input, read from the live ledger, within a day (H3-20)',async t=>{
   const f=fixture(t);
   await f.router.dispatch({id:'owner-asks',kind:'owner',text:'让桌面整理一下报告'},async()=> 'new-turn');
@@ -119,4 +45,41 @@ test('a desktop hand-off is authorized by an accepted owner input, read from the
   assert.equal(f.router.handoffSource('owner-asks').reason,'source-too-old');
   f.router.state.config.handoffSourceMaxHours=48;
   assert.equal(f.router.handoffSource('owner-asks').state,'eligible','the limit is the configured one');
+});
+
+
+test('manual choices require the current owner model context and apply only after the turn',async t=>{
+ const f=fixture(t);await f.router.dispatch({id:'choice',kind:'owner',text:'用 sol high'},async()=> 'new-turn');
+ const request={commandId:'manual',sourceInputId:'choice',mode:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'high'},reason:'owner choice'};
+ await assert.rejects(f.router.requestMode(request),/only from the owner/);
+ await f.router.requestMode(request,{ownerModelChoice:true});
+ assert.equal(f.router.state.requests.manual.state,'pending');assert.equal(f.runtime.model,'deepseek-flash');
+ await f.router.applyPendingMode();assert.equal(f.router.state.requests.manual.state,'applied');assert.equal(f.runtime.model,'gpt-6-sol');
+});
+
+test('the retired historical classifier cannot manufacture a mode change',async t=>{
+ const f=fixture(t,{classify:()=>assert.fail('no historical classifier')});
+ await f.router.dispatch({id:'old',kind:'owner',text:'切到 sol high'},async()=> 'new-turn');
+ f.clock.now+=25*3600000;const before=f.router.snapshot();
+ assert.equal(f.router.reclassifyAcceptedControl,undefined);assert.deepEqual(f.router.snapshot(),before);assert.deepEqual(f.switches,[]);
+});
+
+test('configured work profile applies when KIN accepts the task and catalog names remain visible',async t=>{
+ const profiles={work:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},chat:{model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'}};
+ const f=fixture(t,{profiles,classify:()=>assert.fail('no pre-chat classification')});
+ await f.router.dispatch({id:'do-work',kind:'owner',text:'please write the report'},async()=> 'new-turn');assert.deepEqual(f.switches,[]);
+ await f.router.requestMode({commandId:'accept',mode:'work',sourceInputId:'do-work',reason:'KIN accepts'});await f.router.applyPendingMode();
+ assert.deepEqual(f.switches,['gpt-6-astra']);assert.deepEqual((await f.router.readRuntime()).defaults.work,profiles.work);
+ assert.deepEqual(f.router.currentTask().inputIds,['do-work']);
+ f.router.rememberModelNames([{id:'gpt-6-astra',aliases:['Astra (catalog)']}]);
+ assert.ok(runtimeReply({actual:{model:'gpt-6-astra',reasoningEffort:'high',verified:true},tasks:[],mode:'auto'},{names:f.router.modelNames}).includes('Astra (catalog)'));
+ assert.equal(displayName('unknown-model'),'unknown-model');
+});
+
+test('a failed literal force leaves the original epoch active',async t=>{
+ let during=null;const f=fixture(t);
+ const router=new MobileRouter({...f.args,forceSwitch:async()=>{during=router.forceInProgress();return {state:'failed',reason:'native-cancel-request-failed'};}});
+ Object.assign(f.runtime,{active:true,nativeStatus:'active'});
+ await router.dispatch({id:'force-now',kind:'owner',text:'/mode work'},()=>assert.fail('literal command is handled by host'));
+ assert.equal(during,true);assert.equal(router.state.requests['owner-mode:force-now'].state,'failed');assert.equal(router.forceInProgress(),false);assert.equal(router.state.executionEpoch,0);
 });

@@ -22,21 +22,37 @@ const safeReceipt=(record,depth=0)=>{
   }
   return Object.keys(value).length?value:undefined;
 };
-function failure(record={},fallback={}) {
-  const supplied=record?.failure&&typeof record.failure==='object'?record.failure:record;
-  const rawCode=supplied?.code??record?.code??record?.message;
-  const code=staticToken(rawCode,fallback.code??'contact-host-unclassified');
+export function normalizeContactFailure(record={},fallback={}) {
+  const supplied={...fallback,...(record?.failure&&typeof record.failure==='object'?record.failure:record??{})};
+  const rawCode=record?.failure?.code??record?.code??record?.message??supplied?.code;
+  let code=staticToken(rawCode,fallback.code??'contact-host-unclassified');
   let category=FAILURE_CATEGORIES.has(supplied?.category)?supplied.category:fallback.category??'unknown';
   let stage=staticToken(supplied?.stage,fallback.stage??'contact-host');
   let retry=supplied?.retry_condition??supplied?.retryCondition??fallback.retry_condition??'backoff';
   if(code==='contact-draft-invalid-result'){category='model-output';stage='contact-draft-format';retry='deepseek-decision';}
   else if(/^deepseek-(timeout|network-error|http-|key-unavailable|background-capacity|foreground-priority)/.test(code)){category='model-unavailable';stage='contact-draft-execution';retry='backoff';}
   else if(/^deepseek-(missing-structured-result|incomplete-or-unverified)/.test(code)){category='model-output';stage='contact-draft-format';retry='deepseek-decision';}
+  // Both rejected promises and returned native errors retain the same provider
+  // status. Do not turn a deterministic 400 into another timed retry.
+  const status=Number(supplied.http_status??supplied.status??supplied.statusCode??
+    String(record?.message??rawCode??'').match(/(?:HTTP(?: status)?|status(?: code)?|statusCode|unexpected status|deepseek-http-|provider-http-)[^0-9]{0,20}([45][0-9]{2})/i)?.[1]);
+  if(Number.isInteger(status)&&status>=400&&status<=599) {
+    supplied.http_status=status;supplied.retryable=status===408||status===429||status>=500;
+    if(category!=='delivery-uncertain') {
+      category=supplied.retryable?'model-unavailable':'contract';code='provider-http-'+status;
+      retry=supplied.retryable?'backoff':'repair-input';
+    }
+  }
   const retry_condition=RETRY_CONDITIONS.has(retry)?retry:'backoff';
   const receipt=safeReceipt(supplied?.model_receipt??supplied?.modelReceipt??record?.receipt);
-  const model_invoked=typeof supplied?.model_invoked==='boolean'?supplied.model_invoked:undefined;
-  return {category,stage,code,retry_condition,...(model_invoked===undefined?{}:{model_invoked}),...(receipt?{model_receipt:receipt}:{})};
+  const model_invoked=typeof supplied?.model_invoked==='boolean'||supplied?.model_invoked===null?supplied.model_invoked:undefined;
+  const native=Object.fromEntries(['native_error','native_reason','native_stage']
+    .filter(key=>typeof supplied?.[key]==='string'&&staticToken(supplied[key],null)).map(key=>[key,supplied[key]]));
+  const facts=Object.fromEntries(['http_status','retryable','diagnostic_id'].filter(k=>supplied?.[k]!==undefined).map(k=>[k,supplied[k]]));
+  return {category,stage,code,retry_condition,...native,...facts,...(supplied.error_type?{error_type:supplied.error_type}:{}),...(model_invoked===undefined?{}:{model_invoked}),...(receipt?{model_receipt:receipt}:{})};
 }
+
+const failure=normalizeContactFailure;
 
 /** The owner's rules that hold one contact after another (owner-activity's evaluateContactPolicy):
  * they wait for a reply or keep the minimum gap before the NEXT contact. */
@@ -185,25 +201,26 @@ export class MindLoop {
       if(valid.reason==='repeats-unconfirmed-send')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'repeats-unconfirmed-send',...chosen});
       if(valid.reason==='desire-not-offered')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-unknown-desire',retry_condition:'deepseek-decision'})});
-      if(this.closed||!valid.eligible||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
+      if(!valid.eligible||epoch!==this.ownerEpoch()) {
         return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'Draft or delivery conditions changed'});
       }
       if(decision.action!=='send')return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-decision',decision:semantic,...chosen});
       if(typeof content!=='string'||!content.trim())return await settleDraft({attempt_id:attempt.id,state:'canceled',reason:'draft-failed',
         failure:failure({category:'model-output',stage:'contact-draft-output',code:'contact-draft-empty-output',retry_condition:'deepseek-decision'})});
-      const held=await settleDraft({attempt_id:attempt.id,state:'pending',...chosen,text:content});
+      const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
+      const outbound={id:attempt.id,text:content,messages:decision.messages,bubbles:decision.bubbles,memes:decision.memes,
+        presentation:decision.presentation,presentations:decision.presentations,references:decision.references,files};
+      const held=await settleDraft({attempt_id:attempt.id,state:'pending',...chosen,text:content,outbound});
       // Something the draft had before it was deleted while it was written: the store canceled it in
       // the write that would have held the text, and nothing is sent (CL6D-MM-01).
       if(held?.state==='canceled')return held;
       // The durable pending write is not a send. Yield safely if context moved.
-      if(this.closed||this.isBusy()||!this.eligibility().eligible||epoch!==this.ownerEpoch()) {
-        return await this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,
-          reason:epoch!==this.ownerEpoch()?'contact-source-changed':'Delivery conditions changed before sending'});
-      }
+      if(epoch!==this.ownerEpoch())return await this.call('settle',{attempt_id:attempt.id,state:'canceled',aborted_before_send:true,reason:'contact-source-changed'});
+      if(this.closed||this.isBusy()||!this.eligibility().eligible)
+        return {state:'pending',attempt_id:attempt.id,reason:'delivery-deferred'};
       possibleSend=true;
-      const files=(attempt.desires??[attempt.desire]).filter(d=>d&&(!chosen.desire_ids||chosen.desire_ids.includes(d.id))).flatMap(d=>d.delivery_artifacts??[]);
       // The batch asks about this contact itself (`within`): its own attempt is not a contact before it.
-      const receipt=await this.send({id:attempt.id,text:content,bubbles:decision.bubbles,memes:decision.memes,presentation:decision.presentation,presentations:decision.presentations,references:decision.references,files,
+      const receipt=await this.send({...outbound,
         guard:within=>!this.closed&&!this.isBusy()&&this.eligibility(within).eligible&&epoch===this.ownerEpoch()});
       // The owner's contact rules said no at the send itself (the Feishu contact answers `skipped`, with
       // their reason): it returned before its batch was written, so nothing went out under this id. It is

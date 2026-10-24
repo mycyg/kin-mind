@@ -18,7 +18,7 @@ test('native encrypted include violates documented contract; Kimi adapter remove
   assert.throws(()=>documented(input));
   const result=kimiRequest(input,'chat');documented(result);
   assert.equal(result.include,undefined);assert.equal(result.client_metadata,undefined);
-  assert.deepEqual(result.input,input.input);assert.deepEqual(result.tools,input.tools);
+  assert.deepEqual(result.input.slice(0,input.input.length),input.input);assert.equal(result.input.at(-1).content[0].text,'可信宿主任务模式：reply');assert.deepEqual(result.tools,input.tools);
   assert.equal(result.prompt_cache_key,'synthetic');assert.equal(result.stream,true);
   assert.deepEqual(result.reasoning,{effort:'high'});assert.deepEqual(input,before);
 });
@@ -34,11 +34,18 @@ test('documented search includes, developer roles, images and paired tool histor
     {type:'function_call',name:'lookup',call_id:'test',arguments:'{}'},
     {type:'function_call_output',call_id:'test',output:'Synthetic result.'});
   const result=kimiRequest(input,'chat');documented(result);
-  assert.deepEqual(result.include,['web_search_call.action.sources']);assert.deepEqual(result.input,input.input);
+  assert.deepEqual(result.include,['web_search_call.action.sources']);assert.deepEqual(result.input.slice(0,input.input.length),input.input);assert.equal(result.input.at(-1).content[0].text,'可信宿主任务模式：reply');
 });
 test('DeepSeek serialization stays unchanged and incompatible Kimi compaction still refuses',()=>{
   const input={...native(),model:'deepseek-flash'};const result=deepseekRequest(input);
   assert.deepEqual(result.include,input.include);assert.deepEqual(result.client_metadata,input.client_metadata);
   const invalid=native();invalid.input.push({type:'compaction',encrypted_content:'synthetic'});
   assert.throws(()=>kimiRequest(invalid));
+});
+
+// The real Kimi Responses endpoint rejected json_object on 2026-10-24.
+test('optional host schema keeps the Kimi schema contract without requesting all-required strict mode',()=>{
+ const input={...native(),text:{format:{type:'json_schema',name:'draft',strict:true,schema:{type:'object',properties:{action:{type:'string'},messages:{type:'array',items:{type:'string'}}},required:['action'],additionalProperties:false}}}};
+ const out=kimiRequest(input,'chat');assert.equal(out.text.format.type,'json_schema');assert.equal(out.text.format.strict,false);
+ assert.deepEqual(out.text.format.schema,input.text.format.schema);assert.equal(input.text.format.strict,true);
 });

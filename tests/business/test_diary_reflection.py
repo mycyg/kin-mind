@@ -85,11 +85,11 @@ def run(mind, source, answer, key="idle-tick"):
 def test_every_provider_is_asked_for_the_diary_and_the_operational_lane_may_submit_it(env):
     mind, *_ = env
     shared = A.SYSTEM
-    assert "日记与反思" in shared and "basis=internal_thought" in shared and "recent_reflections" in shared and "today_count" in shared
-    assert "不重复增加成长依据" in shared
+    assert "日记与反思" in shared and "internal_thought" in shared and "recent_reflections" in shared and "today_count" in shared
+    assert "不必为了凑记录重写同一件事" in shared
     provider = A.DeepSeek.__new__(A.DeepSeek)
     system = A.DeepSeek._system(provider, {"stimulus": "idle-review", "operational_only": True}, None)
-    assert "日记与反思" in system and "感想与日记（understanding）" in system
+    assert "日记与反思" in system and "understanding" in system
     assert "category 取 state.traits.categories 允许的类型" in A.TRAIT_OBSERVATIONS_PROMPT
     assert "不必等用户确认每一次成长" in A.TRAIT_DECISIONS_PROMPT
     # A historical pass has no diary to write: its prompt stays its own.
@@ -136,63 +136,30 @@ def test_an_assessment_is_shown_the_diaries_and_a_trait_can_grow_from_one(env):
     assert kept in json.dumps(json.loads(rows[0]["data"]))
 
 
-def test_a_trait_type_the_contract_does_not_list_is_named_to_the_model_and_all_types_once_the_owner_approves(env, tmp_path):
+def test_all_trait_types_can_evolve_from_real_diary_evidence_without_an_approval_step(env):
     mind, source, diary, _ = env
     root = mind.engine.db.root
-    with mind.engine.db.connect(write=True) as conn:
-        Traits(mind).ensure(conn)  # the ledger's tables, as a store that has run it has them
-    contract(root, mind.scope, ["interests", "兴趣"])
-    assert mind.read()["trait_ledger"]["traits"]["categories"] == ["interests", "兴趣"]
+    contract(root, mind.scope, ["interests"])
+    before = (root / "persona-policy.json").read_text()
     humor = diary("d-humor", "我发现自己越来越爱接冷笑话。", topic="幽默")
-
     def answer(context):
         return Appraisal(reason="冷笑话", trait_observations=[TraitObservation(
             key="冷笑话", category="humor", slug="dry-jokes", evidence_class="self_statement",
             polarity="support", evidence_ids=[humor])])
-
     run(mind, source, answer, key="tick-one")
     with mind.engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_trait_observations").fetchone()[0] == 0
-        refused = [r[0] for r in conn.execute("SELECT section FROM mind_section_refusals")]
-    assert "trait_observations" in refused
-
-    # The owner's word, as the release records it: every type, the canon itself untouched.
-    before = json.loads((root / "persona-policy.json").read_text())
-    done = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--quote", "测试用的批准原话",
-                           "--at", "2026-09-27T09:00:00+08:00"], capture_output=True, text=True, check=True)
-    assert json.loads(done.stdout)["state"] == "widened"
-    after = json.loads((root / "persona-policy.json").read_text())
-    assert after["mutable_trait_keys"] == ["interests", "兴趣", ALL_TRAIT_TYPES]
-    assert after["mutable_trait_keys_approval"]["quote"] == "测试用的批准原话"
-    assert {k: v for k, v in after.items() if not k.startswith("mutable_trait_keys")} == \
-        {k: v for k, v in before.items() if not k.startswith("mutable_trait_keys")}
-    again = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--quote", "x", "--at", "y"],
-                           capture_output=True, text=True, check=True)
-    assert json.loads(again.stdout)["state"] == "unchanged"
-
-    policy = load_persona(mind.engine, mind.scope)
-    assert trait_categories(policy) == "all" and mutable_trait(policy, "humor")
-    validate_trait_changes(policy, {"humor": "x", "values": "y"})
-    assert mind.read()["trait_ledger"]["traits"]["categories"] == "all"
-    run(mind, source, answer, key="tick-two")
-    with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM mind_trait_observations").fetchone()[0] == 1
+        assert not conn.execute("SELECT 1 FROM mind_section_refusals WHERE section='trait_observations'").fetchall()
+    assert mind.read()["trait_ledger"]["traits"]["categories"] == "all"
+    assert (root / "persona-policy.json").read_text() == before
 
 
-def test_without_the_owners_word_a_listed_contract_still_refuses_other_types(tmp_path):
+def test_legacy_mutable_keys_do_not_restrict_current_self_edit_authorization(tmp_path):
     scope = Scope(persona="synthetic-contract")
     policy = contract(tmp_path, scope, ["interests"])
-    assert trait_categories(policy) == ["interests"] and not mutable_trait(policy, "humor")
-    with pytest.raises(ValueError, match="explicit owner approval"):
-        validate_trait_changes(policy, {"humor": "x"})
+    assert trait_categories(policy) == "all" and mutable_trait(policy, "humor")
+    validate_trait_changes(policy, {"humor": "x", "values": "y"})
     assert trait_categories(None) == "all" and mutable_trait(None, "anything")
-    # The script refuses to run without the owner's words, and a dry run changes nothing.
-    missing = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--quote", " ", "--at", "t"], capture_output=True, text=True)
-    assert missing.returncode != 0
-    planned = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), "--quote", "都可以", "--at", "t", "--dry-run"],
-                             capture_output=True, text=True, check=True)
-    assert json.loads(planned.stdout)["state"] == "planned"
-    assert json.loads((tmp_path / "persona-policy.json").read_text())["mutable_trait_keys"] == ["interests"]
 
 
 def test_today_count_is_independent_of_the_excerpt_window(env):

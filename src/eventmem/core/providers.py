@@ -115,6 +115,17 @@ class Providers:
 
         if not recording():
             raise SessionRequired(f"Model role {role} is not asked for by a look")
+        from .prompts import project_prompt, project_schema
+        if json_:
+            json_ = dict(json_)
+            for field in ("tools", "response_format"):
+                if field in json_:
+                    json_[field] = project_schema("provider/" + role + "/" + field, json_[field], self.engine.db.root)
+            if isinstance(json_.get("system"), str):
+                json_["system"] = project_prompt("provider/" + role, json_["system"], self.engine.db.root)
+            if isinstance(json_.get("messages"), list):
+                json_["messages"] = [{**m, "content": project_prompt("provider/" + role, m["content"], self.engine.db.root)}
+                    if m.get("role") == "system" and isinstance(m.get("content"), str) else m for m in json_["messages"]]
         config = self.role(role)
         headers = (
             {"Authorization": "Bearer " + os.environ[config.api_key_env]}

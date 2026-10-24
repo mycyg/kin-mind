@@ -316,7 +316,7 @@ class Scheduler:
                 conn, "schedule:" + request.command_id, request.model_dump(), run
             )
 
-    def control(self, sid, action, expected_revision, due_at=None):
+    def control(self, sid, action, expected_revision, due_at=None, *, change_context=None):
         from .models import utc
 
         if action not in {"cancel", "pause", "resume", "snooze", "confirm"}:
@@ -325,9 +325,11 @@ class Scheduler:
             row = conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
             if not row:
                 raise Missing(sid)
+            data = json.loads(row["data"])
+            prior=data.get("companion_last_change")
+            if change_context and prior and prior["intent"]==change_context:return prior["result"]
             if row["revision"] != expected_revision:
                 raise Conflict("Schedule revision changed")
-            data = json.loads(row["data"])
             if action == "confirm":
                 data["confirmed"] = True
                 conn.execute(
@@ -351,12 +353,14 @@ class Scheduler:
             if action == "snooze" and not due_at:
                 raise ValueError("Snooze requires due_at")
             due = utc(due_at) if due_at else row["due_at"]
+            result = {"id": sid, "revision": expected_revision + 1, "status": state}
+            if action != "confirm": result |= reconciliation(outcomes)
+            if change_context:data["companion_last_change"]={"intent":change_context,"result":result}
             conn.execute(
                 "UPDATE schedules SET state=?,revision=revision+1,due_at=?,data=? WHERE id=?",
                 (state, due, dumps(data), sid),
             )
-            result = {"id": sid, "revision": expected_revision + 1, "status": state}
-            return result if action == "confirm" else result | reconciliation(outcomes)
+            return result
 
     def _eligible(self, conn, schedule, policy, stamp):
         if schedule["state"] in ("canceled", "paused", "complete"):
@@ -503,6 +507,10 @@ class Scheduler:
                     "scope": record["scope"],
                     "attempts": [],
                 }
+                route = json.loads(schedule["data"]).get("companion_delivery")
+                if route:
+                    data["companion_delivery"] = route
+                    data["schedule_generation"] = json.loads(schedule["data"]).get("generation",0)
                 confirmed = json.loads(schedule["data"]).get("confirmed")
                 state = (
                     "ready"

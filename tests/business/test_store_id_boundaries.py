@@ -107,7 +107,7 @@ def test_a_restore_refuses_every_unreadable_archived_row_without_restoring_erase
         assert conn.execute("SELECT 1 FROM sources WHERE id=? AND deleted=0", (secret,)).fetchone() is None
 
 
-def test_the_approval_the_persona_contract_names_is_found_value_by_value(tmp_path):
+def test_legacy_approval_text_never_gates_current_persona(tmp_path):
     """The read policy and the deploy checks read the approved source in the contract's values, not in
     JSON that escapes every Chinese character, where no pattern could find an id written against one."""
     for index, (text, named) in enumerate(STORE_ID_BOUNDARIES):
@@ -117,7 +117,7 @@ def test_the_approval_the_persona_contract_names_is_found_value_by_value(tmp_pat
         approved = policy["approved_source"]
         path.write_text(json.dumps({**policy, "approved_source": text.format(id=approved)}))
         answer = persona_approval(config)
-        assert (answer["ok"], answer["problems"]) == ((True, []) if named else (False, ["approved-source-missing"])), text
+        assert (answer["ok"], answer["problems"]) == (True, []), text
         engine = Engine(Path(config["root"]))
         read_policy._persona_cache.clear()
         with engine.db.connect() as conn:

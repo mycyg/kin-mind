@@ -255,3 +255,18 @@ test('a settled run\'s final answer keeps the artifacts it names and loses its w
   worker.close();
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('shared creator uses main receipt, real artifact hashes and verifier without spawning a model',async()=>{
+ const root=temporary(),log=[];
+ try{
+  const creator=new AutonomousCreator({command:'native-main',root,executions:records(log),spawnImpl:()=>assert.fail('new model process'),
+   nativeRun:async request=>{assert.equal(request.kind,'creation');fs.writeFileSync(path.join(request.context.workspace,'a.txt'),'made');return {state:'complete',result:{artifacts:['a.txt'],summary:'made',remaining:[],verification:[]},receipt:{channel:'legacy',model:'k3',native_session_id:'same-main',native_turn_id:'turn-3'}};},
+   verifier:{capabilities:()=>({static_html_render:false}),verify:async result=>{log.push('verify');return result;}}});
+  const result=await creator.run({plan:{id:'p'},step:{id:'s'},run:{id:'r'},brief:{}});
+  assert.equal(result.state,'produced');assert.equal(result.receipt.thread_id,'same-main');assert.equal(result.receipt.exit_code,undefined);
+  assert.equal(result.artifacts[0].sha256,createHash('sha256').update('made').digest('hex'));assert.deepEqual(log,['open:creation-verification','verify','settle']);
+  creator.nativeRun=async()=>({state:'waiting',reason:'owner-preempted'});
+  const interrupted=await creator.run({plan:{id:'p'},step:{id:'s'},run:{id:'r2'},brief:{}});
+  assert.equal(interrupted.state,'interrupted');assert.equal(interrupted.checkpoint,result.receipt.workspace);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

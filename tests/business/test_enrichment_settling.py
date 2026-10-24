@@ -26,7 +26,7 @@ pytest_plugins = ('test_kin_mind',)
 
 # What an enrichment row carried before settling existed.
 ENRICHMENT_KEYS = {"evidence_ids", "agent_version", "origin", "stimulus", "parent_id", "seed_memory", "seed_receipt",
-                   "seed_sources", "evaluated_ids", "seed_tombstone_mark"}
+                   "seed_sources", "evaluated_ids", "seed_tombstone_mark", "recipient_person_id"}
 
 
 class Action:
@@ -129,6 +129,7 @@ def test_kin_reaches_out_and_xiaoguang_answers_half_an_hour_later_and_one_reques
     assert quiet <= time.time(), "the answer has been quiet for twenty minutes"
     assert jobs.runnable("enrichment")
 
+    assert all(data["recipient_person_id"] == "person:xiaoguang" for _, _, data in rows.values())
     organizer = Organizer()
     assert jobs.run_one(organizer, lane="enrichment")["state"] == "complete"
     assert len(organizer.requests) == 1 and {contact, answer} <= set(organizer.requests[0])

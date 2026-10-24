@@ -102,6 +102,17 @@ export function chatEnvelope(text) {
     Object.keys(bubble).every(key=>['text','references','bubble_id','presentation'].includes(key))&&
     typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
     (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
+  // Some native replies put a viewed MEME beside a referenced text bubble.
+  // Expand only this unambiguous shape; the normal image validator and the
+  // current-turn inspection receipt still decide whether the image can leave.
+  if(Array.isArray(value.bubbles))value.bubbles=value.bubbles.flatMap(bubble=>{
+    if(!bubble||typeof bubble!=='object'||Array.isArray(bubble)||!Object.hasOwn(bubble,'image'))return [bubble];
+    const {image,...text}=bubble;
+    if(!referenced(text)||!image||typeof image!=='object'||Array.isArray(image)||
+      Object.keys(image).some(key=>!['meme_id','inspection_id'].includes(key)))return [bubble];
+    const visual={type:'image',...image};
+    return memeBubble(visual)?[text,visual]:[bubble];
+  });
   if(value.action==='send'&&keys.every(k=>['action','bubbles','presentation'].includes(k))&&Array.isArray(value.bubbles)&&value.bubbles.length
     &&value.bubbles.every(bubble=>typeof bubble==='string'?bubble.trim():referenced(bubble)||memeBubble(bubble)))
     return {state:'send',...(value.presentation?{presentation:replyPresentation(value.presentation)}:{}),bubbles:value.bubbles.map(bubble=>memeBubble(bubble)?'[表情图片]':(typeof bubble==='string'?bubble:bubble.text).trim()),

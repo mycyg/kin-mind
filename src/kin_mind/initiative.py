@@ -76,6 +76,8 @@ def _code(value):
     return value if isinstance(value, str) and CODE.fullmatch(value) else None
 
 
+from . import recipient
+
 def unsent_contacts(conn, mind, state, at):
     """Contact wishes still standing a day or more after they were made, with no send behind them.
     A send of unknown outcome is being reconciled under its own id and is not one of them. One that
@@ -84,6 +86,8 @@ def unsent_contacts(conn, mind, state, at):
     now, held = timestamp(at), mind._unconfirmed_desires(conn)
     found = []
     for desire in state["desires"].values():
+        if not recipient.belongs(desire):
+            continue
         if (desire.get("kind") != "contact" or desire.get("status") not in LIVE or desire.get("delivery")
                 or desire["id"] in held or timestamp(desire["expires_at"]) <= now):
             continue
@@ -102,19 +106,19 @@ def facts(mind, at=None):
     with mind.engine.db.connect() as conn:
         state = mind._load(conn)
         made = {}
-        wishes = [(d.get("kind"), d.get("created_at")) for d in state["desires"].values()]
+        wishes = [(d.get("kind"), d.get("created_at")) for d in state["desires"].values() if recipient.belongs(d)]
         if _table(conn, "mind_desire_archive"):
             # A finished wish moved to the archive was still made when it was made.
-            wishes += conn.execute("SELECT kind,json_extract(data,'$.created_at') FROM mind_desire_archive WHERE scope=?",
+            wishes += conn.execute("SELECT kind,json_extract(data,'$.created_at') FROM mind_desire_archive WHERE scope=? AND "+recipient.predicate(),
                                    (scope,)).fetchall()
         for kind, created in wishes:
             if kind in WISH_KINDS and created and (kind not in made or timestamp(created) > timestamp(made[kind])):
                 made[kind] = created
         last_wish = max((timestamp(value) for value in made.values()), default=None)
-        sent = conn.execute("SELECT json_extract(data,'$.updated_at') FROM mind_contacts WHERE scope=? AND state='accepted' "
+        sent = conn.execute("SELECT json_extract(data,'$.updated_at') FROM mind_contacts WHERE scope=? AND "+recipient.predicate()+" AND state='accepted' "
                             "ORDER BY json_extract(data,'$.updated_at') DESC LIMIT 1", (scope,)).fetchone()
         # Idle reviews queued after the latest wish of any kind: how many quiet looks went by without one.
-        idle = conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE scope=? AND kind='idle-review' AND created_at>?",
+        idle = conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE scope=? AND "+recipient.predicate()+" AND kind='idle-review' AND created_at>?",
                             (scope, last_wish.isoformat() if last_wish else "")).fetchone()[0]
         exploration, failed = None, []
         if _table(conn, "mind_explorations"):
@@ -130,7 +134,7 @@ def facts(mind, at=None):
                 failed.append({"exploration_id": row["id"], "state": row["state"], "hours_ago": _hours(now, row["created_at"]),
                                "desire_id": data.get("desire_id"), **({"code": code} if code else {})})
         try:
-            creation = conn.execute("SELECT state,json_extract(data,'$.started_at') AS started FROM mind_plan_runs WHERE scope=? "
+            creation = conn.execute("SELECT state,json_extract(data,'$.started_at') AS started FROM mind_plan_runs WHERE scope=? AND "+recipient.predicate()+" "
                                     "AND actor='create' ORDER BY json_extract(data,'$.started_at') DESC LIMIT 1", (scope,)).fetchone()
         except sqlite3.OperationalError:
             creation = None

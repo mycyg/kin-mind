@@ -22,7 +22,7 @@ function fixture(t){
  const context={cursors:{input:1,send:1},configVersion:'persona-v1',tasks:[],inputs:[]};const calls=[],candidateRequests=[],loads=[];
  // What a candidate launched now would carry (NativeCandidate.launch): its instructions, when a companion layer is on.
  const launch={instructionBinding:null};
- const config={...SESSION_DEFAULTS,prepare:true,rotate:true};
+ const config={...SESSION_DEFAULTS,prepare:true,rotate:true,compactPressure:100};
  const options={file:path.join(dir,'registry.json'),binding:{threadId:'old',nativeSessionId:'old',conversationId:'logical'},coordinator:{locked:f=>f()},inspect:async()=>({...runtime}),collect:async()=>structuredClone(context),now:()=>clock.now,config,lease:false,
   checkpoint:async(c,b)=>({id:'cp:'+c.cursors.input,conversationId:b.conversationId,generation:b.generation,configVersion:c.configVersion,cursors:c.cursors,complete:true,tokens:100,sourceRevisions:{u:1,a:1},items:[{id:'u',revision:1,role:'user',text:'蓝色机器人叫云朵。'},{id:'a',revision:1,role:'assistant',text:'你要云朵的方形贴纸吗？'}],pendingQuestions:[{sourceId:'a',target:'云朵的方形贴纸'}]}),
   compact:async id=>{calls.push('compact');runtime.lastTokenUsage.inputTokens=10000;return {completed:true,actual_session:'old',operationId:id,at:new Date(clock.now).toISOString()};},ackCompact:async()=>calls.push('ack'),
@@ -968,4 +968,34 @@ test('a changed launch replaces the candidate before anything is committed, and 
  g.manager.loadCandidate=async()=>{};minutes(g,4);
  assert.equal((await g.manager.tick()).state,'complete');
  assert.deepEqual([again.length,g.manager.state.retiredCandidates.at(-1).staleReason],[2,'check-failed']);
+});
+
+test('capacity recovery bypasses stale advice and cooldown, but never active work',async t=>{
+ const f=fixture(t);f.manager.state.config.compactPressure=.65;
+ f.runtime.modelContextWindow=1000000;f.runtime.lastTokenUsage={inputTokens:0};f.runtime.totalTokenUsage={totalTokens:1000000};
+ f.runtime.nativeStatus='systemError';f.runtime.contextWindowExceeded=true;
+ f.manager.state.sessionAdvice={action:'observe',snapshotId:'stale',generation:1};
+ f.manager.state.compactions.push({id:'recent',state:'complete',generation:1,completedAt:f.clock.now});
+ f.runtime.active=true;assert.equal((await f.manager.tick()).reason,'native-or-delivery-busy');assert.equal(f.calls.includes('compact'),false);
+ f.runtime.active=false;assert.equal((await f.manager.tick()).reason,'native-or-delivery-busy');
+ f.runtime.nativeStatus='idle';assert.equal((await f.manager.tick()).state,'complete');assert.equal(f.calls.filter(x=>x==='compact').length,1);
+ assert.equal(f.manager.state.compactions.at(-1).checkpoint.id,'cp:1');assert.equal(f.manager.state.binding.nativeSessionId,'old');
+});
+test('full-window zero usage is pressure evidence; fresh native compaction clears the error',()=>{
+ const runtime={nativeStatus:'systemError',modelContextWindow:1000000,lastTokenUsage:{inputTokens:0},totalTokenUsage:{totalTokens:1000000}};
+ const failed=nativePressureRuntime(runtime,{});assert.equal(failed.contextWindowExceeded,true);assert.equal(windowPressure(failed).level,'critical');
+ const recovered=nativePressureRuntime({...runtime,nativeStatus:'idle',lastTokenUsage:{inputTokens:60000}},{contextWindowExceeded:false});
+ assert.equal(recovered.contextWindowExceeded,false);assert.equal(windowPressure(recovered).level,'normal');
+});
+test('65 percent capacity uses local checkpoint without needing a semantic suggestion',async t=>{
+ const f=fixture(t);f.manager.state.config.compactPressure=.65;f.runtime.modelContextWindow=1000000;f.runtime.lastTokenUsage={inputTokens:610000};
+ assert.equal((await f.manager.tick()).state,'complete');assert.equal(f.calls.filter(x=>x==='compact').length,1);
+});
+
+test('55 percent warms one checkpoint in the same controller; identical idle ticks reuse it',async t=>{
+ const f=fixture(t);f.runtime.modelContextWindow=1000000;f.runtime.lastTokenUsage={inputTokens:520000};f.manager.state.config.compactPressure=0.65;
+ let builds=0;const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{builds++;return build(...args);};
+ await f.manager.tick();assert.equal(builds,1);assert.equal(f.calls.includes('compact'),false);assert.equal(f.manager.state.checkpointPreparation.complete,true);
+ await f.manager.tick();assert.equal(builds,1);
+ f.runtime.lastTokenUsage.inputTokens=650000;await f.manager.tick();assert.equal(f.calls.includes('compact'),true);assert.equal(builds,1);
 });

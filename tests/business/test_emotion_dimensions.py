@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from kin_mind import appraisal as A
-from kin_mind.expression import TENDENCIES, compile_expression
+from kin_mind.expression import compile_expression
 from kin_mind.profile import DIMENSIONS, GROUPS
 from kin_mind.state import AffectiveEvent
 
@@ -33,7 +33,7 @@ def as_older_release(mind):
     return state
 
 
-def test_every_dimension_sits_in_exactly_one_group_and_keeps_both_expression_ends():
+def test_every_dimension_sits_in_exactly_one_group():
     members = [key for group in GROUPS.values() for key in group["members"]]
     assert sorted(members) == sorted(DIMENSIONS) and len(members) == len(set(members)) == 28
     assert all(DIMENSIONS[key]["group"] == group for group, spec in GROUPS.items() for key in spec["members"])
@@ -42,7 +42,6 @@ def test_every_dimension_sits_in_exactly_one_group_and_keeps_both_expression_end
     assert len(labels) == len(set(labels))
     # Both kept, apart: 好奇心 is the quick spark, 探索欲 the lasting drive it feeds.
     assert DIMENSIONS["wonder"]["label"] == "好奇心" and DIMENSIONS["curiosity"]["label"] == "探索欲"
-    assert set(TENDENCIES) == set(DIMENSIONS) and all(len(ends) == 2 and all(ends) for ends in TENDENCIES.values())
 
 
 def test_a_new_mind_reads_every_dimension_with_its_group(setup):
@@ -113,16 +112,13 @@ def test_an_assessment_may_score_every_dimension_at_once():
         A.Appraisal.model_validate({"reason": "未知", "values": {"boredom": 50}})
 
 
-def test_the_new_emotions_reach_the_expression_hints_with_their_guardrails():
-    def entry(key, value):
-        return {"value": value, "baseline": DIMENSIONS[key]["baseline"], "basis": "event_inferred", "evidence_ids": ["s1"]}
-    guidance = compile_expression({"jealousy": entry("jealousy", 85), "fear": entry("fear", 75), "mood": entry("mood", 65)})["guidance"]
-    texts = {item["id"]: item["text"] for item in guidance}
-    assert set(texts) == {"jealousy", "fear"}
-    assert "不盘问" in texts["jealousy"] and "不要求对方交代" in texts["jealousy"] and "不用害怕给对方施压" in texts["fear"]
-    # A role default of the new ones stays quiet: no hint at a baseline.
-    quiet = compile_expression({key: {**entry(key, DIMENSIONS[key]["baseline"]), "basis": "role_default"} for key in NEW})
-    assert [item["id"] for item in quiet["guidance"]] == ["natural"] and quiet["version"] == "expression-v2"
+def test_emotions_remain_facts_without_forcing_scripted_behavior():
+    emotions = {"jealousy": {"value": 85, "basis": "event_inferred", "evidence_ids": ["s1"]},
+                "fear": {"value": 75, "basis": "event_inferred", "evidence_ids": ["s1"]}}
+    expression = compile_expression(emotions)
+    assert expression["feelings"] == emotions
+    assert expression["guidance"] == []
+    assert expression["version"] == "expression-v3"
 
 
 def test_the_host_start_up_brings_an_older_state_up_to_the_profile(tmp_path):

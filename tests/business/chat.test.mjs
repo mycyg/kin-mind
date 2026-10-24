@@ -133,7 +133,7 @@ test('the router hands the owner\'s literal stop to the reply tail and asks its 
   await router.dispatch({id:'stop-1',text:'停止任务'},async()=>'new-turn');
   assert.deepEqual(heard,[{inputId:'stop-1'}]);
   assert.deepEqual(router.state.inputs['stop-1'].tail,{carrier:'owner-stop',state:'recorded'});
-  assert.equal(asked.length,1);assert.equal('interruptedReply' in asked[0],false);assert.equal(router.state.inputs['chat-1'].tail,undefined);
+  assert.equal(asked.length,0);assert.equal(router.state.inputs['chat-1'].tail,undefined);
 });
 
 test('CR-LIFE-14: words that did not go out are owed however old they are',async t=>{

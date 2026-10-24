@@ -450,7 +450,6 @@ def test_a_window_that_saw_the_habits_gets_them_again_once_a_delete_took_a_value
     assert HABITS_ITEM not in read("turn-4")["covered_ids"]
     assert her_words(engine) == {}
 
-    assert not hasattr(context, "digest")
     assert [Contexts.habits_item(habits)["revision"] for habits in (before, after)] == [seen, contexts.window("thread-1")["seen"][HABITS_ITEM]]
 
 

@@ -305,7 +305,7 @@ def exploration_capabilities(config, *, computer_override=None):
                                        "ui-local-write-scope-unavailable"},
     }
     return {"version": config.get("agent_version"),
-            "executor": "codex-cli",
+            "executor": "native-main-session" if config.get("companion", {}).get("shared_session") else "codex-cli",
             "capabilities": capabilities,
             "capabilities_version": digest(capabilities),
             # Legacy flat keys the DS-facing view already reads.
@@ -687,6 +687,7 @@ def run_codex(
     codex_home=None,
     executor_source=None,
     version_probe_ms=None,
+    native_exchange=None,
 ):
     """One bounded codex attempt. Returns the ExecutionReport-shaped receipt.
 
@@ -887,7 +888,7 @@ def run_codex(
                       schema_file=schema_file, last_file=last_file, provider=provider,
                       computer_mcp=computer_mcp, web_mcp=web_mcp, ui_mcp=ui_mcp,
                       model_catalog=model_catalog, execution_env=marked)
-    child_env = codex_env(
+    child_env = {} if native_exchange else codex_env(
         codex_home, env_key=provider.get("env_key"),
         extra_env_keys=(ui_mcp or {}).get("env_vars", []),
     )
@@ -903,6 +904,8 @@ def run_codex(
     prompt = codex_prompt(topic, budget_seconds=budget_seconds, continuation=continuation,
                           computer=computer_mcp, web=web_mcp, ui=ui_mcp,
                           output_schema=bool(provider.get("supports_output_schema")))
+    if native_exchange:
+        prompt = prompt.replace("Codex shell 和工作目录为只读；宿主读取最终结果，不读取工作区作为结果。", "本轮沿主会话已有工具和权限执行；引用事实仍须由本次授权探索工具回执或给定证据支撑。")
     thread_id = None
     turn_completed = False
     # When the CLI was started, and how long it took to report its session.
@@ -944,72 +947,100 @@ def run_codex(
 
     buffer = b""
     with tempfile.TemporaryFile() as diagnostic:
-        spawned = time.monotonic()
-        try:
-            # The CLI's session is a group of its own, reported to the host that owns the worker
-            # before anything can end the worker (CR3-MM-02, worker_groups).
-            with worker_groups.starting() as report_group:
-                child = subprocess.Popen(
-                    argv, cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=diagnostic, start_new_session=True, env=child_env,
-                )
-                report_group(child.pid)
-        except OSError as error:
-            unavailable = CodexUnavailable("codex-cli-missing", error)
-            unavailable.startup = {**startup, "session": {"state": "failed", "stage": "spawn",
-                                                          "elapsed_ms": _elapsed_ms(spawned)}}
-            raise unavailable from error
-        state = "failed"
-        reason = None
-        outgoing = prompt.encode()
-        sent = 0
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ)
-                selector.register(child.stdin, selectors.EVENT_WRITE)
-                while True:
-                    if canceled():
-                        state = "preempted"
-                        break
-                    if time.monotonic() - started >= budget_seconds:
-                        state = "timed-out"
-                        break
-                    for key, _ in selector.select(timeout=0.2):
-                        if key.fileobj is child.stdin:
-                            try:
-                                sent += os.write(key.fileobj.fileno(), outgoing[sent : sent + 65536])
-                            except OSError:
-                                sent = len(outgoing)  # the child is gone
-                            if sent >= len(outgoing):
-                                selector.unregister(key.fileobj)
-                                key.fileobj.close()
-                            continue
-                        chunk = os.read(key.fileobj.fileno(), 65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            record_frame(line)
-                        if len(buffer) > 2_000_000:
-                            raise RuntimeError("explorer-output-limit")
-                    if child.poll() is not None:
-                        try:
-                            selector.unregister(child.stdin)
-                            child.stdin.close()
-                        except (KeyError, ValueError, OSError):
-                            pass
-                        if not selector.get_map():
-                            if buffer.strip():
-                                record_frame(buffer)
-                                buffer = b""
+        native_receipt = None
+        exit_code = None
+        if native_exchange:
+            # The existing main session executes; only tools run as worker-owned processes.
+            # All source ledgers and final-result validation below are the original path.
+            state, reason = "failed", None
+            if canceled():
+                state = "preempted"
+            else:
+                answer = native_exchange({"id": "exploration:" + directory.name + ":" + str(attempt),
+                    "kind": "exploration", "timeout_ms": max(1, int((budget_seconds-(time.monotonic()-started))*1000)),
+                    "system": prompt, "schema": findings_schema(),
+                    "context": {"actor": "agent:kin", "started_at": started_at,
+                                "execution_id": directory.name, "attempt": attempt}},
+                    {name: spec for name, spec in {"kin_computer": computer_mcp, "kin_web": web_mcp, "kin_ui": ui_mcp}.items() if spec})
+                native_receipt = answer.get("receipt") or {}
+                thread_id = native_receipt.get("fork_thread_id") or native_receipt.get("native_session_id")
+                turn_completed = (answer.get("state") == "complete" and bool(thread_id)
+                    and bool(native_receipt.get("native_turn_id")) and native_receipt.get("model") == model)
+                if turn_completed:
+                    last_file.write_text(dumps(answer["result"]))
+                    usages.append(native_receipt.get("usage"))
+                elif answer.get("reason") in {"owner-preempted", "assessment-canceled"} or canceled():
+                    state = "preempted"
+                session_ms = _elapsed_ms(started) if thread_id else None
+            ended_ms = _elapsed_ms(started)
+        else:
+            spawned = time.monotonic()
+            try:
+                # The CLI's session is a group of its own, reported to the host that owns the worker
+                # before anything can end the worker (CR3-MM-02, worker_groups).
+                with worker_groups.starting() as report_group:
+                    child = subprocess.Popen(
+                        argv, cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=diagnostic, start_new_session=True, env=child_env,
+                    )
+                    report_group(child.pid)
+            except OSError as error:
+                unavailable = CodexUnavailable("codex-cli-missing", error)
+                unavailable.startup = {**startup, "session": {"state": "failed", "stage": "spawn",
+                                                              "elapsed_ms": _elapsed_ms(spawned)}}
+                raise unavailable from error
+            state = "failed"
+            reason = None
+            outgoing = prompt.encode()
+            sent = 0
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(child.stdout, selectors.EVENT_READ)
+                    selector.register(child.stdin, selectors.EVENT_WRITE)
+                    while True:
+                        if canceled():
+                            state = "preempted"
                             break
-        finally:
-            ended_ms = _elapsed_ms(spawned)
-            # Only the process group created for this invocation is signaled: the CLI and
-            # whatever it started there, until the group is empty; then the host is told.
-            worker_groups.end(child)
-            child.stdout.close()
+                        if time.monotonic() - started >= budget_seconds:
+                            state = "timed-out"
+                            break
+                        for key, _ in selector.select(timeout=0.2):
+                            if key.fileobj is child.stdin:
+                                try:
+                                    sent += os.write(key.fileobj.fileno(), outgoing[sent : sent + 65536])
+                                except OSError:
+                                    sent = len(outgoing)  # the child is gone
+                                if sent >= len(outgoing):
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                                continue
+                            chunk = os.read(key.fileobj.fileno(), 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                            buffer += chunk
+                            while b"\n" in buffer:
+                                line, buffer = buffer.split(b"\n", 1)
+                                record_frame(line)
+                            if len(buffer) > 2_000_000:
+                                raise RuntimeError("explorer-output-limit")
+                        if child.poll() is not None:
+                            try:
+                                selector.unregister(child.stdin)
+                                child.stdin.close()
+                            except (KeyError, ValueError, OSError):
+                                pass
+                            if not selector.get_map():
+                                if buffer.strip():
+                                    record_frame(buffer)
+                                    buffer = b""
+                                break
+            finally:
+                ended_ms = _elapsed_ms(spawned)
+                # Only the process group created for this invocation is signaled: the CLI and
+                # whatever it started there, until the group is empty; then the host is told.
+                worker_groups.end(child)
+                child.stdout.close()
+            exit_code = child.returncode
         elapsed = round(time.monotonic() - started, 2)
         # A result is final only on a clean native completion. Anything written by
         # an interrupted or truncated run is a partial basis, never a result.
@@ -1051,7 +1082,7 @@ def run_codex(
         evidence_coverage = None
         citation_rejections = None
         if state == "failed":
-            if child.returncode == 0 and turn_completed:
+            if turn_completed and (native_exchange is not None or exit_code == 0):
                 if final_text is None:
                     reason = "missing-final-result"
                 else:
@@ -1184,7 +1215,8 @@ def run_codex(
             "reason": reason,
             "result": result_dump,
             "partial": state != "complete",
-            "executor": "codex-cli",
+            "executor": "native-main-session" if native_exchange else "codex-cli",
+            **({"native_receipt": native_receipt} if native_receipt else {}),
             "provider": provider["id"],
             "model": model,
             "reasoning": reasoning,
@@ -1208,7 +1240,7 @@ def run_codex(
                                        "web": rejected_web_receipts},
             "operational_actions": {"computer": operational_computer_actions},
             "native_execution_id": thread_id,
-            "exit_code": child.returncode,
+            "exit_code": exit_code,
             "started_at": started_at,
             "finished_at": time.time(),
             "seconds": elapsed,

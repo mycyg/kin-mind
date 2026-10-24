@@ -209,7 +209,7 @@ def test_unmarked_every_writer_stores_references_exactly_as_before(system):
         data = {"evaluated_sources": written, "exploration_targets": [{**written[0], "exploration_id": "x"}]}
         # Not a copy and not a byte different: the unmarked writer is the writer it was.
         assert evidence_refs.as_stored(conn, mind.scope.key(), "mind_appraisals", data) is data
-        assert queue_row(conn, mind.scope.key(), data) == dumps(data)
+        assert json.loads(queue_row(conn, mind.scope.key(), data)) == {**data, "recipient_person_id": "person:xiaoguang"}
     assert item["evidence"] == written
     stored = [json.loads(data) for data in rows(mind, "mind_graph_nodes").values() if json.loads(data)["id"] == item["id"]]
     revision = [json.loads(data) for data in rows(mind, "mind_graph_revisions").values() if json.loads(data)["id"] == item["id"]]

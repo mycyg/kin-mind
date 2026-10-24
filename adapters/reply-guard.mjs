@@ -40,7 +40,7 @@ export class ReplyGuard {
   /** `onAnswered` hears once per group that its input was answered (CR-LIFE-13). */
   constructor({call,directory,outbox=()=>[],clock=()=>Date.now(),onOutcome=()=>{},onAnswered=null,
     manifestDirectory,channel='feishu',contracts,receipt,emit,lease,role,hooks,sleep,retry,
-    ownerEpoch=null,onTail=null,tailLimits,tailHooks,tailWaitMs=5000}) {
+    ownerEpoch=null,audience=null,onTail=null,tailLimits,tailHooks,tailWaitMs=5000}) {
     Object.assign(this,{call,directory,outbox,clock,onOutcome,channel,tailWaitMs});
     this.active=new Map();
     this.manifests=new TransportManifests({directory:manifestDirectory??path.join(directory,'reply-manifests'),
@@ -48,7 +48,7 @@ export class ReplyGuard {
       receipt:receipt??(async id=>(await this.outbox()).find(r=>r.id===id)??null),
       cancelShare:draftId=>this.call?.('share-cancel',{draft_id:draftId}),
       review:(requests,context)=>this.checkGroup(requests,context),onOutcome});
-    this.tail=new ReplyTail({manifests:this.manifests,clock,ownerEpoch,hooks:tailHooks,limits:tailLimits,
+    this.tail=new ReplyTail({manifests:this.manifests,clock,ownerEpoch,audience,hooks:tailHooks,limits:tailLimits,
       onEvent:detail=>(onTail??onOutcome)(detail)});
   }
   async check(request) {

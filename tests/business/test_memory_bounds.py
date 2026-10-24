@@ -216,15 +216,17 @@ def test_frequency_ranking_is_gated_on_the_replays_own_output(world, tmp_path):
             reinforcement.validate_enable(conn, SCOPE.key(), config(replay_output=str(path), replay_sha256=sha), at)
 
 
-def test_the_retired_judgment_cache_writes_and_reuses_nothing(tmp_path, monkeypatch):
+def test_retired_cache_only_purges_legacy_source_dependencies(tmp_path):
     engine = Engine(tmp_path / "db")
-    monkeypatch.setattr(judgment_cache, "environment_digest", lambda *args: pytest.fail("No environment hash is computed"))
-    token = judgment_cache.put(engine, "judge_step", "request-1", {"scope": "synthetic", "type": "step-complete"},
-                               {"verdict": "done"}, now=1000.0, depends_on=["src_synthetic"], valid_for=3600)
-    assert token is None
-    with engine.db.connect() as conn:
-        assert judgment_cache.get(engine, conn, "judge_step", "request-1", {"scope": "synthetic"}, now=1000.0) is None
-        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_judgment_cache'").fetchone()
+    with engine.db.connect(write=True) as conn:
+        assert judgment_cache.invalidate(conn, ["old-source"]) == 0
+        conn.execute("CREATE TABLE mind_judgment_cache(token TEXT, data TEXT)")
+        conn.execute("CREATE TABLE mind_judgment_cache_deps(token TEXT, dependency TEXT)")
+        conn.executemany("INSERT INTO mind_judgment_cache VALUES (?,?)", [("old", "old words"), ("other", "other words")])
+        conn.executemany("INSERT INTO mind_judgment_cache_deps VALUES (?,?)", [("old", "old-source"), ("other", "other-source")])
+        assert judgment_cache.invalidate(conn, ["old-source"]) == 1
+        assert [tuple(row) for row in conn.execute("SELECT token FROM mind_judgment_cache")] == [("other",)]
+        assert [tuple(row) for row in conn.execute("SELECT token FROM mind_judgment_cache_deps")] == [("other",)]
 
 
 def test_evidence_origins_follow_actual_source_ids_without_merging_words():

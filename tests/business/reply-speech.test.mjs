@@ -94,3 +94,15 @@ test('proactive mixed forms survive parsing, freezing, and journal resume',async
  assert.equal(sent.length,2);assert.equal(sent[0].speech,undefined);assert.ok(sent[1].speech);
  await batch({id:'mixed-contact'});assert.equal(sent.length,2);
 });
+
+test('long voice waits only its recipient, while another recipient text completes',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-recipient-lanes-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ const receipts=new Map(),sent=[];let release,started;const waiting=new Promise(r=>release=r),begun=new Promise(r=>started=r);
+ const m=new TransportManifests({directory,receipt:id=>receipts.get(id)});
+ const entries=[['a1','a','voice'],['a2','a','text'],['b1','b','text']].map(([id,person,mode])=>({request:{draft_id:id,reply_id:'in',text:id},delivery:{id,text:id,route:{person_id:person,chat_id:person},presentation:{mode}}}));
+ const draft=m.createDraft({entries,ownerEpoch:1});
+ const run=m.run(draft.group_id,{transport:{send:async d=>{if(d.speech){started();await waiting;}sent.push(d.text);const r={state:'accepted',messageId:d.id};receipts.set(d.id,r);return r;}}});
+ await begun;const deadline=Date.now()+2000;while(!sent.length&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));assert.deepEqual(sent,['b1']);release();
+ assert.equal((await run).manifest.state,'accepted');assert.deepEqual(sent,['b1','a1','a2']);
+ await m.run(draft.group_id,{transport:{send:()=>{throw Error('duplicate');}}});
+});

@@ -69,7 +69,7 @@ async function transmit(entry,{settle,send,lookup,read,contract,done}) {
   for(const part of parts) {
     if(done.has(part.id)){messageIds.push(done.get(part.id));continue;}
     let receipt=null;
-    try{receipt=normalizeReceipt(await send(part));}catch{/* The transport's own receipt decides. */}
+    try{receipt=normalizeReceipt(await send({...part,...(entry.companion_delivery??{})}));}catch{/* The transport's own receipt decides. */}
     if(classifyReceipt(receipt)!=='accepted') {
       try{receipt=normalizeReceipt(await lookup(part.id))??receipt;}catch{receipt={state:'unreadable'};}
     }

@@ -7,6 +7,7 @@ from eventmem.core.db import Conflict, Missing, digest, dumps
 from eventmem.core.models import SourceInput
 
 from .state import project
+from . import recipient
 from .model_runtime import verified_decision
 
 
@@ -15,7 +16,7 @@ class ActionEvents:
         self.mind = mind
 
     def emit(self, conn, kind, key, data):
-        identifier = "action_" + digest([self.mind.scope.key(), kind, key])[:32]
+        identifier = "action_" + digest(recipient.key([self.mind.scope.key(), kind, key]))[:32]
         conn.execute(
             "INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)",
             (
@@ -24,7 +25,7 @@ class ActionEvents:
                 kind,
                 self.mind.clock(),
                 "pending",
-                dumps(data),
+                dumps({**data,"recipient_person_id":recipient.current()}),
             ),
         )
         return identifier
@@ -76,48 +77,8 @@ class ActionEvents:
         return self.mind._mutate(request, "action-policy", apply)
 
     def crossings(self):
-        queued = []
         with self.mind.engine.db.connect(write=True) as conn:
-            state = self.mind._load(conn)
-            queued.extend(self._due_reviews(conn, state))
-            from .autonomy_schema import legacy_thresholds
-            if not legacy_thresholds(conn, self.mind.scope.key()):
-                # Scores are context. Only due reviews and new evidence wake DS.
-                return queued
-            if not state.get("action_policy") or not self.mind._fresh(
-                conn, state["action_policy"]["evidence"]
-            ):
-                return queued
-            for name in ("initiative", "curiosity"):
-                entry = state["dimensions"][name]
-                motive = entry.get("motivation")
-                threshold = state["profile"][
-                    "contact" if name == "initiative" else "exploration"
-                ].get("threshold") or 75
-                # A high level is not a new event. Repeated reads and restarts keep
-                # the same episode key; an appraisal starting high cannot self-loop.
-                if not motive or not entry["score"] < threshold <= project(
-                    entry, self.mind.clock()
-                ):
-                    continue
-                if not self.mind._entry_fresh(conn, entry):
-                    continue
-                key = self.emit(
-                    conn,
-                    "drive-crossing",
-                    [name, motive["episode_id"]],
-                    {
-                        "dimension": name,
-                        "value": project(entry, self.mind.clock()),
-                        "threshold": threshold,
-                        "episode_id": motive["episode_id"],
-                        "evidence_ids": [r["record_id"] for r in entry["evidence"]],
-                        "agent_version": state["agent_version"],
-                        "reason": motive["reason"],
-                    },
-                )
-                queued.append(key)
-        return queued
+            return self._due_reviews(conn, self.mind._load(conn))
 
     def _due_reviews(self, conn, state):
         """What has run its course asks Kin to look again; nothing is changed for her (K1-02, K1-04).
@@ -136,6 +97,8 @@ class ActionEvents:
                     "evidence_ids": [r["record_id"] for r in entry["evidence"]], "agent_version": state["agent_version"]}))
         from .trait_refs import links_fresh
         for desire in state["desires"].values():
+            if not recipient.belongs(desire):
+                continue
             # K1-19: a wish that rested on a trait which has since moved is not ready; Kin is asked
             # once per trait revision set whether it still holds.
             if desire.get("trait_revisions") and desire["status"] in {"wanted", "waiting"} and not links_fresh(conn, self.mind, desire):
@@ -145,6 +108,8 @@ class ActionEvents:
         # Changed concerns use the existing review lane for contact AND exploration.
         # A repeated tick asks once for this dependency revision set; it never resumes a wish.
         for desire in state["desires"].values():
+            if not recipient.belongs(desire):
+                continue
             if (desire["status"] != "wanted" or not desire.get("concern_revisions")
                     or timestamp(desire["expires_at"]) <= timestamp(now)
                     or self.mind._concern_links_fresh(conn, state, desire)):
@@ -195,7 +160,7 @@ class ActionEvents:
     def drain(self, jobs):
         with self.mind.engine.db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM mind_action_events WHERE scope=? AND state IN ('pending','queued') ORDER BY created_at,id LIMIT 16",
+                "SELECT * FROM mind_action_events WHERE scope=? AND " + recipient.predicate() + " AND state IN ('pending','queued') ORDER BY created_at,id LIMIT 16",
                 (self.mind.scope.key(),),
             ).fetchall()
         for row in rows:
@@ -250,22 +215,20 @@ class ActionEvents:
                     "UPDATE mind_action_events SET state=?,data=? WHERE id=?",
                     (
                         ended.get(status["state"], "queued"),
-                        dumps(data),
+                        dumps({**data,"recipient_person_id":recipient.current()}),
                         row["id"],
                     ),
                 )
 
     def review_unselected(self):
         view = self.mind.read()
-        from .autonomy_schema import enabled, legacy_thresholds, optimized
+        from .autonomy_schema import enabled, optimized
         with self.mind.engine.db.connect() as conn:
             semantic = enabled(conn, self.mind.scope.key())
-            legacy = legacy_thresholds(conn, self.mind.scope.key())
             versions = optimized(conn, self.mind.scope.key(), "wish_version_review")
         if (
             not view.get("action_policy")
             or view["action_policy"]["needs_review"]
-            or (legacy and view["dimensions"]["curiosity"]["value"] < 75)
         ):
             return
         with self.mind.engine.db.connect(write=True) as conn:
@@ -326,17 +289,9 @@ class ActionEvents:
         view = self.mind.read()
         if (view.get("action_policy") or {}).get("needs_review"):
             return {"state": "waiting", "reason": "action-policy-needs-review"}
-        score = view["dimensions"]["curiosity"]
-        from .autonomy_schema import enabled, legacy_thresholds
+        from .autonomy_schema import enabled
         with self.mind.engine.db.connect() as conn:
             semantic = enabled(conn, self.mind.scope.key())
-            legacy = legacy_thresholds(conn, self.mind.scope.key())
-        if legacy and (score["needs_review"] or score["projected_value"] < (view["exploration"].get("threshold") or 75)):
-            return {
-                "state": "waiting",
-                "reason": "curiosity-below-threshold-or-stale",
-                "curiosity": score["value"],
-            }
         with self.mind.engine.db.connect() as conn:
             if self.mind._action_review_pending(conn):
                 return {"state": "waiting", "reason": "action-appraisal-pending"}
@@ -373,7 +328,6 @@ class ActionEvents:
         desire = min(choices, key=lambda d: (-d["strength"], d["created_at"], d["id"]))
         return {
             "state": "ready",
-            "curiosity": score["value"],
             "desire": desire,
             "revision": view["revision"],
         }

@@ -48,6 +48,17 @@ UNCLASSIFIED = Classification("unknown", None, "block")
 # the kind is then the same for all of them, while the handling follows the raise site
 # (the same fault is refused alone inside an isolated section and blocks outside one).
 REGISTRY = {
+    "Unbound autonomous recipient": ("semantic", "recipient-unbound", "section"),
+    "Wish evidence unavailable for recipient": ("runtime", "wish-evidence-unavailable", "reuse"),
+    "Contact attempt belongs to another recipient": ("semantic", "contact-recipient-mismatch", "block"),
+    "Desire belongs to another recipient": ("semantic", "desire-recipient-mismatch", "section"),
+    "The contact desire or policy is no longer current": ("runtime", "contact-state-changed", "block"),
+    "Linked wish belongs to another recipient or is unavailable": ("semantic", "plan-wish-unavailable", "section"),
+    "Plan belongs to another recipient": ("semantic", "plan-recipient-mismatch", "section"),
+    "Deferred plan belongs to another recipient": ("semantic", "plan-recipient-mismatch", "section"),
+    "Activity is not visible to this sharing recipient": ("runtime", "activity-source-unavailable", "reuse"),
+    "Reply belongs to another recipient": ("semantic", "reply-recipient-mismatch", "block"),
+    "Sharing source protected": ("runtime", "sharing-source-protected", "block"),
     "Event source was deleted": ("semantic", "evidence-erased", "section"),
     "Share source was deleted": ("semantic", "evidence-erased", "section"),
     "Share reference must name a saved finding": ("semantic", "share-reference-invalid", "section"),

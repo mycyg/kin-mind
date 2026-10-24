@@ -29,41 +29,35 @@ def canon(tmp_path, *, authority="explicit", approved_source=None):
     return {"root": str(root), "scope": SCOPE.model_dump(), "persona_contract": record}
 
 
-def test_a_complete_matching_approval_record_holds_and_says_nothing_of_the_persona(tmp_path):
-    config = canon(tmp_path)
+def test_current_persona_is_readable_without_an_approval_record(tmp_path):
+    config = canon(tmp_path, authority="model", approved_source="missing-old-approval")
+    config.pop("persona_contract")
     answer = persona_approval(config)
-    assert answer == {"ok": True, "problems": [], "version": "persona-v3", "approved_ids": 1}
+    assert answer["ok"] and answer["problems"] == []
+    assert answer["source"] == "prompts/persona"
     assert "合成" not in json.dumps(answer, ensure_ascii=False)
 
 
-def test_each_gap_in_the_approval_record_is_named(tmp_path):
+def test_editable_persona_is_the_deployment_source_and_stale_seed_hashes_do_not_freeze_it(tmp_path):
+    from eventmem.core.prompts import PromptStore
     config = canon(tmp_path)
-    record = config["persona_contract"]
-    # A record without the voice and maintenance hashes would let either change unseen.
-    partial = persona_approval({**config, "persona_contract": {"version": record["version"], "core_sha256": record["core_sha256"]}})
-    assert partial["problems"] == ["approval-record-incomplete:voice_sha256", "approval-record-incomplete:maintenance_sha256"]
-    moved = persona_approval({**config, "persona_contract": {**record, "voice_sha256": "0" * 64}})
-    assert moved["problems"] == ["approval-record-differs:voice_sha256"]
-    assert persona_approval({**config, "persona_contract": None})["problems"][0] == "approval-record-missing"
-    elsewhere = persona_approval({**config, "persona_contract": {**record, "path": str(tmp_path / "other.json")}})
-    assert elsewhere["problems"] == ["persona-contract-path-differs"]
+    root = tmp_path / "MemoryPalace"
+    saved = PromptStore(root / "prompts").write("persona", "我可以改变自己的说话方式，也记得小光与一一。")
+    answer = persona_approval(config)
+    assert answer["ok"] and answer["prompt_version"] == saved["version"]
+    path = root / "persona-policy.json"
+    policy = json.loads(path.read_text())
+    path.write_text(json.dumps({**policy, "voice": "改变过的自然语气。"}, ensure_ascii=False))
+    assert persona_approval(config)["ok"]
 
 
-def test_the_approval_must_be_her_own_source_in_the_persona_scope(tmp_path):
-    model = persona_approval(canon(tmp_path / "model", authority="model"))
-    assert model["ok"] is False and model["problems"][0].startswith("approved-source-not-owner:src_")
-    unknown = persona_approval(canon(tmp_path / "unknown", approved_source="src_" + "a" * 32))
-    assert unknown["problems"] == ["approved-source-unresolved:src_" + "a" * 32]
-
-
-def test_a_damaged_canon_needs_review(tmp_path):
+def test_unreadable_persona_reports_an_actual_document_problem(tmp_path):
     config = canon(tmp_path)
     path = tmp_path / "MemoryPalace" / "persona-policy.json"
-    policy = json.loads(path.read_text())
-    path.write_text(json.dumps({**policy, "voice": "改过的说话方式。"}, ensure_ascii=False))
-    assert persona_approval(config)["problems"] == ["persona-contract-invalid"]
+    path.write_text("invalid JSON")
+    assert persona_approval(config)["problems"] == ["persona-document-unreadable"]
     path.unlink()
-    assert persona_approval(config)["problems"] == ["persona-contract-missing"]
+    assert persona_approval(config)["problems"] == ["persona-seed-missing-or-other-scope"]
 
 
 def world(tmp_path):

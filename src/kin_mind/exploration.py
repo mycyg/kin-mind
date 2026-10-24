@@ -152,6 +152,9 @@ class AssistanceHint(Model):
 
 
 class Findings(Model):
+    sharing_classification: Literal['ordinary','private','intimate','health','financial','uncertain'] = Field(default='uncertain', description='普通日常可共享；私密、情色亲密、健康财务及不能判断的材料受保护。只判断本次结果，不改变其输入来源的保护。')
+    topic_tags: list[str] = Field(default_factory=list, max_length=8)
+    perspective: Literal['external_commentary','reported_facts','kin_reflection','mixed'] = 'mixed'
     summary: str = Field(min_length=1)
     findings: list[str]
     sources: list[Citation]
@@ -455,7 +458,7 @@ class Explorations:
                     "semantic_classification", "body_bytes_representation", "raw_body_complete",
                 }}),
                 occurred_at=receipt.get("read_at") or self.mind.clock(), extract=False,
-                metadata={"host_event": "web-observation", "executor": "codex-cli",
+                metadata={"host_event": "web-observation", "executor": "codex-cli", "speaker_person_id":"agent:kin", "actor":"agent:kin", "knowledge_basis":"external_source",
                           "locator": receipt["locator"], "resource_version": receipt["version"],
                           "stored_content": "excerpt", "delivery": web_delivery(receipt)}))
             observation_ids.append(observed["id"])
@@ -468,7 +471,8 @@ class Explorations:
                 occurred_at=self.mind.clock(), extract=not MemoryContinuity(self.mind).settings()['semantic'],
                 # Executor (the CLI that ran) and provider (the model behind it) are
                 # distinct facts; legacy rows come from kimi-cli running kimi.
-                metadata={"host_event": "exploration-result", "executor": executor,
+                metadata={"host_event": "exploration-result", "executor": executor, "speaker_person_id":"agent:kin", "actor":"agent:kin", "knowledge_basis":"model_report",
+                          "perspective":(data.get("result") or {}).get("perspective","mixed"), "topic_tags":(data.get("result") or {}).get("topic_tags",[]),
                           "provider": data.get("provider"),
                           "model": data.get("model"), "reasoning": data.get("reasoning"),
                           "exploration_id": eid,
@@ -480,7 +484,7 @@ class Explorations:
             # The report is written from the wish's evidence, which it goes with, and from what the
             # brief showed besides: checked where it is stored (CR5-MM-02).
             try:
-                source = self.engine.receive(report(), derived_from=data["evidence_ids"], shown=shown)
+                source = self.engine.receive(report(), derived_from=[*data["evidence_ids"], *shown], shown=shown)
             except Conflict as error:
                 if getattr(error, "code", None) not in DERIVED_CONFLICTS:
                     raise
@@ -489,6 +493,13 @@ class Explorations:
                 state = "failed"
                 data.update(error="exploration-inputs-changed", inputs_withheld=error.code, partial=True, result=None)
                 source = self.engine.receive(report())
+        from .companions import Companions
+        companion_memory=Companions(self.engine,self.mind.scope)
+        classification=(data.get("result") or {}).get("sharing_classification","uncertain")
+        for sid in [source["id"],*observation_ids]:
+            companion_memory.annotate(source_id=sid,speaker_person_id="agent:kin",conversation_key=None,
+                classification=classification,sharing="ordinary-shared",recipient_person_id=desire.get("recipient_person_id", "person:xiaoguang"),basis="internal_thought" if sid==source["id"] else "observed",
+                participants=[{"person_id":"agent:kin","role":"explorer"}],command_id="exploration-actor:"+sid,evidence_id=eid)
         data["source_id"] = source["id"]
         data["observation_ids"] = observation_ids
         # The run names everything its brief showed: one deleted since loses it its words, in this

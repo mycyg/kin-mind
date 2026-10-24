@@ -201,6 +201,12 @@ def test_host_explore_codex_leaves_the_phone_session_binding_untouched(tmp_path,
     result = dispatch(config, "explore", {})
     assert result["state"] == "complete"
     assert registry.read_bytes() == before
+    from kin_mind.companions import Companions
+    with mind.engine.db.connect() as conn:
+        row=conn.execute("SELECT id,data FROM sources WHERE namespace='kin-exploration' ORDER BY received_at DESC LIMIT 1").fetchone()
+        metadata=json.loads(row['data'])['metadata'];annotation=Companions(mind.engine,mind.scope).annotation(conn,row['id'])
+    assert metadata['actor']=='agent:kin' and metadata['knowledge_basis']=='model_report'
+    assert annotation['speaker_person_id']=='agent:kin' and annotation['basis']=='internal_thought'
 
 def test_historical_sources_stay_citable_with_time_nature(tmp_path, monkeypatch):
     """W1.6: legitimate old material remains citable as historical — not rejected
@@ -813,3 +819,23 @@ def test_a_failed_readiness_probe_is_timed_in_the_exploration_record(tmp_path, m
     with pytest.raises(CodexUnavailable) as caught:
         run_codex(fake, TOPIC, tmp_path / "job", computer=UI_COMPUTER, budget_seconds=60, **codex_kwargs())
     assert caught.value.startup["readiness_probe"]["state"] == "failed"
+
+@pytest.mark.parametrize('case', ['complete', 'unbacked', 'preempted', 'wrong-model'])
+def test_main_session_execution_reuses_source_validation_and_checkpoint(tmp_path, monkeypatch, case):
+    import subprocess
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('no model CLI may start'))
+    seen=[]
+    def exchange(request, servers):
+        seen.append(request)
+        assert servers == {} and request['kind'] == 'exploration'
+        result = dict(FINDINGS)
+        if case == 'unbacked': result['sources'] = [{'url':'https://unread.invalid/page','title':'not read'}]
+        return {'state':'waiting' if case == 'preempted' else 'complete', 'reason':'owner-preempted' if case == 'preempted' else None,
+                'result':result, 'receipt':{'channel':'legacy','native_session_id':'same-main','native_turn_id':'turn-1',
+                                          'model':'wrong' if case == 'wrong-model' else 'k3'}}
+    report=run_codex(None,TOPIC,tmp_path/'run',model='k3',reasoning='high',provider=PROVIDER,cli_version='native-main',native_exchange=exchange)
+    assert len(seen)==1 and report['executor']=='native-main-session' and report['exit_code'] is None
+    assert report['native_execution_id']=='same-main'
+    assert report['state']=={'complete':'complete','unbacked':'failed','preempted':'preempted','wrong-model':'failed'}[case]
+    if case=='complete':assert report['result']['sources'][0]['receipt']['locator']=='memory://s1'
+    elif case in {'unbacked','preempted'}:assert (tmp_path/'run'/'checkpoint.json').exists()

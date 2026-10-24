@@ -145,7 +145,8 @@ def contact_failures(conn, scope, now):
             failed_24h += 1
         if found and last is None:
             last = {"at": _iso(seconds), "code": _label(found.get("code")), "category": _label(found.get("category")),
-                    "stage": _label(found.get("stage")), "wish_id": _label(wish)}
+                    "stage": _label(found.get("stage")), "wish_id": _label(wish),
+                    **{k: found[k] for k in ("http_status", "retryable", "diagnostic_id") if k in found}}
         if not open_:
             continue
         if not found or (streak and _label(found.get("code")) != streak["code"]):
@@ -153,6 +154,7 @@ def contact_failures(conn, scope, now):
             continue
         if streak is None:
             streak = {"count": 0, "code": _label(found.get("code")), "category": _label(found.get("category")),
+                      **{k: found[k] for k in ("http_status", "retryable", "diagnostic_id") if k in found},
                       "stage": _label(found.get("stage")), "last_at": _iso(seconds), "wish_id": _label(wish), "wish_ids": [], "times": []}
         streak["count"] += 1
         streak["first_at"] = _iso(seconds)

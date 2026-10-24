@@ -61,6 +61,7 @@ test('settled records beyond the hot tail move to the monthly archive, and a rep
 test('an open task keeps its inputs and a bounded history (AD1-08)',async t=>{
   const f=fixture(t,{hotLimits:LIMITS});
   await f.router.dispatch({id:'work-request',kind:'owner',text:'work please'},async()=> 'new-turn');
+  f.router.recordModeRequest({mode:'work',commandId:'take-work',sourceInputId:'work-request',reason:'I will do it'});
   const task=f.router.currentTask();
   for(let i=0;i<LIMITS.inputs+2;i++)await answeredChat(f.router,'c'+i);
   await f.router.reconcile();

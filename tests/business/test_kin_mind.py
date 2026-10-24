@@ -279,38 +279,21 @@ def test_a_transient_cancel_lets_the_same_wish_be_tried_again(setup):
     assert second["id"] != first["id"] and second["state"] == "drafting"
 
 
-def test_a_draft_that_never_started_only_waits_and_is_never_set_aside(setup):
-    """CR2-INT-06: a draft whose fork was never made ran no model (the host says model_invoked:
-    false, WS4). Its wish waits and is drafted again, five minutes later each time up to half an
-    hour. It is no drafting failure: however often it happens the wish is never set aside and no
-    review is asked for. A draft that did fail still counts."""
-    from kin_mind.state import CONTACT_WAIT_MIN_SECONDS, DRAFT_START_WAIT_MAX_SECONDS, timestamp
+def test_technical_failures_do_not_change_the_wish_or_invent_a_model_decision(setup):
     mind, source, clock = setup
-    wish(mind, source, "unmade", content="Tell her about the rain")
-
-    def raw():
-        with mind.engine.db.connect() as conn:
-            return next(iter(mind._load(conn)["desires"].values()))
-    waits = []
-    for _ in range(8):
-        attempt = mind.claim_contact(owner_epoch="owner-1")
-        assert attempt["state"] == "drafting"
-        mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-not-started",
-                            failure={"category": "model-unavailable", "stage": "contact-draft-model", "code": "fork-draft-failed",
-                                     "retry_condition": "backoff", "model_invoked": False})
-        desire = raw()
-        assert desire["status"] == "waiting" and desire["contact_wait"]["condition"] == "time"
-        assert not desire.get("contact_failures")
-        waits.append((timestamp(desire["contact_wait"]["retry_at"]) - timestamp(desire["contact_wait"]["since"])).total_seconds())
-        clock[0] += timedelta(seconds=waits[-1] + 1)
-        mind.reconsider_contacts(owner_epoch="owner-1")
-        assert raw()["status"] == "wanted"
-    assert waits == [min(DRAFT_START_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS * n) for n in range(1, 9)]
+    did = wish(mind, source, "unmade", content="Tell her about the rain")["desire_id"]
     with mind.engine.db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='wish-review'").fetchone()[0] == 0
-    attempt = mind.claim_contact(owner_epoch="owner-1")
-    mind.settle_contact(attempt_id=attempt["id"], state="canceled", reason="draft-failed")
-    assert raw()["contact_failures"] == 1 and raw()["contact_start_waits"] == 8
+        before = dict(mind._load(conn)["desires"][did])
+    for invoked in [False, None, True]:
+        attempt = mind.claim_contact(owner_epoch="owner-1")
+        detail={"category":"model-unavailable","stage":"contact-draft-model","code":"fork-draft-failed","retry_condition":"backoff","model_invoked":invoked}
+        mind.settle_contact(attempt_id=attempt["id"],state="canceled",reason="draft-failed",failure=detail)
+        with mind.engine.db.connect() as conn:
+            assert mind._load(conn)["desires"][did] == before
+            row=json.loads(conn.execute("SELECT data FROM mind_contacts WHERE id=?",(attempt["id"],)).fetchone()[0])
+            assert row["failure"]["model_invoked"] is invoked
+            assert "decision" not in row and "host_wait" not in row
+        assert mind.contact_candidate()["eligible"]
 
 
 def test_the_reviews_of_one_tick_are_one_assessment(setup):
@@ -326,7 +309,7 @@ def test_the_reviews_of_one_tick_are_one_assessment(setup):
     assert jobs.run_one(reviewer)["state"] == "idle"
 
 
-def test_a_decision_outlives_a_deployment_but_not_a_change_of_what_decides_behaviour(setup):
+def test_a_decision_outlives_deployment_and_model_changes_but_not_a_contract_change(setup, monkeypatch):
     """K1-13, MAIN-RUA-02: the compat stamp, not agent_version, says whether a decision holds."""
     from kin_mind import compat
     mind, _, _ = setup
@@ -343,6 +326,8 @@ def test_a_decision_outlives_a_deployment_but_not_a_change_of_what_decides_behav
         conn.execute("INSERT OR REPLACE INTO settings(key,data) VALUES('behavior_models',?)",
                      (json.dumps({"chat": "another-model", "chat_effort": "high"}),))
     with mind.engine.db.connect() as conn:
+        assert mind.decision_current(conn, {"compat": stamped})
+        monkeypatch.setattr(compat, "BEHAVIOR_CONTRACT", "behavior-next")
         assert not mind.decision_current(conn, {"compat": stamped})
 
 
@@ -517,7 +502,8 @@ def test_a_fresh_intent_replaces_the_score_band_table():
                   "playfulness": {"value": 85, "basis": "event_inferred", "evidence_ids": ["src_b"]},
                   "initiative": {"value": 95, "basis": "event_inferred", "evidence_ids": ["src_c"], "baseline": 50}}
     fallback = compile_expression(dimensions)["guidance"]
-    assert any(item["id"] == "longing-play" for item in fallback)
+    assert fallback == []
+    assert compile_expression(dimensions)["feelings"] == dimensions
     intent = {"id": "intent-1", "valid_until": "2099-01-01T00:00:00+00:00", "stance": "安静陪着她",
               "continue_topics": [{"topic": "她的论文"}], "avoid": [], "evidence_ids": ["src_d"]}
     guided = compile_expression(dimensions, intent=intent)["guidance"]

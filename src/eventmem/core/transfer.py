@@ -19,7 +19,7 @@ from .persona import approve_canon
 # archives history compaction moved old events into. A backup carries them; credentials,
 # locks, caches and vectors (re-embedded after a restore) stay out (E2-09).
 STORE_FILES = ("persona-policy.json", "kin-self-knowledge.json")
-STORE_FOLDERS = ("configuration-versions", "persona-versions", "archive")
+STORE_FOLDERS = ("configuration-versions", "persona-versions", "prompts", "archive")
 CHUNK = 1024 * 1024
 BLOB_KEY = re.compile(r"(?:blob_[0-9a-f]{32}|[0-9a-f]{64})")
 
@@ -43,7 +43,7 @@ def store_files(root):
         folder = root / name
         if folder.is_dir() and not folder.is_symlink():
             found += sorted(path.relative_to(root).as_posix() for path in folder.rglob("*")
-                            if path.is_file() and not path.is_symlink())
+                            if path.is_file() and not path.is_symlink() and (name != "prompts" or path.suffix == ".json"))
     return found
 
 
@@ -129,11 +129,8 @@ def backup(engine, output: Path):
 def restore(archive_path: Path, target: Path, *, persona_approval=None):
     """Restore a backup into an empty, isolated target.
 
-    A backup that carries a persona canon puts that canon in place for the restored store, so
-    it is restored only as `persona_approval` names it: the owner's approval record the host
-    keeps (mind-config `persona_contract`: the version and all three hashes). With no record,
-    an incomplete one or a canon that differs from it, nothing is restored and the canon is
-    left for host review. The canon's version history (persona-versions/) travels as it was."""
+    The editable prompts and their history travel with the store. Legacy approval
+    records are accepted as compatibility arguments and do not freeze these texts."""
     target = target.expanduser()
     if target.is_symlink():
         raise ValueError("Restore target must not be a symlink")

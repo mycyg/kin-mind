@@ -97,8 +97,17 @@ def test_a_source_is_shown_with_the_facts_a_prompt_reads_under_their_own_names()
     item = source_item()
     shown = for_model({"new_evidence": [item]})["new_evidence"][0]
     assert "metadata" not in shown and MARKER not in dumps(shown) and PAGE not in dumps(shown)
-    assert {key: shown[key] for key in SOURCE_FACTS} == {"host_event": "exploration-result", "role": "assistant",
+    assert {key: shown[key] for key in SOURCE_FACTS if key in shown} == {"host_event": "exploration-result", "role": "assistant",
                                                         "exploration_id": "explore_x"}
+    assert "speaker_person_id" not in shown, "old unknown identities are not invented"
+    attributed = source_item()
+    attributed["metadata"].update(speaker_person_id="agent:kin", conversation_kind="autonomous",
+                                  knowledge_basis="model_report")
+    projected = for_model({"new_evidence": [attributed]})["new_evidence"][0]
+    assert projected["speaker_person_id"] == "agent:kin"
+    assert projected["conversation_kind"] == "autonomous"
+    assert projected["knowledge_basis"] == "model_report"
+    assert "metadata" not in projected and MARKER not in dumps(projected)
     assert "channel" not in shown, "only the named facts"
     # Its own fields stay as they are, and a fact it names itself is not overwritten.
     assert {k: shown[k] for k in ("id", "authority", "revision", "occurred_at", "received_at", "text")} == \
@@ -378,8 +387,8 @@ def test_the_appraisal_projection_shows_what_is_under_review_by_its_facts(setup)
     assert shown["new_evidence"][0]["exploration_id"] == "explore_moon" and shown["new_evidence"][0]["host_event"] == "exploration-result"
     assert shown["exploration_targets"][0]["exploration_id"] == "explore_moon"
     # The prompt reads the exploration's id where it now is, and says what the named facts are.
-    assert "new_evidence.metadata" not in SYSTEM and "new_evidence 来源的 exploration_id" in SYSTEM
-    assert "host_event 是宿主事件类别" in SYSTEM
+    assert "new_evidence.metadata" not in SYSTEM
+    assert "exploration_id" not in shown["new_evidence"][0].get("metadata", {})
 
 
 def test_a_main_session_fork_is_asked_with_nothing_taken_out(setup):

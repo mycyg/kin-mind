@@ -130,3 +130,37 @@ def compact_plan(plan):
             step["decision"] = {k:v for k,v in original["decision"].items() if k in {"id", "action", "reason", "at", "next_review_at", "procedure_ids", "artifact_hashes"}}
         result["steps"].append(step)
     return result
+
+
+def appraisal_wish(wish):
+    """Settled wishes retain meaning and delivery facts, not provider audit payloads."""
+    if wish.get("status") not in {"completed", "abandoned", "canceled"}:
+        return dict(wish)
+    result = {k: v for k, v in wish.items() if k not in {"decision_receipt", "evidence"}}
+    result["evidence"] = [{k: v for k, v in ref.items() if k in
+        {"source_id", "record_id", "revision", "authority", "occurred_at", "hash"}}
+        for ref in wish.get("evidence", [])]
+    result["detail_tool"] = "read_affective_state"
+    return result
+
+
+def appraisal_plan(plan):
+    """Terminal plans are an index of settled facts, not recurring execution prompts.
+
+    The original plan/receipts remain available through read_autonomous_plans.
+    Active plans retain the existing complete decision projection.
+    """
+    if plan.get("status") not in {"completed", "canceled", "abandoned"}:
+        return compact_plan(plan)
+    result = {k: v for k, v in plan.items() if k in
+              {"id", "key", "revision", "status", "goal", "reason", "evidence", "created_at", "updated_at"}}
+    result["detail_tool"] = "read_autonomous_plans"
+    result["steps"] = []
+    for step in plan.get("steps", []):
+        item = {k: v for k, v in step.items() if k in {"id", "revision", "state", "goal", "completion", "waiting_reason"}}
+        receipts = step.get("receipts", [])
+        item["receipt_count"] = len(receipts)
+        item["receipt_refs"] = [{k: v for k, v in r.items() if k in
+            {"id", "run_id", "state", "status", "source_id", "complete", "message_id", "verified"}} for r in receipts]
+        result["steps"].append(item)
+    return result

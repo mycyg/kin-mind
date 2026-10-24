@@ -56,10 +56,10 @@ const within=(work,ms)=>{let timer;return Promise.race([work,new Promise(resolve
 export class ReplyTail {
   /** `ownerEpoch()` is the host's current owner epoch; `onEvent` receives
    * text-free status facts keyed by group. */
-  constructor({manifests,clock=()=>Date.now(),ownerEpoch=null,onEvent=()=>{},hooks={},limits={}}) {
-    Object.assign(this,{manifests,clock,ownerEpoch,onEvent,hooks});
+  constructor({manifests,clock=()=>Date.now(),ownerEpoch=null,audience=null,onEvent=()=>{},hooks={},limits={}}) {
+    Object.assign(this,{manifests,clock,ownerEpoch,audience,onEvent,hooks});
     this.limits={...TAIL_DEFAULTS,...limits};
-    this.latest=null;this.chain=Promise.resolve();
+    this.latest=null;this.latestByAudience=new Map();this.chain=Promise.resolve();
   }
 
   // ---- reading -----------------------------------------------------------
@@ -111,7 +111,9 @@ export class ReplyTail {
   // ---- the owner's messages ----------------------------------------------
 
   /** The newest owner message, in memory only: what stops a group that is being sent right now. */
-  note({id=null}={}){if(id===null||this.latest?.id!==id)this.latest={id,at:this.clock()};}
+  sameAudience(a,b){return !this.audience||this.audience(a)===this.audience(b);}
+  latestFor(id){return this.audience?this.latestByAudience.get(this.audience(id)):this.latest;}
+  note({id=null}={}){if(id===null||this.latestFor(id)?.id!==id){this.latest={id,at:this.clock()};if(this.audience)this.latestByAudience.set(this.audience(id),this.latest);}}
   /** The owner's literal stop. Durable before anything else, so a restart cannot lose it; no model is asked. */
   async stopped({inputId=null}={}) {
     try {
@@ -126,9 +128,10 @@ export class ReplyTail {
   stops(){const read=readJsonFile(this.stopsFile());return read.state==='ok'&&Array.isArray(read.value?.stops)?read.value.stops.filter(s=>Number.isFinite(s?.at)):[];}
   /** The newest thing the owner said after this group was written: a stop, or a message. */
   newerThan(manifest) {
-    const stop=this.stops().findLast(s=>s.at>=manifest.created_at);
+    const stop=this.stops().findLast(s=>s.at>=manifest.created_at&&this.sameAudience(s.input_id,manifest.reply_id));
     if(stop)return {reason:'owner-stop',inputId:stop.input_id};
-    if(!manifest.work&&this.latest&&this.latest.at>manifest.created_at)return {reason:'new-owner-input',inputId:this.latest.id};
+    const latest=this.latestFor(manifest.reply_id);
+    if(!manifest.work&&latest&&latest.at>manifest.created_at)return {reason:'new-owner-input',inputId:latest.id};
     return null;
   }
 
@@ -138,11 +141,12 @@ export class ReplyTail {
    * 'cancel', stops the group at its next bubble boundary. */
   guard(inner=async()=>'send') {
     return async view=>{
-      const stop=this.stops().findLast(s=>s.at>=(view.createdAt??Infinity));
+      const stop=this.stops().findLast(s=>s.at>=(view.createdAt??Infinity)&&this.sameAudience(s.input_id,view.request?.reply_id));
       if(stop)return {action:'interrupt',reason:'owner-stop',inputId:stop.input_id};
       const answer=await inner(view);
-      if(answer==='cancel')return {action:'interrupt',reason:'input-or-session-superseded',inputId:this.latest?.id??null};
-      const newer=this.latest&&!view.request?.work&&this.latest.at>(view.createdAt??0)?this.latest:null;
+      if(answer==='cancel')return {action:'interrupt',reason:'input-or-session-superseded',inputId:this.latestFor(view.request?.reply_id)?.id??null};
+      const latest=this.latestFor(view.request?.reply_id);
+      const newer=latest&&!view.request?.work&&latest.at>(view.createdAt??0)?latest:null;
       if(actionOf(answer)==='send'&&newer)return {action:'interrupt',reason:'new-owner-input',inputId:newer.id};
       return answer;
     };

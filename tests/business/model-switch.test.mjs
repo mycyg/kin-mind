@@ -43,20 +43,7 @@ function profileFixture(t,{initial={model:'deepseek-flash',provider:'openai-15m'
   return {root,router:new MobileRouter(args),runtime,args,switches,classifications,now:()=>++now};
 }
 
-test('automatic changes notify once per verified transition, including a delayed intermediate model',async t=>{
- const f=fixture(t);f.runtime.model='deepseek-flash';
- await f.router.dispatch({id:'work',text:'write code'},async()=> 'new-turn');
- assert.equal(Object.values(f.router.state.notices).filter(n=>n.kind==='model-switched').length,1);
- const first=Object.values(f.router.state.notices)[0];assert.equal(first.target,'gpt-6.1-sol');
- f.runtime.model='deepseek-flash';await f.router.readRuntime();
- const sent=[];
- await f.router.flushNotices({send:async r=>{sent.push(r);return {state:'accepted',messageId:r.id};},lookup:async()=>null});
- assert.equal(sent.length,2);assert.match(sent[0].text,/此前已切换到 GPT/);assert.match(sent[0].text,/现在用的是 DeepSeek/);
- assert.equal(f.router.lastToldModel(),'deepseek-flash','what the owner was told is the model the delivered message named as current');
- assert.equal(f.router.state.recent.some(r=>r.text===sent[0].text),false);
- const restarted=new MobileRouter(f.args);
- await restarted.flushNotices({send:async r=>{sent.push(r);},lookup:async()=>null});assert.equal(sent.length,2);
-});
+
 
 test('pre-submit errors can retry once, post-submit ambiguity never replays',async t=>{
   const f=fixture(t);const input={id:'one',text:'write code',submissionProtocol:'host-boundary-v1'};
@@ -70,156 +57,21 @@ test('pre-submit errors can retry once, post-submit ambiguity never replays',asy
   await assert.rejects(()=>f.router.dispatch({...input,id:'two'},async()=>assert.fail('ambiguous retry')),/reconciliation/);
 });
 
-test('duplicate input never resubmits or reclassifies; uncertain submission is held',async t=>{
-  const f=fixture(t);let count=0;const input={id:'one',text:'hello'};
-  await f.router.dispatch(input,async()=>{count++;return'new-turn';});
-  await f.router.dispatch(input,async()=>{count++;return'new-turn';});
-  assert.equal(count,1);assert.equal(f.classificationCalls(),1);
-  await assert.rejects(f.router.dispatch({id:'two',text:'hi'},async()=>{throw Error('lost response');}),/reconciliation/);
-  await assert.rejects(f.router.dispatch({id:'two',text:'hi'},async()=>{count++;}),/reconciliation/);
-  assert.equal(count,1);
-});
 
-test('a classification failure never manufactures work: the input waits as itself, bounded and visible',async t=>{
-  // KIN-ITER-20260918-02: this REVISES the old "classifier timeout fails over to
-  // work" semantics. A failed classification creates no task, no GPT switch and no
-  // execution grant; the input waits as itself and the failure class is recorded.
-  let calls=0;
-  const f=fixture(t,{classify:async()=>{calls++;throw Error('classification-timeout');}});
-  await assert.rejects(f.router.dispatch({id:'question',text:'unclear'},async()=>{throw Error('must not submit');}),/waiting/);
-  assert.equal(f.router.tasks().length,0,'no task is manufactured out of a failure');
-  assert.deepEqual(f.switched,[],'and no provider switch');
-  const record=f.router.state.inputs.question;
-  assert.equal(record.state,'semantic-pending');assert.equal(record.reason,'classification-timeout');
-  const entry=f.router.state.semanticPending.question;
-  assert.deepEqual([entry.failure.class,entry.attempts,entry.maxAttempts,entry.model],['timeout',2,4,'gpt-6-sol']);
-  assert.equal(calls,2,'the live dispatch drove the first bounded retry of the same input');
-  // The budget is visible and bounded. After it the owner's message is still hers:
-  // it goes to Kin unlabelled, on the current profile, instead of ending unanswered (AD1-02).
-  for(const _ of [1,2]){f.router.state.semanticPending.question.nextAttemptAt=0;await f.router.reviewSemanticPending();}
-  assert.equal(calls,4);
-  const exhausted=f.router.state.inputs.question;
-  assert.deepEqual([exhausted.state,exhausted.route,exhausted.unlabeled,exhausted.failureClass,exhausted.taskId],['selected','chat',true,'timeout',null]);
-  assert.equal(f.router.state.semanticPending.question.state,'failed');
-  assert.equal(f.router.state.semanticPending.question.text,undefined,'the owner text leaves the retry record once it is settled');
-  assert.equal(f.router.tasks().length,0);assert.deepEqual(f.switched,[]);
-  let submitted=0;
-  const outcome=await f.router.dispatch({id:'question',text:'unclear'},async detail=>{submitted++;assert.equal(detail.model,'gpt-6-sol');return 'new-turn';});
-  assert.equal(outcome.route,'new-turn');assert.equal(submitted,1);
-  assert.equal(calls,4,'and it is never classified again');assert.deepEqual(f.switched,[]);
-});
 
-test('uncertain notification reconciles its original ID without another send',async t=>{
-  const f=fixture(t);await f.router.dispatch({id:'status',text:'现在是什么模型'},async()=>{throw Error('no model');});
-  let sends=0;
-  await f.router.flushNotices({send:async()=>{sends++;return{state:'accepted'};},lookup:async()=>({state:'unconfirmed'})});
-  const id=Object.keys(f.router.state.notices)[0];assert.equal(f.router.state.notices[id].state,'unconfirmed');
-  const restored=new MobileRouter(f.args);restored.state.notices[id].nextAttemptAt=0;
-  await restored.flushNotices({send:async()=>{sends++;throw Error('must not replay');},lookup:async requested=>{assert.equal(requested,id);return{state:'accepted',messageId:'reconciled'};}});
-  assert.equal(sends,1);assert.equal(restored.state.notices[id].messageId,'reconciled');
-});
 
-test('same-model control notices name verified effort and describe Fast only as configuration',async t=>{
-  const f=profileFixture(t,{initial:{model:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
-    classify:async input=>({route:'control',control:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'high',serviceTierPreference:'fast'},force:true,reason:'same model higher effort',recall:{mode:'light',query:input.text,reason:'control'}})});
-  await f.router.dispatch({id:'sol-high',text:'Sol 保持不变，改成 high 和 Fast'},async()=>assert.fail('control is host-owned'));
-  const sent=[];await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'same-model-notice'};},lookup:async()=>null});
-  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 GPT‑6 Sol · high · Fast 配置已开启（手动模式）。']);
-  assert.doesNotMatch(sent[0].text,/priority|实际.*Fast/);
-});
 
-test('automatic work restores the exact prior full profile only after every open task settles',async t=>{
-  const f=profileFixture(t,{initial:{model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'},classify:async input=>({route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}})});
-  await f.router.dispatch({id:'multi-work',text:'做两个独立步骤'},async()=> 'new-turn');
-  const first=f.router.currentTask(),firstReturn=structuredClone(f.router.state.autoReturnProfile);
-  assert.equal(first.status,'proposed','a work label is only a proposal until Kin takes it on (N5)');
-  await f.router.requestMode({taskOutcome:'accepted',mode:'work',commandId:'accept-first',completedTaskId:first.id,completedInputVersion:first.inputVersion,reason:'I will do both steps'});
-  const second={...structuredClone(first),id:'work-second',inputIds:['second'],inputVersion:1,summary:'second step',deliveries:{},tools:{},completion:null,createdAt:f.now()};
-  f.router.state.tasks[second.id]=second;f.router.save('synthetic-second-task');
-  for(const task of [first,second]){task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};task.stopReason='end_turn';task.turnEndedAt=f.now();task.deliveries['delivery-'+task.id]={state:'accepted',messageId:'m-'+task.id,inputVersion:task.inputVersion,turnFence:task.executionEpoch,at:f.now()};}
-  second.deliveries['delivery-'+second.id].state='pending';
-  await f.router.reconcile();
-  assert.deepEqual([f.router.state.tasks[first.id].status,f.router.state.tasks[second.id].status,f.runtime.model],['completed','running','gpt-6.1-sol']);
-  second.deliveries['delivery-'+second.id].state='accepted';second.deliveries['delivery-'+second.id].messageId='m-second';second.deliveries['delivery-'+second.id].at=f.now();
-  await f.router.reconcile();await f.router.applyPendingMode();
-  assert.deepEqual(firstReturn,{provider:'custom-gateway',providerKind:'native',model:'gpt-6-astra',reasoningEffort:'high',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
-  assert.deepEqual([f.runtime.model,f.runtime.reasoningEffort,f.runtime.serviceTierPreference],['gpt-6-astra','high','default']);
-});
 
-test('a natural manual Astra profile is catalog-validated, announced once and persists through work completion',async t=>{
-  const f=profileFixture(t,{classify:async input=>input.text.includes('ASTRA-6')
-    ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit owner profile',recall:{mode:'light',query:input.text,reason:'current control'}}
-    :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}}});
-  const control=await f.router.dispatch({id:'astra',text:'我要切换到ASTRA-6 medium'},async()=>assert.fail('host control is not a native prompt'));
-  assert.deepEqual([control.route,control.state,f.router.state.mode,f.runtime.model],['host-control','applied','manual','gpt-6-astra']);
-  assert.deepEqual(f.router.state.manualProfile,{provider:'custom-gateway',providerKind:'native',model:'gpt-6-astra',reasoningEffort:'medium',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
-  const sent=[];
-  await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'manual-ok'};},lookup:async()=>null});
-  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 GPT‑6 Astra · medium（手动模式）。']);
-  let work;
-  await f.router.dispatch({id:'work-after-manual',text:'现在写代码并交付'},async detail=>{work=detail;return'new-turn';});
-  assert.equal(work.model,'gpt-6-astra');assert.equal(f.switches.length,1,'automatic work routing cannot override the manual pin');
-  const task=f.router.currentTask();
-  // The work label only proposed it; Kin takes it on before it is hers to complete (CR-LIFE-10).
-  assert.equal(task.status,'proposed');assert.equal(f.router.openWork().length,0,'a proposal holds no lock');
-  await f.router.requestMode({commandId:'take-on',mode:'work',reason:'taking it on',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
-  task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};
-  await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',turnFence:task.executionEpoch});
-  await f.router.observe('delivery',{taskId:task.id,id:'manual-delivery',state:'accepted',messageId:'m-manual',inputVersion:task.inputVersion,turnFence:task.executionEpoch});
-  await f.router.reconcile();
-  assert.deepEqual([f.router.tasks().length,f.router.state.mode,f.runtime.model],[0,'manual','gpt-6-astra']);
-  assert.equal(Object.values(f.router.state.requests).some(request=>request.state==='pending'&&request.mode==='auto'),false);
-});
 
-test('confirmed owner force bypasses stale coordinator processing, fences late output and preserves ledgers',async t=>{
-  let forceCall;
-  const f=profileFixture(t,{initial:{model:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
-    classify:async input=>input.text.includes('ASTRA')
-      ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit immediate owner switch',recall:{mode:'light',query:input.text,reason:'current control'}}
-      :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}},
-    forceSwitch:async request=>{forceCall=request;return{state:'interrupted',nativeTurnId:'turn-old'};}});
-  await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=> 'new-turn');
-  const task=f.router.currentTask(),taskId=task.id,inputVersion=task.inputVersion;
-  f.router.state.operations.old={inputId:'original-work',kind:'tool',state:'running'};
-  f.router.state.notices.old={id:'old',kind:'status',state:'sending',stage:'sending'};
-  f.runtime.active=true;f.runtime.backgroundTasks=1;f.runtime.pendingDeliveries=1;f.runtime.nativeStatus='idle';
-  const result=await f.router.dispatch({id:'force-astra',text:'现在切到 ASTRA-6 medium'},async()=>assert.fail('control does not enter the native prompt'));
-  assert.deepEqual([result.route,result.state,f.runtime.model,f.router.state.executionEpoch],['host-control','applied','gpt-6-astra',1]);
-  assert.deepEqual([forceCall.fromEpoch,forceCall.toEpoch,forceCall.sourceInputId],[0,1,'force-astra']);
-  assert.equal(f.switches.at(-1).context.forceBoundary.receipt.state,'interrupted','the switch receives the confirmed hot-switch proof');
-  assert.deepEqual([f.router.currentTask().id,f.router.currentTask().inputVersion,f.router.currentTask().continuationRequired],[taskId,inputVersion,true]);
-  assert.equal(f.router.state.operations.old.state,'fenced-unconfirmed');
-  assert.equal(f.router.state.notices.old.state,'sending','the already-started send ledger is preserved, never replayed');
-  await f.router.observe('prompt-end',{taskId,stopReason:'end_turn',turnFence:0,inputVersion});
-  await f.router.observe('tool',{taskId,id:'old-tool',status:'completed',turnFence:0,inputVersion});
-  await f.router.observe('delivery',{taskId,id:'old-delivery',state:'accepted',messageId:'already-sent',turnFence:0,inputVersion});
-  assert.equal(task.stopReason,undefined,'the canceled turn cannot become a completed turn');
-  assert.equal(task.deliveries['old-delivery'],undefined,'an old fence never overwrites the current delivery ledger');
-  assert.equal(Object.values(task.deliveryHistory).some(delivery=>delivery.id==='old-delivery'&&delivery.messageId==='already-sent'&&delivery.lateAfterForce),true,'an already-sent platform receipt remains independent evidence at its old fence');
-  await f.router.dispatch({id:'original-work',text:'继续做当前任务'},async()=>assert.fail('the original ID can never be resubmitted'));
-  assert.equal(f.router.currentTask().id,taskId);
-});
 
-test('an unconfirmed force request completes its original fence when the same native session becomes idle',async t=>{
-  let forceCalls=0;
-  const f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'fast'},force:true,reason:'owner model change'}),
-    forceSwitch:async()=>{forceCalls++;return {state:'unconfirmed',reason:'native-not-idle'};}});
-  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';f.runtime.active=true;
-  const first=await f.router.dispatch({id:'force-after-system-error',kind:'owner',text:'切到 Sol medium'},async()=>assert.fail('control does not submit'));
-  const request=f.router.state.requests['owner-mode:force-after-system-error'];
-  assert.deepEqual([first.state,request.forceState,f.router.state.executionEpoch,forceCalls],['pending','unconfirmed',4,1]);
-  await f.router.applyPendingMode();
-  assert.equal(f.router.state.forceBoundaries.length,0,'an unknown native turn cannot be fenced');
-  f.runtime.nativeStatus='idle';f.runtime.active=false;
-  await f.router.applyPendingMode();
-  assert.deepEqual([request.state,request.forceState,f.router.state.executionEpoch,forceCalls],['applied','confirmed',5,1]);
-  assert.equal(request.forceBoundary.receipt.state,'idle');
-  assert.equal(request.forceBoundary.receipt.reconciled,true);
-  assert.equal(f.switches.length,1);
-  await f.router.applyPendingMode();
-  assert.equal(f.router.state.forceBoundaries.length,1,'repeated pumps do not create another boundary');
-  assert.equal(f.switches.length,1);
-});
+
+
+
+
+
+
+
+
 
 test('an already applied unconfirmed force is fenced once only while its original mode remains current',async t=>{
   const f=profileFixture(t,{initial:{model:'gpt-6-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'fast'},
@@ -246,21 +98,7 @@ test('an already applied unconfirmed force is fenced once only while its origina
   assert.equal(restored.unfencedForce(),null,'a later boundary prevents duplicate advancement');
 });
 
-test('a later deferred mode uses the earlier confirmed interruption fence without reviving the old mode',async t=>{
-  let forces=0;
-  const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:input.text==='first'?'gpt-6-sol':'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:input.text==='first'?'fast':'default'},force:input.text==='first',reason:'owner model choice'}),
-    forceSwitch:async()=>{forces++;return {state:'unconfirmed',reason:'native-not-idle'};}});
-  f.router.state.executionEpoch=4;f.runtime.nativeStatus='systemError';f.runtime.active=true;
-  await f.router.dispatch({id:'first',kind:'owner',text:'first'},async()=>assert.fail('control'));
-  await f.router.dispatch({id:'second',kind:'owner',text:'second'},async()=>assert.fail('control'));
-  const first=f.router.state.requests['owner-mode:first'],second=f.router.state.requests['owner-mode:second'];
-  assert.deepEqual([first.state,second.state,f.router.state.executionEpoch,forces],['superseded','pending',4,1]);
-  f.runtime.nativeStatus='idle';f.runtime.active=false;await f.router.applyPendingMode();
-  assert.equal(first.state,'superseded');assert.equal(first.forceState,'confirmed');
-  assert.equal(f.router.state.forceBoundaries[0].commandId,first.commandId);
-  assert.deepEqual([second.state,f.runtime.model,f.router.state.executionEpoch],['applied','gpt-6-astra',5]);
-  assert.deepEqual(f.switches.map(item=>item.model),['gpt-6-astra'],'the older Sol choice is never switched or announced');
-});
+
 
 test('a turn fenced before transport submission retires its manifest without replaying, while an unknown send stays blocked',async t=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-switch-receipt-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -342,191 +180,33 @@ test('quiet main assessment retains the actual manual profile and never classifi
   assert.equal((await f.router.dispatch({id:'assessment:two',text:'下一次',kind:'assessment'},async()=>assert.fail('must yield'))).route,'deferred');
 });
 
-test('a mixed work and explicit model request switches first and submits the work exactly once',async t=>{
- const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'owner selected model and commissioned a document'})});
- f.router.state.mode='manual';f.router.state.manualProfile={model:'deepseek-flash',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'};
- let submissions=0;
- const input={id:'mixed-work',kind:'owner',text:'Switch to ASTRA medium and finish the document'};
- const result=await f.router.dispatch(input,async decision=>{submissions++;assert.equal(f.runtime.model,'gpt-6-astra');assert.equal(decision.profile.reasoningEffort,'medium');assert.ok(decision.taskId);return 'new-turn';});
- assert.equal(result.route,'new-turn');assert.equal(f.router.state.requests['owner-mode:mixed-work'].state,'applied');
- assert.equal(f.router.currentTask().inputVersion,1);assert.equal(f.router.state.mode,'manual');
- const again=await f.router.dispatch(input,()=>assert.fail('duplicate work'));assert.equal(again.route,'deduplicated');assert.equal(submissions,1);
-});
 
-test('mixed owner control interrupts active work but preserves task identity and old side effects',async t=>{
- let f,forces=0;
- f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:true,reason:'explicit owner choice'}),forceSwitch:async()=>{forces++;Object.assign(f.runtime,{active:false,nativeStatus:'idle',backgroundTasks:0});return {state:'interrupted'};}});
- const task=f.router.addTask({id:'old',text:'previous work'});task.deliveries.old={state:'accepted',messageId:'already-delivered'};
- Object.assign(f.runtime,{active:true,nativeStatus:'active',backgroundTasks:1,pendingDeliveries:1});
- await f.router.dispatch({id:'mixed-force',kind:'owner',text:'Switch and add figures'},async()=>{assert.equal(f.runtime.model,'gpt-6-astra');return 'new-turn';});
- assert.equal(forces,1);assert.equal(f.router.currentTask().id,task.id);assert.equal(task.deliveries.old.messageId,'already-delivered');assert.equal(task.inputVersion,2);
-});
 
-test('failed mixed control never runs work under the previous model',async t=>{
- const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'__unsupported__',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'unsupported exact choice'})});
- const result=await f.router.dispatch({id:'unsupported-work',kind:'owner',text:'Use unavailable model to work'},()=>assert.fail('must not submit on old model'));
- assert.equal(result.route,'control-failed');assert.equal(f.runtime.model,'deepseek-flash');assert.equal(f.router.state.inputs['unsupported-work'].failureStage,'model-control');
-});
 
-test('explicit deferred mixed control without prior work does not wait on its own new task',async t=>{
- const f=profileFixture(t,{classify:async()=>({route:'work',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},force:false,reason:'switch at idle then work'})});
- await f.router.dispatch({id:'deferred-new-work',kind:'owner',text:'After old work ends, switch and start the next document'},async()=> 'new-turn');
- assert.equal(f.router.state.requests['owner-mode:deferred-new-work'].state,'applied');assert.equal(f.router.tasks().length,1);
-});
 
-test('control-only interruption leaves the task open as a fact and injects no continuation (N2, AD1-23)',async t=>{
- let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
- const task=f.router.addTask({id:'original',text:'finish original deliverable'});Object.assign(f.runtime,{active:true,nativeStatus:'active'});
- await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
- assert.equal(task.handoff,undefined,'the host never asks Kin to continue');
- assert.equal(f.router.state.requests['owner-mode:control-only'].state,'applied');assert.equal(task.inputVersion,1);
- assert.equal(f.router.tasks().length,1);
- const [facts]=f.router.workFacts();
- assert.deepEqual([facts.id,facts.status,Boolean(facts.interruptedBy)],[task.id,'running',true]);
-});
 
-test('an owner force switch keeps a declined outcome instead of resuming the task (AD1-23)',async t=>{
- let f;f=profileFixture(t,{classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'},reason:'owner profile choice'}),forceSwitch:async()=>{Object.assign(f.runtime,{active:false,nativeStatus:'idle'});return {state:'interrupted'};}});
- const task=f.router.addTask({id:'original',text:'finish original deliverable'});
- f.router.state.inputs.original={id:'original',kind:'owner',state:'accepted',hash:'h',at:1};
- await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0});
- await f.router.requestMode({mode:'auto',taskOutcome:'declined',completedTaskId:task.id,completedInputVersion:1,sourceInputId:'original',reason:'I will not do the rest',commandId:'decline'});
- Object.assign(f.runtime,{active:true,nativeStatus:'active'});
- await f.router.dispatch({id:'control-only',kind:'owner',text:'Switch to ASTRA medium'},()=>assert.fail('control is not owner work'));
- assert.equal(task.handoff,undefined);
- assert.deepEqual([task.completion.outcome,Boolean(task.completion.interruptedBy),task.completion.state],['declined',true,undefined]);
- await f.router.observe('delivery',{taskId:task.id,inputVersion:1,turnFence:task.executionEpoch,sourceInputId:'original',id:'refusal',state:'accepted',messageId:'refusal-sent'});
- await f.router.reconcile();
- assert.equal(task.status,'canceled');assert.equal(task.outcome,'declined');
-});
 
-test('repeated manual profile keeps active work, tools and pending delivery intact, including restart',async t=>{
-  let interruptions=0;
-  const profile={model:'gpt-6-astra',reasoningEffort:'medium',serviceTierPreference:'default'};
-  const f=profileFixture(t,{classify:async input=>input.text==='work'
-    ?{route:'work',reason:'new work'}
-    :{route:input.text==='mixed'?'work':'control',control:'manual',profile,force:true,reason:'same selected profile'},
-    forceSwitch:async()=>{interruptions++;return{state:'interrupted'};}});
-  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
-  await f.router.dispatch({id:'work',text:'work'},async()=> 'new-turn');
-  const task=f.router.currentTask(),version=task.inputVersion,epoch=f.router.state.executionEpoch;
-  task.tools.tool={status:'in_progress',turnFence:epoch};
-  task.deliveries.file={state:'unconfirmed',inputVersion:version};
-  f.runtime.active=true;f.runtime.backgroundTasks=1;f.runtime.pendingDeliveries=1;f.runtime.nativeStatus='running';
-  const notices=structuredClone(f.router.state.notices),tools=structuredClone(task.tools),deliveries=structuredClone(task.deliveries);
-  await f.router.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('control'));
-  assert.equal(f.router.state.requests['owner-mode:same-control'].state,'applied');
-  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.equal(f.router.state.executionEpoch,epoch);
-  // The only thing added is the reply to her control, which answers it (CR-LIFE-07).
-  const reply=Object.values(f.router.state.notices).filter(notice=>!notices[notice.id]);
-  assert.deepEqual(reply.map(notice=>[notice.kind,notice.sourceInputId]),[['status','same-control']]);
-  for(const notice of reply)notices[notice.id]=structuredClone(notice);
-  assert.deepEqual(f.router.state.notices,notices);assert.deepEqual(task.tools,tools);assert.deepEqual(task.deliveries,deliveries);
-  assert.equal(task.inputVersion,version);assert.equal(task.handoff,undefined);
-  const restarted=new MobileRouter(f.args);
-  await restarted.dispatch({id:'same-control',text:'pin'},async()=>assert.fail('duplicate control'));
-  let submitted;
-  await restarted.dispatch({id:'mixed-repeat',text:'mixed'},async detail=>{submitted=detail;return'steer';});
-  assert.equal(submitted.taskId,task.id);assert.equal(submitted.inputVersion,version+1);
-  assert.equal(interruptions,0);assert.equal(f.switches.length,1);assert.deepEqual(restarted.state.notices,JSON.parse(JSON.stringify(notices)));
-});
 
-test('manual content and task completion retain the full profile without choosing another model',async t=>{
-  const f=profileFixture(t,{classify:async input=>input.text==='pin'
-    ?{route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:'high',serviceTierPreference:'default'},reason:'owner choice'}
-    :{route:input.text==='chat'?'chat':'work',reason:'content only'}});
-  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
-  for(const text of ['work','chat','progress'])await f.router.dispatch({id:text,text},async detail=>{assert.equal(detail.model,'gpt-6-astra');assert.equal(detail.profile.reasoningEffort,'high');return'new-turn';});
-  assert.equal(f.classifications.length,4,'one existing content/recall call per owner message');
-  for(const call of f.classifications.slice(1))assert.deepEqual([call.mode,call.currentProfile.model,call.currentProfile.reasoningEffort,call.currentProfile.serviceTierPreference],['manual','gpt-6-astra','high','default']);
-  const task=f.router.currentTask(),notices=structuredClone(f.router.state.notices);
-  await f.router.requestMode({commandId:'task-complete',mode:'auto',completedTaskId:task.id,completedInputVersion:task.inputVersion,reason:'task finished',notify:false});
-  await f.router.reconcile();await f.router.applyPendingMode();
-  assert.ok(task.completion);assert.equal(f.router.state.mode,'manual');assert.equal(f.router.state.requestedMode,null);
-  assert.equal(f.switches.length,1);assert.deepEqual(f.router.state.notices,notices);
-});
 
-test('an actual effort change still interrupts once and notifies after profile verification',async t=>{
-  let interruptions=0;
-  const f=profileFixture(t,{classify:async input=>({route:'control',control:'manual',profile:{model:'gpt-6-astra',reasoningEffort:input.text==='pin'?'medium':'high',serviceTierPreference:'default'},force:true,reason:'fresh owner request'}),
-    forceSwitch:async()=>{interruptions++;f.runtime.active=false;f.runtime.nativeStatus='idle';return{state:'interrupted'};}});
-  await f.router.dispatch({id:'pin',text:'pin'},async()=>assert.fail('control'));
-  f.runtime.active=true;f.runtime.nativeStatus='running';
-  await f.router.dispatch({id:'higher',text:'higher'},async()=>assert.fail('control'));
-  assert.equal(interruptions,1);assert.equal(f.runtime.reasoningEffort,'high');assert.equal(f.switches.length,2);
-  assert.equal(Object.values(f.router.state.notices).length,2);
-});
 
-test('a historical canceled task cannot discard another task input after a classification retry or restart',async t=>{
-  let calls=0;
-  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'append a conclusion'};}});
-  const task=f.router.addTask({id:'current-work',text:'edit current article'});
-  f.router.state.tasks.old={...structuredClone(task),id:'old',status:'canceled',cancelRequested:true,canceledAt:1};
-  const input={id:'conclusion',text:'append the conclusion'};
-  await f.router.select(input);
-  const restarted=new MobileRouter(f.args);
-  await restarted.reviewSemanticPending();
-  assert.equal(restarted.state.inputs.conclusion.state,'selected');
-  assert.equal(restarted.state.inputs.conclusion.taskId,task.id);
-  let submitted=0;
-  await restarted.dispatch(input,async detail=>{submitted++;assert.equal(detail.taskId,task.id);return'steer';});
-  await restarted.dispatch(input,async()=>assert.fail('duplicate'));
-  assert.equal(submitted,1);assert.equal(calls,2);assert.equal(restarted.state.tasks.old.status,'canceled');
-});
 
-test('late work never extends a task the owner is stopping: it opens its own proposal and is answered (AD1-01)',async t=>{
-  let calls=0;
-  const f=fixture(t,{classify:async()=>{if(++calls===1)throw Error('classification-timeout');return{route:'work',reason:'late work'};}});
-  const task=f.router.addTask({id:'current-work',text:'edit current article'});
-  await f.router.select({id:'pending',text:'append a conclusion'});
-  task.cancelRequested=true;
-  await f.router.reviewSemanticPending();
-  const record=f.router.state.inputs.pending;
-  assert.equal(record.state,'selected','the message is dispatched, never retired unanswered');
-  assert.notEqual(record.taskId,task.id);assert.equal(f.router.state.tasks[task.id].inputVersion,1);
-  assert.equal(f.router.state.tasks[record.taskId].status,'proposed');
-});
 
-test('a stop classified late is recorded on its own input and applied only then (AD1-01)',async t=>{
-  let calls=0;
-  const f=fixture(t,{classifyIntents:true,classify:async()=>{if(++calls===1)throw SyntaxError('unreadable');return{route:'work',reason:'owner wants it stopped',stop:'current_task'};}});
-  const task=f.router.addTask({id:'current-work',text:'edit current article'});
-  await f.router.select({id:'stop-late',text:'别做了'});
-  assert.equal(task.cancelRequested,undefined,'a failed classification decides nothing');
-  await f.router.reviewSemanticPending();
-  const record=f.router.state.inputs['stop-late'];
-  assert.deepEqual([record.state,record.stop?.requested,record.taskId],['selected','current_task',task.id]);
-  assert.equal(task.cancelRequested,true);assert.equal(task.inputVersion,1,'the stop never becomes new work on the task');
-  let submitted=0;
-  await f.router.dispatch({id:'stop-late',text:'别做了'},async()=>{submitted++;return 'steered';});
-  assert.equal(submitted,1,'Kin reads the stop and answers it');
-  await f.router.reconcile();
-  assert.equal(task.status,'canceled');
-});
 
-test('an invalid classification answer can never leave a stop behind (AD1-01)',async t=>{
-  const f=fixture(t,{classifyIntents:true,classify:async()=>({route:'nonsense',stop:'current_task'})});
-  const task=f.router.addTask({id:'current-work',text:'edit current article'});
-  await f.router.select({id:'garbled',text:'hmm'});
-  assert.equal(task.cancelRequested,undefined);assert.equal(f.router.state.inputs.garbled.state,'semantic-pending');
-});
 
-test('classification and host preparation run outside the router mutex, on a checked basis (AD1-06)',async t=>{
-  let release;const gate=new Promise(resolve=>{release=resolve;});
-  const f=fixture(t,{classify:async()=>{await gate;return {route:'chat',reason:'slow'};},waitForIdle:async()=>{}});
-  const dispatching=f.router.dispatch({id:'slow',text:'hello'},async()=> 'new-turn');
-  await new Promise(resolve=>setTimeout(resolve,10));
-  await f.router.observe('tool',{id:'bookkeeping',status:'completed'});
-  assert.equal((await f.router.readRuntime()).actual.model,'gpt-6-sol','bookkeeping and reads go on while the classifier thinks');
-  release();assert.equal((await dispatching).route,'new-turn');
-  let prepared=0,sent=0;
-  const result=await f.router.dispatch({id:'prepared',text:'again',submissionProtocol:'host-boundary-v1'},async(decision,started)=>{
-    // A fence lands while the host prepares its prompt: nothing is sent on the old basis.
-    if(++prepared===1)f.router.state.executionEpoch++;
-    await started();sent++;return 'new-turn';});
-  assert.deepEqual([result.route,prepared,sent],['new-turn',2,1]);
-  assert.equal(f.router.state.inputs.prepared.executionEpoch,f.router.state.executionEpoch);
-});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 test('new independent work can retry after a prior task was canceled',async t=>{
   let calls=0;
@@ -585,94 +265,198 @@ test('runtime lists supplier capabilities and new defaults while preserving an o
  assert.equal(view.actual.model,'gpt-5.6-sol');assert.deepEqual(f.router.state.manualProfile,chosen);
 });
 
-test('a natural manual Kimi profile is catalog-validated, announced once and persists through work completion',async t=>{
-  const f=profileFixture(t,{classify:async input=>input.text.includes('Kimi')
-    ?{route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},force:true,reason:'explicit owner profile',recall:{mode:'light',query:input.text,reason:'current control'}}
-    :{route:'work',reason:'substantive work',recall:{mode:'light',query:input.text,reason:'current request'}}});
-  const control=await f.router.dispatch({id:'astra',text:'我要切换到Kimi high'},async()=>assert.fail('host control is not a native prompt'));
-  assert.deepEqual([control.route,control.state,f.router.state.mode,f.runtime.model],['host-control','applied','manual','k3']);
-  assert.deepEqual(f.router.state.manualProfile,{provider:'openai-15m',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTier:null,serviceTierVerified:false,serviceTierPreference:'default'});
-  const sent=[];
-  await f.router.flushNotices({send:async notice=>{sent.push(notice);return{state:'accepted',messageId:'manual-ok'};},lookup:async()=>null});
-  assert.deepEqual(sent.map(notice=>notice.text),['已切换到 Kimi K3 · high（手动模式）。']);
-  let work;
-  await f.router.dispatch({id:'work-after-manual',text:'现在写代码并交付'},async detail=>{work=detail;return'new-turn';});
-  assert.equal(work.model,'k3');assert.equal(f.switches.length,1,'automatic work routing cannot override the manual pin');
-  const task=f.router.currentTask();
-  // The work label only proposed it; Kin takes it on before it is hers to complete (CR-LIFE-10).
-  assert.equal(task.status,'proposed');assert.equal(f.router.openWork().length,0,'a proposal holds no lock');
-  await f.router.requestMode({commandId:'take-on',mode:'work',reason:'taking it on',taskOutcome:'accepted',completedTaskId:task.id,completedInputVersion:task.inputVersion});
-  task.completion={inputVersion:task.inputVersion,at:f.now(),summary:'done'};
-  await f.router.observe('prompt-end',{taskId:task.id,stopReason:'end_turn',turnFence:task.executionEpoch});
-  await f.router.observe('delivery',{taskId:task.id,id:'manual-delivery',state:'accepted',messageId:'m-manual',inputVersion:task.inputVersion,turnFence:task.executionEpoch});
-  await f.router.reconcile();
-  assert.deepEqual([f.router.tasks().length,f.router.state.mode,f.runtime.model],[0,'manual','k3']);
-  assert.equal(Object.values(f.router.state.requests).some(request=>request.state==='pending'&&request.mode==='auto'),false);
-});
 
-test('a pending owner switch recovers from terminal provider error in its original session and ID',async t=>{
-  let f,forces=0;
-  f=profileFixture(t,{initial:{model:'k3',provider:'openai-15m',providerKind:'gateway',reasoningEffort:'high',serviceTierPreference:'default'},
-    classify:async()=>({route:'control',control:'manual',profile:{model:'gpt-6.1-sol',reasoningEffort:'medium',serviceTierPreference:'fast'},force:true,reason:'owner switch back'}),
-    forceSwitch:async()=>{forces++;return{state:'unconfirmed'};}});
-  f.runtime.nativeStatus='systemError';f.runtime.active=true;
-  await f.router.dispatch({id:'switch-back',kind:'owner',text:'切回 Sol'},async()=>assert.fail('no native prompt'));
-  const request=f.router.state.requests['owner-mode:switch-back'];assert.equal(request.state,'pending');
-  const calls=[];
-  f.router.switchModel=async(model,profile,context)=>switchCodexModel({sessionId:'synthetic',profile,modelCatalog:LIVE_MODELS,forceBoundary:context.forceBoundary,
-    connection:{extMethod:async method=>{calls.push(method);if(method==='_kin/runtime')return {...f.runtime};
-      if(method==='providers/disable')Object.assign(f.runtime,{providerOverride:false,modelProvider:'custom-gateway'});},
-      setSessionConfigOption:async({configId,value})=>Object.assign(f.runtime,{[({model:'model',reasoning_effort:'reasoningEffort','fast-mode':'fastMode'})[configId]]:value,serviceTierPreference:configId==='fast-mode'?(value==='on'?'fast':'default'):f.runtime.serviceTierPreference})}});
-  for(const changed of [{active:false,backgroundTasks:1},{active:false,backgroundTasks:0,nativeSessionId:'wrong'}]){
-    Object.assign(f.runtime,changed);await f.router.applyPendingMode();assert.equal(request.state,'pending');assert.deepEqual(calls,[]);
-  }
-  Object.assign(f.runtime,{nativeSessionId:'synthetic',backgroundTasks:0});
-  await f.router.applyPendingMode();
-  assert.equal(request.state,'applied');assert.equal(request.forceBoundary.receipt.nativeStatus,'systemError');
-  assert.equal(f.runtime.model,'gpt-6.1-sol');assert.equal(f.runtime.reasoningEffort,'medium');assert.equal(f.runtime.fastMode,'on');
-  assert.equal(f.runtime.nativeSessionId,'synthetic');assert.equal(forces,1);
-  assert.equal(f.router.state.executionEpoch,1);assert.equal(calls.filter(x=>x==='providers/disable').length,1);
-  await f.router.applyPendingMode();assert.equal(f.router.state.executionEpoch,1);
-});
 
-test('incompatible Kimi history fails explicitly before force interruption and persists without an unconfirmed transition',async t=>{
- const {historyError}=await import('../../adapters/provider-history.mjs');let forces=0;
- const f=profileFixture(t,{preflightProfile:async target=>{if(target.model==='k3')throw historyError();},forceSwitch:async()=>{forces++;throw Error('must not interrupt');},
- classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},force:true,reason:'synthetic owner control'})});
- f.runtime.active=true;
- const before={...f.runtime};await f.router.dispatch({id:'blocked-kimi',text:'切换Kimi'},()=>assert.fail('no prompt'));
- assert.equal(forces,0);assert.deepEqual(f.runtime,before);assert.equal(f.switches.length,0);
- const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_INCOMPATIBLE');
- assert.notEqual(f.router.state.transition?.state,'unconfirmed');
- const persisted=JSON.parse(fs.readFileSync(f.router.file));assert.equal(persisted.requests[request.commandId].state,'failed');
- const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return{state:'accepted',messageId:'synthetic'};},lookup:async()=>null});assert.ok(notices.some(s=>s.includes('历史')&&s.includes('原会话')));
-});
-test('a history refusal at the final switch boundary settles the transition without changing the prior profile',async t=>{
- const {historyError}=await import('../../adapters/provider-history.mjs');const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
- const before={...f.runtime};f.router.switchModel=async()=>{throw historyError(true);};
- await f.router.dispatch({id:'late-history',text:'切到Kimi'},()=>assert.fail('no prompt'));
- const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
- assert.equal(request.state,'failed');assert.equal(request.failureReason,'KIMI_HISTORY_UNVERIFIED');assert.equal(f.router.state.transition.state,'failed-before-switch');assert.deepEqual(f.runtime,before);
- const restarted=new MobileRouter(f.args);assert.equal(restarted.state.requests[request.commandId].state,'failed');assert.notEqual(restarted.state.transition.state,'unconfirmed');
-});
+
+
+
+
 
 test('classifier recent conversation projects only model-visible dialogue fields',()=>{
  assert.deepEqual(recentConversation([{role:'user',text:'synthetic',at:1,conversation_id:'private-index',platform_message_id:'private-message'}]),[{role:'user',text:'synthetic',at:1}]);
 });
-test('temporary handoff failures remain pending with Chinese notice',async t=>{
- const f=profileFixture(t,{initial:{model:'gpt-6.1-sol',provider:'custom-gateway',providerKind:'native',reasoningEffort:'medium',serviceTierPreference:'default'},classify:async()=>({route:'control',control:'manual',profile:{model:'k3',reasoningEffort:'high',serviceTierPreference:'default'},reason:'synthetic owner control'})});
- let now=1000,attempts=0;f.router.now=()=>now;const switchModel=f.router.switchModel;
- f.router.switchModel=async()=>{attempts++;throw Object.assign(Error('Source session is not idle'),{code:'HANDOFF_NOT_COMMITTED',beforeMutation:true});};
- await f.router.dispatch({id:'temporary-handoff',text:'切到Kimi'},()=>assert.fail('no prompt'));
- const request=Object.values(f.router.state.requests).find(r=>r.profile?.model==='k3');
- assert.equal(request.state,'pending');assert.equal(request.waitingReason,'HANDOFF_NOT_COMMITTED');
- const notices=[];await f.router.flushNotices({send:async r=>{notices.push(r.text);return {state:'accepted',messageId:'synthetic'};},lookup:async()=>null});
- assert(notices.some(s=>s.includes('切换正在处理')));assert(!notices.some(s=>s.includes('Source session')));
- for(const delay of [30000,120000,600000,600000]){
-   assert.equal(request.retryAt-now,delay);await f.router.applyPendingMode();const before=attempts;
-   now=request.retryAt-1;await f.router.applyPendingMode();assert.equal(attempts,before);
-   now++;await f.router.applyPendingMode();assert.equal(attempts,before+1);
+
+
+test('an already configured gateway is not restarted for a fresh conversation profile',async()=>{
+ const runtime={known:true,sessionId:'fresh',threadId:'fresh',nativeSessionId:'fresh',nativeStatus:'idle',model:'deepseek-flash',modelProvider:'custom-gateway',providerOverride:true,providerBaseUrl:'http://127.0.0.1:9',reasoningEffort:'high',serviceTierPreference:'default',fastMode:'off',active:false,backgroundTasks:0};
+ const calls=[];const connection={extMethod:async name=>{calls.push(name);if(name==='_kin/runtime')return {...runtime};throw Error('a fresh thread has no durable rollout for provider restart');},setSessionConfigOption:async({configId,value})=>{runtime[({model:'model',reasoning_effort:'reasoningEffort','fast-mode':'fastMode'})[configId]]=value;}};
+ await switchCodexModel({connection,sessionId:'fresh',profile:{provider:'custom-gateway',providerKind:'gateway',model:'deepseek-flash',reasoningEffort:'high',serviceTierPreference:'default'},gateway:{baseUrl:runtime.providerBaseUrl,token:'test-only'}});
+ assert.equal(calls.includes('providers/set'),false);
+});
+
+
+test('peer inherits primary manual model before restore, follows changes, and preserves its own thread and inputs',async t=>{
+ const f=profileFixture(t),manual={provider:'openai-15m',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTierPreference:'default'};
+ let selected={mode:'manual',profile:manual};
+ const peer=new MobileRouter({...f.args,primaryModelSettings:()=>selected});
+ peer.state.inputs['group-event']={id:'group-event',state:'settled',kind:'owner',text:'synthetic family event'};
+ const originalThread=peer.state.sessionId;
+ assert.equal(await peer.refreshPrimaryModelSelection(),true);await peer.restoreRoutingProfile();
+ assert.equal(f.runtime.model,'k3');assert.equal(peer.state.mode,'manual');
+ assert.equal(peer.state.sessionId,originalThread);assert.equal(peer.state.inputs['group-event'].text,'synthetic family event');
+ assert.ok(Object.values(peer.state.notices).every(n=>n.state==='suppressed'),'inherited changes do not broadcast startup model notices');
+ const rev=peer.state.revision;assert.equal(await peer.refreshPrimaryModelSelection(),false);assert.equal(peer.state.revision,rev);
+ selected={mode:'manual',profile:{...manual,model:'deepseek-flash'}};
+ f.runtime.active=true;await peer.refreshPrimaryModelSelection();assert.equal((await peer.restoreRoutingProfile()).state,'waiting');assert.equal(f.runtime.model,'k3','do not interrupt an active reply');
+ f.runtime.active=false;await peer.restoreRoutingProfile();assert.equal(f.runtime.model,'deepseek-flash');
+ const restarted=new MobileRouter({...f.args,primaryModelSettings:()=>selected});await restarted.refreshPrimaryModelSelection();await restarted.restoreRoutingProfile();
+ assert.equal(restarted.state.inputs['group-event'].text,'synthetic family event');
+ assert.equal(restarted.state.sessionId,originalThread);
+});
+
+test('primary auto setting restores peer auto routing without copying primary work or conversations',async t=>{
+ const f=profileFixture(t);let selected={mode:'manual',profile:{provider:'openai-15m',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTierPreference:'default'}};
+ const peer=new MobileRouter({...f.args,primaryModelSettings:()=>selected});await peer.refreshPrimaryModelSelection();await peer.restoreRoutingProfile();
+ selected={mode:'auto',profile:{...selected.profile,model:'deepseek-flash'}};await peer.refreshPrimaryModelSelection();await peer.restoreRoutingProfile();
+ assert.equal(peer.state.mode,'auto');assert.equal(f.runtime.model,'deepseek-flash');assert.equal(peer.state.manualProfile,undefined);
+ assert.equal(peer.desiredProfile(f.runtime,{route:'work'}).model,peer.profiles.work.model);assert.deepEqual(peer.state.tasks,{});assert.deepEqual(peer.state.inputs,{});
+});
+
+test('peer control cannot create a divergent manual override or force interrupt the primary setting',async t=>{
+ const f=profileFixture(t),selected={mode:'manual',profile:{provider:'openai-15m',providerKind:'gateway',model:'k3',reasoningEffort:'high',serviceTierPreference:'default'}};
+ const peer=new MobileRouter({...f.args,primaryModelSettings:()=>selected});await peer.refreshPrimaryModelSelection();await peer.restoreRoutingProfile();
+ const request={commandId:'synthetic-group-choice',state:'pending',mode:'manual',profile:{...selected.profile,model:'deepseek-flash'},sourceInputId:'group-control',force:true,notify:true};
+ peer.state.requests[request.commandId]=request;await peer.applyModeRequest(request,f.runtime);
+ assert.equal(request.state,'failed');assert.equal(request.failureReason,'primary-model-setting-owned');assert.equal(f.runtime.model,'k3');assert.equal(f.switches.length,1);
+ await assert.rejects(peer.requestMode({commandId:'untrusted-manual',mode:'manual',profile:selected.profile,reason:'untrusted'}),/only from the owner/);
+});
+
+test('one native router keeps different recipients tasks and return destinations distinct',async t=>{
+ const f=fixture(t),x={id:'x-work',text:'x work',kind:'owner',recipient_person_id:'person:xiaoguang',conversation_key:'private-x'},y={id:'y-work',text:'y work',kind:'owner',recipient_person_id:'person:yiyi',conversation_key:'private-y'};
+ const tx=f.router.addTask(x),ty=f.router.addTask(y);
+ assert.notEqual(tx.id,ty.id);assert.deepEqual(tx.inputIds,['x-work']);assert.deepEqual(ty.inputIds,['y-work']);
+ assert.equal(f.router.currentTask(x).id,tx.id);assert.equal(f.router.currentTask(y).id,ty.id);
+ const locked=f.router.applyRouteLock({id:'family-chat',text:'hello',kind:'owner',recipient_person_id:'group:family',conversation_key:'group-1'},{decision:'chat',intent:'chat',reason:'casual'});
+ assert.equal(locked.task,null);assert.ok(!tx.contextInputIds?.includes('family-chat'));assert.ok(!ty.contextInputIds?.includes('family-chat'));
+});
+
+// Ordinary input is interpreted in KIN's turn. These cases invoke the same requestMode
+// boundary used by the host tool after it supplies the current owner's identity.
+async function ownerInput(f,id='choice',text='切换模型') {
+ return f.router.dispatch({id,kind:'owner',text},async()=> 'new-turn');
+}
+async function choose(f,{id='choice',commandId='choose',profile={model:'k3'},force=false}={}) {
+ if(!f.router.state.inputs[id])await ownerInput(f,id);
+ return f.router.requestMode({commandId,sourceInputId:id,mode:'manual',profile,reason:'owner chose this model',notify:true,force},{ownerModelChoice:true});
+}
+async function takeWork(f,id='job') {
+ if(!f.router.state.inputs[id])await ownerInput(f,id,'写一份报告');
+ await f.router.requestMode({commandId:'take-'+id,sourceInputId:id,mode:'work',reason:'KIN accepts the work'});
+ return f.router.currentTask();
+}
+
+test('ordinary requests, including model names and work, enter KIN once without a pre-chat classifier',async t=>{
+ const f=profileFixture(t,{classify:()=>assert.fail('retired pre-chat classifier')});const prompts=[];
+ for(const [id,text]of [['a','现在是什么模型'],['b','切换到 Kimi high'],['c','写代码'],['d','不用回复我，随便看看']])
+  await f.router.dispatch({id,kind:'owner',text},async d=>{prompts.push(d);return 'new-turn';});
+ assert.equal(prompts.length,4);assert.equal(f.classifications.length,0);assert.deepEqual(f.switches,[]);assert.equal(f.router.tasks().length,0);
+ await f.router.dispatch({id:'b',kind:'owner',text:'切换到 Kimi high'},()=>assert.fail('duplicate native submission'));
+ assert.equal(f.router.state.inputs.b.state,'accepted');assert.deepEqual(f.router.state.semanticPending,{});
+});
+
+test('a classifier outage cannot manufacture work or stop ordinary conversation',async t=>{
+ const f=fixture(t,{classify:async()=>{throw Error('provider-http-503');}});let submitted=0;
+ await f.router.dispatch({id:'hello',kind:'owner',text:'想随便说两句'},async()=>{submitted++;return 'new-turn';});
+ assert.equal(submitted,1);assert.equal(f.router.tasks().length,0);assert.deepEqual(f.router.state.semanticPending,{});
+});
+
+for(const model of ['k3','gpt-6-astra'])test('main-model manual choice applies '+model+' once and persists across restart and later chat',async t=>{
+ const f=profileFixture(t);await choose(f,{profile:{model}});await f.router.applyPendingMode();
+ assert.equal(f.runtime.model,model);assert.equal(f.router.state.requests.choose.state,'applied');assert.equal(f.router.state.mode,'manual');
+ const receipt=f.router.state.requests.choose;assert.equal(receipt.force,false);assert.equal(f.switches.length,1);
+ const profile=structuredClone(f.router.state.manualProfile);const restored=new MobileRouter(f.args);f.router=restored;
+ await ownerInput(f,'next','刚才说到哪儿啦');assert.equal(restored.state.inputs.next.model,model);assert.deepEqual(restored.state.manualProfile,profile);assert.equal(f.switches.length,1);
+ const notices=[];await restored.flushNotices({send:async n=>{notices.push(n);return {state:'accepted',messageId:'sent-'+n.id};},lookup:async()=>null});
+ assert.ok(notices.some(n=>n.sourceInputId==='choice'));assert.ok(notices.every(n=>n.text.length>0));
+ await restored.flushNotices({send:()=>assert.fail('duplicate notice'),lookup:async()=>null});
+});
+
+test('a mode tool request waits for the active turn and only the latest pending model is applied',async t=>{
+ const f=profileFixture(t);await ownerInput(f);f.runtime.active=true;f.runtime.nativeStatus='active';
+ await choose(f,{commandId:'first',profile:{model:'k3'}});await f.router.applyPendingMode();assert.deepEqual(f.switches,[]);
+ await choose(f,{commandId:'second',profile:{model:'gpt-6-astra'}});assert.equal(f.router.state.requests.first.state,'superseded');
+ f.runtime.active=false;f.runtime.nativeStatus='idle';await f.router.applyPendingMode();
+ assert.deepEqual(f.switches.map(s=>s.model),['gpt-6-astra']);assert.equal(f.router.state.requests.second.state,'applied');assert.equal(f.router.state.executionEpoch,0);
+});
+
+test('accepting and completing work preserves the explicitly selected manual profile',async t=>{
+ const f=profileFixture(t);await choose(f);await f.router.applyPendingMode();const profile=structuredClone(f.router.state.manualProfile);
+ const task=await takeWork(f);await f.router.applyPendingMode();assert.equal(task.status,'running');assert.deepEqual(task.inputIds,['job']);
+ assert.equal(f.runtime.model,'k3');assert.equal(f.router.state.mode,'manual');assert.equal(f.switches.length,1);
+ await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
+ await f.router.requestMode({commandId:'done',mode:'auto',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'job',reason:'finished'});
+ await f.router.observe('delivery',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,id:'report',state:'accepted',messageId:'m-report'});
+ await f.router.observe('prompt-end',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,stopReason:'end_turn'});
+ await f.router.reconcile();await f.router.applyPendingMode();assert.equal(task.status,'completed');assert.deepEqual(f.router.state.manualProfile,profile);assert.equal(f.runtime.model,'k3');assert.equal(f.switches.length,1);
+});
+
+test('accepting work in auto mode captures and later restores the full previous profile',async t=>{
+ const initial={model:'gpt-6-astra',provider:'custom-gateway',providerKind:'native',reasoningEffort:'high',serviceTierPreference:'default'};
+ const f=profileFixture(t,{initial});f.router.state.autoIdleProfile={...initial};const task=await takeWork(f);await f.router.applyPendingMode();
+ assert.equal(f.runtime.model,'gpt-6.1-sol');assert.equal(f.router.state.autoReturnProfile.model,'gpt-6-astra');
+ await f.router.observe('prompt-start',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,inputIds:['job']});
+ await f.router.requestMode({commandId:'done',mode:'auto',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'job',reason:'finished'});
+ await f.router.observe('delivery',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,id:'report',state:'accepted',messageId:'m-report'});
+ await f.router.observe('prompt-end',{taskId:task.id,inputVersion:task.inputVersion,turnFence:0,stopReason:'end_turn'});
+ await f.router.reconcile();await f.router.applyPendingMode();assert.equal(task.status,'completed');
+ assert.deepEqual([f.runtime.model,f.runtime.reasoningEffort,f.runtime.serviceTierPreference],['gpt-6-astra','high','default']);
+});
+
+test('same manual profile retains running work and accepted effects without interrupting or restarting',async t=>{
+ const f=profileFixture(t,{forceSwitch:()=>assert.fail('no interruption')});await choose(f);await f.router.applyPendingMode();const task=await takeWork(f);await f.router.applyPendingMode();
+ task.tools.t={status:'in_progress'};task.deliveries.sent={state:'accepted',messageId:'old-platform-id'};const prior=structuredClone(task);
+ f.runtime.active=true;f.runtime.nativeStatus='active';await choose(f,{commandId:'same'});await f.router.applyPendingMode();
+ assert.equal(f.router.state.requests.same.state,'applied');assert.deepEqual(task,prior);assert.equal(f.switches.length,1);assert.equal(f.router.state.executionEpoch,0);
+});
+
+test('a same-model effort change waits for idle and verifies the actual effort before announcing',async t=>{
+ const f=profileFixture(t);await choose(f,{profile:{model:'gpt-6-sol',reasoningEffort:'medium',serviceTierPreference:'priority'}});await f.router.applyPendingMode();
+ f.runtime.active=true;await choose(f,{commandId:'high',profile:{model:'gpt-6-sol',reasoningEffort:'high',serviceTierPreference:'priority'}});await f.router.applyPendingMode();assert.equal(f.runtime.reasoningEffort,'medium');
+ f.runtime.active=false;await f.router.applyPendingMode();assert.equal(f.runtime.reasoningEffort,'high');assert.equal(f.router.state.requests.high.state,'applied');assert.equal(f.switches.length,2);
+});
+
+test('unsupported model or effort fails before any profile change or interruption',async t=>{
+ for(const profile of [{model:'missing'},{model:'k3',reasoningEffort:'ultra'}]){
+  const f=profileFixture(t,{forceSwitch:()=>assert.fail('unsupported choice must not interrupt')});await choose(f,{profile});await f.router.applyPendingMode();
+  assert.equal(f.router.state.requests.choose.state,'failed');assert.equal(f.runtime.model,'deepseek-flash');assert.deepEqual(f.switches,[]);assert.equal(f.router.state.executionEpoch,0);
  }
- now=request.retryAt;f.router.switchModel=switchModel;await f.router.applyPendingMode();
- assert.equal(request.state,'applied');assert.equal(request.retryAt,undefined);assert.equal(request.handoffAttempts,undefined);
+});
+
+test('provider history refusal leaves the original model, session and delivered effects intact',async t=>{
+ const f=profileFixture(t,{preflightProfile:async()=>{throw Object.assign(Error('incompatible history'),{code:'KIMI_HISTORY_INCOMPATIBLE',beforeMutation:true});}});
+ await choose(f);await f.router.applyPendingMode();assert.equal(f.router.state.requests.choose.state,'failed');assert.equal(f.runtime.model,'deepseek-flash');assert.equal(f.router.sessionId,'synthetic');assert.deepEqual(f.switches,[]);
+});
+
+test('a failed switch acknowledgement is kept uncertain and is not announced as successful',async t=>{
+ const f=profileFixture(t);await choose(f);f.router.switchModel=async()=>{throw Error('connection lost after switch request');};
+ await f.router.applyPendingMode();assert.equal(f.router.state.requests.choose.state,'pending');assert.equal(f.router.state.transition.state,'unconfirmed');
+ assert.equal(f.router.state.requests.choose.waitingReason,'switch-unconfirmed');assert.equal(f.router.state.mode,'auto');
+ assert.equal(Object.values(f.router.state.notices).some(n=>n.kind==='model-switched'&&n.target==='k3'),false);
+});
+
+test('a temporary handoff failure retries the original request after its delay',async t=>{
+ const f=profileFixture(t);await choose(f);const original=f.router.switchModel;let calls=0;
+ f.router.switchModel=async(...args)=>{if(++calls===1)throw Object.assign(Error('busy handoff'),{code:'HANDOFF_NOT_COMMITTED'});return original(...args);};
+ await f.router.applyPendingMode();const r=f.router.state.requests.choose;assert.equal(r.state,'pending');assert.equal(r.waitingReason,'HANDOFF_NOT_COMMITTED');assert.ok(r.retryAt>r.failedAt);
+ await f.router.applyPendingMode();assert.equal(calls,1);r.retryAt=0;await f.router.applyPendingMode();assert.equal(calls,2);assert.equal(r.state,'applied');assert.equal(f.runtime.model,'k3');
+});
+
+test('unknown notification reconciles the same platform ID after restart without resending',async t=>{
+ const f=profileFixture(t);await choose(f);await f.router.applyPendingMode();let sends=0;
+ await f.router.flushNotices({send:async()=>{sends++;return {state:'unconfirmed'};},lookup:async()=>({state:'unconfirmed'})});
+ const notices=Object.values(f.router.state.notices).filter(n=>n.state==='unconfirmed');assert.ok(notices.length>0);const sent=sends;
+ const restarted=new MobileRouter(f.args);for(const n of Object.values(restarted.state.notices))n.nextAttemptAt=0;
+ await restarted.flushNotices({send:()=>assert.fail('never resend unknown outcome'),lookup:async id=>({state:'accepted',messageId:'reconciled-'+id})});
+ assert.equal(sends,sent);assert.ok(Object.values(restarted.state.notices).every(n=>n.state==='accepted'));
+});
+
+test('a frozen model tool request stays pending and applies under its original ID after thaw',async t=>{
+ const f=profileFixture(t);await ownerInput(f);await f.router.freezeDispatch('release');await choose(f);await f.router.applyPendingMode();assert.deepEqual(f.switches,[]);assert.equal(f.router.state.requests.choose.state,'pending');
+ await f.router.thawDispatch('released');await f.router.applyPendingMode();assert.equal(f.router.state.requests.choose.state,'applied');assert.equal(f.switches.length,1);
+});
+
+test('a literal owner work command can replace a manual pin while task acceptance cannot',async t=>{
+ const f=profileFixture(t);await choose(f);await f.router.applyPendingMode();
+ const out=await f.router.dispatch({id:'literal-work',kind:'owner',text:'/mode work'},()=>assert.fail('literal control is handled by host'));
+ assert.equal(out.route,'host-control');assert.equal(f.router.state.mode,'work');assert.equal(f.runtime.model,'gpt-6.1-sol');
 });

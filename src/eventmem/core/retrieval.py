@@ -252,6 +252,8 @@ def deep_inputs(engine, request, trace, scenario_policy):
 
 
 def candidates(engine, request, *, full_lexical=False, policy=None):
+    from kin_mind.companion_view import ACTIVE_VIEW
+    view = ACTIVE_VIEW.get()
     trace = {"channels": {}, "filtered": [], "ranked": [], "mode": request.mode}
     ranks: dict[str, float] = defaultdict(float)
     docs: dict[str, dict] = {}
@@ -486,6 +488,9 @@ def candidates(engine, request, *, full_lexical=False, policy=None):
             # Relation-seeded and vector ids joined after `found`; one pass for them too.
             prefill(list(ranks))
         for rid in list(ranks):
+            if view is not None and view.visible_id(rid, conn) is False:
+                del ranks[rid]
+                continue
             data = load(rid)
             if data is None:
                 trace["filtered"].append(
@@ -592,7 +597,10 @@ def _recall(engine, request, *, access_origin, allow_model, record, original=Fal
     from .db import recording
 
     # A look's candidates are found without models: never handed to a recall that may use them.
-    cache_key = (generation, key, recording())
+    from kin_mind.companion_view import ACTIVE_VIEW
+    view = ACTIVE_VIEW.get()
+    view_key = (view.scope.key(), view.person, view.conversation) if view else None
+    cache_key = (generation, key, recording(), view_key)
     with engine.cache_lock:
         cached = engine.cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < 30:
@@ -631,6 +639,10 @@ def _recall(engine, request, *, access_origin, allow_model, record, original=Fal
         selected, lines, used = [], [], 0
         accounts = {"constraints": 0, "predictions": 0, "memory": 0}
         for candidate in docs:
+            # Recheck access on warm caches before consuming the budget or marking
+            # a record seen. A mixed result must not hide usable memories.
+            if view is not None and view.visible_id(candidate["id"], conn) is False:
+                continue
             try:
                 data = engine._get(conn, candidate["id"], request.at, request.known_at)
             except Missing:
@@ -693,6 +705,8 @@ def _recall(engine, request, *, access_origin, allow_model, record, original=Fal
                     },
                 )
             )
+            if view is not None:
+                selected[-1]["provenance"] = view.provenance(data["source_ids"], conn)
             state["seen"][rid] = revision
             state["resident"][rid] = revision
             if len(selected) >= request.limit:

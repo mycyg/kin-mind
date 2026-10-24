@@ -2,18 +2,18 @@ import {holdsSession} from './input-ledger.mjs';
 /** Session health is measured per native window, never by rollout file size or
  * cumulative billing. Compression is the first pressure remedy. */
 export const SESSION_DEFAULTS=Object.freeze({version:'compact-first-v1',observe:true,compact:true,prepare:false,rotate:false,
-  pausedTaskHandover:false,preparePressure:0.65,criticalPressure:0.85,rotationCooldownMs:1800000,
+  pausedTaskHandover:false,preparePressure:0.55,compactPressure:0.65,criticalPressure:0.85,rotationCooldownMs:1800000,
   compactCooldownMs:1800000,outputReserve:32768,toolReserve:8192,restoreBudget:2000});
 
 export function windowPressure(runtime,config=SESSION_DEFAULTS) {
   const window=runtime.modelContextWindow;
   const measured=runtime.lastTokenUsage?.inputTokens;
-  const next=runtime.expectedInputTokens??measured;
+  const next=runtime.contextWindowExceeded?window:(runtime.expectedInputTokens??measured);
   const output=runtime.outputReserve??config.outputReserve,tools=runtime.toolReserve??config.toolReserve;
   const known=[window,next,output,tools].every(v=>Number.isFinite(v)&&v>=0)&&window>0;
   const ratio=known?(next+output+tools)/window:null;
   return {known,effectiveWindow:window??null,inputTokens:measured??null,expectedInputTokens:next??null,outputReserve:output,toolReserve:tools,ratio,
-    level:!known?'unknown':ratio>=config.criticalPressure?'critical':ratio>=config.preparePressure?'elevated':'normal'};
+    level:!known?'unknown':ratio>=config.criticalPressure?'critical':ratio>=Math.min(config.preparePressure,0.55)?'elevated':'normal'};
 }
 
 /** Advice references observations, not the model's own confidence. An error
@@ -33,6 +33,8 @@ export function rotationEligibility(state,advice,now=Date.now()) {
 }
 
 export function safeBoundary({runtime,tasks=[],inputs=[],notices=[],contactRunning=false}) {
+  // The active native compact API accepts idle only; a terminal error retains
+  // capacity pressure and waits for native idle instead of starting an unconfirmable operation.
   if(!runtime?.known||runtime.active||runtime.nativeStatus!=='idle'||runtime.backgroundTasks||runtime.queued||runtime.pendingDeliveries||runtime.handoffTasks||contactRunning)return {safe:false,reason:'native-or-delivery-busy'};
   // The router's ledger is the one definition of an input still in play (AD1-09).
   if(inputs.some(holdsSession))return {safe:false,reason:'input-awaiting-dispatch-or-reconciliation'};

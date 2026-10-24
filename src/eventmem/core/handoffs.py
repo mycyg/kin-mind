@@ -163,6 +163,7 @@ class TaskHandoffs:
                 "state": "pending",
                 "created_at": self.clock(),
                 "read_at": None,
+                **({"companion_delivery":task["companion_delivery"]} if task.get("companion_delivery") else {}),
             }
             c.execute(
                 "INSERT INTO handoff_outbox VALUES(?,?,?,?,?,?)",
@@ -210,6 +211,7 @@ class TaskHandoffs:
         source,
         acceptance,
         source_input_id=None,
+        companion_delivery=None,
     ):
         if (
             self.actor == "transport"
@@ -225,6 +227,8 @@ class TaskHandoffs:
             "source": text(source, 2000),
             "acceptance": text(acceptance, 3000),
         }
+        if companion_delivery is not None:
+            args["companion_delivery"] = companion_delivery
         if source_input_id is not None:
             args["source_input_id"] = identifier(source_input_id)
 

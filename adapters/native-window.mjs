@@ -9,7 +9,7 @@ export function nativePressureRuntime(runtime,history) {
   const liveMeasured=live&&(live.inputTokens>0||live.outputTokens>0||live.totalTokens>0);
   const usage=liveMeasured?live:history.lastTokenUsage??live;
   const estimate=usage?.inputTokens===0&&usage.outputTokens===0&&usage.totalTokens>0?usage.totalTokens:undefined;
-  return {...runtime,modelContextWindow:runtime.modelContextWindow??history.modelContextWindow,lastTokenUsage:usage,
+  return {...runtime,contextWindowExceeded:history.contextWindowExceeded===true||(runtime.nativeStatus==='systemError'&&runtime.lastTokenUsage?.inputTokens===0&&runtime.totalTokenUsage?.totalTokens===runtime.modelContextWindow),modelContextWindow:runtime.modelContextWindow??history.modelContextWindow,lastTokenUsage:usage,
     ...(estimate!==undefined?{expectedInputTokens:estimate}:{}),
     usageEvidence:{source:liveMeasured?'native-runtime':'native-history',measuredAt:liveMeasured?runtime.checkedAt:history.measuredAt,
       kind:estimate!==undefined?'post-compaction-context-estimate':'input-usage'}};
@@ -97,13 +97,15 @@ export class NativeWindow {
       const found=[];
       this.state.offset=await readLines(this.file,this.state.offset,end,(line,at)=>{
         const injection=line.includes('kin-context:')||line.includes('kin-checkpoint:')||line.includes('kin-effect:');
-        if(!injection&&!line.includes('"type":"compacted"')&&!line.includes('"type":"token_count"')&&!line.includes('"type":"session_meta"'))return;
+        if(!injection&&!line.includes('"type":"compacted"')&&!line.includes('"type":"token_count"')&&!line.includes('"type":"session_meta"')&&!line.includes('context_window_exceeded'))return;
         let item;try{item=JSON.parse(line);}catch{return;}
         if(item.type==='session_meta'&&item.payload.id!==this.threadId)throw Error('Native rollout owner mismatch');
         if(item.type==='compacted'){
+          this.state.contextWindowExceeded=false;
           const id=item.payload.window_id??('compact:'+item.timestamp);
           if(!this.state.eventIds.includes(id)){this.state.eventIds.push(id);this.state.compactions++;this.state.events.push({id,kind:'context-compaction',state:'completed',threadId:this.threadId,at:item.timestamp,origin:'native-history'});}
         }
+        if(item.payload?.error?.codex_error_info==='context_window_exceeded')this.state.contextWindowExceeded=true;
         if(item.type==='event_msg'&&item.payload?.type==='token_count'){
           const info=item.payload.info;
           if(info?.last_token_usage){const u=info.last_token_usage;this.state.lastTokenUsage={inputTokens:u.input_tokens,cachedInputTokens:u.cached_input_tokens,outputTokens:u.output_tokens,totalTokens:u.total_tokens};this.state.modelContextWindow=info.model_context_window;this.state.measuredAt=item.timestamp;}

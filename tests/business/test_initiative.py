@@ -63,12 +63,12 @@ def idle_review(mind, memory, actions, clock):
 
 def test_every_provider_is_told_an_idle_review_may_start_something():
     """The invitation is in the contract DeepSeek is given, and the main session hears it once."""
-    deepseek = A.DeepSeek.__new__(A.DeepSeek)
-    system = A.DeepSeek._system(deepseek, {"stimulus": "idle-review", "operational_only": True}, None)
-    assert "空闲评估本身就是自主起念的机会" in system and "想联系、探索或创作都可以直接提出" in system
-    assert "每次idle-review都对主动联系作一个明确决定" in system
-    native = A.NativeReview.__new__(A.NativeReview)
-    assert A.NativeReview._system(native, {"stimulus": "idle-review"}, None).count("自主起念的机会") == 1
+    for cls in (A.DeepSeek, A.NativeReview):
+        provider = cls.__new__(cls)
+        system = cls._system(provider, {"stimulus": "idle-review", "operational_only": True}, None)
+        assert "想开口、探索、创作或安静都由你判断" in system
+        assert "也可以没有什么新信息或内容价值" in system
+        assert system.count("聊天陪伴本身有意义") == 1
 
 
 # --- 2. An idle review states a contact decision, and sees how long it has been quiet ---------------
@@ -231,7 +231,7 @@ def test_the_owner_word_on_contact_frequency_reaches_the_assessment_whatever_the
     # The assessment is shown it, and told how to read it.
     shown = A.appraisal_context({"state": mind.read(), "new_evidence": [], "stimulus": "idle-review"})
     assert shown["state"]["contact"]["frequency"]["text"] == "主动联系可以更频繁一点"
-    assert "state.contact.frequency" in A.SYSTEM and "无论表达风格是什么" in A.SYSTEM
+    assert "state.contact" in A.SYSTEM and "对方实际说过的频率要求" in A.SYSTEM
     # A newer word from the same place: the old one is not shown as current.
     source("frequency", text="最近少联系一点", version="2")
     assert "text" not in mind.read()["contact"]["frequency"] and mind.read()["contact"]["frequency"]["needs_review"]

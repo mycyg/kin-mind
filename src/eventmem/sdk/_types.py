@@ -10,6 +10,20 @@ class Body_upload_source(TypedDict, total=False):
     metadata: Required[str]
     file: Required[str]
 
+class CompanionDelivery(TypedDict, total=False):
+    mode: Literal['text', 'voice', 'both']
+    schema_version: int
+    channel: str
+    person_id: Required[Literal['person:xiaoguang', 'person:yiyi']]
+    app_id: Required[str]
+    open_id: Required[str]
+    chat_id: Required[str]
+    conversation_key: Required[str]
+    binding_revision: Required[int]
+    requester_person_id: Required[Literal['person:xiaoguang', 'person:yiyi']]
+    request_conversation_key: Required[str]
+    source_input_id: Required[str]
+
 class ContactPolicy(TypedDict, total=False):
     id: str
     scope: Scope
@@ -194,6 +208,7 @@ class ScheduleChange(TypedDict, total=False):
     due_at: str | None
 
 class ScheduleInput(TypedDict, total=False):
+    companion_delivery: CompanionDelivery | None
     command_id: Required[str]
     policy_id: str
     record_id: Required[str]

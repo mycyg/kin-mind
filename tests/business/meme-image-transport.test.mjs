@@ -25,7 +25,8 @@ for (const model of ['k3', 'deepseek-flash']) {
       headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model,input})});
     assert.equal(response.status,200); await response.text();
     assert.equal(sent.length,1);
-    assert.deepEqual(sent[0].input,before);
+    assert.deepEqual(sent[0].input.slice(0,before.length),before);
+    assert.equal(sent[0].input.length,before.length+1);assert.equal(sent[0].input.at(-1).role,model==='deepseek-flash'?'system':'developer');
     assert.deepEqual(input,before);
     assert.equal(typeof sent[0].input[1].output,'object');
     assert.deepEqual(Buffer.from(sent[0].input[1].output[1].image_url.split(',')[1],'base64'),png(2,71));
