@@ -46,15 +46,14 @@ def test_missing_history_does_not_rebase(flexible):
 
 def test_original_method_conflicts_then_new_method_rebases_same_event_order(flexible):
     import ast
-    import subprocess
     from pathlib import Path
     from kin_mind.state import DesireChange
     mind, memory, source, clock = flexible
     received(memory, clock, 'synthetic-x')
     received(memory, clock, 'synthetic-y')
     revision = mind.read()['revision']
-    # Pin the actual pre-fix source; HEAD already contains the fix after release.
-    original = subprocess.check_output(['/usr/bin/git', 'show', '12da5dccf85648685a81107a078ecae222afb1f5:src/kin_mind/state.py'], cwd=Path(__file__).resolve().parents[2], text=True, env={'PATH': '/usr/bin:/bin'})
+    # The exact pre-fix method is checked in so shallow/public clones reproduce it.
+    original = (Path(__file__).with_name('fixtures') / 'pre_rebase_manage_desire.py').read_text()
     tree = ast.parse(original)
     method = next(n for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'Mind' for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'manage_desire')
     namespace = {'DesireChange': DesireChange}
