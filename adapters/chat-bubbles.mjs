@@ -100,8 +100,8 @@ export function chatEnvelope(text) {
   const keys=Object.keys(value);
   const referenced=bubble=>bubble&&typeof bubble==='object'&&!Array.isArray(bubble)&&
     Object.keys(bubble).every(key=>['text','references','bubble_id','presentation'].includes(key))&&
-    typeof bubble.text==='string'&&bubble.text.trim()&&Array.isArray(bubble.references)&&
-    (!Object.hasOwn(bubble,'bubble_id')||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
+    typeof bubble.text==='string'&&bubble.text.trim()&&(bubble.references==null||Array.isArray(bubble.references))&&
+    (bubble.bubble_id==null||typeof bubble.bubble_id==='string'&&bubble.bubble_id);
   // Some native replies put a viewed MEME beside a referenced text bubble.
   // Expand only this unambiguous shape; the normal image validator and the
   // current-turn inspection receipt still decide whether the image can leave.
@@ -119,7 +119,7 @@ export function chatEnvelope(text) {
       ...(value.bubbles.some(memeBubble)?{meme_refs:value.bubbles.map(b=>memeBubble(b)?b:null)}:{}),
       ...(value.bubbles.some(bubble=>typeof bubble==='object')?{
         ...(value.bubbles.some(bubble=>bubble?.presentation)?{presentations:value.bubbles.map(bubble=>bubble?.presentation?replyPresentation(bubble.presentation):null)}:{}),
-        references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references:undefined),
+        references:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.references??[]:undefined),
         reference_bubble_ids:value.bubbles.map(bubble=>typeof bubble==='object'?bubble.bubble_id??null:null)}:{})};
   return {state:'invalid',reason:'chat-envelope-incomplete'};
 }

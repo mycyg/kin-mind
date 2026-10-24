@@ -16,9 +16,11 @@ def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown
     from .exploration import Explorations
     from .memory import MemoryContinuity
     from .procedures import Procedures
+    from .energy import view as energy_view
     memory = MemoryContinuity(mind)
     evidence, gaps, read = [], [], []
     with mind.engine.db.connect() as conn:
+        current_energy = energy_view(conn, mind.scope.key(), mind.clock())
         for identifier in list(dict.fromkeys(evidence_ids))[:24]:
             try:
                 refs = mind._evidence(conn, [identifier])
@@ -34,6 +36,7 @@ def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown
                 gaps.append({"id": identifier, "reason": "source-needs-review"})
     previous = Explorations(mind).recent(4)
     brief = {"question": question, "goal": plan.get("goal") if plan else question,
+            "energy_context": current_energy,
             "motivation": plan.get("motivation") if plan else None,
             "completion": step.get("completion") if step else None,
             "known_evidence": evidence, "missing_or_uncertain": gaps,

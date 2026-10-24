@@ -16,3 +16,28 @@ test('MCP cached instructions use the named current fragment without changing us
  assert.ok(refreshMcpInstructions('旧会话\n'+old,{root}).includes(fresh));
  assert.equal(refreshMcpInstructions('没有这个片段的用户原话。',{root}),'没有这个片段的用户原话。');
 });
+
+test('native compaction reads the edited prompt after cache reuse and restart without rewriting ordinary messages',async t=>{
+ const {refreshSessionSummaryPrompt}=await import('../../adapters/project-prompts.mjs');
+ const root=fixture(t),old='合成摘要：保留当前话题。',fresh='合成摘要：保留偏好的条件与原话。';
+ projectPrompt('summary/session',old,{root});fs.mkdirSync(path.join(root,'summary'),{recursive:true});
+ fs.writeFileSync(path.join(root,'summary/session.json'),JSON.stringify({name:'summary/session',version:2,edited:true,text:fresh}));
+ assert.equal(refreshSessionSummaryPrompt(old,{root}),fresh);
+ assert.equal(refreshSessionSummaryPrompt('她引用过：'+old,{root}),'她引用过：'+old);
+ projectPrompt('summary/session','更新后的代码默认摘要。',{root});
+ assert.equal(refreshSessionSummaryPrompt(old,{root}),fresh,'an old native session still gets the KIN edit after a default refresh');
+ assert.equal(currentProjectPrompt('summary/session','cached old launch',{root}),fresh);
+});
+
+
+test('persona refresh recognizes current, historical and collaboration-wrapped text without rewriting neighbors',async t=>{
+ const {refreshPersonaPrompt}=await import('../../adapters/project-prompts.mjs');
+ const root=fixture(t),old='Synthetic old persona.',fresh='Synthetic new persona.';
+ projectPrompt('persona',old,{root});projectPrompt('persona','Synthetic new code default.',{root});
+ fs.mkdirSync(path.join(root,'.history/persona'),{recursive:true});
+ fs.writeFileSync(path.join(root,'.history/persona/2.json'),JSON.stringify({text:'Synthetic prior edit.'}));
+ fs.writeFileSync(path.join(root,'persona.json'),JSON.stringify({version:3,edited:true,text:fresh}));
+ for(const cached of [old,'Synthetic prior edit.',fresh])assert.equal(refreshPersonaPrompt(cached,{root}),fresh);
+ assert.equal(refreshPersonaPrompt('<collaboration_mode>'+old+'</collaboration_mode>',{root}),'<collaboration_mode>'+fresh+'</collaboration_mode>');
+ for(const text of ['Synthetic base.', 'Quoted '+old,old+'\nSynthetic permissions.'])assert.equal(refreshPersonaPrompt(text,{root}),text);
+});

@@ -8,6 +8,19 @@ import sys
 import time
 
 
+def generation_options(request, reference_mode):
+    # Preserve the current sound when no host override is configured. Explicit
+    # defaults also make the recorded settings match what enters the model.
+    options = dict(temperature=0.3 if reference_mode else 0.9,
+                   top_p=0.9 if reference_mode else 1.0,
+                   top_k=50, repetition_penalty=1.05, max_tokens=4096)
+    options.update(request.get("generation", {}))
+    if reference_mode:
+        # The installed MLX Base ICL path applies this floor internally too.
+        options["repetition_penalty"] = max(options["repetition_penalty"], 1.5)
+    return options
+
+
 def main():
     model_path, ffmpeg = sys.argv[1:3]
     model = None
@@ -32,7 +45,9 @@ def main():
                 load_ms = round((time.monotonic() - load_started) * 1000)
                 stage = "synthesis"
                 generation_started = time.monotonic()
-                if request.get("referenceAudio") and request.get("referenceText"):
+                reference_mode = bool(request.get("referenceAudio") and request.get("referenceText"))
+                generation = generation_options(request, reference_mode)
+                if reference_mode:
                     # The selected synthetic recording anchors identity. Base ICL
                     # has no instruct control: expression follows text/punctuation.
                     if reference is None:
@@ -43,13 +58,13 @@ def main():
                         reference = mx.array(np.frombuffer(data, dtype=np.float32).copy())
                     results = list(model.generate(
                         text=request["text"], ref_audio=reference, ref_text=request["referenceText"],
-                        lang_code="Chinese", temperature=0.3, top_p=0.9, verbose=False,
+                        lang_code="Chinese", **generation, verbose=False,
                     ))
                 else:
                     results = list(model.generate_custom_voice(
                         text=request["text"], speaker=request["voice"], language="Chinese",
                         instruct=request.get("style") or "自然口语，像和熟悉的人聊天。",
-                        verbose=False,
+                        **generation, verbose=False,
                     ))
                 audio = np.concatenate([np.asarray(result.audio).reshape(-1) for result in results])
                 rate = results[0].sample_rate
@@ -67,6 +82,8 @@ def main():
                 os.replace(encoded, file)
             response = {"ok": True, "cold": cold, "loadMs": load_ms, "generationMs": generation_ms,
                         "durationMs": round(audio.size / rate * 1000),
+                        "synthesis": {"mode": "reference" if reference_mode else "custom_voice",
+                                      "generation": generation, "styleApplied": not reference_mode},
                         "elapsedMs": round((time.monotonic() - started) * 1000)}
         except Exception:
             response = {"ok": False, "stage": stage}

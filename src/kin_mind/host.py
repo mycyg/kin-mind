@@ -107,6 +107,9 @@ def _dispatch(config, action, request):
         if request.pop("recent", False):
             return notes.recent()
         return notes.read(**request)
+    if action in {"energy-configure", "energy-activity"}:
+        from .energy import configure, activity
+        return (configure if action == "energy-configure" else activity)(mind, request)
     if action == "liveness-facts":
         # The host's contact pause and fault watch: the store's liveness facts, read-only, with no
         # model, executor or embedding service asked (operational_status.liveness_read).
@@ -125,6 +128,8 @@ def _dispatch(config, action, request):
         if action == "plan-deferral":
             # The router's deferral pass (WS3) hands over a task Kin chose to do later (N10).
             return plans.defer_owner_task(request)
+        if action == "plan-started":
+            return plans.started(**request)
         if action == "plan-renew":
             return plans.renew(**request)
         if action == "plan-recover":
@@ -684,6 +689,7 @@ def _dispatch(config, action, request):
                 "runner":lambda executable,topic,directory,**kwargs:run_codex(executable,topic,directory,
                     reasoning=profile["reasoningEffort"],provider={"id":"native-main","base_url":"http://127.0.0.1","wire_api":"responses"},
                     cli_version="native-main",native_exchange=lambda request,servers:native_exploration_exchange({**request,"profile":profile},servers),**kwargs)}
+            prepared["runner"].reports_start = True
         if prepared is None:
             prepared = prepare_codex_exploration(config, repair=repair_final)
         if prepared["state"] != "ready":
@@ -814,7 +820,7 @@ UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 RESIDENT_ACTIONS = frozenset({
     "private-note-save", "private-notes",
     "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
-    "check", "settle", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
+    "check", "settle", "energy-configure", "energy-activity", "plan-started", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
     "context-delivery-metrics", "configure-habits", "reply-choice", "review-due", "liveness-facts",

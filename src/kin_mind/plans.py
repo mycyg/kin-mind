@@ -775,6 +775,7 @@ class AutonomousPlans:
                     run_id = "plan_run_" + digest([self.scope, plan["id"], step["id"], step["revision"]])[:32]
                     attempt = {"recipient_person_id": recipient.current(), "id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
                                "step_revision": step["revision"], "actor": actor, "decision": step["decision"], "state": "running",
+                               "energy_activity_id": "plan:" + digest([plan["id"], step["id"], step["goal"], step["completion"]])[:40],
                                "started_at": self.mind.clock(), "owner": owner, "fence": 1}
                     conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, self.scope, plan["id"], step["id"], actor, "running", time.time() + 90, owner, 1, self._row(conn, "mind_plan_runs", attempt)))
                     step.update(state="running", run_id=run_id)
@@ -794,6 +795,29 @@ class AutonomousPlans:
             if row:
                 noted = {"shown": shown, **({"tombstone_mark": mark} if mark is not None else {})}
                 conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (self._row(conn, "mind_plan_runs", {**json.loads(row[0]), **noted}), run_id))
+
+    def started(self, run_id, owner, fence):
+        """Executor acknowledgement, not claim/queue admission; no task-state change.
+
+        A step's unchanged goal is one logical effort across retries and leases.
+        An intentionally changed goal/completion is a new effort, not a transport retry.
+        """
+        from .energy import execution
+        with self.engine.db.connect(write=True) as conn:
+            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND " + recipient.predicate() + " AND id=?", (self.scope, run_id)).fetchone()
+            if not row or row["owner"] != owner or row["fence"] != fence:
+                raise Conflict("Execution fence mismatch", target=run_id)
+            run = json.loads(row["data"])
+            if row["state"] != "running" and not run.get("execution_started_at"):
+                raise Conflict("Execution is no longer running", target=run_id)
+            plan = self.get(conn, row["plan_id"])
+            step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
+            key = run.get("energy_activity_id") or "plan:" + digest([plan["id"], step["id"], step["goal"], step["completion"]])[:40]
+            result = execution(conn, self.mind, "work", key, run_id, "started")
+            run.setdefault("execution_started_at", self.mind.clock())
+            run["energy_activity_id"] = key
+            conn.execute("UPDATE mind_plan_runs SET data=? WHERE id=?", (self._row(conn, "mind_plan_runs", run), run_id))
+            return {"state": "started", "energy_context": result["energy_context"]}
 
     def renew(self, run_id, owner, fence):
         with self.engine.db.connect(write=True) as conn:
@@ -845,6 +869,8 @@ class AutonomousPlans:
             if state == "completed" and (plan["status"] != "active" or step.get("decision", {}).get("id") != run["decision"]["id"]
                     or not self.mind._fresh(conn, run["decision"]["evidence"])):
                 raise Conflict("Completion lost its current decision or evidence")
+            from .energy import finish_recorded_execution
+            finish_recorded_execution(conn, self.mind, "work", run.get("energy_activity_id"), run_id)
             run.update(state=state, result=result, finished_at=self.mind.clock())
             conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,data=? WHERE id=?", (state, self._row(conn, "mind_plan_runs", run), run_id))
             step.update(state="completed" if state == "completed" else "unconfirmed" if state == "unconfirmed" else "waiting",
@@ -886,6 +912,8 @@ class AutonomousPlans:
         # Contact delivery may have happened before the crash. Preserve
         # uncertainty until the existing transport reconciles receipts.
         state = "unconfirmed" if row["actor"] == "contact" else "interrupted"
+        from .energy import finish_recorded_execution
+        finish_recorded_execution(conn, self.mind, "work", run.get("energy_activity_id"), row["id"])
         run.update(state=state, reason=reason, checkpoint_retained=True, fence=row["fence"] + 1)
         conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,fence=fence+1,data=? WHERE id=?", (state, self._row(conn, "mind_plan_runs", run), row["id"]))
         plan = self.get(conn, row["plan_id"])

@@ -2028,6 +2028,36 @@ export class MobileRouter {
     if(['rejected','undeliverable'].includes(data.state)){record.undelivered=(record.undelivered??0)+1;return true;}
     return uncertaintyChanged;
   }
+  /** A handed reply remains owed until its successor reaches an actual outcome.
+   * This relation is delivery history, not a claim that the old words were sent. */
+  replyHandoffEvidence(record) {
+    const ids=new Set([record.id]),records=[record];
+    for(let i=0;i<records.length;i++)for(const old of Object.values(this.state.inputs))
+      if(!ids.has(old.id)&&old.replyHandoff?.inputId===records[i].id&&!answered(old)&&!old.canceledBy) {
+        ids.add(old.id);records.push(old);
+      }
+    return {delivered:records.some(r=>(r.delivered??0)>0),unknown:records.some(r=>r.uncertainDeliveries?.length)};
+  }
+  settleReplyHandoffs() {
+    const changed=[];let moved=true;
+    while(moved) {
+      moved=false;
+      for(const record of Object.values(this.state.inputs)) {
+        if(!record.replyHandoff||answered(record)||record.canceledBy)continue;
+        const next=this.state.inputs[record.replyHandoff.inputId];
+        if(!next||next.canceledBy||next.state==='superseded')continue;
+        if(answered(next)&&!record.uncertainDeliveries?.length&&!next.uncertainDeliveries?.length) {
+          record.answer={state:'merged',mergedInto:next.id,basis:'answered-handoff',at:this.now()};
+          record.settledAt??=record.answer.at;changed.push(record.id);moved=true;
+        } else if(next.ownerNotice?.state==='accepted'&&record.ownerNotice?.state!=='accepted') {
+          if(record.ownerNotice)record.replyHandoff.previousNotice={...record.ownerNotice};
+          record.ownerNotice={...next.ownerNotice};record.settledAt??=next.settledAt??this.now();
+          changed.push(record.id);moved=true;
+        }
+      }
+    }
+    return changed;
+  }
   /** The whole reply to an owner input reached the platform, or Kin chose not to
    * reply. It settles the input its reply group belongs to and the inputs the group
    * says it answered when the reply was formed (`answeredInputIds`: those merged into its
@@ -2039,6 +2069,20 @@ export class MobileRouter {
     const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
     if(!record)return null;
     const state=kind==='reply-complete'?'accepted':['silent','merged','defer','processed'].includes(data.state)?data.state:null;if(!state)return null;
+    if(data.handoff&&state==='merged') {
+      const next=this.state.inputs[data.mergedInto];
+      const ids=[...new Set([record.id,...(data.answeredInputIds??[])])],linked=[];
+      for(const id of ids) {
+        const old=this.state.inputs[id];
+        if(!old||!next||old===next||!ownerInput(old)||!ownerInput(next)||old.intent==='work'||old.canceledBy||answered(old)||old.uncertainDeliveries?.length)continue;
+        if(old.conversation_key&&next.conversation_key&&old.conversation_key!==next.conversation_key)continue;
+        const seen=new Set([old.id]);let cursor=next;
+        while(cursor&&!seen.has(cursor.id)){seen.add(cursor.id);cursor=this.state.inputs[cursor.replyHandoff?.inputId];}
+        if(cursor)continue;
+        old.replyHandoff={inputId:next.id,groupId:data.groupId,at:this.now()};linked.push(old.id);
+      }
+      return [...linked,...this.settleReplyHandoffs()];
+    }
     const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
     const settled=[record.id];
     if(ownerInput(record))for(const id of new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'))) {
@@ -2046,7 +2090,7 @@ export class MobileRouter {
       if(!other||!ownerInput(other)||other.state!=='accepted'||answered(other))continue;
       other.answer={state:state==='accepted'?'covered':state,by:record.id,basis:'answered-input-ids',at};other.settledAt??=at;settled.push(id);
     }
-    return settled;
+    return [...settled,...this.settleReplyHandoffs()];
   }
   observe(kind,data={}) {
     return this.locked(async()=>{
@@ -2461,7 +2505,7 @@ export class MobileRouter {
     const now=this.now(),stuckMs=(this.state.config.inputStuckMinutes??10)*60000,gapMs=(this.state.config.noticeGapMinutes??10)*60000;
     const actions=await this.locked(async()=>{
       this.expireUnsubmittedInputs();
-      const list=[],due=[];let changed=false;
+      const list=[],due=[];let changed=this.settleReplyHandoffs().length>0;
       // At most one notice starts a send in a pass, and only past the gap since the last one that did.
       let starting=this.frozen()||now-(this.state.lastOwnerNoticeAt??-Infinity)<gapMs;
       // Counted when it is handed out, so a quick retake cannot lose the count (CR2-LIFE-05).
@@ -2488,6 +2532,11 @@ export class MobileRouter {
         }
         const summary=inputSummary(record),notice=record.ownerNotice;
         if(['answered','superseded','canceled-by-owner','failed-notified'].includes(summary))continue;
+        // The successor owns the same unfinished chat obligation. Its own failure
+        // is reported once, with that receipt traced back through replyHandoff.
+        // A canceled successor did not take responsibility: keep the original due.
+        const successor=this.state.inputs[record.replyHandoff?.inputId];
+        if(successor&&!successor.canceledBy&&successor.state!=='superseded'&&!successor.historical&&!answered(successor))continue;
         // A failed owner control is reported by its own mode notice.
         if(record.failureStage==='model-control'&&Object.values(this.state.notices).some(n=>n.sourceInputId===record.id&&!['failed','rejected','unresolved','superseded'].includes(n.state)))continue;
         // A notice already owed is sent or looked up; the input's own evidence still counts.
@@ -2523,16 +2572,16 @@ export class MobileRouter {
           if(!inflight&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
           if(reconciliation)verdict='unknown';
         } else if(record.state==='accepted') {
-          if(record.operationFailed)verdict='stopped';
-          else if(record.nativeFailure)verdict=record.uncertainDeliveries?.length?'unknown':(record.delivered??0)>0?'partial':'stopped';
-          else if(idle&&replyOutcomes.some(f=>f.inputIds.includes(record.id)&&['format-failed','send-failed'].includes(f.state)))verdict=(record.delivered??0)>0?'partial':'stopped';
+          const evidence=this.replyHandoffEvidence(record);
+          if(record.operationFailed||record.nativeFailure)verdict=evidence.unknown?'unknown':evidence.delivered?'partial':'stopped';
+          else if(idle&&replyOutcomes.some(f=>f.inputIds.includes(record.id)&&['format-failed','send-failed'].includes(f.state)))verdict=evidence.unknown?'unknown':evidence.delivered?'partial':'stopped';
           else if(record.route==='control') {
             // A control is answered by its own reply; while that reply is still being made or
             // sent nothing is owed, and once it failed or went unconfirmed the owner is told.
             const replies=Object.values(this.state.notices).filter(n=>n.sourceInputId===record.id||n.subscriberIds?.includes(record.id));
             if(idle&&!replies.some(n=>['pending','preparing','sending','retry'].includes(n.state)))verdict=replies.some(n=>n.state==='unconfirmed')||!replies.length?'unknown':'stopped';
           }
-          else if(idle)verdict=(record.delivered??0)>0?'partial':'unknown';
+          else if(idle)verdict=evidence.delivered&&!evidence.unknown?'partial':'unknown';
         }
         if(verdict&&!notice)due.push({record,verdict});
       }
@@ -2585,6 +2634,14 @@ export class MobileRouter {
       }
       // A notice that may start a send passes the gate when it starts; a lookup needs no gate.
       const record=this.state.inputs[action.id];
+      const successor=this.state.inputs[record?.replyHandoff?.inputId];
+      const handed=successor&&!successor.canceledBy&&successor.state!=='superseded'&&!successor.historical;
+      if(action.mayStart&&(answered(record)||record?.canceledBy||handed)) {
+        await this.locked(async()=>{const notice=record?.ownerNotice;if(notice?.state==='sending') {
+          notice.state=action.previous??'not-submitted';this.save('input-notice-superseded',{id:action.id});
+        }});
+        results.push({...action,result:'input-settled'});continue;
+      }
       let gate=null;
       if(action.mayStart) {
         gate=this.beginActivity({kind:'notice',id:record?.ownerNotice?.id??action.id,channel:record?.channel??null});
@@ -2607,6 +2664,7 @@ export class MobileRouter {
           const group=replyOutcomes.find(f=>f.groupId&&f.inputIds.includes(record.id));
           for(const id of group?.inputIds??[]) {const other=this.state.inputs[id];
             if(other&&other!==record&&!other.answer&&!other.ownerNotice){other.ownerNotice={...notice};other.settledAt=this.now();}}
+          this.settleReplyHandoffs();
         }
         else if(kind==='rejected'&&action.mayStart) {
           // Refused outright, so nothing reached her: the same notice goes again after a

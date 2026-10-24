@@ -87,9 +87,9 @@ export class AutonomousCreator {
     current.interrupt();
     return within(current.done,capMs);
   }
-  async run({plan,step,run,brief}, {signal,timeoutMs=1200000,onHeartbeat=async()=>({state:'renewed'})}={}){
+  async run({plan,step,run,brief}, {signal,timeoutMs=1200000,onHeartbeat=async()=>({state:'renewed'}),onStarted=async()=>{}}={}){
     if(this.current)throw Error('Creation executor is already running');
-    if(this.nativeRun)return this.runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat});
+    if(this.nativeRun)return this.runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat,onStarted});
     if(typeof this.executions?.open!=='function')throw Error('Creation needs the host\'s execution records');
     const directory=creationWorkspace(this.root,plan,step);
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
@@ -112,9 +112,10 @@ export class AutonomousCreator {
     // An interruption ends every process of the step, TERM and then KILL, until none is left.
     const terminate=()=>{interrupted=true;void execution.end();};
     this.current={interrupt:terminate,done};
-    let child=null,timer=null,heartbeat=null;
+    let child=null,timer=null,heartbeat=null,startRecorded=Promise.resolve();
     try{
       child=this.spawnImpl(this.command,args,{cwd:directory,env,stdio:['pipe','pipe','pipe'],detached:true});this.child=child;
+      child.once('spawn',()=>{startRecorded=Promise.resolve().then(onStarted).catch(()=>{});});
       // The CLI leads a group of its own, as a mind worker does: what it starts there without a
       // session of its own is the step's, and what is left there once the CLI has exited is ended
       // with the step -- found or not before the CLI went (CL6-MM-09).
@@ -149,12 +150,13 @@ export class AutonomousCreator {
     }finally{
       clearTimeout(timer);clearInterval(heartbeat);signal?.removeEventListener('abort',terminate);
       // The step is over, and its record goes, only once nothing of it is left.
+      await startRecorded;
       await execution.settle();
       if(this.child===child)this.child=null;
       this.current=null;finished();
     }
   }
-  async runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat}){
+  async runNative({plan,step,run,brief},{signal,timeoutMs,onHeartbeat,onStarted}){
     const directory=creationWorkspace(this.root,plan,step),started=Date.now();
     fs.mkdirSync(directory,{recursive:true,mode:0o700});
     const lastFile=path.join(directory,'.result-'+run.id+'.json'),controller=new AbortController();
@@ -171,6 +173,9 @@ export class AutonomousCreator {
         context:{actor:'agent:kin',workspace:directory,plan:{id:plan.id,goal:plan.goal,motivation:plan.motivation},step,brief,
           host_verification_capabilities:this.verifier?.capabilities()??{static_html_render:false}}},{signal:controller.signal});
       const native=answer.receipt??{};
+      // This interface returns its native start receipt only when the turn ends.
+      // Charge that proven work even after failure, never a queued/unknown turn.
+      if(answer.model_invoked!==false&&(native.native_turn_id||answer.started===true))await onStarted();
       const receipt={executor:native.channel==='fork'?'native-isolated-session':'native-main-session',native_receipt:native,model:native.model,reasoning:native.reasoning,
         thread_id:native.fork_thread_id??native.native_session_id,native_turn_id:native.native_turn_id,run_id:run.id,workspace:directory,
         elapsed_ms:Date.now()-started,usage:native.usage??null,usage_status:native.usage?'reported':'unknown'};
@@ -205,7 +210,7 @@ const halted=code=>Object.assign(Error(code),{code});
  * The completion review (`plan-result`) runs a model in a worker process of its own; when `call`
  * answers with the host's mind worker promise, its `exited` settles once that process has ended. */
 export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS,
-  beginActivity=()=>({ok:true,release(){}})}){
+  beginActivity=()=>({ok:true,release(){}}),recordStarted=null,recordFinished=null}){
   let running=false,closed=false,controller=null,current=null,stops=0;
   const owner='creator-'+process.pid;
   // Nothing of this host runs yet: the final answers the last one left keep no words (CL6-MM-07).
@@ -234,10 +239,22 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       activity=beginActivity({kind:'creation',id:run.id});
       if(!activity?.ok)throw halted('dispatch-frozen');
       current={plan_id:claimed.plan.id,goal:claimed.plan.goal,step:claimed.step?.goal,run_id:run.id};
-      const result=await creator.run(claimed,{signal:controller.signal,onHeartbeat:async()=>{
+      let executionStarted=false;
+      const result=await creator.run(claimed,{signal:controller.signal,onStarted:async()=>{
+        executionStarted=true;
+        try {
+          if(recordStarted)await recordStarted(claimed,{owner});
+          else await call('plan-started',{run_id:run.id,owner,fence:run.fence});
+        } catch {recordStatus({creation:{state:'energy-receipt-pending',run_id:run.id}});}
+      },onHeartbeat:async()=>{
         if(closed)return {state:'interrupt'};
         return call('plan-renew',{run_id:run.id,owner,fence:run.fence});
-      }});
+      }}).finally(async()=>{
+        // The executor has already settled its processes here. Energy release
+        // must not depend on a later plan-result review accepting this lease.
+        if(executionStarted&&recordFinished)try{await recordFinished(claimed,{owner});}
+        catch{recordStatus({creation:{state:'energy-receipt-pending',run_id:run.id}});}
+      });
       let settled=await review({run_id:run.id,owner,fence:run.fence,result});
       // The completion review found no free model slot: the same verified result is offered
       // again while the lease is kept, instead of the whole creation running again (K2-02).

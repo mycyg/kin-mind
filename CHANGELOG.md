@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.100
+
+- Accept omitted optional reply metadata and settle handed-off inputs against actual delivery receipts, with accurate partial and delayed-failure notices.
+- Refresh registered persona and native compaction prompts without replacing base instructions or ordinary conversation history; preserve fuller conversational meaning and avoid repeated source context.
+- Pass supported local speech sampling settings through the real worker and report their effective values.
+- Include companion conversations in activity windows and use one authoritative rhythm phase.
+- Project shared energy from activity receipts, elapsed wake/rest time and local night-time tiredness; retain logical activity deduplication and execution recovery.
+
 ## 0.1.61
 
 - Keep the main conversation responsive while one owned task worker continues, with event-backed progress, revision/cancellation fences, and separately acknowledged public items and final results.

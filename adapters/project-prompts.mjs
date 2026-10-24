@@ -62,3 +62,34 @@ export function refreshMcpInstructions(text,{root}={}) {
   }
   return text;
 }
+
+/** Match complete registered revisions, never a position or a prose substring.
+ * Native can put the persona beside permission text in one developer message. */
+function refreshRegisteredPrompt(name,text,{root}={}) {
+  if(!root||typeof text!=='string')return text;
+  const file=path.join(root,'.defaults',name+'.json');
+  let registered;
+  try{registered=JSON.parse(fs.readFileSync(file,'utf8'));}catch(error){if(error.code==='ENOENT')return text;throw error;}
+  const current=currentProjectPrompt(name,registered.text,{root});
+  const known=[registered.text,current,...(registered.previous_texts??[])];
+  const history=path.join(root,'.history',name);
+  if(fs.existsSync(history))for(const file of fs.readdirSync(history))if(file.endsWith('.json'))
+    known.push(JSON.parse(fs.readFileSync(path.join(history,file),'utf8')).text);
+  return known.some(old=>typeof old==='string'&&text.trim()===old.trim())?current:text;
+}
+
+export function refreshPersonaPrompt(text,options={}) {
+  if(typeof text!=='string')return text;
+  const begin='<collaboration_mode>',end='</collaboration_mode>';
+  if(text.startsWith(begin)&&text.endsWith(end)) {
+    const body=text.slice(begin.length,-end.length),current=refreshRegisteredPrompt('persona',body,options);
+    return current===body?text:begin+current+end;
+  }
+  return refreshRegisteredPrompt('persona',text,options);
+}
+
+/** Native compaction caches its launch-time prompt. Refresh only the exact
+ * registered instruction part; quoted text and historical summaries remain data. */
+export function refreshSessionSummaryPrompt(text,options={}) {
+  return refreshRegisteredPrompt('summary/session',text,options);
+}

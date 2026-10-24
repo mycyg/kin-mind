@@ -447,3 +447,38 @@ test('format failure uses a stopped notice and one receipt covers the same faile
   f.clock.now+=700000;await f.router.watch({notifyOwner,replyOutcomes});assert.equal(notices.length,1);
   assert.equal(f.router.state.inputs.owner.answer,undefined,'notice is not a delivered Kin reply');
 });
+
+
+test('operation failures retain partial delivery and unknown send distinctions',async t=>{
+ for(const [delivered,uncertain,expected] of [[1,[], 'partial'],[0,['send-id'],'unknown'],[0,[],'stopped']]) {
+  const f=fixture(t);f.router.state.inputs.owner={id:'owner',kind:'owner',state:'accepted',at:1,operationFailed:{at:2},delivered,uncertainDeliveries:uncertain};
+  const notices=[];await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'notice'};}});
+  assert.deepEqual(notices,[[expected,'owner']]);
+ }
+});
+
+
+test('a reply settled while another lookup was pending does not start its queued failure notice',async t=>{
+ const f=fixture(t);f.clock.now=700000;
+ f.router.state.inputs.lookup={id:'lookup',kind:'assessment',state:'unconfirmed',at:1,submit:{sessionId:'synthetic'}};
+ f.router.state.inputs.owner={id:'owner',kind:'owner',state:'accepted',at:1,nativeFailure:{at:2}};
+ let lookups=0,notices=0;
+ await f.router.watch({reconcileInput:async()=>{lookups++;await f.router.observe('reply-complete',{inputId:'owner'});return {state:'unknown'};},notifyOwner:async()=>{notices++;return {state:'accepted',messageId:'unwanted'};}});
+ assert.equal(lookups,1);assert.equal(notices,0);assert.equal(f.router.state.inputs.owner.answer.state,'accepted');
+ assert.notEqual(f.router.state.inputs.owner.ownerNotice?.state,'sending');
+});
+
+
+test('a handoff established while another lookup was pending suppresses the queued old notice until its successor outcome',async t=>{
+ const f=fixture(t);f.clock.now=700000;
+ f.router.state.inputs.lookup={id:'lookup',kind:'assessment',state:'unconfirmed',at:1,submit:{sessionId:'synthetic'}};
+ f.router.state.inputs.owner={id:'owner',kind:'owner',state:'accepted',at:1,nativeFailure:{at:2}};
+ f.router.state.inputs.next={id:'next',kind:'owner',state:'accepted',at:f.clock.now};
+ let notices=0;
+ await f.router.watch({reconcileInput:async()=>{await f.router.observe('reply-choice',{inputId:'owner',state:'merged',mergedInto:'next',handoff:true});return {state:'unknown'};},notifyOwner:async()=>{notices++;return {state:'accepted',messageId:'unwanted'};}});
+ assert.equal(notices,0);assert.equal(f.router.state.inputs.owner.answer,undefined);
+ assert.notEqual(f.router.state.inputs.owner.ownerNotice?.state,'sending');
+ await f.router.observe('reply-complete',{inputId:'next'});
+ f.clock.now+=700000;await f.router.watch({notifyOwner:async()=>{notices++;return {state:'accepted'};}});
+ assert.equal(notices,0);assert.equal(f.router.state.inputs.owner.answer.state,'merged');
+});

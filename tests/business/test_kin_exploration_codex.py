@@ -839,3 +839,22 @@ def test_main_session_execution_reuses_source_validation_and_checkpoint(tmp_path
     assert report['state']=={'complete':'complete','unbacked':'failed','preempted':'preempted','wrong-model':'failed'}[case]
     if case=='complete':assert report['result']['sources'][0]['receipt']['locator']=='memory://s1'
     elif case in {'unbacked','preempted'}:assert (tmp_path/'run'/'checkpoint.json').exists()
+
+
+def test_start_receipt_only_follows_actual_cli_spawn_or_native_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIN_TEST_DS_KEY", "synthetic")
+    started=[]
+    fake=fake_codex(tmp_path/"fake-energy",COMPLETE)
+    report=run_codex(fake,TOPIC,tmp_path/"cli-energy",on_started=lambda:started.append("cli"),**codex_kwargs())
+    assert report["state"]=="complete" and started==["cli"]
+    with pytest.raises(CodexUnavailable):
+        run_codex(tmp_path/"missing",TOPIC,tmp_path/"not-started",on_started=lambda:started.append("missing"),**codex_kwargs())
+    assert started==["cli"]
+    def exchange(request,servers):
+        return {"state":"complete","result":FINDINGS,"receipt":{"native_session_id":"same-main","native_turn_id":"turn-energy","model":"deepseek-flash"}}
+    report=run_codex(None,TOPIC,tmp_path/"native-energy",native_exchange=exchange,cli_version="native-main",
+        on_started=lambda:started.append("native"),**codex_kwargs())
+    assert report["state"]=="complete" and started==["cli","native"]
+    report=run_codex(None,TOPIC,tmp_path/"native-no-turn",native_exchange=lambda *args:{"state":"waiting","receipt":{}},
+        cli_version="native-main",on_started=lambda:started.append("missing-turn"),**codex_kwargs())
+    assert report["state"]=="failed" and started==["cli","native"]

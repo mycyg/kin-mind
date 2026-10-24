@@ -16,6 +16,11 @@ CREATE INDEX IF NOT EXISTS mind_owner_interactions ON sources(scope,occurred_at,
  AND json_extract(data,'$.authority')='explicit'
  AND json_extract(data,'$.metadata.role')='user'
  AND json_extract(data,'$.metadata.host_event')='message';
+CREATE INDEX IF NOT EXISTS mind_human_interactions ON sources(scope,occurred_at,id)
+ WHERE deleted=0 AND (namespace IN ('kin-owner-input','kin-companion-input') OR substr(namespace,1,5)='host:')
+ AND json_extract(data,'$.authority')='explicit'
+ AND json_extract(data,'$.metadata.role')='user'
+ AND json_extract(data,'$.metadata.host_event')='message';
 """
 
 
@@ -39,23 +44,31 @@ def quiet_hours(contact, at):
 def at_rest(view, at):
     """Rest/contact timing, independent of temporary attention to an input."""
     rhythm = view.get("rhythm") or {}
-    return ((rhythm.get("base_phase") or rhythm.get("phase")) == REST_PHASE
+    return ((rhythm.get("phase") or rhythm.get("base_phase")) == REST_PHASE
             or quiet_hours(view.get("contact") or {}, at))
 
 
-def interaction_windows(conn, scope, at, timezone="Asia/Singapore"):
+def interaction_windows(conn, scope, at, timezone="Asia/Singapore", *, recipient_person_id="person:xiaoguang", conversation_key=None):
+    """Activity in the selected conversation, never another person's private messages.
+
+    Legacy unannotated owner messages belong to Xiaoguang. A group is its own
+    recipient; its human speakers count in that group, not in either private chat.
+    """
     cutoff = (stamp(at) - timedelta(days=14)).isoformat()
     rows = conn.execute(
         "SELECT s.id,s.occurred_at FROM sources s WHERE s.scope=? AND s.deleted=0 "
         "AND s.occurred_at>=? AND s.occurred_at<=? "
-        "AND (s.namespace='kin-owner-input' OR substr(s.namespace,1,5)='host:') "
+        "AND (s.namespace IN ('kin-owner-input','kin-companion-input') OR substr(s.namespace,1,5)='host:') "
         "AND json_extract(s.data,'$.authority')='explicit' "
         "AND json_extract(s.data,'$.metadata.role')='user' "
         "AND json_extract(s.data,'$.metadata.host_event')='message' "
+        "AND COALESCE(json_extract(s.data,'$.metadata.recipient_person_id'),json_extract(s.data,'$.metadata.speaker_person_id'),'person:xiaoguang')=? "
+        "AND (? IS NULL OR json_extract(s.data,'$.metadata.conversation_key')=? "
+        "OR (s.namespace!='kin-companion-input' AND json_extract(s.data,'$.metadata.conversation_key') IS NULL AND ?='person:xiaoguang')) "
         "AND NOT EXISTS(SELECT 1 FROM sources newer WHERE newer.namespace=s.namespace "
         "AND newer.source_key=s.source_key AND newer.scope=s.scope AND newer.deleted=0 "
         "AND newer.received_at>s.received_at) ORDER BY s.occurred_at,s.id",
-        (scope, cutoff, at),
+        (scope, cutoff, at, recipient_person_id, conversation_key, conversation_key, recipient_person_id),
     ).fetchall()
     windows, seen = [], set()
     for row in rows:
@@ -86,6 +99,8 @@ def interaction_windows(conn, scope, at, timezone="Asia/Singapore"):
         "window_days": 14,
         "join_minutes": 30,
         "timezone": timezone,
+        "recipient_person_id": recipient_person_id,
+        "conversation_key": conversation_key,
         "window_count": len(windows),
         "active_days": len(days),
         "hourly_window_starts": hours,
@@ -114,7 +129,10 @@ def rhythm_view(entry, at, interactions, *, fresh=True):
     value = entry["target"] + (entry["alertness"] - entry["target"]) * 0.5 ** (
         elapsed / (60 * entry["half_life_minutes"])
     )
-    phase = entry.get("base_phase") or entry["phase"]
+    # phase is the single chosen phase; base_phase remains a compatibility alias.
+    # Attention already has its own independent field, so a second phase could
+    # otherwise silently override "resting" with a stale "awake".
+    phase = entry.get("phase") or entry["base_phase"]
     attention = entry.get("attention_for")
     return_to = entry.get("return_to")
     latest = interactions.get("last_owner_at")

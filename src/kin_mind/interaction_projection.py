@@ -33,7 +33,7 @@ DESIRE_FIELDS = ("id", "kind", "status", "topic", "content", "completion", "expi
                  "needs_review", "trait_needs_review", "evidence")
 # Whole, as the render shows them.
 WHOLE_FIELDS = ("scope", "as_of", "revision", "agent_version", "profile_version", "persona_contract",
-                "contact", "interaction_timing", "continuity", "traits", "interaction_style", "contact_unconfirmed")
+                "contact", "interaction_timing", "continuity", "traits", "interaction_style", "contact_unconfirmed", "energy_context")
 RHYTHM_FIELDS = ("mode", "status", "phase", "alertness", "needs_review", "observed_at")
 
 

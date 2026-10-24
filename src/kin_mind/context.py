@@ -67,7 +67,8 @@ def affect_projection(view):
     understanding = (view.get("appraisal_summary") or {}).get("understanding") if active else None
     # The derived layers in words and a coarse pulse, without content fingerprints.
     layers = compact(view.get("affect_layers"), coarse=True) if active else None
-    return {"dimensions": {k: {"value": round(v["value"]), "review": REVIEW_MARK} if v.get("needs_review") else round(v["value"])
+    return {"energy_context": view.get("energy_context"),
+            "dimensions": {k: {"value": round(v["value"]), "review": REVIEW_MARK} if v.get("needs_review") else round(v["value"])
                            for k, v in view["dimensions"].items()},
             "understanding": marked(understanding, pending or (isinstance(understanding, dict) and understanding.get("needs_review"))),
             "expression": [g["text"] for g in (view.get("expression") or {}).get("guidance", [])[:INTERACTION_LIMITS["guidance"]]] if active else [],
@@ -1037,6 +1038,7 @@ class Contexts:
         # the scores: words and the pulse, none of it a source.
         rhythm = view.get("rhythm") or {}
         result["rhythm"] = {k: rhythm[k] for k in ("status", "phase", "alertness") if k in rhythm}
+        result["energy_context"] = view.get("energy_context")
         layers = compact(view.get("affect_layers"))
         if layers:
             result["affect_layers"] = layers

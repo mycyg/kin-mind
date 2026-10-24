@@ -4,11 +4,23 @@ import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {fileURLToPath} from 'node:url';
 
+// Stable host configuration, not per-bubble model output. Only parameters the
+// installed Qwen implementation actually applies belong on this wire.
+function generationOptions(value) {
+  const valid={temperature:n=>n>=0,top_p:n=>n>0&&n<=1,top_k:n=>Number.isInteger(n)&&n>=0,
+    repetition_penalty:n=>n>=1,max_tokens:n=>Number.isInteger(n)&&n>0};
+  if(!value||Array.isArray(value)||typeof value!=='object')throw Error('Invalid TTS generation configuration');
+  for(const [key,n] of Object.entries(value))if(!Object.hasOwn(valid,key)||typeof n!=='number'||!Number.isFinite(n)||!valid[key](n))
+    throw Error('Invalid TTS generation option: '+key);
+  return {...value};
+}
+
 /** One lazy worker owned by the host. Requests share the loaded model; replies
  * retain their existing transport ID and a completed audio file for resume. */
 export class LocalSpeech {
-  constructor({python,model,ffmpeg,directory,voice='serena',referenceAudio,referenceText,timeoutMs=180000,spawnImpl=spawn}) {
+  constructor({python,model,ffmpeg,directory,voice='serena',referenceAudio,referenceText,generation={},timeoutMs=180000,spawnImpl=spawn}) {
     Object.assign(this,{python,model,ffmpeg,directory,voice,referenceAudio,referenceText,timeoutMs,spawnImpl});
+    this.generation=generationOptions(generation);
     this.queue=Promise.resolve();this.child=null;this.pending=null;
   }
   start() {
@@ -39,7 +51,7 @@ export class LocalSpeech {
       const result=await new Promise((resolve,reject)=>{
         const timer=setTimeout(()=>{this.pending=null;this.child?.kill();this.child=null;reject(Object.assign(Error('Local speech timed out'),{code:'TTS_FAILED'}));},this.timeoutMs);
         this.pending={resolve,reject,timer};
-        this.child.stdin.write(JSON.stringify({text,style,voice:this.voice,referenceAudio:this.referenceAudio,referenceText:this.referenceText,file})+'\n');
+        this.child.stdin.write(JSON.stringify({text,style,voice:this.voice,referenceAudio:this.referenceAudio,referenceText:this.referenceText,generation:this.generation,file})+'\n');
       });
       await fs.writeFile(file+'.json',JSON.stringify(result),{mode:0o600});
       return {...result,data:await fs.readFile(file),name:'Kin-voice.ogg',cached:false};

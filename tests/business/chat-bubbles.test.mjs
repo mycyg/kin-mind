@@ -82,3 +82,13 @@ test('private envelopes keep the public prefix without trusting a generated sour
     '```text\n'+suffix+'\n```','> kin-context:context:example','协议 `</｜｜DSML｜｜ calls>` 不是正文。'])
     assert.equal(chatEnvelope(text),null);
 });
+
+
+test('unreferenced object bubbles normalize only omitted or null references for every presentation',()=>{
+ for(const mode of ['text','voice','both'])for(const references of [undefined,null,[]]) {
+  const parsed=chatEnvelope(JSON.stringify({action:'send',bubbles:['前面的话',{text:'正文',presentation:{mode,style:''},references}]}));
+  assert.equal(parsed.state,'send');assert.deepEqual(parsed.references,[undefined,[]]);assert.equal(parsed.presentations[1].mode,mode);
+ }
+ for(const bubble of [{text:'正文',references:'wrong'},{text:'正文',private_note:'不得外发'},{text:'正文',references:[],unexpected:true}])
+  assert.equal(chatEnvelope(JSON.stringify({action:'send',bubbles:[bubble]})).state,'invalid');
+});

@@ -148,7 +148,16 @@ class ActionEvents:
                 "desire_ids": expired[:12], "reason": "These wishes passed their window without being settled",
                 "evidence_ids": list(dict.fromkeys(fresh))[:24], "agent_version": state["agent_version"]}))
         rhythm = state.get("rhythm")
-        if rhythm and rhythm.get("half_life_minutes"):
+        # An enabled idle clock is the model's explicit next look. Do not wake it
+        # sooner merely because the alertness curve passed a half-life. Inputs,
+        # wishes and plans above remain independent wakeups. Older stores without
+        # a live idle clock retain their once-per-phase review.
+        configured = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_memory_config'").fetchone()
+        row = conn.execute("SELECT data FROM mind_memory_config WHERE scope=?", (self.mind.scope.key(),)).fetchone() if configured else None
+        settings = json.loads(row[0]) if row else {}
+        idle_clock = settings.get("idle") and settings.get("semantic") and recipient.cursor(
+            conn, self.mind.scope.key(), "mind_action_schedule" if settings.get("operational_lanes") else "mind_semantic_cursor")
+        if rhythm and rhythm.get("half_life_minutes") and not idle_clock:
             ends = stamp(rhythm["at"]) + timedelta(minutes=rhythm["half_life_minutes"])
             if ends <= stamp(now) and self.mind._fresh(conn, rhythm.get("evidence", [])):
                 queued.append(self.emit(conn, "rhythm-review", [rhythm.get("event_id"), ends.isoformat()], {

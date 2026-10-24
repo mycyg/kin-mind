@@ -1,6 +1,6 @@
 export const REPLY_MODES = ['text', 'voice', 'both'];
 export const presentationSchema = {type:'object',additionalProperties:false,required:['mode','style'],properties:{
-  mode:{type:'string',enum:REPLY_MODES},style:{type:'string',description:'简短的声音语气描述，不含札记、背景或要朗读的其他内容；无需调整时留空'}}};
+  mode:{type:'string',enum:REPLY_MODES},style:{type:'string',description:'当前参考克隆不应用独立语气指令，留空；仅兼容支持指令的其他音色配置，不含札记或其他朗读内容'}}};
 
 export function replyPresentation(value) {
   return {mode:REPLY_MODES.includes(value?.mode)?value.mode:'text',style:typeof value?.style==='string'?value.style:''};

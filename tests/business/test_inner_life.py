@@ -190,7 +190,7 @@ def test_settling_with_an_awake_base_offers_material_without_forcing_a_dream(env
         rhythm=RhythmProposal(phase="settling", base_phase="awake", alertness=35, target=20,
                               half_life_minutes=180, reason="Relaxing")))
     view = mind.read()["rhythm"]
-    assert view["phase"] == "awake" and view["proposed_phase"] == "settling"
+    assert view["phase"] == "settling" and view["base_phase"] == "settling" and view["proposed_phase"] == "settling"
     entry("settling-material", "今天折了一只纸船。")
     result, reader = review(mind, source, lambda c: Appraisal(reason="只想安静放松"), "quiet-choice", stimulus=stimulus)
     assert result["state"] == "complete", result

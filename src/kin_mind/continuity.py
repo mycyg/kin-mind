@@ -39,8 +39,8 @@ class Understanding(Model):
 
 
 class RhythmProposal(Model):
-    phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"]
-    base_phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] | None = None
+    phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] = Field(description="Your chosen lasting phase. Temporary attention is a separate field; time does not change this phase automatically.")
+    base_phase: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] | None = Field(default=None, description="Legacy alias; omit this field. If supplied, phase remains authoritative.")
     attention_for: Literal["owner_message", "task", "urgent"] | None = None
     return_to: Literal["awake", "settling", "drowsy", "resting", "roused", "recovering"] | None = None
     current_activity: str | None = Field(default=None, max_length=600)
@@ -455,7 +455,7 @@ class Continuity:
             return marker_changed
         if current == attention_for and entry.get("attention_input_id") == input_id:
             return marker_changed
-        phase = entry.get("base_phase") or entry["phase"]
+        phase = entry.get("phase") or entry["base_phase"]
         entry.update(base_phase=phase, attention_for=attention_for,
                      return_to=entry.get("return_to") or phase, attention_input_id=input_id,
                      attention_at=self.clock(), attention_event_id=event_id)
@@ -745,7 +745,9 @@ class Continuity:
             proposal = request.rhythm
             evidence = self._subjective_refs(conn, proposal.evidence_ids, allowed)
             old = state.get("rhythm") or {}
-            phase = proposal.base_phase or proposal.phase
+            phase = proposal.phase
+            from .energy import phase_changed
+            phase_changed(conn, self, phase)
             state["rhythm"] = {
                 **proposal.model_dump(exclude={"evidence_ids"}),
                 "phase": proposal.phase,
@@ -825,7 +827,11 @@ class Continuity:
                     if result["concerns"] and switched_on(conn, self.scope.key(), "timed_concerns") else ())
         result["selected_concerns"] = select_concerns(result["concerns"], topic, intent=stated, entering=entering)
         if flags["rhythm"]:
-            interactions = interaction_windows(conn, self.scope.key(), at)
+            from . import recipient
+            from .companion_view import ACTIVE_VIEW
+            active = ACTIVE_VIEW.get()
+            interactions = interaction_windows(conn, self.scope.key(), at,
+                recipient_person_id=recipient.current(), conversation_key=active.conversation if active else None)
             entry = state.get("rhythm")
             result["rhythm"] = rhythm_view(
                 entry,

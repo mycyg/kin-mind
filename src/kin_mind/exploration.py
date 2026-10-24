@@ -241,6 +241,9 @@ class Explorations:
                 data = json.loads(row["data"])
                 if row["id"] not in dead or liveness.record_alive(data.get("liveness")):
                     continue
+                if data.get("execution_started_at") and data.get("energy_activity_id"):
+                    from .energy import execution
+                    execution(conn, self.mind, "explore", data["energy_activity_id"], row["id"], "finished")
                 conn.execute("UPDATE mind_explorations SET state='interrupted' WHERE id=? AND scope=? AND state='running'", (row["id"], scope))
                 desire = current["desires"].get(data.get("desire_id"))
                 if desire and desire["status"] == "in_progress":
@@ -313,6 +316,7 @@ class Explorations:
             # there is no other executor to fall back to.
             from .codex_executor import run_codex
             runner = run_codex
+            runner.reports_start = True
         from . import workdirs
         from .actions import ActionEvents
         from .erasure import tombstone_mark
@@ -382,8 +386,24 @@ class Explorations:
         # Every source the run is shown besides the wish's evidence: its report is kept only while
         # all of it still stands (CR5-MM-02).
         shown = []
+        def execution_started():
+            from sqlite3 import Error as DatabaseError
+            from .energy import execution
+            # The real start remains a fact even if its accounting write must wait
+            # for the normal final transaction. Never orphan a spawned executor
+            # because a secondary state update briefly failed.
+            data.setdefault("execution_started_at", self.mind.clock())
+            data["energy_activity_id"] = "wish:" + digest([desire["id"], desire["content"]])[:40]
+            try:
+                with self.engine.db.connect(write=True) as conn:
+                    execution(conn, self.mind, "explore", data["energy_activity_id"], eid, "started")
+                    conn.execute("UPDATE mind_explorations SET data=? WHERE id=?", (dumps(data), eid))
+            except DatabaseError:
+                pass  # The existing settlement transaction retries this same id.
         try:
             options = {}
+            if getattr(runner, "reports_start", False):
+                options["on_started"] = execution_started
             ui_enabled = bool((computer or {}).get("enabled")
                               and ((computer or {}).get("ui") or {}).get("enabled"))
             if target == "computer" or ui_enabled:
@@ -507,6 +527,9 @@ class Explorations:
         data["evaluated_sources"] = shown
         with self.engine.db.connect(write=True) as conn:
             from .erasure import drop_deleted
+            if data.get("execution_started_at") and data.get("energy_activity_id"):
+                from .energy import execution
+                execution(conn, self.mind, "explore", data["energy_activity_id"], eid, "finished")
             # What was deleted since the run began: before it, nothing of it reached the run (CL6E-MM-02).
             data = drop_deleted(conn, data, since=mark)
             current = self.mind._load(conn)

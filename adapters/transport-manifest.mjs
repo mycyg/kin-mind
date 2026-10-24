@@ -679,12 +679,13 @@ export class TransportManifests {
       if(ready.length)return {groupId:manifest.group_id,inputId:ready[0],answeredInputIds:ready,state:manifest.bubbles.every(b=>b.request?.input_scope==='turn')?'processed':'accepted',itemSettlement:true};
       if(ids.every(id=>settled.has(id)))return null;
     }
-    // An owner interruption transfers never-submitted words to the next accepted
-    // native input. Settle that handoff in the input ledger too, without claiming
-    // those words reached the platform. Failed/uncertain sends still need their
-    // original reconciliation or failure notice; merely retiring them is no answer.
-    const handed=manifest.state==='retired'&&!manifest.work&&manifest.reason==='new-owner-input'&&
-      !manifest.tail_owed&&manifest.tail_handed?.reason==='new-owner-input'&&
+    // Carry the handoff fact to the input ledger. It settles only when the successor
+    // has an answer; being admitted to its native turn is not delivery. Format
+    // failures have no transport fragments, so their failure fact can travel too.
+    // Work and attempted/unknown sends retain their own obligations.
+    const handoffReason=manifest.reason==='new-owner-input'||String(manifest.reason??'').startsWith('private-note-')||manifest.reason==='private-reply-envelope';
+    const handed=manifest.state==='retired'&&!manifest.work&&handoffReason&&
+      !manifest.tail_owed&&manifest.tail_handed?.reason===manifest.reason&&
       typeof manifest.tail_handed.input_id==='string'&&manifest.tail_handed.input_id&&manifest.tail_handed.input_id!==manifest.reply_id&&
       !(manifest.answered_input_ids??[]).includes(manifest.tail_handed.input_id)&&
       manifest.tail_handed.items?.length>0&&manifest.bubbles.every(b=>
@@ -693,7 +694,7 @@ export class TransportManifests {
     const state=manifest.state==='accepted'?'accepted':handed?'merged':manifest.state==='retired'&&OWN_CHOICES.includes(manifest.reason)?manifest.reason:null;
     if(!state)return null;
     return {groupId:manifest.group_id,inputId:manifest.reply_id,answeredInputIds:manifest.answered_input_ids??[manifest.reply_id],state,
-      ...(handed?{mergedInto:manifest.tail_handed.input_id}:state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
+      ...(handed?{mergedInto:manifest.tail_handed.input_id,handoff:true}:state==='merged'&&manifest.choice?.merged_into?{mergedInto:manifest.choice.merged_into}:{})};
   }
   /** Side effects that are still due and still worth trying: each bubble's, and the group's answer. */
   owes(manifest) {

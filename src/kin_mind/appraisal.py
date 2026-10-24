@@ -972,7 +972,7 @@ def _appraisal_context(context):
         "scope", "agent_version", "revision", "as_of", "contact", "exploration",
         "interaction_style", "interaction_timing", "autonomy", "persona_contract",
         "continuity", "rhythm", "appraisal_summary", "exploration_decisions", "activity_decisions", "exploration_capabilities",
-        "contact_unconfirmed", "affect_layers",
+        "contact_unconfirmed", "affect_layers", "energy_context",
     }}
     if isinstance(state.get("contact_unconfirmed"), list):
         state["contact_unconfirmed"] = [unlisted(u) for u in state["contact_unconfirmed"]]

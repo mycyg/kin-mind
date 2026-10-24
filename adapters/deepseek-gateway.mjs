@@ -1,4 +1,4 @@
-import {projectPrompt,currentProjectPrompt,projectSchema,refreshMcpInstructions} from './project-prompts.mjs';
+import {projectPrompt,currentProjectPrompt,projectSchema,refreshMcpInstructions,refreshSessionSummaryPrompt,refreshPersonaPrompt} from './project-prompts.mjs';
 import {assertKimiInputCompatible,isHistoryRefusal,KIMI_HISTORY_MESSAGE} from './provider-history.mjs';
 import http from 'node:http';
 import {privateReplyBoundary} from './chat-bubbles.mjs';
@@ -387,10 +387,19 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       const effective={...parsed,input:[...parsed.input]};
       if(promptRoot) {
         if(typeof effective.instructions==='string')effective.instructions=currentProjectPrompt('system',effective.instructions,{root:promptRoot});
-        const developer=effective.input.findIndex(item=>item.role==='developer');
-        if(developer>=0) {
-          const item=effective.input[developer],text=typeof item.content==='string'?item.content:item.content.filter(p=>typeof p.text==='string').map(p=>p.text).join('\n');
-          effective.input[developer]={...item,content:[{type:'input_text',text:currentProjectPrompt('persona',text,{root:promptRoot})}]};
+        effective.input=effective.input.map(item=>item.role==='developer'?{...item,
+          content:typeof item.content==='string'?refreshPersonaPrompt(item.content,{root:promptRoot}):item.content.map(part=>typeof part.text==='string'?{...part,text:refreshPersonaPrompt(part.text,{root:promptRoot})}:part)}:item);
+      }
+      // Native marks compaction explicitly. The final user part is its cached
+      // compact_prompt; identical ordinary/historical user text remains data.
+      let turnMetadata;
+      try{turnMetadata=JSON.parse(parsed.client_metadata?.['x-codex-turn-metadata']);}catch{}
+      if(turnMetadata?.request_kind==='compaction') {
+        const index=effective.input.findLastIndex(item=>item.role==='user'),item=effective.input[index];
+        if(item) {
+          const content=typeof item.content==='string'?refreshSessionSummaryPrompt(item.content,{root:promptRoot}):item.content.map((part,i)=>
+            i===item.content.length-1&&part.type==='input_text'&&typeof part.text==='string'?{...part,text:refreshSessionSummaryPrompt(part.text,{root:promptRoot})}:part);
+          effective.input[index]={...item,content};
         }
       }
       effective.instructions=refreshMcpInstructions(effective.instructions,{root:promptRoot});

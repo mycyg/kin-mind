@@ -688,6 +688,7 @@ def run_codex(
     executor_source=None,
     version_probe_ms=None,
     native_exchange=None,
+    on_started=None,
 ):
     """One bounded codex attempt. Returns the ExecutionReport-shaped receipt.
 
@@ -963,6 +964,8 @@ def run_codex(
                                 "execution_id": directory.name, "attempt": attempt}},
                     {name: spec for name, spec in {"kin_computer": computer_mcp, "kin_web": web_mcp, "kin_ui": ui_mcp}.items() if spec})
                 native_receipt = answer.get("receipt") or {}
+                if on_started and native_receipt.get("native_turn_id"):
+                    on_started()
                 thread_id = native_receipt.get("fork_thread_id") or native_receipt.get("native_session_id")
                 turn_completed = (answer.get("state") == "complete" and bool(thread_id)
                     and bool(native_receipt.get("native_turn_id")) and native_receipt.get("model") == model)
@@ -984,6 +987,8 @@ def run_codex(
                         stderr=diagnostic, start_new_session=True, env=child_env,
                     )
                     report_group(child.pid)
+                    if on_started:
+                        on_started()
             except OSError as error:
                 unavailable = CodexUnavailable("codex-cli-missing", error)
                 unavailable.startup = {**startup, "session": {"state": "failed", "stage": "spawn",
@@ -1277,6 +1282,7 @@ def codex_runner(*, reasoning, provider, cli_version, model_catalog=None, repair
                          executor_source=executor_source, version_probe_ms=version_probe_ms, **kwargs)
 
     run.wants_continuation = True
+    run.reports_start = True
     return run
 
 

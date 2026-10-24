@@ -34,6 +34,8 @@ class PromptStore:
     def effective(name):
         if name == 'persona':
             return '下一次 DS/Kimi 请求或原生回合读取。'
+        if name == 'summary/session':
+            return 'DS/Kimi 在下一次摘要请求读取；原生直连在重新加载会话时读取。'
         if name == 'system' or name.startswith(('mcp/', 'tools/')):
             return 'DS/Kimi 在下一次请求读取；原生直连在重新加载会话时读取。'
         return '使用这段提示词的下一次调用读取。'

@@ -301,3 +301,58 @@ test('assessment fallback schema follows evidence without changing schema or cha
  const b=deepseekRequest({...body,text:{format:{type:'json_schema',schema:{...schema,description:'another task'}}}},'high','assessment');
  assert.equal(a.instructions,b.instructions);assert.deepEqual(a.input[0],b.input[0]);
 });
+
+test('DS and Kimi refresh only the native compaction instruction, preserving identical ordinary and historical user text',async t=>{
+ const os=await import('node:os'),path=await import('node:path');const {projectPrompt}=await import('../../adapters/project-prompts.mjs');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-summary-gateway-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const old='Synthetic compaction instruction.',fresh='Synthetic updated compaction instruction with conditions retained.';
+ projectPrompt('summary/session',old,{root});fs.mkdirSync(path.join(root,'summary'),{recursive:true});
+ fs.writeFileSync(path.join(root,'summary/session.json'),JSON.stringify({name:'summary/session',version:2,edited:true,text:fresh}));
+ for(const model of ['deepseek-flash','k3']){
+  let sent;const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic',promptRoot:root,
+   purposeFor:()=>({lane:'foreground',purpose:'native-chat-turn',mainConversation:true}),fetchImpl:async(_url,init)=>{sent=JSON.parse(init.body);return new Response(JSON.stringify({status:'completed',output:[]}));}});
+  try {
+   const input=[user(old),user('A quote: '+old),user(old)];
+   for(const kind of ['turn',undefined,'compaction']) {
+    // Actual native 0.162.1 metadata distinguishes manual compaction from chat.
+    const client_metadata=kind?{'x-codex-turn-metadata':JSON.stringify({request_kind:kind})}:{};
+    const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model,input,client_metadata})});
+    assert.equal(response.status,200);await response.text();
+    assert.equal(sent.input[0].content[0].text,old,'historical user text is never refreshed');
+    assert.equal(sent.input[1].content[0].text,'A quote: '+old);
+    assert.equal(sent.input[2].content[0].text,kind==='compaction'?fresh:old,'only the actual compaction tail is refreshed');
+   }
+   assert.equal(input[2].content[0].text,old,'the incoming history remains immutable');
+  }finally{await gateway.close();}
+ }
+});
+
+
+test('native 0.162 developer ordering refreshes only registered persona parts and preserves base and permissions',async t=>{
+ // Anonymized shape of native-mock-1: no instructions field; separate base
+ // developer, then one developer containing persona AND permission parts.
+ const os=await import('node:os'),path=await import('node:path');
+ const {projectPrompt}=await import('../../adapters/project-prompts.mjs');
+ const {instructionTextEvidence}=await import('../../adapters/instruction-evidence.mjs');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-native-persona-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const base='Synthetic base instructions.',old='Synthetic cached persona.',fresh='Synthetic edited persona.',permissions='<permissions instructions>Synthetic permissions.</permissions instructions>';
+ projectPrompt('persona',old,{root});projectPrompt('persona','Synthetic current default persona.',{root});
+ fs.writeFileSync(path.join(root,'persona.json'),JSON.stringify({name:'persona',version:2,edited:true,text:fresh}));
+ const part=text=>({type:'input_text',text}),developer=(...texts)=>({type:'message',role:'developer',content:texts.map(part)});
+ for(const model of ['deepseek-flash','k3'])for(const verifiedBase of [false,true]) {
+  let sent;const gateway=await startDeepSeekGateway({key:'synthetic',kimiKey:'synthetic',promptRoot:root,
+   ...(verifiedBase?{requiredIncomingInstructions:instructionTextEvidence(base)}:{}),
+   fetchImpl:async(_,init)=>{sent=JSON.parse(init.body);return new Response(JSON.stringify({status:'completed',output:[]}));}});
+  try {
+   const input=[developer(base),developer(old,permissions),user(old),user('Quoted '+old)];
+   const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model,input})});
+   assert.equal(response.status,200);await response.text();
+   const messages=sent.input.filter(i=>i.role===(model==='k3'?'developer':'system'));
+   if(!verifiedBase)assert.deepEqual(messages[0].content,[part(base)],'the first developer is the base, not persona');
+   else assert.ok(sent.instructions.startsWith(base+'\n\n'));
+   assert.deepEqual(messages[verifiedBase?0:1].content,[part(fresh),part(permissions)],'only the registered persona part changes');
+   assert.deepEqual(sent.input.filter(i=>i.role==='user'),[user(old),user('Quoted '+old)]);
+   assert.deepEqual(input[1].content,[part(old),part(permissions)],'native input remains immutable');
+  }finally{await gateway.close();}
+ }
+});

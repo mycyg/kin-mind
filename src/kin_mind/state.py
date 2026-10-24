@@ -401,6 +401,7 @@ class Mind(Continuity):
         # changes in place: the next save re-anchors the slow layer of any curve it moved from these
         # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
         self._curves = {}
+        from .energy import SCHEMA as ENERGY_SCHEMA
         from .archive_memory import SCHEMA as ARCHIVE_MEMORY_SCHEMA
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
@@ -409,7 +410,7 @@ class Mind(Continuity):
         from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + recipient.CURSOR_SCHEMA + ";" + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
                              + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA
-                             + EVIDENCE_REF_SCHEMA):
+                             + EVIDENCE_REF_SCHEMA + ENERGY_SCHEMA):
             return
         with self.engine.db.connect() as conn:
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
@@ -1769,6 +1770,8 @@ class Mind(Continuity):
                 result["interaction_style"] = interaction_style(result["dimensions"], behavior)
             elif behavior:
                 result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
+            from .energy import view as energy_view
+            result["energy_context"] = energy_view(conn, self.scope.key(), at)
             self._continuity_view(conn, state, result, at, query)
             if history:
                 # The same six keys as before. How a revision is stored is the layer's business,
