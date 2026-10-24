@@ -100,10 +100,14 @@ class Endpoint:
 class Clock:
     """The appraisal module's clock, which the endpoint moves on as its model answers."""
 
-    offset = 0.0
+    def __init__(self):
+        # Only scripted provider latency advances this budget test. Real SQLite
+        # and fixture preparation time must not change the exact allowance.
+        self.base = real_time.monotonic()
+        self.offset = 0.0
 
     def monotonic(self):
-        return real_time.monotonic() + self.offset
+        return self.base + self.offset
 
     def __getattr__(self, name):
         return getattr(real_time, name)
