@@ -2069,6 +2069,7 @@ export class MobileRouter {
     const record=typeof data.inputId==='string'?this.state.inputs[data.inputId]:null;
     if(!record)return null;
     const state=kind==='reply-complete'?'accepted':['silent','merged','defer','processed'].includes(data.state)?data.state:null;if(!state)return null;
+    if(kind==='reply-choice'&&['accepted','covered','processed'].includes(record.answer?.state))return null;
     if(data.handoff&&state==='merged') {
       const next=this.state.inputs[data.mergedInto];
       const ids=[...new Set([record.id,...(data.answeredInputIds??[])])],linked=[];
@@ -2083,11 +2084,15 @@ export class MobileRouter {
       }
       return [...linked,...this.settleReplyHandoffs()];
     }
-    const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{})};record.settledAt??=at;
+    const at=this.now();record.answer={state,at,...(data.mergedInto?{mergedInto:data.mergedInto}:{}),
+      ...(state==='defer'?{desireId:data.desireId,retryAt:data.retryAt}:{})};record.settledAt??=at;
     const settled=[record.id];
     if(ownerInput(record))for(const id of new Set((Array.isArray(data.answeredInputIds)?data.answeredInputIds:[]).filter(id=>typeof id==='string'))) {
       const other=id===record.id?null:this.state.inputs[id];
-      if(!other||!ownerInput(other)||other.state!=='accepted'||answered(other))continue;
+      if(!other||!ownerInput(other)||other.state!=='accepted')continue;
+      // Actual group delivery supersedes a prior intention for every covered
+      // input, while late choices cannot downgrade a receipt already accepted.
+      if(answered(other)&&(!['accepted','processed'].includes(state)||['accepted','covered','processed'].includes(other.answer?.state)))continue;
       other.answer={state:state==='accepted'?'covered':state,by:record.id,basis:'answered-input-ids',at};other.settledAt??=at;settled.push(id);
     }
     return [...settled,...this.settleReplyHandoffs()];

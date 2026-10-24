@@ -21,10 +21,13 @@ test('native start callback waits for real receipt; failed started work counts, 
  const run=creator.run(claim,{onStarted:async()=>{starts++;}});await new Promise(r=>setImmediate(r));assert.equal(starts,0);
  finish({state:'waiting',reason:'native-failed',started:true,receipt:{native_turn_id:'actual-turn',fork_thread_id:'actual-fork'}});
  assert.equal((await run).state,'failed');assert.equal(starts,1);
- for(const answer of [{state:'waiting',model_invoked:false},{state:'waiting',started:null,receipt:{}},{state:'waiting',started:true,model_invoked:false,receipt:{native_turn_id:'admission-refused'}}]) {
+ for(const answer of [{state:'waiting',model_invoked:false},{state:'waiting',started:null,receipt:{}},{state:'waiting',started:true,model_invoked:false,receipt:{}}]) {
   creator.nativeRun=async()=>answer;await creator.run(claim,{onStarted:async()=>{starts++;}});
  }
  assert.equal(starts,1);
+ // A real native ACK is role activity even when its provider later refuses admission.
+ creator.nativeRun=async()=>({state:'waiting',started:true,model_invoked:false,receipt:{native_turn_id:'admission-refused'}});
+ await creator.run(claim,{onStarted:async()=>{starts++;}});assert.equal(starts,2);
 });
 test('plan claim alone does not charge and completion receipt propagates exact owner/fence',async()=>{
  const calls=[],loop={tick:async()=>{},review(){}};let shouldStart=false;

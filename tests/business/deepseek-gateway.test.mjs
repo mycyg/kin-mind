@@ -87,6 +87,8 @@ test('gateway contracts use the current task and the supplied recipient director
   assert.doesNotMatch(source, /小光/);
   const contracts=gatewayContracts();
   assert.match(contracts.reply,/recipient_id/);
+  assert.match(contracts.reply,/只输出一个完整的 JSON 消息数组/);
+  assert.match(contracts.reply,/数组前后不写说明、标签或代码围栏/);
   const body={model:'deepseek-flash',instructions:'base',input:[user('在吗')]};
   assert.equal(deepseekRequest(body).instructions,'base\n\n'+contracts.reply);
   assert.equal(deepseekRequest(body,'high','assessment').instructions,'base\n\n'+contracts.assessment);

@@ -255,6 +255,7 @@ export class TransportManifests {
     const manifest={...companionBasis(first.delivery),schema:MANIFEST_SCHEMA,group_id:id,delivery_id:first.delivery.memoryBatchId??id,reply_id:first.request.reply_id??null,channel,
       ...(answeredIds(first.request)?{answered_input_ids:answeredIds(first.request)}:{}),
       kind:first.delivery.kind??'reply',work:Boolean(first.request.work),
+      ...(first.request.failure?{failure:first.request.failure}:{}),
       ...(Object.hasOwn(first.delivery,'taskId')?{taskId:first.delivery.taskId}:{}),
       ...(Object.hasOwn(first.delivery,'inputVersion')?{inputVersion:first.delivery.inputVersion}:{}),
       ...(Object.hasOwn(first.delivery,'turnFence')?{turnFence:first.delivery.turnFence}:{}),

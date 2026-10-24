@@ -14,6 +14,12 @@ test('ambiguous nested image shapes remain invalid',()=>{
  for(const bubble of [{text:'x',references:[],image:{...image,url:'https://example.invalid/image'}},
   {text:'x',references:[],image:{...image,inspection_id:'invented'}},
   {text:'x',references:[],private_note:'leak',image},
-  {text:'',references:[],image},{text:'x',image},
+  {text:'',references:[],image},
   {text:'x',references:[],image:[image]}])assert.equal(parsePrivateReply(reply([bubble])).state,'invalid');
+});
+
+test('a viewed inline image with omitted optional references retains separate text and image',()=>{
+ const result=parsePrivateReply(reply([{text:'synthetic text',image}]));
+ assert.equal(result.state,'send');assert.deepEqual(result.bubbles,['synthetic text','[表情图片]']);
+ assert.deepEqual(result.references[0],[]);assert.deepEqual(result.meme_refs,[null,{type:'image',...image}]);
 });

@@ -482,3 +482,16 @@ test('a handoff established while another lookup was pending suppresses the queu
  f.clock.now+=700000;await f.router.watch({notifyOwner:async()=>{notices++;return {state:'accepted'};}});
  assert.equal(notices,0);assert.equal(f.router.state.inputs.owner.answer.state,'merged');
 });
+
+
+test('accepted group receipts outrank prior defer for primary and covered inputs, and late choices cannot downgrade either',async t=>{
+ for(const event of ['reply-complete','reply-choice']) {
+  const f=fixture(t);
+  for(const id of ['primary','covered'])f.router.state.inputs[id]={id,kind:'owner',state:'accepted',answer:{state:'defer',desireId:'scheduled',retryAt:'later'}};
+  await f.router.observe(event,{inputId:'primary',answeredInputIds:['primary','covered'],state:'processed'});
+  const states=event==='reply-complete'?['accepted','covered']:['processed','processed'];
+  assert.deepEqual(['primary','covered'].map(id=>f.router.state.inputs[id].answer.state),states);
+  for(const id of ['primary','covered'])await f.router.observe('reply-choice',{inputId:id,state:'defer',desireId:'late'});
+  assert.deepEqual(['primary','covered'].map(id=>f.router.state.inputs[id].answer.state),states);
+ }
+});

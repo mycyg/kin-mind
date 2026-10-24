@@ -42,7 +42,7 @@ export const NEUTRAL_OWNER_NAME = '主人';
 export function gatewayContracts(owner = NEUTRAL_OWNER_NAME) {
   if (typeof owner !== 'string' || !/^[^\s`$\\]{1,20}$/u.test(owner)) throw Error('invalid-owner-name');
   return Object.freeze({
-    reply: `最终回复请使用消息数组，每条消息写 recipient_id 和 content。默认发文字，也可以用 mode 选择 voice 或 both。你决定对谁说什么，也可以同时联系几个人；这次不想说话时返回 []。宿主提供说话人、会话、已发送内容和工具回执。`,
+    reply: `最终回复只输出一个完整的 JSON 消息数组，数组前后不写说明、标签或代码围栏。每条消息写 recipient_id 和 content。默认发文字，也可以用 mode 选择 voice 或 both。你决定对谁说什么，也可以同时联系几个人；这次不想说话时返回 []。宿主提供说话人、会话、已发送内容和工具回执。`,
     'contact-draft': `` + contactDraftInstructions,
     assessment: `这是一轮内部评估。结合当前状态和记忆，想想自己的感受、心愿和下一步。想行动或想安静都可以。按本轮提供的结构提交决定，宿主会保存它。`,
     'internal-execution': `内部执行任务。完成本轮工作，依据工具结果提交执行结果。`,

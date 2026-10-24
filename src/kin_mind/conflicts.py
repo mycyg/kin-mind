@@ -216,6 +216,7 @@ REGISTRY = {
     "Inconsistent plan decision base revision": ("runtime", "plan-decision-base-inconsistent", "section"),
     "Execution lease expired or was replaced": ("runtime", "execution-lease-lost", "block"),
     "Execution fence mismatch": ("runtime", "execution-fence-mismatch", "block"),
+    "Execution is no longer running": ("runtime", "execution-not-running", "block"),
     "An executor outcome cannot be overwritten": ("semantic", "execution-outcome-final", "block"),
     "Late executor result is isolated": ("runtime", "execution-result-late", "block"),
     "Completion requires a verified host result source": ("semantic", "insufficient-authority", "block"),
