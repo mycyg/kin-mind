@@ -12,6 +12,12 @@ from kin_mind.session_checkpoint import SessionCheckpoint
 pytest_plugins = ("test_kin_mind",)
 
 
+@pytest.fixture(autouse=True)
+def fixed_identity_clock(setup):
+    # Synthetic dialogue and the observer share a deterministic time basis.
+    setup[2][0] = datetime(2030, 4, 8, 10, 0, tzinfo=timezone.utc)
+
+
 def utterance(number, person="xiaoguang", kind="owner-message", **extra):
     route = "chat:" + person
     return {"id": "identity-test-" + str(number), "kind": kind,
