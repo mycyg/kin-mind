@@ -906,7 +906,10 @@ export class MobileRouter {
       if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
       const priorTask=this.currentTask();
-      if(priorTask?.completion?.outcome==='declined'&&this.declarationReady(priorTask,runtime))this.closeTask(priorTask,{event:'decline-settled-before-input'});
+      if(priorTask?.completion?.outcome&&!priorTask.parallel&&!this.busy(runtime)) {
+        this.recoverDeclarationEnd(priorTask);
+        if(this.declarationReady(priorTask,runtime))this.closeTask(priorTask,{event:'declaration-settled-before-input'});
+      }
       // A failed native turn is terminal, not active work. Only a new assessment
       // on the current profile may proceed; switching and other busy checks stay unchanged.
       if(['proactive','assessment'].includes(input.kind)&&this.internalHeld(runtime,input.kind))return {deferred:{state:'deferred',reason:'owner-work-held'}};
@@ -2122,6 +2125,7 @@ export class MobileRouter {
         this.save('input-native-failed',{id:record.id,code:record.nativeFailure.code});return;
       }
       let dirty=false;
+      const endingTurn=kind==='prompt-end'?this.state.turn:null;
       if(kind==='prompt-start') {
         const refused=this.refusedPrompt(data);
         if(refused)return refused;
@@ -2153,7 +2157,10 @@ export class MobileRouter {
       // only when the ledger learned something from it (AD1-07).
       if(noTask&&taskEvent){if(dirty)this.save(kind);return;}
       const storeHistorical=(reason,{authoritative=false}={})=>{
-        const at=this.now();
+        // The native end and its input ledger are the same observation. Keep
+        // their timestamp identical even if persistence crosses a clock tick.
+        const at=kind==='prompt-end'&&endingTurn?.taskId===task?.id&&endingTurn?.turnFence===turnFence&&
+          endingTurn?.inputIds.includes(data.sourceInputId)?endingTurn.endedAt:this.now();
         const event={kind,reason,taskId:task?.id,inputVersion:data.inputVersion,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch,at,
           id:data.id,state:data.state,status:data.status,messageId:data.messageId,outboxId:data.outboxId,stage:data.stage,submissionStarted:data.submissionStarted,
           sourceInputId:data.sourceInputId,stopReason:data.stopReason};
@@ -2178,6 +2185,7 @@ export class MobileRouter {
             lateAfterForce:true,authority:authoritative?'historical-fence':'evidence-only',reason,...(data.reason?{detailReason:data.reason}:{}),at};
           trim(task,'toolHistory');
         }
+        if(task&&kind==='prompt-end')this.recoverDeclarationEnd(task);
         this.save('late-'+kind,{taskId:task?.id,reason,turnFence:turnFence??null,currentEpoch:this.state.executionEpoch});
       };
       let historicalReason=null;
@@ -2199,7 +2207,7 @@ export class MobileRouter {
       if(task&&open(task)) {
         if(kind==='prompt-start') {
           if(task.completion?.outcome==='declined'&&this.declarationReady(task,await this.inspect()))this.closeTask(task);
-          if(open(task)){if(task.status!=='proposed')task.status='running';task.turnStartedAt=this.now();task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
+          if(open(task)){if(task.status!=='proposed')task.status='running';task.turnStartedAt=this.state.turn.startedAt;task.executionEpoch=turnFence??this.state.executionEpoch;task.continuationRequired=false;if(task.completion?.state==='historical-proposal')delete task.completion;delete task.turnEndedAt;delete task.turnEndedFence;}
         }
         if(kind==='prompt-end') {
           task.turnEndedAt=this.now();task.turnEndedFence=turnFence??task.executionEpoch;task.stopReason=data.stopReason;
@@ -2257,6 +2265,26 @@ export class MobileRouter {
       delete task.tools[id];changed=true;
     }
     return changed;
+  }
+  /** A supplement can advance the task version inside a single native turn.
+   * Its original prompt-end then remains a version-mismatch event, not authority
+   * for the newer task's tools or deliveries. It can still prove that the exact
+   * turn in which Kin declared the newer outcome ended. Recover old snapshots
+   * from that event plus the source input's persisted start/end, never a later
+   * chat's task turn times or merely an idle runtime. */
+  recoverDeclarationEnd(task) {
+    const proposal=task.completion,source=this.state.inputs[proposal?.sourceInputId];
+    if(task.parallel||!proposal?.outcome||proposal.state==='historical-proposal'||proposal.turnEndedAt||
+      proposal.inputVersion!==task.inputVersion||proposal.turnFence!==task.executionEpoch||
+      !Number.isFinite(proposal.turnStartedAt)||!source||source.taskId!==task.id||
+      source.turnStartedAt!==proposal.turnStartedAt||source.executionEpoch!==proposal.turnFence||
+      !Number.isFinite(source.turnEndedAt)||source.turnEndedAt<proposal.at||proposal.at<proposal.turnStartedAt)return false;
+    const end=this.state.lateEvents?.findLast(event=>event.kind==='prompt-end'&&event.reason==='input-version-mismatch'&&
+      event.taskId===task.id&&event.sourceInputId===source.id&&event.turnFence===proposal.turnFence&&
+      event.at===source.turnEndedAt&&Number.isSafeInteger(event.inputVersion)&&event.inputVersion>0&&event.inputVersion<proposal.inputVersion);
+    if(!end)return false;
+    proposal.turnEndedAt=source.turnEndedAt;proposal.turnEndedFence=end.turnFence;proposal.stopReason=end.stopReason;
+    return true;
   }
   /** Kin's current declaration settles work once its turn has ended and the
    * native runtime is idle. Delivery receipts and stale tool ledger entries are
@@ -2411,6 +2439,7 @@ export class MobileRouter {
         // Independent worker lifecycle and delivery are settled by ParallelTasks.
         if(task.parallel)continue;
         if(task.cancelRequested){this.cancelTask(task);changed=true;continue;}
+        if(this.recoverDeclarationEnd(task))changed=true;
         // Kin's declared outcome closes the task once the host's facts are in (N1).
         if(task.completion?.outcome&&task.completion.state!=='historical-proposal') {
           if(this.declarationReady(task,runtime)){this.closeTask(task);changed=true;}

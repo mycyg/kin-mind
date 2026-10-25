@@ -3,6 +3,18 @@
 from eventmem.core.db import Conflict, Missing, digest
 
 
+PLAN_STATE_MEANINGS = {
+    "pending": "Planned; this step has not been authorized or started.",
+    "ready": "Authorized, not proof of execution; consult execution.plan_run and linked_wish.",
+    "running": "A host reserved the step; an active lease is a reservation, execution_started_at is the executor acknowledgement.",
+    "waiting": "Awaiting another decision; consult receipts for any failed or interrupted attempt.",
+    "completed": "Settled by a host result or sourced owner completion; consult receipts.",
+    "unconfirmed": "The outcome is uncertain; delivery may have happened and needs reconciliation.",
+    "abandoned": "No further execution is authorized.",
+    "window": "next_review_at changes when to reconsider, never not_after; an expired unfinished window needs review of the window or cancellation.",
+}
+
+
 def execution_brief(mind, *, question, evidence_ids, plan=None, step=None, shown=None, since=None):
     """What an executor is given. `shown`, a list, receives every source the brief names -- its
     evidence at the versions read, the dialogue, earlier results and histories by id, the plan's
@@ -122,7 +134,7 @@ def compact_plan(plan):
         step = {k:v for k,v in original.items() if k not in {"receipts", "decision", "delivery_artifacts"}}
         step["receipts"] = []
         for r in original.get("receipts", [])[-2:]:
-            value = {k:v for k,v in r.items() if k in {"id", "run_id", "state", "kind", "status", "verified", "source_id", "complete", "message_id", "reason", "waiting_reason", "summary", "phase", "verification_gaps", "resume_action", "checkpoint"}}
+            value = {k:v for k,v in r.items() if k in {"id", "run_id", "state", "kind", "status", "verified", "source_id", "complete", "message_id", "reason", "waiting_reason", "summary", "phase", "verification_gaps", "resume_action", "checkpoint", "checkpoint_retained"}}
             if r.get("completion_review"):
                 value["completion_review"] = {k:v for k,v in r["completion_review"].items()
                     if k in {"complete", "reason", "remaining", "step_remaining", "downstream", "advisory"}}
@@ -156,11 +168,11 @@ def appraisal_plan(plan):
     if plan.get("status") not in {"completed", "canceled", "abandoned"}:
         return compact_plan(plan)
     result = {k: v for k, v in plan.items() if k in
-              {"id", "key", "revision", "status", "goal", "reason", "evidence", "created_at", "updated_at"}}
+              {"id", "key", "recipient_person_id", "revision", "status", "goal", "reason", "evidence", "created_at", "updated_at"}}
     result["detail_tool"] = "read_autonomous_plans"
     result["steps"] = []
     for step in plan.get("steps", []):
-        item = {k: v for k, v in step.items() if k in {"id", "revision", "state", "goal", "completion", "waiting_reason"}}
+        item = {k: v for k, v in step.items() if k in {"id", "revision", "state", "goal", "completion", "waiting_reason", "execution", "execution_window"}}
         receipts = step.get("receipts", [])
         item["receipt_count"] = len(receipts)
         item["receipt_refs"] = [{k: v for k, v in r.items() if k in

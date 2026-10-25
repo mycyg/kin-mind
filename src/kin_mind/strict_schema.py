@@ -53,6 +53,43 @@ def decode(schema, value):
     return _decode(schema, value, schema.get("$defs") or {})
 
 
+def encode(schema, value):
+    """Put a repair proposal back in the wire shape; do not fix its invalid values.
+
+    The model must see the same map/list and JSON-text representation that its
+    answer will be held to, even when the original answer has already decoded.
+    """
+    return _encode_value(schema, value, schema.get("$defs") or {})
+
+
+def _encode_value(node, value, definitions):
+    node = _resolve(node, definitions)
+    if not isinstance(node, dict):
+        return json.dumps(value, ensure_ascii=False)
+    branches = node.get("anyOf") or node.get("oneOf")
+    if branches:
+        for branch in branches:
+            if _fits(branch, value, definitions):
+                return _encode_value(branch, value, definitions)
+        return value
+    shape = _shape(node)
+    if shape == "any":
+        return json.dumps(value, ensure_ascii=False)
+    if shape == "map" and isinstance(value, dict):
+        return [{"key": key, "value": _encode_value(_map_values(node), item, definitions)}
+                for key, item in value.items()]
+    if shape == "object" and isinstance(value, dict):
+        properties = node.get("properties") or {}
+        result = {key: _encode_value(properties[key], item, definitions) if key in properties else item
+                  for key, item in value.items()}
+        for key in properties.keys() - value.keys() - set(node.get("required") or ()):
+            result[key] = None
+        return result
+    if shape == "array" and isinstance(value, list):
+        return [_encode_value(node.get("items") or {}, item, definitions) for item in value]
+    return value
+
+
 def _words(node, extra=()):
     notes = [text.format(json.dumps(node[key], ensure_ascii=False) if isinstance(node[key], str) else node[key])
              for key, text in _BOUNDS if key in node]

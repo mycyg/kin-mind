@@ -56,7 +56,7 @@ from .memory import REVIEW_CEILING_MINUTES, REVIEW_FLOOR_MINUTES, MemoryAssessme
 from .model_runtime import ModelAdmissionWait, evaluation_slot, request_client
 from .model_view import for_model
 from .profile import DIMENSIONS
-from .strict_schema import decode as decode_strict, strict_schema
+from .strict_schema import decode as decode_strict, encode as encode_strict, strict_schema
 from .state import (CONTACT_WAIT_MAX_SECONDS, CONTACT_WAIT_MIN_SECONDS, AffectiveEvent, DesireChange, Evolution,
                     Motivation, contact_wait_seconds, timestamp)
 
@@ -774,7 +774,7 @@ SYSTEM = """你是 KIN 的记忆与情绪评估器。结合本轮发生的事、
 
 整理记忆时，保留谁说过或做过什么、事情的主体、来源和时间。memory.notes、links 和 graph 可以记录经历、关联和更正。引用本轮材料或工具读取结果里的真实编号；修改已有记录时沿用它的 id。想法、推测和梦按它们原本的性质记录，实际做过和送达的事情则依据执行回执。
 
-memory_context 提供近期对话、作品、已分享记录和相关事件。需要更多背景时，可以通过现有记忆工具读取。计划里的 not_before 和 not_after 表示行动时间窗口，next_review_at 表示下次考虑的时间；这些时间使用 Asia/Singapore。提交变更时使用当前 revision，同一轮对同一个计划沿用同一个版本。next_review_minutes 用来安排下次复评，新事件仍然可以提前唤醒。
+memory_context 提供近期对话、作品、已分享记录和相关事件。需要更多背景时，可以通过现有记忆工具读取。计划里的 not_before 和 not_after 表示行动时间窗口，next_review_at 只安排下次考虑的时间；这些时间使用 Asia/Singapore。窗口已过时，结合当时的目的和当前情况明确更新窗口、放下计划或说明仍要等待什么。执行是否开始、是否成功，以步骤 execution 和成果回执为准：pending 是尚未执行，ready 是已有执行决定，真实运行与完成各有记录。目标、旧等待理由和过去说过正在做的事只提供背景。提交变更时使用当前 revision，同一轮对同一个计划沿用同一个版本。next_review_minutes 用来安排下次复评，新事件仍然可以提前唤醒。
 
 想记日记与反思时，可以写在 understanding 中，并用 basis 的 internal_thought 标明这是自己的想法。recent_reflections 和 today_count 帮你看见已经记过什么，不必为了凑记录重写同一件事。
 
@@ -1483,7 +1483,8 @@ class DeepSeek:
                 # The state/IDs stay structured; the long evidence is summarized
                 # once across this batch, preserving source authority separately.
                 evidence = request_context["new_evidence"]
-                items = [{"id": s["id"], "revision": s.get("revision", 1), "basis": s.get("authority", "inferred"), "text": dumps({k:s[k] for k in ("text", "occurred_at", "received_at") if k in s})} for s in evidence]
+                from .dialogue import DIALOGUE_IDENTITY_FIELDS
+                items = [{"id": s["id"], "revision": s.get("revision", 1), "basis": s.get("authority", "inferred"), "text": dumps({k:s[k] for k in ("text", "occurred_at", "received_at", *DIALOGUE_IDENTITY_FIELDS) if k in s})} for s in evidence]
                 memory_data = request_context["memory_context"]
                 # These are complete decision records, not the entire work/share
                 # ledger. Summarize long latest interactions in the same request.
@@ -1503,10 +1504,10 @@ class DeepSeek:
                         items.append({"id": "dimension:" + dimension, "text": value.pop("reason"), "basis": "inferred"})
                 for index, dialogue in enumerate(request_context.get("recent_dialogue", [])):
                     items.append({"id": "dialogue:" + str(index), "text": dumps(dialogue), "basis": "documented"})
-                request_context["recent_dialogue"] = [{k: v for k, v in dialogue.items() if k in {"id", "source_id", "role", "occurred_at", "received_at"}}
+                request_context["recent_dialogue"] = [{k: v for k, v in dialogue.items() if k in {"id", "source_id", "role", "occurred_at", "received_at", *DIALOGUE_IDENTITY_FIELDS}}
                                                      for dialogue in request_context.get("recent_dialogue", [])]
                 request_context["new_evidence"] = [{k: v for k, v in source.items() if k != "text"} for source in evidence]
-                memory_data["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt") if k in e} for e in memory_data["pending_events"]]
+                memory_data["pending_events"] = [{k: e[k] for k in ("seq", "id", "kind", "at", "source_id", "receipt", *DIALOGUE_IDENTITY_FIELDS) if k in e} for e in memory_data["pending_events"]]
                 for kind in ("works", "shares"):
                     memory_data[kind] = [{k: e[k] for k in ("id", "kind", "at", "revision", "state", "source_id") if k in e} for e in memory_data[kind]]
                 memory_data["graph_candidates"] = [{k:e[k] for k in ("id","kind","revision","content_version","owner_id","basis","source_ids","needs_review","share_coverage") if k in e} for e in memory_data.get("graph_candidates",[])]
@@ -1802,7 +1803,7 @@ class NativeReview(DeepSeek):
         # The main session already loads the approved persona once as stable instructions.
         # Whether an idle assessment may start something is said in SYSTEM, for every provider: it
         # used to be said here only, and assessments run on DeepSeek (2026-09-27).
-        return super()._system(context, None) + "\n本轮由隔离后台评估，实际模型以宿主profile为准。recipient_targets是已绑定目的地；统一心跳只思考一次，可以选择小光、一一、家庭群或不说话。wishes和sharing可写recipient_person_id，分别保留偏好与分享状态；也可推进已有计划或探索，不必每个人都联系。日记和活动均可选择不做，日记的写法见上；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
+        return super()._system(context, None) + "\n本轮由隔离后台评估，实际模型以宿主profile为准。recipient_targets是已绑定目的地；统一心跳只思考一次，可以选择小光、一一、家庭群或不说话。wishes、sharing和plan_changes可写recipient_person_id，按原请求的发言主体和目的地选择归属；跨对象共享记忆仍保留各人的身份。action_decisions按已有计划id沿用其归属，同轮新建计划用key指代时也填写recipient_person_id；也可推进已有计划或探索，不必每个人都联系。日记和活动均可选择不做，日记的写法见上；长久惦记放入 concerns，活动安排放入 plan_changes。没有新想法时相应字段可以留空。人格、记忆和情绪沿原来源关联；重读日记、内部评估或背景注入不是新互动，不重复增加成长依据。"
 
     def request_profile(self, context):
         return {**super().request_profile(context), "parameters": self.profile}
@@ -1817,9 +1818,19 @@ class NativeReview(DeepSeek):
         # Shared semantic contracts may name their API submission tool. A native
         # turn delivers that same schema as its final, without an invented tool.
         system += "\n最终JSON即本轮提交；需要背景时用只读记忆工具召回。本线程的背景由本轮资料和召回结果提供。"
-        if hasattr(self, "engine"):
+        if name == "repair_appraisal" and getattr(self, "appraisal_request_schema", None) is not None:
+            # The repair answers the exact contract of the failed main call,
+            # including its offered sections and projected schema overrides.
+            schema = self.appraisal_request_schema
+        elif hasattr(self, "engine"):
             from eventmem.core.prompts import project_schema
             schema = project_schema("assessment/" + name + "/schema", schema, self.engine.db.root)
+        if name == "submit_appraisal":
+            self.appraisal_request_schema = deepcopy(schema)
+        elif name == "repair_appraisal" and "proposal" in context:
+            # Validation sees decoded dictionaries, while a native final uses
+            # entry arrays. Preserve values, but show the repair its wire form.
+            context = {**context, "proposal": encode_strict(schema, context["proposal"])}
         # Three parts for `_kin/assess` (WS4): the standing contract (instructions and fixed
         # definitions), the dynamic context, and the schema object, which travels only as
         # outputSchema and is never pasted into the input. `system` repeats the contract for the
@@ -2910,7 +2921,20 @@ class Appraisals:
                     # The host's own record of the plan view this attempt shows the model.
                     # Decisions are checked against it at commit, step by step.
                     data["plan_view"] = shown_plans.pop("manifest")
-                    model_context["recipient_targets"] = getattr(self.mind, "unified_targets", {})
+                    # One assessment can choose any bound recipient. Read each agenda and
+                    # its execution fence together, rather than committing it in the
+                    # default recipient's context.
+                    data["recipient_plan_views"] = {recipient.current(): data["plan_view"]}
+                    agendas = {}
+                    for person, target in getattr(self.mind, "unified_targets", {}).items():
+                        if person == recipient.current():
+                            agenda = shown_plans
+                        else:
+                            with recipient.target_scope(self.mind, person):
+                                agenda = AutonomousPlans(self.mind).read(limit=40, manifest=True)
+                            data["recipient_plan_views"][person] = agenda.pop("manifest")
+                        agendas[person] = {**target, "plans": agenda["plans"]}
+                    model_context["recipient_targets"] = agendas
                     model_context["autonomy_context"] = {"semantic_actions": True,
                         "plans_enabled": settings["autonomous_plans"], "creation_enabled": settings["creative_execution"],
                         "procedure_learning": settings["procedure_learning"],
@@ -3391,26 +3415,43 @@ class Appraisals:
                     if settings["autonomous_plans"] and not historical and not new_interaction:
                         from .plans import AutonomousPlans
                         plans = AutonomousPlans(self.mind)
-                        shown = dict(data.get("plan_view") or {})
-                        shown["plans"] = dict(shown.get("plans", {}))
+                        views = {person: {**value, "plans": dict(value.get("plans", {}))}
+                                 for person, value in (data.get("recipient_plan_views") or
+                                     {recipient.current(): data.get("plan_view") or {}}).items()}
+                        shown = views[recipient.current()]
 
-                        def same_plan(value):
+                        def plan_person(value, explicit=None):
+                            people = {c.recipient_person_id or recipient.current() for c in proposal.plan_changes
+                                      if c.action == "create" and c.key == value}
+                            if not explicit and len(people) > 1:
+                                raise Conflict("Plan key needs recipient_person_id")
+                            return plans.recipient_for(conn, value, explicit or next(iter(people), None))
+
+                        def same_plan(value, person=None):
                             try:
-                                return plans._target(conn, value)["id"]
+                                with recipient.target_scope(self.mind, person or plan_person(value)):
+                                    return plans._target(conn, value)["id"]
                             except Missing:
                                 return value
 
                         def on_changed_plan(decision):
-                            named = {decision.plan_id, same_plan(decision.plan_id)}
-                            return any(named & ({c.id, c.key, "plan_" + digest([self.mind.scope.key(), c.desire_id or c.key])[:32]}
-                                                | ({same_plan(c.id)} if c.id else set())) for c in proposal.plan_changes)
+                            person = plan_person(decision.plan_id, decision.recipient_person_id)
+                            named = {decision.plan_id, same_plan(decision.plan_id, person)}
+                            for change in proposal.plan_changes:
+                                target = plan_person(change.id, change.recipient_person_id)
+                                with recipient.target_scope(self.mind, target):
+                                    identifier = change.id or "plan_" + digest(recipient.key([self.mind.scope.key(), change.desire_id or change.key]))[:32]
+                                if target == person and named & {change.id, change.key, identifier}:
+                                    return True
+                            return False
 
                         def autonomous_execute(decision):
                             # A target that cannot be read is not known to be harmless.
                             if decision.action != "execute":
                                 return False
                             try:
-                                plan = plans._target(conn, decision.plan_id)
+                                with recipient.target_scope(self.mind, plan_person(decision.plan_id, decision.recipient_person_id)):
+                                    plan = plans._target(conn, decision.plan_id)
                             except Missing:
                                 return True
                             step = next((s for s in plan["steps"] if s["id"] == decision.step_id), None)
@@ -3420,11 +3461,16 @@ class Appraisals:
 
                         def apply_plan_changes():
                             # The recorded view follows the changes only if all of them apply.
-                            view = {**shown, "plans": dict(shown["plans"])}
+                            updated = {person: {**view, "plans": dict(view["plans"])} for person, view in views.items()}
                             for index, change in changes:
-                                changed = plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
-                                plans.refresh_view(conn, view, changed, eid + ":plan:" + str(index))
-                            shown["plans"] = view["plans"]
+                                person = plan_person(change.id, change.recipient_person_id)
+                                if person not in updated:
+                                    raise Missing("Plan recipient was not shown in this assessment")
+                                with recipient.target_scope(self.mind, person):
+                                    changed = plans.change(conn, change, eid + ":plan:" + str(index), allowed=list(semantic_refs.values()), receipt=receipt)
+                                    plans.refresh_view(conn, updated[person], changed, eid + ":plan:" + str(index))
+                            for person, view in updated.items():
+                                views[person]["plans"] = view["plans"]
                         if changes:
                             section("plan_changes", apply_plan_changes)
                         decisions = [d for _, d in hold("action_decisions", proposal.action_decisions, {"plan_changes": on_changed_plan, "habits": autonomous_execute})]
@@ -3432,8 +3478,17 @@ class Appraisals:
                         def apply_action_decisions():
                             # A decision is fenced by the step and basis the model was shown, not by its
                             # expected_revision alone. One that lost that fence is held, not raised.
-                            held_decisions.extend(plans.decide_batch(conn, decisions, eid + ":decision:", receipt, list(semantic_refs.values()),
-                                shown, version=effective_version, job_id=row["id"]))
+                            grouped = {}
+                            for decision in decisions:
+                                person = plan_person(decision.plan_id, decision.recipient_person_id)
+                                if person not in views:
+                                    raise Missing("Plan recipient was not shown in this assessment")
+                                grouped.setdefault(person, []).append(decision)
+                            for person, selected in grouped.items():
+                                prefix = eid + ":decision:" + (person + ":" if person != recipient.current() else "")
+                                with recipient.target_scope(self.mind, person):
+                                    held_decisions.extend(plans.decide_batch(conn, selected, prefix, receipt, list(semantic_refs.values()),
+                                        views[person], version=effective_version, job_id=row["id"]))
                         if decisions:
                             section("action_decisions", apply_action_decisions)
                         review_targets = data.get("plan_review_targets") or ([data["plan_review_target"]] if data.get("plan_review_target") else [])
@@ -3671,7 +3726,7 @@ class Appraisals:
                         # the enrichment job. A follow-up never queues another: its own refusals are only recorded.
                         review_id = "review_" + digest([row["id"], FOLLOW_UP])[:32]
                         conn.execute("INSERT OR IGNORE INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
-                            (review_id, self.mind.scope.key(), "pending", time.time(), dumps({"evidence_ids": data["evidence_ids"],
+                            (review_id, self.mind.scope.key(), "pending", time.time(), dumps({"recipient_person_id": recipient.current(), "evidence_ids": data["evidence_ids"],
                                 "agent_version": effective_version, "origin": "reflection", "stimulus": FOLLOW_UP, "parent_id": row["id"],
                                 # A dropped memory item, and an audited section, are only recorded: no follow-up restates them.
                                 "section_review": {"rejected_sections": [r for r in rejected if "item" not in r and r["section"] not in AUDIT_SECTIONS],

@@ -8,7 +8,7 @@ from eventmem.core.engine import root_id
 from eventmem.core.retrieval import tokens
 
 from .context import INJECTION_CEILING as CEILING, Contexts
-from .dialogue import RECENT_EXCHANGES, dialogue_rows, is_public_dialogue, redundant_public_summaries, split_recent, utc_time
+from .dialogue import DIALOGUE_IDENTITY_FIELDS, RECENT_EXCHANGES, dialogue_identity, dialogue_rows, is_public_dialogue, redundant_public_summaries, split_recent, utc_time
 from .memory import MemoryContinuity
 from .session_advice import latest as latest_advice
 
@@ -61,7 +61,7 @@ class SessionCheckpoint:
             if not event.get("text") or event.get("kind") == "delivery" and event.get("state") != "accepted":
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
-            identity = (role, event["text"])
+            identity = (role, dialogue_identity(event), event["text"])
             previous = texts.get(identity)
             duplicate_receipt = role == "assistant" and previous and previous["kind"] != event["kind"] and abs((datetime.fromisoformat(previous["at"].replace("Z", "+00:00")) - datetime.fromisoformat(event["at"].replace("Z", "+00:00"))).total_seconds()) < 30
             if duplicate_receipt:
@@ -94,7 +94,7 @@ class SessionCheckpoint:
                           "occurred_at": utc_time(event["at"]), "received_at": utc_time(received_at),
                           "sourceId": event.get("source_id", event["id"]), "basis": "owner-statement" if role == "user" else "public-output",
                           "delivery": event.get("state") if event["kind"] == "delivery" else "not-confirmed-by-this-record",
-                          **{k:event[k] for k in ("speaker_person_id","recipient_person_id","conversation_key","conversation_kind","chat_id","actor") if k in event}})
+                          **{k:event[k] for k in ("channel", *DIALOGUE_IDENTITY_FIELDS) if k in event}})
         items.reverse()
         items, _ = split_recent(items, exchanges=8)
         linked, watermarks = None, None
@@ -219,7 +219,7 @@ class SessionCheckpoint:
         # routing and business state. Measuring only old dialogue text can choose
         # the original-history branch even when that full payload exceeds 8k.
         if older and (restore_capacity is not None or tokens(dumps(self.payload({**checkpoint, 'items': raw}))) + 180 > budget):
-            items = [{"id": i["id"], "revision": i["revision"], "text": dumps({k: i[k] for k in ("role", "text", "at", "delivery", "speaker_person_id", "recipient_person_id", "conversation_key", "conversation_kind", "chat_id", "sourceId") if k in i}), "basis": i["basis"], "facts": {}, "dependencies": i.get("dependencies", [])} for i in older]
+            items = [{"id": i["id"], "revision": i["revision"], "text": dumps({k: i[k] for k in ("role", "text", "at", "delivery", "channel", "sourceId", *DIALOGUE_IDENTITY_FIELDS) if k in i}), "basis": i["basis"], "facts": {}, "dependencies": i.get("dependencies", [])} for i in older]
             instruction = TEXTURE_INSTRUCTION if settings.get('checkpoint_texture') is True else FACTS_INSTRUCTION
             # Native headroom permits carrying essential state and recent turns;
             # it is not a request to fill that room with all old dialogue. Give
@@ -303,7 +303,7 @@ class SessionCheckpoint:
         return {'kind': 'internal-continuity-checkpoint', 'marker': 'kin-checkpoint:restore:' + 'f' * 64,
                 'checkpointId': checkpoint.get('id', 'checkpoint:' + 'f' * 64),
                 'conversationId': checkpoint['conversationId'], 'generation': checkpoint['generation'], 'configVersion': checkpoint['configVersion'],
-                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at', 'occurred_at', 'received_at', 'speaker_person_id', 'recipient_person_id', 'conversation_key', 'conversation_kind', 'chat_id', 'sourceId', 'delivery') if k in item} for item in checkpoint['items']],
+                'scope': checkpoint['scope'], 'publicHistory': [{k: item[k] for k in ('id', 'role', 'text', 'at', 'occurred_at', 'received_at', 'channel', 'sourceId', 'delivery', *DIALOGUE_IDENTITY_FIELDS) if k in item} for item in checkpoint['items']],
                 'tasks': [{k: task[k] for k in ('id', 'inputVersion', 'status', 'goal', 'summary', 'acceptance', 'remaining', 'result') if k in task} for task in checkpoint.get('tasks', [])],
                 'inputStates': [{k: item[k] for k in ('id', 'state', 'taskId') if k in item} for item in selected.values()],
                 **({'businessState':checkpoint['businessState']} if checkpoint.get('businessState') else {}),

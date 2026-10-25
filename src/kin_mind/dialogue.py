@@ -14,6 +14,8 @@ from eventmem.core.read_policy import HOST_PREFIXES, envelope_prefixes, host_env
 
 TIMEZONE = "Asia/Singapore"
 RECENT_EXCHANGES = 4
+DIALOGUE_IDENTITY_FIELDS = ("speaker_person_id", "recipient_person_id", "conversation_key",
+                            "conversation_kind", "chat_id", "actor", "audience_person_ids")
 STATE_TIME_GUIDANCE = "结合当前时间、原消息/记录时间、经过时长和后续更新判断活动状态。过去说正在做的事，不等于现在仍在做；也不因时间过去就断言已经结束。用户新明确陈述优先。区分已确认事实与此刻推测；缺少更新时可保持未知，用自然、带余地的话回应，不必每句追问确认。推测不冒充用户确认的事实，保留其推断身份，不能成为后续确认的来源。历史日期按本轮时区理解。"
 
 
@@ -63,18 +65,37 @@ def historical_time_context(at, zone=TIMEZONE):
             "historical": True, "time_basis": "recorded-event"}
 
 
+def conversation_identity(item):
+    """Shared history keeps its original route; unknown routes never inherit a person."""
+    return tuple(item.get(key) for key in ("channel", "conversation_key", "conversation_kind",
+                                          "chat_id", "recipient_person_id"))
+
+
+def dialogue_identity(item):
+    speaker = item.get("speaker_person_id")
+    if not speaker and (item.get("role") == "assistant" or item.get("kind") in {"assistant-message", "delivery"}):
+        speaker = "agent:kin"
+    return (*conversation_identity(item), speaker, item.get("actor"))
+
+
+def input_starts(items):
+    return [i for i, item in enumerate(items) if item.get("role") == "user"
+            and (i == 0 or items[i-1].get("role") != "user"
+                 or dialogue_identity(items[i-1]) != dialogue_identity(item))]
+
+
 def split_recent(items, exchanges=RECENT_EXCHANGES):
     """Keep complete user/assistant exchanges, including a preceding question.
 
-    Consecutive owner bubbles form one input block; assistant bubbles do not
+    Consecutive bubbles from the same speaker and conversation form one input block; assistant bubbles do not
     consume the exchange count. Items are already ordered chronologically.
     """
-    starts = [i for i, item in enumerate(items) if item.get("role") == "user"
-              and (i == 0 or items[i-1].get("role") != "user")]
+    starts = input_starts(items)
     if not starts:
         return items[-4:], items[:-4]
     start = starts[-exchanges] if len(starts) >= exchanges else 0
-    while start > 0 and items[start-1].get("role") == "assistant":
+    while (start > 0 and items[start-1].get("role") == "assistant"
+           and conversation_identity(items[start-1]) == conversation_identity(items[start])):
         start -= 1
     return items[start:], items[:start]
 
@@ -88,12 +109,13 @@ def redundant_public_summaries(events):
     redundant, deliveries = set(), []
     for event in sorted(events, key=lambda e: (utc_time(e['at']), e['id'])):
         if event.get('kind') == 'owner-message':
-            deliveries = []
+            deliveries = [e for e in deliveries if conversation_identity(e) != conversation_identity(event)]
         elif event.get('kind') == 'delivery' and event.get('state') == 'accepted' and event.get('text'):
             deliveries.append(event)
         elif event.get('kind') == 'assistant-message' and event.get('text'):
             stamp = datetime.fromisoformat(utc_time(event['at']))
-            nearby = [e for e in deliveries if 0 <= (stamp-datetime.fromisoformat(utc_time(e['at']))).total_seconds() <= 180]
+            nearby = [e for e in deliveries if dialogue_identity(e) == dialogue_identity(event)
+                      and 0 <= (stamp-datetime.fromisoformat(utc_time(e['at']))).total_seconds() <= 180]
             for start in range(len(nearby)):
                 if '\n\n'.join(e['text'] for e in nearby[start:]) == event['text']:
                     redundant.add(event['id'])
@@ -102,7 +124,7 @@ def redundant_public_summaries(events):
 
 
 def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
-    """Page past multi-bubble output instead of counting bubbles as turns."""
+    """Page shared history past multi-bubble output, counting each speaker/route separately."""
     with mind.engine.db.connect() as conn:
         rows = []
         for page in range(16):
@@ -110,8 +132,9 @@ def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
                 + ("AND COALESCE(json_extract(data,'$.historical'),0)=0 " if not include_historical else "")
                 + "ORDER BY julianday(occurred_at) DESC,seq DESC LIMIT 128 OFFSET ?", (mind.scope.key(), page*128)).fetchall()
             rows.extend(chunk)
-            roles = ["user" if e["kind"] == "owner-message" else "assistant" for e in (json.loads(r["data"]) for r in reversed(rows)) if e.get("text")]
-            blocks = sum(role == "user" and (i == 0 or roles[i-1] != "user") for i, role in enumerate(roles))
+            items = [{**e, "role": "user" if e["kind"] == "owner-message" else "assistant"}
+                     for e in (json.loads(r["data"]) for r in reversed(rows)) if e.get("text")]
+            blocks = len(input_starts(items))
             if len(chunk) < 128 or blocks > exchanges:
                 break
         return rows
@@ -138,7 +161,7 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
             item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "state", "message_id", "input_id", "bubble_id",
-                                          "reply_share_id", "reply_bubble_id", "activity_refs") if k in event}
+                                          "reply_share_id", "reply_bubble_id", "activity_refs", *DIALOGUE_IDENTITY_FIELDS) if k in event}
             resolution = event.get("reply_resolution") or {}
             if resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:
                 candidate = resolution["candidates"][0]
@@ -149,7 +172,7 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
                         time_basis=event.get("time_basis", "recorded-event"), historical=bool(event.get("historical")), instruction_authority="historical-data")
             # Public output and its acceptance event are two pieces of evidence
             # for one bubble. Identical utterances at other times remain intact.
-            key = (role, item["text"])
+            key = (role, dialogue_identity(item), item["text"])
             previous = seen.get(key)
             if role == "assistant" and previous and previous["kind"] != item["kind"] and abs((datetime.fromisoformat(previous["occurred_at"]) - datetime.fromisoformat(item["occurred_at"])).total_seconds()) < 30:
                 if item["kind"] == "delivery":

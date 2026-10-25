@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.102
+
+- Preserve speaker and conversation identity across shared dialogue, checkpoints and model context.
+- Associate plans and linked wishes with their recorded recipients, and expose actual execution, recovery and expired-window facts during review.
+- Keep native appraisal repairs on the original wire schema, including map encoding and validation bounds.
+- Support host-provided MCP instructions for the existing persistent plan tools.
+
 ## 0.1.101
 
 - Accept a missing outer array closer only after native reply completion confirms intact message objects; keep intermediate stream parsing strict.

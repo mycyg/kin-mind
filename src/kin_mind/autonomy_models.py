@@ -22,6 +22,8 @@ class PlanStep(Model):
 
 class PlanChange(Model):
     action: Literal["create", "update", "pause", "resume", "reschedule", "cancel"]
+    recipient_person_id: Literal["person:xiaoguang", "person:yiyi", "group:family"] | None = Field(
+        default=None, description="Recipient of this request or goal; choose explicitly when creating from a shared review. Existing stable IDs keep their stored recipient.")
     id: str | None = None
     key: str | None = Field(default=None, max_length=160)
     expected_revision: int | None = Field(default=None, ge=1)
@@ -58,6 +60,8 @@ class PlanChange(Model):
 
 class ActionDecision(Model):
     plan_id: str = Field(min_length=1, max_length=160)
+    recipient_person_id: Literal["person:xiaoguang", "person:yiyi", "group:family"] | None = Field(
+        default=None, description="Recipient owning the plan; disambiguates a new plan key in a shared review. Existing stable IDs keep their stored recipient.")
     step_id: str = Field(min_length=1, max_length=100)
     expected_revision: int = Field(ge=1)
     action: Literal["execute", "wait", "abandon", "owner_accepted", "owner_completed", "owner_declined"]

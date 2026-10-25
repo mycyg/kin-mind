@@ -144,8 +144,30 @@ class AutonomousPlans:
                                expected=manifest[moved["record_id"]], actual=moved["revision"])
         return refs
 
+    def recipient_for(self, conn, id=None, recipient_person_id=None):
+        """Stable identities keep their stored owner, including legacy X plans.
+
+        A key is only meaningful inside a recipient context; it never resolves an
+        existing plan across recipients. Explicit ownership is not a migration.
+        """
+        if id:
+            row = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND id=?", (self.scope, id)).fetchone()
+            if row:
+                from .companions import XIAOGUANG
+                owner = json.loads(row[0]).get("recipient_person_id", XIAOGUANG)
+                if recipient_person_id is not None and recipient_person_id != owner:
+                    raise Conflict("A plan's recipient cannot be changed", target=id,
+                                   expected=owner, actual=recipient_person_id)
+                return owner
+        return recipient_person_id or recipient.current()
+
     def change(self, conn, proposal, command, *, allowed=None, receipt=None):
         p = PlanChange.model_validate(proposal)
+        person = self.recipient_for(conn, p.id if p.action != "create" else None, p.recipient_person_id)
+        with recipient.target_scope(self.mind, person):
+            return self._change(conn, p, command, allowed=allowed, receipt=receipt)
+
+    def _change(self, conn, p, command, *, allowed=None, receipt=None):
         refs = self._refs(conn, p.evidence_ids, allowed)
         if p.desire_id:
             linked = self.mind._load(conn)["desires"].get(p.desire_id)
@@ -223,15 +245,17 @@ class AutonomousPlans:
 
     def manage(self, request):
         command = request["command_id"]
-        key = "plan_command_" + digest(recipient.key([self.scope, command]))[:32]
+        raw = PlanChange.model_validate({k: v for k, v in request.items() if k != "command_id"})
         with self.engine.db.connect(write=True) as conn:
-            prior = conn.execute("SELECT result FROM commands WHERE id=?", (key,)).fetchone()
-            if prior:
-                return json.loads(prior[0])
-            raw = PlanChange.model_validate({k: v for k, v in request.items() if k != "command_id"}).model_dump()
-            plan = self.change(conn, raw, command)
-            conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, "", dumps(plan)))
-            return plan
+            person = self.recipient_for(conn, raw.id if raw.action != "create" else None, raw.recipient_person_id)
+            with recipient.target_scope(self.mind, person):
+                key = "plan_command_" + digest(recipient.key([self.scope, command]))[:32]
+                prior = conn.execute("SELECT result FROM commands WHERE id=?", (key,)).fetchone()
+                if prior:
+                    return json.loads(prior[0])
+                plan = self.change(conn, raw, command)
+                conn.execute("INSERT INTO commands VALUES(?,?,?)", (key, "", dumps(plan)))
+                return plan
 
     def defer_owner_task(self, request):
         """N10, the plan side. An owner task Kin chose to do later becomes her own plan: the router
@@ -666,14 +690,48 @@ class AutonomousPlans:
                 plan["needs_review"] = not self.mind._fresh(conn, plan["evidence"])
                 for step in plan["steps"]:
                     step["waiting_reason"] = self.waiting_reason(conn, plan, step, state)
+                    step["execution"] = self._execution_view(conn, plan, step, state)
+                    now = timestamp(self.mind.clock())
+                    window = "expired" if step.get("not_after") and timestamp(step["not_after"]) <= now else (
+                        "not_open" if step.get("not_before") and timestamp(step["not_before"]) > now else
+                        "open" if step.get("not_before") or step.get("not_after") else "unbounded")
+                    step["execution_window"] = {"state": window,
+                        "review_required": window == "expired" and plan["status"] == "active" and step["state"] not in {"completed", "abandoned"}}
                 if history:
                     plan["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_plan_history WHERE id=? ORDER BY revision", (plan["id"],))]
             # Same snapshot as the plans themselves, so it describes exactly what is returned.
             shown = self.manifest(conn, plans) if manifest else None
         # The page size the query used, not the one asked for (K2-07).
-        result = {"plans": plans, "next_cursor": cursor + taken if len(plans) == min(100, max(1, limit)) and not identifier else None,
+        from .decision_context import PLAN_STATE_MEANINGS
+        result = {"plans": plans, "state_meanings": PLAN_STATE_MEANINGS,
+                  "next_cursor": cursor + taken if len(plans) == min(100, max(1, limit)) and not identifier else None,
                   "timezone": "Asia/Singapore"}
         return {**result, "manifest": shown} if manifest else result
+
+    def _execution_view(self, conn, plan, step, state):
+        """Read ledger facts without treating a goal, decision or lease as completed work."""
+        receipts = step.get("receipts", [])
+        run_id = step.get("run_id") or next((r["run_id"] for r in reversed(receipts) if r.get("run_id")), None)
+        run = None
+        if run_id:
+            row = conn.execute("SELECT * FROM mind_plan_runs WHERE scope=? AND plan_id=? AND step_id=? AND id=?",
+                               (self.scope, plan["id"], step["id"], run_id)).fetchone()
+            run = {"id": run_id, "found": row is not None}
+            if row:
+                data = json.loads(row["data"])
+                run.update(state=row["state"], lease_until=row["lease_until"], fence=row["fence"],
+                           lease_status="active" if row["state"] == "running" and row["lease_until"] > time.time() else
+                                        "expired" if row["state"] == "running" else "released",
+                           claimed_at=data.get("started_at"), execution_started_at=data.get("execution_started_at"),
+                           finished_at=data.get("finished_at"), recovery_reason=data.get("reason"),
+                           checkpoint_retained=data.get("checkpoint_retained", False))
+        did = step.get("desire_id") or (plan.get("desire_id") if len(plan["steps"]) == 1 else None)
+        wish = self.mind._desire(conn, state, did) if did else None
+        return {"plan_run": run,
+                "linked_wish": {"id": did, "status": wish.get("status") if wish else None} if did else None,
+                "receipt_count": len(receipts),
+                "latest_outcome": {k: v for k, v in receipts[-1].items() if k in
+                    {"id", "run_id", "state", "status", "complete", "verified", "source_id", "message_id", "reason", "checkpoint_retained"}} if receipts else None}
 
     def _source_state(self, conn, ref):
         """What freshness of this evidence rests on: a later state of it is a different fact."""
@@ -808,8 +866,8 @@ class AutonomousPlans:
             if not row or row["owner"] != owner or row["fence"] != fence:
                 raise Conflict("Execution fence mismatch", target=run_id)
             run = json.loads(row["data"])
-            if row["state"] != "running" and not run.get("execution_started_at"):
-                raise Conflict("Execution is no longer running", target=run_id)
+            if not run.get("execution_started_at") and (row["state"] != "running" or row["lease_until"] <= time.time()):
+                raise Conflict("Execution lease expired or is no longer running", target=run_id)
             plan = self.get(conn, row["plan_id"])
             step = next(s for s in plan["steps"] if s["id"] == row["step_id"])
             key = run.get("energy_activity_id") or "plan:" + digest([plan["id"], step["id"], step["goal"], step["completion"]])[:40]
@@ -1038,10 +1096,12 @@ class AutonomousPlans:
     def linked_ready(self, conn, desire, state=None):
         if not desire.get("plan_id"):
             return True
-        plan = self.get(conn, desire["plan_id"])
-        step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
-        return bool(step and step.get("decision", {}).get("id") == desire.get("plan_decision_id")
-                    and not self.waiting_reason(conn, plan, step, state))
+        from .companions import XIAOGUANG
+        with recipient.target_scope(self.mind, desire.get("recipient_person_id", XIAOGUANG)):
+            plan = self.get(conn, desire["plan_id"])
+            step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
+            return bool(step and step.get("decision", {}).get("id") == desire.get("plan_decision_id")
+                        and not self.waiting_reason(conn, plan, step, state))
 
     def settle_linked(self, conn, desire, receipt):
         if not desire.get("plan_id"):

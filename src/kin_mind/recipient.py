@@ -1,7 +1,35 @@
 """Trusted operational recipient; never a second memory scope or affect state."""
 from .companions import XIAOGUANG
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+OPERATIONAL_TARGET = ContextVar('kin_operational_target', default=None)
+
+@contextmanager
+def target_scope(mind, person=None):
+    """Select operational ownership while keeping the same shared memory store.
+
+    The conversation is context, not a delivery address. Actual delivery still
+    resolves the recipient through the host's bound directory.
+    """
+    person = person or current()
+    if person not in {'person:xiaoguang', 'person:yiyi', 'group:family'}:
+        raise ValueError('Unknown operational recipient')
+    if person == current():
+        yield
+        return
+    # A plan transaction changes ownership only. Constructing CompanionView
+    # here would initialize its tables through a second database connection
+    # while this transaction already holds the write lock.
+    token = OPERATIONAL_TARGET.set(person)
+    try:
+        yield
+    finally:
+        OPERATIONAL_TARGET.reset(token)
 
 def current():
+    if OPERATIONAL_TARGET.get() is not None:
+        return OPERATIONAL_TARGET.get()
     from .companion_view import ACTIVE_VIEW
     view = ACTIVE_VIEW.get()
     return view.person if view else XIAOGUANG

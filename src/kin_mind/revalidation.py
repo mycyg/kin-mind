@@ -32,7 +32,7 @@ from eventmem.core.retrieval import tokens
 from . import erasure
 from . import manifest as manifests
 from .conflicts import reusable
-from .dialogue import clock_context
+from .dialogue import DIALOGUE_IDENTITY_FIELDS, clock_context
 
 # Light attempts one stored proposal may spend before the next attempt judges afresh.
 LIGHT_LIMIT = 2
@@ -804,7 +804,7 @@ def _request(jobs, data, context, stored, entries):
         "commit_conflict": {k: stored.conflict[k] for k in ("code", "expected", "actual") if k in stored.conflict},
         "stored_proposal": stored.proposal,
         "conflicts": [e["public"] for e in entries],
-        "recent_dialogue": [{k: item[k] for k in ("role", "kind", "text", "occurred_at", "received_at", "channel", "seq") if k in item}
+        "recent_dialogue": [{k: item[k] for k in ("role", "kind", "text", "occurred_at", "received_at", "channel", "seq", *DIALOGUE_IDENTITY_FIELDS) if k in item}
                             for item in context.get("recent_dialogue") or []]})
 
 

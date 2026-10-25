@@ -198,6 +198,10 @@ REGISTRY = {
     "Linked concern requires review": ("runtime", "reference-needs-review", "reuse"),
     # --- plans.py ---
     "Plan is missing or outside this scope": ("semantic", "plan-unknown", "section"),
+    "A plan's recipient cannot be changed": ("semantic", "plan-recipient-mismatch", "section"),
+    "Plan key needs recipient_person_id": ("semantic", "plan-recipient-ambiguous", "section"),
+    "Plan recipient was not shown in this assessment": ("semantic", "plan-recipient-not-shown", "section"),
+    "Execution lease expired or is no longer running": ("runtime", "execution-lease-lost", "block"),
     "Plan evidence needs review": ("runtime", "cited-evidence-not-current", "reuse"),
     "Plan uses evidence not supplied to this evaluation": ("semantic", "evidence-out-of-bounds", "block"),
     "Plan evidence changed after it was supplied": ("runtime", "cited-evidence-changed", "reuse"),

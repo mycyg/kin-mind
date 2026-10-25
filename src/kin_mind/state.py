@@ -989,6 +989,14 @@ class Mind(Continuity):
         return compat.holds(stored, compat.stamp(self, conn, state))
 
     def _desire_ready(self, conn, desire, at, *, state=None):
+        # Shared initiative considers every wish. Its plan, sharing permission
+        # and unconfirmed attempts belong to that wish's recipient, not to the
+        # caller currently updating the shared affect state.
+        from .companions import XIAOGUANG
+        with recipient.target_scope(self, desire.get("recipient_person_id", XIAOGUANG)):
+            return self._recipient_desire_ready(conn, desire, at, state=state)
+
+    def _recipient_desire_ready(self, conn, desire, at, *, state=None):
         from .autonomy_schema import enabled
         from .model_runtime import verified_decision
         if enabled(conn, self.scope.key()):

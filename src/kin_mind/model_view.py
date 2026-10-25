@@ -62,7 +62,7 @@ from .evidence_refs import DROPPED, is_ref, trace
 SOURCE_ID = re.compile(r"src_[0-9a-f]{32}")
 RECORD_ID = re.compile(r"mem_[0-9a-f]{32}")
 # The facts of a source's metadata a prompt reads, shown under their own names beside the source.
-SOURCE_FACTS = ("host_event", "role", "exploration_id", "speaker_person_id", "conversation_key",
+SOURCE_FACTS = ("host_event", "role", "exploration_id", "speaker_person_id", "recipient_person_id", "actor", "audience_person_ids", "conversation_key",
                 "conversation_kind", "chat_id", "knowledge_basis", "subject_ids", "participants")
 # A string is parsed only if it names one of these: nothing else can hold what this takes out. Bare
 # words, so JSON carried as text inside JSON (a memory item's line: `"text":"{\"evidence\":...}"`)
@@ -109,8 +109,12 @@ def source_facts(metadata):
     """The facts of a source's metadata a prompt reads (`SOURCE_FACTS`), those it has."""
     if not isinstance(metadata, dict):
         return {}
-    return {key: metadata[key] for key in SOURCE_FACTS
-            if isinstance(metadata.get(key), (str, int, float, bool)) and metadata[key] != ""}
+    facts = {key: metadata[key] for key in SOURCE_FACTS
+             if isinstance(metadata.get(key), (str, int, float, bool)) and metadata[key] != ""}
+    audience = metadata.get("audience_person_ids")
+    if isinstance(audience, list) and all(isinstance(person, str) for person in audience):
+        facts["audience_person_ids"] = list(audience)
+    return facts
 
 
 def index_only(container, key):

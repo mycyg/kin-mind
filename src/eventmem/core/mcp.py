@@ -18,11 +18,14 @@ from .models import (
 from .self_knowledge import AssessmentInput, ClaimInput, PredictionInput, SelfKnowledge
 
 
-def create_mcp(engine):
+DEFAULT_INSTRUCTIONS = "KIN 的统一经历记忆。结果保留人物、来源与时间；按需要沿引用读取原文。"
+
+
+def create_mcp(engine, *, instructions=DEFAULT_INSTRUCTIONS):
     from .prompts import mcp_instructions
     server = FastMCP(
         "Kin Mind",
-        instructions=mcp_instructions("KIN 的统一经历记忆。结果保留人物、来源与时间；按需要沿引用读取原文。", engine.db.root),
+        instructions=mcp_instructions(instructions, engine.db.root),
         streamable_http_path="/",
         stateless_http=True,
         json_response=True,
