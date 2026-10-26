@@ -286,3 +286,33 @@ test('native creator records a real start while running, once across duplicate A
   await creator.run({...input,run:{id:'unknown'}},{onStarted:()=>assert.fail('unknown is not a native start')});await noStart();
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('a creation the host held off before anything ran is interrupted as not-started, never reviewed; the ledger hears how it ended',async()=>{
+ const root=temporary(),log=[];
+ try{
+  const creator=new AutonomousCreator({command:'native-main',root,executions:records(log),nativeRun:async()=>({state:'waiting',reason:'native-runtime'})});
+  const held=await creator.run({plan:{id:'p'},step:{id:'s'},run:{id:'r'},brief:{}});
+  assert.deepEqual([held.state,held.reason],['interrupted','not-started']);
+  // A fork that may have run is not held off.
+  creator.nativeRun=async()=>({state:'waiting',stage:'unknown',receipt:{}});
+  assert.equal((await creator.run({plan:{id:'p'},step:{id:'s'},run:{id:'r2'},brief:{}})).state,'failed');
+  creator.nativeRun=async()=>({state:'waiting',reason:'native-runtime'});
+  const calls=[],ended=[];let notified=0;
+  const worker=startAutonomousWork({loop:{tick:async()=>{},review:()=>assert.fail('the ledger tells Kin')},isBusy:()=>false,creator,notify:()=>{notified++;},
+   beginActivity:spec=>({ok:true,release:outcome=>ended.push([spec.id,outcome])}),
+   call:async(action,input)=>{calls.push([action,input]);if(action==='plan-claim')return {state:'claimed',run:{id:'r3',fence:2},plan:{id:'p'},step:{id:'s'}};return {state:'renewed'};}});
+  await worker.tick();
+  assert.deepEqual(calls.map(([action])=>action),['plan-claim','plan-interrupt']);assert.equal(calls[1][1].reason,'not-started');
+  assert.deepEqual(ended,[['r3',{state:'interrupted',reason:'not-started'}]]);assert.equal(notified,0);
+  // Another creation in the slot holds this one off under its own code.
+  const busy=startAutonomousWork({loop:{tick:async()=>{},review:()=>{}},isBusy:()=>false,creator,beginActivity:()=>({ok:false,reason:'creation-slot-busy'}),
+   call:async(action,input)=>{calls.push([action,input]);return action==='plan-claim'?{state:'claimed',run:{id:'r4',fence:1},plan:{id:'p'}}:{};}});
+  await busy.tick();assert.deepEqual([calls.at(-1)[0],calls.at(-1)[1].reason],['plan-interrupt','creation-slot-busy']);
+  // A settled result: told once, through `notify` (the ledger's), not the creator's own loop review.
+  const settled=startAutonomousWork({loop:{tick:async()=>{},review:()=>assert.fail('the ledger tells Kin')},isBusy:()=>false,creator:{run:async()=>({state:'produced'}),stop(){}},
+   notify:()=>{notified++;},beginActivity:spec=>({ok:true,release:outcome=>ended.push([spec.id,outcome])}),
+   call:async action=>action==='plan-claim'?{state:'claimed',run:{id:'r5',fence:1},plan:{id:'p'}}:action==='plan-result'?{state:'completed'}:{}});
+  await settled.tick();assert.equal(notified,1);assert.deepEqual(ended.at(-1),['r5',{state:'completed'}]);
+  await worker.close();await busy.close();await settled.close();
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

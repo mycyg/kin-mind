@@ -1,11 +1,34 @@
 # Changelog
 
+## 0.1.104
+
+- Kin's own creations start while 小光 is chatting instead of being skipped; a creation held back before it starts is retried up to three times without using the day's allowance.
+- ParallelTasks keeps one ledger of Kin's own long runs (creation now; exploration next): one creation at a time, Kin learns the outcome at its next review, and runs left over from a restart are blocked.
+- Daily limits for self-initiated activity are hard caps: six explorations or plays and three creations a day; work 小光 hands over or defers is neither counted nor capped.
+- When the main session runs on K3/Kimi, exploration and creation forks run on DeepSeek, which also lets creation receipts pass verification again.
+- Interests also grow from topics Kin wants to keep talking about; the "moment" block is present when the memory context is off; delivery facts told once stay told across restarts.
+- A family member's turn is timed by that person's previous message; memes collected from deleted WeChat messages retire; nameless tool prompts are stored under the tool's own name, with a one-time migration of an edited copy; health shows real quarantine reason codes.
+
+## 0.1.103
+
+- Shared-mode turns record Kin's array reply again for the classifier and task results; trailing text after a completed reply array is held as a format failure; inputs settle only through messages to their own speaker; files can name the recipient within the turn.
+- Background parallel tasks close after failure, blocking or cancellation; their finals follow the task's own execution epoch.
+- Deletion reaches group batches, relayed text, collected memes and contact notes; meme trash no longer counts against the caps; long voice replies fall back to text; old audio and exploration workdirs move to the Trash.
+- Exploration drops unsourced citations instead of failing the run, with a token ceiling for main-session runs.
+- Model-visible identities carry person ids and conversation kind only; companion sharing classification is removed; family-group membership changes become context; the family directory and install paths live in the host.
+- Prompt versions record their source input and external reads, with history, restore and owner notices; edited prompts are never overwritten by code defaults and are marked stale when the default moves; persona approval is removed.
+- Paid web search and fetch have per-turn, per-day and per-site budgets, are marked untrusted and are counted per purpose.
+- Assessments are paced, isolated runs use DeepSeek through the host gateway, recoverable quarantines requeue automatically, and rejected maintenance advice settles deterministically; idle contact decisions default to "not now", drafts use a lean snapshot with one alternate-model retry, and auto chat compacts around 120K tokens.
+- Energy recovers after quiet time and has low, normal and high tiers that shape replies, waits and retries; a tired Kin may defer a reply and is reminded once after recovering.
+- New drives: boredom rises while idle and falls with engaging activity; intimacy (with 小光 only) rises over time and falls after a satisfying private moment. Every reply and draft context opens with a "moment" block of energy, boredom and up to three emotional leanings; negative feelings last longer.
+- Kin keeps its own evolving interests and, when bored and rested, may wake its idle review to explore, play, create, chat or rest, within daily limits.
+- Release tooling re-reads the full-suite CI receipt, asks for a reason for partial or fourth-in-a-day releases, keeps failure notices on, and writes one usage ledger read by health and the daily review.
+
 ## 0.1.102
 
-- Preserve speaker and conversation identity across shared dialogue, checkpoints and model context.
-- Associate plans and linked wishes with their recorded recipients, and expose actual execution, recovery and expired-window facts during review.
-- Keep native appraisal repairs on the original wire schema, including map encoding and validation bounds.
-- Support host-provided MCP instructions for the existing persistent plan tools.
+- Keep plan ownership and task completion correct across shared conversations; preserve wish ownership while shared readiness settles, and classify plan errors.
+- Keep appraisal repair proposals on the original wire contract.
+- Let the host describe its memory tool entry workflow.
 
 ## 0.1.101
 
@@ -178,6 +201,15 @@
 - Keep the main conversation responsive while one owned task worker continues, with event-backed progress, revision/cancellation fences, and separately acknowledged public items and final results.
 - Allow optional public text, voice, and inspected MEME expressions through the existing transport queue; preserve private-note boundaries.
 - Reduce repeated automatic note context while preserving original records, provenance, correction links, and full retrieval.
+
+## 0.1.58
+
+- Apply owner-authored chat, contact and background expression prompt updates without changing reply schemas or voice delivery.
+
+## 0.1.57
+
+- Allow background drafts from a model-handoff thread whose native turn history is confirmed empty, without creating a synthetic main-conversation turn.
+- Retain native error, reason and invocation stage in contact failure records.
 
 ## 0.1.55
 

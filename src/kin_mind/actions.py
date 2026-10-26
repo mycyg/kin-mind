@@ -325,11 +325,14 @@ class ActionEvents:
                     if verified_decision(d.get("decision_receipt", {}))
                     and (not semantic or self.mind.decision_current(conn, d.get("decision_receipt", {})))
                 ]
-        # Play waits for the next day once today's explorations are used up (play.py).
-        if any(d.get("exploration_target") == "play" for d in choices):
-            from .play import play_left
-            if not play_left(self.mind):
-                choices = [d for d in choices if d.get("exploration_target") != "play"]
+        # Kin's own explorations, play among them, wait for the next day once today's are used up;
+        # a wish that carries 小光's own step does not (play.left).
+        from .play import play_left
+        with self.mind.engine.db.connect() as conn:
+            owners = {d["id"] for d in choices if AutonomousPlans(self.mind).owner_linked(conn, d)}
+        limited = any(d["id"] not in owners for d in choices) and not play_left(self.mind)
+        if limited:
+            choices = [d for d in choices if d["id"] in owners]
         # A wish whose run ended without a result waits out a pause before its one retry (exploration.py).
         now = timestamp(self.mind.clock())
         pause = lambda d: (d.get("exploration_retry") or {}).get("not_before")
@@ -338,10 +341,11 @@ class ActionEvents:
         if not choices:
             if pausing:
                 return {"state": "waiting", "reason": "exploration-retry-pending", "next_at": min(pausing, key=timestamp)}
-            return {"state": "waiting", "reason": "no-exploration-intent"}
+            return {"state": "waiting", "reason": "daily-limit-reached" if limited else "no-exploration-intent"}
         desire = min(choices, key=lambda d: (-d["strength"], d["created_at"], d["id"]))
         return {
             "state": "ready",
             "desire": desire,
             "revision": view["revision"],
+            **({"origin": "owner"} if desire["id"] in owners else {}),
         }

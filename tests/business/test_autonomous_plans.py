@@ -542,3 +542,58 @@ def test_a_deferral_answers_whether_it_can_ever_be_a_plan(env):
     assert events() == before
 
 
+
+
+def _foreground(mind):
+    from kin_mind.lifecycle import foreground_lease
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS mind_foreground_leases(scope TEXT NOT NULL,session TEXT NOT NULL,"
+                     "expires_at REAL NOT NULL,PRIMARY KEY(scope,session))")
+    foreground_lease(mind.engine, mind.scope.key(), "read:synthetic")
+
+
+def test_kins_own_creation_is_claimed_during_the_owners_chat_and_a_held_off_one_is_ready_again_uncounted(env):
+    """2026-10-26: a foreground session no longer holds a creation's claim. A run the host held off
+    before anything ran goes back to ready on its own decision, a bounded number of times, and is not
+    one of the day's creations."""
+    from kin_mind.play import config, left
+    mind, plans, source, clock, initial = env
+    _foreground(mind)
+    plan = decide(env, create(env))
+    seen = set()
+    for attempt in range(4):
+        claimed = plans.claim("create", "creator-1")
+        assert claimed["state"] == "claimed", attempt
+        run = claimed["run"]
+        assert run["id"] not in seen and "origin" not in run
+        seen.add(run["id"])
+        plans.settle(run["id"], "creator-1", run["fence"], state="interrupted", result={"checkpoint_retained": True, "reason": "not-started"})
+        with mind.engine.db.connect() as conn:
+            assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 3
+    # The fourth hold-off in a row goes to Kin, as any other stop does.
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and [r["reason"] for r in step["receipts"]] == ["not-started"] * 4
+
+
+def test_kins_own_creations_stop_for_the_day_at_the_cap_and_the_owners_go_on(env):
+    from kin_mind.play import config, left
+    mind, plans, source, clock, initial = env
+    with mind.engine.db.connect(write=True) as conn:
+        for index in range(3):
+            conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", ("done-" + str(index), mind.scope.key(), "elsewhere", "s",
+                         "create", "completed" if index else "failed", 0, "creator-0", 1, json.dumps({"started_at": mind.clock()})))
+    decide(env, create(env, key="idea-2"))
+    assert plans.claim("create", "creator-1") == {"state": "waiting", "reason": "daily-limit-reached"}
+    owners = decide(env, create(env, key="owners", steps=[{"id": "make", "actor": "create", "goal": "Make what the owner asked for",
+                                                       "completion": "A verified file is saved", "owner_request_id": "task-1"}]))
+    claimed = plans.claim("create", "creator-1")
+    assert claimed["state"] == "claimed" and claimed["plan"]["id"] == owners["id"] and claimed["run"]["origin"] == "owner"
+    with mind.engine.db.connect() as conn:
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 0
+    clock[0] += timedelta(days=1)
+    with mind.engine.db.connect(write=True) as conn:
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 3
+        for index, origin in enumerate(["owner", None]):
+            conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", ("next-" + str(index), mind.scope.key(), "elsewhere", "s",
+                         "create", "completed", 0, "creator-0", 1, json.dumps({"started_at": mind.clock(), **({"origin": origin} if origin else {})})))
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 2, "the owner's is not one of Kin's three"

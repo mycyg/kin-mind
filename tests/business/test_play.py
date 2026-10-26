@@ -113,6 +113,36 @@ def test_an_erase_takes_an_interest_grown_from_what_it_erases(kin):
         assert {json.loads(row[0])["topic"] for row in conn.execute("SELECT data FROM mind_interests")} == {ERASED}
 
 
+def test_topics_kin_wants_to_keep_talking_about_touch_or_grow_an_interest_from_chat(kin):
+    """An expression intent's continue_topics: an interest one names is touched, once a day; at most one
+    new, fainter interest comes from chat, and it goes with what the appraisal was shown."""
+    from types import SimpleNamespace
+    from kin_mind.appraisal import ExpressionIntent
+    from kin_mind.expression_intent import commit_intent
+    mind, _, _, clock, source = kin
+    said = source("a synthetic chat message")
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute(play.SCHEMA)
+        play._add(conn, mind.scope.key(), mind.clock(), play.config(conn), "天文", 50, "persona")
+    clock[0] += timedelta(days=14)
+
+    def intent(key, *topics):
+        with mind.engine.db.connect(write=True) as conn:
+            commit_intent(SimpleNamespace(mind=mind, conn=conn, state=mind._load(conn), sources=[{"record_id": "rec_synthetic", "revision": 1, "source_id": said}],
+                                          value=ExpressionIntent(stance="想接着聊", continue_topics=[{"topic": t} for t in topics]),
+                                          event_id=key, job_id="job-" + key, receipt={}, version="play-test", stimulus="interaction"))
+    intent("first", "旧地图", "苔藓")
+    intent("touch", "天文望远镜怎么挑")
+    found = live(mind)
+    assert set(found) == {"天文", "旧地图"}, "one new interest at most"
+    assert round(found["天文"]["strength"], 1) == 30.0 and found["天文"]["source"] == "persona"
+    assert (found["旧地图"]["source"], found["旧地图"]["strength"], found["旧地图"]["source_ids"]) == ("chat", play.CHAT_STRENGTH, [said])
+    intent("again", "天文")
+    assert round(live(mind)["天文"]["strength"], 1) == 30.0, "touched once a day"
+    mind.engine.delete(said)
+    assert set(live(mind)) == {"天文"}
+
+
 def bored(monkeypatch, value):
     """The drives module's boredom, as the host's own clock reads it."""
     from kin_mind import drives
@@ -233,7 +263,7 @@ def test_play_waits_for_the_next_day_once_todays_explorations_are_used(kin):
     with mind.engine.db.connect(write=True) as conn:
         for index in range(6):
             conn.execute("INSERT INTO mind_explorations VALUES(?,?,'failed',?,'{}')", ("explore_" + str(index), mind.scope.key(), mind.clock()))
-    assert actions.exploration_candidate()["reason"] == "no-exploration-intent"
+    assert actions.exploration_candidate()["reason"] == "daily-limit-reached"
     clock[0] += timedelta(days=1)
     assert actions.exploration_candidate()["state"] == "ready"
 
@@ -272,3 +302,20 @@ def test_a_completed_creation_touches_the_interests_it_was_about(env, tmp_path):
         play._add(conn, mind.scope.key(), mind.clock(), play.config(conn), "clock", 30, "persona")
     assert accept_result(mind, config, {"run_id": run["id"], "owner": "worker", "fence": 1, "result": result}, Review())["state"] == "completed"
     assert live(mind)["clock"]["strength"] == 35 and live(mind)["clock"]["last_engaged_at"] == mind.clock()
+
+
+def test_kins_own_explorations_of_any_kind_stop_at_the_cap_and_the_owners_do_not_count(kin):
+    mind, memory, actions, clock, source = kin
+    from test_kin_mind import wish
+    wish(mind, source, "look", kind="explore", content="看看手工", topic="手工")
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_state SET data=json_set(data,'$.action_policy',NULL)")
+    Explorations(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        for index in range(6):
+            conn.execute("INSERT INTO mind_explorations VALUES(?,?,'complete',?,?)", ("explore_" + str(index), mind.scope.key(), mind.clock(),
+                         json.dumps({"origin": "owner"} if index == 0 else {})))
+    assert actions.exploration_candidate()["state"] == "ready", "小光's own is not one of Kin's six"
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_explorations VALUES('explore_6',?,'complete',?,'{}')", (mind.scope.key(), mind.clock()))
+    assert actions.exploration_candidate()["reason"] == "daily-limit-reached"

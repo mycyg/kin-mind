@@ -166,3 +166,29 @@ test('a force switch elsewhere does not stale the worker final; a dropped final 
   assert.equal(item.state,'dropped');assert.equal(t.status,'running');
   assert.equal(seen.length,1);assert.ok(seen[0].blockers.includes('final-dropped:stale-expression'));
 });
+
+test('Kin\'s own runs share the ledger: one a mode, none under a freeze, told to Kin once, no words kept, taken back after a restart',async()=>{
+  let frozen=false;const released=[],told=[];
+  const f=fixture({onKinChange:snapshot=>told.push(snapshot)});
+  Object.assign(f.router,{frozen:()=>frozen,beginActivity:({kind,id})=>frozen?{ok:false,reason:'frozen'}:{ok:true,release:()=>released.push(kind+':'+id)}});
+  const one=f.host.beginKin({kind:'creation',id:'run-1'});
+  assert.equal(one.ok,true);assert.equal(f.host.kinBusy('creation'),true);assert.equal(f.host.kinBusy('exploration'),false);
+  assert.deepEqual(f.host.beginKin({kind:'creation',id:'run-2'}),{ok:false,reason:'creation-slot-busy'});
+  await f.drain();
+  assert.equal(f.router.state.kinRuns['run-1'].state,'running');assert.deepEqual(told,[]);
+  assert.equal(one.release({state:'interrupted',reason:'not-started'}),true);
+  assert.equal(one.release({state:'completed'}),false,'a run ends once');
+  assert.deepEqual(released,['creation:run-1']);assert.equal(f.host.kinBusy('creation'),false);
+  await f.drain();await f.drain();
+  assert.deepEqual(told.map(s=>[s.runId,s.mode,s.state,s.reason]),[['run-1','creation','interrupted','not-started']]);
+  assert.equal(f.router.state.kinRuns['run-1'].notification,'accepted');
+  frozen=true;
+  assert.deepEqual(f.host.beginKin({kind:'creation',id:'run-3'}),{ok:false,reason:'frozen'});assert.equal(f.host.kinBusy('creation'),true);
+  frozen=false;
+  f.host.beginKin({kind:'creation',id:'run-4'});await f.drain();
+  // A restart: what the last host left going is blocked here (its store takes the run back); a week-old record goes.
+  f.advance(8*86400000);await f.host.recover();
+  assert.deepEqual([f.router.state.kinRuns['run-4'].state,f.router.state.kinRuns['run-4'].reason],['blocked','host-restarted']);
+  assert.equal(f.router.state.kinRuns['run-1'],undefined);
+  assert.deepEqual(Object.keys(f.disk().kinRuns['run-4']).sort(),['endedAt','id','mode','reason','revision','startedAt','state']);
+});

@@ -7,15 +7,17 @@ const terminal=new Set(['completed','failed','canceled','blocked']);
 const doneItem=new Set(['accepted','dropped','failed']);
 const tState=(t,p)=>!terminal.has(p.state)&&(t.cancelRequested||t.inputVersion!==p.inputVersion)?'cancel_requested':p.state;
 const text=(value,max=8000)=>typeof value==='string'&&value.trim()&&value.length<=max?value.trim():null;
+const code=value=>typeof value==='string'&&/^[a-z0-9][a-z0-9-]{0,79}$/.test(value)?value:null;
+const KIN_KEPT_MS=7*86400000;
 
 /** One task executor and an optional-expression queue, in the router's existing ledger.
  * No model reasoning or raw tool output is admitted to visibleItems. All I/O is a port;
  * the host supplies its owned runtime and existing transport manifests. */
 export class ParallelTasks {
-  constructor({router,runtime,prepare=async()=>null,retire=async()=>{},deliver,now=()=>Date.now(),onChange=()=>{},saveNote=async()=>{},parseFinal,prepareTimeoutMs=15000}) {
-    Object.assign(this,{router,runtime,prepare,retire,deliver,now,onChange,saveNote,parseFinal,prepareTimeoutMs});
+  constructor({router,runtime,prepare=async()=>null,retire=async()=>{},deliver,now=()=>Date.now(),onChange=()=>{},onKinChange=()=>{},saveNote=async()=>{},parseFinal,prepareTimeoutMs=15000}) {
+    Object.assign(this,{router,runtime,prepare,retire,deliver,now,onChange,onKinChange,saveNote,parseFinal,prepareTimeoutMs});
     router.state.visibleItems??={};router.state.visibleSequence??=0;
-    this.preparing=new Map();this.prepared=new Map();this.notifying=new Map();this.running=new Map();this.pumping=false;this.closed=false;
+    this.preparing=new Map();this.prepared=new Map();this.notifying=new Map();this.running=new Map();this.kinActive=new Map();this.pumping=false;this.closed=false;
   }
   async write(fn){return this.router.locked(async()=>{const result=await fn();this.router.save('parallel-task');return result;});}
   tasks(){return Object.values(this.router.state.tasks).filter(t=>t.parallel);}
@@ -30,6 +32,30 @@ export class ParallelTasks {
       finalDelivery:items.filter(i=>i.kind==='final').map(i=>({id:i.id,state:i.state})),workerThreadId:p.threadId??null};
   }
   snapshots(){return this.tasks().slice(-4).map(t=>this.snapshot(t.id));}
+  /** Kin's own long runs (creation for now) in this same ledger: one admission (a freeze, one run
+   * a mode), one recovery and one notification. A record keeps ids, states and codes, never words;
+   * the run itself is its executor's, and ends there. */
+  kinRuns(){return Object.values(this.router.state.kinRuns??{});}
+  kinSnapshot(r){return {runId:r.id,mode:r.mode,state:r.state,startedAt:r.startedAt,endedAt:r.endedAt??null,reason:r.reason??null};}
+  kinBusy(mode){return Boolean(this.router.frozen?.())||this.kinActive.has(mode);}
+  /** `{ok:false,reason}` under a freeze or while a run of this mode is going; else in flight with
+   * the router until `release({state,reason})`. */
+  beginKin({kind,id}) {
+    if(this.kinActive.has(kind))return {ok:false,reason:kind+'-slot-busy'};
+    let activity;try{activity=this.router.beginActivity({kind,id});}catch{return {ok:false,reason:'activity-unavailable'};}
+    if(!activity?.ok)return {ok:false,reason:'frozen'};
+    this.kinActive.set(kind,id);
+    const startedAt=this.now();let released=false;
+    void this.write(()=>{(this.router.state.kinRuns??={})[id]={id,mode:kind,state:'running',startedAt,revision:1};});
+    return {ok:true,release:(outcome={})=>{
+      if(released)return false;released=true;activity.release();
+      if(this.kinActive.get(kind)===id)this.kinActive.delete(kind);
+      void this.write(()=>{const r=this.router.state.kinRuns?.[id];if(!r)return;
+        Object.assign(r,{state:['completed','failed','interrupted'].includes(outcome.state)?outcome.state:'failed',reason:code(outcome.reason),
+          endedAt:this.now(),revision:r.revision+1,notification:'due'});});
+      return true;
+    }};
+  }
   async start({taskId,inputVersion,commandId,brief},source) {
     if(!text(commandId,160)||!text(brief,12000))throw Error('Task command and bounded brief required');
     return this.write(()=>{
@@ -89,6 +115,11 @@ export class ParallelTasks {
         if(t.parallel.notification==='submitting')t.parallel.notification='unknown';
       }
       for(const item of Object.values(this.router.state.visibleItems))if(['preparing','ready'].includes(item.state))item.state='admitted';
+      // A Kin run the last host left going: its executor's store takes it back (plan-recover).
+      for(const r of this.kinRuns()) {
+        if(r.state==='running')Object.assign(r,{state:'blocked',reason:'host-restarted',endedAt:this.now(),revision:r.revision+1});
+        if(r.endedAt&&r.endedAt<this.now()-KIN_KEPT_MS)delete this.router.state.kinRuns[r.id];
+      }
     });
   }
   runTask(t) {
@@ -224,6 +255,13 @@ export class ParallelTasks {
           p.notification=receipt?.state==='pending'?'pending':'accepted';
         })).catch(()=>this.write(()=>{p.notification='unknown';})).catch(()=>{}).finally(()=>this.notifying.delete(p.runId));
         this.notifying.set(p.runId,job);
+      }
+      // Kin's own run ended: Kin hears of it in Kin's own review, never as a message to anyone.
+      for(const r of this.kinRuns()) {
+        if(r.notification!=='due'||this.notifying.has(r.id)||this.router.frozen?.())continue;
+        const job=Promise.resolve().then(()=>this.onKinChange(this.kinSnapshot(r))).then(()=>this.write(()=>{r.notification='accepted';}),
+          ()=>this.write(()=>{r.notification='unknown';})).catch(()=>{}).finally(()=>this.notifying.delete(r.id));
+        this.notifying.set(r.id,job);
       }
     } finally {this.pumping=false;}
   }

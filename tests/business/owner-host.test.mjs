@@ -373,6 +373,7 @@ test('the derived layers ride beside the scores, in words and a pulse, and say t
  assert.equal(interactionView({continuity:{activation:'active'},dimensions:{}}).affect_layers,undefined,'an older core sends none');
  const text=stateContext({state});
  assert.ok(text.includes('由宿主从已提交的分数本地推导')&&text.includes('"feeling":"有点酸"'));
+ assert.ok(stateContext({state,moment:'此刻的状态（合成）：\n精力 50/100，正常。'}).startsWith('此刻的状态（合成）：\n精力 50/100，正常。\n以下是共享记忆库'),'the fallback leads with the moment block');
  assert.ok(!/(src|mem)_/.test(JSON.stringify(view.affect_layers)));
 });
 test('the minute loop runs one contact tick a minute (AD2-15)',async t=>{

@@ -406,7 +406,8 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       effective.instructions=refreshMcpInstructions(effective.instructions,{root:promptRoot});
       effective.input=effective.input.map(item=>['system','developer'].includes(item.role)?{...item,
         content:typeof item.content==='string'?refreshMcpInstructions(item.content,{root:promptRoot}):item.content.map(part=>typeof part.text==='string'?{...part,text:refreshMcpInstructions(part.text,{root:promptRoot})}:part)}:item);
-      if(promptRoot&&effective.tools){const promptTool=tool=>({...tool,...(tool.parameters?{parameters:projectSchema('tools/'+tool.name+'/schema',tool.parameters,{root:promptRoot})}:{}),...(tool.description?{description:projectPrompt('tools/'+tool.name,tool.description,{root:promptRoot})}:{}),...(tool.tools?{tools:tool.tools.map(promptTool)}:{})});effective.tools=effective.tools.map(promptTool);}
+      // A tool without a name (tool search) is kept under its type, never one shared `tools/undefined`.
+      if(promptRoot&&effective.tools){const promptTool=tool=>{const key='tools/'+(tool.name??tool.type);return {...tool,...(tool.parameters?{parameters:projectSchema(key+'/schema',tool.parameters,{root:promptRoot})}:{}),...(tool.description?{description:projectPrompt(key,tool.description,{root:promptRoot})}:{}),...(tool.tools?{tools:tool.tools.map(promptTool)}:{})};};effective.tools=effective.tools.map(promptTool);}
       const body = kimi ? kimiRequest(effective, requestProfile, currentContracts, {sharedMain}) : deepseekRequest(effective, reasoningEffort, requestProfile, currentContracts);
       const instructionContext={schema:'kin-gateway-instruction-evidence/v1',provider:upstreamProvider,lane:attributed.lane,
         purpose:attributed.purpose,model:body.model,reasoningEffort:body.reasoning.effort,

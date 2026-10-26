@@ -331,6 +331,21 @@ test('DS and Kimi refresh only the native compaction instruction, preserving ide
 });
 
 
+test('a tool without a name keeps its description under its own type, not a shared tools/undefined',async t=>{
+ const os=await import('node:os'),path=await import('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'kin-tool-prompts-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const gateway=await startDeepSeekGateway({key:'synthetic',promptRoot:root,fetchImpl:async()=>new Response(JSON.stringify({status:'completed',output:[]}))});
+ try {
+  const tools=[{type:'function',name:'synthetic_tool',description:'Synthetic named tool.',parameters:{type:'object',properties:{}}},
+   {type:'tool_search',description:'Synthetic tool discovery.',parameters:{type:'object',properties:{query:{type:'string'}}}}];
+  const response=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model:'deepseek-flash',input:[user('hi')],tools})});
+  assert.equal(response.status,200);await response.text();
+  const kept=fs.readdirSync(path.join(root,'.defaults','tools')).sort();
+  assert.ok(kept.includes('tool_search.json')&&kept.includes('synthetic_tool.json'),kept.join(','));
+  assert.ok(!kept.includes('undefined.json')&&!kept.includes('undefined'),kept.join(','));
+ }finally{await gateway.close();}
+});
+
 test('native 0.162 developer ordering refreshes only registered persona parts and preserves base and permissions',async t=>{
  // Anonymized shape of native-mock-1: no instructions field; separate base
  // developer, then one developer containing persona AND permission parts.

@@ -92,6 +92,13 @@ def _label(value):
     return value[:96] if isinstance(value, str) and value else None
 
 
+def reason_label(value):
+    """A quarantine's reason as a static label. A provider's validation code names its fields as
+    `field=type,...` (appraisal.py), which is a code too, not text."""
+    from .model_lanes import label
+    return label(str(value).replace("=", ":").replace(",", ":")) if value else "unknown"
+
+
 # Whose call it was that an attempt ended unsent (2026-10-01: of 17 canceled on 2026-09-28, 14 were drafts
 # that failed, and each carried the host's fallback wait as its `decision`, just like Kin's own three). Kin's
 # decision to wait or let go is settled with this reason and kept as the attempt's `decision`. Every other
@@ -226,14 +233,13 @@ def liveness(conn, scope, *, now=None):
             "last_complete_at": complete, "hours_since_last_complete": _hours(_seconds(complete), now),
         }
     if _table(conn, "mind_appraisals"):
-        from .model_lanes import label
         rows = conn.execute("SELECT available,json_extract(data,'$.attempt_started_at'),json_extract(data,'$.repair_reason') "
                             "FROM mind_appraisals WHERE scope=? AND state='needs-repair'", (scope,)).fetchall()
         available = [row[0] for row in rows if isinstance(row[0], (int, float))]
         started = [_seconds(row[1]) for row in rows]
         reasons = {}
         for row in rows:
-            reasons[label(row[2]) if row[2] else "unknown"] = reasons.get(label(row[2]) if row[2] else "unknown", 0) + 1
+            reasons[reason_label(row[2])] = reasons.get(reason_label(row[2]), 0) + 1
         # The rows an outage alone set aside go back by themselves after the next commit (recovery.py):
         # counted apart, with how long ago an appraisal last committed.
         from .recovery import recoverable_sql
@@ -392,13 +398,12 @@ def operational_status(mind, config=None):
         memory = {"evidence_isolation": isolation_status(conn, scope), "history_erase": erasure_status(conn, scope)}
         # Quarantined appraisals have no automatic way out: how many, since when, and why, as
         # static labels, so an operator can retire or resume them (K4-06, DB1-05).
-        from .model_lanes import label
         count, oldest = conn.execute("SELECT COUNT(*),MIN(available) FROM mind_appraisals WHERE scope=? AND state='needs-repair'",
                                      (scope,)).fetchone()
         reasons = {}
         for reason, n in conn.execute("SELECT json_extract(data,'$.repair_reason'),COUNT(*) FROM mind_appraisals "
                                       "WHERE scope=? AND state='needs-repair' GROUP BY 1", (scope,)):
-            reasons[label(reason) if reason else "unknown"] = reasons.get(label(reason) if reason else "unknown", 0) + n
+            reasons[reason_label(reason)] = reasons.get(reason_label(reason), 0) + n
         memory["quarantined"] = {"count": count, "oldest_available_unix": oldest, "reasons": reasons}
         memory["fork_read_errors"] = fork_read_errors(mind.engine.db.root)
         # Whether the work is moving (OPS-02): the phone's self-check reads this with the rest.

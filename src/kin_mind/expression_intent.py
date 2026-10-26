@@ -144,6 +144,10 @@ def commit_intent(commit):
     trait_refs.record(conn, mind.scope.key(), "intent", identifier,
                       {ref["trait_id"]: ref["revision"] for ref in traits},
                       dependent_revision=intent["valid_until"], at=at)
+    # What Kin wants to keep talking about may grow into an interest (play.py).
+    from .play import from_chat
+    from_chat(conn, mind, [topic["topic"] for topic in topics],
+              sorted({ref["source_id"] for ref in commit.sources or [] if ref.get("source_id")}))
     return intent
 
 

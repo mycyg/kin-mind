@@ -194,6 +194,17 @@ def test_reply_context_leads_with_the_moment_block(env):
     assert "精力" in built["rendered_text"].split("\n")[2]
 
 
+def test_without_the_memory_context_the_fallback_still_carries_the_moment_block(env):
+    mind, _, _, _ = env
+    from kin_mind.host import dispatch
+    energy.configure(mind, {"enabled": True, "night_penalty": 0})
+    config = {"root": str(mind.engine.db.path.parent), "scope": mind.scope.model_dump(), "agent_version": "life-test", "session_id": "life-main"}
+    result = dispatch(config, "ingest", {"id": "fallback-1", "text": "synthetic fallback",
+                                          "at": datetime.now(timezone.utc).isoformat(), "channel": "feishu"})
+    assert result["memory_context"]["state"] == "disabled"
+    assert result["moment"].startswith(moment.HEADER) and "精力" in result["moment"]
+
+
 def test_family_state_reads_drop_the_intimacy_dimension_and_its_style(env, monkeypatch):
     from kin_mind import host
     from kin_mind.companion_host import dispatch_companion

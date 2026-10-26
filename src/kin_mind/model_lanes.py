@@ -3,7 +3,8 @@
 A lane follows the purpose its caller declares, never the name of the function that ends up
 calling the model (compression serves a waiting user and an idle queue alike):
 
-  background  bounded by meta.kin_background_model_limit; yields to any foreground session
+  background  bounded by meta.kin_background_model_limit; yields to any foreground session,
+              except Kin's own creation (FOREGROUND_EXEMPT)
   user-work   one reserved slot that does not yield. A held work task keeps a foreground
               lease, so the review that would release it could otherwise never be admitted
   foreground  always admitted; the row only records who is calling
@@ -47,6 +48,9 @@ DEFAULT_BACKGROUND_LIMIT = 2
 # older store says. A larger value anywhere is read as this one (CR-MIND-10).
 BACKGROUND_LIMIT_CEILING = 4
 USER_WORK_LIMIT = 1
+# Kin's own creation runs beside 小光's chat: still bounded by the background limit, it does not
+# wait for a foreground session (it used to, and was skipped while 小光 talked).
+FOREGROUND_EXEMPT = frozenset({"native-creation"})
 RETRY_SECONDS = 30
 # core/jobs.py and recovery.py match on these two strings: they stay byte-identical.
 WAIT_CAPACITY = "deepseek-background-capacity"
@@ -231,7 +235,7 @@ class Ledger:
                 reason = WAIT_USER_WORK
             elif lane == "background" and pool["held"] >= pool["limit"]:
                 reason = WAIT_CAPACITY
-            elif lane == "background" and foreground_active(conn):
+            elif lane == "background" and purpose not in FOREGROUND_EXEMPT and foreground_active(conn):
                 reason = WAIT_FOREGROUND
             if reason:
                 return {"state": "wait", "reason": reason, "retry_after_seconds": RETRY_SECONDS, "capacity": pool}

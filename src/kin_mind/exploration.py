@@ -353,6 +353,8 @@ class Explorations:
         data = {"desire_id": desire["id"], "selected_brief": desire["content"], "exploration_target": target,
                 "topic_selected_by": "deepseek-appraisal", "agent_version": agent_version,
                 "evidence_ids": [r["record_id"] for r in desire["evidence"]],
+                # 小光's own: not one of Kin's explorations of the day (play.left).
+                **({"origin": "owner"} if candidate.get("origin") == "owner" else {}),
                 # Where its executor writes: a delete of anything the run names takes the words of
                 # that directory too, once the run is settled (workdirs.erased_runs, OPS-03).
                 "workdir": str((Path(directory) / eid).absolute()),

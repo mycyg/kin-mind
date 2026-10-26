@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from eventmem.core.prompts import PromptStore, project_prompt, MAX_PREVIOUS_TEXTS
+from eventmem.core.prompts import PromptStore, project_prompt, MAX_PREVIOUS_TEXTS, carry_renamed
 
 
 def test_each_version_records_its_source_and_can_be_restored(tmp_path):
@@ -66,3 +66,43 @@ def test_dot_segments_are_refused_and_defaults_keep_a_bounded_history(tmp_path):
     assert len(registered['previous_texts']) == MAX_PREVIOUS_TEXTS
     assert registered['previous_texts'][-1] == f'合成默认 {MAX_PREVIOUS_TEXTS + 2}'
     assert 'previous_texts' not in store.read('contact-draft')
+
+
+def test_an_edit_under_the_old_tool_search_name_carries_over_once_and_the_old_stays(tmp_path):
+    store = PromptStore(tmp_path / 'prompts')
+    # The shape the code once registered in place: version 1, no `edited` -- not an edit, nothing to carry.
+    store.document('tools/undefined').parent.mkdir(parents=True)
+    store.document('tools/undefined').write_text(json.dumps({'name': 'tools/undefined', 'version': 1, 'text': '合成旧默认。'}))
+    assert carry_renamed(store) == []
+    store.write('tools/undefined', '合成的改写。', source_input_id='input-1')
+    project_prompt('tools/tool_search', '合成新默认。', tmp_path)
+    assert carry_renamed(store) == ['tools/tool_search']
+    carried = store.read('tools/tool_search')
+    assert (carried['text'], carried['edited'], carried['migrated_from'], carried['source_input_id']) == ('合成的改写。', True, 'tools/undefined', None)
+    assert store.read('tools/undefined')['text'] == '合成的改写。', 'the old document stays'
+    # Once: a later choice to follow the default again is not undone at the next start-up.
+    store.restore('tools/tool_search', 'default')
+    assert carry_renamed(store) == [] and store.read('tools/tool_search')['text'] == '合成新默认。'
+    assert [v['version'] for v in store.history('tools/tool_search')['versions']] == [2, 1]
+
+
+def test_an_edit_already_made_under_the_new_name_is_never_replaced(tmp_path):
+    store = PromptStore(tmp_path / 'prompts')
+    store.write('tools/undefined', '合成的旧改写。')
+    store.write('tools/tool_search', '合成的新改写。')
+    assert carry_renamed(store) == [] and store.read('tools/tool_search')['text'] == '合成的新改写。'
+
+
+def test_the_start_up_recovery_carries_it(tmp_path):
+    from eventmem.core import Engine
+    from eventmem.core.models import Scope, SourceInput
+    from kin_mind.host import dispatch
+    from kin_mind.state import Mind
+    engine, scope = Engine(tmp_path / 'memory'), Scope(persona='synthetic-prompts')
+    mind = Mind(engine, scope)
+    init = engine.receive(SourceInput(namespace='test', key='configuration', scope=scope, text='configuration', authority='explicit'))['id']
+    mind.initialize(agent_version='test-v1', evidence_ids=[init])
+    PromptStore(engine.db.root / 'prompts').write('tools/undefined', '合成的改写。')
+    config = {'root': str(tmp_path / 'memory'), 'scope': scope.model_dump(), 'agent_version': 'test-v1'}
+    assert dispatch(config, 'recover', {})['prompts_carried'] == ['tools/tool_search']
+    assert dispatch(config, 'recover', {})['prompts_carried'] == []

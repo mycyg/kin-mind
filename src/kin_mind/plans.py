@@ -48,6 +48,16 @@ REVIEW_REASONS = {"configuration-changed", "new-owner-evidence", "source-needs-r
                   "window-review-required", "procedure-needs-review", "trait-needs-review", "activity-needs-review"}
 # Ledger marker: the review that took this reason finished without being able to show the plan.
 UNSHOWN = "unshown:"
+# A creation the host held off before anything ran -- no fork, another creation in its slot, a
+# release freeze: its step is ready again on the same decision (at most HELD_OFF_RETRIES times) and
+# the run is not one of the day's creations (play.left).
+HELD_OFF = ("not-started", "creation-slot-busy", "dispatch-frozen")
+HELD_OFF_RETRIES = 3
+
+
+def owner_origin(plan, step):
+    """Work 小光 handed over or put off: never counted against Kin's day, never capped."""
+    return bool(step.get("owner_request_id")) or str(plan.get("key") or "").startswith("deferred-task:")
 
 
 class AutonomousPlans:
@@ -810,7 +820,8 @@ class AutonomousPlans:
                 return {"state": "waiting", "reason": "foreground-or-feature-disabled"}
             from .model_lanes import foreground_active
             # Machine-wide, like every other yield to the user: a scope isolates data, not attention.
-            if foreground_active(conn, self.scope):
+            # Kin's own creation runs beside 小光's chat instead (model_lanes.FOREGROUND_EXEMPT).
+            if actor != "create" and foreground_active(conn, self.scope):
                 return {"state": "waiting", "reason": "user-work-priority"}
             if actor == "create" and not enabled(conn, self.scope, "records"):
                 return {"state": "waiting", "reason": "result-memory-disabled"}
@@ -825,22 +836,30 @@ class AutonomousPlans:
                 return {"state": "waiting", "reason": "executor-reserved", "run_id": active[0]}
             rows = conn.execute("SELECT data FROM mind_plans WHERE scope=? AND " + recipient.predicate() + " AND status='active' ORDER BY next_review,id", (self.scope,)).fetchall()
             state = self.mind._load(conn) if rows else None
+            # Kin's own creations stop for the day at the cap; 小光's go on (play.left).
+            from .play import config as play_config, left
+            capped = actor == "create" and left(conn, self.scope, self.mind.clock(), play_config(conn))["create"] <= 0
+            limited = False
             for row in rows:
                 plan = json.loads(row[0])
                 for step in plan["steps"]:
                     if step["actor"] != actor or self.waiting_reason(conn, plan, step, state):
                         continue
+                    origin = owner_origin(plan, step)
+                    if capped and not origin:
+                        limited = True
+                        continue
                     run_id = "plan_run_" + digest([self.scope, plan["id"], step["id"], step["revision"]])[:32]
                     attempt = {"recipient_person_id": recipient.current(), "id": run_id, "plan_id": plan["id"], "step_id": step["id"], "plan_revision": plan["revision"],
                                "step_revision": step["revision"], "actor": actor, "decision": step["decision"], "state": "running",
                                "energy_activity_id": "plan:" + digest([plan["id"], step["id"], step["goal"], step["completion"]])[:40],
-                               "started_at": self.mind.clock(), "owner": owner, "fence": 1}
+                               "started_at": self.mind.clock(), "owner": owner, "fence": 1, **({"origin": "owner"} if origin else {})}
                     conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, self.scope, plan["id"], step["id"], actor, "running", time.time() + 90, owner, 1, self._row(conn, "mind_plan_runs", attempt)))
                     step.update(state="running", run_id=run_id)
                     plan["revision"] += 1
                     self._save(conn, plan, "claim:" + run_id)
                     return {"state": "claimed", "run": attempt, "plan": plan, "step": step}
-        return {"state": "waiting", "reason": "no-current-decision"}
+        return {"state": "waiting", "reason": "daily-limit-reached" if limited else "no-current-decision"}
 
     def note_shown(self, run_id, shown, mark=None):
         """What a claimed run's brief showed its executor besides the decision's evidence -- the
@@ -931,11 +950,16 @@ class AutonomousPlans:
             finish_recorded_execution(conn, self.mind, "work", run.get("energy_activity_id"), run_id)
             run.update(state=state, result=result, finished_at=self.mind.clock())
             conn.execute("UPDATE mind_plan_runs SET state=?,lease_until=0,data=? WHERE id=?", (state, self._row(conn, "mind_plan_runs", run), run_id))
-            step.update(state="completed" if state == "completed" else "unconfirmed" if state == "unconfirmed" else "waiting",
+            held_off = (state == "interrupted" and row["actor"] == "create" and result.get("reason") in HELD_OFF and step.get("decision")
+                        and sum(r.get("reason") in HELD_OFF for r in step["receipts"]) < HELD_OFF_RETRIES)
+            step.update(state="ready" if held_off else "completed" if state == "completed" else "unconfirmed" if state == "unconfirmed" else "waiting",
                         revision=step["revision"] + 1)
-            step.pop("decision", None)
+            if held_off:
+                step["decision"]["plan_revision"] = plan["revision"] + 1
+            else:
+                step.pop("decision", None)
             step["receipts"].append({"run_id": run_id, "state": state, **result})
-            plan.update(revision=plan["revision"] + 1, next_review_at=self.mind.clock())
+            plan.update(revision=plan["revision"] + 1, **({} if held_off else {"next_review_at": self.mind.clock()}))
             self._finish(plan)
             self._save(conn, plan, "settle:" + run_id)
             return run
@@ -1102,6 +1126,19 @@ class AutonomousPlans:
             step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
             return bool(step and step.get("decision", {}).get("id") == desire.get("plan_decision_id")
                         and not self.waiting_reason(conn, plan, step, state))
+
+    def owner_linked(self, conn, desire):
+        """A wish that carries a step of 小光's own (owner_origin)."""
+        if not desire.get("plan_id"):
+            return False
+        from .companions import XIAOGUANG
+        with recipient.target_scope(self.mind, desire.get("recipient_person_id", XIAOGUANG)):
+            try:
+                plan = self.get(conn, desire["plan_id"])
+            except Missing:
+                return False
+            step = next((s for s in plan["steps"] if s["id"] == desire.get("plan_step_id")), None)
+            return bool(step and owner_origin(plan, step))
 
     def settle_linked(self, conn, desire, receipt):
         if not desire.get("plan_id"):

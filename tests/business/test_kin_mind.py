@@ -615,6 +615,20 @@ def test_no_more_than_four_background_calls_whatever_is_configured(setup):
         assert conn.execute("SELECT value FROM meta WHERE key=?", (model_lanes.CAPACITY_KEY,)).fetchone()[0] == 4
 
 
+def test_kins_own_creation_does_not_wait_for_a_foreground_session(setup):
+    """2026-10-26: a creation keeps the background bound but runs beside 小光's chat; the rest still yields."""
+    from kin_mind import model_lanes
+    from kin_mind.lifecycle import foreground_lease
+    mind, _source, _clock = setup
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS mind_foreground_leases(scope TEXT NOT NULL,session TEXT NOT NULL,"
+                     "expires_at REAL NOT NULL,PRIMARY KEY(scope,session))")
+    foreground_lease(mind.engine, mind.scope.key(), "read:synthetic")
+    ledger = model_lanes.Ledger(mind.engine.db.path)
+    assert ledger.acquire("background", "native-assessment", holder="test")["reason"] == model_lanes.WAIT_FOREGROUND
+    assert ledger.acquire("background", "native-creation", holder="test")["state"] == "admitted"
+
+
 def test_a_session_review_commits_to_the_carrier_without_a_mind_revision(setup):
     """CR-RT-10: through the real commit path, a maintenance result reaches the registry carrier in
     one leased, idempotent transaction; the mind's revision, state row and history stay as they were."""

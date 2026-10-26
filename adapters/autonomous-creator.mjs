@@ -180,6 +180,9 @@ export class AutonomousCreator {
         thread_id:native.fork_thread_id??native.native_session_id,native_turn_id:native.native_turn_id,run_id:run.id,workspace:directory,
         elapsed_ms:Date.now()-started,usage:native.usage??null,usage_status:native.usage?'reported':'unknown'};
       if(controller.signal.aborted||answer.reason==='owner-preempted')return {state:'interrupted',receipt,checkpoint:directory};
+      // Nothing ran: no fork was made, or none reached a turn. The step was held off, not failed.
+      if(answer.state==='waiting'&&!receipt.native_turn_id&&answer.model_invoked!==true&&!['started','unknown'].includes(answer.stage))
+        return {state:'interrupted',reason:'not-started',receipt,checkpoint:directory};
       if(answer.state!=='complete'||!receipt.thread_id||!receipt.native_turn_id)return {state:'failed',receipt,reason:'native-run-incomplete',checkpoint:directory};
       const output=answer.result;
       if(!Array.isArray(output?.artifacts)||!output.artifacts.length||output.artifacts.length>24||!Array.isArray(output.remaining)||typeof output.summary!=='string')return {state:'failed',receipt,reason:'invalid-result-shape'};
@@ -198,8 +201,8 @@ export class AutonomousCreator {
 
 /** Existing minute loop dispatches one creator. A running creation is Kin's own work: a new
  * owner message does not stop it (she hears of it and decides, through her plan); shutdown,
- * an explicit stop and a changed plan or decision do. It starts only while the owner's work
- * is not running. */
+ * an explicit stop and a changed plan or decision do. It starts when `isBusy()` lets it: the
+ * host's word, which no longer waits for 小光's chat. */
 const REVIEW_RETRIES=15,REVIEW_RETRY_MS=20000;
 /** A static reason for a stop, never a message text: a worker's failure code, else a generic one. */
 export function stopReason(error){
@@ -210,9 +213,11 @@ const halted=code=>Object.assign(Error(code),{code});
 /** `beginActivity({kind,id})`: the router's in-flight registration (CR-MIND-01), `{ok:false}` under
  * a release freeze, else `{ok:true,release()}`. Without one, nothing is registered.
  * The completion review (`plan-result`) runs a model in a worker process of its own; when `call`
- * answers with the host's mind worker promise, its `exited` settles once that process has ended. */
+ * answers with the host's mind worker promise, its `exited` settles once that process has ended.
+ * `release(outcome)` hears how the run ended ({state, reason}); `notify` tells Kin of a settled result,
+ * unless the host's ledger does (parallel-tasks.mjs beginKin). */
 export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{},retryMs=REVIEW_RETRY_MS,
-  beginActivity=()=>({ok:true,release(){}}),recordStarted=null,recordFinished=null}){
+  beginActivity=()=>({ok:true,release(){}}),recordStarted=null,recordFinished=null,notify=()=>loop.review()}){
   let running=false,closed=false,controller=null,current=null,stops=0;
   const owner='creator-'+process.pid;
   // Nothing of this host runs yet: the final answers the last one left keep no words (CL6-MM-07).
@@ -220,7 +225,7 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
   const tick=async()=>{
     // No Codex to run (the runtime bundle unreadable): nothing is claimed only to be interrupted.
     if(closed||running||isBusy()||creator.command===null)return;
-    running=true;let claimed,activity=null;
+    running=true;let claimed,activity=null,outcome=null;
     // CR3-MM-09: every completion review this run asked for, retries included, is in flight until
     // its worker process has ended, not merely until it answered: a timeout answers first and
     // ends the process after. The creation's activity is released only once each has.
@@ -239,7 +244,7 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       // CR-MIND-01: in flight with the router from the moment the executor starts; a release
       // freeze that began after the tick's own check defers it.
       activity=beginActivity({kind:'creation',id:run.id});
-      if(!activity?.ok)throw halted('dispatch-frozen');
+      if(!activity?.ok)throw halted(activity?.reason==='creation-slot-busy'?'creation-slot-busy':'dispatch-frozen');
       current={plan_id:claimed.plan.id,goal:claimed.plan.goal,step:claimed.step?.goal,run_id:run.id};
       let executionStarted=false;
       const result=await creator.run(claimed,{signal:controller.signal,onStarted:async()=>{
@@ -257,6 +262,7 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
         if(executionStarted&&recordFinished)try{await recordFinished(claimed,{owner});}
         catch{recordStatus({creation:{state:'energy-receipt-pending',run_id:run.id}});}
       });
+      if(result?.reason==='not-started')throw halted('not-started');
       let settled=await review({run_id:run.id,owner,fence:run.fence,result});
       // The completion review found no free model slot: the same verified result is offered
       // again while the lease is kept, instead of the whole creation running again (K2-02).
@@ -267,15 +273,17 @@ export function startAutonomousWork({loop,call,creator,isBusy,recordStatus=()=>{
       }
       if(settled?.state==='waiting')throw Object.assign(Error('completion-review-unavailable'),{code:'completion-review-unavailable'});
       recordStatus({creation:{state:settled.state,plan_id:claimed.plan.id,run_id:run.id}});
-      void loop.review();
+      outcome={state:settled.state};
+      void notify();
     }catch(error){
       // The reason travels into the plan's receipt: Kin decides what to do with the step (K2-02).
       const reason=stopReason(error);
       if(claimed?.state==='claimed')try{await call('plan-interrupt',{run_id:claimed.run.id,owner,fence:claimed.run.fence,reason});}catch{}
       recordStatus({creation:{state:'needs-review',reason}});
+      outcome={state:'interrupted',reason};
     }
     finally{
-      await Promise.allSettled(reviews);try{activity?.release?.();}catch{}
+      await Promise.allSettled(reviews);try{activity?.release?.(outcome??{state:'interrupted'});}catch{}
       // Settled, interrupted or failed alike: its final answer keeps no words (CL6-MM-07).
       if(claimed?.state==='claimed')try{creator.settled?.(claimed);}catch{}
       running=false;controller=null;current=null;

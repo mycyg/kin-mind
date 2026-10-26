@@ -501,10 +501,14 @@ def _dispatch(config, action, request):
         # layer off, the answer is the state view, as before, and nothing to prepare.
         if memory.settings()["context"]:
             return {"source_id": source["id"], "appraisal": job, "memory_enabled": True}
+        state = mind.read(query=request["text"])
+        # 此刻的状态 leads this fallback as it leads the memory context (moment.py).
+        from .moment import current as moment
         return {
             "source_id": source["id"],
             "appraisal": job,
-            "state": mind.read(query=request["text"]),
+            "state": state,
+            "moment": moment(mind, state),
             "findings": explorer.recent(),
             "memory_context": {"state": "disabled", "text": "", "tokens": 0},
         }
@@ -834,10 +838,13 @@ def _dispatch(config, action, request):
         # just interrupted among them, rather than when the next exploration starts (OPS-03).
         directory = config.get("exploration_directory")
         swept = explorer.sweep_workdirs(directory) if directory else []
+        # An edit saved under a prompt's old name carries over to its new name, once (prompts.py).
+        from eventmem.core.prompts import PromptStore, carry_renamed
+        carried = carry_renamed(PromptStore(engine.db.root / "prompts"))
         return {"state": "recovered", "canceled_drafts": 0, "resumable_drafts": len(attempts),
                 "enrichment_rescheduled": enrichment_rescheduled,
                 "interrupted_explorations": interrupted, "live_explorations": retained,
-                "swept_workdirs": len(swept)}
+                "swept_workdirs": len(swept), "prompts_carried": carried}
     raise ValueError("Unknown host action")
 
 

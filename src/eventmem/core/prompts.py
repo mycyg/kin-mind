@@ -7,6 +7,9 @@ import fcntl
 from datetime import datetime, timezone
 
 MAX_PREVIOUS_TEXTS = 16
+# Names a prompt had before it was renamed. Tool search has no name, so its description was kept as
+# `tools/undefined` until the gateway named nameless tools by their type (2026-10-26).
+RENAMED = {'tools/undefined': 'tools/tool_search'}
 
 
 def assembled(name):
@@ -129,12 +132,32 @@ class PromptStore:
                          'updated_at': datetime.now(timezone.utc).isoformat(), 'default_seen_at': seen,
                          'source_input_id': provenance.get('source_input_id'),
                          'external_read': provenance.get('external_read'),
-                         **({'restored_from': provenance['restored_from']} if 'restored_from' in provenance else {})}
+                         **({'restored_from': provenance['restored_from']} if 'restored_from' in provenance else {}),
+                         **({'migrated_from': provenance['migrated_from']} if 'migrated_from' in provenance else {})}
                 state = 'saved'
             temporary = target.with_name(target.name + '.' + uuid.uuid4().hex + '.tmp')
             temporary.write_text(json.dumps(value, ensure_ascii=False))
             os.replace(temporary, target)
             return {**value, 'state': state, 'path': str(target), 'effective': self.effective(name)}
+
+
+def carry_renamed(store):
+    """Once, at start-up: an edit saved under a prompt's old name becomes a new version of its new
+    name, while that one is absent or follows its default. A plain save recorded as a migration (no
+    input, no notice); the old document stays. Answers the names it wrote."""
+    carried = []
+    for old, new in RENAMED.items():
+        source = store.document(old)
+        value = json.loads(source.read_text()) if source.exists() else None
+        target = store.document(new)
+        current = json.loads(target.read_text()) if target.exists() else None
+        folder = store.root / '.history' / new
+        earlier = [json.loads(p.read_text()) for p in folder.glob('*.json')] if folder.exists() else []
+        if not edited(value) or edited(current) or any(v.get('migrated_from') == old for v in [current or {}, *earlier]):
+            continue
+        store.write(new, value['text'], migrated_from=old)
+        carried.append(new)
+    return carried
 
 
 def project_prompt(name, fallback, root):

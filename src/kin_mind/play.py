@@ -4,15 +4,16 @@ An interest is a short topic Kin likes. Its strength fades while nothing touches
 `half_life_days`), grows when an activity on it was fun and drops when it was dull; where it came
 from is kept: the persona, an exploration, or chat. An activity ends in `after_activity`, with Kin's
 own word on how it went (an exploration result's `enjoyment`); its `new_interests` may add a few,
-never past `max_interests`. An interest keeps the sources it grew from, so an erase takes its words.
+never past `max_interests`. Topics Kin wants to keep talking about may touch one or add a faint one
+from chat (`from_chat`). An interest keeps the sources it grew from, so an erase takes its words.
 
 Boredom (the drives module's, or estimated from the hours since anything engaging happened), energy,
 the rhythm phase, what is running and today's count decide only when Kin is given an idle review to
 think about what to do (`wake`): the usual idle review, woken early. There Kin is shown the
 interests and boredom (`context`) and chooses among the wishes Kin could always make -- explore,
 play (an exploration with `exploration_target: play`, smaller and lighter), create, contact -- or
-rest. Nothing here starts, sends or blocks anything else; only play waits for the next day once
-today's explorations are used up.
+rest. Nothing here starts or sends anything; Kin's own explorations (play among them) and creations
+wait for the next day once today's are used up (`left`), 小光's never do.
 """
 import json
 import math
@@ -38,6 +39,8 @@ DEFAULTS = {"enabled": True, "timezone": "Asia/Singapore", "boredom_threshold": 
 TOPIC_CHARS, SHOWN, FADED, NEW_STRENGTH, NEW_PER_ACTIVITY = 24, 8, 5.0, 30.0, 2
 STEP, TOUCH = {"fun": 15.0, "meh": -10.0}, 5.0
 SEED_STRENGTH, SEED_SHOWN, SEED_TAGS = {"persona": 50.0, "chat": 40.0}, 12, 8
+# A topic Kin wants to keep talking about starts fainter than one an activity sparked.
+CHAT_STRENGTH = 15.0
 SLEEPY = ("drowsy", "resting")
 LAST_ENGAGING = (
     "SELECT MAX(created_at) FROM mind_explorations WHERE scope=?",
@@ -161,6 +164,26 @@ def after_activity(conn, mind, text, result=None, source_ids=()):
         _add(conn, scope, at, cfg, topic, NEW_STRENGTH, "exploration", source_ids, engaged=at)
 
 
+def from_chat(conn, mind, topics, source_ids=()):
+    """The topics an expression intent wants to stay with (`continue_topics`), in the appraisal's
+    transaction: an interest one names is touched, at most once a day; of the rest, at most one
+    becomes a faint interest from chat, kept with the sources the appraisal was shown."""
+    cfg, scope, at = config(conn), mind.scope.key(), mind.clock()
+    if not cfg["enabled"] or not topics:
+        return
+    conn.execute(SCHEMA)
+    live, touched, added = interests(conn, scope, at, cfg), set(), False
+    for topic in topics:
+        named = [entry for entry in live if _key(entry["topic"]) in _key(topic)]
+        for entry in named:
+            if entry["id"] not in touched and (not entry.get("last_engaged_at") or _days(entry["last_engaged_at"], at) >= 1):
+                entry.update(strength=min(100.0, entry["strength"] + TOUCH), as_of=at, last_engaged_at=at)
+                _save(conn, scope, entry)
+            touched.add(entry["id"])
+        if not named and not added:
+            added = bool(_add(conn, scope, at, cfg, topic, CHAT_STRENGTH, "chat", source_ids, engaged=at))
+
+
 def boredom(conn, mind, at, cfg):
     """The drives module's boredom while it is there and on; else an estimate from the hours since
     anything engaging happened: an exploration, a creation, a contact sent, a message received."""
@@ -184,12 +207,17 @@ def energy(conn, scope, at):
 
 
 def left(conn, scope, at, cfg):
-    """What is left of today's explorations (play among them) and creations, by the local day."""
+    """What is left of today's explorations (play among them) and creations, by the local day: Kin's
+    own only -- 小光's (`origin` owner) and a creation the host held off (plans.HELD_OFF) do not count."""
+    from .plans import HELD_OFF
     zone = ZoneInfo(cfg["timezone"])
     since = datetime.combine(stamp(at).astimezone(zone).date(), time(), zone).astimezone(timezone.utc).isoformat()
-    explored = _one(conn, "SELECT COUNT(*) FROM mind_explorations WHERE scope=? AND created_at>=?", (scope, since)) or 0
+    explored = _one(conn, "SELECT COUNT(*) FROM mind_explorations WHERE scope=? AND created_at>=? "
+                          "AND json_extract(data,'$.origin') IS NOT 'owner'", (scope, since)) or 0
     created = _one(conn, "SELECT COUNT(*) FROM mind_plan_runs WHERE scope=? AND actor='create' "
-                         "AND json_extract(data,'$.started_at')>=?", (scope, since)) or 0
+                         "AND json_extract(data,'$.started_at')>=? AND json_extract(data,'$.origin') IS NOT 'owner' "
+                         "AND NOT (state='interrupted' AND COALESCE(json_extract(data,'$.result.reason'),'') IN (" + ",".join("?" * len(HELD_OFF)) + "))",
+                   (scope, since, *HELD_OFF)) or 0
     return {"explore_or_play": max(0, cfg["explore_per_day"] - explored), "create": max(0, cfg["create_per_day"] - created)}
 
 

@@ -108,6 +108,26 @@ def test_rows_an_outage_set_aside_and_the_idle_decisions_are_said_apart(store):
     assert facts["contact_funnel"]["idle_decisions_24h"] == {"contact": 1, "not-now": 0, "defaulted": 1}
 
 
+def test_a_validation_code_is_a_reason_and_a_settled_row_is_no_longer_counted(store):
+    """A provider's validation code names its fields with `=`: it is said as a code, not as unlabelled;
+    text still is not. A row an operator's triage superseded leaves the count."""
+    engine, scope, _mind, root = store
+    with engine.db.connect(write=True) as conn:
+        for key, reason, state in (("app_code", "repeated-failure:deepseek-invalid-result:values=value_error", "needs-repair"),
+                                   ("app_text", "repeated-failure:a sentence with words", "needs-repair"),
+                                   ("app_settled", "repeated-failure:Missing", "superseded")):
+            conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES(?,?,?,?,?)",
+                         (key, scope.key(), state, NOW.timestamp(), dumps({"attempt_started_at": iso(hours=1), "repair_reason": reason})))
+    conn = read_only(root)
+    try:
+        facts = liveness(conn, scope.key(), now=NOW.timestamp())
+    finally:
+        conn.close()
+    assert facts["quarantine"]["count"] == 5
+    assert facts["quarantine"]["reasons"] == {"compression-passes-exhausted:13": 3, "unlabelled": 1,
+                                              "repeated-failure:deepseek-invalid-result:values:value_error": 1}
+
+
 def test_a_failure_on_a_revision_since_replaced_or_deleted_is_not_a_failure_of_the_day(store):
     """A vector that failed for a revision its record has since moved past, or for a record since
     deleted, is never needed: nothing shows that revision again, and repair does not queue it. It is
